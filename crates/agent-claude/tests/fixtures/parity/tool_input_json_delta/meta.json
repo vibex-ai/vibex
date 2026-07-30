@@ -1,0 +1,9 @@
+{
+  "capability": "tool_input_json_delta",
+  "mode": "stream_events",
+  "source": "synthetic-offline (input_json_delta wire shape accepted by map_claude_stream_event)",
+  "sdk": "offline Serde wire mirror",
+  "recorded_at": "2026-07-11",
+  "known_defects": [],
+  "notes": "Replayed offline through parity::map_stream_event; input_json_delta accumulates partial_json per content block index and emits ToolCall(Progress)."
+}

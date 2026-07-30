@@ -1,0 +1,12 @@
+{
+  "compatibilityIdentity": "adapter=codex-acp@1.1.2;runtime=@openai/codex@fixture",
+  "enricher": "codex",
+  "nativeBaselineReferences": [
+    "crates/agent-codex/tests/fixtures/parity/command_execution",
+    "crates/agent-codex/tests/fixtures/parity/file_changes",
+    "crates/agent-codex/tests/fixtures/parity/web_search",
+    "crates/agent-codex/tests/fixtures/parity/todo_list",
+    "crates/agent-codex/tests/fixtures/parity/collaboration_tool",
+    "crates/agent-claude/tests/fixtures/parity/image_attachment"
+  ]
+}

@@ -1,0 +1,35 @@
+[package]
+name = "vibex-diagnostics"
+version = "0.1.0-rc.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+vibex-agent = { path = "../agent" }
+vibex-agent-claude = { path = "../agent-claude" }
+vibex-agent-codex = { path = "../agent-codex" }
+vibex-config-switch = { path = "../config-switch" }
+vibex-core = { path = "../core" }
+vibex-db = { path = "../db" }
+vibex-fs = { path = "../fs" }
+vibex-git = { path = "../git" }
+vibex-remote = { path = "../remote" }
+vibex-terminal = { path = "../terminal" }
+
+[[bin]]
+name = "vibex-diagnostic-bundle-smoke"
+path = "src/bin/vibex-diagnostic-bundle-smoke.rs"
+
+[[bin]]
+name = "vibex-performance-baseline"
+path = "src/bin/vibex-performance-baseline.rs"
+
+[[bin]]
+name = "vibex-e2e-regression-harness"
+path = "src/bin/vibex-e2e-regression-harness.rs"

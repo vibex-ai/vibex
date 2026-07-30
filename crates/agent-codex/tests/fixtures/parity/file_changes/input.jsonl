@@ -1,0 +1,1 @@
+{"type":"fileChange","id":"item_fc_1","status":"completed","changes":[{"path":"src/lib.rs","kind":"update"},{"path":"src/new_module.rs","kind":"add"},{"path":"src/legacy.rs","kind":"delete"}]}

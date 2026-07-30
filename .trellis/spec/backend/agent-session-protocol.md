@@ -1,0 +1,3042 @@
+# Agent Session Protocol
+
+Vibex must present a provider-neutral Agent session protocol across PC, Web,
+and mobile clients. Every online Agent, including Claude and Codex, executes
+through ACP. Native Claude/Codex transcript and parity crates are offline
+compatibility inputs only.
+
+Evidence: current Agent/runtime code, tests, and completed Agent-session Trellis tasks.
+
+> Legacy cutover note (2026-07-29): later sections that name Tauri commands,
+> React hooks, browser mocks, or files from the former desktop shell are retained
+> pre-cutover evidence. That shell once occupied `apps/desktop`; its adapters no
+> longer exist. Current callers use the GPUI Backend facade, `DesktopRuntime`, or
+> the versioned Remote protocol.
+
+## Session Identity
+
+Persist three independent layers of identity:
+
+- Logical Session: `AgentSession.id` is the stable id used by UI, remote
+  clients, database records, links, and audit logs. `AgentSession.agent_id` is
+  required; Profile/Model state is not duplicated on this DTO.
+- Product selection: durable desired/effective `SessionRuntimeSelection`
+  identifies `agent_id + provider_profile_id + model_id + optional
+  reasoning_effort/mode_id`.
+- Execution fence: the current `RuntimeBinding` and activation generation bind
+  the selection to an exact
+  `AgentRuntimeRouteKey { agent_id, Acp, adapter_id }`, process instance, and
+  ACP-native session handle.
+
+`ProviderKind` may describe configuration, import, diagnostics, or provenance;
+it is never a Logical Session identity, online route key, or fallback choice.
+Never expose binding ids, generations, Adapter ids, process ids, or native ids
+as client routing ids. ACP diagnostics and debug logs use irreversible short
+hashes and must not print a raw native session id even when a process has only
+one attachment.
+
+## Scenario: Runtime Option Catalog
+
+### 1. Scope / Trigger
+
+Session creation and in-session selectors need one provider-neutral list of enabled Agent/Profile/Model combinations.
+The catalog is published by the configuration/runtime boundary and is also the stale-check input for desired/effective
+session selection.
+
+### 2. Signatures
+
+```text
+agent_list_runtime_options() -> SessionRuntimeOptionCatalog
+build_runtime_option_catalog(agents, profiles, evidence_by_profile) -> SessionRuntimeOptionCatalog
+refresh_agent_runtime_options(agent_id) -> RuntimeOptionRefreshResult
+```
+
+### 3. Contracts
+
+- `SessionRuntimeOption` contains product selection, Agent/Profile/Model labels, evidence-backed `reasoningEfforts` and
+  `modes`, and `availability` (`available | temporarily_unavailable | requires_configuration`).
+- `SessionRuntimeOptionCatalog.revision` is a deterministic positive revision of the ordered redacted projection.
+- Ordinary Catalog reads use the persisted runtime-option snapshot for each Provider Profile and must never start an
+  ACP process. Slow ACP probing is restricted to first enable/setup, one-time bootstrap of Profiles with no attempt
+  record, configuration changes, and the explicit per-Agent refresh action in the configuration center.
+- A successful refresh atomically replaces the Profile's model/session-config evidence. A failed refresh records the
+  attempt and stable error code without overwriting the last successful snapshot. A first failed bootstrap counts as
+  attempted and is not retried on every application start; the user can retry with the explicit refresh action.
+- Only `added && enabled` Agents and enabled `ProviderProfile.kind = acp` Profiles are included. Explicit enabled
+  configured Models remain authoritative; when a Profile has no explicit Model configuration, models discovered from
+  that Profile's ACP `session/new` response populate the catalog. Explicitly disabled Models are never revived by probe
+  evidence. Configuration-only Claude/Codex Profiles are omitted. Adapter ids, commands, native ids, URLs, secrets and
+  raw provider payloads never cross this DTO.
+- `reasoningEffort = null` and `modeId = null` mean that the Adapter's converged defaults remain authoritative. Runtime
+  fence matching always requires the exact Model and compares Effort/Mode only when the product selection explicitly
+  sets them.
+- `AgentSessionRuntimeSelectionState` carries desired/effective selection, session/selection revisions, binding and
+  activation fence metadata, pending switch id and an actionable error.
+
+### 4. Validation & Error Matrix
+
+- Disabled Agent/Profile/Model -> omitted from the catalog; probe evidence cannot revive an explicitly disabled Model.
+- Profile without explicit Models -> use only models advertised by that Profile's ACP `session/new` response.
+- Missing negotiated Effort/Mode evidence -> empty values and null overrides; never synthesize `planning`, `fast`,
+  `medium` or similar.
+- Enabled non-ACP Profile -> omitted from the catalog; never reinterpret it as an ACP runtime Profile.
+- Unknown/needs-configuration Agent -> `requires_configuration`.
+- Failed probe/runtime -> `temporarily_unavailable`.
+- Failed refresh with an older successful snapshot -> continue serving the older snapshot and expose the failed refresh
+  status in configuration management; do not empty working selectors.
+- Catalog revision changes -> clients must re-fetch and reject stale desired selections.
+
+### 5. Good/Base/Bad Cases
+
+- Good: two enabled Profiles expose the same Model with different evidence; both options remain distinct and ordered.
+- Base: a Profile has configured Models but no Effort evidence; the Model is selectable and Effort is empty/disabled.
+- Base: a selected option has null Effort/Mode while the attachment reports Adapter defaults; the exact Model still
+  matches and the fence remains valid.
+- Bad: a static UI fallback adds `planning` or `fast` when the ACP session advertises no modes.
+
+### 6. Tests Required
+
+- Catalog unit tests assert deterministic revision/order, disabled filtering, zero-configuration ACP model discovery,
+  duplicate handling, capability evidence, availability states and redacted serialization.
+- Persistence tests assert snapshot round-trip, last-success preservation on failure, first-failure attempt records, and
+  that ordinary Catalog reads work with no registered Agent runtime.
+- Tauri/browser contract tests assert the command and mock return the generated DTO shape.
+- Frontend typecheck asserts selectors consume catalog values and render an empty/disabled state without fallback.
+
+### 7. Wrong vs Correct
+
+```typescript
+// Wrong: invents a mode that the Agent never negotiated.
+const modes = [{ value: "planning", label: "Planning" }];
+
+// Correct: render only the catalog/session evidence.
+const modes = runtimeOption?.modes ?? negotiatedSessionConfig.modes;
+```
+
+## Scenario: Claude ACP Extension And Transcript Compensation
+
+### 1. Scope / Trigger
+
+Claude ACP may report background Agent/shell/task activity only through `_claude/*` extensions or its JSONL
+transcript. These records must join the canonical event pipeline without weakening standard ACP routing.
+
+### 2. Signatures
+
+```text
+decode_claude_extension(method, params) -> Option<ClaudeExtensionEvent>
+parse_claude_transcript_line(line) -> Result<Option<ClaudeTranscriptEvent>, error>
+ClaudeTranscriptTailWatcher::poll() -> Result<ClaudeTranscriptEvent[]>
+```
+
+### 3. Contracts
+
+- Only known, versioned `_claude/background_*`, `_claude/task_*` methods decode; unknown extensions stay diagnostics.
+- Transcript tail reads complete JSONL lines only and resets offset when a resumed/forked path relocates the file.
+- Prompt fingerprints dedupe transcript copies of live ACP prompts; event ids dedupe repeated tail reads.
+- Background work is keyed by `binding_id + activation_generation`; active work makes attachment idle sweep unsafe.
+- Decoded records become `AgentEventInput` and then `CanonicalAgentEvent`, never a provider-specific timeline variant.
+
+### 4. Validation & Error Matrix
+
+- Malformed JSONL -> bounded diagnostic, continue at next line.
+- Unknown extension -> ignore with bounded diagnostic.
+- Partial final line -> retain offset and retry next poll.
+- Old binding/generation -> route fence rejects before timeline/background state mutation.
+- Sensitive transcript/extension values -> bounded/redacted raw extension only.
+
+### 5. Good/Base/Bad Cases
+
+- Good: a live prompt and the matching transcript prompt produce one canonical prompt fingerprint.
+- Base: a background task keeps its source attachment alive until completed, then idle sweep may reclaim it.
+- Bad: an extension event with no routed native session is assigned to the current session by guesswork.
+
+### 6. Tests Required
+
+- Decoder tests cover known/unknown methods, status transitions and bounded fields.
+- Tail tests cover complete/partial lines, duplicate polls and resume relocation.
+- Fence tests cover binding/generation isolation and idle-sweep protection.
+- Leak tests assert Debug/serialized diagnostics contain no prompt, token or native id.
+
+### 7. Wrong vs Correct
+
+```rust
+// Wrong: unknown `_claude/*` payload is written directly to Timeline.
+timeline.push(raw_params);
+
+// Correct: decode known extension, route the fence, then normalize canonically.
+if let Some(event) = decode_claude_extension(method, params) {
+    attachment.handle_claude_extension(method, params);
+}
+```
+
+## Scenario: Codex ACP Runtime Home And Semantic Events
+
+### 1. Scope / Trigger
+
+Codex ACP creates/resumes native threads, projects config/MCP/Skills into `CODEX_HOME`, decodes Codex extensions and
+optionally calls unstable fork.
+
+### 2. Signatures
+
+```text
+codex_acp_runtime_home_path(runtime_data, session_id, profile_id) -> PathBuf
+ensure_private_runtime_directory(path) -> VibexResult<()>
+write_private_runtime_file_atomic(path, bytes) -> VibexResult<()>
+decode_codex_extension(method, params, compatibility_identity) -> Option<AgentEventInput>
+plan_codex_fork(evidence, identity, generation, native_session_id) -> Option<CodexForkPlan>
+```
+
+### 3. Contracts
+
+- Runtime home is exactly `<runtime-data>/codex-runtime-homes/<logical-session>/<profile>`; process fingerprints never
+  become a home path component.
+- Config projection acquires a home-local lock and atomically renames `config.toml`; native thread/history files are
+  not deleted or moved by projection changes.
+- Every Vibex-created Runtime Home/staging directory is owner-only (`0700` on
+  Unix), and every Vibex-created projection, manifest, lock, and temporary file
+  is owner-only (`0600` on Unix). Existing overly broad Vibex-owned boundaries
+  are tightened before use and remain private after atomic rename.
+- Private filesystem helpers inspect final entries without following symlinks,
+  reject non-directory/non-file boundaries, create temporary files in the same
+  directory, sync, rename, and revalidate the published file. They do not walk
+  or chmod Agent-owned thread/history children.
+- Non-Unix builds keep the same containment and atomic-write API; platform ACL
+  hardening remains owned by the application data directory implementation.
+- Diff content maps to `FileOperation` even when `rawInput` is absent. `oldText/newText` are optional lossless fields.
+- WebSearch, TodoUpdate, Collaboration and ImageGeneration stay canonical product types.
+- Fork requires exact negotiated `VersionedRaw` evidence for the current identity/generation.
+
+### 4. Validation & Error Matrix
+
+- Home lock timeout -> `codex_runtime_home_busy`.
+- Temp write/rename failure -> structured storage error; previous config remains authoritative.
+- Final Runtime Home symlink/non-directory ->
+  `validation/acp_private_directory_invalid`; do not chmod the target.
+- Existing projection symlink/non-file ->
+  `validation/acp_private_file_invalid`; do not write the target.
+- Create/write/sync/publish/permission failure -> stable `acp_private_*`
+  storage error with only the I/O error kind in diagnostics.
+- Unknown `_codex/*` -> bounded diagnostic, no timeline mutation.
+- Static/old-generation fork evidence -> unavailable; never send the request.
+- Unsupported image extension -> `mimeType = null` but keep a bounded image reference.
+
+### 5. Good/Base/Bad Cases
+
+- Good: a fingerprint/config change rewrites config atomically and the existing native thread remains resumable.
+- Good: an existing Vibex-owned `0777` Runtime Home is tightened to `0700`,
+  a replacement config is `0600`, and an Agent-created history child is not
+  recursively modified.
+- Base: Diff supplies path plus old/new text only in content; canonical FileOperation keeps all three.
+- Bad: `CODEX_HOME` points at `<session>/<profile>/<fingerprint>` and strands earlier thread state.
+- Bad: call `fs::write` through a symlink, rely on process umask for secrets,
+  or recursively chmod the provider's native session tree.
+
+### 6. Tests Required
+
+- Stable-home tests assert path equality across materializations and preservation of an existing thread-state file.
+- Unix permission tests assert `0700` directories, `0600` files after replace,
+  broad-mode tightening, temporary cleanup, final symlink rejection, unchanged
+  symlink targets, and no recursive ownership of Agent history.
+- Workspace check and non-Unix compilation must keep the helper API portable.
+- Diff tests assert add/update/delete mapping and old/new text preservation.
+- Parity golden tests assert WebSearch/Todo/Collaboration semantic variants.
+- Fork tests assert exact identity/generation/source/encoding gating.
+
+### 7. Wrong vs Correct
+
+```text
+Wrong: fs::write(CODEX_HOME/<fingerprint>/config.toml) through ambient umask
+Correct: CODEX_HOME/<session>/<profile>/sessions + owner-only atomic .vibex projection
+```
+
+## Unified Session States
+
+Use exactly these top-level states at client boundaries:
+
+| State | Meaning |
+| --- | --- |
+| `initializing` | Logical Session and ACP attachment are being prepared or restored. |
+| `idle` | Ready for user input. |
+| `running` | A turn is executing and may stream events. |
+| `needs_input` | Waiting for permission, a question answer, or another user choice. |
+| `error` | The latest turn failed, but the session can continue. |
+| `closed` | Session runtime is closed. |
+| `archived` | User archived it and it is hidden by default. |
+
+Provider-specific states must map into this set before crossing the Agent
+service boundary.
+
+## Required Session Operations
+
+The provider-neutral service must model these operations even if a provider
+needs fallback behavior:
+
+- Create session.
+- Resume session.
+- Import native history.
+- Send text, rich attachments, file references, and image inputs.
+- Interrupt the current turn.
+- Continue, retry, fork, rollback, compact, archive, unarchive, delete, rename,
+  and copy session link.
+- Set model, reasoning effort, permission mode, working directory, sandbox,
+  network/web search, and extra context.
+- Read token usage, account status, context window, capabilities, slash
+  commands, skills, and MCP status where supported.
+
+If the selected Agent/Adapter does not support an operation, return a capability-aware
+error instead of silently ignoring the request.
+
+Session creation and fork may report a durable `initializing` snapshot before
+ACP runtime materialization finishes so clients can navigate without waiting for
+process startup. The snapshot must be emitted only after the Logical Session and
+its initial Timeline prefix commit successfully. The mutation itself still
+resolves with the final ready session or a structured initialization error.
+
+## Scenario: ACP Session Attachment Ownership And Native Routing
+
+### 1. Scope / Trigger
+
+- Trigger: an ACP process creates, loads, prompts, updates, requests permission,
+  creates a terminal, crashes, or is reused by more than one Logical Session.
+- `AcpProcess` is a transport resource. Every session-scoped side effect must
+  first resolve a `SessionAttachmentRegistry` fence; dedicated processes do not
+  get a routing exception.
+
+### 2. Signatures
+
+```rust
+SessionAttachmentAcquireKey {
+    binding_id: RuntimeBindingId,
+    native_session_id: Option<String>,
+    process_instance_id: AcpProcessInstanceId,
+    activation_generation: u64,
+}
+
+SessionAttachmentEventFence {
+    binding_id: RuntimeBindingId,
+    activation_generation: u64,
+    process_instance_id: AcpProcessInstanceId,
+    native_session_id: String,
+}
+
+SessionAttachmentRegistry::acquire(session_id, key, operation)
+SessionAttachmentRegistry::activate(fence)
+SessionAttachmentRegistry::route(process_instance_id, native_session_id, method)
+SessionAttachmentRegistry::apply_current(fence, synchronous_operation)
+SessionAttachmentRegistry::acquire_prompt(fence)
+SessionAttachmentRegistry::mark_crashed(fence)
+```
+
+Inbound session-scoped ACP envelopes:
+
+```text
+notification: session/update { params.sessionId, params.update }
+request: session/request_permission { id, params.sessionId, ... }
+request: terminal/create { id, params.sessionId, ... }
+```
+
+### 3. Contracts
+
+- A live attachment is keyed by surrogate `RuntimeBindingId`; a
+  `VibexSessionId` selects current attachment state but is never reused as the
+  binding id.
+- The native route lookup key is exactly
+  `(AcpProcessInstanceId, native_session_id)`. Delivery then checks all four
+  fence fields and requires the attachment to be committed and current.
+- Same-key concurrent acquire executes `session/new` or `session/load` once.
+  Different keys may run concurrently. Load/new run after process acquire and
+  outside the process acquire lock; failed/losing attachment candidates release
+  their `ProcessLease::attach()` reservation.
+- An attachment record retains the exact normalized acquire key, including
+  whether `native_session_id` was `None` or `Some(id)`. The final event fence
+  cannot reconstruct that distinction, so existing-attachment de-duplication
+  must compare the stored key instead of synthesizing a key from the returned
+  native id.
+- Per-key acquire locks are weak registry entries with RAII cleanup. Success,
+  error, panic, waiter cancellation, and cancellation while the load/new future
+  is running must all release the strong lock owner; later lookup prunes any
+  dead weak entry so cancelled unique keys cannot grow the lock table.
+- A created attachment starts `Prepared`. Prepared events are quarantined and
+  have zero timeline/config/permission side effects; `activate` atomically
+  inactivates the previous current attachment and commits the new generation.
+- Missing, empty, unknown, old-process, old-native, old-generation, and
+  old-binding events never fall back to a default or unique session. A request
+  that needs an ACP response is cancelled or rejected immediately.
+- Active turn sink/chunk state, tool-call merge state, available commands,
+  model/mode/config state, pending permissions, and pending terminal-create
+  requests belong to `AcpSessionAttachment`. `AcpProcess` owns only transport
+  requests, initialization capabilities, child lifecycle, terminal host, and
+  immutable launch metadata.
+- Prompt admission uses the attachment prompt gate, revalidates the fence after
+  waiting, claims the active turn, and enqueues `session/prompt` synchronously
+  under `apply_current`. The prompt mutex is not held for the response round
+  trip. An RAII guard clears prompt/turn/host-request state on error, timeout,
+  or future cancellation.
+- An async session-config response such as `session/set_model` or
+  `session/set_config_option` re-enters `apply_current` before mutating model,
+  mode, or config state; a response that became stale while awaiting I/O has
+  zero attachment side effects.
+- `session/new` uses a bounded response registration barrier: after the response
+  yields its native id, the stdout reader waits only until the exact route is
+  registered and activated before reading immediately following notifications.
+  The barrier does not infer identity or store process-global session state.
+- Each created attachment subscribes to `ProcessLease::subscribe_crashes()`
+  before load/new. Broadcast plus process snapshot closes the registration race;
+  `mark_crashed(fence)` makes fan-out idempotent. Detach removes the route before
+  cancelling state and decrements exactly one process reservation.
+- Debug output masks prompt/env values and represents native session ids as a
+  short SHA-256 fingerprint. Fence, route diagnostics, terminal request Debug,
+  and OpenCode stderr diagnostics must not contain the raw id.
+
+### 4. Validation & Error Matrix
+
+- Empty attachment native id -> `validation/acp_attachment_native_session_id_empty`.
+- Operation returns a different expected native id ->
+  `conflict/acp_attachment_native_session_mismatch`.
+- Live binding has a different acquire key ->
+  `conflict/acp_attachment_key_conflict`.
+- Same binding/process/generation but a different expected native id, including
+  `None` versus `Some(id)`, -> `conflict/acp_attachment_key_conflict` before the
+  load/new closure runs.
+- Cancelled attachment acquire -> no attachment, route, or live key-lock entry;
+  the exact key remains retryable.
+- Duplicate `(process, native)` route ->
+  `conflict/acp_native_session_route_conflict`; original route remains.
+- Missing event `sessionId` -> process diagnostic
+  `acp_event_session_id_missing`; requests fail closed.
+- Empty event `sessionId` -> process diagnostic `acp_event_session_id_empty`.
+- Unknown process/native route -> process diagnostic
+  `acp_event_session_route_unknown`.
+- Binding or generation mismatch -> process diagnostic `acp_event_fence_stale`.
+- Prepared attachment -> quarantine `acp_event_attachment_prepared`.
+- Non-current/inactive attachment -> `acp_attachment_not_current` or
+  `acp_event_attachment_inactive`.
+- Second active prompt -> `conflict/acp_turn_already_running`.
+- Activation generation regression ->
+  `conflict/acp_attachment_generation_regression`.
+
+### 5. Good/Base/Bad Cases
+
+- Good: two native sessions on one verified pooled process interleave updates,
+  model state, permissions, and interrupts; each modifies only its attachment.
+- Good: process crash broadcasts once; both affected attachments receive one
+  recoverable error carrying their own fence, then a rebuild uses a newer
+  generation and rejects late old-process events.
+- Base: concurrent duplicate acquire returns `Existing`; its extra process
+  reservation is detached without closing a pooled process still in use.
+- Base: a permission request has no recognized native id; Vibex returns
+  `cancelled` and records only a bounded process diagnostic.
+- Bad: `AcpProcess` stores a default native id or first `VibexSessionId` and
+  routes a missing-id update to it.
+- Bad: permission/tool/config maps are keyed only by native id in process-global
+  state, allowing pooled sessions to drain or merge each other's state.
+
+### 6. Tests Required
+
+- Registry unit tests assert same-key at-most-once, exact expected-native key
+  comparison, different-key parallelism, error/cancellation retry and lock
+  cleanup, binding/route conflict, and original-route preservation.
+- Fence tests independently mutate binding, generation, process instance, and
+  native id; every mismatch must have zero attachment side effects.
+- Prompt tests assert same-attachment conflict, different-attachment isolation,
+  replacement while waiting, enqueue fence atomicity, and future-cancellation
+  cleanup.
+- Mock ACP integration asserts pooled update/model/tool/permission isolation,
+  target-only interrupt/close, missing/unknown dedicated routing rejection, and
+  terminal/permission fail-closed responses.
+- Crash tests assert registration-race coverage, single fan-out per attachment,
+  exact reservation decrement, rebuild generation increment, and rejection of
+  late old-process events.
+- Leak tests scan Registry Debug, ACP debug log, OpenCode stderr error Debug, and
+  terminal request Debug for raw native ids, prompt text, env values, tokens,
+  and secrets.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+session/update without sessionId
+  -> process.default_native_session_id
+  -> process.active_turns[native]
+```
+
+#### Correct
+
+```text
+raw ACP envelope(processInstanceId, params.sessionId)
+  -> SessionAttachmentRegistry native route
+  -> full four-field fence + committed/current check
+  -> attachment-local normalization/state update
+  -> otherwise quarantine or bounded process diagnostic
+```
+
+#### Wrong
+
+```rust
+// The returned fence loses whether acquire expected None or Some(native_id),
+// and a strong map entry survives future cancellation.
+existing.fence == fence_rebuilt_from(&requested_key, &existing.fence.native_session_id)
+acquire_locks: HashMap<SessionAttachmentAcquireKey, Arc<Mutex<()>>>
+```
+
+#### Correct
+
+```rust
+existing.acquire_key == requested_key
+acquire_locks: HashMap<SessionAttachmentAcquireKey, Weak<Mutex<()>>>
+// Each acquire owns an RAII guard that removes the matching weak entry when
+// the final strong lock owner exits, including cancellation paths.
+```
+
+## Scenario: ACP Permission Callback Loop
+
+### 1. Scope / Trigger
+
+- Trigger: An ACP agent sends `session/request_permission` while a Vibex turn is
+  streaming, and the user resolves that request through Vibex.
+- This is a cross-layer contract because a native JSON-RPC request flows through
+  `AcpRuntimeClient`, `AcpAgentProvider`, `AgentManager`, permission storage,
+  persisted timeline items, and UI/remote resolution commands.
+
+### 2. Signatures
+
+ACP runtime:
+
+```text
+agent -> Vibex JSON-RPC:
+session/request_permission {
+  id,
+  params: {
+    sessionId,
+    toolCall?,
+    options?: [{ optionId | id, kind | type | name }]
+  }
+}
+
+AcpClient::resolve_permission(AcpPermissionResolution {
+  binding: ProviderBinding, // synthesized from current RuntimeBinding fence
+  resolution: PermissionResolution
+}) -> ()
+```
+
+Provider-neutral manager:
+
+```text
+AgentManager::resolve_permission(ResolvePermissionRequest)
+  -> TimelineItem
+
+PermissionRepository::insert_request(PermissionRequest)
+PermissionRepository::resolve(PermissionResolution)
+PermissionRepository::pending_for_session(VibexSessionId)
+```
+
+### 3. Contracts
+
+- Every ACP permission request must allocate one stable Vibex `RequestId` and
+  persist it as both the timeline permission `id` and ACP
+  `provider_request_id` when no better native id exists.
+- `AcpSessionAttachment.pending_permissions` owns the native JSON-RPC `id`,
+  parsed ACP option summaries, and attachment fence until exactly one
+  resolution, cancellation, detach, or process crash drains it.
+- Timeline permission payloads must include safe details for tool kind,
+  tool-call id, raw input summary, option kinds, or source. Secret-like values
+  must be redacted before persistence.
+- `Approve` prefers `allow_once`, then `allow_always`; `AlwaysAllowForSession`
+  prefers `allow_always`, then `allow_once`; `Deny` prefers `reject_once`, then
+  `reject_always`. Option aliases such as `approve`, `deny`, and hyphen/space
+  variants must be normalized before selection.
+- If no compatible ACP option exists, Vibex must answer the native request with
+  `{ "outcome": { "outcome": "cancelled" } }` rather than hanging the agent.
+- Duplicate resolution attempts are idempotent: storage may append an audit
+  timeline resolution item, but the native ACP JSON-RPC response must not be
+  sent more than once.
+- Permission resolution reloads the Logical Session's current durable
+  selection/binding/generation and validates the exact ACP attachment before
+  synthesizing the adapter-local binding. It does not read a legacy session
+  provider binding or resolve by ProviderKind.
+- While a permission is pending, the provider turn remains running or the
+  session remains `needs_input`; once the permission is resolved and the agent
+  finishes streaming, the session settles to `idle`.
+- Turn interrupt, session close, process shutdown, process exit, or missing
+  active turn sink must drain pending ACP permissions with a cancelled response
+  where the child process is still reachable.
+
+### 4. Validation & Error Matrix
+
+- Unknown session -> `validation/session_not_found`.
+- Missing/stale current RuntimeBinding or attachment fence ->
+  `conflict/runtime_binding_missing` or a bounded ACP attachment mismatch; no
+  native response is sent to another attachment.
+- Provider does not support permission callbacks ->
+  `capability/<provider>_permission_resolution_unsupported`.
+- Permission request id is unknown ->
+  `validation/permission_request_not_found`.
+- Native ACP process is gone before first resolution ->
+  `conflict/acp_permission_process_missing`.
+- Duplicate native resolution after pending state was removed -> no-op success.
+- Missing compatible ACP option for selected Vibex response -> cancelled ACP
+  outcome response.
+
+### 5. Good/Base/Bad Cases
+
+- Good: ACP sends `session/request_permission`; Vibex persists a timeline
+  permission with `provider_request_id`; user approves; runtime sends selected
+  allow option once; the blocked turn continues and returns to `idle`.
+- Good: User denies; runtime sends selected reject option once and timeline
+  state records the denial.
+- Base: User interrupts while permission is pending; runtime replies cancelled,
+  sends `session/cancel`, and clears pending native state.
+- Base: UI retries the same resolution due to reconnect or double-click; manager
+  records the retry as audit if needed, and runtime does not send a second
+  native JSON-RPC response.
+- Bad: `AgentManager` updates storage but does not call provider
+  `resolve_permission`, leaving the ACP child blocked forever.
+- Bad: Runtime holds a pending-permission lock while writing to child stdin.
+- Bad: Missing active turn sink leaves `session/request_permission` unanswered.
+
+### 6. Tests Required
+
+- Runtime unit/integration tests with a mock ACP process must assert approve,
+  reject, interrupt/cancel, duplicate resolution no-op, and process close paths.
+- Manager-level tests must assert permission timeline persistence includes
+  `provider_request_id`, `resolve_permission` delegates to the provider, and
+  duplicate resolution succeeds without a second provider callback.
+- End-to-end ACP provider tests must assert a mid-turn permission blocks the
+  turn until resolution, then streams post-resolution output and settles the
+  session to `idle`.
+- Regression tests must cover option normalization for `kind`, `type`, and
+  `name` fields plus hyphen/space/case variants.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+session/request_permission -> persist timeline item -> immediately return cancelled
+```
+
+This surfaces a permission card but prevents the user decision from reaching the
+ACP agent.
+
+#### Correct
+
+```text
+session/request_permission
+  -> pending_permissions[request_id] stores native rpc id + options
+  -> timeline PermissionRequest(provider_request_id=request_id)
+  -> AgentManager::resolve_permission
+  -> AcpClient::resolve_permission
+  -> JSON-RPC response selected/cancelled exactly once
+  -> provider turn completes
+```
+
+## Scenario: Composer Agent Command Discovery And Execution
+
+### 1. Scope / Trigger
+
+- Trigger: Agent composer command entry uses `/`, `@`, and `$` across Codex,
+  Claude Code, ACP/OpenCode, prompts, skills, and workspace references.
+- This is a cross-layer contract because Rust DTOs flow through
+  `AgentManager`, typed Backend adapters, and the shared desktop composer.
+
+### 2. Signatures
+
+Provider trait:
+
+```text
+AgentProvider::discover_commands(AgentCommandDiscoverRequest)
+  -> AgentCommandDiscoverResponse
+AgentProvider::execute_command(handle, AgentCommandExecuteRequest, ProviderTurnRequest)
+  -> ProviderTurnResult
+```
+
+Tauri commands:
+
+```text
+agent_discover_commands(AgentCommandDiscoverRequest)
+  -> AgentCommandDiscoverResponse
+agent_execute_command(AgentCommandExecuteRequest)
+  -> AgentCommandExecuteResult
+```
+
+Discovery request shape:
+
+```text
+AgentCommandDiscoverRequest {
+  agent_id?,
+  provider_profile_id?,
+  session_id?,
+  workspace_id?,
+  trigger?,
+  query?,
+  limit?
+}
+```
+
+Command discovery must use a concrete `agent_id` plus ACP
+`provider_profile_id`, or derive both from the session's current durable
+selection. ProviderKind is not part of the request and cannot distinguish ACP
+Agents.
+
+### 3. Contracts
+
+- Provider slash commands must be emitted by the provider adapter with
+  `source_kind=provider`, `trigger=slash`,
+  `selection_behavior=insert`, and
+  `execution_behavior=provider_command`.
+- Selecting a provider command inserts command text only; it must not start a
+  provider turn until the user sends.
+- Send-time provider slash commands call `agent_execute_command`, which
+  validates the current selection/binding/generation fence and delegates to
+  the exact ACP route's `AgentProvider::execute_command`.
+- User slash prompts use `source_kind=prompt` and
+  `execution_behavior=expand_prompt_and_send`.
+- `$` skills and `@` references are insert-only in this contract and must not
+  execute directly.
+- No immediate `client_builtin` command is registered by default. Future
+  immediate execution requires `source_kind=client_builtin`,
+  `selection_behavior=execute_immediately`, and `destructive=false`.
+- Desktop may merge workspace file references and local skill manifests at the
+  Tauri layer, but provider commands stay owned by provider adapters.
+- ACP/OpenCode provider slash commands are profile-aware. Generic ACP profiles
+  must not receive the OpenCode command catalog unless their typed profile
+  config identifies an OpenCode-compatible runtime or catalog marker.
+
+### 4. Validation & Error Matrix
+
+- Unsupported provider slash command -> `capability/<provider>_slash_commands_unsupported`.
+- Non-slash provider command trigger -> `validation/provider_command_trigger_invalid`.
+- Empty provider command text -> `validation/provider_command_empty`.
+- Direct execution of `skill` or `reference` -> `capability/agent_command_source_not_executable`.
+- Unregistered immediate client built-in -> `capability/client_builtin_command_unregistered`.
+- Missing session on execution -> `validation/session_not_found`.
+
+### 5. Good/Base/Bad Cases
+
+- Good: Claude Code `/review` is discovered as a provider command, inserted
+  into the composer, edited by the user, and executed only after Send.
+- Good: OpenCode ACP `/status` is discovered through the ACP adapter and
+  executes by sending the slash command text through the ACP provider turn.
+- Base: Provider has no slash capability; discovery returns no provider
+  commands while prompts, references, or skills may still appear if supported.
+- Bad: UI hard-codes Claude/Codex/OpenCode commands without provider adapter
+  participation.
+- Bad: Selecting `/review` immediately starts execution before the user presses
+  Send.
+- Bad: Multiple ACP profiles share one ProviderKind-based static catalog when
+  their command sets diverge; discovery must remain Agent/Profile-aware.
+
+### 6. Tests Required
+
+- Provider adapter tests assert deterministic command discovery for every
+  static catalog added.
+- Manager tests assert provider command execution delegates through
+  `agent_execute_command` and unsupported sources return capability errors.
+- Desktop/Tauri tests assert `$` local skills and `@` references are merged
+  without duplicating provider entries.
+- Frontend checks assert typed generated DTOs are consumed and command
+  selection remains insert-only.
+- Manual UI smoke covers in-session composer and new-session composer for `/`,
+  `@`, and `$`.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```typescript
+// UI-local hard-code bypasses provider capability and execution validation.
+if (agentId === "claude") {
+  suggestions.push({ label: "/review", executeImmediately: true });
+}
+```
+
+#### Correct
+
+```text
+composer -> agent_discover_commands -> AgentManager -> AgentProvider
+selection -> insert text only
+send -> agent_execute_command -> AgentProvider::execute_command
+```
+
+## Scenario: Failed Turn One-Click Continue
+
+### 1. Scope / Trigger
+
+- Trigger: Agent conversation UI offers a one-click continue action after a
+  provider call or streaming turn fails and the session enters `error`.
+- This is a cross-layer contract because Rust DTOs flow through
+  `AgentManager`, Tauri commands, remote Agent requests, generated TypeScript
+  bindings, and the desktop session UI.
+
+### 2. Signatures
+
+Backend manager and Tauri command:
+
+```text
+AgentManager::continue_turn(ContinueAgentTurnRequest) -> Vec<TimelineItem>
+agent_continue_turn(ContinueAgentTurnRequest) -> Vec<TimelineItem>
+```
+
+Remote request:
+
+```text
+RemoteAgentRequest::ContinueTurn(RemoteAgentContinueTurnRequest)
+RemoteAgentContinueTurnRequest {
+  auth,
+  request: ContinueAgentTurnRequest
+}
+RemoteAgentContinueTurnResponse {
+  appended_items: Vec<TimelineItem>
+}
+```
+
+Core request:
+
+```text
+ContinueAgentTurnRequest {
+  session_id: VibexSessionId,
+  correlation_id: Option<CorrelationId>
+}
+```
+
+### 3. Contracts
+
+- `continue_turn` is provider-neutral. UI code must call the continue command
+  and must not send its own hidden `SendAgentMessageRequest`.
+- The backend owns the fallback continue prompt when no negotiated Agent
+  continue/resume-turn operation exists.
+- The fallback prompt is sent to the provider as turn input but is not appended
+  as a `user_message` timeline item and must not create an optimistic user
+  bubble in the frontend.
+- If a future ACP Agent exposes a failed-turn continuation operation, it
+  may be used behind `AgentManager::continue_turn` without changing desktop or
+  remote request shapes.
+- Normal `send_message` remains visible and appends a `user_message`; only
+  `continue_turn` suppresses the user-message timeline item.
+- `error -> running` is a valid state transition so failed sessions can start a
+  continuation turn.
+- `continue_turn` reloads the same current `RuntimeBinding`, activation
+  generation, effective selection, and committed ACP attachment used by the
+  failed turn. Missing or mismatched authority fails closed; the fallback must
+  not restore/create another attachment or choose another Profile.
+
+### 4. Validation & Error Matrix
+
+- Missing session id or unknown session -> `validation/session_not_found`.
+- Session state is not `error` -> `conflict/agent_continue_requires_error_state`.
+- Session is already `running` -> `conflict/agent_continue_requires_error_state`
+  from the public continue guard, not a hidden second turn.
+- Imported read-only session -> `capability/imported_session_read_only`.
+- Provider fails during continuation -> append a recoverable timeline `error`,
+  keep session state `error`, return the structured provider error.
+- Current RuntimeBinding or committed attachment changed after the failed turn
+  -> a bounded execution-fence conflict; do not send continuation input.
+
+### 5. Good/Base/Bad Cases
+
+- Good: a provider stream fails, the session enters `error`, the user clicks
+  Continue, the provider receives backend-owned continuation input, and the
+  timeline shows only provider/agent follow-up items without a new user bubble.
+- Base: the user manually types a visible follow-up after an error; this uses
+  `send_message`, appends a normal `user_message`, and also transitions the
+  session through `running`.
+- Bad: React calls `agent_send_message` with `"continue"` and locally hides the
+  optimistic bubble while the backend still persists a hidden-looking
+  `user_message`.
+
+### 6. Tests Required
+
+- Manager unit test: failed send moves the session to `error`, `continue_turn`
+  sends provider input, returns provider items, moves the session to `idle`,
+  and does not append a `TimelineItemKind::UserMessage`.
+- Manager/ACP test: a failed turn retains its current durable binding;
+  `continue_turn` sends only through the exact committed attachment and rejects
+  a missing or stale fence without restore/failover.
+- Manager unit test: `continue_turn` rejects an idle session with
+  `agent_continue_requires_error_state`.
+- Frontend typecheck: generated `ContinueAgentTurnRequest` is consumed through
+  the typed API wrapper and hook.
+- Remote/router check: `RemoteAgentRequest::ContinueTurn` dispatches through
+  the same manager method and uses `MutateAgentSession` authorization.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```typescript
+api.agentSendMessage({
+  sessionId,
+  text: "continue",
+  attachments: [],
+  correlationId: null
+});
+// Then locally hide the optimistic user bubble.
+```
+
+#### Correct
+
+```typescript
+api.agentContinueTurn({
+  sessionId,
+  correlationId: null
+});
+```
+
+## Timeline Model
+
+Use append-only, sequence-numbered timeline events as the canonical stream.
+Supported event classes include:
+
+- User messages.
+- Agent message delta and final chunks.
+- Reasoning or thought streams.
+- Plan and todo updates.
+- Tool call started, progress, completed, and failed.
+- Command execution.
+- File read, write, edit, delete, and move.
+- Git diff updates.
+- MCP tool calls.
+- Web search events.
+- Permission requested and resolved.
+- Compact or context boundary events.
+- Subagent/task start, update, and result events.
+- Error, warning, and system notices.
+
+Every live event sent to clients must include a monotonic session sequence. On
+reconnect, clients first fetch the authoritative timeline from the last known
+sequence and only then apply live events.
+
+`FetchTimelineRequest.afterSequence = null` means "latest bounded window", not
+"complete history". Session-detail restore, app restart, and remote reconnect
+flows must not treat a latest window as a complete conversation because long
+provider turns can contain hundreds of streaming delta rows. Complete timeline
+restore must page forward from `afterSequence = 0`, or from the `endSequence` of
+a cache known to have `hasOlder = false` and `startSequence <= 1`, until
+`hasNewer = false`.
+
+## Timeline Attach and Replay
+
+Live timeline subscriptions use an explicit attach flow, not an implicit
+"connect and hope" stream. A client attaches with:
+
+- Stable Vibex session id.
+- `subscription_id` for the UI subscription.
+- `connection_id` for the current socket/device connection.
+- `since_sequence` from the newest authoritative item the client has applied.
+
+The service must respond with either:
+
+- A bounded replay from `since_sequence + 1`, followed by live events.
+- A fresh snapshot when the gap is too large, history was compacted, or the
+  client has no reliable sequence.
+
+Provider adapters never assign client-visible sequence numbers. The timeline
+repository assigns them transactionally when events become authoritative.
+Clients may render optimistic and streaming items, but those items must be
+reconciled or discarded against persisted timeline rows.
+
+## Scenario: ACP Canonical Event Normalization And Raw Extensions
+
+### 1. Scope / Trigger
+
+- Trigger: an ACP live `session/update` or adapter transcript record needs to
+  become an authoritative provider-neutral Timeline event.
+- `crates/agent-acp/src/events.rs` owns semantic normalization. Runtime,
+  transcript import, and UI code must not independently parse provider tool
+  kind strings.
+
+### 2. Signatures
+
+```text
+AgentEventInput { source, compatibilityIdentity, nativeEventId, toolName,
+  title, status, rawInput, outputSummary, rawOutput, content, locations, meta }
+AgentEventEnricher::enrich(input) -> Vec<CanonicalAgentEvent>
+CanonicalAgentEvent = AgentMessage | Reasoning | Plan | ToolCall |
+  CommandExecution | FileOperation | WebSearch | TodoUpdate | Collaboration |
+  ImageGeneration | PermissionRequest | SystemNotice
+normalize_agent_event(enricherKind, input) -> Vec<NormalizedAgentEvent>
+stable_event_correlation_id(identity, nativeEventId, canonicalKind, ordinal)
+  -> String
+```
+
+`ToolCallPayload`, `CommandPayload`, `FileOperationPayload`, `WebSearchPayload`,
+`TodoUpdatePayload`, `CollaborationPayload`, and `ImageGenerationPayload` may
+carry `rawExtension?: AgentEventRawExtension`. Absence preserves legacy JSON.
+
+### 3. Contracts
+
+- Exact Compatibility Registry identity selects Claude, Codex, or Passthrough
+  enrichment. Codex advanced kinds require explicit structured fields; Claude
+  markers without exact-version evidence and every ambiguous payload fall back
+  to generic `ToolCall`.
+- Correlation ids hash a fixed versioned domain, exact compatibility identity,
+  native event id, canonical kind, and ordinal. Live and transcript inputs with
+  equivalent native evidence produce the same id; raw native ids are never
+  persisted, logged, or included in Debug.
+- `AgentEventRawExtension` is schema version 1. It retains at most 16 content
+  blocks, 16 locations, and 16 allowlisted meta entries; todo projection keeps
+  at most 32 items. Raw input/output are at most 4096 UTF-8 bytes, summaries
+  512 bytes, keys 64 bytes, and locations 1024 bytes, including the truncation
+  suffix. Constructors and deserialization apply the same redaction and bounds;
+  unsupported `schemaVersion` values fail closed. Meta keys are canonicalized
+  from ACP camelCase (for example `exitCode` -> `exit_code`) before enrichment.
+- Secret-like values, data URLs, prompt/env values, and private home path
+  segments (including Windows `C:\\Users\\...` paths) are redacted before persistence. The canonical `[redacted]` and
+  `...(truncated)` forms must restore internal sanitized state after JSON
+  deserialization so `truncated` and round-trip equality remain stable. Debug
+  exposes only counts, keys, modes, and presence flags.
+- Attachment-local tool state merges live updates only after native route and
+  four-field current-fence validation. Cumulative output emits `snapshot`, then
+  suffix-only `append`; exact duplicates carry no raw output, non-prefix
+  replacement emits a new `snapshot`. The merge state stores only cumulative
+  byte length and a SHA-256 prefix fingerprint, never a growing output copy;
+  terminal status, turn cleanup, detach, replacement, or crash clears it.
+- Permission requests remain on the typed permission path. Unknown extensions
+  may become a bounded generic tool event or diagnostic but cannot bypass the
+  permission gate or create provider-specific public Timeline variants.
+
+### 4. Validation & Error Matrix
+
+- Missing/unknown/stale/prepared native route -> quarantine or bounded process
+  diagnostic; zero Timeline, permission, config, or tool-state side effects.
+- Unknown enricher identity or incomplete advanced marker -> generic
+  `ToolCall`; do not infer Command/File/Web/Todo/Collaboration/Image semantics.
+- Sensitive or data-URL raw value -> `[redacted]` with `truncated=true`.
+- Unsupported raw extension schema version -> deserialization error; a
+  redaction-only extension remains durable with `truncated=true`.
+- Over-limit string, collection, or output -> UTF-8-safe deterministic
+  truncation; malformed optional structures -> bounded generic fallback.
+- Repeated cumulative output -> no duplicate raw append; output that replaces
+  rather than extends the prior snapshot -> explicit `snapshot`.
+
+### 5. Good/Base/Bad Cases
+
+- Good: the same Codex command fixture normalizes live and transcript records
+  to equal `CommandExecution` events and equal hashed correlation ids.
+- Base: an unmanaged tool with safe bounded raw evidence stays `ToolCall` and
+  remains readable when old records omit `rawExtension`.
+- Bad: matching `command` by title substring, persisting a native tool id,
+  copying the complete cumulative output into every event, or rendering raw
+  provider JSON directly in the UI.
+
+### 6. Tests Required
+
+- Core serde tests cover all additive Timeline variants, legacy JSON,
+  redaction, private paths, UTF-8 byte bounds, collection bounds, sanitized
+  state round-trip, and leak-free Debug.
+- Enricher tests cover all twelve variants, exact identity dispatch, ambiguous
+  fallback, stable/non-colliding hashes, structured command/file batch/web/
+  todo/collaboration/image classification, and Passthrough non-fabrication.
+- Runtime tests cover route/fence ordering, attachment isolation, snapshot /
+  append / duplicate / replacement behavior, and state cleanup on completion,
+  failure, replacement, detach, and crash.
+- Golden tests replay every live/transcript case twice, compare both against
+  expected canonical Timeline JSON, verify P1 native baseline references, and
+  scan fixtures and serialized/debug output for ids, secrets, and private paths.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+session/update -> UI/provider-specific kind parsing -> generic title/summary
+              -> persist raw native id and full cumulative output
+```
+
+#### Correct
+
+```text
+session/update -> exact native route + current fence
+  -> attachment-local merge -> exact-identity AgentEventEnricher
+  -> bounded/redacted canonical event + stable hashed correlation id
+  -> provider-neutral Timeline -> shared desktop/remote rendering
+```
+
+## Delegation, Team, and Automation Events
+
+Multi-agent delegation, Team Mode, and scheduled automation are higher-level
+workflows over the same session protocol. Model them as provider-neutral
+timeline events such as child session started, child progress, child result,
+team mailbox message, team task update, automation run started, automation run
+completed, and automation run failed.
+
+Do not introduce a second UI-only event bus for delegated agents or scheduled
+runs. Child sessions may have their own timeline, but parent sessions need a
+durable reference and summary event so Web/mobile clients can reconstruct the
+workflow after reconnect.
+
+## MCP Sidecar Tools
+
+Optional MCP sidecars may expose tools such as `delegate_to_agent`,
+`check_user_feedback`, `ask_user_question`, and `get_session_info` to native
+Agent CLIs. Those tools must call back into Vibex `AgentManager`, permission
+handling, and timeline storage. They must not mutate provider-native state
+directly or bypass provider-neutral permission records.
+
+Missing or failed sidecars disable only sidecar-backed collaboration features.
+Normal single-session Agent operation must continue with a capability warning.
+
+## Provider Adapter Contracts
+
+- `AgentManager::register_runtime` accepts only an exact ACP
+  `AgentRuntimeRouteKey` and an `AgentProvider` whose kind is ACP. One active
+  route is allowed per concrete Agent; missing or non-ACP routes fail closed.
+- `crates/agent-acp` is the only online adapter boundary. Treat negotiated and
+  compatibility-scoped capability evidence as authoritative.
+- Model command, args, env, cwd template, models, modes, and disabled tools as
+  ACP Provider configuration, not UI-specific settings or Native SDK options.
+- ACP-native handles live in durable `RuntimeBinding` records and in-memory
+  attachment state. Adapter-local `ProviderBinding` values may be synthesized
+  from that exact current fence, but are never persisted as session authority.
+- `crates/agent-claude` and `crates/agent-codex` own only read-only transcript
+  import, pure-Serde parity replay, and fixture sanitization. They must not
+  implement `AgentProvider`, depend on Native SDK crates, or provide online
+  smoke binaries.
+- Incoming ACP `session/request_permission` requests must be converted at the
+  adapter boundary into provider-neutral `PermissionRequest` timeline events
+  with bounded/redacted titles and details. Do not persist raw ACP permission
+  payloads, full tool inputs, prompts, terminal logs, env values, or tokens.
+- If the adapter has not implemented a full provider-side approval callback
+  lifecycle, it may conservatively cancel/deny the native ACP request only after
+  recording the provider-neutral permission event and returning an incomplete
+  turn so the Agent session can move to `needs_input`.
+- Backend runtime gates must check provider capabilities before mutating
+  permission state or attempting unsupported operations such as interrupt.
+  Unsupported ACP operations return `capability/*_unsupported` errors instead
+  of writing timeline/permission side effects first.
+- Default validation must not start Claude, Codex, OpenCode, or another real
+  ACP process. Real managed-Adapter startup belongs to explicit environment and
+  login-gated smoke tasks.
+
+## Permissions
+
+Permission requests are timeline events and durable records. They must include:
+
+- The requested action and provider-native request id.
+- Human-readable title and details.
+- A risk category such as command, file change, patch, network, or custom tool.
+- Project/workspace/session context.
+- Allowed responses.
+- Resolution metadata including responder device and timestamp.
+
+Sensitive files such as `.env`, private keys, token files, and credential stores
+default to asking the user even when the provider has a permissive mode.
+
+## Scenario: ACP-only Logical Session Core
+
+### 1. Scope / Trigger
+
+- Trigger: code creates, restores, sends to, commands, interrupts, resolves a
+  permission for, or closes an online Logical Session after the ACP-only
+  cutover.
+- This is a cross-layer contract. Rust serde types in `crates/core` are the
+  source of truth; SQLite owns durable runtime authority; frontend code consumes
+  those DTOs through the shared Rust Backend contracts.
+
+### 2. Signatures
+
+Tauri commands exposed by `apps/desktop/src-tauri`:
+
+```text
+agent_list_sessions(include_archived?: bool) -> Vec<AgentSession>
+agent_create_session(CreateAgentSessionRequest {
+  runtime: SessionRuntimeSelection,
+  workspaceRoot, workspaceMode, title?, safety?
+}) -> AgentSession
+agent_get_session(session_id: VibexSessionId) -> AgentSession
+agent_list_runtime_options() -> SessionRuntimeOptionCatalog
+agent_get_runtime_selection(session_id) -> AgentSessionRuntimeSelectionState
+agent_fetch_timeline(request: FetchTimelineRequest) -> TimelinePage
+agent_send_message(request: SendAgentMessageRequest) -> Vec<TimelineItem>
+agent_continue_turn(request: ContinueAgentTurnRequest) -> Vec<TimelineItem>
+agent_execute_command(request: AgentCommandExecuteRequest) -> AgentCommandExecuteResult
+agent_interrupt(session_id: VibexSessionId) -> ()
+agent_archive_session(session_id: VibexSessionId) -> ()
+agent_delete_session(session_id: VibexSessionId) -> ()
+agent_resolve_permission(request: ResolvePermissionRequest) -> TimelineItem
+agent_get_capabilities() -> ProviderCapabilitiesResponse
+
+AgentManager::register_runtime(AgentRuntimeRouteKey, Arc<dyn AgentProvider>)
+RuntimeSelectionService::initialize_new_session(session_id, desired)
+MessageSubmissionCoordinator::submit(SendAgentMessageRequest)
+```
+
+Authoritative session/runtime tables:
+
+```text
+projects
+workspaces
+agent_sessions
+session_runtime_bindings
+runtime_switches
+runtime_switch_operations
+runtime_switch_events
+agent_message_submissions
+agent_message_submission_payloads
+agent_timeline_items
+permission_requests
+adapter_diagnostics
+```
+
+Repositories:
+`WorkspaceRepository`, `SessionRepository`, `AgentSessionRuntimeRepository`,
+`RuntimeBindingRepository`, `RuntimeSwitchRepository`,
+`MessageSubmissionRepository`, `TimelineRepository`, `PermissionRepository`,
+and `AdapterDiagnosticsRepository`.
+
+### 3. Contracts
+
+- `CreateAgentSessionRequest.runtime` is complete and contains the concrete
+  Agent, enabled ACP Profile, non-empty Model, and optional explicit
+  Effort/Mode. Session creation never derives these fields from ProviderKind.
+- Default safety is `workspace_write` with `askOnRisk = true` and
+  `bypassAllPermissions = false`. A bypass/all-permissions session must be an
+  explicit session setting and visible in durable session/timeline data.
+- `AgentSession.id` is the only primary session id crossing UI/API boundaries.
+  `AgentSession.agentId` is required. Profile/Model, binding/generation,
+  Adapter, process, and ACP-native ids remain outside the session DTO.
+- Online registration and dispatch use only exact ACP route keys. A non-ACP
+  route/provider is rejected, and a missing exact route has no Native or
+  ProviderKind fallback.
+- Creation inserts the `Initializing` session, then atomically persists desired
+  selection plus a `Requested` initial switch before spawn or `session/new`.
+  The normal Prepare/Commit/activate path establishes the first current
+  binding; startup reconciliation resumes interrupted initialization.
+- Ordinary messages always enter `MessageSubmissionCoordinator`. Continue,
+  provider command, permission, interrupt, and close resolve the current
+  durable selection/binding/generation and synthesize any adapter-local handle
+  from that exact fence.
+- Schema v28 intentionally clears old session-scoped data, drops
+  `provider_bindings` and `session_provider_bindings`, and removes legacy
+  provider columns from `agent_sessions`. There is no compatibility read path.
+- `FetchTimelineRequest.afterSequence` supports catch-up. `limit` bounds the
+  response. `TimelinePage` includes `startSequence`, `endSequence`, `hasOlder`,
+  and `hasNewer`.
+- `FetchTimelineRequest.afterSequence = null` returns only a latest bounded
+  window and may set `hasOlder = true`; UI code may use it for previews, but
+  full conversation restore must use forward pagination so a user/assistant
+  turn is not cut in the middle.
+- `agent_timeline_items` is append-only. The repository assigns monotonic
+  per-session sequence numbers inside a transaction.
+- Permission requests are both `permission_requests` rows and
+  `permission_request` timeline payloads. Resolutions append a
+  `permission_resolution` timeline payload.
+- Adapter diagnostics are bounded/redacted and must not become user-visible
+  authoritative timeline content.
+
+### 4. Validation & Error Matrix
+
+- Missing session id -> `validation/session_not_found`.
+- Empty Model or non-ACP/wrong-Agent Profile during create ->
+  `validation/runtime_selection_model_required` or
+  `validation/provider_profile_route_mismatch`.
+- Missing exact ACP route -> `capability/provider_unregistered`.
+- Missing RuntimeSelectionService during create ->
+  `process/runtime_selection_service_unavailable`; no direct create.
+- Missing MessageSubmissionCoordinator ->
+  `process/message_submission_coordinator_unavailable`; no direct send.
+- Missing/stale current binding, selection, attachment, or generation ->
+  `conflict/message_submission_runtime_*` or
+  `conflict/turn_execution_identity_mismatch`; no provider side effect.
+- Empty `SendAgentMessageRequest.text` and empty `attachments` ->
+  `validation/empty_agent_message`.
+- Send while session state is `running` -> `conflict/agent_turn_already_running`.
+- Unsupported ACP operation -> `capability/acp_*_unsupported`.
+- Missing Adapter/Agent binary -> `process/acp_*` with bounded diagnostics.
+- ACP/Adapter failure -> `provider/acp_*` with redacted diagnostic details.
+- DB migration or repository failure -> `storage/*`.
+- Permission wait is `needs_input`, not `error`; only failed/expired provider
+  behavior should move the session to `error`.
+
+### 5. Good/Base/Bad Cases
+
+- Good: Claude and Codex ACP routes coexist with distinct Agent/Adapter ids;
+  each create commits one initial switch/current binding and every turn uses
+  only its own current attachment fence.
+- Base: an option omits Effort/Mode; the Adapter's converged defaults are
+  accepted while the requested Model remains exact.
+- Bad: frontend sends ProviderKind as Agent identity, manager calls an external
+  create before durable intent, reads a removed legacy binding, or switches to
+  another Profile after a fence failure.
+
+### 6. Tests Required
+
+- Core serde tests assert `AgentSession` has only required `agentId` as runtime
+  identity and create carries a complete selection.
+- State-machine tests for allowed and rejected session transitions.
+- DB migration/repository tests assert clean-data cutover, removed legacy
+  tables/columns, initial intent atomicity, current binding, timeline sequence,
+  permission request/resolve, archive, and delete behavior.
+- Manager/ACP tests cover exact route registration, initial side-effect order,
+  crash recovery, durable message/command/continue/permission/interrupt fences,
+  and fail-closed missing ownership.
+- Claude/Codex offline import and pure-Serde parity fixture tests continue to
+  map sanitized historical data without Native SDK dependencies.
+- Tauri/desktop build and frontend type/lint checks proving UI consumes
+  generated protocol types.
+- `pnpm smoke:acp:bridge-contract` is the default fixed-Adapter contract gate.
+  `pnpm smoke:session:codex` and `pnpm smoke:session:claude` are explicit
+  environment/login-gated ACP smokes and must never substitute a Native path.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```typescript
+// UI code reads raw provider event details.
+if (event.codexThreadItem?.type === "reasoning") {
+  renderReasoning(event.codexThreadItem.summary);
+}
+```
+
+#### Correct
+
+```typescript
+// UI code renders the generated Vibex timeline contract.
+if (item.payload.type === "reasoning") {
+  renderReasoning(item.payload.data.text);
+}
+```
+
+#### Wrong
+
+```text
+agent_timeline_items(session_id = native_claude_session_id, sequence = client_count + 1)
+```
+
+#### Correct
+
+```text
+agent_timeline_items(session_id = vibex_session_id, sequence = repository_transaction_next_sequence)
+```
+
+## Scenario: Agent User Message Attachments
+
+### 1. Scope / Trigger
+
+- Trigger: `SendAgentMessageRequest` carries provider-neutral user attachments
+  from desktop/Web clients through the Agent service and authoritative
+  timeline.
+- This is a cross-layer contract because Rust DTOs, generated TypeScript
+  bindings, desktop composer state, remote callers, optimistic timeline
+  reconciliation, and provider adapters must agree on the same payload shape.
+
+### 2. Signatures
+
+Core request shape:
+
+```text
+SendAgentMessageRequest {
+  session_id: VibexSessionId,
+  text: String,
+  attachments: Vec<MessageAttachment>,
+  correlation_id: Option<CorrelationId>
+}
+
+MessageAttachment {
+  label: String,
+  mime_type: Option<String>,
+  uri: Option<String>,
+  inline_text_offset: Option<u32>
+}
+```
+
+Generated TypeScript callers must pass `attachments: MessageAttachment[]`.
+Text-only callers use `attachments: []`.
+
+### 3. Contracts
+
+- `attachments` defaults to an empty vector for backward-compatible serde
+  decoding, but generated frontend clients should send it explicitly.
+- A user message is valid when either `text.trim()` is nonempty or
+  `attachments` is nonempty.
+- The Agent service persists request attachments into
+  `TimelinePayload::UserMessage.attachments` before invoking a provider turn,
+  so reconnect/catch-up clients see the same authoritative user payload.
+- `MessageAttachment.inline_text_offset` is optional and defaults to `None` for
+  backward-compatible decoding. Composer clients set it to the zero-based
+  offset in `text` where an inline image token appeared. Timeline renderers use
+  it only for presentation ordering; provider adapters must not require it for
+  image/file materialization.
+- Attachment payloads stay provider-neutral at this boundary. Provider adapters
+  must explicitly translate supported image/file attachments into ACP content
+  blocks and return capability-aware errors when the Agent cannot consume
+  them.
+- UI optimistic reconciliation compares both trimmed text and attachment
+  metadata so a text-only duplicate does not collapse an attachment-bearing
+  message.
+
+### 4. Validation & Error Matrix
+
+- Empty text and no attachments -> `validation/empty_agent_message`.
+- Attachment-only user message -> accepted and persisted as a user timeline
+  item.
+- Provider lacks image/file input support -> adapter-level capability error or
+  documented fallback, not silent timeline data loss.
+- Missing `inline_text_offset` on older timeline rows -> render the attachment
+  in the legacy tail position instead of rejecting the row.
+- Rust serialization contract drift -> core protocol test failure.
+
+### 5. Good/Base/Bad Cases
+
+- Good: a desktop composer image token sends `text` plus ordered
+  `MessageAttachment` records, and the timeline preserves those attachments
+  after refetch.
+- Good: `这个 [image] 是什么？` sends text with one placeholder spacing point
+  and `inline_text_offset` so history renders the image token between `这个`
+  and `是什么？`, not below the message.
+- Base: scheduled tasks, automation prompts, Web remote text composers, smoke
+  binaries, and tests keep using `attachments: []`.
+- Bad: `AgentManager::send_message` rejects attachment-only messages because
+  text is empty, or appends a user timeline item with `attachments: []` after
+  receiving nonempty request attachments.
+- Bad: desktop history ignores `inline_text_offset` and renders all image
+  attachments after the message body.
+
+### 6. Tests Required
+
+- Binding generation and drift check after changing `SendAgentMessageRequest`.
+- Agent service test for text-plus-attachments and attachment-only validation.
+- Frontend typecheck for desktop/Web callers proving every request provides
+  `attachments`.
+- Timeline optimistic merge test or focused review that attachment metadata
+  participates in duplicate reconciliation, including `inline_text_offset`.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+if request.text.trim().is_empty() {
+    return Err(empty_agent_message());
+}
+
+TimelinePayload::UserMessage(UserMessagePayload {
+    text: request.text.clone(),
+    attachments: Vec::new(),
+})
+```
+
+#### Correct
+
+```rust
+if request.text.trim().is_empty() && request.attachments.is_empty() {
+    return Err(empty_agent_message());
+}
+
+TimelinePayload::UserMessage(UserMessagePayload {
+    text: request.text.clone(),
+    attachments: request.attachments.clone(),
+})
+```
+
+## Scenario: Phase 8 Scheduled Task Runtime
+
+### 1. Scope / Trigger
+
+- Trigger: Phase 8 adds a local scheduled-task runner that executes persisted
+  scheduled prompts through Vibex Agent sessions.
+- The runner belongs in the provider-neutral Agent runtime boundary. It must
+  not call Codex, Claude, ACP, or other provider SDKs directly.
+
+### 2. Signatures
+
+Runtime API in `crates/agent`:
+
+```text
+ScheduledTaskRunner::new(&AgentManager)
+ScheduledTaskRunner::tick(now_ms) -> ScheduledTaskTickResult
+ScheduledTaskRunner::recover_stale_runs(now_ms) -> Vec<ScheduledTaskRun>
+next_run_after(schedule, completed_due_at_ms, completed_at_ms) -> Option<i64>
+```
+
+DB repository helpers:
+
+```text
+ScheduledTaskRepository::list_due(conn, now_ms, limit)
+ScheduledTaskRepository::claim_due(conn, task_id, now_ms)
+ScheduledTaskRepository::mark_task_after_run(conn, task_id, status, next_run_at_ms, now_ms)
+ScheduledTaskRepository::list_stale_running_runs(conn, before_ms, limit)
+```
+
+### 3. Contracts
+
+- `tick(now_ms)` is explicit and test-driven. It must not spawn a background
+  thread, start a timer, or depend on wall-clock time internally.
+- Due tasks are active, non-deleted scheduled tasks with
+  `next_run_at_ms <= now_ms`.
+- Claiming a task creates a `running` run and clears `next_run_at_ms` before
+  provider execution, so repeated ticks do not duplicate local one-shot work.
+- Execution uses `AgentManager::create_session` followed by
+  `AgentManager::send_message`. The scheduled task run stores only the Vibex
+  `session_id`, not provider-native ids.
+- If `send_message` leaves the session in `needs_input`, the scheduled run is
+  recorded as skipped or failed with a bounded permission/input diagnostic. The
+  scheduler must not auto-approve permissions.
+- One-shot schedules clear `next_run_at_ms` and pause after a run. Interval and
+  daily schedules compute the next due timestamp through a pure function.
+- Stale `running` runs are recovered to a non-running status and task state is
+  advanced or paused according to the schedule.
+
+### 4. Validation & Error Matrix
+
+- No registered provider -> `capability/provider_unregistered`, stored on the
+  run as a failed scheduled execution.
+- Provider turn failure -> provider error code/message copied into the run with
+  redacted diagnostics only.
+- Permission required / `needs_input` -> skipped or failed run with
+  `scheduler/permission_required`; session may remain `needs_input` for user
+  review.
+- Unsupported daily timezone -> `validation/scheduler/unsupported_timezone`;
+  task is paused rather than repeatedly retried in a tight loop.
+- Stale running run -> failed run with `scheduler/recovered_stale_run`.
+
+### 5. Good/Base/Bad Cases
+
+- Good: a one-shot mock scheduled task creates one Vibex session, sends the
+  stored prompt, records one succeeded run, and no repeated tick duplicates it.
+- Base: an interval task advances `next_run_at_ms` after success or failure so
+  the scheduler does not immediately rerun the same due timestamp.
+- Base: a permission-requesting mock prompt records a skipped scheduled run and
+  leaves the session in `needs_input`.
+- Bad: scheduler calls an ACP Adapter/runtime directly instead of creating and
+  sending through the durable Logical Session services.
+- Bad: scheduler stores Claude/Codex native ids or raw provider payloads in the
+  scheduled task/run tables.
+
+### 6. Tests Required
+
+- Pure next-run tests for one-shot, interval, daily, and unsupported timezone.
+- DB tests for due listing, claim dedupe, task post-run update, and stale
+  running run listing.
+- Agent tests using `MockAgentProvider` for one-shot success, repeated tick
+  dedupe, interval next-run update, provider failure, permission skip, and
+  stale recovery.
+- Default checks must not start real Codex, Claude, OpenCode, or ACP processes.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+provider.send_turn(native_handle, scheduled_task.prompt).await?;
+```
+
+This bypasses Vibex session creation, timeline persistence, durable runtime
+selection/binding, and permission semantics.
+
+#### Correct
+
+```rust
+let session = manager.create_session(request).await?;
+manager.send_message(SendAgentMessageRequest {
+    session_id: session.id,
+    text: scheduled_task.prompt,
+    attachments: Vec::new(),
+    correlation_id: None,
+}).await?;
+```
+
+The scheduled run goes through the same provider-neutral Agent boundary as a
+manual user turn.
+
+## Scenario: Phase 7 External Session Import Foundation
+
+### 1. Scope / Trigger
+
+- Trigger: Phase 7 adds provider-neutral external Claude/Codex session import
+  contracts and storage/service foundation.
+- Provider-specific native history discovery/parsing is outside this foundation.
+  Import callers pass normalized `ExternalSessionImportCandidate` records.
+
+### 2. Signatures
+
+Core protocol types generated from `crates/core`:
+
+```text
+ExternalSessionImportPreviewRequest
+ExternalSessionImportPreview
+ExternalSessionImportCandidate
+ExternalSessionImportRequest
+ExternalSessionImportResult
+ExternalSessionContinuationStatus = resumable | read_only
+ExternalSessionImportCandidateStatus = importable | partial | blocked
+```
+
+Agent service boundary:
+
+```text
+AgentManager::import_external_sessions(ExternalSessionImportRequest)
+  -> ExternalSessionImportResult
+```
+
+### 3. Contracts
+
+- Imported sessions receive new Vibex-owned `AgentSession.id` values and a
+  concrete `agent_id`, but no current `RuntimeBinding` or desired/effective
+  runtime selection. Native ids in the import candidate are bounded provenance
+  evidence only and are not copied into online runtime authority.
+- Offline parsers may mark a candidate `resumable` only when they recover one
+  stable historical handle (`nativeThreadId` for Codex or `nativeSessionId` for
+  Claude). After the ACP-only cutover, importing that candidate is still a
+  read-only transcript operation until a future explicit ACP materialization
+  contract creates a durable selection and binding.
+- Import notices/diagnostics may include bounded values for `importSource`,
+  `nativeHistoryImported`, `nativeHistoryImportVersion`,
+  `importContinuationStatus`, and `importContinuationReason`; they never make
+  those fields online route inputs.
+- Imported timeline rows are normalized `TimelinePayload` records and must be
+  appended through `TimelineRepository` sequence assignment. The import service
+  prepends a system notice so imported sessions are visibly distinguishable from
+  live Vibex-created sessions.
+- Online operations reject transcript-only sessions before appending a user
+  item or starting an Adapter because authoritative runtime selection/binding
+  state is absent. They must not synthesize state from import provenance.
+
+### 4. Validation & Error Matrix
+
+- Candidate not marked `importable` ->
+  `validation/external_session_import_candidate_not_importable`.
+- Candidate source/provider mismatch ->
+  `validation/external_session_import_provider_mismatch`.
+- Resumable candidate missing the provider-specific native handle ->
+  `validation/external_session_import_resumable_handle_missing`.
+- Transcript-only imported session send -> bounded missing runtime
+  selection/binding error; zero Timeline or Adapter side effects.
+
+### 5. Good/Base/Bad Cases
+
+- Good: a normalized Codex candidate with `nativeThreadId` may report
+  `resumable` evidence in preview, imports its sanitized Timeline into a new
+  Logical Session, and remains read-only because no ACP RuntimeBinding exists.
+- Base: a normalized candidate without a stable resume handle imports as
+  `read_only`, remains listable/fetchable, and preserves imported timeline
+  content.
+- Bad: import code reads real native Claude/Codex history files in deterministic
+  tests, exposes raw native payloads in generated protocol types, or silently
+  starts an unrelated native session for read-only history.
+
+### 6. Tests Required
+
+- Core serde/binding tests for external import DTOs.
+- Agent service tests for resumable provenance, absence of RuntimeBinding,
+  fail-closed online operations, imported timeline ordering, and list/fetch
+  through existing session APIs.
+- Default checks must not require real Claude/Codex auth, CLIs, or native
+  session files.
+
+### 7. Codex JSONL Import Boundary
+
+- Codex-native JSONL discovery/parsing belongs in the Codex adapter crate, not
+  in core DTOs, UI code, remote APIs, or shared Agent storage.
+- The parser may decode only recognized bounded fields from native JSONL:
+  `session_meta.payload.id` for `nativeThreadId`, safe workspace metadata, and
+  supported message/reasoning content that becomes explicit imported timeline
+  items.
+- Codex imports are `resumable` only when exactly one stable native thread id is
+  recovered. Missing or ambiguous native ids must produce `read_only` candidates
+  with bounded reasons such as `missing_native_thread_id` or
+  `ambiguous_native_thread_id`.
+- Malformed and unsupported JSONL records must produce bounded diagnostics with
+  metadata such as line number, record type, item type, role, or hashed path.
+  Diagnostics must not include raw JSONL, prompt text, tool payloads, terminal
+  output, environment values, tokens, or native config blobs.
+- Selected Codex import must delegate normalized candidates to
+  `AgentManager::import_external_sessions`; provider-specific import code must
+  not duplicate database writes or create a second session storage path.
+
+### 8. Claude JSONL Import Boundary
+
+- Claude-native JSONL discovery/parsing belongs in the Claude adapter crate,
+  not in core DTOs, UI code, remote APIs, or shared Agent storage.
+- The parser may decode only recognized bounded fields from native JSONL:
+  top-level `sessionId` for `nativeSessionId`, safe workspace metadata such as
+  `cwd`, and supported `message.role` / `message.content` blocks that become
+  explicit imported timeline items.
+- Claude imports are `resumable` only when exactly one stable native session id
+  is recovered. Missing or ambiguous native ids must produce `read_only`
+  candidates with bounded reasons such as `missing_native_session_id` or
+  `ambiguous_native_session_id`.
+- Malformed and unsupported JSONL records must produce bounded diagnostics with
+  metadata such as line number, record type, item type, role, or hashed path.
+  Diagnostics must not include raw JSONL, prompt text, tool payloads, terminal
+  output, environment values, tokens, or native config blobs.
+- Imported Claude user/assistant text may appear only as explicit imported
+  timeline payloads. Tool-use and tool-result payloads should use bounded
+  summaries and must not import raw tool input/output by default.
+- Selected Claude import must delegate normalized candidates to
+  `AgentManager::import_external_sessions`; provider-specific import code must
+  not duplicate database writes or create a second session storage path.
+- Claude import code must not register an online provider, create a durable
+  binding, or call a Native SDK. Any future continuation must enter through an
+  explicit ACP selection/switch contract.
+
+## Scenario: Phase 10 Automation Graph Runtime
+
+### 1. Scope / Trigger
+
+- Trigger: Phase 10 adds the first local automation graph runtime on top of
+  saved graph definitions, Agent sessions, durable run/run-step records, and
+  permission requests.
+- This is a cross-layer runtime contract: `crates/core` request DTOs are the API
+  source of truth, `crates/agent` owns execution, and `crates/db` owns durable
+  run/read-model state.
+
+### 2. Signatures
+
+Core request DTOs:
+
+```text
+AutomationRunStartRequest {
+  graph_id: AutomationGraphId,
+  trigger: AutomationRunTrigger,
+  scheduled_task_id: Option<ScheduledTaskId>,
+  now_ms: Option<i64>
+}
+AutomationRunResumeRequest {
+  run_id: AutomationRunId,
+  now_ms: Option<i64>
+}
+AutomationRunCancelRequest {
+  run_id: AutomationRunId,
+  now_ms: Option<i64>,
+  reason: Option<String>
+}
+```
+
+Tauri commands:
+
+```text
+automation_run_start(request) -> AutomationRun
+automation_run_resume(request) -> AutomationRun
+automation_run_cancel(request) -> AutomationRun
+automation_run_list(request: AutomationRunListRequest) -> Vec<AutomationRun>
+automation_run_step_list(request: AutomationRunStepListRequest) -> Vec<AutomationRunStep>
+```
+
+Runtime surface:
+
+```text
+AutomationGraphRunner::new(&AgentManager)
+AutomationGraphRunner::start_graph(request) -> AutomationRun
+AutomationGraphRunner::resume_run(request) -> AutomationRun
+AutomationGraphRunner::cancel_run(request) -> AutomationRun
+AutomationGraphRunner::recover_stale_runs(now_ms) -> Vec<AutomationRun>
+```
+
+### 3. Contracts
+
+- `AutomationGraphRunner` must load and mutate automation state only through
+  `AutomationGraphRepository`; it must not issue ad hoc SQL updates against
+  graph, run, or run-step tables.
+- `agent_prompt` nodes create an Agent session and call
+  `AgentManager::send_message`; run steps may store Vibex session ids and
+  permission request ids, but never provider-native ids, resume tokens, or raw
+  provider payloads.
+- `approval_gate` nodes create a provider-neutral `PermissionRequest` through
+  `AgentManager` so the wait is visible in the Agent session timeline and
+  durable permission table.
+- Run diagnostics use bounded `RedactedDiagnostic` values. They must not copy
+  prompt bodies, terminal output, raw file contents, raw Git diffs, env values,
+  secrets, native provider ids, or raw logs.
+- Default automation runtime tests and checks must use mock providers and must
+  not start Claude, Codex, OpenCode, ACP processes, public Relay, hosted
+  services, physical mobile flows, terminal commands, or real file/Git actions.
+- `file_check`, `git_check`, and `terminal_check` remain unsupported unless a
+  later task adds separately tested safe read-only runtimes.
+
+### 4. Validation & Error Matrix
+
+- Missing graph id -> `automation/graph_not_found`.
+- Deleted graph -> `automation/graph_deleted`.
+- Paused graph on new start -> `automation/graph_not_active`.
+- Empty graph -> `automation/empty_graph`.
+- Cyclic graph -> `automation/cyclic_graph`.
+- Nonempty edge expression -> `automation/unsupported_edge_expression`.
+- Unsupported executable node kind -> `automation/unsupported_node_kind`.
+- Resume a non-waiting run -> `automation_run_not_waiting_for_approval`.
+- Resume with pending permission -> keep run `waiting_for_approval`.
+- Resume with denied, expired, or missing permission -> fail the step/run with
+  bounded diagnostics and do not traverse unsafe outgoing edges.
+- Recover stale `running` run/step -> fail or mark recovered with
+  `automation/recovered_stale_run`; do not silently replay dangerous actions.
+
+### 5. Good/Base/Bad Cases
+
+- Good: a mock `agent_prompt` graph creates a run and step, creates an Agent
+  session, sends the prompt through `AgentManager`, and completes with
+  `succeeded` without storing native provider ids.
+- Base: a mock permission request or `approval_gate` moves run and step to
+  `waiting_for_approval`; after approval, explicit resume continues the graph;
+  after denial, the graph stops safely.
+- Bad: an automation runtime directly starts an ACP Adapter process in a
+  default test, evaluates edge expressions as code, stores a prompt copy in
+  diagnostics, or executes terminal/file/Git actions under a generic node.
+
+### 6. Tests Required
+
+- Core serde tests for runtime request DTOs.
+- DB repository tests for run/run-step persistence, bounded diagnostics, and
+  lookup/list helpers.
+- Agent runtime tests for mock success, mock provider error, permission wait,
+  approval approve/deny resume behavior, unsupported node handling, cycle or
+  expression rejection, and stale recovery.
+- Desktop compile/tests proving the UI uses canonical Rust run and run-step types.
+- `git diff --check` and Trellis task validation before task completion.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+// Runtime bypasses repositories and stores provider-native detail.
+conn.execute("UPDATE automation_graph_runs SET error_message = ?1", [raw_prompt])?;
+```
+
+#### Correct
+
+```rust
+// Runtime uses repository helpers and bounded diagnostics.
+AutomationGraphRepository::update_run(&conn, AutomationRunUpdateRequest {
+    id: run.id,
+    status: Some(AutomationRunStatus::Failed),
+    redacted_diagnostics: Some(vec![bounded_diagnostic]),
+    ..Default::default()
+})?;
+```
+
+## Anti-Patterns
+
+- Do not render separate Codex and Claude event models in frontend code.
+- Do not store only native provider history and reconstruct Vibex events lazily.
+- Do not assume streaming order without sequence numbers.
+- Do not continue a turn after an approval response unless the response maps to
+  the provider-native approval id.
+
+## Scenario: Agent Turn Claim And Timeline Append Concurrency
+
+### 1. Scope / Trigger
+
+- Trigger: Any change that starts, continues, retries, executes a slash command,
+  schedules, or remotely dispatches an Agent turn for an existing Vibex session.
+- This is a storage and session-state contract because multiple UI events,
+  remote clients, or background runners can call the same manager concurrently.
+
+### 2. Signatures
+
+Repository helpers:
+
+```text
+SessionRepository::claim_running_turn(conn, session_id, expected_state) -> ()
+TimelineRepository::append(conn, session_id, source, payload, correlation_id,
+  provider_correlation_id, redaction_state) -> TimelineItem
+TimelineRepository::upsert_by_provider_correlation(conn, session_id, source,
+  payload, provider_correlation_id, after_sequence, redaction_state) -> TimelineItem
+```
+
+Manager entry points:
+
+```text
+AgentManager::send_message(SendAgentMessageRequest) -> Vec<TimelineItem>
+AgentManager::continue_turn(ContinueAgentTurnRequest) -> Vec<TimelineItem>
+AgentManager::execute_command(AgentCommandExecuteRequest) -> AgentCommandExecuteResult
+```
+
+### 3. Contracts
+
+- Every turn entry point must flow through `AgentManager::run_agent_turn` or an
+  equivalent path that atomically claims the session before provider execution.
+- Claiming a turn must update `agent_sessions.state` from the state observed by
+  the caller to `running` with a single conditional update:
+  `WHERE session_id = ? AND state = ? AND deleted_at_ms IS NULL`.
+- A caller that reads `idle` or `error` but loses the conditional update race
+  must receive `conflict/agent_turn_already_running`; it must not append a
+  user message, startup notice, provider event, or begin ACP Adapter work.
+- `TimelineRepository::append` owns sequence allocation and insertion inside
+  one write transaction. Callers must not precompute sequence numbers or append
+  timeline rows with ad hoc SQL.
+- Provider retry/progress events that are user-visible updates to the same
+  condition, such as Codex stream `Reconnecting... x/5`, may be coalesced only
+  through a repository helper keyed by `provider_correlation_id`, event kind,
+  source, and the current turn's start sequence. The manager must broadcast the
+  same sequence so clients replace the visible row instead of appending
+  duplicates, while later turns get their own retry/progress item.
+- Timeline insert failures must include bounded diagnostics such as session id,
+  allocated sequence, item kind, source, and the SQLite error string. Do not
+  include prompt text, tool payloads, terminal output, env values, or secrets.
+- Startup notices are Vibex-owned timeline events. Seeing duplicate startup
+  notices for a single visible user turn is evidence of a turn-claim bug unless
+  there are multiple explicit user turns.
+
+### 4. Validation & Error Matrix
+
+- Session is already `running` -> `conflict/agent_turn_already_running`.
+- Conditional claim updates zero rows after a previously valid state read ->
+  `conflict/agent_turn_already_running`.
+- Invalid state transition before claim ->
+  `conflict/invalid_session_state_transition`.
+- Timeline transaction begin or commit fails -> `storage/timeline_*` with
+  bounded diagnostics.
+- Timeline insert fails -> `storage/timeline_insert_failed` with bounded
+  SQLite, session, sequence, kind, and source diagnostics.
+
+### 5. Good/Base/Bad Cases
+
+- Good: two rapid `agent_send_message` calls for the same idle session result
+  in exactly one provider turn; the loser receives `agent_turn_already_running`
+  and no second user timeline item is persisted.
+- Base: a failed session can be continued once by `continue_turn`; a second
+  simultaneous continue attempt is rejected by the same claim path.
+- Bad: manager code reads the session state, checks `state != running`, then
+  performs an unconditional `UPDATE agent_sessions SET state = running`.
+- Bad: provider-stream handlers open separate connections and insert timeline
+  items without the repository write transaction.
+
+### 6. Tests Required
+
+- Manager unit test with a blocking provider: first send reaches provider,
+  second same-session send returns `agent_turn_already_running`, and provider
+  turn count remains one.
+- DB tests for timeline append must assert monotonically increasing per-session
+  sequence numbers through `TimelineRepository::append`.
+- Provider adapter tests that emit live and completed events must continue to
+  pass through manager append paths; no adapter may assign authoritative
+  sequence numbers.
+- Regression tests for coalesced provider retry/progress events must assert
+  both the manager return value and fetched authoritative timeline contain one
+  updated item with the latest payload.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+let session = SessionRepository::get(&conn, &session_id)?.unwrap();
+if session.state != AgentSessionState::Running {
+    SessionRepository::update_state(&conn, &session_id, AgentSessionState::Running)?;
+}
+```
+
+Two concurrent callers can both read `idle`, both update to `running`, and then
+race while assigning timeline sequence numbers.
+
+#### Correct
+
+```rust
+let session = SessionRepository::get(&conn, &session_id)?.unwrap();
+validate_transition(session.state, AgentSessionState::Running)?;
+SessionRepository::claim_running_turn(&conn, &session_id, session.state)?;
+```
+
+The conditional update is the durable claim. Only the winner may append turn
+timeline items or call the provider.
+
+## Scenario: Phase 6 Generic ACP Adapter Foundation
+
+### 1. Scope / Trigger
+
+- Trigger: Phase 6 adds `crates/agent-acp` as the generic ACP adapter
+  foundation.
+- This child establishes the ACP adapter boundary and deterministic event
+  mapping only. Provider catalog UI, dynamic capability probing, and real
+  OpenCode smoke evidence are later Phase 6 children.
+
+### 2. Signatures
+
+Rust adapter surface:
+
+```text
+AcpAgentProvider: AgentProvider
+AcpClient::create_session(AcpCreateSessionRequest) -> AcpSession
+AcpClient::resume_session(ProviderBinding) -> AcpSession
+AcpClient::send_turn(AcpSendTurnRequest) -> AcpTurn
+AcpClient::resolve_permission(AcpPermissionResolution) -> ()
+```
+
+Workspace package:
+
+```text
+crates/agent-acp
+```
+
+### 3. Contracts
+
+- `crates/agent-acp` owns ACP-specific event/client mapping. `crates/agent`
+  remains provider-neutral and must not depend on ACP protocol or CLI
+  dependencies.
+- ACP is registered as an `AgentProvider` under an exact ACP
+  `AgentRuntimeRouteKey`; the manager continues to own Vibex session state,
+  durable RuntimeBinding authority, timeline append, permission persistence,
+  and live-event fanout.
+- `AcpAgentProvider::capabilities_static()` must stay conservative until the
+  later capability-probe child. Do not claim unsupported model lists, dynamic
+  modes, permission resolution, interrupt, or tool features just because an
+  individual fixture can emit those events.
+- ACP-native identifiers may be stored only in the internal durable
+  `RuntimeBinding`/attachment boundary. Adapter-local `ProviderBinding` values
+  are synthesized from that current fence; secret-like values are omitted from
+  persistence and diagnostics.
+- ACP output must map into existing `TimelinePayload` variants. Unknown ACP
+  event kinds become provider notices or redacted diagnostics, not new public
+  timeline variants.
+- Permission requests emitted through ACP use the existing `PermissionRequest`
+  payload and move sessions to `needs_input` through `AgentManager`.
+- For local OpenCode `1.17.9`, Vibex treats `opencode acp` as stdio
+  newline-delimited JSON-RPC 2.0. The minimal executable flow is
+  `initialize` with ACP protocol version `1`, `session/new` with
+  `{ cwd, mcpServers: [] }`, then `session/prompt`; streamed chunks arrive as
+  `session/update` notifications and must be mapped to provider-neutral
+  timeline events or redacted diagnostics.
+- OpenCode `session/new` may include optional `configOptions`, including a
+  `model` category with current value and model options. Vibex may summarize
+  those fields in redacted binding metadata and explicit smoke evidence, but
+  must not persist the raw `session/new` payload or treat this runtime snapshot
+  as the default Provider settings capability source.
+
+### 4. Validation & Error Matrix
+
+- Unregistered ACP provider -> `capability/provider_unregistered`.
+- ACP permission resolution not supported by the current foundation ->
+  `capability/acp_permission_resolution_unsupported`.
+- OpenCode ACP initialize/session/prompt response shape mismatch ->
+  `provider/acp_opencode_protocol_mismatch` or
+  `provider/acp_opencode_handshake_unsupported` with response-key summaries
+  only.
+- Missing optional OpenCode model/config fields in `session/new` -> continue
+  session creation when `sessionId` is present and record an unavailable
+  redacted snapshot.
+- ACP provider/process failures -> `provider/acp_*` or `process/acp_*` with
+  redacted diagnostics when real process wiring is added.
+- Secret-like binding metadata or native resume tokens -> omitted from persisted
+  binding metadata/native fields.
+
+### 5. Good/Base/Bad Cases
+
+- Good: a deterministic ACP fixture drives a durable initial switch through
+  `AgentManager`, commits a safe RuntimeBinding/attachment fence, emits
+  provider-neutral timeline events, and can put the session into `needs_input`
+  via a mapped permission request.
+- Base: ACP capabilities are present but conservative; UI/runtime can see ACP as
+  a Provider kind without assuming real provider support.
+- Bad: frontend code branches on raw ACP event payloads; `crates/agent` imports
+  ACP-specific protocol crates; raw ACP payload dumps or secrets are stored in
+  binding metadata.
+- Bad: treating OpenCode `serve` HTTP behavior as evidence that the ACP adapter
+  works; Phase 6 ACP smoke success must use `opencode acp`.
+
+### 6. Tests Required
+
+- `cargo test -p vibex-agent-acp` must cover conservative capabilities,
+  binding redaction, event mapping, and `AgentManager` fixture integration.
+- `cargo test -p vibex-agent` must continue to pass to prove the
+  provider-neutral manager and existing Mock behavior are not regressed.
+- `pnpm check:rust`, `pnpm check`, and `git diff --check` must pass before the
+  task is completed.
+
+## Scenario: ACP Terminal Tools And Terminal Auth
+
+### 1. Scope / Trigger
+
+- Trigger: an ACP agent asks the Vibex host to create, inspect, kill, release,
+  or wait on a terminal through ACP terminal JSON-RPC methods.
+- Trigger: an ACP provider needs a terminal-based login flow represented as a
+  provider-neutral backend action descriptor.
+- This is a cross-layer contract because ACP runtime requests flow through
+  provider profile config, capability projection, runtime host seams,
+  permission requests, redacted output summaries, and later UI/remote terminal
+  surfaces.
+
+### 2. Signatures
+
+Provider config and capability projection:
+
+```text
+AcpProviderConfig {
+  terminal_tools: bool = false,
+  terminal_auth: bool = false
+}
+
+ProviderCapabilities {
+  terminal_tools: bool,
+  terminal_auth: bool
+}
+```
+
+ACP initialize capabilities:
+
+```text
+clientCapabilities.terminal: bool
+clientCapabilities.auth.terminal: bool
+clientCapabilities.meta.terminal_output: bool
+clientCapabilities.meta["terminal-auth"]: bool
+```
+
+Runtime terminal host seam:
+
+```text
+AcpTerminalHost::create(AcpTerminalCreateRequest) -> TerminalId
+AcpTerminalHost::kill(TerminalId) -> ()
+AcpTerminalHost::release(TerminalId) -> ()
+AcpTerminalHost::output(TerminalId, limit: usize) -> AcpTerminalOutput
+AcpTerminalHost::wait_for_exit(TerminalId) -> AcpTerminalExitStatus
+AcpTerminalHost::terminal_auth_descriptor(AcpTerminalAuthRequest)
+  -> TerminalAuthActionDescriptor
+```
+
+ACP runtime methods served by Vibex:
+
+```text
+terminal/create
+terminal/kill
+terminal/release
+terminal/output
+terminal/wait_for_exit
+```
+
+### 3. Contracts
+
+- Terminal tools and terminal auth are disabled by default in every built-in or
+  imported ACP profile unless an explicit typed config flag or compatible
+  feature token enables them.
+- ACP initialize may advertise `terminal=true` and `auth.terminal=true` only
+  when the provider profile enables the feature and the runtime was constructed
+  with an `AcpTerminalHost`.
+- `terminal/create` is permission-producing. The ACP runtime must emit a Vibex
+  `PermissionRequest` before calling `AcpTerminalHost::create`.
+- Approval and always-allow both create the host terminal once; deny responds to
+  the ACP request with a terminal-denied error and must not create a terminal.
+- Pending terminal-create requests must be drained on interrupt, shutdown, or
+  process exit so the ACP agent is not left waiting forever.
+- Terminal output returned through ACP responses must be bounded and redacted
+  before it crosses non-terminal surfaces. Secret env values must never be
+  copied into permission details, logs, terminal output summaries, or terminal
+  auth descriptors.
+- Terminal auth is represented by `TerminalAuthActionDescriptor`. It may include
+  command, args, cwd, env keys, and redacted env summaries, but not secret env
+  values or auth codes.
+
+### 4. Validation & Error Matrix
+
+- Terminal tools disabled -> do not advertise terminal capability; if a request
+  still arrives, respond with ACP method/capability unavailable.
+- Missing `terminal/create.command` -> JSON-RPC invalid params.
+- Missing terminal id for kill, release, output, or wait -> JSON-RPC invalid
+  params.
+- User denies terminal create -> terminal command denied; no host terminal is
+  created.
+- Terminal host create/output/wait/kill/release fails -> provider/process error
+  with redacted diagnostics only.
+- Terminal host absent while config asks for terminal support -> do not
+  advertise terminal capability; disabled host returns a capability error.
+- Interrupt, shutdown, or process exit while create permission is pending ->
+  pending ACP terminal create is cancelled or errored, never left hanging.
+
+### 5. Good/Base/Bad Cases
+
+- Good: ACP profile enables terminal tools and the runtime has a terminal host;
+  `initialize` advertises terminal support, `terminal/create` emits a permission
+  request, approval creates exactly one host terminal, output is bounded, and
+  wait returns an exit status.
+- Good: ACP profile enables terminal auth and the runtime has a terminal host;
+  backend code can produce a `TerminalAuthActionDescriptor` without writing
+  secrets into ordinary timeline items.
+- Base: terminal tools are disabled; ACP runtime continues to serve sessions,
+  filesystem methods, and permission callbacks without advertising terminal
+  support.
+- Bad: terminal support is advertised solely because a provider feature token is
+  present, even though no Vibex terminal host exists.
+- Bad: command env values or auth tokens appear in permission details, debug
+  logs, terminal output responses, or auth descriptors.
+
+### 6. Tests Required
+
+- Capability tests must assert ACP terminal tools/auth default to disabled and
+  become effective only through explicit config/feature projection.
+- Runtime tests must assert initialize terminal/auth capabilities are gated by
+  both config and host support.
+- Runtime tests must assert terminal create parses command, args, cwd, and env
+  keys, emits a permission request, calls the mock host only after approval, and
+  does not call it after denial.
+- Runtime tests must assert terminal output is bounded and redacted, wait
+  returns exit status, and kill/release delegate to the host.
+- Auth tests must assert `TerminalAuthActionDescriptor` contains env keys or
+  redacted summaries only and never contains secret values.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+config.features contains "terminal"
+  -> initialize advertises terminal=true
+  -> terminal/create directly spawns a process
+```
+
+This bypasses Vibex permission handling and can advertise a capability the host
+cannot actually serve.
+
+#### Correct
+
+```text
+config enables terminal tools + AcpRuntimeClient has AcpTerminalHost
+  -> initialize advertises terminal=true
+  -> terminal/create stores a pending terminal request
+  -> Vibex PermissionRequest is emitted
+  -> approval calls AcpTerminalHost::create once
+  -> ACP receives { terminalId }
+```
+
+The permission system remains the durable approval boundary, and the runtime
+host seam keeps terminal execution provider-neutral.
+
+## Scenario: OpenCode ACP Model Error Bridge
+
+### 1. Scope / Trigger
+
+- Trigger: OpenCode keeps `session/prompt` pending while retrying a failed model
+  API request and does not emit an ACP error response or notification on stdout.
+- This fallback is OpenCode-specific. Generic ACP agents must continue to use
+  standard JSON-RPC responses and process lifecycle errors.
+
+### 2. Signatures
+
+OpenCode launch arguments:
+
+```text
+opencode acp --print-logs --log-level ERROR
+```
+
+OpenCode stderr fields consumed by Vibex:
+
+```text
+message="stream error"
+session.id=<native-session-id>
+small=<true|false>
+error.error=<redacted model API error>
+```
+
+Runtime correlation and failure:
+
+```text
+AcpProcess.pending_prompt_requests[native_session_id] = json_rpc_request_id
+user-action-required main stream error -> session/cancel { sessionId }
+                                       -> provider/opencode_model_api_error
+retryable main stream error -> provider/opencode_model_api_retrying
+                            -> progress, eight errors, or two-minute deadline
+```
+
+### 3. Contracts
+
+- Effective OpenCode args include `--print-logs` and `--log-level ERROR` when
+  absent. Existing same-name args are preserved and never duplicated.
+- The effective args, including injected logging args, are used for process
+  spawn diagnostics, session metadata, and pool command fingerprints.
+- Only `message="stream error"` lines associated with a currently pending
+  `session/prompt` and active native session may affect a turn.
+- `small=true` identifies title/summary generation and must never fail the main
+  turn. A main `small=false` error that requires user action, including exhausted
+  usage/quota, rate limiting, insufficient balance/credit, billing/subscription,
+  or authentication failure, fails immediately. OpenCode 1.18.1 may emit only one
+  such error and then honor a multi-hour `Retry-After`; waiting for a second log
+  line leaves the product in `running` indefinitely.
+- Other main errors remain retryable. The first error in a retry window emits a
+  canonical `opencode_model_api_retrying` Timeline error with a stable provider
+  correlation id, so clients show the provider failure without treating it as a
+  turn boundary. Eight consecutive errors or two minutes of model-stream silence
+  fail the turn. A non-empty Agent message, thought, or new tool-call update proves
+  progress, resets the consecutive error count, and slides the silence deadline.
+  A later error starts a new retry window from zero.
+- The pending JSON-RPC sender is the race arbiter. Vibex sends `session/cancel`
+  only when the stderr path successfully removes that sender before a normal
+  ACP response does.
+- Response, send failure, timeout, shutdown, process exit, and pooled-session
+  removal must clear prompt correlation state. No lock may be held while
+  sending `session/cancel` or completing a pending sender.
+- OpenCode writes model failures to stderr independently from the stdout
+  JSON-RPC response. A terminal prompt RPC error keeps its prompt correlation
+  for a bounded 250 ms stderr-drain window before classifying the response; a
+  one-second detached cleanup removes the correlation if the awaiting caller
+  was cancelled. Never assume cross-pipe write order equals reader-task order.
+  In particular, one delayed stdout progress event may slide the recovery
+  deadline but must not permanently disarm it.
+- User-visible errors use stable code `opencode_model_api_error`; raw stderr is
+  bounded and redacted before becoming diagnostic context.
+
+### 4. Validation & Error Matrix
+
+- Standard ACP JSON-RPC error -> `provider/acp_rpc_error`.
+- OpenCode prompt RPC error whose correlated stderr arrives during the bounded
+  drain -> preserve the stderr reason as `provider/opencode_model_api_error`.
+- OpenCode title stream error (`small=true`) -> ignored for main-turn state.
+- OpenCode usage/quota/rate-limit/balance/billing/authentication stream error ->
+  immediate `provider/opencode_model_api_error` plus `session/cancel`.
+- First retryable OpenCode main stream error -> correlated
+  `provider/opencode_model_api_retrying`; keep waiting within the recovery window.
+- Agent message/thought/new tool-call progress after an error -> reset the
+  consecutive count; later errors start a new recovery window.
+- Eighth consecutive correlated OpenCode main stream error ->
+  `provider/opencode_model_api_error` plus `session/cancel`.
+- One correlated retryable error followed by two minutes of silence ->
+  `provider/opencode_model_api_error` plus `session/cancel`.
+- Stream error for an unknown/inactive session -> diagnostic tail only.
+- Prompt timeout wins before stderr failure -> `process/acp_request_timeout`; a
+  late stderr line must not cancel a newer or already completed request.
+
+### 5. Good/Base/Bad Cases
+
+- Good: a transient upstream 500 recovers after several retries; subsequent
+  model progress resets the budget and the turn continues without cancellation.
+- Good: an upstream failure remains unavailable through eight consecutive
+  errors; Vibex ends the turn with the redacted reason and OpenCode receives one
+  cancel instead of retrying forever.
+- Good: `Free usage exceeded, subscribe to Go` or the underlying `Rate limit
+  exceeded` fails on the first correlated main error, enters session `error`, and
+  appends a provider-neutral Timeline error that GPUI renders.
+- Good: one transient 5xx is visible as a correlated retrying error; recovery
+  removes the pending state, while silence reaches the two-minute deadline.
+- Base: title generation fails while the main model succeeds; the turn returns
+  normally and no cancel is sent.
+- Base: another ACP agent writes similar stderr text; Vibex retains it only as
+  diagnostics because the profile is not OpenCode.
+- Bad: every stderr error fails the first active turn without matching
+  `session.id` to its pending prompt.
+- Bad: Vibex waits for the two-hour prompt timeout after OpenCode has already
+  logged repeated unrecoverable API failures.
+
+### 6. Tests Required
+
+- Unit tests parse quoted logfmt fields, strip known AI SDK error prefixes, and
+  reject unrelated and `small=true` lines.
+- Argument tests assert missing logging flags are appended only for OpenCode
+  and existing flags are not duplicated.
+- Unit tests classify real OpenCode 1.18.1 usage-limit/rate-limit text as
+  user-action-required while leaving 5xx/service-unavailable errors retryable.
+- Mock-process tests emit one correlated usage-limit error and assert immediate
+  `opencode_model_api_error`, session `error`, a persisted Timeline error, and one
+  `session/cancel` notification.
+- Mock-process tests emit eight correlated retryable main errors without a prompt
+  response and assert fast `opencode_model_api_error` completion plus exactly
+  one `session/cancel` notification.
+- Mock-process tests emit one retryable error, one nearby progress update, and
+  then silence; assert a correlated `opencode_model_api_retrying` event followed
+  by deadline failure despite cross-pipe scheduling order.
+- Repeated mock-process tests write stderr before a terminal stdout RPC error and
+  assert high-load scheduling still preserves `opencode_model_api_error` rather
+  than degrading to `acp_rpc_error`.
+- Mock-process tests emit seven errors, model-stream progress, then seven more
+  errors and a successful response; progress must reset the error budget and no
+  cancellation may be sent.
+- Mock-process tests emit a title error followed by a successful prompt and
+  assert the main turn completes without cancellation.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+session/prompt -> OpenCode retries model API forever
+               -> ACP stdout stays silent
+               -> Vibex remains running until the global prompt timeout
+```
+
+#### Correct
+
+```text
+session/prompt -> correlate native session with JSON-RPC id
+stderr usage/rate/billing/auth error -> fail immediately
+stderr retryable error -> show correlated retry state
+                       -> progress, x8 threshold, or two-minute deadline
+                       -> atomically remove sender and send session/cancel
+                       -> return opencode_model_api_error
+```
+
+The bridge restores a bounded provider-neutral turn lifecycle while keeping the
+non-standard stderr dependency isolated to the OpenCode profile.
+
+## Scenario: ACP Session Runtime Configuration State And Operation Gate
+
+### 1. Scope / Trigger
+
+- Trigger: a committed ACP attachment changes Model, Mode, Reasoning Effort, or
+  another advertised session option, or replays the same preference after a
+  process/attachment rebuild.
+- This is a cross-layer contract spanning `crates/core` domain state,
+  `crates/db` binding CAS, and `crates/agent-acp` discovery, wire selection,
+  attachment fencing, and replay.
+- Session configuration is not process configuration: these values must never
+  enter `ProcessSpawnConfigSnapshot` or its fingerprint.
+
+### 2. Signatures
+
+```rust
+SessionRuntimeConfigState {
+    preferred_model: Option<String>,
+    effective_model: Option<String>,
+    preferred_mode: Option<String>,
+    effective_mode: Option<String>,
+    preferred_reasoning_effort: Option<String>,
+    effective_reasoning_effort: Option<String>,
+    config_values: BTreeMap<String, SessionRuntimeConfigValueState>,
+    state_revision: i64,
+    applied_activation_generation: Option<i64>,
+}
+
+SessionRuntimeConfigValueState {
+    preferred: Option<ProviderSessionConfigValue>,
+    effective: Option<ProviderSessionConfigValue>,
+}
+
+SessionRuntimeConfigMutationRequest {
+    session_id: VibexSessionId,
+    expected_revision: i64,
+    expected_binding_id: RuntimeBindingId,
+    expected_activation_generation: i64,
+    patch: SessionRuntimeConfigPatch,
+}
+
+AcpRuntimeClient::update_session_runtime_config(request)
+    -> SessionRuntimeConfigMutationResult
+RuntimeBindingRepository::compare_and_set_session_runtime_config_state(
+    conn, binding_id, expected_state, expected_activation_generation, next_state
+) -> ()
+```
+
+`model`, `reasoning_effort`, `approval_mode`, and `sandbox_mode` are reserved
+canonical keys. Mode is the typed `mode_id` field; reserved values cannot be
+smuggled through `config_values`. Generic values use the explicit dual shape,
+and legacy `{ value, label }` JSON is read as both preferred and effective but
+is written back in the dual shape.
+
+### 3. Contracts
+
+- A mutation first validates the committed/current four-part attachment fence,
+  expected revision, process `Ready` state, `ProcessConfigStatus::Current`,
+  and an idle attachment (no active turn, permission, or terminal-create
+  request). Failure at this gate has zero state or wire side effects.
+- A semantic preferred change increments `state_revision` once for the whole
+  patch. An identical converged patch is a zero-revision/zero-wire no-op. A
+  same-revision pending patch may retry only fields whose effective value has
+  not converged.
+- Preferred state is recorded before any ACP request. Effective state advances
+  only after a successful response, no explicit conflicting value, the same
+  mutation revision, and a fresh `SessionAttachmentRegistry::apply_current`
+  fence check. A stale response has no attachment or transient-store effect.
+- Field order is deterministic: Model, Reasoning Effort, Mode, then generic
+  canonical keys in ascending order. Partial wire success keeps confirmed
+  effective fields and leaves failed fields preferred-only; ACP effects are not
+  rolled back.
+- Candidate order is negotiated typed live operation, negotiated versioned raw
+  operation, advertised Model config option, exact compatibility-identity
+  extension, descriptor startup projection (`RestartAndResume`), then
+  unavailable. Only an explicit capability negative (`-32601`, method-not-found,
+  or an equivalent unsupported diagnostic) advances to the next candidate.
+  Authentication, permission, timeout, transport, malformed response, and
+  provider errors stop fallback for that field.
+- Alias mapping is explicit and exact-identity scoped. Normalized labels or
+  value containment are never semantic evidence; duplicate mappings fail
+  closed as an ambiguity.
+- A new/load/rebuilt attachment seeds effective values only from that response.
+  The same `RuntimeBindingId` retains preferred state across a crash and gets a
+  new activation generation. Intentional close or replacement removes the
+  legacy transient state; no incomplete durable binding row is created.
+- Profile-only Model IDs and a session-global effort option do not fabricate
+  per-Model reasoning capability. Effort is attached to a Model only when a
+  live probe or exact extension explicitly associates the two.
+- Diagnostics and outcomes contain bounded canonical keys, operation/encoding,
+  stable error codes, revision, and generation only. They do not contain raw
+  native session ids, prompts, environment values, secrets, or unbounded ACP
+  payloads.
+
+### 4. Validation & Error Matrix
+
+- Expected session/binding/revision/generation mismatch -> structured
+  `StaleConfirmation` outcome with `acp_session_config_fence_stale` and no
+  ACP request.
+- Missing/non-ready process -> `StaleConfirmation` outcome;
+  stale process-config status -> `RestartRequired` outcome;
+  active turn or pending host work -> `Busy` outcome.
+- Unknown/reserved key, set-and-clear conflict, empty/overlong value, or
+  invalid effort spelling -> `validation/acp_session_config_*` error.
+- No exact alias or ambiguous alias -> `validation/acp_session_config_key_*`;
+  labels and selected values never trigger a reserved mapping.
+- No candidate or advertised value -> `Unavailable`; a descriptor startup
+  projection -> `RestartRequired` without replacing the process.
+- ACP method-not-found/explicit unsupported -> mark only that operation
+  negative for the current identity/generation and try the next candidate.
+- Permission/authentication/timeout/transport/provider error -> `Failed` and
+  no fallback; prior confirmed fields remain effective.
+- Response explicitly reports a value different from the target -> `Failed`
+  with `acp_session_config_response_mismatch`.
+- Fence/revision/CAS failure after an external success ->
+  `StaleConfirmation` or `ReconciliationRequired`; never claim effective for a
+  replacement generation.
+
+### 5. Good/Base/Bad Cases
+
+- Good: a four-field patch emits `session/set_model`, then effort, then mode,
+  then sorted generic options; one capability-negative Model response falls
+  back to its exact advertised config option while an auth error does not.
+- Good: after a crash, the same binding retains preferred Model, loads a new
+  generation's observed Model/Mode, replays only differences, and blocks prompt
+  dispatch while an unavailable known preference remains unconverged.
+- Base: a Profile contributes Model IDs to the catalog with an empty effort
+  set; an explicit session/probe association may add bounded efforts.
+- Bad: writing preferred/effective values into the process fingerprint, trying
+  `set_config_option` after a permission failure, or accepting a late response
+  after the binding/generation changed.
+- Bad: using an option label such as `"Model"` or a value containing a model id
+  as an alias, or inserting a partial `session_runtime_bindings` row for the
+  transient legacy path.
+
+### 6. Tests Required
+
+- Core serde tests cover explicit fields, dual generic values, legacy JSON,
+  revision monotonicity, and generation convergence.
+- DB tests cover successful CAS, identical-state no-write, stale JSON/revision,
+  stale activation generation, and missing binding with zero writes.
+- Planner tests cover exact aliases/collisions, typed/raw/config-option/
+  extension/restart/unavailable priority, generation-scoped observed negative,
+  deterministic field order, and catalog no-fabrication.
+- ACP mock tests cover Model/Mode/Effort/generic wire shapes, partial success,
+  response mismatch, capability-only fallback, auth/timeout no-fallback,
+  busy/stale-process zero side effects, pooled attachment isolation, close
+  cleanup, and same-binding crash rebuild replay.
+- Run `cargo test -p vibex-agent-acp`, `cargo test -p vibex-core runtime`,
+  `cargo test -p vibex-db runtime`, workspace check/test, scoped clippy,
+  `pnpm check:frontend`, and Trellis validation. Default
+  checks remain offline and credential-free.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+set_model fails for any reason
+  -> try set_config_option
+  -> write effective immediately
+  -> prompt on whichever attachment answers later
+```
+
+#### Correct
+
+```text
+validate current fence + idle/process gate
+  -> CAS preferred (revision + 1)
+  -> choose exact-identity candidate
+  -> fallback only on capability negative
+  -> revalidate fence + revision
+  -> CAS effective / mark generation applied
+```
+
+## Scenario: ACP Session Restore Compatibility And Stale Detection
+
+### 1. Scope / Trigger
+
+- Trigger: an ACP runtime rebuilds a process for an existing `ProviderBinding`,
+  imports a native session, or receives a restore response after the process or
+  attachment generation changed.
+- `crates/core` owns restore DTOs, `crates/agent-acp` owns current-generation
+  capability resolution and the restore gate, and `crates/db` owns exact CAS.
+
+### 2. Signatures
+
+```text
+AgentSessionRestoreCompatibilityKey {
+  agentId, nativeSessionId, nativeStateHomeId,
+  adapterCompatibilityIdentity, agentStateFormatIdentity,
+  providerResumeIdentity, workspaceIdentity
+}
+resolve_restore_compatibility(sourceKey, targetKey, generationEvidence, generation)
+  -> Compatible | ProbeRequired { allowedMethods } | Incompatible { reason }
+AgentSessionRestoreOutcome = Resumed | Loaded | NotFound |
+  AuthenticationRequired | Unsupported | TransientFailure | FatalFailure
+RuntimeBindingRepository::compare_and_set_restore_compatibility_key(...)
+RuntimeSwitchRepository::compare_and_set_restore_compatibility_result(...)
+```
+
+### 3. Contracts
+
+- Restore keys trim and bound identity strings. Native ids are serialized only
+  for exact matching; Debug, errors, and diagnostics never print native ids or
+  resume tokens.
+- Identity comparison is exact across Agent, state home, adapter/state format,
+  provider resume identity, and workspace. A mismatch is `Incompatible`.
+- `Compatible` requires current-generation `NegotiatedRuntime` or
+  `ObservedRuntime` support. Static descriptors and unknown evidence produce
+  `ProbeRequired` only.
+- The candidate order is `session/resume` (versioned raw), then `session/load`
+  (typed), inside the attachment acquire closure. Only method-not-found,
+  explicit unsupported, or stable not-found can advance or use explicit fresh.
+- The native session id in a `session/resume` or `session/load` request is the
+  authoritative restored identity. Standard ACP restore responses are objects
+  that may omit `sessionId`; accept that shape. If an Adapter includes the
+  extension field, it must be a string that exactly matches the requested id.
+- A restore JSON-RPC error may carry decisive evidence under `error.data` even
+  when `error.message` is only `Internal error`. The ACP boundary must inspect
+  bounded structured data before discarding it, map a recognized missing native
+  resource to the stable redacted `protocolErrorKind=resource_not_found`, and
+  never copy the raw data or native id into Debug, diagnostics, or user errors.
+  This classification is operation-scoped to `session/resume` and
+  `session/load`; the same data on prompt or configuration operations remains a
+  provider error.
+- Fresh uses a new transient binding id and `nativeSessionId=None` acquire key;
+  it must not reuse an old native-id key. Auth/permission, timeout,
+  transport/process crash, malformed response, route mismatch, and provider
+  failures stop the chain and preserve the source current attachment.
+- Success revalidates the complete fence before config replay or CAS. Stale or
+  missing binding/switch rows perform zero writes. The switch result JSON seam
+  is an optional bounded cache, not current-binding authority; P5 commit and
+  Context Bridge remain out of scope.
+
+### 4. Validation & Error Matrix
+
+- Empty/overlong identity -> `validation/restore_compatibility_identity_*`.
+- Identity mismatch -> typed `RestoreIncompatibilityReason`, no wire request.
+- Missing generation evidence -> `ProbeRequired`.
+- Method-not-found/unsupported -> `Unsupported`; stable missing session ->
+  `NotFound`; these are the only automatic fresh candidates.
+- Codex `-32603 Internal error` with bounded `error.data.details` matching
+  `no rollout found for thread id ...` on resume/load -> `NotFound`; resume
+  advances once to load, and a second classified miss may create fresh.
+- `-32603 Internal error` without recognized structured missing-resource
+  evidence -> `FatalFailure`; no fresh fallback.
+- Object response without `sessionId` -> valid restore response; present
+  non-string `sessionId`, a different id, or a non-object response ->
+  `FatalFailure` with no fresh fallback.
+- Auth/permission -> `AuthenticationRequired`; timeout/transport/process ->
+  `TransientFailure`; malformed response/native mismatch/provider error ->
+  `FatalFailure`; none may fresh-fallback.
+- Binding/switch identity, generation, revision, status, or expected-result CAS
+  mismatch -> structured conflict with zero writes.
+
+### 5. Good/Base/Bad Cases
+
+- Good: negotiated resume succeeds once; resume method-not-found advances once
+  to load; load not-found creates fresh under a new transient identity.
+- Good: Codex ACP returns modes/config options without echoing `sessionId`;
+  Vibex retains the requested native id and continues attachment activation.
+- Good: Codex reports a missing rollout only in `error.data`; Vibex records the
+  redacted `resource_not_found` kind, tries resume/load once each, then creates
+  one fresh native session while retaining the Logical Session timeline.
+- Base: static/unknown capability returns probe-required instead of guessing an
+  encoding.
+- Base: an unrelated `-32603` on `session/prompt` remains a provider failure
+  even if its structured data contains generic session wording.
+- Bad: catch-all `session/load` error followed by `session/new`, or fresh retry
+  with `Some(oldNativeSessionId)` in the same attachment key.
+- Bad: validate a restore response with the `session/new` response contract and
+  reject it only because it does not echo `sessionId`.
+
+### 6. Tests Required
+
+- Core serde/Debug tests cover key validation, identity mismatch reasons,
+  seven outcomes, and raw-id redaction.
+- Resolver tests cover negotiated Compatible, static/unknown ProbeRequired,
+  identity mismatches, generation scoping, and deterministic order.
+- ACP mock tests cover typed load, versioned resume, fallback, not-found/
+  unsupported fresh, auth/timeout/provider/invalid no-fallback, native-id
+  mismatch, an omitted optional response `sessionId`, and same-key at-most-once
+  effects. Include the exact Codex
+  `-32603` + `error.data.details=no rollout found for thread id ...` shape and
+  assert one resume, one load, one fresh session, and no raw native id in the
+  classified error state.
+- DB tests cover typed key round-trip, identical no-write, stale generation,
+  and switch restore-result CAS/query. Run targeted and workspace checks,
+  bindings/frontend checks, fmt, clippy, and Trellis validation.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+require restoreResponse.sessionId == requestedNativeId
+session/load error (any category) -> warn -> session/new -> replace route
+```
+
+#### Correct
+
+```text
+exact key + current evidence
+  -> resume (versioned raw) -> load (typed)
+  -> keep requestedNativeId; validate response.sessionId only when present
+  -> inspect bounded JSON-RPC error.data before dropping provider detail
+  -> expose only a stable redacted error kind
+  -> classify miss/unsupported separately from auth/transient/fatal
+  -> fresh only for an allowed miss, with a new transient binding key
+  -> fence + CAS before target state becomes effective
+```
+
+## Scenario: Turn Execution Attribution Snapshot
+
+### 1. Scope / Trigger
+
+- Trigger: an Agent provider is about to admit a prompt, emit live events, return buffered/transcript events, or
+  coalesce an existing timeline item.
+- The attribution answers which committed runtime actually executed the visible turn. It is not derived from the
+  Composer selection, desired runtime, a later current binding, or provider-native session identifiers.
+
+### 2. Signatures
+
+```text
+AgentProvider::prepare_turn_execution(handle, request)
+  -> Option<ProviderTurnExecutionIdentity { binding_id, activation_generation, model_id }>
+
+ProviderTurnRequest.execution_identity: Option<ProviderTurnExecutionIdentity>
+
+TurnExecutionAttribution {
+  agent_id, provider_profile_id, model_id,
+  binding_id, activation_generation,
+  agent_label, provider_profile_label, model_label
+}
+
+TimelineItem.executionAttribution?: TurnExecutionAttributionView {
+  agentLabel, providerProfileLabel, modelLabel
+}
+
+agent_timeline_items.execution_attribution_json TEXT NULL
+```
+
+### 3. Contracts
+
+- The manager calls `prepare_turn_execution` once per provider attempt before `send_turn`, creates one immutable
+  `TurnExecutionAttribution`, and attaches the same snapshot to live, buffered/final, permission, tool, transcript,
+  coalesced, and output-producing terminal-error items from that attempt.
+- Generic ACP prepare may establish/restore the attachment and must return the committed binding/generation plus its
+  effective Model. ACP send takes the session operation lock, reads only the current committed attachment, and
+  revalidates binding, generation, and effective Model before `begin_turn` or `session/prompt`. Send must not restore or
+  create a replacement attachment from the old request binding.
+- Every online turn is ACP-backed and requires a real committed RuntimeBinding id and activation generation. Do not
+  synthesize generation zero, a legacy binding id, or attribution from ProviderKind.
+- SQLite stores the complete Rust-only audit snapshot. Timeline reads project it to `TurnExecutionAttributionView`;
+  generated TypeScript and remote/Desktop payloads never contain binding ids, generations, native ids, adapter ids,
+  credentials, commands, endpoints, or raw provider metadata.
+- The field is nullable and omitted from serialized legacy timeline JSON. Existing rows and non-Agent items remain
+  readable without inventing a source. Labels and Model ids are trimmed, non-empty, UTF-8-safe, and byte-bounded.
+- Provider-correlation coalescing compares the complete stored snapshot before update. It never overwrites, adopts, or
+  drops attribution from a different attempt.
+- Canonical `FileOperation`, `Command`, `WebSearch`, `TodoUpdate`, `Collaboration`, `ImageGeneration`, and `Permission`
+  payloads remain unchanged; attribution is Timeline metadata, not a replacement event or generic ToolCall payload.
+
+### 4. Validation & Error Matrix
+
+- Missing/invalid profile or Agent definition while creating a proved attribution -> structured
+  `turn_execution_profile_missing`, `turn_execution_agent_missing`, or `turn_execution_attribution_invalid`; no prompt
+  admission.
+- ACP send without a prepared identity -> `turn_execution_identity_missing`; no active turn, prompt, permission, or
+  timeline side effect.
+- Binding, generation, or effective Model changed after prepare -> `turn_execution_identity_mismatch`; no active turn,
+  prompt, permission, or timeline side effect.
+- Effective ACP Model not provable or changed after prepare -> `turn_execution_identity_mismatch`; no provider turn
+  starts and attribution is never guessed from UI state.
+- Coalesced event attribution differs from stored audit JSON, including `Some` versus `None` ->
+  `turn_execution_attribution_conflict`; existing row remains unchanged.
+- Old/NULL attribution row -> safe `None` projection and legacy rendering.
+
+### 5. Good/Base/Bad Cases
+
+- Good: ACP prepare restores a session, snapshots binding generation 4 and effective Model A, then every streamed and
+  final item retains that source after the user switches to Model B.
+- Good: a streamed delta is persisted and the provider then fails; the single terminal error carries the same safe
+  attribution as the delta, and the manager does not replay the turn through failover.
+- Base: a historical timeline row with no attribution remains fully readable/renderable; new online turns do not use
+  that nullable legacy shape as execution authority.
+- Bad: `send_turn` calls attachment restore again with the pre-prepare binding, or a coalescing update adds attribution
+  to an old un-attributed item.
+- Bad: the public Timeline serializes `bindingId`, `activationGeneration`, native session ids, adapter identity, or
+  secret-bearing profile configuration.
+
+### 6. Tests Required
+
+- Core tests cover bounded construction, deserialize revalidation, legacy omission, and safe JSON projection with no
+  internal fence fields.
+- DB tests cover migration/NULL compatibility, complete audit round-trip, safe read projection, coalescing stability,
+  and mismatch rejection without mutation.
+- Manager tests cover one attribution across streamed/final/error items, exactly one terminal error, stable profile
+  labels, and no binding/generation leak in Timeline JSON.
+- ACP mock tests cover Claude/Codex managed routes, selected/default/provable Model rules, prepare/restore, stale
+  generation rejection before prompt admission, and normal restore/fresh behavior.
+- Canonical event golden tests remain exhaustive for semantic variants. Run workspace check/test, bindings generation
+  and drift check, frontend typecheck/lint/build, fmt, clippy, and Trellis validation.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+send prompt -> read current Composer/profile/model -> tag returned events
+late event -> coalesce and overwrite whichever attribution is stored
+```
+
+#### Correct
+
+```text
+prepare committed execution identity
+  -> build one bounded audit snapshot
+  -> send revalidates fence under prompt-admission lock
+  -> persist the same snapshot on every output item
+  -> project only safe labels to clients
+  -> reject conflicting coalescing updates
+```
+
+## Scenario: Durable Ordinary Message Submission And Current-Binding Fence
+
+### 1. Scope / Trigger
+
+- Trigger: Desktop or Remote submits an ordinary message to an ACP Logical
+  Session, retries that action, changes the desired runtime between queued
+  messages, disconnects while waiting, or restarts after prompt admission.
+- `crates/core` owns the provider-neutral request/query contract, `crates/db`
+  owns enqueue/sequence/result transactions, `crates/agent` owns ordered
+  workers and prompt admission, and ACP owns the final attachment fence.
+
+### 2. Signatures
+
+```text
+SendAgentMessageRequest {
+  sessionId, messageIdempotencyKey, desiredRuntime,
+  text, attachments, reasoningEffort, correlationId
+}
+GetMessageSubmissionRequest { sessionId, messageIdempotencyKey }
+MessageSubmissionCoordinator::{submit, get_submission, reconcile_on_startup}
+ProviderTurnRequest::{message_submission_id, required_runtime, execution_identity}
+AcpSendTurnRequest::{message_submission_id, required_runtime, execution_identity}
+
+agent_message_submission_payloads(
+  payload_reference, submission_id, session_id, submission_sequence,
+  payload_json, result_first_sequence, result_last_sequence,
+  created_at_ms, updated_at_ms
+)
+```
+
+### 3. Contracts
+
+- Enqueue stores the submission and isolated payload in one immediate SQLite
+  transaction. Exact `(session, key, payload, desiredRuntime)` retries reuse
+  one row and sequence; a different payload with the same key is a conflict.
+- One detached worker processes only the earliest nonterminal sequence for a
+  session. Caller cancellation never owns worker cancellation; different
+  sessions may drain concurrently.
+- Dispatch requires authoritative selection status `Ready` and
+  `effective == desiredRuntime`. A linked cancelled switch cancels only
+  Awaiting/Ready rows. Failed, superseded, or ambiguous preparation never
+  falls back to the previous runtime.
+- A previous switch failure may be cleared before enqueue only by successful
+  lifecycle materialization of the exact DB-current binding and activation
+  generation. The recovery CAS also requires `desired == effective`, no
+  pending switch, and a Current binding row; it does not relax the Ready gate
+  or route a queued submission as fallback.
+- The selection snapshot and linked switch status are separate reads. If the switch
+  is observed `Committed` after an earlier non-ready snapshot, reread authoritative
+  selection before classifying the submission: advance to Ready when the fresh state
+  is Ready/effective at the requested runtime, and fail only when that fresh state
+  still diverges.
+- `ReadyToDispatch -> AboutToPrompt` is the durable no-replay boundary. The
+  manager creates the user Timeline item only after that CAS, immediately
+  before provider admission. Success stores the user item and Timeline range
+  atomically with `Dispatched`, then advances to `Completed`.
+- After claiming the session `Running`, a durable ACP turn rereads the DB
+  runtime state and current `RuntimeBinding`. It must match desired/effective,
+  Ready, no pending switch, Agent/Profile/Model/Effort/Mode, binding state,
+  activation generation, and applied-generation evidence. The manager builds
+  a temporary provider binding from that current row; it must not use the
+  session DTO, import provenance, or caller payload as execution authority.
+- ACP prepare and send both require the current committed attachment to match
+  the binding id, activation generation, enabled Profile/Agent, effective
+  config, and applied generation. Durable prepare never calls
+  `ensure_attachment`; a missing or replaced attachment fails closed.
+- Durable turns have no automatic Profile failover, streamed/final binding
+  authority update, legacy history bridge, alternate direct dispatch, or
+  ProviderKind routing fallback. Those paths could silently redirect a
+  captured turn after admission.
+- Every ordinary message, including Claude/Codex, requires the installed
+  coordinator. A dropped coordinator fails closed without a direct dispatch or
+  user Timeline fallback.
+- An error after `AboutToPrompt` without a complete durable result fence is
+  `AmbiguousPromptDispatch`; startup never calls the provider again. Completed
+  retries reconstruct the response from the durable Timeline range.
+- Prompt text, attachments, payload references, provider/native ids, tokens,
+  workspace paths, and idempotency key values do not appear in Debug, tracing,
+  errors, or public submission projections beyond the query contract's key.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Empty, oversized, or control-character message key | `message_submission_idempotency_key_required` / `_invalid`; zero writes. |
+| Same key with another payload/runtime | `message_submission_idempotency_payload_conflict`; no second sequence or prompt. |
+| Request effort differs from desired runtime | `message_submission_runtime_config_mismatch`; zero enqueue. |
+| Runtime gate changes before manager admission | `message_submission_runtime_gate_changed`; no provider call. |
+| Old `FailedUsingPrevious` state retries the already effective selection and exact current runtime materializes successfully | CAS the selection to `Ready`, clear only the session projection error, and retain the failed switch journal. |
+| Linked switch commits between selection and switch reads | Reread selection; dispatch once if it converged, otherwise `message_submission_runtime_changed_after_commit`. |
+| Current binding missing, stale, non-current, or config/generation mismatch | `message_submission_runtime_binding_*`; no provider call. |
+| Current committed ACP attachment missing or mismatched | `turn_execution_identity_mismatch`; no `session/prompt`. |
+| Installed ACP coordinator weak reference cannot upgrade | `message_submission_coordinator_unavailable`; no direct fallback or user Timeline item. |
+| Provider/receipt uncertainty after AboutToPrompt | `message_submission_prompt_dispatch_ambiguous`; never replay automatically. |
+| Startup sees AboutToPrompt with complete result fence | Advance Dispatched then Completed without provider work. |
+
+### 5. Good/Base/Bad Cases
+
+- Good: a ForceFresh switch retains an inactive source RuntimeBinding, but
+  durable send prompts only the DB-current target attachment once.
+- Good: two queued messages with different desired runtimes switch and prompt
+  in sequence; dropping either caller does not stop the worker.
+- Base: a Claude or Codex ACP session with no explicit Effort/Mode uses the
+  Adapter-converged defaults and still dispatches through the exact current
+  binding once.
+- Bad: call `ensure_attachment` from durable prepare using the old request
+  binding, auto-fail over to another Profile, or replace durable current
+  authority with an adapter-local binding.
+- Bad: classify an unknown post-prompt error as Failed and resend on startup.
+
+### 6. Tests Required
+
+- Core tests cover serde fields and Debug redaction for send/query/state.
+- DB tests cover atomic enqueue, exact conflict, sequence ordering, switch
+  cancellation, CAS transitions, dispatch-result transaction, and range load.
+- Coordinator tests cover concurrent same-key submit, caller drop, per-session
+  order, cross-session parallelism, desired gate, terminal switch outcomes,
+  committed-switch selection-read races, AboutToPrompt ambiguity, and result-fenced
+  recovery.
+- Manager/ACP tests cover dropped-coordinator fail-closed, no durable
+  failover/history bridge/binding update, prepare/send identity mismatch, and
+  ForceFresh dispatch exclusively to the current target native session.
+- Selection-service/ACP-lifecycle/DB tests cover healing stale
+  `FailedUsingPrevious` through same-selection retry only after the exact
+  current attachment activates; Ready same-selection remains a no-op, while
+  mismatched fences and divergent desired state remain non-Ready.
+- Remote/Desktop tests and checks cover canonical request/query serialization,
+  authorization, production coordinator reuse, bindings drift, frontend
+  typecheck/build, workspace tests, fmt, clippy, and Trellis validation.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+Composer switch -> await switch -> manager reads legacy session binding
+  -> ensure/restore attachment -> prompt -> retry unknown failures
+```
+
+#### Correct
+
+```text
+enqueue payload + desired runtime
+  -> ordered worker makes effective == desired
+  -> CAS AboutToPrompt
+  -> manager rereads DB current binding/generation/config
+  -> ACP revalidates current committed attachment under admission lock
+  -> prompt once -> atomically persist Timeline result fence
+  -> unknown post-boundary outcome stays Ambiguous
+```
+
+## Scenario: Hidden Context Bridge Injection And Success-Only Cursor Commit
+
+### 1. Scope / Trigger
+
+- Trigger: the first durable ordinary message reaches a DB-current ACP binding
+  with a pending incremental Context Bridge, or any later completed durable turn
+  must advance that binding's consumed Timeline cursor.
+- The bridge is internal provider continuity data. It is not a public Timeline,
+  Remote, Desktop, or generated TypeScript contract.
+
+### 2. Signatures
+
+```text
+PreparedContextBridge::provider_text(current_user_text) -> provider_text
+ContextBridgeService::pending_for_turn(
+  session_id, binding_id, activation_generation,
+) -> Option<PreparedContextBridge>
+ContextBridgeRepository::record_successful_turn(
+  session_id, binding_id, activation_generation,
+  submission_id, consumed_context_sequence,
+) -> Option<ContextBridgeRecord>
+ProviderTurnResult { events, binding_update, completed }
+```
+
+### 3. Contracts
+
+- After the durable current-binding/config fence and before appending the user
+  Timeline item, the manager loads at most one pending bridge, rebuilds its exact
+  stored window, and verifies version, summary sequence, and SHA-256 fingerprint.
+- Version 1 projection is deterministic and bounded. Priority is older-turn
+  rolling summary, recent final User/Assistant turns, latest Todo state,
+  unfinished Plan, deduplicated key files, then bounded tool/command/web result
+  summaries. Budget reduction drops low-priority and older entries first.
+- Always exclude reasoning, deltas, permissions, attachments/image references,
+  raw extensions, ToolCall input/native ids, command text/cwd/full output,
+  FileOperation old/new text, and Redacted items. Sanitize remaining text for
+  credential assignments/tokens, private home paths, `.env`, credential files,
+  and private-key/certificate paths before hashing or rendering.
+- Only provider text receives `VIBEX_CONTEXT_BRIDGE_*` and current-message
+  delimiters. The current user text inside that prefix is not trimmed or
+  rewritten. The authoritative UserMessage stores the exact original text and
+  attachments; no bridge/system item is appended to the public Timeline.
+- `ProviderTurnResult.completed == true` and persisted provider events are
+  prerequisites for cursor commit. Provider errors, cancellation, stale fences,
+  fingerprint mismatch, and `completed == false` (including unresolved
+  permission) leave every cursor and pending attempt unchanged.
+- A completed durable turn atomically rechecks session current binding plus
+  activation generation, monotonically advances `last_context_sequence`, and,
+  when pending, advances summary/version, marks the attempt applied, and appends
+  one audit-only `ContextBridgeApplied` event. Completed turns without a pending
+  bridge still advance `last_context_sequence`.
+- Debug, errors, bridge metadata, runtime-switch events, and submission
+  projections expose no bridge body, prompt, fingerprint, secret, native id, or
+  private database path.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Binding/session/generation is stale before prompt | `context_bridge_turn_binding_stale`; no UserMessage/provider call. |
+| Pending metadata does not match binding cursors/version | `context_bridge_record_mismatch`; no provider call. |
+| Timeline rebuild differs from durable fingerprint | `context_bridge_snapshot_changed`; no provider call. |
+| Completed result sequence is before prepared window | `context_bridge_consumed_sequence_invalid`; transaction rollback. |
+| Current pointer/generation changes before commit | `context_bridge_turn_fence_stale`; no cursor/apply event. |
+| Provider returns error or `completed=false` | persist normal allowed Timeline state, but keep bridge pending and cursors unchanged. |
+
+### 5. Good/Base/Bad Cases
+
+- Good: provider receives bounded continuity plus the exact current message;
+  clients see only the original UserMessage and normal provider events.
+- Good: an unresolved permission produces NeedsInput while the bridge stays
+  pending; no cursor claims that the turn completed.
+- Base: a completed turn with no pending bridge advances only the context
+  cursor; an equal/lower retry is a zero-write no-op.
+- Bad: mark the bridge applied when `session/prompt` returns an incomplete
+  permission state, or write the rendered prefix into Timeline/audit/Debug.
+- Bad: advance only through `prepare_sequence` and omit the successful turn's
+  own User/Assistant sequences, causing them to replay after switching back.
+
+### 6. Tests Required
+
+- Builder tests cover deterministic priority/budgets/dedupe and leakage for
+  secrets, private paths, Redacted items, reasoning/deltas, attachment/image
+  references, raw extensions, file old/new text, command input/full output, and
+  duplicate tool events.
+- Manager/ACP tests assert hidden provider prefix, exact public UserMessage,
+  successful atomic apply, normal no-pending advancement, stale fence rollback,
+  provider-error no progress, and unresolved-permission no progress.
+- Integration tests assert ForceFresh first-turn apply and A -> B -> A no
+  duplicate replay. Debug/error/audit JSON scans must not find bridge content.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+append bridge as a SystemMessage
+send prompt -> immediately advance cursor
+permission pending -> mark attempt applied
+```
+
+#### Correct
+
+```text
+verify pending bridge under current binding fence
+  -> prefix provider text only
+  -> persist original UserMessage and provider events
+  -> require completed=true
+  -> atomically recheck fence, advance cursors, apply attempt, append audit event
+```

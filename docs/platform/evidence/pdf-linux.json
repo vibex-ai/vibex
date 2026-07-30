@@ -1,0 +1,255 @@
+{
+  "schemaVersion": "pdf-linux-evidence.v1",
+  "status": "partial",
+  "capturedAt": "2026-07-19T08:24:08.736Z",
+  "source": {
+    "vibexBaselineCommit": "f1c624f115401d6160a771545fa1ec73128394b1",
+    "captureParentCommit": "1f51f0dbd31c7bdb990b87b1143fd7630f864031",
+    "rustToolchain": "rustc 1.97.0 (2d8144b78 2026-07-07) (Arch Linux rust 1:1.97.0-1)",
+    "lockfileSha256": "7a5488b1882681707399417335bf61343f78b9afaa9fbe054a41c3c98c5db959",
+    "sourceInputRoots": [
+      "Cargo.lock",
+      "Cargo.toml",
+      "rust-toolchain.toml",
+      "apps/desktop/Cargo.toml",
+      "apps/desktop/src",
+      "docs/licenses/pdfium-7881-review.json",
+      "docs/platform/fixtures/pdf-feasibility.pdf",
+      "scripts/generate-pdf-fixture.mjs",
+      "scripts/capture-pdf.mjs"
+    ],
+    "sourceInputTreeSha256": "3d131e5743c3bdc9c689579ca89f8077dca70c6ecaee796f77768f3d513480f1"
+  },
+  "runner": {
+    "platform": "linux",
+    "architecture": "x86_64",
+    "syntheticDocument": true,
+    "displayRequired": false,
+    "systemPopplerUsed": false
+  },
+  "nativeInput": {
+    "target": "linux-x86_64",
+    "release": "chromium/7881",
+    "asset": "pdfium-linux-x64.tgz",
+    "archiveSha256": "1470e21b8b4a3b4ad7f85684e2da11d94f3b69a86d81dee11b9b6709d927ac1d",
+    "archiveBytes": 3644759,
+    "librarySha256": "f728930966f503652b92acc89b9374a2eeca00ce42e26dccd3e4b5c5161b2d64",
+    "libraryBytes": 7645184,
+    "runtimeDependencies": [
+      "libpthread",
+      "libm",
+      "libgcc_s",
+      "libc"
+    ]
+  },
+  "run": {
+    "schemaVersion": "vibex-pdf-feasibility-run.v1",
+    "status": "passed",
+    "platform": "linux",
+    "architecture": "x86_64",
+    "engine": {
+      "wrapper": "pdfium-render",
+      "wrapperVersion": "0.9.3",
+      "pdfiumVersion": "7881",
+      "binding": "explicit-dynamic-library",
+      "processModel": "in-process-native-library",
+      "childProcessesStarted": 0
+    },
+    "fixture": {
+      "bytes": 246256,
+      "sha256": "5eee17047b63701cff30656d9f044cd6d205c175275d02429177294012ccde89",
+      "pageCount": 12,
+      "cjkTextExtracted": true,
+      "embeddedFontMarkerPresent": true
+    },
+    "rendering": {
+      "fit": {
+        "width": 960,
+        "height": 1358,
+        "rgbaBytes": 5214720,
+        "rgbaSha256": "d141d7d28a8c8cc3c8eb107c0f0da10cbdf251239b51a27674b805c5d2a761ad",
+        "sampledUniqueColors": 400,
+        "elapsedMs": 144.129815
+      },
+      "zoom150Percent": {
+        "width": 1440,
+        "height": 2038,
+        "rgbaBytes": 11738880,
+        "rgbaSha256": "c5039cb1d068495452f7edf6ef28665fd5215092da53abdab67f7c820d8fb5c7",
+        "sampledUniqueColors": 375,
+        "elapsedMs": 310.204762
+      },
+      "aspectRatioPreserved": true,
+      "distinctZoomOutput": true,
+      "previewRawRgbaWritten": true
+    },
+    "virtualization": {
+      "strategy": "visible-two-pages-plus-one-page-overscan-lru",
+      "visiblePages": 2,
+      "overscanPagesPerSide": 1,
+      "cacheBudgetBytes": 25165824,
+      "viewportSteps": 24,
+      "renderRequests": 88,
+      "cacheHits": 44,
+      "cacheMisses": 44,
+      "evictions": 40,
+      "maximumResidentPages": 4,
+      "maximumResidentBytes": 20858880,
+      "cacheBudgetRespected": true
+    },
+    "errorHandling": {
+      "invalidDocumentRejected": true,
+      "loadingErrorIsStructured": true
+    },
+    "memory": {
+      "currentRssBeforeKib": 23728,
+      "currentRssAfterKib": 79588,
+      "processPeakRssKib": 79588,
+      "measurementSource": "proc-self-status"
+    },
+    "privacy": {
+      "documentTextStored": false,
+      "nativeLibraryPathStored": false,
+      "fixturePathStored": false
+    }
+  },
+  "process": {
+    "measurement": "proc-self-status-vmhwm",
+    "maximumResidentSetKib": 79588,
+    "processTreeMembers": 1,
+    "childProcessesObserved": 0
+  },
+  "preview": {
+    "path": "docs/parity/screenshots/current/spikes/linux-pdfium-page-1.png",
+    "bytes": 95668,
+    "sha256": "82207e83bf96df1bc8bd79b595ecc2aa972ee6d5b77a4b788fcaf6b54f9aa239",
+    "width": 960,
+    "height": 1358,
+    "uniqueColors": 1513,
+    "entropy": 0.12273
+  },
+  "licenseReview": {
+    "path": "docs/licenses/pdfium-7881-review.json",
+    "status": "approved_for_linux_distribution",
+    "prohibitedGplOrAgplComponentDetected": false,
+    "unapprovedExpressions": [],
+    "productionPolicyModified": true,
+    "nativeBinaryRegisteredForDistribution": true,
+    "registeredTargets": [
+      "linux-x86_64"
+    ]
+  },
+  "webviewComparison": {
+    "status": "deferred_by_user_request",
+    "tested": false,
+    "inferredResult": null
+  },
+  "capabilityDisposition": {
+    "pageListAndScroll": "passed_by_bounded_virtualization_model",
+    "zoomAndFit": "passed",
+    "loadingAndError": "passed",
+    "systemOpen": "retained_platform_shell_requirement_not_engine_dependent",
+    "searchAnnotationsAndForms": "outside_current_parity_scope"
+  },
+  "claims": [
+    {
+      "id": "native_pdfium_bind",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "page_render",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "cjk_embedded_font",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "zoom_and_fit",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "page_virtualization",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "bounded_decode_cache",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "invalid_document_error",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "linux_process_memory",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "native_distribution_license_review",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "macos_windows_native_runtime",
+      "status": "blocked",
+      "decisionBearing": true,
+      "blocker": {
+        "code": "hosted-pdfium-runtime-not-run",
+        "owner": "desktop-platform",
+        "detail": "Pinned native archive identities exist, but macOS and Windows runtime rendering has not run."
+      }
+    },
+    {
+      "id": "webview_pdf_comparison",
+      "status": "deferred_by_user_request",
+      "decisionBearing": false,
+      "blocker": null
+    }
+  ],
+  "summary": {
+    "passedClaims": 9,
+    "blockedClaims": 1,
+    "deferredClaims": 1,
+    "technicalRouteProvenOnLinux": true,
+    "pdfGateSatisfied": false
+  },
+  "recommendation": {
+    "route": "pdfium-native-linux",
+    "selectedForProduction": true,
+    "productionTargets": [
+      "linux-x86_64"
+    ],
+    "deferredTargets": [
+      "macos-x86_64",
+      "macos-aarch64",
+      "windows-x86_64"
+    ],
+    "compressedNativeInputBytes": 3644759,
+    "installedNativeLibraryBytes": 7645184,
+    "cacheBudgetBytes": 25165824,
+    "productionEstimateEngineerWeeks": {
+      "min": 2,
+      "max": 4
+    },
+    "prerequisites": [
+      "hosted macOS and Windows headless render probes"
+    ]
+  }
+}

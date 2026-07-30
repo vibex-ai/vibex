@@ -1,0 +1,43 @@
+{
+  "candidateStatus": "importable",
+  "continuationReason": null,
+  "continuationStatus": "resumable",
+  "diagnosticCodes": [],
+  "items": [
+    {
+      "payload": {
+        "data": {
+          "attachments": [],
+          "text": "Summarize the repository layout"
+        },
+        "type": "user_message"
+      },
+      "providerCorrelationId": "item-user-1",
+      "source": "user"
+    },
+    {
+      "payload": {
+        "data": {
+          "isFinal": true,
+          "text": "Check the crates directory first"
+        },
+        "type": "reasoning"
+      },
+      "providerCorrelationId": "item-reasoning-1",
+      "source": "agent"
+    },
+    {
+      "payload": {
+        "data": {
+          "isFinal": true,
+          "text": "The workspace contains agent crates plus a shared core crate."
+        },
+        "type": "agent_message"
+      },
+      "providerCorrelationId": "item-assistant-1",
+      "source": "agent"
+    }
+  ],
+  "nativeThreadId": "codex-thread-parity-1",
+  "workspaceRoot": "/home/user/workspace/demo"
+}

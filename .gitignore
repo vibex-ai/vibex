@@ -1,0 +1,33 @@
+/target/
+node_modules/
+dist/
+apps/*/dist/
+apps/mobile/android/
+apps/mobile/ios/
+apps/mobile/artifacts/
+crates/core/bindings/
+*.tsbuildinfo
+.idea/
+/.vibex/
+/.pnpm-store/
+/coverage/
+*.log
+*.tmp
+*.db
+*.db-shm
+*.db-wal
+
+# Local controlled-environment E2E state (credentials, harness homes, relay logs)
+.e2e-local-env/
+
+# Private Trellis task tree. These paths live in the working tree but belong to a
+# separate task repository (git dir .trellis/.taskgit, work tree .trellis).
+# The rules must stay in THIS file rather than .trellis/.gitignore: the task
+# repository's work tree starts at .trellis/, so it never reads this file, while
+# a .gitignore inside .trellis/ would hide the very files it has to track.
+/.trellis/tasks/
+/.trellis/research/
+/.trellis/workspace/*/
+/.trellis/.current-task
+/.trellis/.runtime/
+/.trellis/.taskgit/

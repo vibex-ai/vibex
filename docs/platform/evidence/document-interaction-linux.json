@@ -1,0 +1,113 @@
+{
+  "schemaVersion": "document-interaction-linux-evidence.v1",
+  "status": "passed",
+  "capturedAt": "2026-07-25T10:45:58.859Z",
+  "source": {
+    "captureParentCommit": "f4d6fbe169ca28d511d8cde100265f7a83f5380f",
+    "rustToolchain": "rustc 1.97.0 (2d8144b78 2026-07-07)",
+    "lockfileSha256": "4d7403b1d03a19381c6c30f7527bbbca9883518b8d562ac559c1582d33da367c",
+    "sourceInputRoots": [
+      "Cargo.lock",
+      "Cargo.toml",
+      "apps/desktop/Cargo.toml",
+      "apps/desktop/src/document_interaction.rs",
+      "apps/desktop/src/main.rs",
+      "apps/desktop/src/office_surface.rs",
+      "apps/desktop/src/pdf_controller.rs",
+      "apps/desktop/src/pdf_surface.rs",
+      "apps/desktop/src/pdf_worker.rs",
+      "crates/content/Cargo.toml",
+      "crates/content/src/lifecycle.rs",
+      "crates/content/src/office.rs",
+      "crates/content/src/pdf.rs",
+      "scripts/capture-document-interaction-linux.mjs",
+      "scripts/generate-office-fixtures.mjs",
+      "scripts/generate-pdf-fixture.mjs"
+    ],
+    "sourceInputTreeSha256": "3ca1ca4490c8b27ec13fe163941320d58075ef75f093ad7afb339cefafca7787"
+  },
+  "runner": {
+    "platform": "linux",
+    "architecture": "x64",
+    "displayBackend": "wayland-hyprland",
+    "syntheticDisplay": false,
+    "activeMonitorObserved": true
+  },
+  "window": {
+    "identity": "dev.vibex.desktop.preview",
+    "xwayland": false,
+    "monitorId": 0,
+    "width": 1200,
+    "height": 900
+  },
+  "fixtures": {
+    "pdf": {
+      "bytes": 246256,
+      "sha256": "5eee17047b63701cff30656d9f044cd6d205c175275d02429177294012ccde89"
+    },
+    "office": {
+      "bytes": 1149,
+      "sha256": "316464c27cb98b487f71f957fbcaabf9fd2033f1686169fa8bc7bf4fdbc00785"
+    }
+  },
+  "capture": {
+    "screenshotPath": "docs/parity/screenshots/current/native-content/linux-wayland-pdf-office.png",
+    "screenshotSha256": "4f37c801fc58bbbe05a6aa13d3fcd01ebda8ecf40dadb61ecbd1cadc4c627a02",
+    "interactionState": {
+      "currentPage": 2,
+      "zoomLabel": "Fit width",
+      "officeVisible": true
+    },
+    "pdfRegion": {
+      "x": 150,
+      "y": 220,
+      "width": 570,
+      "height": 640,
+      "uniqueColors": 1515,
+      "entropy": 0.303624,
+      "standardDeviation": 0.173592
+    }
+  },
+  "run": {
+    "schemaVersion": "document-interaction-run.v1",
+    "status": "passed",
+    "pdf": {
+      "pageCount": 12,
+      "currentPage": 1,
+      "zoomLabel": "125%",
+      "renderedPages": 3,
+      "nextPageCommandObserved": true,
+      "zoomCommandObserved": true,
+      "workerActive": false
+    },
+    "office": {
+      "initialKind": "docx",
+      "initialVisibleItems": 3,
+      "initialResidentItems": 5,
+      "initialResidentBytes": 1059,
+      "systemOpenAvailable": true,
+      "closeCommandObserved": true,
+      "finalResidentItems": 0,
+      "finalResidentBytes": 0
+    },
+    "privacy": {
+      "documentPathsStored": false,
+      "pdfContentStored": false,
+      "officeContentStored": false
+    }
+  },
+  "process": {
+    "processExited": true,
+    "appExitCode": 0,
+    "panicMentioned": false
+  },
+  "privacy": {
+    "documentPathsStored": false,
+    "pdfContentStored": false,
+    "officeContentStored": false
+  },
+  "limitations": [
+    "Physical Wayland only; X11 remains untested.",
+    "The Office physical slice uses DOCX; XLSX, ODS, and PPTX remain controller-tested."
+  ]
+}

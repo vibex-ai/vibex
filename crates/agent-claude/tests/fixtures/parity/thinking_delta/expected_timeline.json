@@ -1,0 +1,26 @@
+{
+  "events": [
+    {
+      "payload": {
+        "data": {
+          "isFinal": false,
+          "text": "Consider the request first."
+        },
+        "type": "reasoning"
+      },
+      "providerCorrelationId": null,
+      "source": "agent"
+    },
+    {
+      "payload": {
+        "data": {
+          "isFinal": false,
+          "text": " Then draft the answer."
+        },
+        "type": "reasoning"
+      },
+      "providerCorrelationId": null,
+      "source": "agent"
+    }
+  ]
+}

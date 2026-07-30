@@ -1,0 +1,19 @@
+[package]
+name = "vibex-backup"
+version = "0.1.0-rc.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+rusqlite = { version = "0.37", features = ["bundled"] }
+vibex-core = { path = "../core" }
+vibex-db = { path = "../db" }
+
+[[bin]]
+name = "vibex-backup-restore-smoke"
+path = "src/bin/vibex-backup-restore-smoke.rs"

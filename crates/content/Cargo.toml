@@ -1,0 +1,18 @@
+[package]
+name = "vibex-content"
+version = "0.1.0-rc.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pdfium-render.workspace = true
+quick-xml.workspace = true
+sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+vibex-core = { path = "../core" }
+vibex-terminal = { path = "../terminal" }
+zip.workspace = true

@@ -1,0 +1,11 @@
+{
+  "capability": "interrupt",
+  "mode": "meta_only",
+  "source": "observation snapshot 2026-07-11",
+  "sdk": "offline compatibility metadata",
+  "recorded_at": "2026-07-11",
+  "known_defects": [
+    "The historical pre-cutover baseline did not retain an interrupt-capable runtime handle."
+  ],
+  "notes": "Retained only as offline evidence. Online interrupt is exclusively the durable managed ACP attachment cancel path."
+}

@@ -1,0 +1,49 @@
+{
+  "events": [
+    {
+      "payload": {
+        "data": {
+          "inputSummary": "{}",
+          "outputSummary": null,
+          "status": "started",
+          "summary": "Claude tool call",
+          "toolCallId": "toolu_parity_02",
+          "toolName": "Write"
+        },
+        "type": "tool_call"
+      },
+      "providerCorrelationId": null,
+      "source": "agent"
+    },
+    {
+      "payload": {
+        "data": {
+          "inputSummary": "{}{\"file_path\":\"/home/user/demo.txt\"",
+          "outputSummary": null,
+          "status": "progress",
+          "summary": "Claude tool input",
+          "toolCallId": "toolu_parity_02",
+          "toolName": "Write"
+        },
+        "type": "tool_call"
+      },
+      "providerCorrelationId": null,
+      "source": "agent"
+    },
+    {
+      "payload": {
+        "data": {
+          "inputSummary": "{}{\"file_path\":\"/home/user/demo.txt\",\"content\":\"hello\"}",
+          "outputSummary": null,
+          "status": "progress",
+          "summary": "Claude tool input",
+          "toolCallId": "toolu_parity_02",
+          "toolName": "Write"
+        },
+        "type": "tool_call"
+      },
+      "providerCorrelationId": null,
+      "source": "agent"
+    }
+  ]
+}

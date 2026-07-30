@@ -1,0 +1,11 @@
+{
+  "capability": "file_attachment",
+  "mode": "meta_only",
+  "source": "observation snapshot 2026-07-11",
+  "sdk": "offline compatibility metadata",
+  "recorded_at": "2026-07-11",
+  "known_defects": [
+    "This historical baseline projected attachments as local-file references instead of structured multimodal content."
+  ],
+  "notes": "Retained only as offline pre-cutover evidence. Online attachment behavior is owned by the managed Claude ACP Adapter and canonical Agent attachment tests."
+}

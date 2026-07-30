@@ -1,0 +1,26 @@
+[workspace]
+members = [
+  "apps/relay-server",
+  "crates/core",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+repository = "https://github.com/vibex-ai/vibex"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["serde", "v4"] }
+axum = { version = "0.8", features = ["ws"] }
+futures-util = "0.3"
+reqwest = { version = "0.13.4", features = ["json"] }
+sha2 = "0.10"
+tower = { version = "0.5", features = ["util"] }
+tokio-tungstenite = "0.28"

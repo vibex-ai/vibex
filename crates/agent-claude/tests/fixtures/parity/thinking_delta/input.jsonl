@@ -1,0 +1,4 @@
+{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
+{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Consider the request first."}}
+{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":" Then draft the answer."}}
+{"type":"content_block_stop","index":0}

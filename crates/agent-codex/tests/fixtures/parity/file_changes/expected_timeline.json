@@ -1,0 +1,40 @@
+{
+  "events": [
+    {
+      "payload": {
+        "data": {
+          "operation": "edit",
+          "path": "src/lib.rs",
+          "summary": "Codex file change: Completed"
+        },
+        "type": "file_operation"
+      },
+      "providerCorrelationId": null,
+      "source": "agent"
+    },
+    {
+      "payload": {
+        "data": {
+          "operation": "write",
+          "path": "src/new_module.rs",
+          "summary": "Codex file change: Completed"
+        },
+        "type": "file_operation"
+      },
+      "providerCorrelationId": null,
+      "source": "agent"
+    },
+    {
+      "payload": {
+        "data": {
+          "operation": "delete",
+          "path": "src/legacy.rs",
+          "summary": "Codex file change: Completed"
+        },
+        "type": "file_operation"
+      },
+      "providerCorrelationId": null,
+      "source": "agent"
+    }
+  ]
+}

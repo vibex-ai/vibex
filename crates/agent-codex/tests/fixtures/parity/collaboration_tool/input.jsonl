@@ -1,0 +1,1 @@
+{"type":"collabToolCall","id":"item_collab_1","tool":"spawn_agent","status":"completed","senderThreadId":"thread_parity_a","newThreadId":"thread_parity_b","prompt":"Review the diff in src/lib.rs","agentStatus":"done"}

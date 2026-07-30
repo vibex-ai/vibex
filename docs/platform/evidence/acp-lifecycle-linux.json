@@ -1,0 +1,126 @@
+{
+  "schemaVersion": "acp-lifecycle-evidence.v1",
+  "status": "passed",
+  "capturedAt": "2026-07-18T11:23:52.853Z",
+  "source": {
+    "vibexBaselineCommit": "f1c624f115401d6160a771545fa1ec73128394b1",
+    "captureParentCommit": "65efcb3ee74e711bb9d25ca0f55af7b36dc3b0c8",
+    "zedRevision": "819fe337999551ce8177b14c8db1127645617ae4",
+    "gpuiComponentRevision": "3c270ed244d06fb211b47f156761c1d833eac535",
+    "rustToolchain": "rustc 1.97.0 (2d8144b78 2026-07-07) (Arch Linux rust 1:1.97.0-1)",
+    "lockfileSha256": "6bafd6ea8d8aa706f6a51a01d7884c6f00209247b716f5cb6ba4e4b8a3aa80a4",
+    "sourceInputRoots": [
+      "Cargo.lock",
+      "Cargo.toml",
+      "rust-toolchain.toml",
+      "apps/desktop/Cargo.toml",
+      "apps/desktop/src",
+      "crates/agent/Cargo.toml",
+      "crates/agent/src",
+      "crates/agent-acp/Cargo.toml",
+      "crates/agent-acp/src",
+      "crates/config-switch/Cargo.toml",
+      "crates/config-switch/src",
+      "crates/core/Cargo.toml",
+      "crates/core/src",
+      "scripts/capture-acp-lifecycle.mjs"
+    ],
+    "sourceInputTreeSha256": "c17f518b9e0ccf330164fe5fee5e09b0e4b628d3329b2f1fa2a48c3d2bc5be94"
+  },
+  "artifact": {
+    "path": "target/debug/vibex-desktop",
+    "bytes": 1029069440,
+    "sha256": "228b6cf10a941c777eb4238182eefff085db0ef206221c3f3ee7fd709cd0ecbb"
+  },
+  "runner": {
+    "platform": "linux",
+    "architecture": "x64",
+    "kernelRelease": "7.1.3-arch1-3",
+    "displayBackend": "wayland-hyprland",
+    "compositor": "Hyprland",
+    "syntheticDisplay": false,
+    "monitor": {
+      "width": 2560,
+      "height": 1440,
+      "refreshRateHz": 59.951,
+      "scaleFactor": 1,
+      "transform": 0
+    }
+  },
+  "window": {
+    "identity": "dev.vibex.desktop.preview",
+    "discovered": true,
+    "xwayland": false,
+    "width": 1200,
+    "height": 780
+  },
+  "capture": {
+    "screenshotPath": "docs/parity/screenshots/current/spikes/linux-wayland-acp-lifecycle.png",
+    "screenshotSha256": "420923f934c7b9df9a1f028abcac03370f217e8e212002896a12a6285105543b",
+    "width": 1200,
+    "height": 780,
+    "uniqueColors": 3982,
+    "entropy": 0.0224445,
+    "mean": 0.980437,
+    "standardDeviation": 0.0457635
+  },
+  "process": {
+    "providerProcessObserved": true,
+    "observedProviderProcessCount": 1,
+    "observedProviderProcessesExited": true,
+    "unexpectedProviderProcessesAfterExit": 0,
+    "appExitCode": 0,
+    "panicMentioned": false
+  },
+  "lifecycle": {
+    "schemaVersion": "acp-lifecycle-run.v1",
+    "status": "passed",
+    "provider": {
+      "id": "opencode",
+      "version": "1.18.1",
+      "realProcess": true,
+      "adapterBoundary": true,
+      "transport": "acp",
+      "rawOutputStored": false
+    },
+    "gpui": {
+      "tokioTaskOwned": true,
+      "foregroundEntityUpdates": 23,
+      "responseTextStored": false
+    },
+    "session": {
+      "created": true,
+      "nativeIdPresent": true,
+      "completed": true,
+      "streamedEventCount": 17,
+      "streamedTextBytes": 17,
+      "eventCounts": {
+        "agent_message_delta": 3,
+        "reasoning": 14
+      }
+    },
+    "errorSurface": {
+      "exercised": true,
+      "structuredErrorCode": "acp_binary_missing",
+      "rawProviderErrorStored": false
+    },
+    "shutdown": {
+      "sessionClosed": true,
+      "sweepCompleted": true,
+      "processesRemoved": 0,
+      "elapsedMs": 12055,
+      "bounded": true,
+      "temporaryRootRemoved": true
+    },
+    "failure": null,
+    "limitations": [
+      "This Linux spike proves one real OpenCode ACP turn, not every Agent or provider.",
+      "Response text is counted and discarded; semantic answer quality is outside this gate."
+    ]
+  },
+  "limitations": [
+    "This physical Linux spike exercises one authenticated OpenCode ACP turn, not every Agent or provider.",
+    "The screenshot proves the final GPUI status surface only; response text is counted and discarded.",
+    "macOS and Windows GUI behavior is outside this Linux evidence record."
+  ]
+}

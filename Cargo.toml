@@ -1,0 +1,101 @@
+[workspace]
+members = [
+  "apps/desktop",
+  "apps/relay-server",
+  "apps/web",
+  "crates/agent",
+  "crates/agent-acp",
+  "crates/agent-claude",
+  "crates/agent-codex",
+  "crates/backup",
+  "crates/config-switch",
+  "crates/content",
+  "crates/core",
+  "crates/diagnostics",
+  "crates/desktop-model",
+  "crates/desktop-runtime",
+  "crates/db",
+  "crates/fs",
+  "crates/git",
+  "crates/relay",
+  "crates/remote",
+  "crates/terminal",
+  "crates/vibex-markdown",
+  "crates/vibex-backend",
+  "crates/vibex-remote-client",
+  "crates/vibex-ui",
+  "crates/vibex-terminal-ui",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.97.0"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/vibex-ai/vibex"
+
+[workspace.dependencies]
+alacritty_terminal = "0.26"
+async-trait = "0.1"
+command-group = { version = "5.0.1", features = ["with-tokio"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+semver = { version = "1", features = ["serde"] }
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["serde", "v4", "js"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+  "BinaryType",
+  "CloseEvent",
+  "Crypto",
+  "ErrorEvent",
+  "Event",
+  "MessageEvent",
+  "Storage",
+  "WebSocket",
+  "Window",
+] }
+wry = "=0.55.1"
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+futures-util = { version = "0.3", features = ["sink"] }
+futures-channel = "0.3"
+reqwest = { version = "0.13.4", features = ["json", "stream"] }
+fs2 = "0.4.3"
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
+gpui_tokio = { git = "https://github.com/zed-industries/zed" }
+gpui-component = { git = "https://github.com/longbridge/gpui-component" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
+image = { version = "=0.25.10", default-features = false }
+markdown = { version = "=1.0.0", features = ["serde"] }
+html5ever = "0.27"
+markup5ever_rcdom = "0.3"
+mathjax-svg-rs = "=0.4.0"
+mermaid-rs-renderer = { version = "=0.3.1", default-features = false }
+pulldown-cmark = { version = "=0.13.0", default-features = false, features = ["html", "serde", "simd"] }
+pdfium-render = { version = "=0.9.3", default-features = false, features = ["pdfium_7881", "thread_safe"] }
+quick-xml = "=0.41.0"
+qrcode = { version = "0.14.1", default-features = false }
+hkdf = "0.12"
+hmac = "0.12"
+ignore = "0.4"
+rand_core = "0.6"
+tower = { version = "0.5", features = ["util"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
+url = "=2.5.8"
+ropey = "=2.0.0-beta.1"
+x25519-dalek = { version = "2", default-features = false, features = ["alloc", "precomputed-tables", "static_secrets", "zeroize"] }
+zip = { version = "=8.4.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[profile.dev]
+incremental = true
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

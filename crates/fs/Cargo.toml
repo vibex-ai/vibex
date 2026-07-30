@@ -1,0 +1,21 @@
+[package]
+name = "vibex-fs"
+version = "0.1.0-rc.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ignore.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+vibex-core = { path = "../core" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+
+[[bin]]
+name = "vibex-files-smoke"
+path = "src/bin/vibex-files-smoke.rs"

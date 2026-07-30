@@ -1,0 +1,48 @@
+[package]
+name = "vibex-agent-acp"
+version = "0.1.0-rc.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+command-group.workspace = true
+# Fixed typed ACP schema version; upgrades go through the Compatibility
+# Registry process (P2-02+). Same version combination validated by Codeg.
+sacp = "=11.0.0"
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+vibex-agent = { path = "../agent" }
+vibex-config-switch = { path = "../config-switch" }
+vibex-core = { path = "../core" }
+vibex-db = { path = "../db" }
+
+[dev-dependencies]
+rusqlite = { version = "0.37", features = ["bundled"] }
+tempfile = "3"
+vibex-diagnostics = { path = "../diagnostics" }
+
+[[bin]]
+name = "vibex-acp-opencode-smoke"
+path = "src/bin/vibex-acp-opencode-smoke.rs"
+
+[[bin]]
+name = "vibex-acp-bridge-contract"
+path = "src/bin/vibex-acp-bridge-contract.rs"
+
+[[bin]]
+name = "real_claude_agent_acp_smoke"
+path = "src/bin/real_claude_agent_acp_smoke.rs"
+
+[[bin]]
+name = "real_codex_acp_smoke"
+path = "src/bin/real_codex_acp_smoke.rs"

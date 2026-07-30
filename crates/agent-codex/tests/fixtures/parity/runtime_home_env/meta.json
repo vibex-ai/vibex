@@ -1,0 +1,9 @@
+{
+  "capability": "runtime_home_env",
+  "mode": "meta_only",
+  "source": "observation snapshot 2026-07-11",
+  "sdk": "managed Codex ACP runtime home contract",
+  "recorded_at": "2026-07-11",
+  "known_defects": [],
+  "notes": "Layout: <config-db-dir>/codex-runtime-homes/<session-id>/<profile-id>. The managed ACP runtime projects bounded config and Skills there while keeping secret values out of config.toml."
+}

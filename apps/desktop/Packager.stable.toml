@@ -1,0 +1,39 @@
+name = "vibex-desktop"
+productName = "Vibex"
+version = "0.1.0-rc.1"
+identifier = "dev.vibex.desktop"
+description = "Vibex stable candidate after approved identity transfer"
+authors = ["Vibex"]
+publisher = "Vibex"
+copyright = "Copyright 2026 Vibex"
+binariesDir = "../../target/release"
+outDir = "../../target/release-packages/stable"
+icons = [
+  "assets/app-icons/icon.png",
+  "assets/app-icons/icon.ico",
+]
+resources = [
+  { src = "../../target/native/pdfium/linux-x86_64", target = "pdfium" },
+  { src = "../web/dist", target = "web" },
+]
+
+[[binaries]]
+path = "vibex-desktop"
+main = true
+
+[deb]
+depends = [
+  "libc6",
+  "libgcc-s1",
+  "libxcb1",
+  "libxcb-xkb1",
+  "libxkbcommon0",
+  "libxkbcommon-x11-0",
+  "libdbus-1-3",
+  "libvulkan1",
+  "libfontconfig1",
+]
+section = "devel"
+
+[appimage]
+excludedLibs = ["libpdfium.so"]

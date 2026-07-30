@@ -1,0 +1,22 @@
+[package]
+name = "vibex-ui"
+version = "0.1.0-rc.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+gpui.workspace = true
+gpui-component.workspace = true
+serde.workspace = true
+vibex-core = { path = "../core" }
+vibex-desktop-model = { path = "../desktop-model" }
+vibex-backend = { path = "../vibex-backend" }
+vibex-terminal-ui = { path = "../vibex-terminal-ui" }
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile = "3"
+tokio.workspace = true
+vibex-git = { path = "../git" }

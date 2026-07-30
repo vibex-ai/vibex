@@ -1,0 +1,184 @@
+{
+  "schemaVersion": "terminal-stress-linux-evidence.v1",
+  "status": "passed",
+  "capturedAt": "2026-07-20T09:11:57.075Z",
+  "source": {
+    "captureParentCommit": "75fa162d00004e139b15f0987cb79c5be2071c84",
+    "rustToolchain": "rustc 1.97.1 (8bab26f4f 2026-07-14) (Arch Linux rust 1:1.97.1-1)",
+    "lockfileSha256": "2a460e5cd42aa18f99a362401994793283f1f78f9de5dfdd5739e43e87610a41",
+    "sourceInputRoots": [
+      "Cargo.lock",
+      "Cargo.toml",
+      "crates/content/Cargo.toml",
+      "crates/content/src/terminal.rs",
+      "crates/content/src/terminal_stress.rs",
+      "crates/content/src/bin/vibex-terminal-stress.rs",
+      "crates/terminal/Cargo.toml",
+      "crates/terminal/src/emulator.rs",
+      "crates/terminal/src/lib.rs",
+      "scripts/capture-terminal-stress-linux.mjs"
+    ],
+    "sourceInputTreeSha256": "4d6fe838940deb043a80ba0c42a1ea7fa0d5ecc0bbd54638cfb9281716a039cb"
+  },
+  "runner": {
+    "platform": "linux",
+    "architecture": "x64",
+    "kernelRelease": "7.1.4-arch1-1",
+    "syntheticPty": false,
+    "ptyBackend": "portable-pty-openpty",
+    "procfsObserved": true
+  },
+  "run": {
+    "schemaVersion": "terminal-stress-linux-run.v1",
+    "status": "passed",
+    "platform": "linux",
+    "architecture": "x86_64",
+    "soakRequestedSeconds": 300,
+    "soakObservedSeconds": 300,
+    "throughput": {
+      "fixtureBytes": 10485760,
+      "fixtureSha256": "44f9296993796e201208c6c245b9515d36b62c87d0be4459ff347bfa054cd527",
+      "observedSha256": "44f9296993796e201208c6c245b9515d36b62c87d0be4459ff347bfa054cd527",
+      "elapsedMs": 2230,
+      "dataLossObserved": false,
+      "rawDroppedChunks": 0
+    },
+    "burst": {
+      "requestedFrames": 120,
+      "observedFrames": 120,
+      "elapsedMs": 1026,
+      "sourceFramesPerSecond": 116.93223943353269,
+      "dataLossObserved": false,
+      "maxSnapshotMs": 0,
+      "renderUpdates": 64,
+      "fullRepaints": 1,
+      "partialRepaints": 64,
+      "changedRows": 156,
+      "maxParseFrameMs": 1,
+      "boundedRepaint": true
+    },
+    "scrollback": {
+      "requestedLines": 10000,
+      "observedHistoryLines": 10000,
+      "frameRows": 24,
+      "frameColumns": 100,
+      "modelResidentBytes": 72172800,
+      "modelBudgetBytes": 134217728,
+      "bounded": true
+    },
+    "lifecycle": {
+      "createCount": 101,
+      "restoreCount": 100,
+      "killCount": 101,
+      "allSessionsClosed": true,
+      "statusesValid": true
+    },
+    "resize": {
+      "requestedRows": 42,
+      "requestedColumns": 132,
+      "observedRows": 42,
+      "observedColumns": 132,
+      "reflowMarkerObserved": true
+    },
+    "sequenceRebuild": {
+      "emptyIncrementalSnapshot": true,
+      "fullRetainedBytes": 174,
+      "incrementalBytes": 49,
+      "incrementalSnapshotBounded": true,
+      "gapInjected": true,
+      "rebuildObserved": true,
+      "dataLossObserved": false
+    },
+    "soak": {
+      "requestedSeconds": 300,
+      "observedSeconds": 300,
+      "activityTicks": 1250,
+      "snapshots": 2500,
+      "sequenceGaps": 0,
+      "rawDroppedChunks": 0,
+      "maxTickMs": 7,
+      "renderUpdates": 1250,
+      "fullRepaints": 1,
+      "partialRepaints": 1250,
+      "completedRequestedDuration": true
+    },
+    "resources": {
+      "procfsAvailable": true,
+      "baselineRssBytes": 3997696,
+      "peakRssBytes": 62693376,
+      "finalRssBytes": 59379712,
+      "rssGrowthBytes": 55382016,
+      "baselineFdCount": 4,
+      "peakFdCount": 7,
+      "finalFdCount": 4,
+      "baselineChildCount": 0,
+      "peakChildCount": 1,
+      "finalChildCount": 0,
+      "fdLeakObserved": false,
+      "childLeakObserved": false,
+      "rssBudgetBytes": 67108864
+    },
+    "privacy": {
+      "rawOutputStored": false,
+      "terminalMarkerStored": false,
+      "workspacePathStored": false,
+      "environmentStored": false
+    }
+  },
+  "claims": [
+    {
+      "id": "terminal_10_mib_no_loss",
+      "status": "passed",
+      "decisionBearing": true
+    },
+    {
+      "id": "terminal_120_fps_burst",
+      "status": "passed",
+      "decisionBearing": true
+    },
+    {
+      "id": "terminal_10000_line_scrollback",
+      "status": "passed",
+      "decisionBearing": true
+    },
+    {
+      "id": "terminal_repeated_lifecycle",
+      "status": "passed",
+      "decisionBearing": true
+    },
+    {
+      "id": "terminal_resize_reflow",
+      "status": "passed",
+      "decisionBearing": true
+    },
+    {
+      "id": "terminal_sequence_rebuild",
+      "status": "passed",
+      "decisionBearing": true
+    },
+    {
+      "id": "terminal_five_minute_activity",
+      "status": "passed",
+      "decisionBearing": true
+    },
+    {
+      "id": "terminal_fd_child_rss_bounded",
+      "status": "passed",
+      "decisionBearing": true
+    },
+    {
+      "id": "terminal_stress_privacy",
+      "status": "passed",
+      "decisionBearing": true
+    }
+  ],
+  "summary": {
+    "passedClaims": 9,
+    "failedClaims": 0,
+    "terminalStressGateSatisfied": true
+  },
+  "limitations": [
+    "This is Linux PTY, parser, lifecycle, and process-tree evidence; macOS and Windows physical results are not inferred.",
+    "The report retains counts, hashes, timings, and resource metrics only; raw terminal output is discarded."
+  ]
+}

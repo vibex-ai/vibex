@@ -1,0 +1,11 @@
+{
+  "capability": "model_selection",
+  "mode": "meta_only",
+  "source": "observation snapshot 2026-07-11",
+  "sdk": "offline compatibility metadata",
+  "recorded_at": "2026-07-11",
+  "known_defects": [
+    "This metadata-only historical snapshot did not include negotiated model evidence."
+  ],
+  "notes": "Online model identity now comes only from durable SessionRuntimeSelection and managed ACP catalog or negotiated evidence; this fixture is offline evidence only."
+}

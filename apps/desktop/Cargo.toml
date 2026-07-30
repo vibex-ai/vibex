@@ -1,0 +1,59 @@
+[package]
+name = "vibex-desktop"
+version = "0.1.0-rc.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+e2e-test-support = []
+web-preview-spike = ["dep:gtk", "dep:webkit2gtk", "dep:wry"]
+
+[dependencies]
+gpui.workspace = true
+gpui_platform.workspace = true
+gpui_tokio.workspace = true
+gpui-component.workspace = true
+gpui-component-assets.workspace = true
+image.workspace = true
+qrcode.workspace = true
+pdfium-render.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+base64.workspace = true
+chrono = "0.4.45"
+tokio.workspace = true
+url.workspace = true
+rfd = { version = "0.17.2", default-features = false, features = ["wayland", "xdg-portal"] }
+vibex-agent = { path = "../../crates/agent" }
+vibex-agent-acp = { path = "../../crates/agent-acp" }
+vibex-agent-claude = { path = "../../crates/agent-claude" }
+vibex-agent-codex = { path = "../../crates/agent-codex" }
+vibex-config-switch = { path = "../../crates/config-switch" }
+vibex-content = { path = "../../crates/content" }
+vibex-core = { path = "../../crates/core" }
+vibex-desktop-model = { path = "../../crates/desktop-model" }
+vibex-desktop-runtime = { path = "../../crates/desktop-runtime" }
+vibex-backend = { path = "../../crates/vibex-backend", features = ["native"] }
+vibex-ui = { path = "../../crates/vibex-ui" }
+vibex-markdown = { path = "../../crates/vibex-markdown" }
+vibex-terminal = { path = "../../crates/terminal" }
+wry = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.18", optional = true }
+webkit2gtk = { version = "=2.0.2", features = ["v2_38"], optional = true }
+
+[dev-dependencies]
+axum.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+vibex-db = { path = "../../crates/db" }
+vibex-remote-client = { path = "../../crates/vibex-remote-client" }
+vibex-remote = { path = "../../crates/remote" }
+
+[[bin]]
+name = "vibex-desktop"
+path = "src/main.rs"

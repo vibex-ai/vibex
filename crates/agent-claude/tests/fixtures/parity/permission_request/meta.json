@@ -1,0 +1,11 @@
+{
+  "capability": "permission_request",
+  "mode": "meta_only",
+  "source": "observation snapshot 2026-07-11",
+  "sdk": "offline compatibility metadata",
+  "recorded_at": "2026-07-11",
+  "known_defects": [
+    "The historical pre-cutover baseline did not surface a timeline permission request."
+  ],
+  "notes": "Online permission requests are exclusively normalized from ACP session/request_permission through the current attachment fence."
+}

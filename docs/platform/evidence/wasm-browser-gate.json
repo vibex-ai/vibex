@@ -1,0 +1,791 @@
+{
+  "schemaVersion": "vibex-wasm-browser-evidence.v1",
+  "capturedAt": "2026-07-30T11:40:58.751Z",
+  "source": {
+    "dependencySourcePolicy": "upstream_git_root_cargo_lock",
+    "zedRevision": "c9e8e611dbc279afa0914d28c4d37ad07f38c03b",
+    "gpuiComponentRevision": "031555662e99a1b5a549990b47f246d475b8288a",
+    "sourceTreeSha256": "039e01ff3b1ac4a815b28c469622c47572684a7238f73892a89313787bb749d3",
+    "lockfileSha256": "9f369bb4fef16ff737c1ac6951740e4f37b56e75bcbbb1b195e41221762e043a",
+    "pnpmLockfileSha256": "ae6aa0f7a317118a33b9affbd66c26b550bf3bf4de1acea1d0643665a5787e17"
+  },
+  "requiredViewports": [
+    "1280x800@1",
+    "360x800@2"
+  ],
+  "targets": {
+    "chromium": {
+      "status": "passed",
+      "engine": "chromium",
+      "version": "149.0.7827.55",
+      "defaultProductEntry": {
+        "root": {
+          "mode": "workbench",
+          "defaultMode": "workbench",
+          "gateFixtureIsProductSource": false
+        },
+        "workflow": {
+          "schemaVersion": "vibex-workflow-workbench.v1",
+          "connection": "offline",
+          "shell": "wide",
+          "navigationLevel": "global",
+          "globalDestination": "sessions",
+          "sessionDestination": "agent",
+          "activeSurface": "agent",
+          "workspaceCount": 0,
+          "sessionCount": 0,
+          "timelineRowCount": 0,
+          "pendingApprovalCount": 0,
+          "agentRuntimeReady": false,
+          "agentMutationPhase": "idle",
+          "agentLiveEventCount": 0,
+          "agentRecoveryCount": 0,
+          "fileRowCount": 0,
+          "fileSearchResultCount": 0,
+          "fileHasActiveFile": false,
+          "fileEditorStatus": "clean",
+          "fileLiveEventCount": 0,
+          "fileRecoveryCount": 0,
+          "gitChangeCount": 0,
+          "gitSelectedCount": 0,
+          "gitMutationPending": false,
+          "gitCommitPhase": "idle",
+          "gitLiveEventCount": 0,
+          "gitRecoveryCount": 0,
+          "terminalCount": 0,
+          "terminalConnection": "idle",
+          "terminalSequence": 1,
+          "terminalRebuildCount": 0,
+          "terminalRecoveryCount": 0,
+          "managementLoadState": "idle",
+          "managementAgentCount": 0,
+          "managementProfileCount": 0,
+          "managementHealthCount": 0,
+          "managementDeviceCount": 0,
+          "managementRevokedDeviceCount": 0,
+          "managementOperationPending": false,
+          "managementLiveEventCount": 0,
+          "managementRecoveryCount": 0,
+          "hasRelayStatus": false,
+          "hasPairingOffer": false,
+          "errorCodes": []
+        },
+        "renderedSurfaces": [
+          "agent",
+          "files",
+          "git",
+          "terminal",
+          "management"
+        ],
+        "pairing": {
+          "schemaVersion": "vibex-pairing-state.v1",
+          "state": "unpaired"
+        },
+        "pairingLayerHidden": false,
+        "pixels": {
+          "width": 1280,
+          "height": 800,
+          "uniqueColors": 1467,
+          "entropy": 0.251449,
+          "standardDeviation": 9433.76
+        },
+        "screenshot": "docs/parity/screenshots/current/spikes/web-workbench-default.png",
+        "sha256": "5282684061ace35dd8f9245b93a1ac88242661f4604d034cdd42bb18bf408cba"
+      },
+      "compactDefaultProductEntry": {
+        "root": {
+          "mode": "workbench",
+          "defaultMode": "workbench",
+          "gateFixtureIsProductSource": false
+        },
+        "workflow": {
+          "schemaVersion": "vibex-workflow-workbench.v1",
+          "connection": "offline",
+          "shell": "compact",
+          "navigationLevel": "global",
+          "globalDestination": "sessions",
+          "sessionDestination": "agent",
+          "activeSurface": "agent",
+          "workspaceCount": 0,
+          "sessionCount": 0,
+          "timelineRowCount": 0,
+          "pendingApprovalCount": 0,
+          "agentRuntimeReady": false,
+          "agentMutationPhase": "idle",
+          "agentLiveEventCount": 0,
+          "agentRecoveryCount": 0,
+          "fileRowCount": 0,
+          "fileSearchResultCount": 0,
+          "fileHasActiveFile": false,
+          "fileEditorStatus": "clean",
+          "fileLiveEventCount": 0,
+          "fileRecoveryCount": 0,
+          "gitChangeCount": 0,
+          "gitSelectedCount": 0,
+          "gitMutationPending": false,
+          "gitCommitPhase": "idle",
+          "gitLiveEventCount": 0,
+          "gitRecoveryCount": 0,
+          "terminalCount": 0,
+          "terminalConnection": "idle",
+          "terminalSequence": 1,
+          "terminalRebuildCount": 0,
+          "terminalRecoveryCount": 0,
+          "managementLoadState": "idle",
+          "managementAgentCount": 0,
+          "managementProfileCount": 0,
+          "managementHealthCount": 0,
+          "managementDeviceCount": 0,
+          "managementRevokedDeviceCount": 0,
+          "managementOperationPending": false,
+          "managementLiveEventCount": 0,
+          "managementRecoveryCount": 0,
+          "hasRelayStatus": false,
+          "hasPairingOffer": false,
+          "errorCodes": []
+        },
+        "renderedSurfaces": [
+          "agent",
+          "files",
+          "git",
+          "terminal",
+          "management"
+        ],
+        "pairing": {
+          "schemaVersion": "vibex-pairing-state.v1",
+          "state": "unpaired"
+        },
+        "pairingLayerHidden": false,
+        "pixels": {
+          "width": 720,
+          "height": 1600,
+          "uniqueColors": 2444,
+          "entropy": 0.382401,
+          "standardDeviation": 15547
+        }
+      },
+      "launchArguments": [
+        "--enable-unsafe-webgpu",
+        "--use-angle=vulkan",
+        "--enable-features=Vulkan"
+      ],
+      "navigationWallMs": 8712.982999,
+      "wide": {
+        "screenshot": "docs/parity/screenshots/current/spikes/web-wide.png",
+        "sha256": "51cb4d4603e38b8c3cf379b3c739bb1bb350fbe44f51872f10346c43a04db21f",
+        "metrics": {
+          "width": 1280,
+          "height": 800,
+          "uniqueColors": 7310,
+          "entropy": 0.0677049,
+          "standardDeviation": 5582.43
+        }
+      },
+      "compact": {
+        "screenshot": "docs/parity/screenshots/current/spikes/web-compact.png",
+        "sha256": "58fd76c73f0c10abe89df2cc0328e99929f3f26868123573b139bce68560f610",
+        "metrics": {
+          "width": 720,
+          "height": 1600,
+          "uniqueColors": 29745,
+          "entropy": 0.126688,
+          "standardDeviation": 8622.77
+        },
+        "canvas": {
+          "width": 360,
+          "height": 800
+        },
+        "reportedDevicePixelRatio": 2,
+        "backingStoreMatchesDevicePixels": false
+      },
+      "runtime": {
+        "state": "ready",
+        "firstFrameMs": 422.19999999552965,
+        "adapter": {
+          "vendor": "amd",
+          "architecture": "rdna-3",
+          "device": "",
+          "description": "",
+          "fallback": false
+        },
+        "pixelMetrics": {
+          "uniqueColors": 136,
+          "standardDeviation": 18.39018956364088
+        },
+        "contract": {
+          "schemaVersion": "vibex-browser-gate.v1",
+          "runtime": {
+            "dispatcher": "single_threaded_web",
+            "applicationHandleOwner": "thread_local_runtime",
+            "sharedArrayBufferRequired": false
+          },
+          "breakpoints": {
+            "wideMinWidth": 1100,
+            "mediumMinWidth": 760,
+            "compactMinWidth": 0
+          },
+          "network": {
+            "maxProbeResponseBytes": 4096,
+            "largeResponsePolicy": "stream_or_native_bridge_required"
+          },
+          "performanceBudgets": {
+            "firstFrameMs": 5000,
+            "frameP95Ms": 50,
+            "inputPresentationMs": 500,
+            "timelineRows": 48
+          },
+          "accessibility": {
+            "gpuiSemanticRolesConfigured": true,
+            "webAccessibilityAdapterAvailable": false,
+            "releaseBlocking": true
+          },
+          "compatibility": {
+            "schemaVersion": "vibex-platform-compat.v1",
+            "owner": "apps/web",
+            "behaviorGated": true,
+            "inputEventFallbackRequired": true,
+            "touchScrollFallbackRequired": true,
+            "upstreamObservedRevision": "82766871481bfc126f8fd42a3b9f51afc9b2decd",
+            "removeWhen": {
+              "inputEventCommittedByGpuiWeb": true,
+              "touchPointerProducesGpuiScrollPhases": true
+            }
+          }
+        },
+        "compatibility": {
+          "schemaVersion": "vibex-platform-compat.v1",
+          "owner": "apps/web",
+          "capabilities": {
+            "inputEventFallback": true,
+            "touchScrollFallback": true,
+            "capacitorKeyboard": false,
+            "capacitorApp": false
+          },
+          "input": {
+            "enabled": true,
+            "fallbackCommits": 0,
+            "fallbackDeletes": 0,
+            "nativeConsumed": 0,
+            "compositionOwned": 0,
+            "duplicateSuppressed": 0,
+            "lastInputType": null,
+            "lastData": null
+          },
+          "touch": {
+            "enabled": true,
+            "state": "idle",
+            "tapsReplayed": 0,
+            "scrollGestures": 0,
+            "wheelEvents": 0,
+            "cancelled": 0,
+            "coordinateScale": [
+              1,
+              1
+            ],
+            "lastTapPosition": null,
+            "lastWheelPosition": null
+          },
+          "keyboard": {
+            "visible": false,
+            "inset": 0,
+            "source": "none",
+            "nativeEvents": 0
+          },
+          "back": {
+            "events": 0,
+            "lastResult": "unhandled",
+            "lastFallback": "none"
+          }
+        },
+        "build": {
+          "schemaVersion": "vibex-web-build.v1",
+          "buildId": "10386de3655e9b1843ed8b2a",
+          "packageVersion": "0.1.0-rc.1",
+          "profile": "release",
+          "gitCommit": "uncommitted-worktree",
+          "wasmBindgenVersion": "0.2.125",
+          "wasmBytes": 23818142,
+          "wasmSha256": "5b3759a3f808deeb0e54811df2087d6bd6d6884b895687b404ebfd41c328b6f3",
+          "glueSha256": "41ca01158be66de60f8f5bd41f3bede0d5de5128b6aa2cd68177c8f2edaa87c9",
+          "staticSha256": "1e605c527621ec75eb359e97276fe4dd90b7f35e1eef9db69918c6783cece0e9",
+          "cacheName": "vibex-static-10386de3655e9b1843ed8b2a",
+          "cacheAssets": [
+            "./",
+            "./index.html",
+            "./offline.html",
+            "./styles.css",
+            "./host.js",
+            "./host-services.js",
+            "./platform-compat.js",
+            "./manifest.webmanifest",
+            "./icon.svg",
+            "./build.json",
+            "./pkg/vibex_web.js",
+            "./pkg/vibex_web_bg.wasm"
+          ]
+        },
+        "probes": {
+          "storage": {
+            "status": "passed",
+            "implementation": "localStorage"
+          },
+          "secureStorage": {
+            "status": "unsupported",
+            "implementation": "capacitor_secure_storage_plugin",
+            "reason": "plugin_not_available_in_this_host"
+          },
+          "fetch": {
+            "status": "passed",
+            "bytes": 52,
+            "url": "http://127.0.0.1:41713/__gate/fetch"
+          },
+          "webSocket": {
+            "status": "passed",
+            "url": "ws://127.0.0.1:41713/__gate/ws"
+          }
+        }
+      },
+      "input": {
+        "inputPresentationMs": 26.399999998509884,
+        "fixture": {
+          "composerValue": "Web keyboard 123 pasted中文 é验候选",
+          "approval": "pending",
+          "host": {
+            "viewportWidth": 1280,
+            "viewportHeight": 800,
+            "devicePixelRatio": 1,
+            "visible": true,
+            "focused": true,
+            "darkMode": false,
+            "fullscreen": false,
+            "keyboardVisible": false,
+            "keyboardInset": 0,
+            "keyboardSource": "none",
+            "safeArea": {
+              "top": 0,
+              "right": 0,
+              "bottom": 0,
+              "left": 0
+            },
+            "storageStatus": "passed",
+            "networkStatus": "passed",
+            "resumeCount": 0,
+            "lastSequence": 7
+          },
+          "scrollOffsets": {
+            "page": [
+              0,
+              0
+            ],
+            "timeline": [
+              0,
+              0
+            ]
+          },
+          "scrollMaxOffsets": {
+            "page": [
+              32,
+              32
+            ],
+            "timeline": [
+              0,
+              1660
+            ]
+          },
+          "overlay": {
+            "dialogActive": false,
+            "sheetActive": false,
+            "lastPlatformBack": "unhandled",
+            "layout": {
+              "dialogWidth": 448,
+              "dialogMaxHeight": 776,
+              "dialogMarginTop": 12,
+              "sheetPlacement": "right",
+              "sheetSize": 360
+            }
+          },
+          "interfaceFont": {
+            "tokenFamily": "Inter Variable",
+            "resolvedFamily": "Inter"
+          },
+          "themeDark": false
+        },
+        "interactions": {
+          "pointer": 1,
+          "touch": 0,
+          "wheel": 0,
+          "keyboard": 19,
+          "beforeInput": 1,
+          "input": 2,
+          "paste": 1,
+          "compositionStart": 3,
+          "compositionUpdate": 3,
+          "compositionEnd": 3,
+          "last": {
+            "name": "input",
+            "type": "input",
+            "inputType": "",
+            "data": "验",
+            "at": 1294.5
+          }
+        },
+        "residualInput": {
+          "before": "Web keyboard 123 pasted中文 é验",
+          "inserted": "Web keyboard 123 pasted中文 é验候选Z",
+          "deleted": "Web keyboard 123 pasted中文 é验候选",
+          "fixture": {
+            "composerValue": "Web keyboard 123 pasted中文 é验候选",
+            "approval": "pending",
+            "host": {
+              "viewportWidth": 1280,
+              "viewportHeight": 800,
+              "devicePixelRatio": 1,
+              "visible": true,
+              "focused": true,
+              "darkMode": false,
+              "fullscreen": false,
+              "keyboardVisible": false,
+              "keyboardInset": 0,
+              "keyboardSource": "none",
+              "safeArea": {
+                "top": 0,
+                "right": 0,
+                "bottom": 0,
+                "left": 0
+              },
+              "storageStatus": "passed",
+              "networkStatus": "passed",
+              "resumeCount": 0,
+              "lastSequence": 7
+            },
+            "scrollOffsets": {
+              "page": [
+                0,
+                0
+              ],
+              "timeline": [
+                0,
+                0
+              ]
+            },
+            "scrollMaxOffsets": {
+              "page": [
+                32,
+                32
+              ],
+              "timeline": [
+                0,
+                1660
+              ]
+            },
+            "overlay": {
+              "dialogActive": false,
+              "sheetActive": false,
+              "lastPlatformBack": "unhandled",
+              "layout": {
+                "dialogWidth": 448,
+                "dialogMaxHeight": 776,
+                "dialogMarginTop": 12,
+                "sheetPlacement": "right",
+                "sheetSize": 360
+              }
+            },
+            "interfaceFont": {
+              "tokenFamily": "Inter Variable",
+              "resolvedFamily": "Inter"
+            },
+            "themeDark": false
+          },
+          "compatibility": {
+            "schemaVersion": "vibex-platform-compat.v1",
+            "owner": "apps/web",
+            "capabilities": {
+              "inputEventFallback": true,
+              "touchScrollFallback": true,
+              "capacitorKeyboard": false,
+              "capacitorApp": false
+            },
+            "input": {
+              "enabled": true,
+              "fallbackCommits": 2,
+              "fallbackDeletes": 1,
+              "nativeConsumed": 0,
+              "compositionOwned": 0,
+              "duplicateSuppressed": 0,
+              "lastInputType": "deleteContentBackward",
+              "lastData": null
+            },
+            "touch": {
+              "enabled": true,
+              "state": "idle",
+              "tapsReplayed": 0,
+              "scrollGestures": 0,
+              "wheelEvents": 0,
+              "cancelled": 0,
+              "coordinateScale": [
+                1,
+                1
+              ],
+              "lastTapPosition": null,
+              "lastWheelPosition": null
+            },
+            "keyboard": {
+              "visible": false,
+              "inset": 0,
+              "source": "none",
+              "nativeEvents": 0
+            },
+            "back": {
+              "events": 0,
+              "lastResult": "unhandled",
+              "lastFallback": "none"
+            }
+          }
+        },
+        "pasteAutomation": "dom_clipboard_event_with_data_transfer",
+        "physicalClipboardClaimed": false
+      },
+      "lifecycle": {
+        "resumeCount": 5,
+        "focusEventBridge": true
+      },
+      "resize": {
+        "medium": {
+          "viewportWidth": 900,
+          "viewportHeight": 700,
+          "devicePixelRatio": 1,
+          "visible": true,
+          "focused": true,
+          "darkMode": false,
+          "fullscreen": false,
+          "keyboardVisible": false,
+          "keyboardInset": 0,
+          "keyboardSource": "none",
+          "safeArea": {
+            "top": 0,
+            "right": 0,
+            "bottom": 0,
+            "left": 0
+          },
+          "storageStatus": "passed",
+          "networkStatus": "passed",
+          "resumeCount": 5,
+          "lastSequence": 24
+        }
+      },
+      "performance": {
+        "frameP95Ms": 16.700000000000728,
+        "frameSampleCount": 120
+      },
+      "components": {
+        "dialogRendered": true,
+        "sheetRendered": true,
+        "platformBack": {
+          "dialog": "closed_dialog",
+          "sheet": "closed_sheet",
+          "empty": "unhandled"
+        },
+        "compactLayout": {
+          "dialogWidth": 328,
+          "dialogMaxHeight": 776,
+          "dialogMarginTop": 12,
+          "sheetPlacement": "bottom",
+          "sheetSize": 360
+        }
+      },
+      "touch": {
+        "pageScrollBefore": 0,
+        "pageScrollAfter": -225,
+        "compatibility": {
+          "enabled": true,
+          "state": "ended",
+          "tapsReplayed": 1,
+          "scrollGestures": 1,
+          "wheelEvents": 6,
+          "cancelled": 0,
+          "coordinateScale": [
+            0.5,
+            0.5
+          ],
+          "lastTapPosition": [
+            90,
+            210
+          ],
+          "lastWheelPosition": [
+            90,
+            140
+          ]
+        },
+        "statefulTap": {
+          "openedDialog": true,
+          "platformBack": "closed_dialog",
+          "finalCompatibility": {
+            "enabled": true,
+            "state": "ended",
+            "tapsReplayed": 2,
+            "scrollGestures": 3,
+            "wheelEvents": 18,
+            "cancelled": 0,
+            "coordinateScale": [
+              0.5,
+              0.5
+            ],
+            "lastTapPosition": [
+              90,
+              55
+            ],
+            "lastWheelPosition": [
+              90,
+              140
+            ]
+          }
+        }
+      },
+      "appearance": {
+        "darkModeTransition": true,
+        "lightModeRestored": true
+      },
+      "fullscreen": {
+        "entered": true,
+        "exited": true
+      },
+      "accessibility": {
+        "canvasRole": null,
+        "dom": {
+          "roleElements": 2,
+          "labelledElements": 1
+        },
+        "axRoles": {
+          "RootWebArea": 1,
+          "none": 6,
+          "Canvas": 1,
+          "textbox": 1,
+          "generic": 1
+        },
+        "gpuiSemanticTreeExposed": false
+      },
+      "negativePath": {
+        "code": "WEBGPU_FORCED_UNSUPPORTED",
+        "title": "This browser cannot run Vibex",
+        "canvasCount": 0
+      },
+      "diagnostics": {
+        "consoleMessages": [
+          {
+            "type": "warning",
+            "text": "[WARN] gpui_web::dispatcher: SharedArrayBuffer not available; falling back to single-threaded dispatcher"
+          },
+          {
+            "type": "info",
+            "text": "[INFO] gpui_wgpu::wgpu_context: Selected GPU adapter: \"\" (BrowserWebGpu)"
+          },
+          {
+            "type": "info",
+            "text": "[INFO] gpui_web::platform: WebGPU context initialized successfully"
+          },
+          {
+            "type": "warning",
+            "text": "WebGPU canvas configured with a different format than is preferred by this device (\"rgba8unorm\"). This requires an extra copy, which may impact performance."
+          }
+        ],
+        "pageErrors": [],
+        "compactConsoleMessages": [
+          {
+            "type": "warning",
+            "text": "[WARN] gpui_web::dispatcher: SharedArrayBuffer not available; falling back to single-threaded dispatcher"
+          },
+          {
+            "type": "info",
+            "text": "[INFO] gpui_wgpu::wgpu_context: Selected GPU adapter: \"\" (BrowserWebGpu)"
+          },
+          {
+            "type": "info",
+            "text": "[INFO] gpui_web::platform: WebGPU context initialized successfully"
+          },
+          {
+            "type": "warning",
+            "text": "WebGPU canvas configured with a different format than is preferred by this device (\"rgba8unorm\"). This requires an extra copy, which may impact performance."
+          }
+        ],
+        "compactPageErrors": []
+      }
+    },
+    "firefox": {
+      "status": "passed",
+      "engine": "firefox",
+      "version": "151.0",
+      "disposition": {
+        "state": "ready",
+        "code": "GATE_READY",
+        "detail": "The GPUI canvas rendered.",
+        "gpuExposed": true,
+        "runtime": {
+          "adapter": {
+            "vendor": "",
+            "architecture": "",
+            "device": "",
+            "description": "",
+            "fallback": false
+          },
+          "errors": [],
+          "pixelMetrics": {
+            "uniqueColors": 41,
+            "standardDeviation": 19.356381959874014
+          }
+        },
+        "pixels": {
+          "width": 1280,
+          "height": 800,
+          "uniqueColors": 605,
+          "entropy": 0.0514017,
+          "standardDeviation": 4327.23
+        }
+      },
+      "diagnostics": {
+        "consoleMessages": [
+          {
+            "type": "warning",
+            "text": "[WARN] gpui_web::dispatcher: SharedArrayBuffer not available; falling back to single-threaded dispatcher"
+          },
+          {
+            "type": "info",
+            "text": "[INFO] gpui_wgpu::wgpu_context: Selected GPU adapter: \"\" (BrowserWebGpu)"
+          },
+          {
+            "type": "warning",
+            "text": "[WARN] gpui_wgpu::wgpu_context: Dual-source blending not available on this GPU. Subpixel text antialiasing will be disabled."
+          },
+          {
+            "type": "info",
+            "text": "[INFO] gpui_web::platform: WebGPU context initialized successfully"
+          }
+        ],
+        "pageErrors": []
+      }
+    }
+  },
+  "screenshots": {
+    "workbench": {
+      "path": "docs/parity/screenshots/current/spikes/web-workbench-default.png",
+      "sha256": "5282684061ace35dd8f9245b93a1ac88242661f4604d034cdd42bb18bf408cba"
+    },
+    "wide": {
+      "path": "docs/parity/screenshots/current/spikes/web-wide.png",
+      "sha256": "51cb4d4603e38b8c3cf379b3c739bb1bb350fbe44f51872f10346c43a04db21f"
+    },
+    "compact": {
+      "path": "docs/parity/screenshots/current/spikes/web-compact.png",
+      "sha256": "58fd76c73f0c10abe89df2cc0328e99929f3f26868123573b139bce68560f610"
+    }
+  },
+  "decision": {
+    "technicalSpike": "go",
+    "productionRelease": "no_go",
+    "primaryChromiumWebUiValidated": true,
+    "additionalBrowserRendered": true,
+    "a11yReleaseBlocker": true,
+    "physicalAndroidPending": true,
+    "physicalIosPending": true,
+    "reason": "Chromium renders the real five-surface workflow workbench by default and the Gate fixture only in explicit diagnostics mode, but the locked web platform has no accessibility adapter and physical mobile evidence is pending."
+  }
+}

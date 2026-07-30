@@ -1,0 +1,17 @@
+{
+  "events": [
+    {
+      "payload": {
+        "data": {
+          "action": "spawn_agent",
+          "agentLabel": "thread_parity_b",
+          "status": "completed",
+          "summary": "done"
+        },
+        "type": "collaboration"
+      },
+      "providerCorrelationId": null,
+      "source": "agent"
+    }
+  ]
+}

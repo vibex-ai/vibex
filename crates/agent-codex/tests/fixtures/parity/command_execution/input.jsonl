@@ -1,0 +1,2 @@
+{"type":"commandExecution","id":"item_cmd_1","command":"cargo test -p demo","aggregatedOutput":"running 12 tests\ntest result: ok. 12 passed","exitCode":0,"status":"completed"}
+{"type":"commandExecution","id":"item_cmd_2","command":"cargo build --broken-flag","aggregatedOutput":"error: unexpected argument","exitCode":2,"status":"failed"}

@@ -1,0 +1,11 @@
+{
+  "capability": "terminal_activity_hooks",
+  "mode": "meta_only",
+  "source": "observation snapshot 2026-07-11",
+  "sdk": "offline compatibility metadata",
+  "recorded_at": "2026-07-11",
+  "known_defects": [
+    "This historical metadata snapshot declared terminal activity hooks without replayable events."
+  ],
+  "notes": "Online terminal activity capability is published only from managed ACP compatibility evidence."
+}

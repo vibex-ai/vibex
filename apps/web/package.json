@@ -1,0 +1,13 @@
+{
+  "name": "@vibex/web",
+  "version": "0.1.0-rc.1",
+  "license": "AGPL-3.0-or-later",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "build:release": "node scripts/build.mjs --release",
+    "check:integration": "node ../../scripts/check-wasm-integration.mjs --self-test",
+    "typecheck": "cargo +nightly-2026-07-24 check -p vibex-web --target wasm32-unknown-unknown --locked"
+  }
+}

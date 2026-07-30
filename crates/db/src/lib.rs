@@ -1,0 +1,12936 @@
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use serde::{Serialize, de::DeserializeOwned};
+use vibex_core::{
+    AdapterDiagnostic, AgentConfig, AgentDiscoveryRecord, AgentId, AgentModelListResponse,
+    AgentModelProviderDefaultSelection, AgentModelProviderFailoverEntry, AgentSession,
+    AgentSessionConfigProbe, AgentSessionSafety, AgentSessionState, AutomationEdge,
+    AutomationEdgeCreateRequest, AutomationEdgeId, AutomationGraph, AutomationGraphCreateRequest,
+    AutomationGraphId, AutomationGraphListRequest, AutomationGraphStatus,
+    AutomationGraphUpdateRequest, AutomationNode, AutomationNodeCreateRequest, AutomationNodeId,
+    AutomationRun, AutomationRunCreateRequest, AutomationRunId, AutomationRunListRequest,
+    AutomationRunStep, AutomationRunStepCreateRequest, AutomationRunStepId,
+    AutomationRunStepListRequest, AutomationRunStepUpdateRequest, AutomationRunUpdateRequest,
+    CorrelationId, DeviceId, GitManagedWorktreeStatus, GitWorktreeOperationRecord,
+    GitWorktreeOperationStatus, Hook, HookCreateRequest, HookId, HookInstallPreview,
+    HookInstallState, McpServer, McpServerAgentMatrix, McpServerCreateRequest, McpServerId,
+    McpServerProviderMatrix, McpServerSecretReference, McpServerStatus, PermissionActionDetail,
+    PermissionRequest, PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
+    ProjectId, ProjectRecord, Prompt, PromptCreateRequest, PromptId, PromptStatus,
+    ProviderCapabilityProbeResult, ProviderHealthProbeResult, ProviderInjectionPreview,
+    ProviderInjectionPreviewRequest, ProviderKind, ProviderNativeExportApplyResult,
+    ProviderNativeExportFilePlan, ProviderNativeExportListRequest, ProviderNativeExportPreview,
+    ProviderNativeExportRecordSummary, ProviderNativeExportRollbackResult, ProviderNetworkDefaults,
+    ProviderOptions, ProviderPermissionDefaults, ProviderProfile, ProviderProfileCreateRequest,
+    ProviderProfileDefaultScope, ProviderProfileDefaultSelection, ProviderProfileId,
+    ProviderProfileSetDefaultRequest, ProviderProfileStatus, ProviderSandboxDefaults,
+    ProviderSecretReference, ProviderUsageRecord, ProviderUsageWindow, RedactedDiagnostic,
+    RemoteAuditListRequest, RemoteAuditRecord, RemoteDeviceDetail, RemoteDeviceStatus,
+    RemotePairingCode, RequestId, RightRailPlugin, RightRailPluginCreateRequest,
+    RightRailPluginDeleteRequest, RightRailPluginId, RightRailPluginKind,
+    RightRailPluginReorderRequest, RightRailPluginStatus, RightRailPluginUpdateRequest,
+    RightRailSystemPluginKey, RightRailWebPluginUaMode, ScheduledTask, ScheduledTaskAttentionKind,
+    ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
+    ScheduledTaskAuditListRequest, ScheduledTaskAuditOutcome, ScheduledTaskAuditRecord,
+    ScheduledTaskCreateRequest, ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun,
+    ScheduledTaskRunCreateRequest, ScheduledTaskRunId, ScheduledTaskRunListRequest,
+    ScheduledTaskRunStatus, ScheduledTaskRunTrigger, ScheduledTaskRunUpdateRequest,
+    ScheduledTaskStatus, ScheduledTaskUpdateRequest, Skill, SkillAgentMatrix, SkillCreateRequest,
+    SkillId, SkillProviderMatrix, SkillStatus, TerminalId, TerminalSession, TimelineItem,
+    TimelineItemId, TimelinePage, TimelinePayload, TimelineRedactionState, TimelineSource,
+    TurnExecutionAttribution, VibexError, VibexResult, VibexSessionId, WorkspaceId, WorkspaceMode,
+    WorkspaceRecord, agent_id_for_provider_kind, unix_timestamp_ms,
+};
+
+mod remote_v2;
+pub use remote_v2::*;
+
+pub type DbConnection = Connection;
+
+pub mod runtime;
+pub use runtime::{
+    AgentSessionRuntimeRepository, AgentSessionRuntimeState, ContextBridgePrepareRequest,
+    ContextBridgeRecord, ContextBridgeRepository, DesiredRuntimeSwitchEnqueueRequest,
+    DesiredRuntimeSwitchEnqueueResult, MessageSubmissionPayloadRecord, MessageSubmissionRecord,
+    MessageSubmissionRepository, RequestedSwitchClaimOutcome, RuntimeBindingRepository,
+    RuntimeSwitchCommitRequest, RuntimeSwitchEventRepository, RuntimeSwitchRecord,
+    RuntimeSwitchRepository, RuntimeSwitchReserveRequest, SwitchOperationAppendRequest,
+    SwitchOperationJournalRepository, SwitchOperationRecord,
+};
+
+pub const CURRENT_SCHEMA_VERSION: i64 = 30;
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Clone, Copy)]
+pub struct Migration {
+    pub version: i64,
+    pub name: &'static str,
+    pub sql: &'static str,
+}
+
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "stage0_foundation_smoke",
+        sql: "
+            CREATE TABLE IF NOT EXISTS foundation_smoke (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                marker TEXT NOT NULL,
+                last_seen_at_ms INTEGER NOT NULL
+            );
+        ",
+    },
+    Migration {
+        version: 2,
+        name: "agent_session_core",
+        sql: "
+            CREATE TABLE IF NOT EXISTS projects (
+                project_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                root_path TEXT NOT NULL UNIQUE,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS workspaces (
+                workspace_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                root_path TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                UNIQUE(project_id, root_path, mode)
+            );
+
+            CREATE TABLE IF NOT EXISTS agent_sessions (
+                session_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                project_id TEXT NOT NULL REFERENCES projects(project_id),
+                workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),
+                workspace_root TEXT NOT NULL,
+                workspace_mode TEXT NOT NULL,
+                provider_kind TEXT NOT NULL,
+                provider_profile_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                permission_mode TEXT NOT NULL,
+                ask_on_risk INTEGER NOT NULL,
+                bypass_all_permissions INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                archived_at_ms INTEGER NULL,
+                deleted_at_ms INTEGER NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_sessions_workspace
+                ON agent_sessions(workspace_id, deleted_at_ms, archived_at_ms);
+
+            CREATE TABLE IF NOT EXISTS provider_bindings (
+                session_id TEXT PRIMARY KEY REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+                provider_kind TEXT NOT NULL,
+                provider_profile_id TEXT NOT NULL,
+                native_session_id TEXT NULL,
+                native_thread_id TEXT NULL,
+                native_resume_token TEXT NULL,
+                redacted_metadata_json TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS session_provider_bindings (
+                session_id TEXT NOT NULL REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+                provider_profile_id TEXT NOT NULL,
+                provider_kind TEXT NOT NULL,
+                native_session_id TEXT NULL,
+                native_thread_id TEXT NULL,
+                native_resume_token TEXT NULL,
+                redacted_metadata_json TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (session_id, provider_profile_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS agent_timeline_items (
+                session_id TEXT NOT NULL REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+                sequence INTEGER NOT NULL,
+                timeline_item_id TEXT NOT NULL UNIQUE,
+                kind TEXT NOT NULL,
+                source TEXT NOT NULL,
+                timestamp_ms INTEGER NOT NULL,
+                correlation_id TEXT NULL,
+                provider_correlation_id TEXT NULL,
+                payload_json TEXT NOT NULL,
+                redaction_state TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                source_event_id TEXT NULL,
+                PRIMARY KEY (session_id, sequence),
+                UNIQUE(session_id, source_event_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_timeline_session_sequence
+                ON agent_timeline_items(session_id, sequence);
+
+            CREATE TABLE IF NOT EXISTS permission_requests (
+                request_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+                project_id TEXT NULL REFERENCES projects(project_id),
+                workspace_id TEXT NULL REFERENCES workspaces(workspace_id),
+                provider_request_id TEXT NULL,
+                risk_category TEXT NOT NULL,
+                title TEXT NOT NULL,
+                details_json TEXT NOT NULL,
+                allowed_responses_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                requested_at_ms INTEGER NOT NULL,
+                expires_at_ms INTEGER NULL,
+                resolution_json TEXT NULL,
+                resolved_at_ms INTEGER NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_permission_requests_session_status
+                ON permission_requests(session_id, status);
+
+            CREATE TABLE IF NOT EXISTS adapter_diagnostics (
+                diagnostic_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NULL REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+                provider_kind TEXT NOT NULL,
+                level TEXT NOT NULL,
+                code TEXT NOT NULL,
+                message TEXT NOT NULL,
+                redacted_details_json TEXT NOT NULL,
+                timestamp_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_adapter_diagnostics_session
+                ON adapter_diagnostics(session_id, timestamp_ms);
+        ",
+    },
+    Migration {
+        version: 3,
+        name: "pc_workbench_slice",
+        sql: "
+            CREATE TABLE IF NOT EXISTS terminal_sessions (
+                terminal_id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                shell TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                rows INTEGER NOT NULL,
+                cols INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                closed_at_ms INTEGER NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_terminal_sessions_workspace
+                ON terminal_sessions(workspace_id, updated_at_ms);
+
+            CREATE TABLE IF NOT EXISTS workbench_recent_files (
+                workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+                path TEXT NOT NULL,
+                last_opened_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (workspace_id, path)
+            );
+
+            CREATE TABLE IF NOT EXISTS git_snapshots (
+                workspace_id TEXT PRIMARY KEY REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+                branch TEXT NULL,
+                short_commit TEXT NULL,
+                dirty INTEGER NOT NULL,
+                changed_files INTEGER NOT NULL,
+                captured_at_ms INTEGER NOT NULL
+            );
+        ",
+    },
+    Migration {
+        version: 4,
+        name: "advanced_git_worktrees",
+        sql: "
+            CREATE TABLE IF NOT EXISTS git_managed_worktrees (
+                worktree_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                workspace_id TEXT NULL REFERENCES workspaces(workspace_id) ON DELETE SET NULL,
+                repo_root TEXT NOT NULL,
+                worktree_path TEXT NOT NULL UNIQUE,
+                branch TEXT NULL,
+                base_ref TEXT NULL,
+                head TEXT NULL,
+                status TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                closed_at_ms INTEGER NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_git_managed_worktrees_project
+                ON git_managed_worktrees(project_id, status, updated_at_ms);
+
+            CREATE TABLE IF NOT EXISTS git_worktree_operations (
+                operation_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                source_workspace_id TEXT NULL REFERENCES workspaces(workspace_id) ON DELETE SET NULL,
+                target_workspace_id TEXT NULL REFERENCES workspaces(workspace_id) ON DELETE SET NULL,
+                operation TEXT NOT NULL,
+                status TEXT NOT NULL,
+                worktree_path TEXT NULL,
+                branch TEXT NULL,
+                base_ref TEXT NULL,
+                head_before TEXT NULL,
+                head_after TEXT NULL,
+                error TEXT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_git_worktree_operations_project
+                ON git_worktree_operations(project_id, updated_at_ms);
+        ",
+    },
+    Migration {
+        version: 5,
+        name: "provider_profile_core",
+        sql: "
+            CREATE TABLE IF NOT EXISTS provider_profiles (
+                provider_profile_id TEXT PRIMARY KEY,
+                provider_kind TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                account_alias TEXT NULL,
+                base_url TEXT NULL,
+                default_model TEXT NULL,
+                small_model TEXT NULL,
+                large_model TEXT NULL,
+                reasoning_effort TEXT NULL,
+                sandbox_defaults_json TEXT NOT NULL,
+                network_defaults_json TEXT NOT NULL,
+                permission_defaults_json TEXT NOT NULL,
+                provider_options_json TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                deleted_at_ms INTEGER NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_provider_profiles_kind
+                ON provider_profiles(provider_kind, deleted_at_ms, updated_at_ms);
+
+            CREATE TABLE IF NOT EXISTS provider_secret_references (
+                secret_ref_id TEXT PRIMARY KEY,
+                provider_profile_id TEXT NOT NULL REFERENCES provider_profiles(provider_profile_id) ON DELETE CASCADE,
+                secret_kind TEXT NOT NULL,
+                backend TEXT NOT NULL,
+                setup_state TEXT NOT NULL,
+                lookup_key TEXT NOT NULL,
+                display_label TEXT NOT NULL,
+                redacted_hint TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_provider_secret_references_profile
+                ON provider_secret_references(provider_profile_id);
+
+            CREATE TABLE IF NOT EXISTS provider_default_profiles (
+                scope_kind TEXT NOT NULL,
+                scope_id TEXT NOT NULL,
+                provider_kind TEXT NOT NULL,
+                provider_profile_id TEXT NOT NULL REFERENCES provider_profiles(provider_profile_id),
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY(scope_kind, scope_id, provider_kind)
+            );
+
+            CREATE TABLE IF NOT EXISTS provider_injection_previews (
+                preview_id TEXT PRIMARY KEY,
+                provider_profile_id TEXT NOT NULL REFERENCES provider_profiles(provider_profile_id),
+                request_json TEXT NOT NULL,
+                preview_json TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_provider_injection_previews_profile
+                ON provider_injection_previews(provider_profile_id, created_at_ms);
+        ",
+    },
+    Migration {
+        version: 6,
+        name: "provider_health_usage",
+        sql: "
+            CREATE TABLE IF NOT EXISTS provider_health_probe_records (
+                health_record_id TEXT PRIMARY KEY,
+                provider_profile_id TEXT NOT NULL REFERENCES provider_profiles(provider_profile_id),
+                provider_kind TEXT NOT NULL,
+                probe_kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                latency_ms INTEGER NULL,
+                checked_at_ms INTEGER NOT NULL,
+                expires_at_ms INTEGER NULL,
+                diagnostics_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_provider_health_probe_records_latest
+                ON provider_health_probe_records(provider_profile_id, probe_kind, checked_at_ms);
+
+            CREATE TABLE IF NOT EXISTS provider_usage_records (
+                usage_record_id TEXT PRIMARY KEY,
+                provider_profile_id TEXT NOT NULL REFERENCES provider_profiles(provider_profile_id),
+                provider_kind TEXT NOT NULL,
+                source TEXT NOT NULL,
+                unit TEXT NOT NULL,
+                label TEXT NOT NULL,
+                used REAL NULL,
+                limit_value REAL NULL,
+                remaining REAL NULL,
+                window_label TEXT NULL,
+                window_started_at_ms INTEGER NULL,
+                window_ends_at_ms INTEGER NULL,
+                recorded_at_ms INTEGER NOT NULL,
+                metadata_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_provider_usage_records_latest
+                ON provider_usage_records(provider_profile_id, unit, recorded_at_ms);
+        ",
+    },
+    Migration {
+        version: 7,
+        name: "mcp_resource_management",
+        sql: "
+            CREATE TABLE IF NOT EXISTS mcp_servers (
+                mcp_server_id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                transport_kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                scope_kind TEXT NOT NULL,
+                project_id TEXT NULL REFERENCES projects(project_id) ON DELETE SET NULL,
+                workspace_id TEXT NULL REFERENCES workspaces(workspace_id) ON DELETE SET NULL,
+                command TEXT NULL,
+                args_json TEXT NOT NULL,
+                url TEXT NULL,
+                description TEXT NULL,
+                tags_json TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                deleted_at_ms INTEGER NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_mcp_servers_scope
+                ON mcp_servers(scope_kind, deleted_at_ms, updated_at_ms);
+
+            CREATE TABLE IF NOT EXISTS mcp_server_secret_references (
+                secret_ref_id TEXT PRIMARY KEY,
+                mcp_server_id TEXT NOT NULL REFERENCES mcp_servers(mcp_server_id) ON DELETE CASCADE,
+                secret_kind TEXT NOT NULL,
+                backend TEXT NOT NULL,
+                setup_state TEXT NOT NULL,
+                lookup_key TEXT NOT NULL,
+                display_label TEXT NOT NULL,
+                redacted_hint TEXT NOT NULL,
+                target TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_mcp_server_secret_references_server
+                ON mcp_server_secret_references(mcp_server_id);
+
+            CREATE TABLE IF NOT EXISTS mcp_server_provider_matrix (
+                mcp_server_id TEXT NOT NULL REFERENCES mcp_servers(mcp_server_id) ON DELETE CASCADE,
+                provider_kind TEXT NOT NULL,
+                enabled INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY(mcp_server_id, provider_kind)
+            );
+            CREATE INDEX IF NOT EXISTS idx_mcp_server_provider_matrix_provider
+                ON mcp_server_provider_matrix(provider_kind, enabled);
+        ",
+    },
+    Migration {
+        version: 8,
+        name: "skills_prompts_hooks_resource_management",
+        sql: "
+            CREATE TABLE IF NOT EXISTS skills (
+                skill_id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                source_kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                scope_kind TEXT NOT NULL,
+                project_id TEXT NULL REFERENCES projects(project_id) ON DELETE SET NULL,
+                workspace_id TEXT NULL REFERENCES workspaces(workspace_id) ON DELETE SET NULL,
+                source_uri TEXT NULL,
+                description TEXT NULL,
+                tags_json TEXT NOT NULL,
+                content_preview TEXT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                deleted_at_ms INTEGER NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_skills_scope
+                ON skills(scope_kind, deleted_at_ms, updated_at_ms);
+
+            CREATE TABLE IF NOT EXISTS skill_provider_matrix (
+                skill_id TEXT NOT NULL REFERENCES skills(skill_id) ON DELETE CASCADE,
+                provider_kind TEXT NOT NULL,
+                enabled INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY(skill_id, provider_kind)
+            );
+            CREATE INDEX IF NOT EXISTS idx_skill_provider_matrix_provider
+                ON skill_provider_matrix(provider_kind, enabled);
+
+            CREATE TABLE IF NOT EXISTS prompts (
+                prompt_id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                scope_kind TEXT NOT NULL,
+                project_id TEXT NULL REFERENCES projects(project_id) ON DELETE SET NULL,
+                workspace_id TEXT NULL REFERENCES workspaces(workspace_id) ON DELETE SET NULL,
+                body TEXT NOT NULL,
+                description TEXT NULL,
+                tags_json TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                deleted_at_ms INTEGER NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_prompts_scope_kind
+                ON prompts(scope_kind, kind, deleted_at_ms, updated_at_ms);
+
+            CREATE TABLE IF NOT EXISTS hooks (
+                hook_id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                provider_kind TEXT NOT NULL,
+                event_kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                install_state TEXT NOT NULL,
+                command_preview TEXT NULL,
+                managed_marker TEXT NOT NULL,
+                description TEXT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                deleted_at_ms INTEGER NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_hooks_provider_event
+                ON hooks(provider_kind, event_kind, deleted_at_ms, updated_at_ms);
+
+            CREATE TABLE IF NOT EXISTS hook_install_previews (
+                preview_id TEXT PRIMARY KEY,
+                hook_id TEXT NOT NULL REFERENCES hooks(hook_id),
+                target_path TEXT NOT NULL,
+                marker TEXT NOT NULL,
+                redacted_preview TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_hook_install_previews_hook
+                ON hook_install_previews(hook_id, created_at_ms);
+        ",
+    },
+    Migration {
+        version: 9,
+        name: "provider_native_export_records",
+        sql: "
+            CREATE TABLE IF NOT EXISTS provider_native_export_records (
+                export_id TEXT PRIMARY KEY,
+                provider_profile_id TEXT NOT NULL REFERENCES provider_profiles(provider_profile_id),
+                source TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                status TEXT NOT NULL,
+                preview_json TEXT NOT NULL,
+                applied_at_ms INTEGER NULL,
+                rolled_back_at_ms INTEGER NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_provider_native_export_records_profile
+                ON provider_native_export_records(provider_profile_id, created_at_ms);
+
+            CREATE TABLE IF NOT EXISTS provider_native_export_file_operations (
+                operation_id TEXT PRIMARY KEY,
+                export_id TEXT NOT NULL REFERENCES provider_native_export_records(export_id) ON DELETE CASCADE,
+                source TEXT NOT NULL,
+                file_kind TEXT NOT NULL,
+                operation_kind TEXT NOT NULL,
+                target_path TEXT NOT NULL,
+                backup_path TEXT NULL,
+                temp_path TEXT NULL,
+                marker TEXT NULL,
+                status TEXT NOT NULL,
+                redacted_diff TEXT NOT NULL,
+                diagnostics_json TEXT NOT NULL,
+                target_size_before INTEGER NULL,
+                target_size_after INTEGER NULL,
+                backup_size INTEGER NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_provider_native_export_file_operations_export
+                ON provider_native_export_file_operations(export_id, status);
+            CREATE INDEX IF NOT EXISTS idx_provider_native_export_file_operations_target
+                ON provider_native_export_file_operations(target_path, updated_at_ms);
+        ",
+    },
+    Migration {
+        version: 10,
+        name: "remote_devices_pairing_audit",
+        sql: "
+            CREATE TABLE IF NOT EXISTS remote_devices (
+                device_id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                public_key TEXT NULL,
+                auth_secret_hash TEXT NOT NULL,
+                permission_level TEXT NOT NULL,
+                status TEXT NOT NULL,
+                paired_at_ms INTEGER NULL,
+                last_seen_at_ms INTEGER NULL,
+                revoked_at_ms INTEGER NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_remote_devices_status
+                ON remote_devices(status, updated_at_ms);
+
+            CREATE TABLE IF NOT EXISTS remote_pairing_codes (
+                pairing_id TEXT PRIMARY KEY,
+                code_hash TEXT NOT NULL UNIQUE,
+                permission_level TEXT NOT NULL,
+                expires_at_ms INTEGER NOT NULL,
+                claimed_device_id TEXT NULL REFERENCES remote_devices(device_id) ON DELETE SET NULL,
+                created_at_ms INTEGER NOT NULL,
+                claimed_at_ms INTEGER NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_remote_pairing_codes_expiry
+                ON remote_pairing_codes(expires_at_ms, claimed_at_ms);
+
+            CREATE TABLE IF NOT EXISTS remote_audit_logs (
+                audit_id TEXT PRIMARY KEY,
+                device_id TEXT NULL REFERENCES remote_devices(device_id) ON DELETE SET NULL,
+                action TEXT NOT NULL,
+                target_kind TEXT NOT NULL,
+                target_id TEXT NULL,
+                outcome TEXT NOT NULL,
+                redacted_summary TEXT NOT NULL,
+                request_id TEXT NULL,
+                correlation_id TEXT NULL,
+                created_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_remote_audit_logs_device
+                ON remote_audit_logs(device_id, created_at_ms);
+            CREATE INDEX IF NOT EXISTS idx_remote_audit_logs_created
+                ON remote_audit_logs(created_at_ms);
+        ",
+    },
+    Migration {
+        version: 11,
+        name: "provider_capability_probe_records",
+        sql: "
+            CREATE TABLE IF NOT EXISTS provider_capability_probe_records (
+                capability_record_id TEXT PRIMARY KEY,
+                provider_profile_id TEXT NOT NULL REFERENCES provider_profiles(provider_profile_id),
+                provider_kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                capabilities_json TEXT NOT NULL,
+                source TEXT NOT NULL,
+                checked_at_ms INTEGER NOT NULL,
+                expires_at_ms INTEGER NULL,
+                diagnostics_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_provider_capability_probe_records_latest
+                ON provider_capability_probe_records(provider_profile_id, checked_at_ms);
+        ",
+    },
+    Migration {
+        version: 12,
+        name: "scheduled_task_contract_storage",
+        sql: "
+            CREATE TABLE IF NOT EXISTS scheduled_tasks (
+                scheduled_task_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                project_id TEXT NULL REFERENCES projects(project_id) ON DELETE SET NULL,
+                workspace_id TEXT NULL REFERENCES workspaces(workspace_id) ON DELETE SET NULL,
+                workspace_root TEXT NOT NULL,
+                workspace_mode TEXT NOT NULL,
+                provider_kind TEXT NOT NULL,
+                provider_profile_id TEXT NULL REFERENCES provider_profiles(provider_profile_id) ON DELETE SET NULL,
+                schedule_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                safety_json TEXT NOT NULL,
+                next_run_at_ms INTEGER NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                deleted_at_ms INTEGER NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_due
+                ON scheduled_tasks(status, next_run_at_ms);
+            CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_workspace
+                ON scheduled_tasks(workspace_id, status, updated_at_ms);
+
+            CREATE TABLE IF NOT EXISTS scheduled_task_runs (
+                scheduled_task_run_id TEXT PRIMARY KEY,
+                scheduled_task_id TEXT NOT NULL REFERENCES scheduled_tasks(scheduled_task_id) ON DELETE CASCADE,
+                status TEXT NOT NULL,
+                trigger TEXT NOT NULL,
+                session_id TEXT NULL REFERENCES agent_sessions(session_id) ON DELETE SET NULL,
+                due_at_ms INTEGER NOT NULL,
+                started_at_ms INTEGER NULL,
+                ended_at_ms INTEGER NULL,
+                attempt INTEGER NOT NULL,
+                error_code TEXT NULL,
+                error_message TEXT NULL,
+                redacted_diagnostics_json TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_scheduled_task_runs_task
+                ON scheduled_task_runs(scheduled_task_id, started_at_ms, created_at_ms);
+            CREATE INDEX IF NOT EXISTS idx_scheduled_task_runs_session
+                ON scheduled_task_runs(session_id);
+        ",
+    },
+    Migration {
+        version: 13,
+        name: "automation_graph_contract_storage",
+        sql: "
+            CREATE TABLE IF NOT EXISTS automation_graphs (
+                automation_graph_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                description TEXT NULL,
+                project_id TEXT NULL REFERENCES projects(project_id) ON DELETE SET NULL,
+                workspace_id TEXT NULL REFERENCES workspaces(workspace_id) ON DELETE SET NULL,
+                workspace_root TEXT NOT NULL,
+                workspace_mode TEXT NOT NULL,
+                provider_kind TEXT NULL,
+                provider_profile_id TEXT NULL REFERENCES provider_profiles(provider_profile_id) ON DELETE SET NULL,
+                trigger_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                deleted_at_ms INTEGER NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_automation_graphs_workspace
+                ON automation_graphs(workspace_id, status, updated_at_ms);
+            CREATE INDEX IF NOT EXISTS idx_automation_graphs_status
+                ON automation_graphs(status, updated_at_ms);
+
+            CREATE TABLE IF NOT EXISTS automation_graph_nodes (
+                automation_node_id TEXT PRIMARY KEY,
+                automation_graph_id TEXT NOT NULL REFERENCES automation_graphs(automation_graph_id) ON DELETE CASCADE,
+                kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                config_json TEXT NOT NULL,
+                position_json TEXT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_automation_graph_nodes_graph
+                ON automation_graph_nodes(automation_graph_id);
+
+            CREATE TABLE IF NOT EXISTS automation_graph_edges (
+                automation_edge_id TEXT PRIMARY KEY,
+                automation_graph_id TEXT NOT NULL REFERENCES automation_graphs(automation_graph_id) ON DELETE CASCADE,
+                source_node_id TEXT NOT NULL,
+                target_node_id TEXT NOT NULL,
+                condition_json TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_automation_graph_edges_graph
+                ON automation_graph_edges(automation_graph_id);
+
+            CREATE TABLE IF NOT EXISTS automation_graph_runs (
+                automation_run_id TEXT PRIMARY KEY,
+                automation_graph_id TEXT NOT NULL REFERENCES automation_graphs(automation_graph_id) ON DELETE CASCADE,
+                status TEXT NOT NULL,
+                trigger TEXT NOT NULL,
+                scheduled_task_id TEXT NULL REFERENCES scheduled_tasks(scheduled_task_id) ON DELETE SET NULL,
+                session_id TEXT NULL REFERENCES agent_sessions(session_id) ON DELETE SET NULL,
+                started_at_ms INTEGER NULL,
+                ended_at_ms INTEGER NULL,
+                error_code TEXT NULL,
+                error_message TEXT NULL,
+                redacted_diagnostics_json TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_automation_graph_runs_graph
+                ON automation_graph_runs(automation_graph_id, created_at_ms);
+            CREATE INDEX IF NOT EXISTS idx_automation_graph_runs_status
+                ON automation_graph_runs(status, updated_at_ms);
+
+            CREATE TABLE IF NOT EXISTS automation_graph_run_steps (
+                automation_run_step_id TEXT PRIMARY KEY,
+                automation_run_id TEXT NOT NULL REFERENCES automation_graph_runs(automation_run_id) ON DELETE CASCADE,
+                automation_node_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                session_id TEXT NULL REFERENCES agent_sessions(session_id) ON DELETE SET NULL,
+                permission_request_id TEXT NULL,
+                started_at_ms INTEGER NULL,
+                ended_at_ms INTEGER NULL,
+                error_code TEXT NULL,
+                error_message TEXT NULL,
+                redacted_diagnostics_json TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_automation_graph_run_steps_run
+                ON automation_graph_run_steps(automation_run_id, created_at_ms);
+            CREATE INDEX IF NOT EXISTS idx_automation_graph_run_steps_permission
+                ON automation_graph_run_steps(permission_request_id);
+        ",
+    },
+    Migration {
+        version: 14,
+        name: "right_rail_plugin_storage",
+        sql: "
+            CREATE TABLE IF NOT EXISTS right_rail_plugins (
+                plugin_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                system_key TEXT NULL,
+                builtin_key TEXT NULL,
+                display_name TEXT NOT NULL,
+                url TEXT NULL,
+                logo TEXT NULL,
+                desktop_user_agent TEXT NULL,
+                mobile_user_agent TEXT NULL,
+                ua_mode TEXT NULL,
+                status TEXT NOT NULL,
+                order_index INTEGER NOT NULL,
+                data_directory TEXT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                deleted_at_ms INTEGER NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_right_rail_plugins_system_key
+                ON right_rail_plugins(system_key)
+                WHERE system_key IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_right_rail_plugins_builtin_key
+                ON right_rail_plugins(builtin_key)
+                WHERE builtin_key IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_right_rail_plugins_order
+                ON right_rail_plugins(deleted_at_ms, order_index);
+        ",
+    },
+    Migration {
+        version: 15,
+        name: "workspace_project_soft_delete",
+        sql: "
+            ALTER TABLE projects ADD COLUMN deleted_at_ms INTEGER NULL;
+            ALTER TABLE workspaces ADD COLUMN deleted_at_ms INTEGER NULL;
+            CREATE INDEX IF NOT EXISTS idx_projects_deleted
+                ON projects(deleted_at_ms, updated_at_ms);
+            CREATE INDEX IF NOT EXISTS idx_workspaces_project_deleted
+                ON workspaces(project_id, deleted_at_ms, updated_at_ms);
+        ",
+    },
+    Migration {
+        version: 16,
+        name: "agent_registry_snapshot",
+        sql: "
+            CREATE TABLE IF NOT EXISTS agent_configs (
+                agent_id TEXT PRIMARY KEY,
+                runtime_kind TEXT NOT NULL,
+                source_kind TEXT NOT NULL,
+                label_override TEXT NULL,
+                description_override TEXT NULL,
+                enabled INTEGER NOT NULL,
+                order_index INTEGER NOT NULL,
+                command_json TEXT NULL,
+                env_json TEXT NOT NULL,
+                params_json TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                deleted_at_ms INTEGER NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_configs_order
+                ON agent_configs(deleted_at_ms, order_index, agent_id);
+
+            CREATE TABLE IF NOT EXISTS agent_discovery_records (
+                discovery_record_id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                cwd_scope TEXT NOT NULL,
+                install_status TEXT NOT NULL,
+                config_status TEXT NOT NULL,
+                runtime_status TEXT NOT NULL,
+                binary_path TEXT NULL,
+                version TEXT NULL,
+                native_config_paths_json TEXT NOT NULL,
+                models_json TEXT NOT NULL,
+                modes_json TEXT NOT NULL,
+                diagnostics_json TEXT NOT NULL,
+                discovered_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_discovery_records_latest
+                ON agent_discovery_records(agent_id, cwd_scope, discovered_at_ms DESC);
+        ",
+    },
+    Migration {
+        version: 17,
+        name: "agent_model_provider_profiles",
+        sql: "
+            ALTER TABLE provider_profiles ADD COLUMN agent_id TEXT NULL;
+
+            UPDATE provider_profiles
+            SET agent_id = CASE provider_kind
+                WHEN 'mock' THEN 'mock'
+                WHEN 'claude' THEN 'claude'
+                WHEN 'codex' THEN 'codex'
+                WHEN 'acp' THEN 'opencode'
+                ELSE provider_kind
+            END
+            WHERE agent_id IS NULL;
+
+            CREATE INDEX IF NOT EXISTS idx_provider_profiles_agent
+                ON provider_profiles(agent_id, deleted_at_ms, updated_at_ms);
+
+            CREATE TABLE IF NOT EXISTS agent_default_model_provider_profiles (
+                scope_kind TEXT NOT NULL,
+                scope_id TEXT NOT NULL DEFAULT '',
+                agent_id TEXT NOT NULL,
+                provider_profile_id TEXT NOT NULL REFERENCES provider_profiles(provider_profile_id),
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY(scope_kind, scope_id, agent_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS agent_model_provider_failover (
+                agent_id TEXT NOT NULL,
+                provider_profile_id TEXT NOT NULL REFERENCES provider_profiles(provider_profile_id),
+                order_index INTEGER NOT NULL,
+                enabled INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY(agent_id, provider_profile_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_model_provider_failover_order
+                ON agent_model_provider_failover(agent_id, order_index, provider_profile_id);
+        ",
+    },
+    Migration {
+        version: 18,
+        name: "resource_agent_matrices",
+        sql: "
+            CREATE TABLE IF NOT EXISTS mcp_server_agent_matrix (
+                mcp_server_id TEXT NOT NULL REFERENCES mcp_servers(mcp_server_id) ON DELETE CASCADE,
+                agent_id TEXT NOT NULL,
+                enabled INTEGER NOT NULL,
+                source_kind TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY(mcp_server_id, agent_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_mcp_server_agent_matrix_agent
+                ON mcp_server_agent_matrix(agent_id, enabled);
+
+            CREATE TABLE IF NOT EXISTS skill_agent_matrix (
+                skill_id TEXT NOT NULL REFERENCES skills(skill_id) ON DELETE CASCADE,
+                agent_id TEXT NOT NULL,
+                enabled INTEGER NOT NULL,
+                source_kind TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY(skill_id, agent_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_skill_agent_matrix_agent
+                ON skill_agent_matrix(agent_id, enabled);
+
+            INSERT OR IGNORE INTO mcp_server_agent_matrix (
+                mcp_server_id, agent_id, enabled, source_kind, created_at_ms, updated_at_ms
+            )
+            SELECT
+                mcp_server_id,
+                CASE provider_kind
+                    WHEN 'mock' THEN 'mock'
+                    WHEN 'claude' THEN 'claude'
+                    WHEN 'codex' THEN 'codex'
+                    WHEN 'acp' THEN 'opencode'
+                    ELSE provider_kind
+                END,
+                enabled,
+                'legacy_backfill',
+                created_at_ms,
+                updated_at_ms
+            FROM mcp_server_provider_matrix;
+
+            INSERT OR IGNORE INTO skill_agent_matrix (
+                skill_id, agent_id, enabled, source_kind, created_at_ms, updated_at_ms
+            )
+            SELECT
+                skill_id,
+                CASE provider_kind
+                    WHEN 'mock' THEN 'mock'
+                    WHEN 'claude' THEN 'claude'
+                    WHEN 'codex' THEN 'codex'
+                    WHEN 'acp' THEN 'opencode'
+                    ELSE provider_kind
+                END,
+                enabled,
+                'legacy_backfill',
+                created_at_ms,
+                updated_at_ms
+            FROM skill_provider_matrix;
+        ",
+    },
+    Migration {
+        version: 19,
+        name: "remove_mock_agent_registry_state",
+        sql: "
+            UPDATE agent_configs
+            SET deleted_at_ms = COALESCE(deleted_at_ms, updated_at_ms, created_at_ms, 0),
+                enabled = 0
+            WHERE agent_id = 'mock' OR runtime_kind = 'mock';
+
+            DELETE FROM agent_discovery_records
+            WHERE agent_id = 'mock';
+
+            UPDATE provider_profiles
+            SET deleted_at_ms = COALESCE(deleted_at_ms, updated_at_ms, created_at_ms, 0),
+                status = 'disabled'
+            WHERE agent_id = 'mock' OR provider_kind = 'mock';
+
+            DELETE FROM agent_default_model_provider_profiles
+            WHERE agent_id = 'mock'
+               OR provider_profile_id IN (
+                    SELECT provider_profile_id
+                    FROM provider_profiles
+                    WHERE agent_id = 'mock' OR provider_kind = 'mock'
+               );
+
+            DELETE FROM agent_model_provider_failover
+            WHERE agent_id = 'mock'
+               OR provider_profile_id IN (
+                    SELECT provider_profile_id
+                    FROM provider_profiles
+                    WHERE agent_id = 'mock' OR provider_kind = 'mock'
+               );
+
+            DELETE FROM mcp_server_agent_matrix
+            WHERE agent_id = 'mock';
+
+            DELETE FROM skill_agent_matrix
+            WHERE agent_id = 'mock';
+
+            DELETE FROM mcp_server_provider_matrix
+            WHERE provider_kind = 'mock';
+
+            DELETE FROM skill_provider_matrix
+            WHERE provider_kind = 'mock';
+        ",
+    },
+    Migration {
+        version: 20,
+        name: "session_provider_bindings",
+        sql: "
+            CREATE TABLE IF NOT EXISTS session_provider_bindings (
+                session_id TEXT NOT NULL REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+                provider_profile_id TEXT NOT NULL,
+                provider_kind TEXT NOT NULL,
+                native_session_id TEXT NULL,
+                native_thread_id TEXT NULL,
+                native_resume_token TEXT NULL,
+                redacted_metadata_json TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (session_id, provider_profile_id)
+            );
+
+            INSERT OR IGNORE INTO session_provider_bindings (
+                session_id, provider_profile_id, provider_kind, native_session_id,
+                native_thread_id, native_resume_token, redacted_metadata_json,
+                created_at_ms, updated_at_ms
+            )
+            SELECT
+                session_id, provider_profile_id, provider_kind, native_session_id,
+                native_thread_id, native_resume_token, redacted_metadata_json,
+                created_at_ms, updated_at_ms
+            FROM provider_bindings;
+        ",
+    },
+    Migration {
+        version: 21,
+        name: "provider_profile_configured_models",
+        sql: "
+            ALTER TABLE provider_profiles
+                ADD COLUMN configured_models_json TEXT NOT NULL DEFAULT '[]';
+        ",
+    },
+    Migration {
+        version: 22,
+        name: "provider_session_config_state",
+        sql: "
+            ALTER TABLE provider_bindings
+                ADD COLUMN session_config_state_json TEXT NULL;
+            ALTER TABLE session_provider_bindings
+                ADD COLUMN session_config_state_json TEXT NULL;
+        ",
+    },
+    Migration {
+        version: 23,
+        name: "acp_runtime_hot_switch_core",
+        sql: "
+            ALTER TABLE agent_sessions ADD COLUMN current_agent_id TEXT NULL;
+            ALTER TABLE agent_sessions ADD COLUMN current_binding_id TEXT NULL;
+            ALTER TABLE agent_sessions ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE agent_sessions ADD COLUMN activation_generation INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE agent_sessions ADD COLUMN desired_runtime_selection_json TEXT NULL;
+            ALTER TABLE agent_sessions ADD COLUMN effective_runtime_selection_json TEXT NULL;
+            ALTER TABLE agent_sessions ADD COLUMN runtime_selection_status TEXT NULL;
+            ALTER TABLE agent_sessions ADD COLUMN selection_revision INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE agent_sessions ADD COLUMN pending_switch_id TEXT NULL;
+
+            CREATE TABLE IF NOT EXISTS session_runtime_bindings (
+                binding_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+                agent_id TEXT NOT NULL,
+                transport_kind TEXT NOT NULL,
+                adapter_id TEXT NOT NULL,
+                adapter_version TEXT NOT NULL,
+                adapter_compatibility_identity TEXT NOT NULL,
+                provider_profile_id TEXT NOT NULL,
+                profile_revision INTEGER NOT NULL DEFAULT 0,
+                native_session_id TEXT NULL,
+                native_state_home_id TEXT NOT NULL,
+                provider_resume_identity TEXT NULL,
+                process_spawn_fingerprint TEXT NOT NULL,
+                session_runtime_config_state_json TEXT NOT NULL,
+                capability_snapshot_json TEXT NULL,
+                restore_compatibility_key_json TEXT NULL,
+                last_context_sequence INTEGER NOT NULL DEFAULT 0,
+                last_summary_sequence INTEGER NOT NULL DEFAULT 0,
+                context_bridge_version INTEGER NOT NULL DEFAULT 0,
+                activation_generation INTEGER NOT NULL DEFAULT 0,
+                binding_state TEXT NOT NULL,
+                created_by_switch_id TEXT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            -- Deliberately a plain (non-unique) index: the same
+            -- session/agent/profile/compatibility identity may own multiple
+            -- fresh bindings (plan section 20.2).
+            CREATE INDEX IF NOT EXISTS idx_session_runtime_bindings_route
+                ON session_runtime_bindings(
+                    session_id, agent_id, provider_profile_id, adapter_compatibility_identity
+                );
+            CREATE INDEX IF NOT EXISTS idx_session_runtime_bindings_session
+                ON session_runtime_bindings(session_id, binding_state);
+
+            CREATE TABLE IF NOT EXISTS runtime_switches (
+                switch_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+                idempotency_key TEXT NOT NULL,
+                source_revision INTEGER NOT NULL,
+                source_binding_id TEXT NULL,
+                desired_selection_revision INTEGER NOT NULL,
+                target_binding_id TEXT NULL,
+                target_agent_id TEXT NOT NULL,
+                target_adapter_id TEXT NOT NULL,
+                target_profile_id TEXT NOT NULL,
+                requested_policy_json TEXT NULL,
+                active_work_policy_json TEXT NULL,
+                requested_session_config_json TEXT NULL,
+                restore_compatibility_result_json TEXT NULL,
+                status TEXT NOT NULL,
+                error_code TEXT NULL,
+                error_detail_redacted TEXT NULL,
+                worker_lease_owner TEXT NULL,
+                worker_lease_deadline_ms INTEGER NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                committed_at_ms INTEGER NULL,
+                UNIQUE(session_id, idempotency_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_runtime_switches_session_status
+                ON runtime_switches(session_id, status);
+
+            CREATE TABLE IF NOT EXISTS runtime_switch_operations (
+                operation_id TEXT PRIMARY KEY,
+                switch_id TEXT NOT NULL REFERENCES runtime_switches(switch_id) ON DELETE CASCADE,
+                sequence INTEGER NOT NULL,
+                operation_kind TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                adapter_idempotency_token TEXT NULL,
+                retry_semantics TEXT NOT NULL,
+                status TEXT NOT NULL,
+                native_result_reference TEXT NULL,
+                error_detail_redacted TEXT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                UNIQUE(switch_id, sequence)
+            );
+
+            CREATE TABLE IF NOT EXISTS agent_message_submissions (
+                submission_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+                message_idempotency_key TEXT NOT NULL,
+                desired_runtime_selection_json TEXT NOT NULL,
+                required_switch_id TEXT NULL,
+                message_payload_reference TEXT NOT NULL,
+                user_message_timeline_item_id TEXT NULL,
+                status TEXT NOT NULL,
+                dispatch_operation_id TEXT NULL,
+                provider_correlation_id TEXT NULL,
+                error_code TEXT NULL,
+                error_detail_redacted TEXT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                dispatched_at_ms INTEGER NULL,
+                UNIQUE(session_id, message_idempotency_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_message_submissions_session_status
+                ON agent_message_submissions(session_id, status);
+        ",
+    },
+    Migration {
+        version: 24,
+        name: "turn_execution_attribution",
+        sql: "
+            ALTER TABLE agent_timeline_items
+                ADD COLUMN execution_attribution_json TEXT NULL;
+        ",
+    },
+    Migration {
+        version: 25,
+        name: "runtime_selection_control_plane",
+        sql: "
+            ALTER TABLE agent_sessions
+                ADD COLUMN runtime_selection_error_code TEXT NULL;
+
+            CREATE TABLE IF NOT EXISTS runtime_switch_events (
+                event_id TEXT PRIMARY KEY,
+                switch_id TEXT NOT NULL REFERENCES runtime_switches(switch_id) ON DELETE CASCADE,
+                session_id TEXT NOT NULL REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+                event_kind TEXT NOT NULL,
+                visibility TEXT NOT NULL,
+                status TEXT NOT NULL,
+                error_code TEXT NULL,
+                created_at_ms INTEGER NOT NULL,
+                UNIQUE(switch_id, event_kind, status)
+            );
+            CREATE INDEX IF NOT EXISTS idx_runtime_switch_events_session
+                ON runtime_switch_events(session_id, created_at_ms, event_id);
+        ",
+    },
+    Migration {
+        version: 26,
+        name: "durable_message_submission_payloads",
+        sql: "
+            CREATE TABLE IF NOT EXISTS agent_message_submission_payloads (
+                payload_reference TEXT PRIMARY KEY,
+                submission_id TEXT NOT NULL UNIQUE
+                    REFERENCES agent_message_submissions(submission_id) ON DELETE CASCADE,
+                session_id TEXT NOT NULL
+                    REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+                submission_sequence INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                result_first_sequence INTEGER NULL,
+                result_last_sequence INTEGER NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                UNIQUE(session_id, submission_sequence)
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_message_submission_payloads_session_sequence
+                ON agent_message_submission_payloads(session_id, submission_sequence);
+        ",
+    },
+    Migration {
+        version: 27,
+        name: "incremental_context_bridge",
+        sql: "
+            CREATE TABLE IF NOT EXISTS runtime_context_bridges (
+                switch_id TEXT PRIMARY KEY
+                    REFERENCES runtime_switches(switch_id) ON DELETE CASCADE,
+                session_id TEXT NOT NULL
+                    REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+                target_binding_id TEXT NOT NULL UNIQUE
+                    REFERENCES session_runtime_bindings(binding_id) ON DELETE CASCADE,
+                from_context_sequence INTEGER NOT NULL CHECK(from_context_sequence >= 0),
+                from_summary_sequence INTEGER NOT NULL CHECK(from_summary_sequence >= 0),
+                prepare_sequence INTEGER NOT NULL CHECK(prepare_sequence > from_context_sequence),
+                summary_sequence INTEGER NOT NULL,
+                bridge_version INTEGER NOT NULL CHECK(bridge_version > 0),
+                content_fingerprint TEXT NOT NULL,
+                applied_submission_id TEXT NULL,
+                applied_context_sequence INTEGER NULL,
+                created_at_ms INTEGER NOT NULL,
+                applied_at_ms INTEGER NULL,
+                CHECK(from_summary_sequence <= from_context_sequence),
+                CHECK(summary_sequence >= from_summary_sequence),
+                CHECK(summary_sequence <= prepare_sequence),
+                CHECK(
+                    (applied_at_ms IS NULL AND applied_context_sequence IS NULL)
+                    OR
+                    (applied_at_ms IS NOT NULL AND applied_context_sequence >= prepare_sequence)
+                )
+            );
+            CREATE INDEX IF NOT EXISTS idx_runtime_context_bridges_pending
+                ON runtime_context_bridges(target_binding_id, applied_at_ms);
+        ",
+    },
+    Migration {
+        version: 28,
+        name: "acp_only_runtime_cutover",
+        sql: "
+            -- This release intentionally does not migrate Native online
+            -- sessions. Cascades clear every session-scoped runtime/timeline
+            -- row before the legacy authority columns and tables disappear.
+            DELETE FROM agent_sessions;
+
+            DROP TABLE session_provider_bindings;
+            DROP TABLE provider_bindings;
+
+            ALTER TABLE agent_sessions DROP COLUMN provider_kind;
+            ALTER TABLE agent_sessions DROP COLUMN provider_profile_id;
+        ",
+    },
+    Migration {
+        version: 29,
+        name: "remote_protocol_v2_pairing_offers",
+        sql: "
+            ALTER TABLE remote_pairing_codes ADD COLUMN offer_format_version INTEGER NULL;
+            ALTER TABLE remote_pairing_codes ADD COLUMN protocol_min_major INTEGER NULL;
+            ALTER TABLE remote_pairing_codes ADD COLUMN protocol_min_minor INTEGER NULL;
+            ALTER TABLE remote_pairing_codes ADD COLUMN protocol_max_major INTEGER NULL;
+            ALTER TABLE remote_pairing_codes ADD COLUMN protocol_max_minor INTEGER NULL;
+            ALTER TABLE remote_pairing_codes ADD COLUMN server_id TEXT NULL;
+            ALTER TABLE remote_pairing_codes ADD COLUMN server_identity_public_key TEXT NULL;
+            ALTER TABLE remote_pairing_codes
+                ADD COLUMN direct_candidates_json TEXT NOT NULL DEFAULT '[]';
+            ALTER TABLE remote_pairing_codes ADD COLUMN relay_candidate_json TEXT NULL;
+            ALTER TABLE remote_pairing_codes
+                ADD COLUMN granted_permissions_json TEXT NOT NULL DEFAULT '[]';
+            ALTER TABLE remote_pairing_codes ADD COLUMN canceled_at_ms INTEGER NULL;
+            ALTER TABLE remote_pairing_codes ADD COLUMN claim_nonce_hash TEXT NULL;
+            ALTER TABLE remote_pairing_codes ADD COLUMN device_ephemeral_public_key TEXT NULL;
+            ALTER TABLE remote_devices ADD COLUMN grant_revision INTEGER NOT NULL DEFAULT 1;
+
+            CREATE INDEX IF NOT EXISTS idx_remote_pairing_offers_state
+                ON remote_pairing_codes(expires_at_ms, canceled_at_ms, claimed_at_ms);
+        ",
+    },
+    Migration {
+        version: 30,
+        name: "provider_runtime_option_snapshots",
+        sql: "
+            CREATE TABLE IF NOT EXISTS provider_runtime_option_snapshots (
+                provider_profile_id TEXT PRIMARY KEY
+                    REFERENCES provider_profiles(provider_profile_id) ON DELETE CASCADE,
+                agent_id TEXT NOT NULL,
+                model_response_json TEXT NULL,
+                session_config_json TEXT NULL,
+                last_success_at_ms INTEGER NULL,
+                last_attempt_at_ms INTEGER NOT NULL,
+                last_error_code TEXT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_provider_runtime_option_snapshots_agent
+                ON provider_runtime_option_snapshots(agent_id, last_attempt_at_ms);
+        ",
+    },
+];
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabaseSmokeResult {
+    pub database_path: PathBuf,
+    pub schema_version: i64,
+    pub applied_migrations: Vec<String>,
+    pub marker: String,
+}
+
+pub struct WorkspaceRepository;
+pub struct SessionRepository;
+pub struct AgentConfigRepository;
+pub struct AgentDiscoveryRepository;
+pub struct ProviderProfileRepository;
+pub struct ProviderSecretReferenceRepository;
+pub struct ProviderDefaultProfileRepository;
+pub struct AgentDefaultModelProviderProfileRepository;
+pub struct AgentModelProviderFailoverRepository;
+pub struct ProviderInjectionPreviewRepository;
+pub struct ProviderNativeExportRepository;
+pub struct ProviderCapabilityRepository;
+pub struct ProviderRuntimeOptionSnapshotRepository;
+pub struct ProviderHealthRepository;
+pub struct ProviderUsageRepository;
+pub struct ScheduledTaskRepository;
+pub struct AutomationGraphRepository;
+pub struct McpServerRepository;
+pub struct SkillRepository;
+pub struct PromptRepository;
+pub struct HookRepository;
+pub struct TimelineRepository;
+pub struct PermissionRepository;
+pub struct AdapterDiagnosticsRepository;
+pub struct TerminalSessionRepository;
+pub struct RecentFileRepository;
+pub struct GitSnapshotRepository;
+pub struct ManagedWorktreeRepository;
+pub struct WorktreeOperationRepository;
+pub struct RemoteDeviceRepository;
+pub struct RemotePairingCodeRepository;
+pub struct RemoteAuditRepository;
+pub struct RightRailPluginRepository;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderRuntimeOptionSnapshotRecord {
+    pub provider_profile_id: ProviderProfileId,
+    pub agent_id: AgentId,
+    pub model_response: Option<AgentModelListResponse>,
+    pub session_config: Option<AgentSessionConfigProbe>,
+    pub last_success_at_ms: Option<i64>,
+    pub last_attempt_at_ms: i64,
+    pub last_error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectLookup {
+    record: ProjectRecord,
+    deleted_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceLookup {
+    record: WorkspaceRecord,
+    deleted_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimelineAppend {
+    pub source: TimelineSource,
+    pub payload: TimelinePayload,
+    pub timestamp_ms: Option<i64>,
+    pub correlation_id: Option<CorrelationId>,
+    pub provider_correlation_id: Option<String>,
+    pub redaction_state: TimelineRedactionState,
+    pub execution_attribution: Option<TurnExecutionAttribution>,
+}
+
+macro_rules! provider_profile_params {
+    ($profile:expr) => {
+        params![
+            $profile.id.as_str(),
+            $profile.agent_id.as_str(),
+            enum_to_db(&$profile.kind)?,
+            $profile.display_name,
+            enum_to_db(&$profile.status)?,
+            $profile.account_alias,
+            $profile.base_url,
+            $profile.default_model,
+            $profile.small_model,
+            $profile.large_model,
+            json_to_db(&$profile.configured_models)?,
+            $profile.reasoning_effort,
+            json_to_db(&$profile.sandbox_defaults)?,
+            json_to_db(&$profile.network_defaults)?,
+            json_to_db(&$profile.permission_defaults)?,
+            json_to_db(&$profile.provider_options)?,
+            $profile.created_at_ms,
+            $profile.updated_at_ms,
+            $profile.deleted_at_ms
+        ]
+    };
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedWorktreeRecord {
+    pub worktree_id: RequestId,
+    pub project_id: ProjectId,
+    pub workspace_id: Option<WorkspaceId>,
+    pub repo_root: String,
+    pub worktree_path: String,
+    pub branch: Option<String>,
+    pub base_ref: Option<String>,
+    pub head: Option<String>,
+    pub status: GitManagedWorktreeStatus,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub closed_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDeviceRecord {
+    pub detail: RemoteDeviceDetail,
+    pub auth_secret_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemotePairingCodeRecord {
+    pub pairing: RemotePairingCode,
+    pub code_hash: String,
+}
+
+impl WorkspaceRepository {
+    pub fn ensure(
+        conn: &Connection,
+        workspace_root: impl AsRef<Path>,
+        mode: WorkspaceMode,
+    ) -> VibexResult<(ProjectRecord, WorkspaceRecord)> {
+        let root_path = normalize_path(workspace_root.as_ref());
+        let now = unix_timestamp_ms();
+        let project_name = workspace_root
+            .as_ref()
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Workspace")
+            .to_string();
+
+        let project = match Self::find_project_by_root(conn, &root_path)? {
+            Some(mut project) => {
+                if project.deleted_at_ms.is_some() {
+                    conn.execute(
+                        "
+                        UPDATE projects
+                        SET deleted_at_ms = NULL, updated_at_ms = ?2
+                        WHERE project_id = ?1
+                        ",
+                        params![project.record.id.as_str(), now],
+                    )
+                    .map_err(storage_err(
+                        "project_restore_failed",
+                        "failed to restore project",
+                    ))?;
+                    project.record.updated_at_ms = now;
+                }
+                project.record
+            }
+            None => {
+                let project = ProjectRecord {
+                    id: ProjectId::new(),
+                    name: project_name,
+                    root_path: root_path.clone(),
+                    created_at_ms: now,
+                    updated_at_ms: now,
+                };
+                conn.execute(
+                    "
+                    INSERT INTO projects
+                        (project_id, name, root_path, created_at_ms, updated_at_ms)
+                    VALUES (?1, ?2, ?3, ?4, ?5)
+                    ",
+                    params![
+                        project.id.as_str(),
+                        project.name,
+                        project.root_path,
+                        project.created_at_ms,
+                        project.updated_at_ms
+                    ],
+                )
+                .map_err(storage_err(
+                    "project_insert_failed",
+                    "failed to insert project",
+                ))?;
+                project
+            }
+        };
+
+        let mode_text = enum_to_db(&mode)?;
+        let workspace = match Self::find_workspace(conn, &project.id, &root_path, &mode_text)? {
+            Some(mut workspace) => {
+                if workspace.deleted_at_ms.is_some() {
+                    conn.execute(
+                        "
+                        UPDATE workspaces
+                        SET deleted_at_ms = NULL, updated_at_ms = ?2
+                        WHERE workspace_id = ?1
+                        ",
+                        params![workspace.record.id.as_str(), now],
+                    )
+                    .map_err(storage_err(
+                        "workspace_restore_failed",
+                        "failed to restore workspace",
+                    ))?;
+                    workspace.record.updated_at_ms = now;
+                }
+                workspace.record
+            }
+            None => {
+                let workspace = WorkspaceRecord {
+                    id: WorkspaceId::new(),
+                    project_id: project.id.clone(),
+                    root_path,
+                    mode,
+                    created_at_ms: now,
+                    updated_at_ms: now,
+                };
+                conn.execute(
+                    "
+                    INSERT INTO workspaces
+                        (workspace_id, project_id, root_path, mode, created_at_ms, updated_at_ms)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    ",
+                    params![
+                        workspace.id.as_str(),
+                        workspace.project_id.as_str(),
+                        workspace.root_path,
+                        enum_to_db(&workspace.mode)?,
+                        workspace.created_at_ms,
+                        workspace.updated_at_ms
+                    ],
+                )
+                .map_err(storage_err(
+                    "workspace_insert_failed",
+                    "failed to insert workspace",
+                ))?;
+                workspace
+            }
+        };
+
+        Ok((project, workspace))
+    }
+
+    pub fn ensure_for_project(
+        conn: &Connection,
+        project_id: &ProjectId,
+        workspace_root: impl AsRef<Path>,
+        mode: WorkspaceMode,
+    ) -> VibexResult<WorkspaceRecord> {
+        let root_path = normalize_path(workspace_root.as_ref());
+        let project = Self::get_project(conn, project_id)?.ok_or_else(|| {
+            VibexError::validation("project_not_found", "project was not found")
+                .with_diagnostic("projectId", project_id.as_str())
+        })?;
+        let mode_text = enum_to_db(&mode)?;
+        let now = unix_timestamp_ms();
+
+        match Self::find_workspace(conn, &project.id, &root_path, &mode_text)? {
+            Some(mut workspace) => {
+                if workspace.deleted_at_ms.is_some() {
+                    conn.execute(
+                        "
+                        UPDATE workspaces
+                        SET deleted_at_ms = NULL, updated_at_ms = ?2
+                        WHERE workspace_id = ?1
+                        ",
+                        params![workspace.record.id.as_str(), now],
+                    )
+                    .map_err(storage_err(
+                        "workspace_restore_failed",
+                        "failed to restore workspace",
+                    ))?;
+                    workspace.record.updated_at_ms = now;
+                }
+                Ok(workspace.record)
+            }
+            None => {
+                let workspace = WorkspaceRecord {
+                    id: WorkspaceId::new(),
+                    project_id: project.id,
+                    root_path,
+                    mode,
+                    created_at_ms: now,
+                    updated_at_ms: now,
+                };
+                conn.execute(
+                    "
+                    INSERT INTO workspaces
+                        (workspace_id, project_id, root_path, mode, created_at_ms, updated_at_ms)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    ",
+                    params![
+                        workspace.id.as_str(),
+                        workspace.project_id.as_str(),
+                        workspace.root_path,
+                        enum_to_db(&workspace.mode)?,
+                        workspace.created_at_ms,
+                        workspace.updated_at_ms
+                    ],
+                )
+                .map_err(storage_err(
+                    "workspace_insert_failed",
+                    "failed to insert workspace",
+                ))?;
+                Ok(workspace)
+            }
+        }
+    }
+
+    pub fn list(conn: &Connection) -> VibexResult<Vec<(ProjectRecord, WorkspaceRecord)>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT
+                    p.project_id, p.name, p.root_path, p.created_at_ms, p.updated_at_ms,
+                    w.workspace_id, w.project_id, w.root_path, w.mode,
+                    w.created_at_ms, w.updated_at_ms
+                FROM workspaces w
+                JOIN projects p ON p.project_id = w.project_id
+                WHERE p.deleted_at_ms IS NULL AND w.deleted_at_ms IS NULL
+                ORDER BY w.updated_at_ms DESC
+                ",
+            )
+            .map_err(storage_err(
+                "workspace_list_failed",
+                "failed to list workspaces",
+            ))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    ProjectRecord {
+                        id: parse_id_sql(row.get(0)?, ProjectId::parse)?,
+                        name: row.get(1)?,
+                        root_path: row.get(2)?,
+                        created_at_ms: row.get(3)?,
+                        updated_at_ms: row.get(4)?,
+                    },
+                    WorkspaceRecord {
+                        id: parse_id_sql(row.get(5)?, WorkspaceId::parse)?,
+                        project_id: parse_id_sql(row.get(6)?, ProjectId::parse)?,
+                        root_path: row.get(7)?,
+                        mode: enum_from_db_sql(row.get(8)?)?,
+                        created_at_ms: row.get(9)?,
+                        updated_at_ms: row.get(10)?,
+                    },
+                ))
+            })
+            .map_err(storage_err(
+                "workspace_list_failed",
+                "failed to list workspaces",
+            ))?;
+
+        let mut workspaces = Vec::new();
+        for row in rows {
+            workspaces.push(row.map_err(storage_err(
+                "workspace_decode_failed",
+                "failed to decode workspace row",
+            ))?);
+        }
+        Ok(workspaces)
+    }
+
+    pub fn get(
+        conn: &Connection,
+        workspace_id: &WorkspaceId,
+    ) -> VibexResult<Option<(ProjectRecord, WorkspaceRecord)>> {
+        conn.query_row(
+            "
+            SELECT
+                p.project_id, p.name, p.root_path, p.created_at_ms, p.updated_at_ms,
+                w.workspace_id, w.project_id, w.root_path, w.mode,
+                w.created_at_ms, w.updated_at_ms
+            FROM workspaces w
+            JOIN projects p ON p.project_id = w.project_id
+            WHERE w.workspace_id = ?1
+                AND w.deleted_at_ms IS NULL
+                AND p.deleted_at_ms IS NULL
+            ",
+            params![workspace_id.as_str()],
+            |row| {
+                Ok((
+                    ProjectRecord {
+                        id: parse_id_sql(row.get(0)?, ProjectId::parse)?,
+                        name: row.get(1)?,
+                        root_path: row.get(2)?,
+                        created_at_ms: row.get(3)?,
+                        updated_at_ms: row.get(4)?,
+                    },
+                    WorkspaceRecord {
+                        id: parse_id_sql(row.get(5)?, WorkspaceId::parse)?,
+                        project_id: parse_id_sql(row.get(6)?, ProjectId::parse)?,
+                        root_path: row.get(7)?,
+                        mode: enum_from_db_sql(row.get(8)?)?,
+                        created_at_ms: row.get(9)?,
+                        updated_at_ms: row.get(10)?,
+                    },
+                ))
+            },
+        )
+        .optional()
+        .map_err(storage_err(
+            "workspace_lookup_failed",
+            "failed to lookup workspace",
+        ))
+    }
+
+    fn find_project_by_root(
+        conn: &Connection,
+        root_path: &str,
+    ) -> VibexResult<Option<ProjectLookup>> {
+        conn.query_row(
+            "
+            SELECT project_id, name, root_path, created_at_ms, updated_at_ms, deleted_at_ms
+            FROM projects
+            WHERE root_path = ?1
+            ",
+            params![root_path],
+            map_project_lookup,
+        )
+        .optional()
+        .map_err(storage_err(
+            "project_lookup_failed",
+            "failed to lookup project",
+        ))
+    }
+
+    pub fn get_project(
+        conn: &Connection,
+        project_id: &ProjectId,
+    ) -> VibexResult<Option<ProjectRecord>> {
+        conn.query_row(
+            "
+            SELECT project_id, name, root_path, created_at_ms, updated_at_ms
+            FROM projects
+            WHERE project_id = ?1 AND deleted_at_ms IS NULL
+            ",
+            params![project_id.as_str()],
+            map_project,
+        )
+        .optional()
+        .map_err(storage_err(
+            "project_lookup_failed",
+            "failed to lookup project",
+        ))
+    }
+
+    fn find_workspace(
+        conn: &Connection,
+        project_id: &ProjectId,
+        root_path: &str,
+        mode: &str,
+    ) -> VibexResult<Option<WorkspaceLookup>> {
+        conn.query_row(
+            "
+            SELECT workspace_id, project_id, root_path, mode, created_at_ms, updated_at_ms,
+                deleted_at_ms
+            FROM workspaces
+            WHERE project_id = ?1 AND root_path = ?2 AND mode = ?3
+            ",
+            params![project_id.as_str(), root_path, mode],
+            map_workspace_lookup,
+        )
+        .optional()
+        .map_err(storage_err(
+            "workspace_lookup_failed",
+            "failed to lookup workspace",
+        ))
+    }
+
+    pub fn delete_project(conn: &mut Connection, project_id: &ProjectId) -> VibexResult<()> {
+        let now = unix_timestamp_ms();
+        let tx = conn.transaction().map_err(storage_err(
+            "project_delete_transaction_failed",
+            "failed to start project delete transaction",
+        ))?;
+        let exists = tx
+            .query_row(
+                "SELECT 1 FROM projects WHERE project_id = ?1",
+                params![project_id.as_str()],
+                |_row| Ok(()),
+            )
+            .optional()
+            .map_err(storage_err(
+                "project_lookup_failed",
+                "failed to lookup project",
+            ))?
+            .is_some();
+        if !exists {
+            return Err(
+                VibexError::validation("project_not_found", "project was not found")
+                    .with_diagnostic("projectId", project_id.as_str()),
+            );
+        }
+
+        tx.execute(
+            "
+            UPDATE projects
+            SET deleted_at_ms = COALESCE(deleted_at_ms, ?2), updated_at_ms = ?2
+            WHERE project_id = ?1
+            ",
+            params![project_id.as_str(), now],
+        )
+        .map_err(storage_err(
+            "project_delete_failed",
+            "failed to delete project",
+        ))?;
+        tx.execute(
+            "
+            UPDATE workspaces
+            SET deleted_at_ms = COALESCE(deleted_at_ms, ?2), updated_at_ms = ?2
+            WHERE project_id = ?1
+            ",
+            params![project_id.as_str(), now],
+        )
+        .map_err(storage_err(
+            "workspace_delete_failed",
+            "failed to delete project workspaces",
+        ))?;
+        tx.execute(
+            "
+            UPDATE agent_sessions
+            SET deleted_at_ms = COALESCE(deleted_at_ms, ?2), updated_at_ms = ?2
+            WHERE project_id = ?1
+            ",
+            params![project_id.as_str(), now],
+        )
+        .map_err(storage_err(
+            "project_session_delete_failed",
+            "failed to delete project sessions",
+        ))?;
+        tx.commit().map_err(storage_err(
+            "project_delete_commit_failed",
+            "failed to commit project delete",
+        ))?;
+        Ok(())
+    }
+}
+
+impl SessionRepository {
+    pub fn insert(conn: &Connection, session: &AgentSession) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO agent_sessions (
+                session_id, title, project_id, workspace_id, workspace_root,
+                workspace_mode, state,
+                permission_mode, ask_on_risk, bypass_all_permissions,
+                created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms,
+                current_agent_id
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            ",
+            params![
+                session.id.as_str(),
+                session.title,
+                session.project_id.as_str(),
+                session.workspace_id.as_str(),
+                session.workspace_root,
+                enum_to_db(&session.workspace_mode)?,
+                enum_to_db(&session.state)?,
+                enum_to_db(&session.safety.permission_mode)?,
+                session.safety.ask_on_risk,
+                session.safety.bypass_all_permissions,
+                session.created_at_ms,
+                session.updated_at_ms,
+                session.archived_at_ms,
+                session.deleted_at_ms,
+                session.agent_id.as_str()
+            ],
+        )
+        .map_err(storage_err(
+            "session_insert_failed",
+            "failed to insert session",
+        ))?;
+        Ok(())
+    }
+
+    pub fn get(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<Option<AgentSession>> {
+        conn.query_row(
+            "
+                SELECT session_id, title, project_id, workspace_id, workspace_root,
+                    workspace_mode, state,
+                    permission_mode, ask_on_risk, bypass_all_permissions,
+                    created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms,
+                    current_agent_id
+                FROM agent_sessions
+                WHERE session_id = ?1 AND deleted_at_ms IS NULL
+                ",
+            params![session_id.as_str()],
+            map_agent_session,
+        )
+        .optional()
+        .map_err(storage_err(
+            "session_lookup_failed",
+            "failed to lookup session",
+        ))
+    }
+
+    pub fn list(conn: &Connection, include_archived: bool) -> VibexResult<Vec<AgentSession>> {
+        let sql = if include_archived {
+            "
+            SELECT session_id, title, project_id, workspace_id, workspace_root,
+                workspace_mode, state,
+                permission_mode, ask_on_risk, bypass_all_permissions,
+                created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms,
+                current_agent_id
+            FROM agent_sessions
+            WHERE deleted_at_ms IS NULL
+            ORDER BY updated_at_ms DESC
+            "
+        } else {
+            "
+            SELECT session_id, title, project_id, workspace_id, workspace_root,
+                workspace_mode, state,
+                permission_mode, ask_on_risk, bypass_all_permissions,
+                created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms,
+                current_agent_id
+            FROM agent_sessions
+            WHERE deleted_at_ms IS NULL AND archived_at_ms IS NULL
+            ORDER BY updated_at_ms DESC
+            "
+        };
+        let mut stmt = conn.prepare(sql).map_err(storage_err(
+            "session_list_failed",
+            "failed to list sessions",
+        ))?;
+        let rows = stmt.query_map([], map_agent_session).map_err(storage_err(
+            "session_list_failed",
+            "failed to list sessions",
+        ))?;
+
+        let mut sessions = Vec::new();
+        for row in rows {
+            let session = row.map_err(storage_err(
+                "session_decode_failed",
+                "failed to decode session row",
+            ))?;
+            sessions.push(session);
+        }
+        Ok(sessions)
+    }
+
+    pub fn update_state(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+        state: AgentSessionState,
+    ) -> VibexResult<()> {
+        conn.execute(
+            "
+            UPDATE agent_sessions
+            SET state = ?2, updated_at_ms = ?3
+            WHERE session_id = ?1 AND deleted_at_ms IS NULL
+            ",
+            params![
+                session_id.as_str(),
+                enum_to_db(&state)?,
+                unix_timestamp_ms()
+            ],
+        )
+        .map_err(storage_err(
+            "session_state_update_failed",
+            "failed to update session state",
+        ))?;
+        Ok(())
+    }
+
+    pub fn claim_running_turn(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+        expected_state: AgentSessionState,
+    ) -> VibexResult<()> {
+        let changed_rows = conn
+            .execute(
+                "
+                UPDATE agent_sessions
+                SET state = ?3, updated_at_ms = ?4
+                WHERE session_id = ?1
+                    AND state = ?2
+                    AND deleted_at_ms IS NULL
+                ",
+                params![
+                    session_id.as_str(),
+                    enum_to_db(&expected_state)?,
+                    enum_to_db(&AgentSessionState::Running)?,
+                    unix_timestamp_ms()
+                ],
+            )
+            .map_err(storage_err(
+                "session_state_update_failed",
+                "failed to update session state",
+            ))?;
+
+        if changed_rows == 0 {
+            return Err(VibexError::conflict(
+                "agent_turn_already_running",
+                "Agent session already has a running turn",
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub fn update_title(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+        title: &str,
+    ) -> VibexResult<AgentSession> {
+        let trimmed_title = title.trim();
+        if trimmed_title.is_empty() {
+            return Err(VibexError::validation(
+                "session_title_empty",
+                "session title must not be empty",
+            ));
+        }
+
+        let changed_rows = conn
+            .execute(
+                "
+                UPDATE agent_sessions
+                SET title = ?2
+                WHERE session_id = ?1 AND deleted_at_ms IS NULL
+                ",
+                params![session_id.as_str(), trimmed_title],
+            )
+            .map_err(storage_err(
+                "session_title_update_failed",
+                "failed to update session title",
+            ))?;
+
+        if changed_rows == 0 {
+            return Err(VibexError::validation(
+                "session_not_found",
+                "Agent session was not found",
+            ));
+        }
+
+        Self::get(conn, session_id)?.ok_or_else(|| {
+            VibexError::validation("session_not_found", "Agent session was not found")
+        })
+    }
+
+    pub fn archive(conn: &Connection, session_id: &VibexSessionId) -> VibexResult<()> {
+        let now = unix_timestamp_ms();
+        conn.execute(
+            "
+            UPDATE agent_sessions
+            SET state = ?2, archived_at_ms = COALESCE(archived_at_ms, ?3), updated_at_ms = ?3
+            WHERE session_id = ?1 AND deleted_at_ms IS NULL
+            ",
+            params![
+                session_id.as_str(),
+                enum_to_db(&AgentSessionState::Archived)?,
+                now
+            ],
+        )
+        .map_err(storage_err(
+            "session_archive_failed",
+            "failed to archive session",
+        ))?;
+        Ok(())
+    }
+
+    pub fn archive_if_timeline_unchanged(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+        expected_end_sequence: i64,
+    ) -> VibexResult<()> {
+        let now = unix_timestamp_ms();
+        let changed_rows = conn
+            .execute(
+                "
+                UPDATE agent_sessions
+                SET state = ?2, archived_at_ms = COALESCE(archived_at_ms, ?3), updated_at_ms = ?3
+                WHERE session_id = ?1
+                    AND deleted_at_ms IS NULL
+                    AND state IN (?4, ?5)
+                    AND ?6 = (
+                        SELECT COALESCE(MAX(sequence), 0)
+                        FROM agent_timeline_items
+                        WHERE session_id = ?1
+                    )
+                ",
+                params![
+                    session_id.as_str(),
+                    enum_to_db(&AgentSessionState::Archived)?,
+                    now,
+                    enum_to_db(&AgentSessionState::Idle)?,
+                    enum_to_db(&AgentSessionState::Error)?,
+                    expected_end_sequence,
+                ],
+            )
+            .map_err(storage_err(
+                "session_archive_failed",
+                "failed to archive session",
+            ))?;
+        if changed_rows == 0 {
+            return Err(VibexError::conflict(
+                "session_archive_source_changed",
+                "Agent session changed before it could be archived",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn delete(conn: &Connection, session_id: &VibexSessionId) -> VibexResult<()> {
+        conn.execute(
+            "DELETE FROM agent_sessions WHERE session_id = ?1",
+            params![session_id.as_str()],
+        )
+        .map_err(storage_err(
+            "session_delete_failed",
+            "failed to delete session",
+        ))?;
+        Ok(())
+    }
+}
+
+impl AgentConfigRepository {
+    pub fn upsert(conn: &Connection, config: &AgentConfig) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO agent_configs (
+                agent_id, runtime_kind, source_kind, label_override,
+                description_override, enabled, order_index, command_json,
+                env_json, params_json, created_at_ms, updated_at_ms,
+                deleted_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            ON CONFLICT(agent_id) DO UPDATE SET
+                runtime_kind = excluded.runtime_kind,
+                source_kind = excluded.source_kind,
+                label_override = excluded.label_override,
+                description_override = excluded.description_override,
+                enabled = excluded.enabled,
+                order_index = excluded.order_index,
+                command_json = excluded.command_json,
+                env_json = excluded.env_json,
+                params_json = excluded.params_json,
+                updated_at_ms = excluded.updated_at_ms,
+                deleted_at_ms = excluded.deleted_at_ms
+            ",
+            params![
+                config.agent_id.as_str(),
+                enum_to_db(&config.runtime_kind)?,
+                enum_to_db(&config.source_kind)?,
+                config.label_override.as_deref(),
+                config.description_override.as_deref(),
+                config.enabled,
+                config.order_index,
+                config.command.as_ref().map(json_to_db).transpose()?,
+                json_to_db(&config.env)?,
+                json_to_db(&config.params)?,
+                config.created_at_ms,
+                config.updated_at_ms,
+                config.deleted_at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "agent_config_upsert_failed",
+            "failed to upsert agent config",
+        ))?;
+        Ok(())
+    }
+
+    pub fn list(conn: &Connection) -> VibexResult<Vec<AgentConfig>> {
+        // No agent-id whitelist here: callers match configs against the
+        // current builtin definitions, so rows for removed agents are ignored
+        // naturally. The runtime_kind filter stays to skip legacy rows (for
+        // example runtime_kind 'mock') that no longer decode.
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT agent_id, runtime_kind, source_kind, label_override,
+                    description_override, enabled, order_index, command_json,
+                    env_json, params_json, created_at_ms, updated_at_ms,
+                    deleted_at_ms
+                FROM agent_configs
+                WHERE runtime_kind IN ('claude_sdk', 'codex_sdk', 'acp')
+                ORDER BY order_index ASC, agent_id ASC
+                ",
+            )
+            .map_err(storage_err(
+                "agent_config_list_failed",
+                "failed to list agent configs",
+            ))?;
+        let rows = stmt.query_map([], map_agent_config).map_err(storage_err(
+            "agent_config_list_failed",
+            "failed to list agent configs",
+        ))?;
+        let mut configs = Vec::new();
+        for row in rows {
+            configs.push(row.map_err(storage_err(
+                "agent_config_decode_failed",
+                "failed to decode agent config",
+            ))?);
+        }
+        Ok(configs)
+    }
+
+    pub fn get(conn: &Connection, agent_id: &AgentId) -> VibexResult<Option<AgentConfig>> {
+        conn.query_row(
+            "
+            SELECT agent_id, runtime_kind, source_kind, label_override,
+                description_override, enabled, order_index, command_json,
+                env_json, params_json, created_at_ms, updated_at_ms,
+                deleted_at_ms
+            FROM agent_configs
+            WHERE agent_id = ?1
+            ",
+            params![agent_id.as_str()],
+            map_agent_config,
+        )
+        .optional()
+        .map_err(storage_err(
+            "agent_config_lookup_failed",
+            "failed to lookup agent config",
+        ))
+    }
+}
+
+impl AgentDiscoveryRepository {
+    pub fn insert(conn: &Connection, record: &AgentDiscoveryRecord) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO agent_discovery_records (
+                discovery_record_id, agent_id, cwd_scope, install_status,
+                config_status, runtime_status, binary_path, version,
+                native_config_paths_json, models_json, modes_json,
+                diagnostics_json, discovered_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            ",
+            params![
+                record.discovery_record_id.as_str(),
+                record.agent_id.as_str(),
+                record.cwd_scope.as_str(),
+                enum_to_db(&record.install_status)?,
+                enum_to_db(&record.config_status)?,
+                enum_to_db(&record.runtime_status)?,
+                record.binary_path.as_deref(),
+                record.version.as_deref(),
+                json_to_db(&record.native_config_paths)?,
+                json_to_db(&record.models)?,
+                json_to_db(&record.modes)?,
+                json_to_db(&record.diagnostics)?,
+                record.discovered_at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "agent_discovery_insert_failed",
+            "failed to insert agent discovery record",
+        ))?;
+        Ok(())
+    }
+
+    pub fn latest_for_agent(
+        conn: &Connection,
+        agent_id: &AgentId,
+        cwd_scope: &str,
+    ) -> VibexResult<Option<AgentDiscoveryRecord>> {
+        conn.query_row(
+            "
+            SELECT discovery_record_id, agent_id, cwd_scope, install_status,
+                config_status, runtime_status, binary_path, version,
+                native_config_paths_json, models_json, modes_json,
+                diagnostics_json, discovered_at_ms
+            FROM agent_discovery_records
+            WHERE agent_id = ?1 AND cwd_scope = ?2
+            ORDER BY discovered_at_ms DESC
+            LIMIT 1
+            ",
+            params![agent_id.as_str(), cwd_scope],
+            map_agent_discovery_record,
+        )
+        .optional()
+        .map_err(storage_err(
+            "agent_discovery_lookup_failed",
+            "failed to lookup agent discovery record",
+        ))
+    }
+
+    pub fn latest_by_agent(
+        conn: &Connection,
+        cwd_scope: &str,
+    ) -> VibexResult<HashMap<AgentId, AgentDiscoveryRecord>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT discovery_record_id, agent_id, cwd_scope, install_status,
+                    config_status, runtime_status, binary_path, version,
+                    native_config_paths_json, models_json, modes_json,
+                    diagnostics_json, discovered_at_ms
+                FROM agent_discovery_records
+                WHERE cwd_scope = ?1
+                ORDER BY agent_id ASC, discovered_at_ms DESC
+                ",
+            )
+            .map_err(storage_err(
+                "agent_discovery_list_failed",
+                "failed to list agent discovery records",
+            ))?;
+        let rows = stmt
+            .query_map(params![cwd_scope], map_agent_discovery_record)
+            .map_err(storage_err(
+                "agent_discovery_list_failed",
+                "failed to list agent discovery records",
+            ))?;
+        let mut records = HashMap::new();
+        for row in rows {
+            let record = row.map_err(storage_err(
+                "agent_discovery_decode_failed",
+                "failed to decode agent discovery record",
+            ))?;
+            records.entry(record.agent_id.clone()).or_insert(record);
+        }
+        Ok(records)
+    }
+}
+
+impl ProviderProfileRepository {
+    pub fn ensure_local_defaults(conn: &Connection) -> VibexResult<()> {
+        for kind in [
+            ProviderKind::Codex,
+            ProviderKind::Claude,
+            ProviderKind::Acp,
+            ProviderKind::Codex,
+        ] {
+            let profile = ProviderProfile::local_default(kind);
+            conn.execute(
+                "
+                INSERT OR IGNORE INTO provider_profiles (
+                    provider_profile_id, agent_id, provider_kind, display_name, status,
+                    account_alias, base_url, default_model, small_model,
+                    large_model, configured_models_json, reasoning_effort, sandbox_defaults_json,
+                    network_defaults_json, permission_defaults_json,
+                    provider_options_json, created_at_ms, updated_at_ms,
+                    deleted_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                ",
+                provider_profile_params!(profile),
+            )
+            .map_err(storage_err(
+                "provider_profile_seed_failed",
+                "failed to seed local default provider profile",
+            ))?;
+        }
+        Ok(())
+    }
+
+    pub fn insert(conn: &Connection, profile: &ProviderProfile) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO provider_profiles (
+                provider_profile_id, agent_id, provider_kind, display_name, status,
+                account_alias, base_url, default_model, small_model, large_model,
+                configured_models_json, reasoning_effort, sandbox_defaults_json, network_defaults_json,
+                permission_defaults_json, provider_options_json, created_at_ms,
+                updated_at_ms, deleted_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+            ",
+            provider_profile_params!(profile),
+        )
+        .map_err(storage_err(
+            "provider_profile_insert_failed",
+            "failed to insert provider profile",
+        ))?;
+        for secret in &profile.secrets {
+            ProviderSecretReferenceRepository::insert(conn, secret)?;
+        }
+        Ok(())
+    }
+
+    pub fn list(conn: &Connection) -> VibexResult<Vec<ProviderProfile>> {
+        Self::ensure_local_defaults(conn)?;
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT provider_profile_id, agent_id, provider_kind, display_name, status,
+                    account_alias, base_url, default_model, small_model,
+                    large_model, configured_models_json, reasoning_effort, sandbox_defaults_json,
+                    network_defaults_json, permission_defaults_json,
+                    provider_options_json, created_at_ms, updated_at_ms,
+                    deleted_at_ms
+                FROM provider_profiles
+                WHERE deleted_at_ms IS NULL
+                    AND agent_id IN ('claude', 'codex', 'opencode')
+                    AND provider_kind IN ('claude', 'codex', 'acp')
+                ORDER BY provider_kind ASC, updated_at_ms DESC
+                ",
+            )
+            .map_err(storage_err(
+                "provider_profile_list_failed",
+                "failed to list provider profiles",
+            ))?;
+        let rows = stmt
+            .query_map([], map_provider_profile_without_secrets)
+            .map_err(storage_err(
+                "provider_profile_list_failed",
+                "failed to list provider profiles",
+            ))?;
+        let mut profiles = Vec::new();
+        for row in rows {
+            let mut profile = row.map_err(storage_err(
+                "provider_profile_decode_failed",
+                "failed to decode provider profile",
+            ))?;
+            profile.secrets =
+                ProviderSecretReferenceRepository::list_for_profile(conn, &profile.id)?;
+            profiles.push(profile);
+        }
+        Ok(profiles)
+    }
+
+    pub fn list_by_agent(
+        conn: &Connection,
+        agent_id: &AgentId,
+        include_disabled: bool,
+    ) -> VibexResult<Vec<ProviderProfile>> {
+        Self::ensure_local_defaults(conn)?;
+        let disabled_status = enum_to_db(&ProviderProfileStatus::Disabled)?;
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT provider_profile_id, agent_id, provider_kind, display_name, status,
+                    account_alias, base_url, default_model, small_model,
+                    large_model, configured_models_json, reasoning_effort, sandbox_defaults_json,
+                    network_defaults_json, permission_defaults_json,
+                    provider_options_json, created_at_ms, updated_at_ms,
+                    deleted_at_ms
+                FROM provider_profiles
+                WHERE agent_id = ?1
+                    AND deleted_at_ms IS NULL
+                    AND (?2 = 1 OR status != ?3)
+                ORDER BY updated_at_ms DESC, provider_profile_id ASC
+                ",
+            )
+            .map_err(storage_err(
+                "provider_profile_agent_list_failed",
+                "failed to list provider profiles for agent",
+            ))?;
+        let rows = stmt
+            .query_map(
+                params![
+                    agent_id.as_str(),
+                    if include_disabled { 1_i64 } else { 0_i64 },
+                    disabled_status
+                ],
+                map_provider_profile_without_secrets,
+            )
+            .map_err(storage_err(
+                "provider_profile_agent_list_failed",
+                "failed to list provider profiles for agent",
+            ))?;
+        let mut profiles = Vec::new();
+        for row in rows {
+            let mut profile = row.map_err(storage_err(
+                "provider_profile_agent_decode_failed",
+                "failed to decode provider profile for agent",
+            ))?;
+            profile.secrets =
+                ProviderSecretReferenceRepository::list_for_profile(conn, &profile.id)?;
+            profiles.push(profile);
+        }
+        Ok(profiles)
+    }
+
+    pub fn first_enabled_for_agent(
+        conn: &Connection,
+        agent_id: &AgentId,
+    ) -> VibexResult<Option<ProviderProfile>> {
+        Self::ensure_local_defaults(conn)?;
+        let enabled_status = enum_to_db(&ProviderProfileStatus::Enabled)?;
+        let mut profile = conn
+            .query_row(
+                "
+                SELECT provider_profile_id, agent_id, provider_kind, display_name, status,
+                    account_alias, base_url, default_model, small_model,
+                    large_model, configured_models_json, reasoning_effort, sandbox_defaults_json,
+                    network_defaults_json, permission_defaults_json,
+                    provider_options_json, created_at_ms, updated_at_ms,
+                    deleted_at_ms
+                FROM provider_profiles
+                WHERE agent_id = ?1 AND status = ?2 AND deleted_at_ms IS NULL
+                ORDER BY updated_at_ms DESC, provider_profile_id ASC
+                LIMIT 1
+                ",
+                params![agent_id.as_str(), enabled_status],
+                map_provider_profile_without_secrets,
+            )
+            .optional()
+            .map_err(storage_err(
+                "provider_profile_agent_default_lookup_failed",
+                "failed to lookup first enabled provider profile for agent",
+            ))?;
+        if let Some(profile) = profile.as_mut() {
+            profile.secrets =
+                ProviderSecretReferenceRepository::list_for_profile(conn, &profile.id)?;
+        }
+        Ok(profile)
+    }
+
+    pub fn get(
+        conn: &Connection,
+        provider_profile_id: &ProviderProfileId,
+    ) -> VibexResult<Option<ProviderProfile>> {
+        Self::ensure_local_defaults(conn)?;
+        let mut profile = conn
+            .query_row(
+                "
+                SELECT provider_profile_id, agent_id, provider_kind, display_name, status,
+                    account_alias, base_url, default_model, small_model,
+                    large_model, configured_models_json, reasoning_effort, sandbox_defaults_json,
+                    network_defaults_json, permission_defaults_json,
+                    provider_options_json, created_at_ms, updated_at_ms,
+                    deleted_at_ms
+                FROM provider_profiles
+                WHERE provider_profile_id = ?1 AND deleted_at_ms IS NULL
+                ",
+                params![provider_profile_id.as_str()],
+                map_provider_profile_without_secrets,
+            )
+            .optional()
+            .map_err(storage_err(
+                "provider_profile_lookup_failed",
+                "failed to lookup provider profile",
+            ))?;
+        if let Some(profile) = profile.as_mut() {
+            profile.secrets =
+                ProviderSecretReferenceRepository::list_for_profile(conn, &profile.id)?;
+        }
+        Ok(profile)
+    }
+
+    pub fn update(conn: &Connection, profile: &ProviderProfile) -> VibexResult<()> {
+        conn.execute(
+            "
+            UPDATE provider_profiles
+            SET agent_id = ?2,
+                provider_kind = ?3,
+                display_name = ?4,
+                status = ?5,
+                account_alias = ?6,
+                base_url = ?7,
+                default_model = ?8,
+                small_model = ?9,
+                large_model = ?10,
+                configured_models_json = ?11,
+                reasoning_effort = ?12,
+                sandbox_defaults_json = ?13,
+                network_defaults_json = ?14,
+                permission_defaults_json = ?15,
+                provider_options_json = ?16,
+                updated_at_ms = ?17
+            WHERE provider_profile_id = ?1 AND deleted_at_ms IS NULL
+            ",
+            params![
+                profile.id.as_str(),
+                profile.agent_id.as_str(),
+                enum_to_db(&profile.kind)?,
+                profile.display_name,
+                enum_to_db(&profile.status)?,
+                profile.account_alias,
+                profile.base_url,
+                profile.default_model,
+                profile.small_model,
+                profile.large_model,
+                json_to_db(&profile.configured_models)?,
+                profile.reasoning_effort,
+                json_to_db(&profile.sandbox_defaults)?,
+                json_to_db(&profile.network_defaults)?,
+                json_to_db(&profile.permission_defaults)?,
+                json_to_db(&profile.provider_options)?,
+                profile.updated_at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "provider_profile_update_failed",
+            "failed to update provider profile",
+        ))?;
+        Ok(())
+    }
+
+    pub fn soft_delete(
+        conn: &mut Connection,
+        provider_profile_id: &ProviderProfileId,
+    ) -> VibexResult<()> {
+        let now = unix_timestamp_ms();
+        let tx = conn.transaction().map_err(storage_err(
+            "provider_profile_delete_transaction_failed",
+            "failed to start provider profile deletion transaction",
+        ))?;
+        tx.execute(
+            "
+            UPDATE provider_profiles
+            SET deleted_at_ms = COALESCE(deleted_at_ms, ?2), updated_at_ms = ?2
+            WHERE provider_profile_id = ?1
+            ",
+            params![provider_profile_id.as_str(), now],
+        )
+        .map_err(storage_err(
+            "provider_profile_delete_failed",
+            "failed to delete provider profile",
+        ))?;
+        for (table, error_code, error_message) in [
+            (
+                "provider_default_profiles",
+                "provider_profile_default_cleanup_failed",
+                "failed to clear provider defaults for deleted profile",
+            ),
+            (
+                "agent_default_model_provider_profiles",
+                "provider_profile_agent_default_cleanup_failed",
+                "failed to clear Agent defaults for deleted profile",
+            ),
+            (
+                "agent_model_provider_failover",
+                "provider_profile_failover_cleanup_failed",
+                "failed to clear failover entries for deleted profile",
+            ),
+            (
+                "provider_runtime_option_snapshots",
+                "provider_profile_runtime_option_snapshot_cleanup_failed",
+                "failed to clear runtime option snapshot for deleted profile",
+            ),
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE provider_profile_id = ?1"),
+                params![provider_profile_id.as_str()],
+            )
+            .map_err(storage_err(error_code, error_message))?;
+        }
+        tx.commit().map_err(storage_err(
+            "provider_profile_delete_commit_failed",
+            "failed to commit provider profile deletion",
+        ))
+    }
+
+    pub fn from_create_request(request: ProviderProfileCreateRequest) -> ProviderProfile {
+        let now = unix_timestamp_ms();
+        let id = ProviderProfileId::new();
+        let secrets = request
+            .secret_references
+            .into_iter()
+            .map(|secret| ProviderSecretReference {
+                id: RequestId::new(),
+                provider_profile_id: id.clone(),
+                secret_kind: secret.secret_kind,
+                backend: secret.backend,
+                setup_state: secret.setup_state,
+                lookup_key: secret.lookup_key,
+                display_label: secret.display_label,
+                redacted_hint: secret.redacted_hint,
+                created_at_ms: now,
+                updated_at_ms: now,
+            })
+            .collect();
+        ProviderProfile {
+            id,
+            agent_id: request
+                .agent_id
+                .unwrap_or_else(|| agent_id_for_provider_kind(request.kind)),
+            kind: request.kind,
+            display_name: request.display_name,
+            status: ProviderProfileStatus::Enabled,
+            account_alias: request.account_alias,
+            base_url: request.base_url,
+            default_model: request.default_model,
+            small_model: request.small_model,
+            large_model: request.large_model,
+            configured_models: request.configured_models,
+            reasoning_effort: request.reasoning_effort,
+            sandbox_defaults: request
+                .sandbox_defaults
+                .unwrap_or_else(ProviderSandboxDefaults::workspace_write_ask_on_risk),
+            network_defaults: request
+                .network_defaults
+                .unwrap_or_else(ProviderNetworkDefaults::local_default),
+            permission_defaults: request
+                .permission_defaults
+                .unwrap_or_else(ProviderPermissionDefaults::ask_on_risk),
+            provider_options: request
+                .provider_options
+                .unwrap_or_else(ProviderOptions::empty),
+            secrets,
+            created_at_ms: now,
+            updated_at_ms: now,
+            deleted_at_ms: None,
+        }
+    }
+}
+
+impl ProviderSecretReferenceRepository {
+    pub fn insert(conn: &Connection, secret: &ProviderSecretReference) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO provider_secret_references (
+                secret_ref_id, provider_profile_id, secret_kind, backend,
+                setup_state, lookup_key, display_label, redacted_hint,
+                created_at_ms, updated_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ",
+            params![
+                secret.id.as_str(),
+                secret.provider_profile_id.as_str(),
+                enum_to_db(&secret.secret_kind)?,
+                enum_to_db(&secret.backend)?,
+                enum_to_db(&secret.setup_state)?,
+                secret.lookup_key,
+                secret.display_label,
+                secret.redacted_hint,
+                secret.created_at_ms,
+                secret.updated_at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "provider_secret_reference_insert_failed",
+            "failed to insert provider secret reference",
+        ))?;
+        Ok(())
+    }
+
+    pub fn list_for_profile(
+        conn: &Connection,
+        provider_profile_id: &ProviderProfileId,
+    ) -> VibexResult<Vec<ProviderSecretReference>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT secret_ref_id, provider_profile_id, secret_kind, backend,
+                    setup_state, lookup_key, display_label, redacted_hint,
+                    created_at_ms, updated_at_ms
+                FROM provider_secret_references
+                WHERE provider_profile_id = ?1
+                ORDER BY created_at_ms ASC
+                ",
+            )
+            .map_err(storage_err(
+                "provider_secret_reference_list_failed",
+                "failed to list provider secret references",
+            ))?;
+        let rows = stmt
+            .query_map(
+                params![provider_profile_id.as_str()],
+                map_provider_secret_reference,
+            )
+            .map_err(storage_err(
+                "provider_secret_reference_list_failed",
+                "failed to list provider secret references",
+            ))?;
+        let mut secrets = Vec::new();
+        for row in rows {
+            secrets.push(row.map_err(storage_err(
+                "provider_secret_reference_decode_failed",
+                "failed to decode provider secret reference",
+            ))?);
+        }
+        Ok(secrets)
+    }
+
+    pub fn replace_for_profile(
+        conn: &Connection,
+        provider_profile_id: &ProviderProfileId,
+        secrets: &[ProviderSecretReference],
+    ) -> VibexResult<()> {
+        conn.execute(
+            "DELETE FROM provider_secret_references WHERE provider_profile_id = ?1",
+            params![provider_profile_id.as_str()],
+        )
+        .map_err(storage_err(
+            "provider_secret_reference_replace_failed",
+            "failed to replace provider secret references",
+        ))?;
+        for secret in secrets {
+            Self::insert(conn, secret)?;
+        }
+        Ok(())
+    }
+}
+
+impl ProviderDefaultProfileRepository {
+    pub fn get(
+        conn: &Connection,
+        scope: ProviderProfileDefaultScope,
+        provider_kind: ProviderKind,
+    ) -> VibexResult<ProviderProfileDefaultSelection> {
+        ProviderProfileRepository::ensure_local_defaults(conn)?;
+        let scope_kind = enum_to_db(&scope.kind)?;
+        let scope_id = scope.storage_key();
+        let row = conn
+            .query_row(
+                "
+                SELECT d.provider_profile_id, d.updated_at_ms
+                FROM provider_default_profiles d
+                JOIN provider_profiles p
+                    ON p.provider_profile_id = d.provider_profile_id
+                WHERE d.scope_kind = ?1 AND d.scope_id = ?2 AND d.provider_kind = ?3
+                    AND p.deleted_at_ms IS NULL
+                ",
+                params![scope_kind, scope_id, enum_to_db(&provider_kind)?],
+                |row| {
+                    Ok((
+                        parse_id_sql(row.get(0)?, ProviderProfileId::parse)?,
+                        row.get::<_, i64>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_err(
+                "provider_default_lookup_failed",
+                "failed to lookup provider default profile",
+            ))?;
+        Ok(ProviderProfileDefaultSelection {
+            scope,
+            provider_kind,
+            provider_profile_id: row.as_ref().map(|(id, _)| id.clone()),
+            updated_at_ms: row.map(|(_, updated_at_ms)| updated_at_ms),
+        })
+    }
+
+    pub fn set(
+        conn: &Connection,
+        request: ProviderProfileSetDefaultRequest,
+    ) -> VibexResult<ProviderProfileDefaultSelection> {
+        ProviderProfileRepository::ensure_local_defaults(conn)?;
+        if ProviderProfileRepository::get(conn, &request.provider_profile_id)?.is_none() {
+            return Err(VibexError::validation(
+                "provider_profile_not_found",
+                "provider profile was not found",
+            )
+            .with_diagnostic("providerProfileId", request.provider_profile_id.as_str()));
+        }
+        let now = unix_timestamp_ms();
+        let scope_kind = enum_to_db(&request.scope.kind)?;
+        let scope_id = request.scope.storage_key();
+        conn.execute(
+            "
+            INSERT INTO provider_default_profiles (
+                scope_kind, scope_id, provider_kind, provider_profile_id,
+                created_at_ms, updated_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+            ON CONFLICT(scope_kind, scope_id, provider_kind) DO UPDATE SET
+                provider_profile_id = excluded.provider_profile_id,
+                updated_at_ms = excluded.updated_at_ms
+            ",
+            params![
+                scope_kind,
+                scope_id,
+                enum_to_db(&request.provider_kind)?,
+                request.provider_profile_id.as_str(),
+                now
+            ],
+        )
+        .map_err(storage_err(
+            "provider_default_set_failed",
+            "failed to set provider default profile",
+        ))?;
+        Ok(ProviderProfileDefaultSelection {
+            scope: request.scope,
+            provider_kind: request.provider_kind,
+            provider_profile_id: Some(request.provider_profile_id),
+            updated_at_ms: Some(now),
+        })
+    }
+}
+
+impl AgentDefaultModelProviderProfileRepository {
+    pub fn get(
+        conn: &Connection,
+        scope: ProviderProfileDefaultScope,
+        agent_id: AgentId,
+    ) -> VibexResult<AgentModelProviderDefaultSelection> {
+        ProviderProfileRepository::ensure_local_defaults(conn)?;
+        let scope_kind = enum_to_db(&scope.kind)?;
+        let scope_id = scope.storage_key();
+        let row = conn
+            .query_row(
+                "
+                SELECT d.provider_profile_id, d.updated_at_ms
+                FROM agent_default_model_provider_profiles d
+                JOIN provider_profiles p
+                    ON p.provider_profile_id = d.provider_profile_id
+                WHERE d.scope_kind = ?1 AND d.scope_id = ?2 AND d.agent_id = ?3
+                    AND p.deleted_at_ms IS NULL
+                ",
+                params![scope_kind, scope_id, agent_id.as_str()],
+                |row| {
+                    Ok((
+                        parse_id_sql(row.get(0)?, ProviderProfileId::parse)?,
+                        row.get::<_, i64>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_err(
+                "agent_model_provider_default_lookup_failed",
+                "failed to lookup agent model provider default profile",
+            ))?;
+        Ok(AgentModelProviderDefaultSelection {
+            scope,
+            agent_id,
+            provider_profile_id: row.as_ref().map(|(id, _)| id.clone()),
+            updated_at_ms: row.map(|(_, updated_at_ms)| updated_at_ms),
+        })
+    }
+
+    pub fn set(
+        conn: &Connection,
+        scope: ProviderProfileDefaultScope,
+        agent_id: AgentId,
+        provider_profile_id: ProviderProfileId,
+    ) -> VibexResult<AgentModelProviderDefaultSelection> {
+        ProviderProfileRepository::ensure_local_defaults(conn)?;
+        let now = unix_timestamp_ms();
+        let scope_kind = enum_to_db(&scope.kind)?;
+        let scope_id = scope.storage_key();
+        conn.execute(
+            "
+            INSERT INTO agent_default_model_provider_profiles (
+                scope_kind, scope_id, agent_id, provider_profile_id,
+                created_at_ms, updated_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+            ON CONFLICT(scope_kind, scope_id, agent_id) DO UPDATE SET
+                provider_profile_id = excluded.provider_profile_id,
+                updated_at_ms = excluded.updated_at_ms
+            ",
+            params![
+                scope_kind,
+                scope_id,
+                agent_id.as_str(),
+                provider_profile_id.as_str(),
+                now
+            ],
+        )
+        .map_err(storage_err(
+            "agent_model_provider_default_set_failed",
+            "failed to set agent model provider default profile",
+        ))?;
+        Ok(AgentModelProviderDefaultSelection {
+            scope,
+            agent_id,
+            provider_profile_id: Some(provider_profile_id),
+            updated_at_ms: Some(now),
+        })
+    }
+}
+
+impl AgentModelProviderFailoverRepository {
+    pub fn list(
+        conn: &Connection,
+        agent_id: &AgentId,
+    ) -> VibexResult<Vec<AgentModelProviderFailoverEntry>> {
+        ProviderProfileRepository::ensure_local_defaults(conn)?;
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT f.agent_id, f.provider_profile_id, p.display_name, p.status,
+                    f.order_index, f.enabled, f.updated_at_ms
+                FROM agent_model_provider_failover f
+                JOIN provider_profiles p
+                    ON p.provider_profile_id = f.provider_profile_id
+                WHERE f.agent_id = ?1 AND p.deleted_at_ms IS NULL
+                ORDER BY f.order_index ASC, f.provider_profile_id ASC
+                ",
+            )
+            .map_err(storage_err(
+                "agent_model_provider_failover_list_failed",
+                "failed to list agent model provider failover queue",
+            ))?;
+        let rows = stmt
+            .query_map(params![agent_id.as_str()], |row| {
+                Ok(AgentModelProviderFailoverEntry {
+                    agent_id: parse_id_sql(row.get(0)?, AgentId::parse)?,
+                    provider_profile_id: parse_id_sql(row.get(1)?, ProviderProfileId::parse)?,
+                    display_name: row.get(2)?,
+                    status: enum_from_db_sql(row.get(3)?)?,
+                    order_index: row.get(4)?,
+                    enabled: row.get::<_, i64>(5)? != 0,
+                    updated_at_ms: row.get(6)?,
+                })
+            })
+            .map_err(storage_err(
+                "agent_model_provider_failover_list_failed",
+                "failed to list agent model provider failover queue",
+            ))?;
+        collect_rows(
+            rows,
+            "agent_model_provider_failover_decode_failed",
+            "failed to decode agent model provider failover queue",
+        )
+    }
+
+    pub fn replace(
+        conn: &mut Connection,
+        agent_id: &AgentId,
+        entries: &[AgentModelProviderFailoverEntry],
+    ) -> VibexResult<Vec<AgentModelProviderFailoverEntry>> {
+        ProviderProfileRepository::ensure_local_defaults(conn)?;
+        let tx = conn.transaction().map_err(storage_err(
+            "agent_model_provider_failover_transaction_failed",
+            "failed to start agent model provider failover transaction",
+        ))?;
+        tx.execute(
+            "DELETE FROM agent_model_provider_failover WHERE agent_id = ?1",
+            params![agent_id.as_str()],
+        )
+        .map_err(storage_err(
+            "agent_model_provider_failover_clear_failed",
+            "failed to clear agent model provider failover queue",
+        ))?;
+        let now = unix_timestamp_ms();
+        for entry in entries {
+            tx.execute(
+                "
+                INSERT INTO agent_model_provider_failover (
+                    agent_id, provider_profile_id, order_index, enabled,
+                    created_at_ms, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+                ",
+                params![
+                    agent_id.as_str(),
+                    entry.provider_profile_id.as_str(),
+                    entry.order_index,
+                    if entry.enabled { 1_i64 } else { 0_i64 },
+                    now
+                ],
+            )
+            .map_err(storage_err(
+                "agent_model_provider_failover_insert_failed",
+                "failed to insert agent model provider failover entry",
+            ))?;
+        }
+        tx.commit().map_err(storage_err(
+            "agent_model_provider_failover_commit_failed",
+            "failed to commit agent model provider failover transaction",
+        ))?;
+        Self::list(conn, agent_id)
+    }
+}
+
+impl ProviderInjectionPreviewRepository {
+    pub fn insert(
+        conn: &Connection,
+        request: &ProviderInjectionPreviewRequest,
+        preview: &ProviderInjectionPreview,
+    ) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO provider_injection_previews (
+                preview_id, provider_profile_id, request_json, preview_json, created_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ",
+            params![
+                preview.preview_id.as_str(),
+                preview.profile.id.as_str(),
+                json_to_db(request)?,
+                json_to_db(preview)?,
+                preview.created_at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "provider_injection_preview_insert_failed",
+            "failed to insert provider injection preview",
+        ))?;
+        Ok(())
+    }
+}
+
+impl ProviderNativeExportRepository {
+    pub fn insert_preview(
+        conn: &Connection,
+        preview: &ProviderNativeExportPreview,
+    ) -> VibexResult<()> {
+        let now = preview.created_at_ms;
+        conn.execute(
+            "
+            INSERT INTO provider_native_export_records (
+                export_id, provider_profile_id, source, mode, status, preview_json,
+                applied_at_ms, rolled_back_at_ms, created_at_ms, updated_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7, ?7)
+            ON CONFLICT(export_id) DO UPDATE SET
+                status = excluded.status,
+                preview_json = excluded.preview_json,
+                updated_at_ms = excluded.updated_at_ms
+            ",
+            params![
+                preview.export_id.as_str(),
+                preview.provider_profile_id.as_str(),
+                enum_to_db(&preview.source)?,
+                enum_to_db(&preview.mode)?,
+                "previewed",
+                json_to_db(preview)?,
+                now
+            ],
+        )
+        .map_err(storage_err(
+            "provider_native_export_record_insert_failed",
+            "failed to insert provider native export record",
+        ))?;
+
+        for file in &preview.files {
+            Self::upsert_file_plan(conn, &preview.export_id, file, now)?;
+        }
+        Ok(())
+    }
+
+    pub fn get_preview(
+        conn: &Connection,
+        export_id: &RequestId,
+    ) -> VibexResult<Option<ProviderNativeExportPreview>> {
+        let preview_json = conn
+            .query_row(
+                "
+                SELECT preview_json
+                FROM provider_native_export_records
+                WHERE export_id = ?1
+                ",
+                params![export_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage_err(
+                "provider_native_export_record_get_failed",
+                "failed to get provider native export record",
+            ))?;
+        preview_json.map(json_from_db).transpose()
+    }
+
+    pub fn record_apply_result(
+        conn: &Connection,
+        result: &ProviderNativeExportApplyResult,
+    ) -> VibexResult<()> {
+        let status = enum_to_db(&result.status)?;
+        conn.execute(
+            "
+            UPDATE provider_native_export_records
+            SET status = ?2, applied_at_ms = ?3, updated_at_ms = ?3
+            WHERE export_id = ?1
+            ",
+            params![result.export_id.as_str(), status, result.applied_at_ms],
+        )
+        .map_err(storage_err(
+            "provider_native_export_apply_record_failed",
+            "failed to record provider native export apply result",
+        ))?;
+        for file in &result.files {
+            Self::upsert_file_plan(conn, &result.export_id, file, result.applied_at_ms)?;
+        }
+        Ok(())
+    }
+
+    pub fn record_rollback_result(
+        conn: &Connection,
+        result: &ProviderNativeExportRollbackResult,
+    ) -> VibexResult<()> {
+        let status = enum_to_db(&result.status)?;
+        conn.execute(
+            "
+            UPDATE provider_native_export_records
+            SET status = ?2, rolled_back_at_ms = ?3, updated_at_ms = ?3
+            WHERE export_id = ?1
+            ",
+            params![result.export_id.as_str(), status, result.rolled_back_at_ms],
+        )
+        .map_err(storage_err(
+            "provider_native_export_rollback_record_failed",
+            "failed to record provider native export rollback result",
+        ))?;
+        for file in &result.files {
+            Self::upsert_file_plan(conn, &result.export_id, file, result.rolled_back_at_ms)?;
+        }
+        Ok(())
+    }
+
+    pub fn list(
+        conn: &Connection,
+        request: ProviderNativeExportListRequest,
+    ) -> VibexResult<Vec<ProviderNativeExportRecordSummary>> {
+        let limit = request.limit.unwrap_or(20).clamp(1, 100);
+        let mut sql = String::from(
+            "
+            SELECT
+                r.export_id, r.provider_profile_id, r.source, r.mode, r.status,
+                COUNT(f.operation_id) AS file_count,
+                COALESCE(SUM(CASE WHEN f.status = 'blocked' THEN 1 ELSE 0 END), 0) AS blocked_count,
+                r.applied_at_ms, r.rolled_back_at_ms, r.created_at_ms, r.updated_at_ms
+            FROM provider_native_export_records r
+            LEFT JOIN provider_native_export_file_operations f ON f.export_id = r.export_id
+            ",
+        );
+        if request.provider_profile_id.is_some() {
+            sql.push_str(" WHERE r.provider_profile_id = ?1 ");
+        }
+        sql.push_str(
+            "
+            GROUP BY r.export_id
+            ORDER BY r.created_at_ms DESC
+            LIMIT ",
+        );
+        sql.push_str(&limit.to_string());
+
+        let mut stmt = conn.prepare(&sql).map_err(storage_err(
+            "provider_native_export_record_list_failed",
+            "failed to list provider native export records",
+        ))?;
+
+        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<_> {
+            let file_count: i64 = row.get(5)?;
+            let blocked_count: i64 = row.get(6)?;
+            Ok(ProviderNativeExportRecordSummary {
+                export_id: parse_id_sql(row.get(0)?, RequestId::parse)?,
+                provider_profile_id: parse_id_sql(row.get(1)?, ProviderProfileId::parse)?,
+                source: enum_from_db_sql(row.get(2)?)?,
+                mode: enum_from_db_sql(row.get(3)?)?,
+                status: row.get(4)?,
+                file_count: u32::try_from(file_count).unwrap_or(u32::MAX),
+                blocked_count: u32::try_from(blocked_count).unwrap_or(u32::MAX),
+                applied_at_ms: row.get(7)?,
+                rolled_back_at_ms: row.get(8)?,
+                created_at_ms: row.get(9)?,
+                updated_at_ms: row.get(10)?,
+            })
+        };
+
+        let rows = if let Some(provider_profile_id) = request.provider_profile_id {
+            stmt.query_map(params![provider_profile_id.as_str()], map_row)
+                .map_err(storage_err(
+                    "provider_native_export_record_list_failed",
+                    "failed to list provider native export records",
+                ))?
+                .collect::<Result<Vec<_>, _>>()
+        } else {
+            stmt.query_map([], map_row)
+                .map_err(storage_err(
+                    "provider_native_export_record_list_failed",
+                    "failed to list provider native export records",
+                ))?
+                .collect::<Result<Vec<_>, _>>()
+        }
+        .map_err(storage_err(
+            "provider_native_export_record_list_failed",
+            "failed to list provider native export records",
+        ))?;
+        Ok(rows)
+    }
+
+    fn upsert_file_plan(
+        conn: &Connection,
+        export_id: &RequestId,
+        file: &ProviderNativeExportFilePlan,
+        updated_at_ms: i64,
+    ) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO provider_native_export_file_operations (
+                operation_id, export_id, source, file_kind, operation_kind,
+                target_path, backup_path, temp_path, marker, status, redacted_diff,
+                diagnostics_json, target_size_before, target_size_after, backup_size,
+                created_at_ms, updated_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, NULL, NULL, ?13, ?13)
+            ON CONFLICT(operation_id) DO UPDATE SET
+                operation_kind = excluded.operation_kind,
+                backup_path = excluded.backup_path,
+                temp_path = excluded.temp_path,
+                marker = excluded.marker,
+                status = excluded.status,
+                redacted_diff = excluded.redacted_diff,
+                diagnostics_json = excluded.diagnostics_json,
+                updated_at_ms = excluded.updated_at_ms
+            ",
+            params![
+                file.operation_id.as_str(),
+                export_id.as_str(),
+                enum_to_db(&file.source)?,
+                enum_to_db(&file.file_kind)?,
+                enum_to_db(&file.operation_kind)?,
+                file.target_path,
+                file.backup_path,
+                file.temp_path,
+                file.marker,
+                enum_to_db(&file.status)?,
+                file.redacted_diff,
+                json_to_db(&file.diagnostics)?,
+                updated_at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "provider_native_export_file_operation_upsert_failed",
+            "failed to upsert provider native export file operation",
+        ))?;
+        Ok(())
+    }
+}
+
+impl ProviderCapabilityRepository {
+    pub fn insert(conn: &Connection, result: &ProviderCapabilityProbeResult) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO provider_capability_probe_records (
+                capability_record_id, provider_profile_id, provider_kind, status,
+                summary, capabilities_json, source, checked_at_ms, expires_at_ms,
+                diagnostics_json
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ",
+            params![
+                result.capability_record_id.as_str(),
+                result.provider_profile_id.as_str(),
+                enum_to_db(&result.provider_kind)?,
+                enum_to_db(&result.status)?,
+                result.summary,
+                json_to_db(&result.capabilities)?,
+                result.source,
+                result.checked_at_ms,
+                result.expires_at_ms,
+                json_to_db(&result.diagnostics)?
+            ],
+        )
+        .map_err(storage_err(
+            "provider_capability_record_insert_failed",
+            "failed to insert provider capability probe record",
+        ))?;
+        Ok(())
+    }
+
+    pub fn list_latest(conn: &Connection) -> VibexResult<Vec<ProviderCapabilityProbeResult>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT capability_record_id, provider_profile_id, provider_kind, status,
+                    summary, capabilities_json, source, checked_at_ms, expires_at_ms,
+                    diagnostics_json
+                FROM provider_capability_probe_records current
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM provider_capability_probe_records newer
+                    WHERE newer.provider_profile_id = current.provider_profile_id
+                        AND newer.checked_at_ms > current.checked_at_ms
+                )
+                ORDER BY provider_profile_id ASC, checked_at_ms DESC
+                ",
+            )
+            .map_err(storage_err(
+                "provider_capability_record_list_failed",
+                "failed to list provider capability probe records",
+            ))?;
+        let rows = stmt
+            .query_map([], map_provider_capability_probe_result)
+            .map_err(storage_err(
+                "provider_capability_record_list_failed",
+                "failed to list provider capability probe records",
+            ))?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(storage_err(
+                "provider_capability_record_decode_failed",
+                "failed to decode provider capability probe record",
+            ))?);
+        }
+        Ok(records)
+    }
+}
+
+impl ProviderRuntimeOptionSnapshotRepository {
+    pub fn upsert_success(
+        conn: &Connection,
+        record: &ProviderRuntimeOptionSnapshotRecord,
+    ) -> VibexResult<()> {
+        let model_response = record.model_response.as_ref().ok_or_else(|| {
+            VibexError::validation(
+                "runtime_option_snapshot_model_response_missing",
+                "successful runtime option snapshot requires model evidence",
+            )
+        })?;
+        let session_config = record.session_config.as_ref().ok_or_else(|| {
+            VibexError::validation(
+                "runtime_option_snapshot_session_config_missing",
+                "successful runtime option snapshot requires session configuration evidence",
+            )
+        })?;
+        let last_success_at_ms = record.last_success_at_ms.ok_or_else(|| {
+            VibexError::validation(
+                "runtime_option_snapshot_success_time_missing",
+                "successful runtime option snapshot requires a success timestamp",
+            )
+        })?;
+        conn.execute(
+            "
+            INSERT INTO provider_runtime_option_snapshots (
+                provider_profile_id, agent_id, model_response_json, session_config_json,
+                last_success_at_ms, last_attempt_at_ms, last_error_code
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
+            ON CONFLICT(provider_profile_id) DO UPDATE SET
+                agent_id = excluded.agent_id,
+                model_response_json = excluded.model_response_json,
+                session_config_json = excluded.session_config_json,
+                last_success_at_ms = excluded.last_success_at_ms,
+                last_attempt_at_ms = excluded.last_attempt_at_ms,
+                last_error_code = NULL
+            ",
+            params![
+                record.provider_profile_id.as_str(),
+                record.agent_id.as_str(),
+                json_to_db(model_response)?,
+                json_to_db(session_config)?,
+                last_success_at_ms,
+                record.last_attempt_at_ms,
+            ],
+        )
+        .map_err(storage_err(
+            "runtime_option_snapshot_upsert_failed",
+            "failed to persist runtime option snapshot",
+        ))?;
+        Ok(())
+    }
+
+    pub fn record_failure(
+        conn: &Connection,
+        provider_profile_id: &ProviderProfileId,
+        agent_id: &AgentId,
+        attempted_at_ms: i64,
+        error_code: &str,
+    ) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO provider_runtime_option_snapshots (
+                provider_profile_id, agent_id, model_response_json, session_config_json,
+                last_success_at_ms, last_attempt_at_ms, last_error_code
+            )
+            VALUES (?1, ?2, NULL, NULL, NULL, ?3, ?4)
+            ON CONFLICT(provider_profile_id) DO UPDATE SET
+                agent_id = excluded.agent_id,
+                last_attempt_at_ms = excluded.last_attempt_at_ms,
+                last_error_code = excluded.last_error_code
+            ",
+            params![
+                provider_profile_id.as_str(),
+                agent_id.as_str(),
+                attempted_at_ms,
+                error_code,
+            ],
+        )
+        .map_err(storage_err(
+            "runtime_option_snapshot_failure_record_failed",
+            "failed to record runtime option snapshot failure",
+        ))?;
+        Ok(())
+    }
+
+    pub fn list(conn: &Connection) -> VibexResult<Vec<ProviderRuntimeOptionSnapshotRecord>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT provider_profile_id, agent_id, model_response_json, session_config_json,
+                    last_success_at_ms, last_attempt_at_ms, last_error_code
+                FROM provider_runtime_option_snapshots
+                ORDER BY provider_profile_id ASC
+                ",
+            )
+            .map_err(storage_err(
+                "runtime_option_snapshot_list_failed",
+                "failed to list runtime option snapshots",
+            ))?;
+        let rows = stmt
+            .query_map([], map_provider_runtime_option_snapshot)
+            .map_err(storage_err(
+                "runtime_option_snapshot_list_failed",
+                "failed to list runtime option snapshots",
+            ))?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(storage_err(
+                "runtime_option_snapshot_decode_failed",
+                "failed to decode runtime option snapshot",
+            ))?);
+        }
+        Ok(records)
+    }
+}
+
+impl ProviderHealthRepository {
+    pub fn insert(conn: &Connection, result: &ProviderHealthProbeResult) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO provider_health_probe_records (
+                health_record_id, provider_profile_id, provider_kind, probe_kind,
+                status, summary, latency_ms, checked_at_ms, expires_at_ms, diagnostics_json
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ",
+            params![
+                result.health_record_id.as_str(),
+                result.provider_profile_id.as_str(),
+                enum_to_db(&result.provider_kind)?,
+                enum_to_db(&result.probe_kind)?,
+                enum_to_db(&result.status)?,
+                result.summary,
+                result.latency_ms.map(i64::from),
+                result.checked_at_ms,
+                result.expires_at_ms,
+                json_to_db(&result.diagnostics)?
+            ],
+        )
+        .map_err(storage_err(
+            "provider_health_record_insert_failed",
+            "failed to insert provider health record",
+        ))?;
+        Ok(())
+    }
+
+    pub fn list_latest(conn: &Connection) -> VibexResult<Vec<ProviderHealthProbeResult>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT health_record_id, provider_profile_id, provider_kind, probe_kind,
+                    status, summary, latency_ms, checked_at_ms, expires_at_ms, diagnostics_json
+                FROM provider_health_probe_records current
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM provider_health_probe_records newer
+                    WHERE newer.provider_profile_id = current.provider_profile_id
+                        AND newer.probe_kind = current.probe_kind
+                        AND newer.checked_at_ms > current.checked_at_ms
+                )
+                ORDER BY provider_profile_id ASC, probe_kind ASC
+                ",
+            )
+            .map_err(storage_err(
+                "provider_health_record_list_failed",
+                "failed to list provider health records",
+            ))?;
+        let rows = stmt
+            .query_map([], map_provider_health_probe_result)
+            .map_err(storage_err(
+                "provider_health_record_list_failed",
+                "failed to list provider health records",
+            ))?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(storage_err(
+                "provider_health_record_decode_failed",
+                "failed to decode provider health record",
+            ))?);
+        }
+        Ok(records)
+    }
+}
+
+impl ProviderUsageRepository {
+    pub fn insert(conn: &Connection, record: &ProviderUsageRecord) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO provider_usage_records (
+                usage_record_id, provider_profile_id, provider_kind, source, unit,
+                label, used, limit_value, remaining, window_label,
+                window_started_at_ms, window_ends_at_ms, recorded_at_ms, metadata_json
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            ",
+            params![
+                record.usage_record_id.as_str(),
+                record.provider_profile_id.as_str(),
+                enum_to_db(&record.provider_kind)?,
+                record.source,
+                enum_to_db(&record.unit)?,
+                record.label,
+                record.used,
+                record.limit_value,
+                record.remaining,
+                record.window.as_ref().map(|window| window.label.as_str()),
+                record
+                    .window
+                    .as_ref()
+                    .and_then(|window| window.started_at_ms),
+                record.window.as_ref().and_then(|window| window.ends_at_ms),
+                record.recorded_at_ms,
+                json_to_db(&record.metadata)?
+            ],
+        )
+        .map_err(storage_err(
+            "provider_usage_record_insert_failed",
+            "failed to insert provider usage record",
+        ))?;
+        Ok(())
+    }
+
+    pub fn list_latest(conn: &Connection) -> VibexResult<Vec<ProviderUsageRecord>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT usage_record_id, provider_profile_id, provider_kind, source, unit,
+                    label, used, limit_value, remaining, window_label,
+                    window_started_at_ms, window_ends_at_ms, recorded_at_ms, metadata_json
+                FROM provider_usage_records current
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM provider_usage_records newer
+                    WHERE newer.provider_profile_id = current.provider_profile_id
+                        AND newer.unit = current.unit
+                        AND newer.label = current.label
+                        AND newer.recorded_at_ms > current.recorded_at_ms
+                )
+                ORDER BY provider_profile_id ASC, unit ASC, label ASC
+                ",
+            )
+            .map_err(storage_err(
+                "provider_usage_record_list_failed",
+                "failed to list provider usage records",
+            ))?;
+        let rows = stmt
+            .query_map([], map_provider_usage_record)
+            .map_err(storage_err(
+                "provider_usage_record_list_failed",
+                "failed to list provider usage records",
+            ))?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(storage_err(
+                "provider_usage_record_decode_failed",
+                "failed to decode provider usage record",
+            ))?);
+        }
+        Ok(records)
+    }
+}
+
+const SCHEDULED_TASK_LIST_DEFAULT_LIMIT: i64 = 100;
+const SCHEDULED_TASK_LIST_MAX_LIMIT: i64 = 500;
+const SCHEDULED_TASK_ERROR_CODE_MAX_CHARS: usize = 128;
+const SCHEDULED_TASK_ERROR_MESSAGE_MAX_CHARS: usize = 1024;
+const SCHEDULED_TASK_DIAGNOSTIC_KEY_MAX_CHARS: usize = 128;
+const SCHEDULED_TASK_DIAGNOSTIC_VALUE_MAX_CHARS: usize = 2048;
+const SCHEDULED_TASK_PERMISSION_REQUIRED_CODE: &str = "scheduler/permission_required";
+const SCHEDULED_TASK_RECOVERED_STALE_RUN_CODE: &str = "scheduler/recovered_stale_run";
+
+impl ScheduledTaskRepository {
+    pub fn create(
+        conn: &Connection,
+        request: ScheduledTaskCreateRequest,
+    ) -> VibexResult<ScheduledTask> {
+        let now = unix_timestamp_ms();
+        let task = ScheduledTask {
+            id: ScheduledTaskId::new(),
+            title: request.title,
+            prompt: request.prompt,
+            project_id: request.project_id,
+            workspace_id: request.workspace_id,
+            workspace_root: request.workspace_root,
+            workspace_mode: request.workspace_mode,
+            provider_kind: request.provider_kind,
+            provider_profile_id: request.provider_profile_id,
+            schedule: request.schedule,
+            status: ScheduledTaskStatus::Active,
+            safety: request
+                .safety
+                .unwrap_or_else(AgentSessionSafety::workspace_write_ask_on_risk),
+            next_run_at_ms: request.next_run_at_ms,
+            created_at_ms: now,
+            updated_at_ms: now,
+            deleted_at_ms: None,
+        };
+
+        insert_scheduled_task(conn, &task)?;
+        Ok(task)
+    }
+
+    pub fn get(conn: &Connection, task_id: &ScheduledTaskId) -> VibexResult<Option<ScheduledTask>> {
+        get_scheduled_task(conn, task_id, false)
+    }
+
+    pub fn list(
+        conn: &Connection,
+        request: ScheduledTaskListRequest,
+    ) -> VibexResult<Vec<ScheduledTask>> {
+        let status = request.status.as_ref().map(enum_to_db).transpose()?;
+        let workspace_id = request.workspace_id.as_ref().map(WorkspaceId::as_str);
+        let include_deleted = if request.include_deleted {
+            1_i64
+        } else {
+            0_i64
+        };
+        let limit = bounded_limit(request.limit);
+
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT scheduled_task_id, title, prompt, project_id, workspace_id,
+                    workspace_root, workspace_mode, provider_kind, provider_profile_id,
+                    schedule_json, status, safety_json, next_run_at_ms, created_at_ms,
+                    updated_at_ms, deleted_at_ms
+                FROM scheduled_tasks
+                WHERE (?1 IS NULL OR workspace_id = ?1)
+                    AND (?2 IS NULL OR status = ?2)
+                    AND (?3 = 1 OR deleted_at_ms IS NULL)
+                ORDER BY updated_at_ms DESC, created_at_ms DESC
+                LIMIT ?4
+                ",
+            )
+            .map_err(storage_err(
+                "scheduled_task_list_failed",
+                "failed to list scheduled tasks",
+            ))?;
+        let rows = stmt
+            .query_map(
+                params![workspace_id, status, include_deleted, limit],
+                map_scheduled_task,
+            )
+            .map_err(storage_err(
+                "scheduled_task_list_failed",
+                "failed to list scheduled tasks",
+            ))?;
+        collect_rows(
+            rows,
+            "scheduled_task_decode_failed",
+            "failed to decode scheduled task row",
+        )
+    }
+
+    pub fn list_due(
+        conn: &Connection,
+        now_ms: i64,
+        limit: Option<u32>,
+    ) -> VibexResult<Vec<ScheduledTask>> {
+        let active = enum_to_db(&ScheduledTaskStatus::Active)?;
+        let limit = bounded_limit(limit);
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT scheduled_task_id, title, prompt, project_id, workspace_id,
+                    workspace_root, workspace_mode, provider_kind, provider_profile_id,
+                    schedule_json, status, safety_json, next_run_at_ms, created_at_ms,
+                    updated_at_ms, deleted_at_ms
+                FROM scheduled_tasks
+                WHERE deleted_at_ms IS NULL
+                    AND status = ?1
+                    AND next_run_at_ms IS NOT NULL
+                    AND next_run_at_ms <= ?2
+                ORDER BY next_run_at_ms ASC, created_at_ms ASC, scheduled_task_id ASC
+                LIMIT ?3
+                ",
+            )
+            .map_err(storage_err(
+                "scheduled_task_due_list_failed",
+                "failed to list due scheduled tasks",
+            ))?;
+        let rows = stmt
+            .query_map(params![active, now_ms, limit], map_scheduled_task)
+            .map_err(storage_err(
+                "scheduled_task_due_list_failed",
+                "failed to list due scheduled tasks",
+            ))?;
+        collect_rows(
+            rows,
+            "scheduled_task_due_decode_failed",
+            "failed to decode due scheduled task row",
+        )
+    }
+
+    pub fn claim_due(
+        conn: &mut Connection,
+        task_id: &ScheduledTaskId,
+        now_ms: i64,
+    ) -> VibexResult<Option<(ScheduledTask, ScheduledTaskRun)>> {
+        let tx = conn.transaction().map_err(storage_err(
+            "scheduled_task_claim_transaction_failed",
+            "failed to start scheduled task claim transaction",
+        ))?;
+        let Some(mut task) = get_scheduled_task(&tx, task_id, false)? else {
+            tx.commit().map_err(storage_err(
+                "scheduled_task_claim_commit_failed",
+                "failed to commit scheduled task claim transaction",
+            ))?;
+            return Ok(None);
+        };
+        let Some(due_at_ms) = task.next_run_at_ms else {
+            tx.commit().map_err(storage_err(
+                "scheduled_task_claim_commit_failed",
+                "failed to commit scheduled task claim transaction",
+            ))?;
+            return Ok(None);
+        };
+        if task.status != ScheduledTaskStatus::Active || due_at_ms > now_ms {
+            tx.commit().map_err(storage_err(
+                "scheduled_task_claim_commit_failed",
+                "failed to commit scheduled task claim transaction",
+            ))?;
+            return Ok(None);
+        }
+
+        let active = enum_to_db(&ScheduledTaskStatus::Active)?;
+        let changed = tx
+            .execute(
+                "
+                UPDATE scheduled_tasks
+                SET next_run_at_ms = NULL, updated_at_ms = ?3
+                WHERE scheduled_task_id = ?1
+                    AND status = ?2
+                    AND deleted_at_ms IS NULL
+                    AND next_run_at_ms = ?4
+                ",
+                params![task_id.as_str(), active, now_ms, due_at_ms],
+            )
+            .map_err(storage_err(
+                "scheduled_task_claim_failed",
+                "failed to claim due scheduled task",
+            ))?;
+        if changed == 0 {
+            tx.commit().map_err(storage_err(
+                "scheduled_task_claim_commit_failed",
+                "failed to commit scheduled task claim transaction",
+            ))?;
+            return Ok(None);
+        }
+
+        task.next_run_at_ms = None;
+        task.updated_at_ms = now_ms;
+        let run = ScheduledTaskRun {
+            id: ScheduledTaskRunId::new(),
+            task_id: task.id.clone(),
+            status: ScheduledTaskRunStatus::Running,
+            trigger: ScheduledTaskRunTrigger::Scheduler,
+            session_id: None,
+            due_at_ms,
+            started_at_ms: Some(now_ms),
+            ended_at_ms: None,
+            attempt: 1,
+            error_code: None,
+            error_message: None,
+            redacted_diagnostics: Vec::new(),
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        };
+        insert_scheduled_task_run(&tx, &run)?;
+        tx.commit().map_err(storage_err(
+            "scheduled_task_claim_commit_failed",
+            "failed to commit scheduled task claim transaction",
+        ))?;
+        Ok(Some((task, run)))
+    }
+
+    pub fn update(
+        conn: &Connection,
+        request: ScheduledTaskUpdateRequest,
+    ) -> VibexResult<ScheduledTask> {
+        let mut task = require_scheduled_task(conn, &request.id, false)?;
+        if let Some(title) = request.title {
+            task.title = title;
+        }
+        if let Some(prompt) = request.prompt {
+            task.prompt = prompt;
+        }
+        if let Some(project_id) = request.project_id {
+            task.project_id = Some(project_id);
+        } else if request.clear_project_id {
+            task.project_id = None;
+        }
+        if let Some(workspace_id) = request.workspace_id {
+            task.workspace_id = Some(workspace_id);
+        } else if request.clear_workspace_id {
+            task.workspace_id = None;
+        }
+        if let Some(workspace_root) = request.workspace_root {
+            task.workspace_root = workspace_root;
+        }
+        if let Some(workspace_mode) = request.workspace_mode {
+            task.workspace_mode = workspace_mode;
+        }
+        if let Some(provider_kind) = request.provider_kind {
+            task.provider_kind = provider_kind;
+        }
+        if let Some(provider_profile_id) = request.provider_profile_id {
+            task.provider_profile_id = Some(provider_profile_id);
+        } else if request.clear_provider_profile_id {
+            task.provider_profile_id = None;
+        }
+        if let Some(schedule) = request.schedule {
+            task.schedule = schedule;
+        }
+        if let Some(safety) = request.safety {
+            task.safety = safety;
+        }
+        if let Some(next_run_at_ms) = request.next_run_at_ms {
+            task.next_run_at_ms = Some(next_run_at_ms);
+        } else if request.clear_next_run_at_ms {
+            task.next_run_at_ms = None;
+        }
+        task.updated_at_ms = unix_timestamp_ms();
+
+        update_scheduled_task(conn, &task)?;
+        Ok(task)
+    }
+
+    pub fn mark_task_after_run(
+        conn: &Connection,
+        task_id: &ScheduledTaskId,
+        status: ScheduledTaskStatus,
+        next_run_at_ms: Option<i64>,
+        now_ms: i64,
+    ) -> VibexResult<ScheduledTask> {
+        let mut task = require_scheduled_task(conn, task_id, false)?;
+        task.status = status;
+        task.next_run_at_ms = next_run_at_ms;
+        task.updated_at_ms = now_ms;
+        update_scheduled_task(conn, &task)?;
+        Ok(task)
+    }
+
+    pub fn pause(conn: &Connection, task_id: &ScheduledTaskId) -> VibexResult<ScheduledTask> {
+        update_scheduled_task_status(conn, task_id, ScheduledTaskStatus::Paused)
+    }
+
+    pub fn resume(conn: &Connection, task_id: &ScheduledTaskId) -> VibexResult<ScheduledTask> {
+        update_scheduled_task_status(conn, task_id, ScheduledTaskStatus::Active)
+    }
+
+    pub fn soft_delete(conn: &Connection, task_id: &ScheduledTaskId) -> VibexResult<ScheduledTask> {
+        let mut task = require_scheduled_task(conn, task_id, false)?;
+        let now = unix_timestamp_ms();
+        task.status = ScheduledTaskStatus::Deleted;
+        task.updated_at_ms = now;
+        task.deleted_at_ms = Some(now);
+        update_scheduled_task(conn, &task)?;
+        Ok(task)
+    }
+
+    pub fn create_run(
+        conn: &Connection,
+        request: ScheduledTaskRunCreateRequest,
+    ) -> VibexResult<ScheduledTaskRun> {
+        let now = unix_timestamp_ms();
+        let run = ScheduledTaskRun {
+            id: ScheduledTaskRunId::new(),
+            task_id: request.task_id,
+            status: request.status,
+            trigger: request.trigger,
+            session_id: request.session_id,
+            due_at_ms: request.due_at_ms,
+            started_at_ms: request.started_at_ms,
+            ended_at_ms: request.ended_at_ms,
+            attempt: request.attempt,
+            error_code: request
+                .error_code
+                .map(|value| truncate_chars(&value, SCHEDULED_TASK_ERROR_CODE_MAX_CHARS)),
+            error_message: request
+                .error_message
+                .map(|value| truncate_chars(&value, SCHEDULED_TASK_ERROR_MESSAGE_MAX_CHARS)),
+            redacted_diagnostics: bound_scheduled_task_diagnostics(request.redacted_diagnostics),
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+
+        insert_scheduled_task_run(conn, &run)?;
+        Ok(run)
+    }
+
+    pub fn update_run(
+        conn: &Connection,
+        request: ScheduledTaskRunUpdateRequest,
+    ) -> VibexResult<ScheduledTaskRun> {
+        let mut run = require_scheduled_task_run(conn, &request.id)?;
+        if let Some(status) = request.status {
+            run.status = status;
+        }
+        if let Some(session_id) = request.session_id {
+            run.session_id = Some(session_id);
+        } else if request.clear_session_id {
+            run.session_id = None;
+        }
+        if let Some(started_at_ms) = request.started_at_ms {
+            run.started_at_ms = Some(started_at_ms);
+        } else if request.clear_started_at_ms {
+            run.started_at_ms = None;
+        }
+        if let Some(ended_at_ms) = request.ended_at_ms {
+            run.ended_at_ms = Some(ended_at_ms);
+        } else if request.clear_ended_at_ms {
+            run.ended_at_ms = None;
+        }
+        if let Some(attempt) = request.attempt {
+            run.attempt = attempt;
+        }
+        if let Some(error_code) = request.error_code {
+            run.error_code = Some(truncate_chars(
+                &error_code,
+                SCHEDULED_TASK_ERROR_CODE_MAX_CHARS,
+            ));
+        } else if request.clear_error_code {
+            run.error_code = None;
+        }
+        if let Some(error_message) = request.error_message {
+            run.error_message = Some(truncate_chars(
+                &error_message,
+                SCHEDULED_TASK_ERROR_MESSAGE_MAX_CHARS,
+            ));
+        } else if request.clear_error_message {
+            run.error_message = None;
+        }
+        if let Some(diagnostics) = request.redacted_diagnostics {
+            run.redacted_diagnostics = bound_scheduled_task_diagnostics(diagnostics);
+        }
+        run.updated_at_ms = unix_timestamp_ms();
+
+        update_scheduled_task_run(conn, &run)?;
+        Ok(run)
+    }
+
+    pub fn list_runs(
+        conn: &Connection,
+        request: ScheduledTaskRunListRequest,
+    ) -> VibexResult<Vec<ScheduledTaskRun>> {
+        let task_id = request.task_id.as_ref().map(ScheduledTaskId::as_str);
+        let session_id = request.session_id.as_ref().map(VibexSessionId::as_str);
+        let status = request.status.as_ref().map(enum_to_db).transpose()?;
+        let limit = bounded_limit(request.limit);
+
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT scheduled_task_run_id, scheduled_task_id, status, trigger,
+                    session_id, due_at_ms, started_at_ms, ended_at_ms, attempt,
+                    error_code, error_message, redacted_diagnostics_json,
+                    created_at_ms, updated_at_ms
+                FROM scheduled_task_runs
+                WHERE (?1 IS NULL OR scheduled_task_id = ?1)
+                    AND (?2 IS NULL OR session_id = ?2)
+                    AND (?3 IS NULL OR status = ?3)
+                ORDER BY created_at_ms DESC, scheduled_task_run_id DESC
+                LIMIT ?4
+                ",
+            )
+            .map_err(storage_err(
+                "scheduled_task_run_list_failed",
+                "failed to list scheduled task runs",
+            ))?;
+        let rows = stmt
+            .query_map(
+                params![task_id, session_id, status, limit],
+                map_scheduled_task_run,
+            )
+            .map_err(storage_err(
+                "scheduled_task_run_list_failed",
+                "failed to list scheduled task runs",
+            ))?;
+        collect_rows(
+            rows,
+            "scheduled_task_run_decode_failed",
+            "failed to decode scheduled task run row",
+        )
+    }
+
+    pub fn list_attention(
+        conn: &Connection,
+        request: ScheduledTaskAttentionListRequest,
+    ) -> VibexResult<Vec<ScheduledTaskAttentionSummary>> {
+        let workspace_id = request.workspace_id.as_ref().map(WorkspaceId::as_str);
+        let limit = bounded_limit(request.limit);
+        let failed = enum_to_db(&ScheduledTaskRunStatus::Failed)?;
+        let skipped = enum_to_db(&ScheduledTaskRunStatus::Skipped)?;
+        let canceled = enum_to_db(&ScheduledTaskRunStatus::Canceled)?;
+
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT t.scheduled_task_id, t.title, t.workspace_id, t.workspace_root,
+                    t.provider_kind, t.provider_profile_id,
+                    r.scheduled_task_run_id, r.status, r.trigger, r.session_id,
+                    r.error_code, r.error_message, r.created_at_ms
+                FROM scheduled_task_runs r
+                JOIN scheduled_tasks t ON t.scheduled_task_id = r.scheduled_task_id
+                WHERE (?1 IS NULL OR t.workspace_id = ?1)
+                    AND (
+                        r.status IN (?2, ?3, ?4)
+                        OR r.error_code IN (?5, ?6)
+                    )
+                ORDER BY r.created_at_ms DESC, r.scheduled_task_run_id DESC
+                LIMIT ?7
+                ",
+            )
+            .map_err(storage_err(
+                "scheduled_task_attention_list_failed",
+                "failed to list scheduled task attention summaries",
+            ))?;
+        let rows = stmt
+            .query_map(
+                params![
+                    workspace_id,
+                    failed,
+                    skipped,
+                    canceled,
+                    SCHEDULED_TASK_PERMISSION_REQUIRED_CODE,
+                    SCHEDULED_TASK_RECOVERED_STALE_RUN_CODE,
+                    limit
+                ],
+                map_scheduled_task_attention_summary,
+            )
+            .map_err(storage_err(
+                "scheduled_task_attention_list_failed",
+                "failed to list scheduled task attention summaries",
+            ))?;
+        collect_rows(
+            rows,
+            "scheduled_task_attention_decode_failed",
+            "failed to decode scheduled task attention summary",
+        )
+    }
+
+    pub fn list_audit(
+        conn: &Connection,
+        request: ScheduledTaskAuditListRequest,
+    ) -> VibexResult<Vec<ScheduledTaskAuditRecord>> {
+        let workspace_id = request.workspace_id.as_ref().map(WorkspaceId::as_str);
+        let status = request.status.as_ref().map(enum_to_db).transpose()?;
+        let limit = bounded_limit(request.limit);
+
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT t.scheduled_task_id, t.title, t.workspace_id, t.workspace_root,
+                    t.provider_kind, t.provider_profile_id,
+                    r.scheduled_task_run_id, r.status, r.trigger, r.session_id,
+                    r.error_code, r.error_message, r.redacted_diagnostics_json,
+                    r.created_at_ms
+                FROM scheduled_task_runs r
+                JOIN scheduled_tasks t ON t.scheduled_task_id = r.scheduled_task_id
+                WHERE (?1 IS NULL OR t.workspace_id = ?1)
+                    AND (?2 IS NULL OR r.status = ?2)
+                ORDER BY r.created_at_ms DESC, r.scheduled_task_run_id DESC
+                LIMIT ?3
+                ",
+            )
+            .map_err(storage_err(
+                "scheduled_task_audit_list_failed",
+                "failed to list scheduled task audit records",
+            ))?;
+        let rows = stmt
+            .query_map(
+                params![workspace_id, status, limit],
+                map_scheduled_task_audit_record,
+            )
+            .map_err(storage_err(
+                "scheduled_task_audit_list_failed",
+                "failed to list scheduled task audit records",
+            ))?;
+        collect_rows(
+            rows,
+            "scheduled_task_audit_decode_failed",
+            "failed to decode scheduled task audit record",
+        )
+    }
+
+    pub fn list_stale_running_runs(
+        conn: &Connection,
+        before_ms: i64,
+        limit: Option<u32>,
+    ) -> VibexResult<Vec<ScheduledTaskRun>> {
+        let running = enum_to_db(&ScheduledTaskRunStatus::Running)?;
+        let limit = bounded_limit(limit);
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT scheduled_task_run_id, scheduled_task_id, status, trigger,
+                    session_id, due_at_ms, started_at_ms, ended_at_ms, attempt,
+                    error_code, error_message, redacted_diagnostics_json,
+                    created_at_ms, updated_at_ms
+                FROM scheduled_task_runs
+                WHERE status = ?1
+                    AND COALESCE(started_at_ms, created_at_ms) <= ?2
+                ORDER BY COALESCE(started_at_ms, created_at_ms) ASC,
+                    scheduled_task_run_id ASC
+                LIMIT ?3
+                ",
+            )
+            .map_err(storage_err(
+                "scheduled_task_stale_run_list_failed",
+                "failed to list stale scheduled task runs",
+            ))?;
+        let rows = stmt
+            .query_map(params![running, before_ms, limit], map_scheduled_task_run)
+            .map_err(storage_err(
+                "scheduled_task_stale_run_list_failed",
+                "failed to list stale scheduled task runs",
+            ))?;
+        collect_rows(
+            rows,
+            "scheduled_task_stale_run_decode_failed",
+            "failed to decode stale scheduled task run row",
+        )
+    }
+}
+
+impl AutomationGraphRepository {
+    pub fn create(
+        conn: &mut Connection,
+        request: AutomationGraphCreateRequest,
+    ) -> VibexResult<AutomationGraph> {
+        let now = unix_timestamp_ms();
+        let graph_id = AutomationGraphId::new();
+        let nodes = automation_nodes_from_requests(&graph_id, request.nodes, now);
+        let edges = automation_edges_from_requests(&graph_id, request.edges, now);
+        validate_automation_edges(&nodes, &edges)?;
+
+        let graph = AutomationGraph {
+            id: graph_id,
+            title: request.title,
+            description: request.description,
+            project_id: request.project_id,
+            workspace_id: request.workspace_id,
+            workspace_root: request.workspace_root,
+            workspace_mode: request.workspace_mode,
+            provider_kind: request.provider_kind,
+            provider_profile_id: request.provider_profile_id,
+            trigger: request.trigger,
+            status: AutomationGraphStatus::Active,
+            version: 1,
+            nodes,
+            edges,
+            created_at_ms: now,
+            updated_at_ms: now,
+            deleted_at_ms: None,
+        };
+
+        let tx = conn.transaction().map_err(storage_err(
+            "automation_graph_create_transaction_failed",
+            "failed to start automation graph create transaction",
+        ))?;
+        insert_automation_graph(&tx, &graph)?;
+        for node in &graph.nodes {
+            insert_automation_node(&tx, node)?;
+        }
+        for edge in &graph.edges {
+            insert_automation_edge(&tx, edge)?;
+        }
+        tx.commit().map_err(storage_err(
+            "automation_graph_create_commit_failed",
+            "failed to commit automation graph create transaction",
+        ))?;
+        Ok(graph)
+    }
+
+    pub fn get(
+        conn: &Connection,
+        graph_id: &AutomationGraphId,
+    ) -> VibexResult<Option<AutomationGraph>> {
+        get_automation_graph(conn, graph_id, false)
+    }
+
+    pub fn list(
+        conn: &Connection,
+        request: AutomationGraphListRequest,
+    ) -> VibexResult<Vec<AutomationGraph>> {
+        let workspace_id = request.workspace_id.as_ref().map(WorkspaceId::as_str);
+        let status = request.status.as_ref().map(enum_to_db).transpose()?;
+        let include_deleted = if request.include_deleted {
+            1_i64
+        } else {
+            0_i64
+        };
+        let limit = bounded_limit(request.limit);
+
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT automation_graph_id, title, description, project_id, workspace_id,
+                    workspace_root, workspace_mode, provider_kind, provider_profile_id,
+                    trigger_json, status, version, created_at_ms, updated_at_ms, deleted_at_ms
+                FROM automation_graphs
+                WHERE (?1 IS NULL OR workspace_id = ?1)
+                    AND (?2 IS NULL OR status = ?2)
+                    AND (?3 = 1 OR deleted_at_ms IS NULL)
+                ORDER BY updated_at_ms DESC, created_at_ms DESC
+                LIMIT ?4
+                ",
+            )
+            .map_err(storage_err(
+                "automation_graph_list_failed",
+                "failed to list automation graphs",
+            ))?;
+        let rows = stmt
+            .query_map(
+                params![workspace_id, status, include_deleted, limit],
+                map_automation_graph,
+            )
+            .map_err(storage_err(
+                "automation_graph_list_failed",
+                "failed to list automation graphs",
+            ))?;
+        let mut graphs = collect_rows(
+            rows,
+            "automation_graph_decode_failed",
+            "failed to decode automation graph row",
+        )?;
+        for graph in &mut graphs {
+            graph.nodes = list_automation_nodes(conn, &graph.id)?;
+            graph.edges = list_automation_edges(conn, &graph.id)?;
+        }
+        Ok(graphs)
+    }
+
+    pub fn update(
+        conn: &Connection,
+        request: AutomationGraphUpdateRequest,
+    ) -> VibexResult<AutomationGraph> {
+        let mut graph = require_automation_graph(conn, &request.id, false)?;
+        if let Some(title) = request.title {
+            graph.title = title;
+        }
+        if let Some(description) = request.description {
+            graph.description = Some(description);
+        } else if request.clear_description {
+            graph.description = None;
+        }
+        if let Some(project_id) = request.project_id {
+            graph.project_id = Some(project_id);
+        } else if request.clear_project_id {
+            graph.project_id = None;
+        }
+        if let Some(workspace_id) = request.workspace_id {
+            graph.workspace_id = Some(workspace_id);
+        } else if request.clear_workspace_id {
+            graph.workspace_id = None;
+        }
+        if let Some(workspace_root) = request.workspace_root {
+            graph.workspace_root = workspace_root;
+        }
+        if let Some(workspace_mode) = request.workspace_mode {
+            graph.workspace_mode = workspace_mode;
+        }
+        if let Some(provider_kind) = request.provider_kind {
+            graph.provider_kind = Some(provider_kind);
+        } else if request.clear_provider_kind {
+            graph.provider_kind = None;
+        }
+        if let Some(provider_profile_id) = request.provider_profile_id {
+            graph.provider_profile_id = Some(provider_profile_id);
+        } else if request.clear_provider_profile_id {
+            graph.provider_profile_id = None;
+        }
+        if let Some(trigger) = request.trigger {
+            graph.trigger = trigger;
+        }
+        if let Some(status) = request.status {
+            graph.status = status;
+        }
+        graph.version = graph.version.saturating_add(1);
+        graph.updated_at_ms = unix_timestamp_ms();
+        if graph.status != AutomationGraphStatus::Deleted {
+            graph.deleted_at_ms = None;
+        }
+
+        update_automation_graph(conn, &graph)?;
+        get_automation_graph(conn, &graph.id, true)?.ok_or_else(|| {
+            VibexError::storage(
+                "automation_graph_not_found",
+                "automation graph was not found",
+            )
+            .with_diagnostic("automationGraphId", graph.id.as_str())
+        })
+    }
+
+    pub fn soft_delete(
+        conn: &Connection,
+        graph_id: &AutomationGraphId,
+    ) -> VibexResult<AutomationGraph> {
+        let mut graph = require_automation_graph(conn, graph_id, false)?;
+        let now = unix_timestamp_ms();
+        graph.status = AutomationGraphStatus::Deleted;
+        graph.version = graph.version.saturating_add(1);
+        graph.updated_at_ms = now;
+        graph.deleted_at_ms = Some(now);
+        update_automation_graph(conn, &graph)?;
+        get_automation_graph(conn, graph_id, true)?.ok_or_else(|| {
+            VibexError::storage(
+                "automation_graph_not_found",
+                "automation graph was not found",
+            )
+            .with_diagnostic("automationGraphId", graph_id.as_str())
+        })
+    }
+
+    pub fn replace_definition(
+        conn: &mut Connection,
+        graph_id: &AutomationGraphId,
+        nodes: Vec<AutomationNodeCreateRequest>,
+        edges: Vec<AutomationEdgeCreateRequest>,
+        expected_version: Option<u32>,
+    ) -> VibexResult<AutomationGraph> {
+        let now = unix_timestamp_ms();
+        let replacement_nodes = automation_nodes_from_requests(graph_id, nodes, now);
+        let replacement_edges = automation_edges_from_requests(graph_id, edges, now);
+        validate_automation_edges(&replacement_nodes, &replacement_edges)?;
+
+        let tx = conn.transaction().map_err(storage_err(
+            "automation_graph_definition_transaction_failed",
+            "failed to start automation graph definition transaction",
+        ))?;
+        let mut graph = require_automation_graph(&tx, graph_id, false)?;
+        if let Some(expected_version) = expected_version
+            && graph.version != expected_version
+        {
+            return Err(VibexError::conflict(
+                "automation_graph_version_conflict",
+                "automation graph changed since this draft was loaded",
+            )
+            .with_diagnostic("expectedVersion", expected_version.to_string())
+            .with_diagnostic("actualVersion", graph.version.to_string()));
+        }
+        tx.execute(
+            "DELETE FROM automation_graph_edges WHERE automation_graph_id = ?1",
+            params![graph_id.as_str()],
+        )
+        .map_err(storage_err(
+            "automation_graph_edge_delete_failed",
+            "failed to delete automation graph edges",
+        ))?;
+        tx.execute(
+            "DELETE FROM automation_graph_nodes WHERE automation_graph_id = ?1",
+            params![graph_id.as_str()],
+        )
+        .map_err(storage_err(
+            "automation_graph_node_delete_failed",
+            "failed to delete automation graph nodes",
+        ))?;
+        for node in &replacement_nodes {
+            insert_automation_node(&tx, node)?;
+        }
+        for edge in &replacement_edges {
+            insert_automation_edge(&tx, edge)?;
+        }
+        graph.nodes = replacement_nodes;
+        graph.edges = replacement_edges;
+        graph.version = graph.version.saturating_add(1);
+        graph.updated_at_ms = now;
+        update_automation_graph(&tx, &graph)?;
+        tx.commit().map_err(storage_err(
+            "automation_graph_definition_commit_failed",
+            "failed to commit automation graph definition transaction",
+        ))?;
+
+        get_automation_graph(conn, graph_id, false)?.ok_or_else(|| {
+            VibexError::storage(
+                "automation_graph_not_found",
+                "automation graph was not found",
+            )
+            .with_diagnostic("automationGraphId", graph_id.as_str())
+        })
+    }
+
+    pub fn create_run(
+        conn: &Connection,
+        request: AutomationRunCreateRequest,
+    ) -> VibexResult<AutomationRun> {
+        let now = unix_timestamp_ms();
+        let run = AutomationRun {
+            id: AutomationRunId::new(),
+            graph_id: request.graph_id,
+            status: request.status,
+            trigger: request.trigger,
+            scheduled_task_id: request.scheduled_task_id,
+            session_id: request.session_id,
+            started_at_ms: request.started_at_ms,
+            ended_at_ms: request.ended_at_ms,
+            error_code: request
+                .error_code
+                .map(|value| truncate_chars(&value, SCHEDULED_TASK_ERROR_CODE_MAX_CHARS)),
+            error_message: request
+                .error_message
+                .map(|value| truncate_chars(&value, SCHEDULED_TASK_ERROR_MESSAGE_MAX_CHARS)),
+            redacted_diagnostics: bound_scheduled_task_diagnostics(request.redacted_diagnostics),
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        insert_automation_run(conn, &run)?;
+        Ok(run)
+    }
+
+    pub fn get_run(
+        conn: &Connection,
+        run_id: &AutomationRunId,
+    ) -> VibexResult<Option<AutomationRun>> {
+        get_automation_run(conn, run_id)
+    }
+
+    pub fn update_run(
+        conn: &Connection,
+        request: AutomationRunUpdateRequest,
+    ) -> VibexResult<AutomationRun> {
+        let mut run = require_automation_run(conn, &request.id)?;
+        if let Some(status) = request.status {
+            run.status = status;
+        }
+        if let Some(scheduled_task_id) = request.scheduled_task_id {
+            run.scheduled_task_id = Some(scheduled_task_id);
+        } else if request.clear_scheduled_task_id {
+            run.scheduled_task_id = None;
+        }
+        if let Some(session_id) = request.session_id {
+            run.session_id = Some(session_id);
+        } else if request.clear_session_id {
+            run.session_id = None;
+        }
+        if let Some(started_at_ms) = request.started_at_ms {
+            run.started_at_ms = Some(started_at_ms);
+        } else if request.clear_started_at_ms {
+            run.started_at_ms = None;
+        }
+        if let Some(ended_at_ms) = request.ended_at_ms {
+            run.ended_at_ms = Some(ended_at_ms);
+        } else if request.clear_ended_at_ms {
+            run.ended_at_ms = None;
+        }
+        if let Some(error_code) = request.error_code {
+            run.error_code = Some(truncate_chars(
+                &error_code,
+                SCHEDULED_TASK_ERROR_CODE_MAX_CHARS,
+            ));
+        } else if request.clear_error_code {
+            run.error_code = None;
+        }
+        if let Some(error_message) = request.error_message {
+            run.error_message = Some(truncate_chars(
+                &error_message,
+                SCHEDULED_TASK_ERROR_MESSAGE_MAX_CHARS,
+            ));
+        } else if request.clear_error_message {
+            run.error_message = None;
+        }
+        if let Some(diagnostics) = request.redacted_diagnostics {
+            run.redacted_diagnostics = bound_scheduled_task_diagnostics(diagnostics);
+        }
+        run.updated_at_ms = unix_timestamp_ms();
+        update_automation_run(conn, &run)?;
+        Ok(run)
+    }
+
+    pub fn list_runs(
+        conn: &Connection,
+        request: AutomationRunListRequest,
+    ) -> VibexResult<Vec<AutomationRun>> {
+        let graph_id = request.graph_id.as_ref().map(AutomationGraphId::as_str);
+        let status = request.status.as_ref().map(enum_to_db).transpose()?;
+        let limit = bounded_limit(request.limit);
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT automation_run_id, automation_graph_id, status, trigger,
+                    scheduled_task_id, session_id, started_at_ms, ended_at_ms,
+                    error_code, error_message, redacted_diagnostics_json,
+                    created_at_ms, updated_at_ms
+                FROM automation_graph_runs
+                WHERE (?1 IS NULL OR automation_graph_id = ?1)
+                    AND (?2 IS NULL OR status = ?2)
+                ORDER BY created_at_ms DESC, automation_run_id DESC
+                LIMIT ?3
+                ",
+            )
+            .map_err(storage_err(
+                "automation_run_list_failed",
+                "failed to list automation graph runs",
+            ))?;
+        let rows = stmt
+            .query_map(params![graph_id, status, limit], map_automation_run)
+            .map_err(storage_err(
+                "automation_run_list_failed",
+                "failed to list automation graph runs",
+            ))?;
+        collect_rows(
+            rows,
+            "automation_run_decode_failed",
+            "failed to decode automation graph run row",
+        )
+    }
+
+    pub fn create_run_step(
+        conn: &Connection,
+        request: AutomationRunStepCreateRequest,
+    ) -> VibexResult<AutomationRunStep> {
+        let now = unix_timestamp_ms();
+        let step = AutomationRunStep {
+            id: AutomationRunStepId::new(),
+            run_id: request.run_id,
+            node_id: request.node_id,
+            status: request.status,
+            session_id: request.session_id,
+            permission_request_id: request.permission_request_id,
+            started_at_ms: request.started_at_ms,
+            ended_at_ms: request.ended_at_ms,
+            error_code: request
+                .error_code
+                .map(|value| truncate_chars(&value, SCHEDULED_TASK_ERROR_CODE_MAX_CHARS)),
+            error_message: request
+                .error_message
+                .map(|value| truncate_chars(&value, SCHEDULED_TASK_ERROR_MESSAGE_MAX_CHARS)),
+            redacted_diagnostics: bound_scheduled_task_diagnostics(request.redacted_diagnostics),
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        insert_automation_run_step(conn, &step)?;
+        Ok(step)
+    }
+
+    pub fn get_run_step(
+        conn: &Connection,
+        step_id: &AutomationRunStepId,
+    ) -> VibexResult<Option<AutomationRunStep>> {
+        get_automation_run_step(conn, step_id)
+    }
+
+    pub fn update_run_step(
+        conn: &Connection,
+        request: AutomationRunStepUpdateRequest,
+    ) -> VibexResult<AutomationRunStep> {
+        let mut step = require_automation_run_step(conn, &request.id)?;
+        if let Some(status) = request.status {
+            step.status = status;
+        }
+        if let Some(session_id) = request.session_id {
+            step.session_id = Some(session_id);
+        } else if request.clear_session_id {
+            step.session_id = None;
+        }
+        if let Some(permission_request_id) = request.permission_request_id {
+            step.permission_request_id = Some(permission_request_id);
+        } else if request.clear_permission_request_id {
+            step.permission_request_id = None;
+        }
+        if let Some(started_at_ms) = request.started_at_ms {
+            step.started_at_ms = Some(started_at_ms);
+        } else if request.clear_started_at_ms {
+            step.started_at_ms = None;
+        }
+        if let Some(ended_at_ms) = request.ended_at_ms {
+            step.ended_at_ms = Some(ended_at_ms);
+        } else if request.clear_ended_at_ms {
+            step.ended_at_ms = None;
+        }
+        if let Some(error_code) = request.error_code {
+            step.error_code = Some(truncate_chars(
+                &error_code,
+                SCHEDULED_TASK_ERROR_CODE_MAX_CHARS,
+            ));
+        } else if request.clear_error_code {
+            step.error_code = None;
+        }
+        if let Some(error_message) = request.error_message {
+            step.error_message = Some(truncate_chars(
+                &error_message,
+                SCHEDULED_TASK_ERROR_MESSAGE_MAX_CHARS,
+            ));
+        } else if request.clear_error_message {
+            step.error_message = None;
+        }
+        if let Some(diagnostics) = request.redacted_diagnostics {
+            step.redacted_diagnostics = bound_scheduled_task_diagnostics(diagnostics);
+        }
+        step.updated_at_ms = unix_timestamp_ms();
+        update_automation_run_step(conn, &step)?;
+        Ok(step)
+    }
+
+    pub fn list_run_steps(
+        conn: &Connection,
+        request: AutomationRunStepListRequest,
+    ) -> VibexResult<Vec<AutomationRunStep>> {
+        let run_id = request.run_id.as_ref().map(AutomationRunId::as_str);
+        let node_id = request.node_id.as_ref().map(AutomationNodeId::as_str);
+        let status = request.status.as_ref().map(enum_to_db).transpose()?;
+        let limit = bounded_limit(request.limit);
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT automation_run_step_id, automation_run_id, automation_node_id,
+                    status, session_id, permission_request_id, started_at_ms, ended_at_ms,
+                    error_code, error_message, redacted_diagnostics_json,
+                    created_at_ms, updated_at_ms
+                FROM automation_graph_run_steps
+                WHERE (?1 IS NULL OR automation_run_id = ?1)
+                    AND (?2 IS NULL OR automation_node_id = ?2)
+                    AND (?3 IS NULL OR status = ?3)
+                ORDER BY created_at_ms DESC, automation_run_step_id DESC
+                LIMIT ?4
+                ",
+            )
+            .map_err(storage_err(
+                "automation_run_step_list_failed",
+                "failed to list automation graph run steps",
+            ))?;
+        let rows = stmt
+            .query_map(
+                params![run_id, node_id, status, limit],
+                map_automation_run_step,
+            )
+            .map_err(storage_err(
+                "automation_run_step_list_failed",
+                "failed to list automation graph run steps",
+            ))?;
+        collect_rows(
+            rows,
+            "automation_run_step_decode_failed",
+            "failed to decode automation graph run step row",
+        )
+    }
+}
+
+impl McpServerRepository {
+    pub fn from_create_request(request: McpServerCreateRequest) -> McpServer {
+        let now = unix_timestamp_ms();
+        let id = McpServerId::new();
+        let secret_references = request
+            .secret_references
+            .into_iter()
+            .map(|secret| McpServerSecretReference {
+                id: RequestId::new(),
+                mcp_server_id: id.clone(),
+                secret_kind: secret.secret_kind,
+                backend: secret.backend,
+                setup_state: secret.setup_state,
+                lookup_key: secret.lookup_key,
+                display_label: secret.display_label,
+                redacted_hint: secret.redacted_hint,
+                target: secret.target,
+                created_at_ms: now,
+                updated_at_ms: now,
+            })
+            .collect();
+        let provider_matrix = request
+            .provider_matrix
+            .into_iter()
+            .map(|entry| McpServerProviderMatrix {
+                provider_kind: entry.provider_kind,
+                enabled: entry.enabled,
+                updated_at_ms: now,
+            })
+            .collect();
+        McpServer {
+            id,
+            display_name: request.display_name,
+            transport_kind: request.transport_kind,
+            status: request.status,
+            scope_kind: request.scope_kind,
+            project_id: request.project_id,
+            workspace_id: request.workspace_id,
+            command: request.command,
+            args: request.args,
+            url: request.url,
+            description: request.description,
+            tags: request.tags,
+            secret_references,
+            provider_matrix,
+            agent_matrix: Vec::new(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            deleted_at_ms: None,
+        }
+    }
+
+    pub fn insert(conn: &Connection, server: &McpServer) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO mcp_servers (
+                mcp_server_id, display_name, transport_kind, status, scope_kind,
+                project_id, workspace_id, command, args_json, url, description,
+                tags_json, created_at_ms, updated_at_ms, deleted_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            ",
+            params![
+                server.id.as_str(),
+                server.display_name,
+                enum_to_db(&server.transport_kind)?,
+                enum_to_db(&server.status)?,
+                enum_to_db(&server.scope_kind)?,
+                server.project_id.as_ref().map(ProjectId::as_str),
+                server.workspace_id.as_ref().map(WorkspaceId::as_str),
+                server.command,
+                json_to_db(&server.args)?,
+                server.url,
+                server.description,
+                json_to_db(&server.tags)?,
+                server.created_at_ms,
+                server.updated_at_ms,
+                server.deleted_at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "mcp_server_insert_failed",
+            "failed to insert MCP server",
+        ))?;
+        Self::replace_secret_references(conn, &server.id, &server.secret_references)?;
+        Self::replace_provider_matrix(conn, &server.id, &server.provider_matrix)?;
+        Self::replace_agent_matrix(conn, &server.id, &server.agent_matrix)?;
+        Ok(())
+    }
+
+    pub fn list(conn: &Connection) -> VibexResult<Vec<McpServer>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT mcp_server_id, display_name, transport_kind, status, scope_kind,
+                    project_id, workspace_id, command, args_json, url, description,
+                    tags_json, created_at_ms, updated_at_ms, deleted_at_ms
+                FROM mcp_servers
+                WHERE deleted_at_ms IS NULL
+                ORDER BY updated_at_ms DESC, display_name ASC
+                ",
+            )
+            .map_err(storage_err(
+                "mcp_server_list_failed",
+                "failed to list MCP servers",
+            ))?;
+        let rows = stmt
+            .query_map([], map_mcp_server_without_children)
+            .map_err(storage_err(
+                "mcp_server_list_failed",
+                "failed to list MCP servers",
+            ))?;
+        let mut servers = Vec::new();
+        for row in rows {
+            let mut server = row.map_err(storage_err(
+                "mcp_server_decode_failed",
+                "failed to decode MCP server",
+            ))?;
+            Self::hydrate(conn, &mut server)?;
+            servers.push(server);
+        }
+        Ok(servers)
+    }
+
+    pub fn list_enabled_for_provider(
+        conn: &Connection,
+        provider_kind: ProviderKind,
+    ) -> VibexResult<Vec<McpServer>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT s.mcp_server_id, s.display_name, s.transport_kind, s.status, s.scope_kind,
+                    s.project_id, s.workspace_id, s.command, s.args_json, s.url, s.description,
+                    s.tags_json, s.created_at_ms, s.updated_at_ms, s.deleted_at_ms
+                FROM mcp_servers s
+                INNER JOIN mcp_server_provider_matrix m
+                    ON m.mcp_server_id = s.mcp_server_id
+                WHERE s.deleted_at_ms IS NULL
+                    AND s.status = ?1
+                    AND m.provider_kind = ?2
+                    AND m.enabled = 1
+                ORDER BY s.display_name ASC
+                ",
+            )
+            .map_err(storage_err(
+                "mcp_server_list_failed",
+                "failed to list enabled MCP servers",
+            ))?;
+        let rows = stmt
+            .query_map(
+                params![
+                    enum_to_db(&McpServerStatus::Enabled)?,
+                    enum_to_db(&provider_kind)?
+                ],
+                map_mcp_server_without_children,
+            )
+            .map_err(storage_err(
+                "mcp_server_list_failed",
+                "failed to list enabled MCP servers",
+            ))?;
+        let mut servers = Vec::new();
+        for row in rows {
+            let mut server = row.map_err(storage_err(
+                "mcp_server_decode_failed",
+                "failed to decode MCP server",
+            ))?;
+            Self::hydrate(conn, &mut server)?;
+            servers.push(server);
+        }
+        Ok(servers)
+    }
+
+    pub fn list_enabled_for_agent(
+        conn: &Connection,
+        agent_id: &AgentId,
+        legacy_provider_kind: ProviderKind,
+    ) -> VibexResult<Vec<McpServer>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT DISTINCT s.mcp_server_id, s.display_name, s.transport_kind, s.status, s.scope_kind,
+                    s.project_id, s.workspace_id, s.command, s.args_json, s.url, s.description,
+                    s.tags_json, s.created_at_ms, s.updated_at_ms, s.deleted_at_ms
+                FROM mcp_servers s
+                LEFT JOIN mcp_server_agent_matrix am
+                    ON am.mcp_server_id = s.mcp_server_id
+                LEFT JOIN mcp_server_provider_matrix pm
+                    ON pm.mcp_server_id = s.mcp_server_id
+                WHERE s.deleted_at_ms IS NULL
+                    AND s.status = ?1
+                    AND (
+                        (am.agent_id = ?2 AND am.enabled = 1)
+                        OR (
+                            am.mcp_server_id IS NULL
+                            AND pm.provider_kind = ?3
+                            AND pm.enabled = 1
+                        )
+                    )
+                ORDER BY s.display_name ASC
+                ",
+            )
+            .map_err(storage_err(
+                "mcp_server_list_failed",
+                "failed to list MCP servers enabled for agent",
+            ))?;
+        let rows = stmt
+            .query_map(
+                params![
+                    enum_to_db(&McpServerStatus::Enabled)?,
+                    agent_id.as_str(),
+                    enum_to_db(&legacy_provider_kind)?
+                ],
+                map_mcp_server_without_children,
+            )
+            .map_err(storage_err(
+                "mcp_server_list_failed",
+                "failed to list MCP servers enabled for agent",
+            ))?;
+        let mut servers = Vec::new();
+        for row in rows {
+            let mut server = row.map_err(storage_err(
+                "mcp_server_decode_failed",
+                "failed to decode MCP server",
+            ))?;
+            Self::hydrate(conn, &mut server)?;
+            servers.push(server);
+        }
+        Ok(servers)
+    }
+
+    pub fn get(conn: &Connection, mcp_server_id: &McpServerId) -> VibexResult<Option<McpServer>> {
+        let mut server = conn
+            .query_row(
+                "
+                SELECT mcp_server_id, display_name, transport_kind, status, scope_kind,
+                    project_id, workspace_id, command, args_json, url, description,
+                    tags_json, created_at_ms, updated_at_ms, deleted_at_ms
+                FROM mcp_servers
+                WHERE mcp_server_id = ?1 AND deleted_at_ms IS NULL
+                ",
+                params![mcp_server_id.as_str()],
+                map_mcp_server_without_children,
+            )
+            .optional()
+            .map_err(storage_err(
+                "mcp_server_lookup_failed",
+                "failed to lookup MCP server",
+            ))?;
+        if let Some(server) = server.as_mut() {
+            Self::hydrate(conn, server)?;
+        }
+        Ok(server)
+    }
+
+    pub fn update(conn: &Connection, server: &McpServer) -> VibexResult<()> {
+        conn.execute(
+            "
+            UPDATE mcp_servers
+            SET display_name = ?2,
+                transport_kind = ?3,
+                status = ?4,
+                scope_kind = ?5,
+                project_id = ?6,
+                workspace_id = ?7,
+                command = ?8,
+                args_json = ?9,
+                url = ?10,
+                description = ?11,
+                tags_json = ?12,
+                updated_at_ms = ?13
+            WHERE mcp_server_id = ?1 AND deleted_at_ms IS NULL
+            ",
+            params![
+                server.id.as_str(),
+                server.display_name,
+                enum_to_db(&server.transport_kind)?,
+                enum_to_db(&server.status)?,
+                enum_to_db(&server.scope_kind)?,
+                server.project_id.as_ref().map(ProjectId::as_str),
+                server.workspace_id.as_ref().map(WorkspaceId::as_str),
+                server.command,
+                json_to_db(&server.args)?,
+                server.url,
+                server.description,
+                json_to_db(&server.tags)?,
+                server.updated_at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "mcp_server_update_failed",
+            "failed to update MCP server",
+        ))?;
+        Self::replace_secret_references(conn, &server.id, &server.secret_references)?;
+        Ok(())
+    }
+
+    pub fn soft_delete(conn: &Connection, mcp_server_id: &McpServerId) -> VibexResult<()> {
+        let now = unix_timestamp_ms();
+        conn.execute(
+            "
+            UPDATE mcp_servers
+            SET deleted_at_ms = COALESCE(deleted_at_ms, ?2), updated_at_ms = ?2
+            WHERE mcp_server_id = ?1
+            ",
+            params![mcp_server_id.as_str(), now],
+        )
+        .map_err(storage_err(
+            "mcp_server_delete_failed",
+            "failed to delete MCP server",
+        ))?;
+        Ok(())
+    }
+
+    pub fn replace_provider_matrix(
+        conn: &Connection,
+        mcp_server_id: &McpServerId,
+        matrix: &[McpServerProviderMatrix],
+    ) -> VibexResult<()> {
+        let now = unix_timestamp_ms();
+        conn.execute(
+            "DELETE FROM mcp_server_provider_matrix WHERE mcp_server_id = ?1",
+            params![mcp_server_id.as_str()],
+        )
+        .map_err(storage_err(
+            "mcp_server_matrix_update_failed",
+            "failed to replace MCP Provider matrix",
+        ))?;
+        for entry in matrix {
+            conn.execute(
+                "
+                INSERT OR REPLACE INTO mcp_server_provider_matrix (
+                    mcp_server_id, provider_kind, enabled, created_at_ms, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                ",
+                params![
+                    mcp_server_id.as_str(),
+                    enum_to_db(&entry.provider_kind)?,
+                    if entry.enabled { 1 } else { 0 },
+                    now,
+                    entry.updated_at_ms
+                ],
+            )
+            .map_err(storage_err(
+                "mcp_server_matrix_update_failed",
+                "failed to insert MCP Provider matrix entry",
+            ))?;
+        }
+        Ok(())
+    }
+
+    pub fn replace_agent_matrix(
+        conn: &Connection,
+        mcp_server_id: &McpServerId,
+        matrix: &[McpServerAgentMatrix],
+    ) -> VibexResult<()> {
+        let now = unix_timestamp_ms();
+        conn.execute(
+            "DELETE FROM mcp_server_agent_matrix WHERE mcp_server_id = ?1",
+            params![mcp_server_id.as_str()],
+        )
+        .map_err(storage_err(
+            "mcp_server_agent_matrix_update_failed",
+            "failed to replace MCP Agent matrix",
+        ))?;
+        for entry in matrix {
+            conn.execute(
+                "
+                INSERT INTO mcp_server_agent_matrix (
+                    mcp_server_id, agent_id, enabled, source_kind, created_at_ms, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ",
+                params![
+                    mcp_server_id.as_str(),
+                    entry.agent_id.as_str(),
+                    if entry.enabled { 1 } else { 0 },
+                    enum_to_db(&entry.source_kind)?,
+                    now,
+                    entry.updated_at_ms
+                ],
+            )
+            .map_err(storage_err(
+                "mcp_server_agent_matrix_update_failed",
+                "failed to insert MCP Agent matrix entry",
+            ))?;
+        }
+        Ok(())
+    }
+
+    fn replace_secret_references(
+        conn: &Connection,
+        mcp_server_id: &McpServerId,
+        secrets: &[McpServerSecretReference],
+    ) -> VibexResult<()> {
+        conn.execute(
+            "DELETE FROM mcp_server_secret_references WHERE mcp_server_id = ?1",
+            params![mcp_server_id.as_str()],
+        )
+        .map_err(storage_err(
+            "mcp_server_secret_update_failed",
+            "failed to replace MCP secret references",
+        ))?;
+        for secret in secrets {
+            conn.execute(
+                "
+                INSERT INTO mcp_server_secret_references (
+                    secret_ref_id, mcp_server_id, secret_kind, backend, setup_state,
+                    lookup_key, display_label, redacted_hint, target, created_at_ms, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                ",
+                params![
+                    secret.id.as_str(),
+                    mcp_server_id.as_str(),
+                    enum_to_db(&secret.secret_kind)?,
+                    enum_to_db(&secret.backend)?,
+                    enum_to_db(&secret.setup_state)?,
+                    secret.lookup_key,
+                    secret.display_label,
+                    secret.redacted_hint,
+                    enum_to_db(&secret.target)?,
+                    secret.created_at_ms,
+                    secret.updated_at_ms
+                ],
+            )
+            .map_err(storage_err(
+                "mcp_server_secret_insert_failed",
+                "failed to insert MCP secret reference",
+            ))?;
+        }
+        Ok(())
+    }
+
+    fn hydrate(conn: &Connection, server: &mut McpServer) -> VibexResult<()> {
+        server.secret_references = Self::list_secret_references(conn, &server.id)?;
+        server.provider_matrix = Self::list_provider_matrix(conn, &server.id)?;
+        server.agent_matrix = Self::list_agent_matrix(conn, &server.id)?;
+        Ok(())
+    }
+
+    fn list_secret_references(
+        conn: &Connection,
+        mcp_server_id: &McpServerId,
+    ) -> VibexResult<Vec<McpServerSecretReference>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT secret_ref_id, mcp_server_id, secret_kind, backend, setup_state,
+                    lookup_key, display_label, redacted_hint, target, created_at_ms, updated_at_ms
+                FROM mcp_server_secret_references
+                WHERE mcp_server_id = ?1
+                ORDER BY created_at_ms ASC
+                ",
+            )
+            .map_err(storage_err(
+                "mcp_server_secret_list_failed",
+                "failed to list MCP secret references",
+            ))?;
+        let rows = stmt
+            .query_map(params![mcp_server_id.as_str()], map_mcp_secret_reference)
+            .map_err(storage_err(
+                "mcp_server_secret_list_failed",
+                "failed to list MCP secret references",
+            ))?;
+        let mut secrets = Vec::new();
+        for row in rows {
+            secrets.push(row.map_err(storage_err(
+                "mcp_server_secret_decode_failed",
+                "failed to decode MCP secret reference",
+            ))?);
+        }
+        Ok(secrets)
+    }
+
+    fn list_provider_matrix(
+        conn: &Connection,
+        mcp_server_id: &McpServerId,
+    ) -> VibexResult<Vec<McpServerProviderMatrix>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT provider_kind, enabled, updated_at_ms
+                FROM mcp_server_provider_matrix
+                WHERE mcp_server_id = ?1
+                ORDER BY provider_kind ASC
+                ",
+            )
+            .map_err(storage_err(
+                "mcp_server_matrix_list_failed",
+                "failed to list MCP Provider matrix",
+            ))?;
+        let rows = stmt
+            .query_map(params![mcp_server_id.as_str()], map_mcp_provider_matrix)
+            .map_err(storage_err(
+                "mcp_server_matrix_list_failed",
+                "failed to list MCP Provider matrix",
+            ))?;
+        let mut matrix = Vec::new();
+        for row in rows {
+            matrix.push(row.map_err(storage_err(
+                "mcp_server_matrix_decode_failed",
+                "failed to decode MCP Provider matrix",
+            ))?);
+        }
+        Ok(matrix)
+    }
+
+    pub fn list_agent_matrix(
+        conn: &Connection,
+        mcp_server_id: &McpServerId,
+    ) -> VibexResult<Vec<McpServerAgentMatrix>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT agent_id, enabled, source_kind, updated_at_ms
+                FROM mcp_server_agent_matrix
+                WHERE mcp_server_id = ?1
+                ORDER BY agent_id ASC
+                ",
+            )
+            .map_err(storage_err(
+                "mcp_server_agent_matrix_list_failed",
+                "failed to list MCP Agent matrix",
+            ))?;
+        let rows = stmt
+            .query_map(params![mcp_server_id.as_str()], map_mcp_agent_matrix)
+            .map_err(storage_err(
+                "mcp_server_agent_matrix_list_failed",
+                "failed to list MCP Agent matrix",
+            ))?;
+        let mut matrix = Vec::new();
+        for row in rows {
+            matrix.push(row.map_err(storage_err(
+                "mcp_server_agent_matrix_decode_failed",
+                "failed to decode MCP Agent matrix",
+            ))?);
+        }
+        Ok(matrix)
+    }
+}
+
+impl SkillRepository {
+    pub fn from_create_request(request: SkillCreateRequest) -> Skill {
+        let now = unix_timestamp_ms();
+        Skill {
+            id: SkillId::new(),
+            display_name: request.display_name,
+            source_kind: request.source_kind,
+            status: request.status,
+            scope_kind: request.scope_kind,
+            project_id: request.project_id,
+            workspace_id: request.workspace_id,
+            source_uri: request.source_uri,
+            description: request.description,
+            tags: request.tags,
+            content_preview: request.content_preview,
+            provider_matrix: request
+                .provider_matrix
+                .into_iter()
+                .map(|entry| SkillProviderMatrix {
+                    provider_kind: entry.provider_kind,
+                    enabled: entry.enabled,
+                    updated_at_ms: now,
+                })
+                .collect(),
+            agent_matrix: Vec::new(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            deleted_at_ms: None,
+        }
+    }
+
+    pub fn insert(conn: &Connection, skill: &Skill) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO skills (
+                skill_id, display_name, source_kind, status, scope_kind,
+                project_id, workspace_id, source_uri, description, tags_json,
+                content_preview, created_at_ms, updated_at_ms, deleted_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            ",
+            params![
+                skill.id.as_str(),
+                skill.display_name,
+                enum_to_db(&skill.source_kind)?,
+                enum_to_db(&skill.status)?,
+                enum_to_db(&skill.scope_kind)?,
+                skill.project_id.as_ref().map(ProjectId::as_str),
+                skill.workspace_id.as_ref().map(WorkspaceId::as_str),
+                skill.source_uri,
+                skill.description,
+                json_to_db(&skill.tags)?,
+                skill.content_preview,
+                skill.created_at_ms,
+                skill.updated_at_ms,
+                skill.deleted_at_ms
+            ],
+        )
+        .map_err(storage_err("skill_insert_failed", "failed to insert Skill"))?;
+        Self::replace_provider_matrix(conn, &skill.id, &skill.provider_matrix)?;
+        Self::replace_agent_matrix(conn, &skill.id, &skill.agent_matrix)?;
+        Ok(())
+    }
+
+    pub fn list(conn: &Connection) -> VibexResult<Vec<Skill>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT skill_id, display_name, source_kind, status, scope_kind,
+                    project_id, workspace_id, source_uri, description, tags_json,
+                    content_preview, created_at_ms, updated_at_ms, deleted_at_ms
+                FROM skills
+                WHERE deleted_at_ms IS NULL
+                ORDER BY updated_at_ms DESC, display_name ASC
+                ",
+            )
+            .map_err(storage_err("skill_list_failed", "failed to list Skills"))?;
+        let rows = stmt
+            .query_map([], map_skill_without_children)
+            .map_err(storage_err("skill_list_failed", "failed to list Skills"))?;
+        let mut skills = Vec::new();
+        for row in rows {
+            let mut skill = row.map_err(storage_err(
+                "skill_decode_failed",
+                "failed to decode Skill row",
+            ))?;
+            Self::hydrate(conn, &mut skill)?;
+            skills.push(skill);
+        }
+        Ok(skills)
+    }
+
+    pub fn list_enabled_for_provider(
+        conn: &Connection,
+        provider_kind: ProviderKind,
+    ) -> VibexResult<Vec<Skill>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT s.skill_id, s.display_name, s.source_kind, s.status, s.scope_kind,
+                    s.project_id, s.workspace_id, s.source_uri, s.description, s.tags_json,
+                    s.content_preview, s.created_at_ms, s.updated_at_ms, s.deleted_at_ms
+                FROM skills s
+                INNER JOIN skill_provider_matrix m ON m.skill_id = s.skill_id
+                WHERE s.deleted_at_ms IS NULL
+                    AND s.status = ?1
+                    AND m.provider_kind = ?2
+                    AND m.enabled = 1
+                ORDER BY s.display_name ASC
+                ",
+            )
+            .map_err(storage_err(
+                "skill_list_failed",
+                "failed to list enabled Skills",
+            ))?;
+        let rows = stmt
+            .query_map(
+                params![
+                    enum_to_db(&SkillStatus::Enabled)?,
+                    enum_to_db(&provider_kind)?
+                ],
+                map_skill_without_children,
+            )
+            .map_err(storage_err(
+                "skill_list_failed",
+                "failed to list enabled Skills",
+            ))?;
+        let mut skills = Vec::new();
+        for row in rows {
+            let mut skill = row.map_err(storage_err(
+                "skill_decode_failed",
+                "failed to decode Skill row",
+            ))?;
+            Self::hydrate(conn, &mut skill)?;
+            skills.push(skill);
+        }
+        Ok(skills)
+    }
+
+    pub fn list_enabled_for_agent(
+        conn: &Connection,
+        agent_id: &AgentId,
+        legacy_provider_kind: ProviderKind,
+    ) -> VibexResult<Vec<Skill>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT DISTINCT s.skill_id, s.display_name, s.source_kind, s.status, s.scope_kind,
+                    s.project_id, s.workspace_id, s.source_uri, s.description, s.tags_json,
+                    s.content_preview, s.created_at_ms, s.updated_at_ms, s.deleted_at_ms
+                FROM skills s
+                LEFT JOIN skill_agent_matrix am ON am.skill_id = s.skill_id
+                LEFT JOIN skill_provider_matrix pm ON pm.skill_id = s.skill_id
+                WHERE s.deleted_at_ms IS NULL
+                    AND s.status = ?1
+                    AND (
+                        (am.agent_id = ?2 AND am.enabled = 1)
+                        OR (
+                            am.skill_id IS NULL
+                            AND pm.provider_kind = ?3
+                            AND pm.enabled = 1
+                        )
+                    )
+                ORDER BY s.display_name ASC
+                ",
+            )
+            .map_err(storage_err(
+                "skill_list_failed",
+                "failed to list Skills enabled for agent",
+            ))?;
+        let rows = stmt
+            .query_map(
+                params![
+                    enum_to_db(&SkillStatus::Enabled)?,
+                    agent_id.as_str(),
+                    enum_to_db(&legacy_provider_kind)?
+                ],
+                map_skill_without_children,
+            )
+            .map_err(storage_err(
+                "skill_list_failed",
+                "failed to list Skills enabled for agent",
+            ))?;
+        let mut skills = Vec::new();
+        for row in rows {
+            let mut skill = row.map_err(storage_err(
+                "skill_decode_failed",
+                "failed to decode Skill row",
+            ))?;
+            Self::hydrate(conn, &mut skill)?;
+            skills.push(skill);
+        }
+        Ok(skills)
+    }
+
+    pub fn get(conn: &Connection, skill_id: &SkillId) -> VibexResult<Option<Skill>> {
+        let mut skill = conn
+            .query_row(
+                "
+                SELECT skill_id, display_name, source_kind, status, scope_kind,
+                    project_id, workspace_id, source_uri, description, tags_json,
+                    content_preview, created_at_ms, updated_at_ms, deleted_at_ms
+                FROM skills
+                WHERE skill_id = ?1 AND deleted_at_ms IS NULL
+                ",
+                params![skill_id.as_str()],
+                map_skill_without_children,
+            )
+            .optional()
+            .map_err(storage_err("skill_lookup_failed", "failed to lookup Skill"))?;
+        if let Some(skill) = skill.as_mut() {
+            Self::hydrate(conn, skill)?;
+        }
+        Ok(skill)
+    }
+
+    pub fn update(conn: &Connection, skill: &Skill) -> VibexResult<()> {
+        conn.execute(
+            "
+            UPDATE skills
+            SET display_name = ?2,
+                source_kind = ?3,
+                status = ?4,
+                scope_kind = ?5,
+                project_id = ?6,
+                workspace_id = ?7,
+                source_uri = ?8,
+                description = ?9,
+                tags_json = ?10,
+                content_preview = ?11,
+                updated_at_ms = ?12
+            WHERE skill_id = ?1 AND deleted_at_ms IS NULL
+            ",
+            params![
+                skill.id.as_str(),
+                skill.display_name,
+                enum_to_db(&skill.source_kind)?,
+                enum_to_db(&skill.status)?,
+                enum_to_db(&skill.scope_kind)?,
+                skill.project_id.as_ref().map(ProjectId::as_str),
+                skill.workspace_id.as_ref().map(WorkspaceId::as_str),
+                skill.source_uri,
+                skill.description,
+                json_to_db(&skill.tags)?,
+                skill.content_preview,
+                skill.updated_at_ms
+            ],
+        )
+        .map_err(storage_err("skill_update_failed", "failed to update Skill"))?;
+        Ok(())
+    }
+
+    pub fn soft_delete(conn: &Connection, skill_id: &SkillId) -> VibexResult<()> {
+        let now = unix_timestamp_ms();
+        conn.execute(
+            "
+            UPDATE skills
+            SET deleted_at_ms = COALESCE(deleted_at_ms, ?2), updated_at_ms = ?2
+            WHERE skill_id = ?1
+            ",
+            params![skill_id.as_str(), now],
+        )
+        .map_err(storage_err("skill_delete_failed", "failed to delete Skill"))?;
+        Ok(())
+    }
+
+    pub fn replace_provider_matrix(
+        conn: &Connection,
+        skill_id: &SkillId,
+        matrix: &[SkillProviderMatrix],
+    ) -> VibexResult<()> {
+        let now = unix_timestamp_ms();
+        conn.execute(
+            "DELETE FROM skill_provider_matrix WHERE skill_id = ?1",
+            params![skill_id.as_str()],
+        )
+        .map_err(storage_err(
+            "skill_matrix_update_failed",
+            "failed to replace Skill Provider matrix",
+        ))?;
+        for entry in matrix {
+            conn.execute(
+                "
+                INSERT INTO skill_provider_matrix (
+                    skill_id, provider_kind, enabled, created_at_ms, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                ",
+                params![
+                    skill_id.as_str(),
+                    enum_to_db(&entry.provider_kind)?,
+                    if entry.enabled { 1 } else { 0 },
+                    now,
+                    entry.updated_at_ms
+                ],
+            )
+            .map_err(storage_err(
+                "skill_matrix_update_failed",
+                "failed to insert Skill Provider matrix entry",
+            ))?;
+        }
+        Ok(())
+    }
+
+    pub fn replace_agent_matrix(
+        conn: &Connection,
+        skill_id: &SkillId,
+        matrix: &[SkillAgentMatrix],
+    ) -> VibexResult<()> {
+        let now = unix_timestamp_ms();
+        conn.execute(
+            "DELETE FROM skill_agent_matrix WHERE skill_id = ?1",
+            params![skill_id.as_str()],
+        )
+        .map_err(storage_err(
+            "skill_agent_matrix_update_failed",
+            "failed to replace Skill Agent matrix",
+        ))?;
+        for entry in matrix {
+            conn.execute(
+                "
+                INSERT INTO skill_agent_matrix (
+                    skill_id, agent_id, enabled, source_kind, created_at_ms, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ",
+                params![
+                    skill_id.as_str(),
+                    entry.agent_id.as_str(),
+                    if entry.enabled { 1 } else { 0 },
+                    enum_to_db(&entry.source_kind)?,
+                    now,
+                    entry.updated_at_ms
+                ],
+            )
+            .map_err(storage_err(
+                "skill_agent_matrix_update_failed",
+                "failed to insert Skill Agent matrix entry",
+            ))?;
+        }
+        Ok(())
+    }
+
+    fn hydrate(conn: &Connection, skill: &mut Skill) -> VibexResult<()> {
+        skill.provider_matrix = Self::list_provider_matrix(conn, &skill.id)?;
+        skill.agent_matrix = Self::list_agent_matrix(conn, &skill.id)?;
+        Ok(())
+    }
+
+    fn list_provider_matrix(
+        conn: &Connection,
+        skill_id: &SkillId,
+    ) -> VibexResult<Vec<SkillProviderMatrix>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT provider_kind, enabled, updated_at_ms
+                FROM skill_provider_matrix
+                WHERE skill_id = ?1
+                ORDER BY provider_kind ASC
+                ",
+            )
+            .map_err(storage_err(
+                "skill_matrix_list_failed",
+                "failed to list Skill Provider matrix",
+            ))?;
+        let rows = stmt
+            .query_map(params![skill_id.as_str()], map_skill_provider_matrix)
+            .map_err(storage_err(
+                "skill_matrix_list_failed",
+                "failed to list Skill Provider matrix",
+            ))?;
+        let mut matrix = Vec::new();
+        for row in rows {
+            matrix.push(row.map_err(storage_err(
+                "skill_matrix_decode_failed",
+                "failed to decode Skill Provider matrix",
+            ))?);
+        }
+        Ok(matrix)
+    }
+
+    pub fn list_agent_matrix(
+        conn: &Connection,
+        skill_id: &SkillId,
+    ) -> VibexResult<Vec<SkillAgentMatrix>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT agent_id, enabled, source_kind, updated_at_ms
+                FROM skill_agent_matrix
+                WHERE skill_id = ?1
+                ORDER BY agent_id ASC
+                ",
+            )
+            .map_err(storage_err(
+                "skill_agent_matrix_list_failed",
+                "failed to list Skill Agent matrix",
+            ))?;
+        let rows = stmt
+            .query_map(params![skill_id.as_str()], map_skill_agent_matrix)
+            .map_err(storage_err(
+                "skill_agent_matrix_list_failed",
+                "failed to list Skill Agent matrix",
+            ))?;
+        let mut matrix = Vec::new();
+        for row in rows {
+            matrix.push(row.map_err(storage_err(
+                "skill_agent_matrix_decode_failed",
+                "failed to decode Skill Agent matrix",
+            ))?);
+        }
+        Ok(matrix)
+    }
+}
+
+impl PromptRepository {
+    pub fn from_create_request(request: PromptCreateRequest) -> Prompt {
+        let now = unix_timestamp_ms();
+        Prompt {
+            id: PromptId::new(),
+            display_name: request.display_name,
+            kind: request.kind,
+            status: request.status,
+            scope_kind: request.scope_kind,
+            project_id: request.project_id,
+            workspace_id: request.workspace_id,
+            body: request.body,
+            description: request.description,
+            tags: request.tags,
+            created_at_ms: now,
+            updated_at_ms: now,
+            deleted_at_ms: None,
+        }
+    }
+
+    pub fn insert(conn: &Connection, prompt: &Prompt) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO prompts (
+                prompt_id, display_name, kind, status, scope_kind, project_id,
+                workspace_id, body, description, tags_json, created_at_ms,
+                updated_at_ms, deleted_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            ",
+            params![
+                prompt.id.as_str(),
+                prompt.display_name,
+                enum_to_db(&prompt.kind)?,
+                enum_to_db(&prompt.status)?,
+                enum_to_db(&prompt.scope_kind)?,
+                prompt.project_id.as_ref().map(ProjectId::as_str),
+                prompt.workspace_id.as_ref().map(WorkspaceId::as_str),
+                prompt.body,
+                prompt.description,
+                json_to_db(&prompt.tags)?,
+                prompt.created_at_ms,
+                prompt.updated_at_ms,
+                prompt.deleted_at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "prompt_insert_failed",
+            "failed to insert Prompt",
+        ))?;
+        Ok(())
+    }
+
+    pub fn list(conn: &Connection) -> VibexResult<Vec<Prompt>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT prompt_id, display_name, kind, status, scope_kind,
+                    project_id, workspace_id, body, description, tags_json,
+                    created_at_ms, updated_at_ms, deleted_at_ms
+                FROM prompts
+                WHERE deleted_at_ms IS NULL
+                ORDER BY updated_at_ms DESC, display_name ASC
+                ",
+            )
+            .map_err(storage_err("prompt_list_failed", "failed to list Prompts"))?;
+        let rows = stmt
+            .query_map([], map_prompt)
+            .map_err(storage_err("prompt_list_failed", "failed to list Prompts"))?;
+        collect_rows(rows, "prompt_decode_failed", "failed to decode Prompt row")
+    }
+
+    pub fn list_enabled(conn: &Connection) -> VibexResult<Vec<Prompt>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT prompt_id, display_name, kind, status, scope_kind,
+                    project_id, workspace_id, body, description, tags_json,
+                    created_at_ms, updated_at_ms, deleted_at_ms
+                FROM prompts
+                WHERE deleted_at_ms IS NULL AND status = ?1
+                ORDER BY display_name ASC
+                ",
+            )
+            .map_err(storage_err(
+                "prompt_list_failed",
+                "failed to list enabled Prompts",
+            ))?;
+        let rows = stmt
+            .query_map(params![enum_to_db(&PromptStatus::Enabled)?], map_prompt)
+            .map_err(storage_err(
+                "prompt_list_failed",
+                "failed to list enabled Prompts",
+            ))?;
+        collect_rows(rows, "prompt_decode_failed", "failed to decode Prompt row")
+    }
+
+    pub fn get(conn: &Connection, prompt_id: &PromptId) -> VibexResult<Option<Prompt>> {
+        conn.query_row(
+            "
+            SELECT prompt_id, display_name, kind, status, scope_kind,
+                project_id, workspace_id, body, description, tags_json,
+                created_at_ms, updated_at_ms, deleted_at_ms
+            FROM prompts
+            WHERE prompt_id = ?1 AND deleted_at_ms IS NULL
+            ",
+            params![prompt_id.as_str()],
+            map_prompt,
+        )
+        .optional()
+        .map_err(storage_err(
+            "prompt_lookup_failed",
+            "failed to lookup Prompt",
+        ))
+    }
+
+    pub fn update(conn: &Connection, prompt: &Prompt) -> VibexResult<()> {
+        conn.execute(
+            "
+            UPDATE prompts
+            SET display_name = ?2,
+                kind = ?3,
+                status = ?4,
+                scope_kind = ?5,
+                project_id = ?6,
+                workspace_id = ?7,
+                body = ?8,
+                description = ?9,
+                tags_json = ?10,
+                updated_at_ms = ?11
+            WHERE prompt_id = ?1 AND deleted_at_ms IS NULL
+            ",
+            params![
+                prompt.id.as_str(),
+                prompt.display_name,
+                enum_to_db(&prompt.kind)?,
+                enum_to_db(&prompt.status)?,
+                enum_to_db(&prompt.scope_kind)?,
+                prompt.project_id.as_ref().map(ProjectId::as_str),
+                prompt.workspace_id.as_ref().map(WorkspaceId::as_str),
+                prompt.body,
+                prompt.description,
+                json_to_db(&prompt.tags)?,
+                prompt.updated_at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "prompt_update_failed",
+            "failed to update Prompt",
+        ))?;
+        Ok(())
+    }
+
+    pub fn soft_delete(conn: &Connection, prompt_id: &PromptId) -> VibexResult<()> {
+        let now = unix_timestamp_ms();
+        conn.execute(
+            "
+            UPDATE prompts
+            SET deleted_at_ms = COALESCE(deleted_at_ms, ?2), updated_at_ms = ?2
+            WHERE prompt_id = ?1
+            ",
+            params![prompt_id.as_str(), now],
+        )
+        .map_err(storage_err(
+            "prompt_delete_failed",
+            "failed to delete Prompt",
+        ))?;
+        Ok(())
+    }
+}
+
+impl HookRepository {
+    pub fn from_create_request(request: HookCreateRequest) -> Hook {
+        let now = unix_timestamp_ms();
+        Hook {
+            id: HookId::new(),
+            display_name: request.display_name,
+            provider_kind: request.provider_kind,
+            event_kind: request.event_kind,
+            status: request.status,
+            install_state: HookInstallState::NotInstalled,
+            command_preview: request.command_preview,
+            managed_marker: request
+                .managed_marker
+                .unwrap_or_else(|| "VIBEX-MANAGED-HOOK".to_string()),
+            description: request.description,
+            created_at_ms: now,
+            updated_at_ms: now,
+            deleted_at_ms: None,
+        }
+    }
+
+    pub fn insert(conn: &Connection, hook: &Hook) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO hooks (
+                hook_id, display_name, provider_kind, event_kind, status,
+                install_state, command_preview, managed_marker, description,
+                created_at_ms, updated_at_ms, deleted_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ",
+            params![
+                hook.id.as_str(),
+                hook.display_name,
+                enum_to_db(&hook.provider_kind)?,
+                enum_to_db(&hook.event_kind)?,
+                enum_to_db(&hook.status)?,
+                enum_to_db(&hook.install_state)?,
+                hook.command_preview,
+                hook.managed_marker,
+                hook.description,
+                hook.created_at_ms,
+                hook.updated_at_ms,
+                hook.deleted_at_ms
+            ],
+        )
+        .map_err(storage_err("hook_insert_failed", "failed to insert Hook"))?;
+        Ok(())
+    }
+
+    pub fn list(conn: &Connection) -> VibexResult<Vec<Hook>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT hook_id, display_name, provider_kind, event_kind, status,
+                    install_state, command_preview, managed_marker, description,
+                    created_at_ms, updated_at_ms, deleted_at_ms
+                FROM hooks
+                WHERE deleted_at_ms IS NULL
+                ORDER BY updated_at_ms DESC, display_name ASC
+                ",
+            )
+            .map_err(storage_err("hook_list_failed", "failed to list Hooks"))?;
+        let rows = stmt
+            .query_map([], map_hook)
+            .map_err(storage_err("hook_list_failed", "failed to list Hooks"))?;
+        collect_rows(rows, "hook_decode_failed", "failed to decode Hook row")
+    }
+
+    pub fn get(conn: &Connection, hook_id: &HookId) -> VibexResult<Option<Hook>> {
+        conn.query_row(
+            "
+            SELECT hook_id, display_name, provider_kind, event_kind, status,
+                install_state, command_preview, managed_marker, description,
+                created_at_ms, updated_at_ms, deleted_at_ms
+            FROM hooks
+            WHERE hook_id = ?1 AND deleted_at_ms IS NULL
+            ",
+            params![hook_id.as_str()],
+            map_hook,
+        )
+        .optional()
+        .map_err(storage_err("hook_lookup_failed", "failed to lookup Hook"))
+    }
+
+    pub fn update(conn: &Connection, hook: &Hook) -> VibexResult<()> {
+        conn.execute(
+            "
+            UPDATE hooks
+            SET display_name = ?2,
+                provider_kind = ?3,
+                event_kind = ?4,
+                status = ?5,
+                install_state = ?6,
+                command_preview = ?7,
+                managed_marker = ?8,
+                description = ?9,
+                updated_at_ms = ?10
+            WHERE hook_id = ?1 AND deleted_at_ms IS NULL
+            ",
+            params![
+                hook.id.as_str(),
+                hook.display_name,
+                enum_to_db(&hook.provider_kind)?,
+                enum_to_db(&hook.event_kind)?,
+                enum_to_db(&hook.status)?,
+                enum_to_db(&hook.install_state)?,
+                hook.command_preview,
+                hook.managed_marker,
+                hook.description,
+                hook.updated_at_ms
+            ],
+        )
+        .map_err(storage_err("hook_update_failed", "failed to update Hook"))?;
+        Ok(())
+    }
+
+    pub fn soft_delete(conn: &Connection, hook_id: &HookId) -> VibexResult<()> {
+        let now = unix_timestamp_ms();
+        conn.execute(
+            "
+            UPDATE hooks
+            SET deleted_at_ms = COALESCE(deleted_at_ms, ?2), updated_at_ms = ?2
+            WHERE hook_id = ?1
+            ",
+            params![hook_id.as_str(), now],
+        )
+        .map_err(storage_err("hook_delete_failed", "failed to delete Hook"))?;
+        Ok(())
+    }
+
+    pub fn insert_install_preview(
+        conn: &Connection,
+        preview: &HookInstallPreview,
+    ) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO hook_install_previews (
+                preview_id, hook_id, target_path, marker, redacted_preview, created_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ",
+            params![
+                preview.preview_id.as_str(),
+                preview.hook_id.as_str(),
+                preview.target_path,
+                preview.marker,
+                preview.redacted_preview,
+                preview.created_at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "hook_install_preview_failed",
+            "failed to persist Hook install preview",
+        ))?;
+        Ok(())
+    }
+}
+
+impl TimelineRepository {
+    pub fn latest_sequence(conn: &Connection, session_id: &VibexSessionId) -> VibexResult<i64> {
+        conn.query_row(
+            "SELECT COALESCE(MAX(sequence), 0)
+             FROM agent_timeline_items WHERE session_id = ?1",
+            params![session_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(storage_err(
+            "timeline_latest_sequence_failed",
+            "failed to load the latest timeline sequence",
+        ))
+    }
+
+    pub fn insert_session_and_append_many(
+        conn: &mut Connection,
+        session: &AgentSession,
+        items: &[TimelineAppend],
+    ) -> VibexResult<Vec<TimelineItem>> {
+        let tx = conn.transaction().map_err(storage_err(
+            "session_import_transaction_failed",
+            "failed to start session import transaction",
+        ))?;
+        SessionRepository::insert(&tx, session)?;
+
+        let mut appended = Vec::with_capacity(items.len());
+        for item in items {
+            appended.push(append_timeline_in_transaction(
+                &tx,
+                &session.id,
+                item.source,
+                item.payload.clone(),
+                item.timestamp_ms,
+                item.correlation_id.as_ref(),
+                item.provider_correlation_id.as_deref(),
+                item.redaction_state,
+                item.execution_attribution.as_ref(),
+            )?);
+        }
+
+        tx.commit().map_err(storage_err(
+            "session_import_transaction_commit_failed",
+            "failed to commit session import transaction",
+        ))?;
+        Ok(appended)
+    }
+
+    pub fn append(
+        conn: &mut Connection,
+        session_id: &VibexSessionId,
+        source: TimelineSource,
+        payload: TimelinePayload,
+        correlation_id: Option<&vibex_core::CorrelationId>,
+        provider_correlation_id: Option<&str>,
+        redaction_state: TimelineRedactionState,
+    ) -> VibexResult<TimelineItem> {
+        Self::append_with_attribution(
+            conn,
+            session_id,
+            source,
+            payload,
+            correlation_id,
+            provider_correlation_id,
+            redaction_state,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_with_attribution(
+        conn: &mut Connection,
+        session_id: &VibexSessionId,
+        source: TimelineSource,
+        payload: TimelinePayload,
+        correlation_id: Option<&vibex_core::CorrelationId>,
+        provider_correlation_id: Option<&str>,
+        redaction_state: TimelineRedactionState,
+        execution_attribution: Option<&TurnExecutionAttribution>,
+    ) -> VibexResult<TimelineItem> {
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "timeline_transaction_failed",
+                "failed to start timeline transaction",
+            ))?;
+        let item = append_timeline_in_transaction(
+            &tx,
+            session_id,
+            source,
+            payload,
+            None,
+            correlation_id,
+            provider_correlation_id,
+            redaction_state,
+            execution_attribution,
+        )?;
+        tx.commit().map_err(storage_err(
+            "timeline_transaction_commit_failed",
+            "failed to commit timeline transaction",
+        ))?;
+        Ok(item)
+    }
+
+    pub fn upsert_by_provider_correlation(
+        conn: &mut Connection,
+        session_id: &VibexSessionId,
+        source: TimelineSource,
+        payload: TimelinePayload,
+        provider_correlation_id: &str,
+        after_sequence: i64,
+        redaction_state: TimelineRedactionState,
+        execution_attribution: Option<&TurnExecutionAttribution>,
+    ) -> VibexResult<TimelineItem> {
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "timeline_transaction_failed",
+                "failed to start timeline transaction",
+            ))?;
+        let kind = payload.kind();
+        let existing = tx
+            .query_row(
+                "
+                SELECT session_id, sequence, timeline_item_id, kind, source, timestamp_ms,
+                    correlation_id, provider_correlation_id, payload_json, redaction_state,
+                    execution_attribution_json
+                FROM agent_timeline_items
+                WHERE session_id = ?1
+                    AND provider_correlation_id = ?2
+                    AND kind = ?3
+                    AND source = ?4
+                    AND sequence > ?5
+                ORDER BY sequence DESC
+                LIMIT 1
+                ",
+                params![
+                    session_id.as_str(),
+                    provider_correlation_id,
+                    enum_to_db(&kind)?,
+                    enum_to_db(&source)?,
+                    after_sequence
+                ],
+                |row| {
+                    let item = map_timeline_item(row)?;
+                    let execution_attribution = row
+                        .get::<_, Option<String>>(10)?
+                        .map(json_from_db_sql)
+                        .transpose()?;
+                    Ok((item, execution_attribution))
+                },
+            )
+            .optional()
+            .map_err(storage_err(
+                "timeline_provider_correlation_lookup_failed",
+                "failed to lookup timeline item by provider correlation id",
+            ))?;
+
+        let item = if let Some((mut item, stored_attribution)) = existing {
+            if stored_attribution.as_ref() != execution_attribution {
+                return Err(VibexError::conflict(
+                    "turn_execution_attribution_conflict",
+                    "provider event attribution does not match the existing timeline item",
+                ));
+            }
+            item.timestamp_ms = unix_timestamp_ms();
+            item.payload = payload;
+            item.redaction_state = redaction_state;
+            tx.execute(
+                "
+                UPDATE agent_timeline_items
+                SET timestamp_ms = ?3,
+                    payload_json = ?4,
+                    redaction_state = ?5
+                WHERE session_id = ?1 AND sequence = ?2
+                ",
+                params![
+                    session_id.as_str(),
+                    item.sequence,
+                    item.timestamp_ms,
+                    json_to_db(&item.payload)?,
+                    enum_to_db(&item.redaction_state)?
+                ],
+            )
+            .map_err(storage_err(
+                "timeline_provider_correlation_update_failed",
+                "failed to update timeline item by provider correlation id",
+            ))?;
+            item
+        } else {
+            append_timeline_in_transaction(
+                &tx,
+                session_id,
+                source,
+                payload,
+                None,
+                None,
+                Some(provider_correlation_id),
+                redaction_state,
+                execution_attribution,
+            )?
+        };
+
+        tx.commit().map_err(storage_err(
+            "timeline_transaction_commit_failed",
+            "failed to commit timeline transaction",
+        ))?;
+        Ok(item)
+    }
+
+    pub fn fetch_after(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+        after_sequence: Option<i64>,
+        limit: u32,
+    ) -> VibexResult<TimelinePage> {
+        let limit = limit.clamp(1, 500) as i64;
+        let overfetch = limit + 1;
+        let mut items = if let Some(after_sequence) = after_sequence {
+            let mut stmt = conn
+                .prepare(
+                    "
+                    SELECT session_id, sequence, timeline_item_id, kind, source, timestamp_ms,
+                        correlation_id, provider_correlation_id, payload_json, redaction_state,
+                        execution_attribution_json
+                    FROM agent_timeline_items
+                    WHERE session_id = ?1 AND sequence > ?2
+                    ORDER BY sequence ASC
+                    LIMIT ?3
+                    ",
+                )
+                .map_err(storage_err(
+                    "timeline_fetch_failed",
+                    "failed to prepare timeline fetch",
+                ))?;
+            let rows = stmt
+                .query_map(
+                    params![session_id.as_str(), after_sequence, overfetch],
+                    map_timeline_item,
+                )
+                .map_err(storage_err(
+                    "timeline_fetch_failed",
+                    "failed to query timeline items",
+                ))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(storage_err(
+                    "timeline_decode_failed",
+                    "failed to decode timeline row",
+                ))?);
+            }
+            out
+        } else {
+            let mut stmt = conn
+                .prepare(
+                    "
+                    SELECT session_id, sequence, timeline_item_id, kind, source, timestamp_ms,
+                        correlation_id, provider_correlation_id, payload_json, redaction_state,
+                        execution_attribution_json
+                    FROM agent_timeline_items
+                    WHERE session_id = ?1
+                    ORDER BY sequence DESC
+                    LIMIT ?2
+                    ",
+                )
+                .map_err(storage_err(
+                    "timeline_fetch_failed",
+                    "failed to prepare timeline fetch",
+                ))?;
+            let rows = stmt
+                .query_map(params![session_id.as_str(), overfetch], map_timeline_item)
+                .map_err(storage_err(
+                    "timeline_fetch_failed",
+                    "failed to query timeline items",
+                ))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(storage_err(
+                    "timeline_decode_failed",
+                    "failed to decode timeline row",
+                ))?);
+            }
+            out.reverse();
+            out
+        };
+
+        let has_newer = items.len() as i64 > limit;
+        if has_newer {
+            if after_sequence.is_some() {
+                items.truncate(limit as usize);
+            } else {
+                items.remove(0);
+            }
+        }
+
+        let start_sequence = items.first().map(|item| item.sequence);
+        let end_sequence = items.last().map(|item| item.sequence);
+        let has_older = if let Some(start_sequence) = start_sequence {
+            conn.query_row(
+                "
+                SELECT EXISTS(
+                    SELECT 1 FROM agent_timeline_items
+                    WHERE session_id = ?1 AND sequence < ?2
+                )
+                ",
+                params![session_id.as_str(), start_sequence],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(storage_err(
+                "timeline_older_probe_failed",
+                "failed to inspect older timeline items",
+            ))?
+        } else {
+            false
+        };
+
+        let has_newer = if let Some(end_sequence) = end_sequence {
+            conn.query_row(
+                "
+                SELECT EXISTS(
+                    SELECT 1 FROM agent_timeline_items
+                    WHERE session_id = ?1 AND sequence > ?2
+                )
+                ",
+                params![session_id.as_str(), end_sequence],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(storage_err(
+                "timeline_newer_probe_failed",
+                "failed to inspect newer timeline items",
+            ))?
+        } else {
+            false
+        };
+
+        Ok(TimelinePage {
+            session_id: session_id.clone(),
+            items,
+            start_sequence,
+            end_sequence,
+            has_older,
+            has_newer,
+        })
+    }
+
+    pub fn fetch_range(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+        first_sequence: i64,
+        last_sequence: i64,
+    ) -> VibexResult<Vec<TimelineItem>> {
+        if first_sequence <= 0 || last_sequence < first_sequence {
+            return Err(VibexError::validation(
+                "timeline_range_invalid",
+                "timeline sequence range is invalid",
+            ));
+        }
+        let mut stmt = conn
+            .prepare(
+                "SELECT session_id, sequence, timeline_item_id, kind, source, timestamp_ms,
+                        correlation_id, provider_correlation_id, payload_json, redaction_state,
+                        execution_attribution_json
+                 FROM agent_timeline_items
+                 WHERE session_id = ?1 AND sequence BETWEEN ?2 AND ?3
+                 ORDER BY sequence ASC",
+            )
+            .map_err(storage_err(
+                "timeline_range_fetch_failed",
+                "failed to prepare timeline range fetch",
+            ))?;
+        let rows = stmt
+            .query_map(
+                params![session_id.as_str(), first_sequence, last_sequence],
+                map_timeline_item,
+            )
+            .map_err(storage_err(
+                "timeline_range_fetch_failed",
+                "failed to query timeline range",
+            ))?;
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row.map_err(storage_err(
+                "timeline_decode_failed",
+                "failed to decode timeline row",
+            ))?);
+        }
+        Ok(items)
+    }
+}
+
+impl PermissionRepository {
+    pub fn insert_request(conn: &Connection, request: &PermissionRequest) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO permission_requests (
+                request_id, session_id, project_id, workspace_id, provider_request_id,
+                risk_category, title, details_json, allowed_responses_json, status,
+                requested_at_ms, expires_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ",
+            params![
+                request.id.as_str(),
+                request.session_id.as_str(),
+                request.project_id.as_ref().map(ProjectId::as_str),
+                request.workspace_id.as_ref().map(WorkspaceId::as_str),
+                request.provider_request_id,
+                enum_to_db(&request.risk_category)?,
+                request.title,
+                json_to_db(&request.details)?,
+                json_to_db(&request.allowed_responses)?,
+                enum_to_db(&request.status)?,
+                request.requested_at_ms,
+                request.expires_at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "permission_request_insert_failed",
+            "failed to insert permission request",
+        ))?;
+        Ok(())
+    }
+
+    pub fn get_request(
+        conn: &Connection,
+        request_id: &RequestId,
+    ) -> VibexResult<Option<PermissionRequest>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT request_id, session_id, project_id, workspace_id, provider_request_id,
+                    risk_category, title, details_json, allowed_responses_json, status,
+                    requested_at_ms, expires_at_ms
+                FROM permission_requests
+                WHERE request_id = ?1
+                ",
+            )
+            .map_err(storage_err(
+                "permission_request_get_failed",
+                "failed to load permission request",
+            ))?;
+        stmt.query_row(params![request_id.as_str()], map_permission_request)
+            .optional()
+            .map_err(storage_err(
+                "permission_request_decode_failed",
+                "failed to decode permission request",
+            ))
+    }
+
+    pub fn resolve(conn: &Connection, resolution: &PermissionResolution) -> VibexResult<()> {
+        let status = match resolution.response {
+            PermissionResponseKind::Approve | PermissionResponseKind::AlwaysAllowForSession => {
+                PermissionRequestStatus::Approved
+            }
+            PermissionResponseKind::Deny => PermissionRequestStatus::Denied,
+        };
+        conn.execute(
+            "
+            UPDATE permission_requests
+            SET status = ?3, resolution_json = ?4, resolved_at_ms = ?5
+            WHERE request_id = ?1 AND session_id = ?2
+            ",
+            params![
+                resolution.request_id.as_str(),
+                resolution.session_id.as_str(),
+                enum_to_db(&status)?,
+                json_to_db(resolution)?,
+                resolution.resolved_at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "permission_request_resolve_failed",
+            "failed to resolve permission request",
+        ))?;
+        Ok(())
+    }
+
+    pub fn pending_for_session(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<Vec<PermissionRequest>> {
+        let pending = enum_to_db(&PermissionRequestStatus::Pending)?;
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT request_id, session_id, project_id, workspace_id, provider_request_id,
+                    risk_category, title, details_json, allowed_responses_json, status,
+                    requested_at_ms, expires_at_ms
+                FROM permission_requests
+                WHERE session_id = ?1 AND status = ?2
+                ORDER BY requested_at_ms ASC
+                ",
+            )
+            .map_err(storage_err(
+                "permission_request_list_failed",
+                "failed to list permission requests",
+            ))?;
+        let rows = stmt
+            .query_map(
+                params![session_id.as_str(), pending],
+                map_permission_request,
+            )
+            .map_err(storage_err(
+                "permission_request_list_failed",
+                "failed to list permission requests",
+            ))?;
+
+        let mut requests = Vec::new();
+        for row in rows {
+            requests.push(row.map_err(storage_err(
+                "permission_request_decode_failed",
+                "failed to decode permission request",
+            ))?);
+        }
+        Ok(requests)
+    }
+}
+
+impl AdapterDiagnosticsRepository {
+    pub fn insert(conn: &Connection, diagnostic: &AdapterDiagnostic) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO adapter_diagnostics (
+                session_id, provider_kind, level, code, message,
+                redacted_details_json, timestamp_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ",
+            params![
+                diagnostic.session_id.as_ref().map(VibexSessionId::as_str),
+                enum_to_db(&diagnostic.provider_kind)?,
+                enum_to_db(&diagnostic.level)?,
+                diagnostic.code,
+                diagnostic.message,
+                json_to_db(&diagnostic.redacted_details)?,
+                diagnostic.timestamp_ms
+            ],
+        )
+        .map_err(storage_err(
+            "adapter_diagnostic_insert_failed",
+            "failed to insert adapter diagnostic",
+        ))?;
+        Ok(())
+    }
+}
+
+impl TerminalSessionRepository {
+    pub fn upsert(conn: &Connection, session: &TerminalSession) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO terminal_sessions (
+                terminal_id, workspace_id, title, shell, cwd, rows, cols, status,
+                created_at_ms, updated_at_ms, closed_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ON CONFLICT(terminal_id) DO UPDATE SET
+                workspace_id = excluded.workspace_id,
+                title = excluded.title,
+                shell = excluded.shell,
+                cwd = excluded.cwd,
+                rows = excluded.rows,
+                cols = excluded.cols,
+                status = excluded.status,
+                updated_at_ms = excluded.updated_at_ms,
+                closed_at_ms = excluded.closed_at_ms
+            ",
+            params![
+                session.id.as_str(),
+                session.workspace_id.as_str(),
+                session.title,
+                session.shell,
+                session.cwd,
+                session.rows,
+                session.cols,
+                enum_to_db(&session.status)?,
+                session.created_at_ms,
+                session.updated_at_ms,
+                session.closed_at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "terminal_session_upsert_failed",
+            "failed to upsert terminal session",
+        ))?;
+        Ok(())
+    }
+
+    pub fn list(
+        conn: &Connection,
+        workspace_id: &WorkspaceId,
+    ) -> VibexResult<Vec<TerminalSession>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT terminal_id, workspace_id, title, shell, cwd, rows, cols, status,
+                    created_at_ms, updated_at_ms, closed_at_ms
+                FROM terminal_sessions
+                WHERE workspace_id = ?1
+                ORDER BY created_at_ms ASC
+                ",
+            )
+            .map_err(storage_err(
+                "terminal_session_list_failed",
+                "failed to list terminal sessions",
+            ))?;
+        let rows = stmt
+            .query_map(params![workspace_id.as_str()], map_terminal_session)
+            .map_err(storage_err(
+                "terminal_session_list_failed",
+                "failed to list terminal sessions",
+            ))?;
+
+        let mut sessions = Vec::new();
+        for row in rows {
+            sessions.push(row.map_err(storage_err(
+                "terminal_session_decode_failed",
+                "failed to decode terminal session",
+            ))?);
+        }
+        Ok(sessions)
+    }
+
+    pub fn get(
+        conn: &Connection,
+        terminal_id: &TerminalId,
+    ) -> VibexResult<Option<TerminalSession>> {
+        conn.query_row(
+            "
+            SELECT terminal_id, workspace_id, title, shell, cwd, rows, cols, status,
+                created_at_ms, updated_at_ms, closed_at_ms
+            FROM terminal_sessions
+            WHERE terminal_id = ?1
+            ",
+            params![terminal_id.as_str()],
+            map_terminal_session,
+        )
+        .optional()
+        .map_err(storage_err(
+            "terminal_session_lookup_failed",
+            "failed to lookup terminal session",
+        ))
+    }
+}
+
+impl RecentFileRepository {
+    pub fn touch(conn: &Connection, workspace_id: &WorkspaceId, path: &str) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO workbench_recent_files (workspace_id, path, last_opened_at_ms)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(workspace_id, path) DO UPDATE SET
+                last_opened_at_ms = excluded.last_opened_at_ms
+            ",
+            params![workspace_id.as_str(), path, unix_timestamp_ms()],
+        )
+        .map_err(storage_err(
+            "recent_file_touch_failed",
+            "failed to update recent file",
+        ))?;
+        Ok(())
+    }
+
+    pub fn list(
+        conn: &Connection,
+        workspace_id: &WorkspaceId,
+        limit: u32,
+    ) -> VibexResult<Vec<String>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT path
+                FROM workbench_recent_files
+                WHERE workspace_id = ?1
+                ORDER BY last_opened_at_ms DESC
+                LIMIT ?2
+                ",
+            )
+            .map_err(storage_err(
+                "recent_file_list_failed",
+                "failed to list recent files",
+            ))?;
+        let rows = stmt
+            .query_map(params![workspace_id.as_str(), limit.clamp(1, 100)], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(storage_err(
+                "recent_file_list_failed",
+                "failed to list recent files",
+            ))?;
+
+        let mut paths = Vec::new();
+        for row in rows {
+            paths.push(row.map_err(storage_err(
+                "recent_file_decode_failed",
+                "failed to decode recent file",
+            ))?);
+        }
+        Ok(paths)
+    }
+}
+
+struct RightRailPluginSeed {
+    id: &'static str,
+    kind: RightRailPluginKind,
+    system_key: Option<RightRailSystemPluginKey>,
+    builtin_key: Option<&'static str>,
+    display_name: &'static str,
+    url: Option<&'static str>,
+    order_index: i64,
+}
+
+const RIGHT_RAIL_PLUGIN_SYSTEM_SEEDS: &[RightRailPluginSeed] = &[
+    RightRailPluginSeed {
+        id: "rail_plugin_system_files",
+        kind: RightRailPluginKind::System,
+        system_key: Some(RightRailSystemPluginKey::Files),
+        builtin_key: None,
+        display_name: "Files",
+        url: None,
+        order_index: 0,
+    },
+    RightRailPluginSeed {
+        id: "rail_plugin_system_git",
+        kind: RightRailPluginKind::System,
+        system_key: Some(RightRailSystemPluginKey::Git),
+        builtin_key: None,
+        display_name: "Git",
+        url: None,
+        order_index: 1,
+    },
+    RightRailPluginSeed {
+        id: "rail_plugin_system_terminal",
+        kind: RightRailPluginKind::System,
+        system_key: Some(RightRailSystemPluginKey::Terminal),
+        builtin_key: None,
+        display_name: "Terminal",
+        url: None,
+        order_index: 2,
+    },
+];
+
+const RIGHT_RAIL_PLUGIN_WEB_SEEDS: &[RightRailPluginSeed] = &[
+    RightRailPluginSeed {
+        id: "rail_plugin_builtin_doubao",
+        kind: RightRailPluginKind::Web,
+        system_key: None,
+        builtin_key: Some("doubao"),
+        display_name: "Doubao",
+        url: Some("https://www.doubao.com/"),
+        order_index: 10,
+    },
+    RightRailPluginSeed {
+        id: "rail_plugin_builtin_kimi",
+        kind: RightRailPluginKind::Web,
+        system_key: None,
+        builtin_key: Some("kimi"),
+        display_name: "Kimi",
+        url: Some("https://www.kimi.com/"),
+        order_index: 11,
+    },
+    RightRailPluginSeed {
+        id: "rail_plugin_builtin_yuanbao",
+        kind: RightRailPluginKind::Web,
+        system_key: None,
+        builtin_key: Some("yuanbao"),
+        display_name: "元宝",
+        url: Some("https://yuanbao.tencent.com/chat"),
+        order_index: 12,
+    },
+];
+
+const RIGHT_RAIL_PLUGIN_DEPRECATED_WEB_BUILTIN_KEYS: &[&str] = &["deepseek", "chatgpt", "gemini"];
+
+impl RightRailPluginRepository {
+    pub fn seed_defaults(conn: &Connection) -> VibexResult<()> {
+        for seed in RIGHT_RAIL_PLUGIN_SYSTEM_SEEDS {
+            Self::insert_seed(conn, seed, true)?;
+        }
+        for seed in RIGHT_RAIL_PLUGIN_WEB_SEEDS {
+            Self::insert_seed(conn, seed, false)?;
+        }
+        Self::retire_deprecated_web_builtin_seeds(conn)?;
+        Self::upgrade_untouched_web_builtin_seeds_to_mobile(conn)?;
+        Ok(())
+    }
+
+    pub fn list(conn: &Connection) -> VibexResult<Vec<RightRailPlugin>> {
+        Self::seed_defaults(conn)?;
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT plugin_id, kind, system_key, builtin_key, display_name, url, logo,
+                    desktop_user_agent, mobile_user_agent, ua_mode, status, order_index,
+                    data_directory, created_at_ms, updated_at_ms, deleted_at_ms
+                FROM right_rail_plugins
+                WHERE deleted_at_ms IS NULL
+                ORDER BY order_index ASC, created_at_ms ASC
+                ",
+            )
+            .map_err(storage_err(
+                "right_rail_plugin_list_failed",
+                "failed to list right rail plugins",
+            ))?;
+        let rows = stmt
+            .query_map([], map_right_rail_plugin)
+            .map_err(storage_err(
+                "right_rail_plugin_list_failed",
+                "failed to list right rail plugins",
+            ))?;
+        collect_rows(
+            rows,
+            "right_rail_plugin_decode_failed",
+            "failed to decode right rail plugin",
+        )
+    }
+
+    pub fn create(
+        conn: &Connection,
+        request: RightRailPluginCreateRequest,
+    ) -> VibexResult<RightRailPlugin> {
+        Self::seed_defaults(conn)?;
+        let display_name = validate_plugin_name(request.display_name)?;
+        let url = validate_web_plugin_url(request.url)?;
+        let id = RightRailPluginId::new();
+        let now = unix_timestamp_ms();
+        let order_index = conn
+            .query_row(
+                "SELECT COALESCE(MAX(order_index), 0) + 1 FROM right_rail_plugins WHERE deleted_at_ms IS NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(storage_err(
+                "right_rail_plugin_order_allocate_failed",
+                "failed to allocate right rail plugin order",
+            ))?;
+
+        conn.execute(
+            "
+            INSERT INTO right_rail_plugins (
+                plugin_id, kind, system_key, builtin_key, display_name, url, logo,
+                desktop_user_agent, mobile_user_agent, ua_mode, status, order_index,
+                data_directory, created_at_ms, updated_at_ms, deleted_at_ms
+            )
+            VALUES (?1, ?2, NULL, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL)
+            ",
+            params![
+                id.as_str(),
+                enum_to_db(&RightRailPluginKind::Web)?,
+                display_name,
+                url,
+                normalize_optional_text(request.logo),
+                normalize_optional_text(request.desktop_user_agent),
+                normalize_optional_text(request.mobile_user_agent),
+                enum_to_db(&request.ua_mode)?,
+                enum_to_db(&RightRailPluginStatus::Enabled)?,
+                order_index,
+                format!("right-rail/{}", id.as_str()),
+                now,
+                now
+            ],
+        )
+        .map_err(storage_err(
+            "right_rail_plugin_create_failed",
+            "failed to create right rail plugin",
+        ))?;
+
+        Self::get_required(conn, &id)
+    }
+
+    pub fn update(
+        conn: &Connection,
+        request: RightRailPluginUpdateRequest,
+    ) -> VibexResult<RightRailPlugin> {
+        let mut plugin = Self::get_required(conn, &request.id)?;
+        if plugin.kind == RightRailPluginKind::System {
+            return Err(VibexError::conflict(
+                "right_rail_system_plugin_immutable",
+                "system right rail plugins cannot be edited, disabled, or deleted",
+            ));
+        }
+
+        if let Some(display_name) = request.display_name {
+            plugin.display_name = validate_plugin_name(display_name)?;
+        }
+        if let Some(url) = request.url {
+            plugin.url = Some(validate_web_plugin_url(url)?);
+        }
+        if request.clear_logo {
+            plugin.logo = None;
+        } else if let Some(logo) = request.logo {
+            plugin.logo = normalize_optional_text(Some(logo));
+        }
+        if request.clear_desktop_user_agent {
+            plugin.desktop_user_agent = None;
+        } else if let Some(user_agent) = request.desktop_user_agent {
+            plugin.desktop_user_agent = normalize_optional_text(Some(user_agent));
+        }
+        if request.clear_mobile_user_agent {
+            plugin.mobile_user_agent = None;
+        } else if let Some(user_agent) = request.mobile_user_agent {
+            plugin.mobile_user_agent = normalize_optional_text(Some(user_agent));
+        }
+        if let Some(ua_mode) = request.ua_mode {
+            plugin.ua_mode = Some(ua_mode);
+        }
+        if let Some(status) = request.status {
+            if status == RightRailPluginStatus::Deleted {
+                return Err(VibexError::validation(
+                    "right_rail_plugin_update_deleted_status",
+                    "delete right rail plugins with the delete operation",
+                ));
+            }
+            plugin.status = status;
+        }
+        plugin.updated_at_ms = unix_timestamp_ms();
+
+        conn.execute(
+            "
+            UPDATE right_rail_plugins
+            SET display_name = ?2,
+                url = ?3,
+                logo = ?4,
+                desktop_user_agent = ?5,
+                mobile_user_agent = ?6,
+                ua_mode = ?7,
+                status = ?8,
+                updated_at_ms = ?9
+            WHERE plugin_id = ?1
+            ",
+            params![
+                plugin.id.as_str(),
+                plugin.display_name,
+                plugin.url,
+                plugin.logo,
+                plugin.desktop_user_agent,
+                plugin.mobile_user_agent,
+                plugin.ua_mode.as_ref().map(enum_to_db).transpose()?,
+                enum_to_db(&plugin.status)?,
+                plugin.updated_at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "right_rail_plugin_update_failed",
+            "failed to update right rail plugin",
+        ))?;
+
+        Self::get_required(conn, &request.id)
+    }
+
+    pub fn soft_delete(
+        conn: &Connection,
+        request: RightRailPluginDeleteRequest,
+    ) -> VibexResult<RightRailPlugin> {
+        let plugin = Self::get_required(conn, &request.id)?;
+        if plugin.kind == RightRailPluginKind::System {
+            return Err(VibexError::conflict(
+                "right_rail_system_plugin_immutable",
+                "system right rail plugins cannot be edited, disabled, or deleted",
+            ));
+        }
+
+        let now = unix_timestamp_ms();
+        conn.execute(
+            "
+            UPDATE right_rail_plugins
+            SET status = ?2, deleted_at_ms = ?3, updated_at_ms = ?3
+            WHERE plugin_id = ?1
+            ",
+            params![
+                request.id.as_str(),
+                enum_to_db(&RightRailPluginStatus::Deleted)?,
+                now
+            ],
+        )
+        .map_err(storage_err(
+            "right_rail_plugin_delete_failed",
+            "failed to delete right rail plugin",
+        ))?;
+
+        let mut deleted = plugin;
+        deleted.status = RightRailPluginStatus::Deleted;
+        deleted.deleted_at_ms = Some(now);
+        deleted.updated_at_ms = now;
+        Ok(deleted)
+    }
+
+    pub fn reorder(
+        conn: &Connection,
+        request: RightRailPluginReorderRequest,
+    ) -> VibexResult<Vec<RightRailPlugin>> {
+        Self::seed_defaults(conn)?;
+        let current = Self::list(conn)?;
+        let current_ids = current
+            .iter()
+            .map(|plugin| plugin.id.as_str().to_string())
+            .collect::<HashSet<_>>();
+        let mut seen = HashSet::new();
+        for id in &request.ordered_plugin_ids {
+            if !current_ids.contains(id.as_str()) {
+                return Err(VibexError::validation(
+                    "right_rail_plugin_reorder_unknown_id",
+                    "right rail plugin reorder included an unknown plugin id",
+                )
+                .with_diagnostic("pluginId", id.as_str()));
+            }
+            if !seen.insert(id.as_str().to_string()) {
+                return Err(VibexError::validation(
+                    "right_rail_plugin_reorder_duplicate_id",
+                    "right rail plugin reorder included a duplicate plugin id",
+                )
+                .with_diagnostic("pluginId", id.as_str()));
+            }
+        }
+
+        let mut ordered_ids = request.ordered_plugin_ids;
+        for plugin in &current {
+            if !seen.contains(plugin.id.as_str()) {
+                ordered_ids.push(plugin.id.clone());
+            }
+        }
+
+        let tx = conn.unchecked_transaction().map_err(storage_err(
+            "right_rail_plugin_reorder_transaction_failed",
+            "failed to start right rail plugin reorder transaction",
+        ))?;
+        let now = unix_timestamp_ms();
+        for (index, id) in ordered_ids.iter().enumerate() {
+            tx.execute(
+                "
+                UPDATE right_rail_plugins
+                SET order_index = ?2, updated_at_ms = ?3
+                WHERE plugin_id = ?1 AND deleted_at_ms IS NULL
+                ",
+                params![id.as_str(), index as i64, now],
+            )
+            .map_err(storage_err(
+                "right_rail_plugin_reorder_failed",
+                "failed to reorder right rail plugin",
+            ))?;
+        }
+        tx.commit().map_err(storage_err(
+            "right_rail_plugin_reorder_commit_failed",
+            "failed to commit right rail plugin reorder",
+        ))?;
+
+        Self::list(conn)
+    }
+
+    fn insert_seed(
+        conn: &Connection,
+        seed: &RightRailPluginSeed,
+        repair_system: bool,
+    ) -> VibexResult<()> {
+        let now = unix_timestamp_ms();
+        let status = RightRailPluginStatus::Enabled;
+        conn.execute(
+            "
+            INSERT OR IGNORE INTO right_rail_plugins (
+                plugin_id, kind, system_key, builtin_key, display_name, url, logo,
+                desktop_user_agent, mobile_user_agent, ua_mode, status, order_index,
+                data_directory, created_at_ms, updated_at_ms, deleted_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, ?7, ?8, ?9, ?10, ?11, ?12, NULL)
+            ",
+            params![
+                seed.id,
+                enum_to_db(&seed.kind)?,
+                seed.system_key.as_ref().map(enum_to_db).transpose()?,
+                seed.builtin_key,
+                seed.display_name,
+                seed.url,
+                if seed.kind == RightRailPluginKind::Web {
+                    Some(enum_to_db(&RightRailWebPluginUaMode::Mobile)?)
+                } else {
+                    None
+                },
+                enum_to_db(&status)?,
+                seed.order_index,
+                if seed.kind == RightRailPluginKind::Web {
+                    Some(format!("right-rail/{}", seed.id))
+                } else {
+                    None
+                },
+                now,
+                now
+            ],
+        )
+        .map_err(storage_err(
+            "right_rail_plugin_seed_failed",
+            "failed to seed right rail plugin",
+        ))?;
+
+        if repair_system {
+            conn.execute(
+                "
+                UPDATE right_rail_plugins
+                SET kind = ?2,
+                    system_key = ?3,
+                    display_name = ?4,
+                    url = NULL,
+                    logo = NULL,
+                    desktop_user_agent = NULL,
+                    mobile_user_agent = NULL,
+                    ua_mode = NULL,
+                    status = ?5,
+                    deleted_at_ms = NULL,
+                    updated_at_ms = ?6
+                WHERE plugin_id = ?1
+                ",
+                params![
+                    seed.id,
+                    enum_to_db(&RightRailPluginKind::System)?,
+                    seed.system_key.as_ref().map(enum_to_db).transpose()?,
+                    seed.display_name,
+                    enum_to_db(&RightRailPluginStatus::Enabled)?,
+                    now
+                ],
+            )
+            .map_err(storage_err(
+                "right_rail_plugin_system_repair_failed",
+                "failed to repair system right rail plugin",
+            ))?;
+        }
+
+        Ok(())
+    }
+
+    fn retire_deprecated_web_builtin_seeds(conn: &Connection) -> VibexResult<()> {
+        let now = unix_timestamp_ms();
+        let deleted = enum_to_db(&RightRailPluginStatus::Deleted)?;
+        let web = enum_to_db(&RightRailPluginKind::Web)?;
+        for builtin_key in RIGHT_RAIL_PLUGIN_DEPRECATED_WEB_BUILTIN_KEYS {
+            conn.execute(
+                "
+                UPDATE right_rail_plugins
+                SET status = ?2, deleted_at_ms = COALESCE(deleted_at_ms, ?3), updated_at_ms = ?3
+                WHERE builtin_key = ?1 AND kind = ?4 AND deleted_at_ms IS NULL
+                ",
+                params![builtin_key, deleted, now, web],
+            )
+            .map_err(storage_err(
+                "right_rail_plugin_deprecated_seed_retire_failed",
+                "failed to retire deprecated right rail plugin preset",
+            ))?;
+        }
+        Ok(())
+    }
+
+    fn upgrade_untouched_web_builtin_seeds_to_mobile(conn: &Connection) -> VibexResult<()> {
+        let now = unix_timestamp_ms();
+        let web = enum_to_db(&RightRailPluginKind::Web)?;
+        let desktop = enum_to_db(&RightRailWebPluginUaMode::Desktop)?;
+        let mobile = enum_to_db(&RightRailWebPluginUaMode::Mobile)?;
+        for seed in RIGHT_RAIL_PLUGIN_WEB_SEEDS {
+            if let Some(builtin_key) = seed.builtin_key {
+                conn.execute(
+                    "
+                    UPDATE right_rail_plugins
+                    SET ua_mode = ?2, updated_at_ms = ?3
+                    WHERE builtin_key = ?1
+                        AND kind = ?4
+                        AND deleted_at_ms IS NULL
+                        AND ua_mode = ?5
+                        AND created_at_ms = updated_at_ms
+                    ",
+                    params![builtin_key, mobile, now, web, desktop],
+                )
+                .map_err(storage_err(
+                    "right_rail_plugin_seed_ua_mode_upgrade_failed",
+                    "failed to upgrade right rail plugin preset user agent mode",
+                ))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn get_required(conn: &Connection, id: &RightRailPluginId) -> VibexResult<RightRailPlugin> {
+        conn.query_row(
+            "
+            SELECT plugin_id, kind, system_key, builtin_key, display_name, url, logo,
+                desktop_user_agent, mobile_user_agent, ua_mode, status, order_index,
+                data_directory, created_at_ms, updated_at_ms, deleted_at_ms
+            FROM right_rail_plugins
+            WHERE plugin_id = ?1
+            ",
+            params![id.as_str()],
+            map_right_rail_plugin,
+        )
+        .optional()
+        .map_err(storage_err(
+            "right_rail_plugin_lookup_failed",
+            "failed to lookup right rail plugin",
+        ))?
+        .ok_or_else(|| {
+            VibexError::validation(
+                "right_rail_plugin_not_found",
+                "right rail plugin was not found",
+            )
+            .with_diagnostic("pluginId", id.as_str())
+        })
+    }
+}
+
+impl GitSnapshotRepository {
+    pub fn upsert(
+        conn: &Connection,
+        workspace_id: &WorkspaceId,
+        branch: Option<&str>,
+        short_commit: Option<&str>,
+        dirty: bool,
+        changed_files: u32,
+        captured_at_ms: i64,
+    ) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO git_snapshots (
+                workspace_id, branch, short_commit, dirty, changed_files, captured_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(workspace_id) DO UPDATE SET
+                branch = excluded.branch,
+                short_commit = excluded.short_commit,
+                dirty = excluded.dirty,
+                changed_files = excluded.changed_files,
+                captured_at_ms = excluded.captured_at_ms
+            ",
+            params![
+                workspace_id.as_str(),
+                branch,
+                short_commit,
+                dirty,
+                changed_files,
+                captured_at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "git_snapshot_upsert_failed",
+            "failed to upsert Git snapshot",
+        ))?;
+        Ok(())
+    }
+}
+
+impl ManagedWorktreeRepository {
+    pub fn insert(conn: &Connection, record: &ManagedWorktreeRecord) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO git_managed_worktrees (
+                worktree_id, project_id, workspace_id, repo_root, worktree_path,
+                branch, base_ref, head, status, created_at_ms, updated_at_ms, closed_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ",
+            params![
+                record.worktree_id.as_str(),
+                record.project_id.as_str(),
+                record.workspace_id.as_ref().map(WorkspaceId::as_str),
+                record.repo_root,
+                record.worktree_path,
+                record.branch,
+                record.base_ref,
+                record.head,
+                enum_to_db(&record.status)?,
+                record.created_at_ms,
+                record.updated_at_ms,
+                record.closed_at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "managed_worktree_insert_failed",
+            "failed to insert managed worktree",
+        ))?;
+        Ok(())
+    }
+
+    pub fn upsert(conn: &Connection, record: &ManagedWorktreeRecord) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO git_managed_worktrees (
+                worktree_id, project_id, workspace_id, repo_root, worktree_path,
+                branch, base_ref, head, status, created_at_ms, updated_at_ms, closed_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ON CONFLICT(worktree_path) DO UPDATE SET
+                workspace_id = excluded.workspace_id,
+                branch = excluded.branch,
+                base_ref = excluded.base_ref,
+                head = excluded.head,
+                status = excluded.status,
+                updated_at_ms = excluded.updated_at_ms,
+                closed_at_ms = excluded.closed_at_ms
+            ",
+            params![
+                record.worktree_id.as_str(),
+                record.project_id.as_str(),
+                record.workspace_id.as_ref().map(WorkspaceId::as_str),
+                record.repo_root,
+                record.worktree_path,
+                record.branch,
+                record.base_ref,
+                record.head,
+                enum_to_db(&record.status)?,
+                record.created_at_ms,
+                record.updated_at_ms,
+                record.closed_at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "managed_worktree_upsert_failed",
+            "failed to upsert managed worktree",
+        ))?;
+        Ok(())
+    }
+
+    pub fn attach_workspace(
+        conn: &Connection,
+        worktree_path: &str,
+        workspace_id: &WorkspaceId,
+    ) -> VibexResult<()> {
+        conn.execute(
+            "
+            UPDATE git_managed_worktrees
+            SET workspace_id = ?2, updated_at_ms = ?3
+            WHERE worktree_path = ?1
+            ",
+            params![worktree_path, workspace_id.as_str(), unix_timestamp_ms()],
+        )
+        .map_err(storage_err(
+            "managed_worktree_attach_failed",
+            "failed to attach worktree workspace",
+        ))?;
+        Ok(())
+    }
+
+    pub fn update_status(
+        conn: &Connection,
+        worktree_path: &str,
+        status: GitManagedWorktreeStatus,
+        head: Option<&str>,
+        closed_at_ms: Option<i64>,
+    ) -> VibexResult<()> {
+        conn.execute(
+            "
+            UPDATE git_managed_worktrees
+            SET status = ?2, head = COALESCE(?3, head), updated_at_ms = ?4, closed_at_ms = ?5
+            WHERE worktree_path = ?1
+            ",
+            params![
+                worktree_path,
+                enum_to_db(&status)?,
+                head,
+                unix_timestamp_ms(),
+                closed_at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "managed_worktree_status_update_failed",
+            "failed to update managed worktree status",
+        ))?;
+        Ok(())
+    }
+
+    pub fn get_by_path(
+        conn: &Connection,
+        worktree_path: &str,
+    ) -> VibexResult<Option<ManagedWorktreeRecord>> {
+        conn.query_row(
+            "
+            SELECT worktree_id, project_id, workspace_id, repo_root, worktree_path,
+                branch, base_ref, head, status, created_at_ms, updated_at_ms, closed_at_ms
+            FROM git_managed_worktrees
+            WHERE worktree_path = ?1
+            ",
+            params![worktree_path],
+            map_managed_worktree,
+        )
+        .optional()
+        .map_err(storage_err(
+            "managed_worktree_lookup_failed",
+            "failed to lookup managed worktree",
+        ))
+    }
+
+    pub fn list_for_project(
+        conn: &Connection,
+        project_id: &ProjectId,
+    ) -> VibexResult<Vec<ManagedWorktreeRecord>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT worktree_id, project_id, workspace_id, repo_root, worktree_path,
+                    branch, base_ref, head, status, created_at_ms, updated_at_ms, closed_at_ms
+                FROM git_managed_worktrees
+                WHERE project_id = ?1
+                ORDER BY updated_at_ms DESC
+                ",
+            )
+            .map_err(storage_err(
+                "managed_worktree_list_failed",
+                "failed to list managed worktrees",
+            ))?;
+        let rows = stmt
+            .query_map(params![project_id.as_str()], map_managed_worktree)
+            .map_err(storage_err(
+                "managed_worktree_list_failed",
+                "failed to list managed worktrees",
+            ))?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(storage_err(
+                "managed_worktree_decode_failed",
+                "failed to decode managed worktree",
+            ))?);
+        }
+        Ok(records)
+    }
+}
+
+impl WorktreeOperationRepository {
+    pub fn insert(conn: &Connection, record: &GitWorktreeOperationRecord) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO git_worktree_operations (
+                operation_id, project_id, source_workspace_id, target_workspace_id,
+                operation, status, worktree_path, branch, base_ref, head_before,
+                head_after, error, created_at_ms, updated_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            ",
+            params![
+                record.operation_id.as_str(),
+                record.project_id.as_str(),
+                record.source_workspace_id.as_ref().map(WorkspaceId::as_str),
+                record.target_workspace_id.as_ref().map(WorkspaceId::as_str),
+                enum_to_db(&record.operation)?,
+                enum_to_db(&record.status)?,
+                record.worktree_path,
+                record.branch,
+                record.base_ref,
+                record.head_before,
+                record.head_after,
+                record.error,
+                record.created_at_ms,
+                record.updated_at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "worktree_operation_insert_failed",
+            "failed to insert worktree operation",
+        ))?;
+        Ok(())
+    }
+
+    pub fn update(
+        conn: &Connection,
+        operation_id: &RequestId,
+        status: GitWorktreeOperationStatus,
+        head_after: Option<&str>,
+        error: Option<&str>,
+    ) -> VibexResult<GitWorktreeOperationRecord> {
+        conn.execute(
+            "
+            UPDATE git_worktree_operations
+            SET status = ?2, head_after = COALESCE(?3, head_after), error = ?4, updated_at_ms = ?5
+            WHERE operation_id = ?1
+            ",
+            params![
+                operation_id.as_str(),
+                enum_to_db(&status)?,
+                head_after,
+                error,
+                unix_timestamp_ms()
+            ],
+        )
+        .map_err(storage_err(
+            "worktree_operation_update_failed",
+            "failed to update worktree operation",
+        ))?;
+        Self::get(conn, operation_id)?.ok_or_else(|| {
+            VibexError::storage(
+                "worktree_operation_missing_after_update",
+                "worktree operation was not found after update",
+            )
+        })
+    }
+
+    pub fn get(
+        conn: &Connection,
+        operation_id: &RequestId,
+    ) -> VibexResult<Option<GitWorktreeOperationRecord>> {
+        conn.query_row(
+            "
+            SELECT operation_id, project_id, source_workspace_id, target_workspace_id,
+                operation, status, worktree_path, branch, base_ref, head_before,
+                head_after, error, created_at_ms, updated_at_ms
+            FROM git_worktree_operations
+            WHERE operation_id = ?1
+            ",
+            params![operation_id.as_str()],
+            map_worktree_operation,
+        )
+        .optional()
+        .map_err(storage_err(
+            "worktree_operation_lookup_failed",
+            "failed to lookup worktree operation",
+        ))
+    }
+}
+
+impl RemoteDeviceRepository {
+    pub fn upsert(conn: &Connection, record: &RemoteDeviceRecord) -> VibexResult<()> {
+        let detail = &record.detail;
+        conn.execute(
+            "
+            INSERT INTO remote_devices (
+                device_id, display_name, public_key, auth_secret_hash, grant_revision,
+                permission_level, status, paired_at_ms, last_seen_at_ms, revoked_at_ms,
+                created_at_ms, updated_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ON CONFLICT(device_id) DO UPDATE SET
+                display_name = excluded.display_name,
+                public_key = excluded.public_key,
+                auth_secret_hash = excluded.auth_secret_hash,
+                grant_revision = excluded.grant_revision,
+                permission_level = excluded.permission_level,
+                status = excluded.status,
+                paired_at_ms = excluded.paired_at_ms,
+                last_seen_at_ms = excluded.last_seen_at_ms,
+                revoked_at_ms = excluded.revoked_at_ms,
+                updated_at_ms = excluded.updated_at_ms
+            ",
+            params![
+                detail.device_id.as_str(),
+                detail.display_name,
+                detail.public_key,
+                record.auth_secret_hash,
+                detail.grant_revision,
+                enum_to_db(&detail.permission_level)?,
+                enum_to_db(&detail.status)?,
+                detail.paired_at_ms,
+                detail.last_seen_at_ms,
+                detail.revoked_at_ms,
+                detail.created_at_ms,
+                detail.updated_at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "remote_device_upsert_failed",
+            "failed to upsert remote device",
+        ))?;
+        Ok(())
+    }
+
+    pub fn get(conn: &Connection, device_id: &DeviceId) -> VibexResult<Option<RemoteDeviceRecord>> {
+        conn.query_row(
+            "
+            SELECT device_id, display_name, public_key, auth_secret_hash, grant_revision,
+                permission_level, status, paired_at_ms, last_seen_at_ms,
+                revoked_at_ms, created_at_ms, updated_at_ms
+            FROM remote_devices
+            WHERE device_id = ?1
+            ",
+            params![device_id.as_str()],
+            map_remote_device_record,
+        )
+        .optional()
+        .map_err(storage_err(
+            "remote_device_lookup_failed",
+            "failed to lookup remote device",
+        ))
+    }
+
+    pub fn list(conn: &Connection) -> VibexResult<Vec<RemoteDeviceRecord>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT device_id, display_name, public_key, auth_secret_hash, grant_revision,
+                    permission_level, status, paired_at_ms, last_seen_at_ms,
+                    revoked_at_ms, created_at_ms, updated_at_ms
+                FROM remote_devices
+                ORDER BY updated_at_ms DESC
+                ",
+            )
+            .map_err(storage_err(
+                "remote_device_list_failed",
+                "failed to list remote devices",
+            ))?;
+        let rows = stmt
+            .query_map([], map_remote_device_record)
+            .map_err(storage_err(
+                "remote_device_list_failed",
+                "failed to list remote devices",
+            ))?;
+        collect_rows(
+            rows,
+            "remote_device_decode_failed",
+            "failed to decode remote device row",
+        )
+    }
+
+    pub fn update_last_seen(conn: &Connection, device_id: &DeviceId, now: i64) -> VibexResult<()> {
+        conn.execute(
+            "
+            UPDATE remote_devices
+            SET last_seen_at_ms = ?2, updated_at_ms = ?2
+            WHERE device_id = ?1
+            ",
+            params![device_id.as_str(), now],
+        )
+        .map_err(storage_err(
+            "remote_device_last_seen_failed",
+            "failed to update remote device last seen",
+        ))?;
+        Ok(())
+    }
+
+    pub fn revoke(
+        conn: &Connection,
+        device_id: &DeviceId,
+        revoked_at_ms: i64,
+    ) -> VibexResult<RemoteDeviceRecord> {
+        conn.execute(
+            "
+            UPDATE remote_devices
+            SET status = ?2, revoked_at_ms = ?3, updated_at_ms = ?3
+            WHERE device_id = ?1
+            ",
+            params![
+                device_id.as_str(),
+                enum_to_db(&RemoteDeviceStatus::Revoked)?,
+                revoked_at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "remote_device_revoke_failed",
+            "failed to revoke remote device",
+        ))?;
+        Self::get(conn, device_id)?.ok_or_else(|| {
+            VibexError::storage(
+                "remote_device_missing_after_revoke",
+                "remote device was not found after revoke",
+            )
+        })
+    }
+}
+
+impl RemotePairingCodeRepository {
+    pub fn insert(conn: &Connection, record: &RemotePairingCodeRecord) -> VibexResult<()> {
+        let pairing = &record.pairing;
+        conn.execute(
+            "
+            INSERT INTO remote_pairing_codes (
+                pairing_id, code_hash, permission_level, expires_at_ms,
+                claimed_device_id, created_at_ms, claimed_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ",
+            params![
+                pairing.pairing_id.as_str(),
+                record.code_hash,
+                enum_to_db(&pairing.permission_level)?,
+                pairing.expires_at_ms,
+                pairing.claimed_device_id.as_ref().map(DeviceId::as_str),
+                pairing.created_at_ms,
+                pairing.claimed_at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "remote_pairing_insert_failed",
+            "failed to insert remote pairing code",
+        ))?;
+        Ok(())
+    }
+
+    pub fn get_by_hash(
+        conn: &Connection,
+        code_hash: &str,
+    ) -> VibexResult<Option<RemotePairingCodeRecord>> {
+        conn.query_row(
+            "
+            SELECT pairing_id, code_hash, permission_level, expires_at_ms,
+                claimed_device_id, created_at_ms, claimed_at_ms
+            FROM remote_pairing_codes
+            WHERE code_hash = ?1
+            ",
+            params![code_hash],
+            map_remote_pairing_code_record,
+        )
+        .optional()
+        .map_err(storage_err(
+            "remote_pairing_lookup_failed",
+            "failed to lookup remote pairing code",
+        ))
+    }
+
+    pub fn mark_claimed(
+        conn: &Connection,
+        pairing_id: &RequestId,
+        device_id: &DeviceId,
+        claimed_at_ms: i64,
+    ) -> VibexResult<RemotePairingCodeRecord> {
+        let changed = conn
+            .execute(
+                "
+            UPDATE remote_pairing_codes
+            SET claimed_device_id = ?2, claimed_at_ms = ?3
+            WHERE pairing_id = ?1 AND claimed_at_ms IS NULL
+            ",
+                params![pairing_id.as_str(), device_id.as_str(), claimed_at_ms],
+            )
+            .map_err(storage_err(
+                "remote_pairing_claim_failed",
+                "failed to mark remote pairing code claimed",
+            ))?;
+        if changed != 1 {
+            return Err(VibexError::conflict(
+                "remote_pairing_claim_conflict",
+                "remote pairing code was already claimed",
+            ));
+        }
+        Self::get_by_id(conn, pairing_id)?.ok_or_else(|| {
+            VibexError::storage(
+                "remote_pairing_missing_after_claim",
+                "remote pairing code was not found after claim",
+            )
+        })
+    }
+
+    pub fn get_by_id(
+        conn: &Connection,
+        pairing_id: &RequestId,
+    ) -> VibexResult<Option<RemotePairingCodeRecord>> {
+        conn.query_row(
+            "
+            SELECT pairing_id, code_hash, permission_level, expires_at_ms,
+                claimed_device_id, created_at_ms, claimed_at_ms
+            FROM remote_pairing_codes
+            WHERE pairing_id = ?1
+            ",
+            params![pairing_id.as_str()],
+            map_remote_pairing_code_record,
+        )
+        .optional()
+        .map_err(storage_err(
+            "remote_pairing_lookup_failed",
+            "failed to lookup remote pairing code",
+        ))
+    }
+}
+
+impl RemoteAuditRepository {
+    pub fn insert(conn: &Connection, record: &RemoteAuditRecord) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO remote_audit_logs (
+                audit_id, device_id, action, target_kind, target_id, outcome,
+                redacted_summary, request_id, correlation_id, created_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ",
+            params![
+                record.audit_id.as_str(),
+                record.device_id.as_ref().map(DeviceId::as_str),
+                enum_to_db(&record.action)?,
+                enum_to_db(&record.target_kind)?,
+                record.target_id,
+                enum_to_db(&record.outcome)?,
+                record.redacted_summary,
+                record.request_id.as_ref().map(RequestId::as_str),
+                record.correlation_id.as_ref().map(CorrelationId::as_str),
+                record.created_at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "remote_audit_insert_failed",
+            "failed to insert remote audit record",
+        ))?;
+        Ok(())
+    }
+
+    pub fn list(
+        conn: &Connection,
+        request: &RemoteAuditListRequest,
+    ) -> VibexResult<Vec<RemoteAuditRecord>> {
+        let limit = request.limit.unwrap_or(100).clamp(1, 500);
+        if let Some(device_id) = &request.device_id {
+            let mut stmt = conn
+                .prepare(
+                    "
+                    SELECT audit_id, device_id, action, target_kind, target_id, outcome,
+                        redacted_summary, request_id, correlation_id, created_at_ms
+                    FROM remote_audit_logs
+                    WHERE device_id = ?1
+                    ORDER BY created_at_ms DESC
+                    LIMIT ?2
+                    ",
+                )
+                .map_err(storage_err(
+                    "remote_audit_list_failed",
+                    "failed to list remote audit records",
+                ))?;
+            let rows = stmt
+                .query_map(params![device_id.as_str(), limit], map_remote_audit_record)
+                .map_err(storage_err(
+                    "remote_audit_list_failed",
+                    "failed to list remote audit records",
+                ))?;
+            return collect_rows(
+                rows,
+                "remote_audit_decode_failed",
+                "failed to decode remote audit record",
+            );
+        }
+
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT audit_id, device_id, action, target_kind, target_id, outcome,
+                    redacted_summary, request_id, correlation_id, created_at_ms
+                FROM remote_audit_logs
+                ORDER BY created_at_ms DESC
+                LIMIT ?1
+                ",
+            )
+            .map_err(storage_err(
+                "remote_audit_list_failed",
+                "failed to list remote audit records",
+            ))?;
+        let rows = stmt
+            .query_map(params![limit], map_remote_audit_record)
+            .map_err(storage_err(
+                "remote_audit_list_failed",
+                "failed to list remote audit records",
+            ))?;
+        collect_rows(
+            rows,
+            "remote_audit_decode_failed",
+            "failed to decode remote audit record",
+        )
+    }
+}
+
+pub fn default_database_path() -> VibexResult<PathBuf> {
+    if let Ok(value) = std::env::var("VIBEX_DB_PATH") {
+        let path = PathBuf::from(value);
+        ensure_safe_database_path(&path)?;
+        return Ok(path);
+    }
+
+    let home = dirs::home_dir().ok_or_else(|| {
+        VibexError::storage(
+            "home_dir_unavailable",
+            "could not resolve user home directory",
+        )
+    })?;
+    Ok(home.join(".vibex").join("vibex.db"))
+}
+
+pub fn stage0_smoke_database_path() -> VibexResult<PathBuf> {
+    if let Ok(value) = std::env::var("VIBEX_DB_PATH") {
+        let path = PathBuf::from(value);
+        ensure_safe_database_path(&path)?;
+        return Ok(path);
+    }
+
+    Ok(PathBuf::from("target")
+        .join("stage0")
+        .join("vibex-smoke.db"))
+}
+
+pub fn open_database(path: &Path) -> VibexResult<Connection> {
+    ensure_safe_database_path(path)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            VibexError::storage(
+                "db_directory_create_failed",
+                "failed to create database directory",
+            )
+            .with_diagnostic("path", parent.display().to_string())
+            .with_diagnostic("error", err.to_string())
+        })?;
+    }
+
+    let conn = Connection::open(path).map_err(|err| {
+        VibexError::storage("db_open_failed", "failed to open SQLite database")
+            .with_diagnostic("path", path.display().to_string())
+            .with_diagnostic("error", err.to_string())
+    })?;
+    conn.busy_timeout(SQLITE_BUSY_TIMEOUT).map_err(storage_err(
+        "db_pragma_failed",
+        "failed to configure SQLite busy timeout",
+    ))?;
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(storage_err(
+            "db_pragma_failed",
+            "failed to enable SQLite WAL mode",
+        ))?;
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(storage_err(
+            "db_pragma_failed",
+            "failed to enable SQLite foreign keys",
+        ))?;
+    Ok(conn)
+}
+
+pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at_ms INTEGER NOT NULL
+        );
+        ",
+    )
+    .map_err(storage_err(
+        "migration_table_failed",
+        "failed to initialize migrations table",
+    ))?;
+
+    let mut applied = Vec::new();
+    for migration in MIGRATIONS {
+        let already_applied = migration_applied(conn, migration.version)?;
+        if already_applied {
+            continue;
+        }
+
+        let tx = conn.transaction().map_err(storage_err(
+            "migration_transaction_failed",
+            "failed to start migration transaction",
+        ))?;
+        tx.execute_batch(migration.sql).map_err(storage_err(
+            "migration_apply_failed",
+            "failed to apply migration",
+        ))?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+            params![migration.version, migration.name, unix_timestamp_ms()],
+        )
+        .map_err(storage_err(
+            "migration_record_failed",
+            "failed to record migration",
+        ))?;
+        tx.commit().map_err(storage_err(
+            "migration_commit_failed",
+            "failed to commit migration",
+        ))?;
+        applied.push(format!("{}:{}", migration.version, migration.name));
+    }
+
+    Ok(applied)
+}
+
+pub fn current_schema_version(conn: &Connection) -> VibexResult<i64> {
+    let version = conn
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(storage_err(
+            "schema_version_read_failed",
+            "failed to read schema version",
+        ))?;
+    Ok(version)
+}
+
+pub fn run_smoke(path: &Path) -> VibexResult<DatabaseSmokeResult> {
+    let mut conn = open_database(path)?;
+    let applied_migrations = apply_migrations(&mut conn)?;
+    let marker = format!("vibex-db-smoke-{}", unix_timestamp_ms());
+
+    conn.execute(
+        "
+        INSERT INTO foundation_smoke (id, marker, last_seen_at_ms)
+        VALUES (1, ?1, ?2)
+        ON CONFLICT(id) DO UPDATE SET
+            marker = excluded.marker,
+            last_seen_at_ms = excluded.last_seen_at_ms
+        ",
+        params![marker, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "sentinel_write_failed",
+        "failed to write Stage 0 sentinel row",
+    ))?;
+
+    let read_back: String = conn
+        .query_row(
+            "SELECT marker FROM foundation_smoke WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(storage_err(
+            "sentinel_read_failed",
+            "failed to read Stage 0 sentinel row",
+        ))?;
+
+    if read_back != marker {
+        return Err(VibexError::storage(
+            "sentinel_mismatch",
+            "database smoke marker did not round-trip",
+        ));
+    }
+
+    Ok(DatabaseSmokeResult {
+        database_path: path.to_path_buf(),
+        schema_version: current_schema_version(&conn)?,
+        applied_migrations,
+        marker,
+    })
+}
+
+fn append_timeline_in_transaction(
+    tx: &Transaction<'_>,
+    session_id: &VibexSessionId,
+    source: TimelineSource,
+    payload: TimelinePayload,
+    timestamp_ms: Option<i64>,
+    correlation_id: Option<&vibex_core::CorrelationId>,
+    provider_correlation_id: Option<&str>,
+    redaction_state: TimelineRedactionState,
+    execution_attribution: Option<&TurnExecutionAttribution>,
+) -> VibexResult<TimelineItem> {
+    let sequence = tx
+        .query_row(
+            "
+            SELECT COALESCE(MAX(sequence), 0) + 1
+            FROM agent_timeline_items
+            WHERE session_id = ?1
+            ",
+            params![session_id.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(storage_err(
+            "timeline_sequence_failed",
+            "failed to allocate timeline sequence",
+        ))?;
+    let timestamp_ms = timestamp_ms.unwrap_or_else(unix_timestamp_ms);
+    let item = TimelineItem {
+        id: TimelineItemId::new(),
+        session_id: session_id.clone(),
+        sequence,
+        timestamp_ms,
+        source,
+        kind: payload.kind(),
+        correlation_id: correlation_id.cloned(),
+        provider_correlation_id: provider_correlation_id.map(ToOwned::to_owned),
+        redaction_state,
+        execution_attribution: execution_attribution.map(TurnExecutionAttribution::view),
+        payload,
+    };
+
+    tx.execute(
+        "
+        INSERT INTO agent_timeline_items (
+            session_id, sequence, timeline_item_id, kind, source, timestamp_ms,
+            correlation_id, provider_correlation_id, payload_json, redaction_state,
+            created_at_ms, execution_attribution_json
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        ",
+        params![
+            item.session_id.as_str(),
+            item.sequence,
+            item.id.as_str(),
+            enum_to_db(&item.kind)?,
+            enum_to_db(&item.source)?,
+            item.timestamp_ms,
+            item.correlation_id.as_ref().map(|value| value.as_str()),
+            item.provider_correlation_id,
+            json_to_db(&item.payload)?,
+            enum_to_db(&item.redaction_state)?,
+            unix_timestamp_ms(),
+            execution_attribution.map(json_to_db).transpose()?
+        ],
+    )
+    .map_err(|err| {
+        VibexError::storage("timeline_insert_failed", "failed to insert timeline item")
+            .with_diagnostic("error", err.to_string())
+            .with_diagnostic("sessionId", session_id.as_str())
+            .with_diagnostic("sequence", sequence.to_string())
+            .with_diagnostic("kind", format!("{:?}", item.kind))
+            .with_diagnostic("source", format!("{:?}", item.source))
+    })?;
+
+    Ok(item)
+}
+
+fn migration_applied(conn: &Connection, version: i64) -> VibexResult<bool> {
+    let value = conn
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            params![version],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(storage_err(
+            "migration_lookup_failed",
+            "failed to inspect migration state",
+        ))?;
+    Ok(value.is_some())
+}
+
+fn ensure_safe_database_path(path: &Path) -> VibexResult<()> {
+    if path.as_os_str().is_empty() {
+        return Err(VibexError::validation(
+            "empty_database_path",
+            "database path must not be empty",
+        ));
+    }
+
+    if path.file_name().is_none() {
+        return Err(VibexError::validation(
+            "database_path_without_file",
+            "database path must include a file name",
+        ));
+    }
+
+    Ok(())
+}
+
+fn normalize_path(path: &Path) -> String {
+    path.to_string_lossy().to_string()
+}
+
+fn normalize_optional_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn validate_plugin_name(value: String) -> VibexResult<String> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Err(VibexError::validation(
+            "right_rail_plugin_name_required",
+            "right rail plugin name is required",
+        ));
+    }
+    if value.len() > 80 {
+        return Err(VibexError::validation(
+            "right_rail_plugin_name_too_long",
+            "right rail plugin name must be 80 characters or fewer",
+        ));
+    }
+    Ok(value)
+}
+
+fn validate_web_plugin_url(value: String) -> VibexResult<String> {
+    let value = value.trim().to_string();
+    if !(value.starts_with("https://") || value.starts_with("http://")) {
+        return Err(VibexError::validation(
+            "right_rail_plugin_url_invalid",
+            "right rail web plugin URL must start with http:// or https://",
+        ));
+    }
+    Ok(value)
+}
+
+fn storage_err(
+    code: &'static str,
+    message: &'static str,
+) -> impl Fn(rusqlite::Error) -> VibexError {
+    move |err| VibexError::storage(code, message).with_diagnostic("error", err.to_string())
+}
+
+fn json_to_db<T: Serialize + ?Sized>(value: &T) -> VibexResult<String> {
+    serde_json::to_string(value).map_err(|err| {
+        VibexError::storage("json_encode_failed", "failed to encode JSON payload")
+            .with_diagnostic("error", err.to_string())
+    })
+}
+
+fn json_from_db<T: DeserializeOwned>(value: String) -> VibexResult<T> {
+    serde_json::from_str(&value).map_err(|err| {
+        VibexError::storage("json_decode_failed", "failed to decode JSON payload")
+            .with_diagnostic("error", err.to_string())
+    })
+}
+
+fn enum_to_db<T: Serialize>(value: &T) -> VibexResult<String> {
+    match serde_json::to_value(value).map_err(|err| {
+        VibexError::storage("enum_encode_failed", "failed to encode enum value")
+            .with_diagnostic("error", err.to_string())
+    })? {
+        serde_json::Value::String(value) => Ok(value),
+        other => Err(VibexError::storage(
+            "enum_encode_failed",
+            "expected enum to serialize as string",
+        )
+        .with_diagnostic("value", other.to_string())),
+    }
+}
+
+fn enum_from_db<T: DeserializeOwned>(value: String) -> VibexResult<T> {
+    serde_json::from_value(serde_json::Value::String(value)).map_err(|err| {
+        VibexError::storage("enum_decode_failed", "failed to decode enum value")
+            .with_diagnostic("error", err.to_string())
+    })
+}
+
+fn parse_id<T>(value: String, parser: impl FnOnce(String) -> VibexResult<T>) -> VibexResult<T> {
+    parser(value).map_err(|err| {
+        VibexError::storage("id_decode_failed", "failed to decode stored id")
+            .with_diagnostic("error", err.to_string())
+    })
+}
+
+fn sql_decode<T>(value: VibexResult<T>) -> rusqlite::Result<T> {
+    value.map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+    })
+}
+
+fn parse_id_sql<T>(
+    value: String,
+    parser: impl FnOnce(String) -> VibexResult<T>,
+) -> rusqlite::Result<T> {
+    sql_decode(parse_id(value, parser))
+}
+
+fn parse_optional_id_sql<T>(
+    value: Option<String>,
+    parser: impl Fn(String) -> VibexResult<T>,
+) -> rusqlite::Result<Option<T>> {
+    value.map(parser).transpose().map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+    })
+}
+
+fn enum_from_db_sql<T: DeserializeOwned>(value: String) -> rusqlite::Result<T> {
+    sql_decode(enum_from_db(value))
+}
+
+fn optional_enum_from_db_sql<T: DeserializeOwned>(
+    value: Option<String>,
+) -> rusqlite::Result<Option<T>> {
+    value.map(enum_from_db).transpose().map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+    })
+}
+
+fn json_from_db_sql<T: DeserializeOwned>(value: String) -> rusqlite::Result<T> {
+    sql_decode(json_from_db(value))
+}
+
+fn collect_rows<T>(
+    rows: impl IntoIterator<Item = rusqlite::Result<T>>,
+    code: &'static str,
+    message: &'static str,
+) -> VibexResult<Vec<T>> {
+    let mut output = Vec::new();
+    for row in rows {
+        output.push(row.map_err(storage_err(code, message))?);
+    }
+    Ok(output)
+}
+
+fn bounded_limit(limit: Option<u32>) -> i64 {
+    limit
+        .map(i64::from)
+        .unwrap_or(SCHEDULED_TASK_LIST_DEFAULT_LIMIT)
+        .clamp(1, SCHEDULED_TASK_LIST_MAX_LIMIT)
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn bound_scheduled_task_diagnostics(
+    diagnostics: Vec<RedactedDiagnostic>,
+) -> Vec<RedactedDiagnostic> {
+    diagnostics
+        .into_iter()
+        .map(|diagnostic| RedactedDiagnostic {
+            key: truncate_chars(&diagnostic.key, SCHEDULED_TASK_DIAGNOSTIC_KEY_MAX_CHARS),
+            value: truncate_chars(&diagnostic.value, SCHEDULED_TASK_DIAGNOSTIC_VALUE_MAX_CHARS),
+        })
+        .collect()
+}
+
+fn insert_scheduled_task(conn: &Connection, task: &ScheduledTask) -> VibexResult<()> {
+    conn.execute(
+        "
+        INSERT INTO scheduled_tasks (
+            scheduled_task_id, title, prompt, project_id, workspace_id, workspace_root,
+            workspace_mode, provider_kind, provider_profile_id, schedule_json, status,
+            safety_json, next_run_at_ms, created_at_ms, updated_at_ms, deleted_at_ms
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+        ",
+        params![
+            task.id.as_str(),
+            task.title,
+            task.prompt,
+            task.project_id.as_ref().map(ProjectId::as_str),
+            task.workspace_id.as_ref().map(WorkspaceId::as_str),
+            task.workspace_root,
+            enum_to_db(&task.workspace_mode)?,
+            enum_to_db(&task.provider_kind)?,
+            task.provider_profile_id
+                .as_ref()
+                .map(ProviderProfileId::as_str),
+            json_to_db(&task.schedule)?,
+            enum_to_db(&task.status)?,
+            json_to_db(&task.safety)?,
+            task.next_run_at_ms,
+            task.created_at_ms,
+            task.updated_at_ms,
+            task.deleted_at_ms
+        ],
+    )
+    .map_err(storage_err(
+        "scheduled_task_insert_failed",
+        "failed to insert scheduled task",
+    ))?;
+    Ok(())
+}
+
+fn update_scheduled_task(conn: &Connection, task: &ScheduledTask) -> VibexResult<()> {
+    conn.execute(
+        "
+        UPDATE scheduled_tasks
+        SET title = ?2,
+            prompt = ?3,
+            project_id = ?4,
+            workspace_id = ?5,
+            workspace_root = ?6,
+            workspace_mode = ?7,
+            provider_kind = ?8,
+            provider_profile_id = ?9,
+            schedule_json = ?10,
+            status = ?11,
+            safety_json = ?12,
+            next_run_at_ms = ?13,
+            updated_at_ms = ?14,
+            deleted_at_ms = ?15
+        WHERE scheduled_task_id = ?1
+        ",
+        params![
+            task.id.as_str(),
+            task.title,
+            task.prompt,
+            task.project_id.as_ref().map(ProjectId::as_str),
+            task.workspace_id.as_ref().map(WorkspaceId::as_str),
+            task.workspace_root,
+            enum_to_db(&task.workspace_mode)?,
+            enum_to_db(&task.provider_kind)?,
+            task.provider_profile_id
+                .as_ref()
+                .map(ProviderProfileId::as_str),
+            json_to_db(&task.schedule)?,
+            enum_to_db(&task.status)?,
+            json_to_db(&task.safety)?,
+            task.next_run_at_ms,
+            task.updated_at_ms,
+            task.deleted_at_ms
+        ],
+    )
+    .map_err(storage_err(
+        "scheduled_task_update_failed",
+        "failed to update scheduled task",
+    ))?;
+    Ok(())
+}
+
+fn update_scheduled_task_status(
+    conn: &Connection,
+    task_id: &ScheduledTaskId,
+    status: ScheduledTaskStatus,
+) -> VibexResult<ScheduledTask> {
+    let mut task = require_scheduled_task(conn, task_id, false)?;
+    task.status = status;
+    task.updated_at_ms = unix_timestamp_ms();
+    update_scheduled_task(conn, &task)?;
+    Ok(task)
+}
+
+fn get_scheduled_task(
+    conn: &Connection,
+    task_id: &ScheduledTaskId,
+    include_deleted: bool,
+) -> VibexResult<Option<ScheduledTask>> {
+    conn.query_row(
+        "
+        SELECT scheduled_task_id, title, prompt, project_id, workspace_id,
+            workspace_root, workspace_mode, provider_kind, provider_profile_id,
+            schedule_json, status, safety_json, next_run_at_ms, created_at_ms,
+            updated_at_ms, deleted_at_ms
+        FROM scheduled_tasks
+        WHERE scheduled_task_id = ?1
+            AND (?2 = 1 OR deleted_at_ms IS NULL)
+        ",
+        params![
+            task_id.as_str(),
+            if include_deleted { 1_i64 } else { 0_i64 }
+        ],
+        map_scheduled_task,
+    )
+    .optional()
+    .map_err(storage_err(
+        "scheduled_task_lookup_failed",
+        "failed to lookup scheduled task",
+    ))
+}
+
+fn require_scheduled_task(
+    conn: &Connection,
+    task_id: &ScheduledTaskId,
+    include_deleted: bool,
+) -> VibexResult<ScheduledTask> {
+    get_scheduled_task(conn, task_id, include_deleted)?.ok_or_else(|| {
+        VibexError::storage("scheduled_task_not_found", "scheduled task was not found")
+            .with_diagnostic("scheduledTaskId", task_id.as_str())
+    })
+}
+
+fn insert_scheduled_task_run(conn: &Connection, run: &ScheduledTaskRun) -> VibexResult<()> {
+    conn.execute(
+        "
+        INSERT INTO scheduled_task_runs (
+            scheduled_task_run_id, scheduled_task_id, status, trigger, session_id,
+            due_at_ms, started_at_ms, ended_at_ms, attempt, error_code, error_message,
+            redacted_diagnostics_json, created_at_ms, updated_at_ms
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        ",
+        params![
+            run.id.as_str(),
+            run.task_id.as_str(),
+            enum_to_db(&run.status)?,
+            enum_to_db(&run.trigger)?,
+            run.session_id.as_ref().map(VibexSessionId::as_str),
+            run.due_at_ms,
+            run.started_at_ms,
+            run.ended_at_ms,
+            i64::from(run.attempt),
+            run.error_code,
+            run.error_message,
+            json_to_db(&run.redacted_diagnostics)?,
+            run.created_at_ms,
+            run.updated_at_ms
+        ],
+    )
+    .map_err(storage_err(
+        "scheduled_task_run_insert_failed",
+        "failed to insert scheduled task run",
+    ))?;
+    Ok(())
+}
+
+fn update_scheduled_task_run(conn: &Connection, run: &ScheduledTaskRun) -> VibexResult<()> {
+    conn.execute(
+        "
+        UPDATE scheduled_task_runs
+        SET status = ?2,
+            session_id = ?3,
+            started_at_ms = ?4,
+            ended_at_ms = ?5,
+            attempt = ?6,
+            error_code = ?7,
+            error_message = ?8,
+            redacted_diagnostics_json = ?9,
+            updated_at_ms = ?10
+        WHERE scheduled_task_run_id = ?1
+        ",
+        params![
+            run.id.as_str(),
+            enum_to_db(&run.status)?,
+            run.session_id.as_ref().map(VibexSessionId::as_str),
+            run.started_at_ms,
+            run.ended_at_ms,
+            i64::from(run.attempt),
+            run.error_code,
+            run.error_message,
+            json_to_db(&run.redacted_diagnostics)?,
+            run.updated_at_ms
+        ],
+    )
+    .map_err(storage_err(
+        "scheduled_task_run_update_failed",
+        "failed to update scheduled task run",
+    ))?;
+    Ok(())
+}
+
+fn get_scheduled_task_run(
+    conn: &Connection,
+    run_id: &ScheduledTaskRunId,
+) -> VibexResult<Option<ScheduledTaskRun>> {
+    conn.query_row(
+        "
+        SELECT scheduled_task_run_id, scheduled_task_id, status, trigger,
+            session_id, due_at_ms, started_at_ms, ended_at_ms, attempt,
+            error_code, error_message, redacted_diagnostics_json,
+            created_at_ms, updated_at_ms
+        FROM scheduled_task_runs
+        WHERE scheduled_task_run_id = ?1
+        ",
+        params![run_id.as_str()],
+        map_scheduled_task_run,
+    )
+    .optional()
+    .map_err(storage_err(
+        "scheduled_task_run_lookup_failed",
+        "failed to lookup scheduled task run",
+    ))
+}
+
+fn require_scheduled_task_run(
+    conn: &Connection,
+    run_id: &ScheduledTaskRunId,
+) -> VibexResult<ScheduledTaskRun> {
+    get_scheduled_task_run(conn, run_id)?.ok_or_else(|| {
+        VibexError::storage(
+            "scheduled_task_run_not_found",
+            "scheduled task run was not found",
+        )
+        .with_diagnostic("scheduledTaskRunId", run_id.as_str())
+    })
+}
+
+fn automation_nodes_from_requests(
+    graph_id: &AutomationGraphId,
+    requests: Vec<AutomationNodeCreateRequest>,
+    now: i64,
+) -> Vec<AutomationNode> {
+    requests
+        .into_iter()
+        .map(|request| AutomationNode {
+            id: request.id.unwrap_or_else(AutomationNodeId::new),
+            graph_id: graph_id.clone(),
+            kind: request.kind,
+            title: request.title,
+            config: request.config,
+            position: request.position,
+            created_at_ms: now,
+            updated_at_ms: now,
+        })
+        .collect()
+}
+
+fn automation_edges_from_requests(
+    graph_id: &AutomationGraphId,
+    requests: Vec<AutomationEdgeCreateRequest>,
+    now: i64,
+) -> Vec<AutomationEdge> {
+    requests
+        .into_iter()
+        .map(|request| AutomationEdge {
+            id: AutomationEdgeId::new(),
+            graph_id: graph_id.clone(),
+            source_node_id: request.source_node_id,
+            target_node_id: request.target_node_id,
+            condition: request.condition,
+            created_at_ms: now,
+            updated_at_ms: now,
+        })
+        .collect()
+}
+
+fn validate_automation_edges(
+    nodes: &[AutomationNode],
+    edges: &[AutomationEdge],
+) -> VibexResult<()> {
+    let node_ids = nodes
+        .iter()
+        .map(|node| node.id.clone())
+        .collect::<HashSet<_>>();
+    for edge in edges {
+        if !node_ids.contains(&edge.source_node_id) {
+            return Err(VibexError::validation(
+                "automation_graph_edge_source_missing",
+                "automation graph edge source node is not part of the graph definition",
+            )
+            .with_diagnostic("sourceNodeId", edge.source_node_id.as_str()));
+        }
+        if !node_ids.contains(&edge.target_node_id) {
+            return Err(VibexError::validation(
+                "automation_graph_edge_target_missing",
+                "automation graph edge target node is not part of the graph definition",
+            )
+            .with_diagnostic("targetNodeId", edge.target_node_id.as_str()));
+        }
+    }
+    Ok(())
+}
+
+fn insert_automation_graph(conn: &Connection, graph: &AutomationGraph) -> VibexResult<()> {
+    conn.execute(
+        "
+        INSERT INTO automation_graphs (
+            automation_graph_id, title, description, project_id, workspace_id,
+            workspace_root, workspace_mode, provider_kind, provider_profile_id,
+            trigger_json, status, version, created_at_ms, updated_at_ms, deleted_at_ms
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+        ",
+        params![
+            graph.id.as_str(),
+            graph.title,
+            graph.description,
+            graph.project_id.as_ref().map(ProjectId::as_str),
+            graph.workspace_id.as_ref().map(WorkspaceId::as_str),
+            graph.workspace_root,
+            enum_to_db(&graph.workspace_mode)?,
+            graph.provider_kind.as_ref().map(enum_to_db).transpose()?,
+            graph
+                .provider_profile_id
+                .as_ref()
+                .map(ProviderProfileId::as_str),
+            json_to_db(&graph.trigger)?,
+            enum_to_db(&graph.status)?,
+            i64::from(graph.version),
+            graph.created_at_ms,
+            graph.updated_at_ms,
+            graph.deleted_at_ms
+        ],
+    )
+    .map_err(storage_err(
+        "automation_graph_insert_failed",
+        "failed to insert automation graph",
+    ))?;
+    Ok(())
+}
+
+fn update_automation_graph(conn: &Connection, graph: &AutomationGraph) -> VibexResult<()> {
+    conn.execute(
+        "
+        UPDATE automation_graphs
+        SET title = ?2,
+            description = ?3,
+            project_id = ?4,
+            workspace_id = ?5,
+            workspace_root = ?6,
+            workspace_mode = ?7,
+            provider_kind = ?8,
+            provider_profile_id = ?9,
+            trigger_json = ?10,
+            status = ?11,
+            version = ?12,
+            updated_at_ms = ?13,
+            deleted_at_ms = ?14
+        WHERE automation_graph_id = ?1
+        ",
+        params![
+            graph.id.as_str(),
+            graph.title,
+            graph.description,
+            graph.project_id.as_ref().map(ProjectId::as_str),
+            graph.workspace_id.as_ref().map(WorkspaceId::as_str),
+            graph.workspace_root,
+            enum_to_db(&graph.workspace_mode)?,
+            graph.provider_kind.as_ref().map(enum_to_db).transpose()?,
+            graph
+                .provider_profile_id
+                .as_ref()
+                .map(ProviderProfileId::as_str),
+            json_to_db(&graph.trigger)?,
+            enum_to_db(&graph.status)?,
+            i64::from(graph.version),
+            graph.updated_at_ms,
+            graph.deleted_at_ms
+        ],
+    )
+    .map_err(storage_err(
+        "automation_graph_update_failed",
+        "failed to update automation graph",
+    ))?;
+    Ok(())
+}
+
+fn insert_automation_node(conn: &Connection, node: &AutomationNode) -> VibexResult<()> {
+    conn.execute(
+        "
+        INSERT INTO automation_graph_nodes (
+            automation_node_id, automation_graph_id, kind, title, config_json,
+            position_json, created_at_ms, updated_at_ms
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        ",
+        params![
+            node.id.as_str(),
+            node.graph_id.as_str(),
+            enum_to_db(&node.kind)?,
+            node.title,
+            json_to_db(&node.config)?,
+            node.position.as_ref().map(json_to_db).transpose()?,
+            node.created_at_ms,
+            node.updated_at_ms
+        ],
+    )
+    .map_err(storage_err(
+        "automation_node_insert_failed",
+        "failed to insert automation graph node",
+    ))?;
+    Ok(())
+}
+
+fn insert_automation_edge(conn: &Connection, edge: &AutomationEdge) -> VibexResult<()> {
+    conn.execute(
+        "
+        INSERT INTO automation_graph_edges (
+            automation_edge_id, automation_graph_id, source_node_id, target_node_id,
+            condition_json, created_at_ms, updated_at_ms
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ",
+        params![
+            edge.id.as_str(),
+            edge.graph_id.as_str(),
+            edge.source_node_id.as_str(),
+            edge.target_node_id.as_str(),
+            json_to_db(&edge.condition)?,
+            edge.created_at_ms,
+            edge.updated_at_ms
+        ],
+    )
+    .map_err(storage_err(
+        "automation_edge_insert_failed",
+        "failed to insert automation graph edge",
+    ))?;
+    Ok(())
+}
+
+fn get_automation_graph(
+    conn: &Connection,
+    graph_id: &AutomationGraphId,
+    include_deleted: bool,
+) -> VibexResult<Option<AutomationGraph>> {
+    let mut graph = conn
+        .query_row(
+            "
+            SELECT automation_graph_id, title, description, project_id, workspace_id,
+                workspace_root, workspace_mode, provider_kind, provider_profile_id,
+                trigger_json, status, version, created_at_ms, updated_at_ms, deleted_at_ms
+            FROM automation_graphs
+            WHERE automation_graph_id = ?1
+                AND (?2 = 1 OR deleted_at_ms IS NULL)
+            ",
+            params![
+                graph_id.as_str(),
+                if include_deleted { 1_i64 } else { 0_i64 }
+            ],
+            map_automation_graph,
+        )
+        .optional()
+        .map_err(storage_err(
+            "automation_graph_lookup_failed",
+            "failed to lookup automation graph",
+        ))?;
+    if let Some(graph) = &mut graph {
+        graph.nodes = list_automation_nodes(conn, &graph.id)?;
+        graph.edges = list_automation_edges(conn, &graph.id)?;
+    }
+    Ok(graph)
+}
+
+fn require_automation_graph(
+    conn: &Connection,
+    graph_id: &AutomationGraphId,
+    include_deleted: bool,
+) -> VibexResult<AutomationGraph> {
+    get_automation_graph(conn, graph_id, include_deleted)?.ok_or_else(|| {
+        VibexError::storage(
+            "automation_graph_not_found",
+            "automation graph was not found",
+        )
+        .with_diagnostic("automationGraphId", graph_id.as_str())
+    })
+}
+
+fn list_automation_nodes(
+    conn: &Connection,
+    graph_id: &AutomationGraphId,
+) -> VibexResult<Vec<AutomationNode>> {
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT automation_node_id, automation_graph_id, kind, title, config_json,
+                position_json, created_at_ms, updated_at_ms
+            FROM automation_graph_nodes
+            WHERE automation_graph_id = ?1
+            ORDER BY created_at_ms ASC, automation_node_id ASC
+            ",
+        )
+        .map_err(storage_err(
+            "automation_node_list_failed",
+            "failed to list automation graph nodes",
+        ))?;
+    let rows = stmt
+        .query_map(params![graph_id.as_str()], map_automation_node)
+        .map_err(storage_err(
+            "automation_node_list_failed",
+            "failed to list automation graph nodes",
+        ))?;
+    collect_rows(
+        rows,
+        "automation_node_decode_failed",
+        "failed to decode automation graph node row",
+    )
+}
+
+fn list_automation_edges(
+    conn: &Connection,
+    graph_id: &AutomationGraphId,
+) -> VibexResult<Vec<AutomationEdge>> {
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT automation_edge_id, automation_graph_id, source_node_id, target_node_id,
+                condition_json, created_at_ms, updated_at_ms
+            FROM automation_graph_edges
+            WHERE automation_graph_id = ?1
+            ORDER BY created_at_ms ASC, automation_edge_id ASC
+            ",
+        )
+        .map_err(storage_err(
+            "automation_edge_list_failed",
+            "failed to list automation graph edges",
+        ))?;
+    let rows = stmt
+        .query_map(params![graph_id.as_str()], map_automation_edge)
+        .map_err(storage_err(
+            "automation_edge_list_failed",
+            "failed to list automation graph edges",
+        ))?;
+    collect_rows(
+        rows,
+        "automation_edge_decode_failed",
+        "failed to decode automation graph edge row",
+    )
+}
+
+fn insert_automation_run(conn: &Connection, run: &AutomationRun) -> VibexResult<()> {
+    conn.execute(
+        "
+        INSERT INTO automation_graph_runs (
+            automation_run_id, automation_graph_id, status, trigger, scheduled_task_id,
+            session_id, started_at_ms, ended_at_ms, error_code, error_message,
+            redacted_diagnostics_json, created_at_ms, updated_at_ms
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        ",
+        params![
+            run.id.as_str(),
+            run.graph_id.as_str(),
+            enum_to_db(&run.status)?,
+            enum_to_db(&run.trigger)?,
+            run.scheduled_task_id.as_ref().map(ScheduledTaskId::as_str),
+            run.session_id.as_ref().map(VibexSessionId::as_str),
+            run.started_at_ms,
+            run.ended_at_ms,
+            run.error_code,
+            run.error_message,
+            json_to_db(&run.redacted_diagnostics)?,
+            run.created_at_ms,
+            run.updated_at_ms
+        ],
+    )
+    .map_err(storage_err(
+        "automation_run_insert_failed",
+        "failed to insert automation graph run",
+    ))?;
+    Ok(())
+}
+
+fn update_automation_run(conn: &Connection, run: &AutomationRun) -> VibexResult<()> {
+    conn.execute(
+        "
+        UPDATE automation_graph_runs
+        SET status = ?2,
+            scheduled_task_id = ?3,
+            session_id = ?4,
+            started_at_ms = ?5,
+            ended_at_ms = ?6,
+            error_code = ?7,
+            error_message = ?8,
+            redacted_diagnostics_json = ?9,
+            updated_at_ms = ?10
+        WHERE automation_run_id = ?1
+        ",
+        params![
+            run.id.as_str(),
+            enum_to_db(&run.status)?,
+            run.scheduled_task_id.as_ref().map(ScheduledTaskId::as_str),
+            run.session_id.as_ref().map(VibexSessionId::as_str),
+            run.started_at_ms,
+            run.ended_at_ms,
+            run.error_code,
+            run.error_message,
+            json_to_db(&run.redacted_diagnostics)?,
+            run.updated_at_ms
+        ],
+    )
+    .map_err(storage_err(
+        "automation_run_update_failed",
+        "failed to update automation graph run",
+    ))?;
+    Ok(())
+}
+
+fn get_automation_run(
+    conn: &Connection,
+    run_id: &AutomationRunId,
+) -> VibexResult<Option<AutomationRun>> {
+    conn.query_row(
+        "
+        SELECT automation_run_id, automation_graph_id, status, trigger,
+            scheduled_task_id, session_id, started_at_ms, ended_at_ms,
+            error_code, error_message, redacted_diagnostics_json,
+            created_at_ms, updated_at_ms
+        FROM automation_graph_runs
+        WHERE automation_run_id = ?1
+        ",
+        params![run_id.as_str()],
+        map_automation_run,
+    )
+    .optional()
+    .map_err(storage_err(
+        "automation_run_lookup_failed",
+        "failed to lookup automation graph run",
+    ))
+}
+
+fn require_automation_run(
+    conn: &Connection,
+    run_id: &AutomationRunId,
+) -> VibexResult<AutomationRun> {
+    get_automation_run(conn, run_id)?.ok_or_else(|| {
+        VibexError::storage(
+            "automation_run_not_found",
+            "automation graph run was not found",
+        )
+        .with_diagnostic("automationRunId", run_id.as_str())
+    })
+}
+
+fn insert_automation_run_step(conn: &Connection, step: &AutomationRunStep) -> VibexResult<()> {
+    conn.execute(
+        "
+        INSERT INTO automation_graph_run_steps (
+            automation_run_step_id, automation_run_id, automation_node_id, status,
+            session_id, permission_request_id, started_at_ms, ended_at_ms, error_code,
+            error_message, redacted_diagnostics_json, created_at_ms, updated_at_ms
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        ",
+        params![
+            step.id.as_str(),
+            step.run_id.as_str(),
+            step.node_id.as_str(),
+            enum_to_db(&step.status)?,
+            step.session_id.as_ref().map(VibexSessionId::as_str),
+            step.permission_request_id.as_ref().map(RequestId::as_str),
+            step.started_at_ms,
+            step.ended_at_ms,
+            step.error_code,
+            step.error_message,
+            json_to_db(&step.redacted_diagnostics)?,
+            step.created_at_ms,
+            step.updated_at_ms
+        ],
+    )
+    .map_err(storage_err(
+        "automation_run_step_insert_failed",
+        "failed to insert automation graph run step",
+    ))?;
+    Ok(())
+}
+
+fn update_automation_run_step(conn: &Connection, step: &AutomationRunStep) -> VibexResult<()> {
+    conn.execute(
+        "
+        UPDATE automation_graph_run_steps
+        SET status = ?2,
+            session_id = ?3,
+            permission_request_id = ?4,
+            started_at_ms = ?5,
+            ended_at_ms = ?6,
+            error_code = ?7,
+            error_message = ?8,
+            redacted_diagnostics_json = ?9,
+            updated_at_ms = ?10
+        WHERE automation_run_step_id = ?1
+        ",
+        params![
+            step.id.as_str(),
+            enum_to_db(&step.status)?,
+            step.session_id.as_ref().map(VibexSessionId::as_str),
+            step.permission_request_id.as_ref().map(RequestId::as_str),
+            step.started_at_ms,
+            step.ended_at_ms,
+            step.error_code,
+            step.error_message,
+            json_to_db(&step.redacted_diagnostics)?,
+            step.updated_at_ms
+        ],
+    )
+    .map_err(storage_err(
+        "automation_run_step_update_failed",
+        "failed to update automation graph run step",
+    ))?;
+    Ok(())
+}
+
+fn get_automation_run_step(
+    conn: &Connection,
+    step_id: &AutomationRunStepId,
+) -> VibexResult<Option<AutomationRunStep>> {
+    conn.query_row(
+        "
+        SELECT automation_run_step_id, automation_run_id, automation_node_id,
+            status, session_id, permission_request_id, started_at_ms, ended_at_ms,
+            error_code, error_message, redacted_diagnostics_json,
+            created_at_ms, updated_at_ms
+        FROM automation_graph_run_steps
+        WHERE automation_run_step_id = ?1
+        ",
+        params![step_id.as_str()],
+        map_automation_run_step,
+    )
+    .optional()
+    .map_err(storage_err(
+        "automation_run_step_lookup_failed",
+        "failed to lookup automation graph run step",
+    ))
+}
+
+fn require_automation_run_step(
+    conn: &Connection,
+    step_id: &AutomationRunStepId,
+) -> VibexResult<AutomationRunStep> {
+    get_automation_run_step(conn, step_id)?.ok_or_else(|| {
+        VibexError::storage(
+            "automation_run_step_not_found",
+            "automation graph run step was not found",
+        )
+        .with_diagnostic("automationRunStepId", step_id.as_str())
+    })
+}
+
+fn u32_from_sql(value: i64) -> rusqlite::Result<u32> {
+    u32::try_from(value).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Integer, Box::new(err))
+    })
+}
+
+fn map_scheduled_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledTask> {
+    Ok(ScheduledTask {
+        id: parse_id_sql(row.get(0)?, ScheduledTaskId::parse)?,
+        title: row.get(1)?,
+        prompt: row.get(2)?,
+        project_id: parse_optional_id_sql(row.get::<_, Option<String>>(3)?, ProjectId::parse)?,
+        workspace_id: parse_optional_id_sql(row.get::<_, Option<String>>(4)?, WorkspaceId::parse)?,
+        workspace_root: row.get(5)?,
+        workspace_mode: enum_from_db_sql(row.get(6)?)?,
+        provider_kind: enum_from_db_sql(row.get(7)?)?,
+        provider_profile_id: parse_optional_id_sql(
+            row.get::<_, Option<String>>(8)?,
+            ProviderProfileId::parse,
+        )?,
+        schedule: json_from_db_sql(row.get(9)?)?,
+        status: enum_from_db_sql(row.get(10)?)?,
+        safety: json_from_db_sql(row.get(11)?)?,
+        next_run_at_ms: row.get(12)?,
+        created_at_ms: row.get(13)?,
+        updated_at_ms: row.get(14)?,
+        deleted_at_ms: row.get(15)?,
+    })
+}
+
+fn map_scheduled_task_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledTaskRun> {
+    Ok(ScheduledTaskRun {
+        id: parse_id_sql(row.get(0)?, ScheduledTaskRunId::parse)?,
+        task_id: parse_id_sql(row.get(1)?, ScheduledTaskId::parse)?,
+        status: enum_from_db_sql(row.get(2)?)?,
+        trigger: enum_from_db_sql(row.get(3)?)?,
+        session_id: parse_optional_id_sql(row.get::<_, Option<String>>(4)?, VibexSessionId::parse)?,
+        due_at_ms: row.get(5)?,
+        started_at_ms: row.get(6)?,
+        ended_at_ms: row.get(7)?,
+        attempt: u32_from_sql(row.get(8)?)?,
+        error_code: row.get(9)?,
+        error_message: row.get(10)?,
+        redacted_diagnostics: json_from_db_sql(row.get(11)?)?,
+        created_at_ms: row.get(12)?,
+        updated_at_ms: row.get(13)?,
+    })
+}
+
+fn map_automation_graph(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationGraph> {
+    Ok(AutomationGraph {
+        id: parse_id_sql(row.get(0)?, AutomationGraphId::parse)?,
+        title: row.get(1)?,
+        description: row.get(2)?,
+        project_id: parse_optional_id_sql(row.get::<_, Option<String>>(3)?, ProjectId::parse)?,
+        workspace_id: parse_optional_id_sql(row.get::<_, Option<String>>(4)?, WorkspaceId::parse)?,
+        workspace_root: row.get(5)?,
+        workspace_mode: enum_from_db_sql(row.get(6)?)?,
+        provider_kind: optional_enum_from_db_sql(row.get::<_, Option<String>>(7)?)?,
+        provider_profile_id: parse_optional_id_sql(
+            row.get::<_, Option<String>>(8)?,
+            ProviderProfileId::parse,
+        )?,
+        trigger: json_from_db_sql(row.get(9)?)?,
+        status: enum_from_db_sql(row.get(10)?)?,
+        version: u32_from_sql(row.get(11)?)?,
+        nodes: Vec::new(),
+        edges: Vec::new(),
+        created_at_ms: row.get(12)?,
+        updated_at_ms: row.get(13)?,
+        deleted_at_ms: row.get(14)?,
+    })
+}
+
+fn map_automation_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationNode> {
+    Ok(AutomationNode {
+        id: parse_id_sql(row.get(0)?, AutomationNodeId::parse)?,
+        graph_id: parse_id_sql(row.get(1)?, AutomationGraphId::parse)?,
+        kind: enum_from_db_sql(row.get(2)?)?,
+        title: row.get(3)?,
+        config: json_from_db_sql(row.get(4)?)?,
+        position: row
+            .get::<_, Option<String>>(5)?
+            .map(json_from_db)
+            .transpose()
+            .map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })?,
+        created_at_ms: row.get(6)?,
+        updated_at_ms: row.get(7)?,
+    })
+}
+
+fn map_automation_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationEdge> {
+    Ok(AutomationEdge {
+        id: parse_id_sql(row.get(0)?, AutomationEdgeId::parse)?,
+        graph_id: parse_id_sql(row.get(1)?, AutomationGraphId::parse)?,
+        source_node_id: parse_id_sql(row.get(2)?, AutomationNodeId::parse)?,
+        target_node_id: parse_id_sql(row.get(3)?, AutomationNodeId::parse)?,
+        condition: json_from_db_sql(row.get(4)?)?,
+        created_at_ms: row.get(5)?,
+        updated_at_ms: row.get(6)?,
+    })
+}
+
+fn map_automation_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationRun> {
+    Ok(AutomationRun {
+        id: parse_id_sql(row.get(0)?, AutomationRunId::parse)?,
+        graph_id: parse_id_sql(row.get(1)?, AutomationGraphId::parse)?,
+        status: enum_from_db_sql(row.get(2)?)?,
+        trigger: enum_from_db_sql(row.get(3)?)?,
+        scheduled_task_id: parse_optional_id_sql(
+            row.get::<_, Option<String>>(4)?,
+            ScheduledTaskId::parse,
+        )?,
+        session_id: parse_optional_id_sql(row.get::<_, Option<String>>(5)?, VibexSessionId::parse)?,
+        started_at_ms: row.get(6)?,
+        ended_at_ms: row.get(7)?,
+        error_code: row.get(8)?,
+        error_message: row.get(9)?,
+        redacted_diagnostics: json_from_db_sql(row.get(10)?)?,
+        created_at_ms: row.get(11)?,
+        updated_at_ms: row.get(12)?,
+    })
+}
+
+fn map_automation_run_step(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationRunStep> {
+    Ok(AutomationRunStep {
+        id: parse_id_sql(row.get(0)?, AutomationRunStepId::parse)?,
+        run_id: parse_id_sql(row.get(1)?, AutomationRunId::parse)?,
+        node_id: parse_id_sql(row.get(2)?, AutomationNodeId::parse)?,
+        status: enum_from_db_sql(row.get(3)?)?,
+        session_id: parse_optional_id_sql(row.get::<_, Option<String>>(4)?, VibexSessionId::parse)?,
+        permission_request_id: parse_optional_id_sql(
+            row.get::<_, Option<String>>(5)?,
+            RequestId::parse,
+        )?,
+        started_at_ms: row.get(6)?,
+        ended_at_ms: row.get(7)?,
+        error_code: row.get(8)?,
+        error_message: row.get(9)?,
+        redacted_diagnostics: json_from_db_sql(row.get(10)?)?,
+        created_at_ms: row.get(11)?,
+        updated_at_ms: row.get(12)?,
+    })
+}
+
+fn map_scheduled_task_attention_summary(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ScheduledTaskAttentionSummary> {
+    let task_id = parse_id_sql(row.get(0)?, ScheduledTaskId::parse)?;
+    let task_title = row.get(1)?;
+    let workspace_id = parse_optional_id_sql(row.get::<_, Option<String>>(2)?, WorkspaceId::parse)?;
+    let workspace_root = row.get(3)?;
+    let provider_kind = enum_from_db_sql(row.get(4)?)?;
+    let provider_profile_id =
+        parse_optional_id_sql(row.get::<_, Option<String>>(5)?, ProviderProfileId::parse)?;
+    let run_id = parse_id_sql(row.get(6)?, ScheduledTaskRunId::parse)?;
+    let status = enum_from_db_sql(row.get(7)?)?;
+    let trigger = enum_from_db_sql(row.get(8)?)?;
+    let session_id =
+        parse_optional_id_sql(row.get::<_, Option<String>>(9)?, VibexSessionId::parse)?;
+    let error_code: Option<String> = row.get(10)?;
+    let error_message: Option<String> = row.get(11)?;
+    let created_at_ms = row.get(12)?;
+    let attention_kind = scheduled_task_attention_kind(status, error_code.as_deref())
+        .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
+
+    Ok(ScheduledTaskAttentionSummary {
+        task_id,
+        task_title,
+        run_id,
+        workspace_id,
+        workspace_root,
+        provider_kind,
+        provider_profile_id,
+        trigger,
+        status,
+        attention_kind,
+        session_id,
+        error_code,
+        error_message,
+        created_at_ms,
+    })
+}
+
+fn map_scheduled_task_audit_record(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ScheduledTaskAuditRecord> {
+    let task_id = parse_id_sql(row.get(0)?, ScheduledTaskId::parse)?;
+    let task_title = row.get(1)?;
+    let workspace_id = parse_optional_id_sql(row.get::<_, Option<String>>(2)?, WorkspaceId::parse)?;
+    let workspace_root = row.get(3)?;
+    let provider_kind = enum_from_db_sql(row.get(4)?)?;
+    let provider_profile_id =
+        parse_optional_id_sql(row.get::<_, Option<String>>(5)?, ProviderProfileId::parse)?;
+    let run_id = parse_id_sql(row.get(6)?, ScheduledTaskRunId::parse)?;
+    let status = enum_from_db_sql(row.get(7)?)?;
+    let trigger = enum_from_db_sql(row.get(8)?)?;
+    let session_id =
+        parse_optional_id_sql(row.get::<_, Option<String>>(9)?, VibexSessionId::parse)?;
+    let error_code: Option<String> = row.get(10)?;
+    let error_message: Option<String> = row.get(11)?;
+    let redacted_diagnostics = json_from_db_sql(row.get(12)?)?;
+    let created_at_ms = row.get(13)?;
+
+    Ok(ScheduledTaskAuditRecord {
+        audit_id: format!("scheduled_audit:{}", run_id.as_str()),
+        task_id,
+        task_title,
+        run_id,
+        workspace_id,
+        workspace_root,
+        provider_kind,
+        provider_profile_id,
+        trigger,
+        outcome: scheduled_task_audit_outcome(status, error_code.as_deref()),
+        status,
+        session_id,
+        error_code,
+        error_message,
+        redacted_diagnostics,
+        created_at_ms,
+    })
+}
+
+fn scheduled_task_attention_kind(
+    status: ScheduledTaskRunStatus,
+    error_code: Option<&str>,
+) -> Option<ScheduledTaskAttentionKind> {
+    match error_code {
+        Some(SCHEDULED_TASK_PERMISSION_REQUIRED_CODE) => {
+            Some(ScheduledTaskAttentionKind::PermissionRequired)
+        }
+        Some(SCHEDULED_TASK_RECOVERED_STALE_RUN_CODE) => {
+            Some(ScheduledTaskAttentionKind::RecoveredStaleRun)
+        }
+        _ => match status {
+            ScheduledTaskRunStatus::Failed => Some(ScheduledTaskAttentionKind::Failed),
+            ScheduledTaskRunStatus::Skipped => Some(ScheduledTaskAttentionKind::Skipped),
+            ScheduledTaskRunStatus::Canceled => Some(ScheduledTaskAttentionKind::Canceled),
+            ScheduledTaskRunStatus::Queued
+            | ScheduledTaskRunStatus::Running
+            | ScheduledTaskRunStatus::Succeeded => None,
+        },
+    }
+}
+
+fn scheduled_task_audit_outcome(
+    status: ScheduledTaskRunStatus,
+    error_code: Option<&str>,
+) -> ScheduledTaskAuditOutcome {
+    match error_code {
+        Some(SCHEDULED_TASK_PERMISSION_REQUIRED_CODE) => {
+            ScheduledTaskAuditOutcome::PermissionRequired
+        }
+        Some(SCHEDULED_TASK_RECOVERED_STALE_RUN_CODE) => {
+            ScheduledTaskAuditOutcome::RecoveredStaleRun
+        }
+        _ => match status {
+            ScheduledTaskRunStatus::Queued => ScheduledTaskAuditOutcome::Queued,
+            ScheduledTaskRunStatus::Running => ScheduledTaskAuditOutcome::Running,
+            ScheduledTaskRunStatus::Succeeded => ScheduledTaskAuditOutcome::Succeeded,
+            ScheduledTaskRunStatus::Failed => ScheduledTaskAuditOutcome::Failed,
+            ScheduledTaskRunStatus::Skipped => ScheduledTaskAuditOutcome::Skipped,
+            ScheduledTaskRunStatus::Canceled => ScheduledTaskAuditOutcome::Canceled,
+        },
+    }
+}
+
+fn map_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectRecord> {
+    Ok(ProjectRecord {
+        id: parse_id_sql(row.get(0)?, ProjectId::parse)?,
+        name: row.get(1)?,
+        root_path: row.get(2)?,
+        created_at_ms: row.get(3)?,
+        updated_at_ms: row.get(4)?,
+    })
+}
+
+fn map_project_lookup(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectLookup> {
+    Ok(ProjectLookup {
+        record: map_project(row)?,
+        deleted_at_ms: row.get(5)?,
+    })
+}
+
+fn map_workspace(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> {
+    Ok(WorkspaceRecord {
+        id: parse_id_sql(row.get(0)?, WorkspaceId::parse)?,
+        project_id: parse_id_sql(row.get(1)?, ProjectId::parse)?,
+        root_path: row.get(2)?,
+        mode: enum_from_db_sql(row.get(3)?)?,
+        created_at_ms: row.get(4)?,
+        updated_at_ms: row.get(5)?,
+    })
+}
+
+fn map_workspace_lookup(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceLookup> {
+    Ok(WorkspaceLookup {
+        record: map_workspace(row)?,
+        deleted_at_ms: row.get(6)?,
+    })
+}
+
+fn map_remote_device_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteDeviceRecord> {
+    Ok(RemoteDeviceRecord {
+        detail: RemoteDeviceDetail {
+            device_id: parse_id_sql(row.get(0)?, DeviceId::parse)?,
+            display_name: row.get(1)?,
+            public_key: row.get(2)?,
+            grant_revision: row.get(4)?,
+            permission_level: enum_from_db_sql(row.get(5)?)?,
+            status: enum_from_db_sql(row.get(6)?)?,
+            paired_at_ms: row.get(7)?,
+            last_seen_at_ms: row.get(8)?,
+            revoked_at_ms: row.get(9)?,
+            created_at_ms: row.get(10)?,
+            updated_at_ms: row.get(11)?,
+        },
+        auth_secret_hash: row.get(3)?,
+    })
+}
+
+fn map_remote_pairing_code_record(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<RemotePairingCodeRecord> {
+    Ok(RemotePairingCodeRecord {
+        pairing: RemotePairingCode {
+            pairing_id: parse_id_sql(row.get(0)?, RequestId::parse)?,
+            permission_level: enum_from_db_sql(row.get(2)?)?,
+            expires_at_ms: row.get(3)?,
+            claimed_device_id: parse_optional_id_sql(row.get(4)?, DeviceId::parse)?,
+            created_at_ms: row.get(5)?,
+            claimed_at_ms: row.get(6)?,
+        },
+        code_hash: row.get(1)?,
+    })
+}
+
+fn map_remote_audit_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteAuditRecord> {
+    Ok(RemoteAuditRecord {
+        audit_id: parse_id_sql(row.get(0)?, RequestId::parse)?,
+        device_id: parse_optional_id_sql(row.get(1)?, DeviceId::parse)?,
+        action: enum_from_db_sql(row.get(2)?)?,
+        target_kind: enum_from_db_sql(row.get(3)?)?,
+        target_id: row.get(4)?,
+        outcome: enum_from_db_sql(row.get(5)?)?,
+        redacted_summary: row.get(6)?,
+        request_id: parse_optional_id_sql(row.get(7)?, RequestId::parse)?,
+        correlation_id: parse_optional_id_sql(row.get(8)?, CorrelationId::parse)?,
+        created_at_ms: row.get(9)?,
+    })
+}
+
+fn map_agent_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSession> {
+    Ok(AgentSession {
+        id: parse_id_sql(row.get(0)?, VibexSessionId::parse)?,
+        title: row.get(1)?,
+        project_id: parse_id_sql(row.get(2)?, ProjectId::parse)?,
+        workspace_id: parse_id_sql(row.get(3)?, WorkspaceId::parse)?,
+        workspace_root: row.get(4)?,
+        workspace_mode: enum_from_db_sql(row.get(5)?)?,
+        state: enum_from_db_sql(row.get(6)?)?,
+        safety: AgentSessionSafety {
+            permission_mode: enum_from_db_sql(row.get(7)?)?,
+            ask_on_risk: row.get(8)?,
+            bypass_all_permissions: row.get(9)?,
+        },
+        created_at_ms: row.get(10)?,
+        updated_at_ms: row.get(11)?,
+        archived_at_ms: row.get(12)?,
+        deleted_at_ms: row.get(13)?,
+        agent_id: parse_id_sql(row.get(14)?, AgentId::parse)?,
+    })
+}
+
+fn map_agent_config(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentConfig> {
+    let enabled: i64 = row.get(5)?;
+    Ok(AgentConfig {
+        agent_id: parse_id_sql(row.get(0)?, AgentId::parse)?,
+        runtime_kind: enum_from_db_sql(row.get(1)?)?,
+        source_kind: enum_from_db_sql(row.get(2)?)?,
+        label_override: row.get(3)?,
+        description_override: row.get(4)?,
+        enabled: enabled != 0,
+        order_index: row.get(6)?,
+        command: row
+            .get::<_, Option<String>>(7)?
+            .map(json_from_db)
+            .transpose()
+            .map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    7,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })?,
+        env: json_from_db_sql(row.get(8)?)?,
+        params: json_from_db_sql(row.get(9)?)?,
+        created_at_ms: row.get(10)?,
+        updated_at_ms: row.get(11)?,
+        deleted_at_ms: row.get(12)?,
+    })
+}
+
+fn map_agent_discovery_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentDiscoveryRecord> {
+    Ok(AgentDiscoveryRecord {
+        discovery_record_id: row.get(0)?,
+        agent_id: parse_id_sql(row.get(1)?, AgentId::parse)?,
+        cwd_scope: row.get(2)?,
+        install_status: enum_from_db_sql(row.get(3)?)?,
+        config_status: enum_from_db_sql(row.get(4)?)?,
+        runtime_status: enum_from_db_sql(row.get(5)?)?,
+        binary_path: row.get(6)?,
+        version: row.get(7)?,
+        native_config_paths: json_from_db_sql(row.get(8)?)?,
+        models: json_from_db_sql(row.get(9)?)?,
+        modes: json_from_db_sql(row.get(10)?)?,
+        diagnostics: json_from_db_sql(row.get(11)?)?,
+        discovered_at_ms: row.get(12)?,
+    })
+}
+
+fn map_provider_profile_without_secrets(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ProviderProfile> {
+    Ok(ProviderProfile {
+        id: parse_id_sql(row.get(0)?, ProviderProfileId::parse)?,
+        agent_id: parse_id_sql(row.get(1)?, AgentId::parse)?,
+        kind: enum_from_db_sql(row.get(2)?)?,
+        display_name: row.get(3)?,
+        status: enum_from_db_sql(row.get(4)?)?,
+        account_alias: row.get(5)?,
+        base_url: row.get(6)?,
+        default_model: row.get(7)?,
+        small_model: row.get(8)?,
+        large_model: row.get(9)?,
+        configured_models: json_from_db_sql(row.get(10)?)?,
+        reasoning_effort: row.get(11)?,
+        sandbox_defaults: json_from_db_sql(row.get(12)?)?,
+        network_defaults: json_from_db_sql(row.get(13)?)?,
+        permission_defaults: json_from_db_sql(row.get(14)?)?,
+        provider_options: json_from_db_sql(row.get(15)?)?,
+        secrets: Vec::new(),
+        created_at_ms: row.get(16)?,
+        updated_at_ms: row.get(17)?,
+        deleted_at_ms: row.get(18)?,
+    })
+}
+
+fn map_provider_secret_reference(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ProviderSecretReference> {
+    Ok(ProviderSecretReference {
+        id: parse_id_sql(row.get(0)?, RequestId::parse)?,
+        provider_profile_id: parse_id_sql(row.get(1)?, ProviderProfileId::parse)?,
+        secret_kind: enum_from_db_sql(row.get(2)?)?,
+        backend: enum_from_db_sql(row.get(3)?)?,
+        setup_state: enum_from_db_sql(row.get(4)?)?,
+        lookup_key: row.get(5)?,
+        display_label: row.get(6)?,
+        redacted_hint: row.get(7)?,
+        created_at_ms: row.get(8)?,
+        updated_at_ms: row.get(9)?,
+    })
+}
+
+fn map_mcp_server_without_children(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpServer> {
+    Ok(McpServer {
+        id: parse_id_sql(row.get(0)?, McpServerId::parse)?,
+        display_name: row.get(1)?,
+        transport_kind: enum_from_db_sql(row.get(2)?)?,
+        status: enum_from_db_sql(row.get(3)?)?,
+        scope_kind: enum_from_db_sql(row.get(4)?)?,
+        project_id: parse_optional_id_sql(row.get::<_, Option<String>>(5)?, ProjectId::parse)?,
+        workspace_id: parse_optional_id_sql(row.get::<_, Option<String>>(6)?, WorkspaceId::parse)?,
+        command: row.get(7)?,
+        args: json_from_db_sql(row.get(8)?)?,
+        url: row.get(9)?,
+        description: row.get(10)?,
+        tags: json_from_db_sql(row.get(11)?)?,
+        secret_references: Vec::new(),
+        provider_matrix: Vec::new(),
+        agent_matrix: Vec::new(),
+        created_at_ms: row.get(12)?,
+        updated_at_ms: row.get(13)?,
+        deleted_at_ms: row.get(14)?,
+    })
+}
+
+fn map_mcp_secret_reference(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpServerSecretReference> {
+    Ok(McpServerSecretReference {
+        id: parse_id_sql(row.get(0)?, RequestId::parse)?,
+        mcp_server_id: parse_id_sql(row.get(1)?, McpServerId::parse)?,
+        secret_kind: enum_from_db_sql(row.get(2)?)?,
+        backend: enum_from_db_sql(row.get(3)?)?,
+        setup_state: enum_from_db_sql(row.get(4)?)?,
+        lookup_key: row.get(5)?,
+        display_label: row.get(6)?,
+        redacted_hint: row.get(7)?,
+        target: enum_from_db_sql(row.get(8)?)?,
+        created_at_ms: row.get(9)?,
+        updated_at_ms: row.get(10)?,
+    })
+}
+
+fn map_mcp_provider_matrix(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpServerProviderMatrix> {
+    let enabled: i64 = row.get(1)?;
+    Ok(McpServerProviderMatrix {
+        provider_kind: enum_from_db_sql(row.get(0)?)?,
+        enabled: enabled != 0,
+        updated_at_ms: row.get(2)?,
+    })
+}
+
+fn map_mcp_agent_matrix(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpServerAgentMatrix> {
+    let enabled: i64 = row.get(1)?;
+    Ok(McpServerAgentMatrix {
+        agent_id: parse_id_sql(row.get(0)?, AgentId::parse)?,
+        enabled: enabled != 0,
+        source_kind: enum_from_db_sql(row.get(2)?)?,
+        updated_at_ms: row.get(3)?,
+    })
+}
+
+fn map_skill_without_children(row: &rusqlite::Row<'_>) -> rusqlite::Result<Skill> {
+    Ok(Skill {
+        id: parse_id_sql(row.get(0)?, SkillId::parse)?,
+        display_name: row.get(1)?,
+        source_kind: enum_from_db_sql(row.get(2)?)?,
+        status: enum_from_db_sql(row.get(3)?)?,
+        scope_kind: enum_from_db_sql(row.get(4)?)?,
+        project_id: parse_optional_id_sql(row.get::<_, Option<String>>(5)?, ProjectId::parse)?,
+        workspace_id: parse_optional_id_sql(row.get::<_, Option<String>>(6)?, WorkspaceId::parse)?,
+        source_uri: row.get(7)?,
+        description: row.get(8)?,
+        tags: json_from_db_sql(row.get(9)?)?,
+        content_preview: row.get(10)?,
+        provider_matrix: Vec::new(),
+        agent_matrix: Vec::new(),
+        created_at_ms: row.get(11)?,
+        updated_at_ms: row.get(12)?,
+        deleted_at_ms: row.get(13)?,
+    })
+}
+
+fn map_skill_provider_matrix(row: &rusqlite::Row<'_>) -> rusqlite::Result<SkillProviderMatrix> {
+    let enabled: i64 = row.get(1)?;
+    Ok(SkillProviderMatrix {
+        provider_kind: enum_from_db_sql(row.get(0)?)?,
+        enabled: enabled != 0,
+        updated_at_ms: row.get(2)?,
+    })
+}
+
+fn map_skill_agent_matrix(row: &rusqlite::Row<'_>) -> rusqlite::Result<SkillAgentMatrix> {
+    let enabled: i64 = row.get(1)?;
+    Ok(SkillAgentMatrix {
+        agent_id: parse_id_sql(row.get(0)?, AgentId::parse)?,
+        enabled: enabled != 0,
+        source_kind: enum_from_db_sql(row.get(2)?)?,
+        updated_at_ms: row.get(3)?,
+    })
+}
+
+fn map_prompt(row: &rusqlite::Row<'_>) -> rusqlite::Result<Prompt> {
+    Ok(Prompt {
+        id: parse_id_sql(row.get(0)?, PromptId::parse)?,
+        display_name: row.get(1)?,
+        kind: enum_from_db_sql(row.get(2)?)?,
+        status: enum_from_db_sql(row.get(3)?)?,
+        scope_kind: enum_from_db_sql(row.get(4)?)?,
+        project_id: parse_optional_id_sql(row.get::<_, Option<String>>(5)?, ProjectId::parse)?,
+        workspace_id: parse_optional_id_sql(row.get::<_, Option<String>>(6)?, WorkspaceId::parse)?,
+        body: row.get(7)?,
+        description: row.get(8)?,
+        tags: json_from_db_sql(row.get(9)?)?,
+        created_at_ms: row.get(10)?,
+        updated_at_ms: row.get(11)?,
+        deleted_at_ms: row.get(12)?,
+    })
+}
+
+fn map_hook(row: &rusqlite::Row<'_>) -> rusqlite::Result<Hook> {
+    Ok(Hook {
+        id: parse_id_sql(row.get(0)?, HookId::parse)?,
+        display_name: row.get(1)?,
+        provider_kind: enum_from_db_sql(row.get(2)?)?,
+        event_kind: enum_from_db_sql(row.get(3)?)?,
+        status: enum_from_db_sql(row.get(4)?)?,
+        install_state: enum_from_db_sql(row.get(5)?)?,
+        command_preview: row.get(6)?,
+        managed_marker: row.get(7)?,
+        description: row.get(8)?,
+        created_at_ms: row.get(9)?,
+        updated_at_ms: row.get(10)?,
+        deleted_at_ms: row.get(11)?,
+    })
+}
+
+fn map_provider_health_probe_result(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ProviderHealthProbeResult> {
+    let latency_ms: Option<i64> = row.get(6)?;
+    Ok(ProviderHealthProbeResult {
+        health_record_id: parse_id_sql(row.get(0)?, RequestId::parse)?,
+        provider_profile_id: parse_id_sql(row.get(1)?, ProviderProfileId::parse)?,
+        provider_kind: enum_from_db_sql(row.get(2)?)?,
+        probe_kind: enum_from_db_sql(row.get(3)?)?,
+        status: enum_from_db_sql(row.get(4)?)?,
+        summary: row.get(5)?,
+        latency_ms: latency_ms.and_then(|value| u32::try_from(value).ok()),
+        checked_at_ms: row.get(7)?,
+        expires_at_ms: row.get(8)?,
+        diagnostics: json_from_db_sql(row.get(9)?)?,
+    })
+}
+
+fn map_provider_capability_probe_result(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ProviderCapabilityProbeResult> {
+    Ok(ProviderCapabilityProbeResult {
+        capability_record_id: parse_id_sql(row.get(0)?, RequestId::parse)?,
+        provider_profile_id: parse_id_sql(row.get(1)?, ProviderProfileId::parse)?,
+        provider_kind: enum_from_db_sql(row.get(2)?)?,
+        status: enum_from_db_sql(row.get(3)?)?,
+        summary: row.get(4)?,
+        capabilities: json_from_db_sql(row.get(5)?)?,
+        source: row.get(6)?,
+        checked_at_ms: row.get(7)?,
+        expires_at_ms: row.get(8)?,
+        diagnostics: json_from_db_sql(row.get(9)?)?,
+    })
+}
+
+fn map_provider_runtime_option_snapshot(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ProviderRuntimeOptionSnapshotRecord> {
+    let model_response = row
+        .get::<_, Option<String>>(2)?
+        .map(json_from_db_sql::<AgentModelListResponse>)
+        .transpose()?;
+    let session_config = row
+        .get::<_, Option<String>>(3)?
+        .map(json_from_db_sql::<AgentSessionConfigProbe>)
+        .transpose()?;
+    Ok(ProviderRuntimeOptionSnapshotRecord {
+        provider_profile_id: parse_id_sql(row.get(0)?, ProviderProfileId::parse)?,
+        agent_id: parse_id_sql(row.get(1)?, AgentId::parse)?,
+        model_response,
+        session_config,
+        last_success_at_ms: row.get(4)?,
+        last_attempt_at_ms: row.get(5)?,
+        last_error_code: row.get(6)?,
+    })
+}
+
+fn map_provider_usage_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderUsageRecord> {
+    let window_label: Option<String> = row.get(9)?;
+    let window_started_at_ms: Option<i64> = row.get(10)?;
+    let window_ends_at_ms: Option<i64> = row.get(11)?;
+    let window = window_label.map(|label| ProviderUsageWindow {
+        label,
+        started_at_ms: window_started_at_ms,
+        ends_at_ms: window_ends_at_ms,
+    });
+    Ok(ProviderUsageRecord {
+        usage_record_id: parse_id_sql(row.get(0)?, RequestId::parse)?,
+        provider_profile_id: parse_id_sql(row.get(1)?, ProviderProfileId::parse)?,
+        provider_kind: enum_from_db_sql(row.get(2)?)?,
+        source: row.get(3)?,
+        unit: enum_from_db_sql(row.get(4)?)?,
+        label: row.get(5)?,
+        used: row.get(6)?,
+        limit_value: row.get(7)?,
+        remaining: row.get(8)?,
+        window,
+        recorded_at_ms: row.get(12)?,
+        metadata: json_from_db_sql(row.get(13)?)?,
+    })
+}
+
+fn map_timeline_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineItem> {
+    let execution_attribution = row
+        .get::<_, Option<String>>(10)?
+        .map(json_from_db_sql::<TurnExecutionAttribution>)
+        .transpose()?;
+    Ok(TimelineItem {
+        session_id: parse_id_sql(row.get(0)?, VibexSessionId::parse)?,
+        sequence: row.get(1)?,
+        id: parse_id_sql(row.get(2)?, TimelineItemId::parse)?,
+        kind: enum_from_db_sql(row.get(3)?)?,
+        source: enum_from_db_sql(row.get(4)?)?,
+        timestamp_ms: row.get(5)?,
+        correlation_id: parse_optional_id_sql(
+            row.get::<_, Option<String>>(6)?,
+            vibex_core::CorrelationId::parse,
+        )?,
+        provider_correlation_id: row.get(7)?,
+        payload: json_from_db_sql(row.get(8)?)?,
+        redaction_state: enum_from_db_sql(row.get(9)?)?,
+        execution_attribution: execution_attribution
+            .as_ref()
+            .map(TurnExecutionAttribution::view),
+    })
+}
+
+fn map_permission_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<PermissionRequest> {
+    Ok(PermissionRequest {
+        id: parse_id_sql(row.get(0)?, vibex_core::RequestId::parse)?,
+        session_id: parse_id_sql(row.get(1)?, VibexSessionId::parse)?,
+        project_id: parse_optional_id_sql(row.get::<_, Option<String>>(2)?, ProjectId::parse)?,
+        workspace_id: parse_optional_id_sql(row.get::<_, Option<String>>(3)?, WorkspaceId::parse)?,
+        provider_request_id: row.get(4)?,
+        risk_category: enum_from_db_sql(row.get(5)?)?,
+        title: row.get(6)?,
+        details: json_from_db_sql::<Vec<PermissionActionDetail>>(row.get(7)?)?,
+        allowed_responses: json_from_db_sql::<Vec<PermissionResponseKind>>(row.get(8)?)?,
+        status: enum_from_db_sql(row.get(9)?)?,
+        requested_at_ms: row.get(10)?,
+        expires_at_ms: row.get(11)?,
+    })
+}
+
+fn map_terminal_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<TerminalSession> {
+    Ok(TerminalSession {
+        id: parse_id_sql(row.get(0)?, TerminalId::parse)?,
+        workspace_id: parse_id_sql(row.get(1)?, WorkspaceId::parse)?,
+        title: row.get(2)?,
+        shell: row.get(3)?,
+        cwd: row.get(4)?,
+        rows: row.get(5)?,
+        cols: row.get(6)?,
+        status: enum_from_db_sql(row.get(7)?)?,
+        created_at_ms: row.get(8)?,
+        updated_at_ms: row.get(9)?,
+        closed_at_ms: row.get(10)?,
+    })
+}
+
+fn map_right_rail_plugin(row: &rusqlite::Row<'_>) -> rusqlite::Result<RightRailPlugin> {
+    Ok(RightRailPlugin {
+        id: parse_id_sql(row.get(0)?, RightRailPluginId::parse)?,
+        kind: enum_from_db_sql(row.get(1)?)?,
+        system_key: optional_enum_from_db_sql(row.get::<_, Option<String>>(2)?)?,
+        builtin_key: row.get(3)?,
+        display_name: row.get(4)?,
+        url: row.get(5)?,
+        logo: row.get(6)?,
+        desktop_user_agent: row.get(7)?,
+        mobile_user_agent: row.get(8)?,
+        ua_mode: optional_enum_from_db_sql(row.get::<_, Option<String>>(9)?)?,
+        status: enum_from_db_sql(row.get(10)?)?,
+        order_index: row.get(11)?,
+        data_directory: row.get(12)?,
+        created_at_ms: row.get(13)?,
+        updated_at_ms: row.get(14)?,
+        deleted_at_ms: row.get(15)?,
+    })
+}
+
+fn map_managed_worktree(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedWorktreeRecord> {
+    Ok(ManagedWorktreeRecord {
+        worktree_id: parse_id_sql(row.get(0)?, RequestId::parse)?,
+        project_id: parse_id_sql(row.get(1)?, ProjectId::parse)?,
+        workspace_id: parse_optional_id_sql(row.get::<_, Option<String>>(2)?, WorkspaceId::parse)?,
+        repo_root: row.get(3)?,
+        worktree_path: row.get(4)?,
+        branch: row.get(5)?,
+        base_ref: row.get(6)?,
+        head: row.get(7)?,
+        status: enum_from_db_sql(row.get(8)?)?,
+        created_at_ms: row.get(9)?,
+        updated_at_ms: row.get(10)?,
+        closed_at_ms: row.get(11)?,
+    })
+}
+
+fn map_worktree_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<GitWorktreeOperationRecord> {
+    Ok(GitWorktreeOperationRecord {
+        operation_id: parse_id_sql(row.get(0)?, RequestId::parse)?,
+        project_id: parse_id_sql(row.get(1)?, ProjectId::parse)?,
+        source_workspace_id: parse_optional_id_sql(
+            row.get::<_, Option<String>>(2)?,
+            WorkspaceId::parse,
+        )?,
+        target_workspace_id: parse_optional_id_sql(
+            row.get::<_, Option<String>>(3)?,
+            WorkspaceId::parse,
+        )?,
+        operation: enum_from_db_sql(row.get(4)?)?,
+        status: enum_from_db_sql(row.get(5)?)?,
+        worktree_path: row.get(6)?,
+        branch: row.get(7)?,
+        base_ref: row.get(8)?,
+        head_before: row.get(9)?,
+        head_after: row.get(10)?,
+        error: row.get(11)?,
+        created_at_ms: row.get(12)?,
+        updated_at_ms: row.get(13)?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use vibex_core::{
+        AcpAdapterId, AdapterDiagnosticLevel, AgentCommandConfig, AgentConfigStatus, AgentId,
+        AgentInstallStatus, AgentMessageDeltaPayload, AgentMessagePayload, AgentModelListSource,
+        AgentModelProviderFailoverEntry, AgentReasoningEffort, AgentRuntimeKind,
+        AgentRuntimeStatus, AgentSourceKind, AutomationAgentPromptConfig,
+        AutomationApprovalGateConfig, AutomationEdgeCondition, AutomationEdgeConditionKind,
+        AutomationGraphTrigger, AutomationNodeConfig, AutomationNodeKind, AutomationNodePosition,
+        AutomationRunStatus, AutomationRunStepStatus, AutomationRunTrigger, BindingState,
+        GitWorktreeOperationKind, HookCreateRequest, HookEventKind, HookInstallPreview, HookStatus,
+        McpSecretTarget, McpServerCreateRequest, McpServerProviderMatrix, McpServerScopeKind,
+        McpServerSecretReferenceCreateRequest, McpServerStatus, McpServerTransportKind,
+        MessageSubmissionId, NativeStateHomeId, PermissionResponseKind, PermissionRiskCategory,
+        PromptCreateRequest, PromptKind, PromptScopeKind, PromptStatus, ProviderBindingMetadata,
+        ProviderCapabilities, ProviderCapabilityProbeResult, ProviderCapabilityProbeStatus,
+        ProviderDefaultScopeKind, ProviderHealthProbeKind, ProviderHealthProbeResult,
+        ProviderHealthStatus, ProviderKind, ProviderNativeConfigFileKind,
+        ProviderNativeExportApplyResult, ProviderNativeExportApplyStatus,
+        ProviderNativeExportFilePlan, ProviderNativeExportFileStatus, ProviderNativeExportMode,
+        ProviderNativeExportOperationKind, ProviderNativeExportPreview, ProviderNativeExportSource,
+        ProviderProfileSetDefaultRequest, ProviderSecretBackend, ProviderSecretKind,
+        ProviderSecretReferenceCreateRequest, ProviderSecretSetupState, ProviderSessionConfigValue,
+        ProviderUsageRecord, ProviderUsageUnit, ProviderUsageWindow, RuntimeBinding,
+        RuntimeBindingId, RuntimeSwitchActiveWorkPolicy, RuntimeSwitchId, RuntimeSwitchPolicy,
+        ScheduledTaskDailySchedule, ScheduledTaskIntervalSchedule, ScheduledTaskOneShotSchedule,
+        ScheduledTaskRunStatus, ScheduledTaskRunTrigger, ScheduledTaskSchedule,
+        SendAgentMessageRequest, SessionRuntimeConfigState, SessionRuntimeSelection,
+        SkillCreateRequest, SkillProviderMatrix, SkillScopeKind, SkillSourceKind, SkillStatus,
+        SystemNoticeLevel, SystemNoticePayload, TerminalStatus, TransportKind,
+        TurnExecutionAttribution, UserMessagePayload,
+    };
+    use vibex_core::{
+        RemoteAuditAction, RemoteAuditOutcome, RemoteAuditTargetKind, RemoteDevicePermissionLevel,
+    };
+
+    #[test]
+    fn migration_smoke_round_trips_sentinel() {
+        let temp = temp_db_path("smoke");
+
+        let result = run_smoke(&temp).unwrap();
+        assert_eq!(result.schema_version, CURRENT_SCHEMA_VERSION);
+        assert!(result.marker.starts_with("vibex-db-smoke-"));
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn schema_v28_clears_legacy_sessions_and_accepts_new_durable_acp_rows() {
+        let temp = temp_db_path("schema-v28-cutover");
+        let mut conn = open_database(&temp).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at_ms INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        for migration in MIGRATIONS.iter().filter(|migration| migration.version < 28) {
+            conn.execute_batch(migration.sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at_ms)
+                 VALUES (?1, ?2, ?3)",
+                params![migration.version, migration.name, unix_timestamp_ms()],
+            )
+            .unwrap();
+        }
+
+        let now = unix_timestamp_ms();
+        conn.execute(
+            "INSERT INTO projects (project_id, name, root_path, created_at_ms, updated_at_ms)
+             VALUES ('project_legacy', 'Legacy', '/tmp/vibex-legacy', ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO workspaces (
+                workspace_id, project_id, root_path, mode, created_at_ms, updated_at_ms
+             ) VALUES (
+                'workspace_legacy', 'project_legacy', '/tmp/vibex-legacy',
+                'current_checkout', ?1, ?1
+             )",
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agent_sessions (
+                session_id, title, project_id, workspace_id, workspace_root, workspace_mode,
+                provider_kind, provider_profile_id, state, permission_mode, ask_on_risk,
+                bypass_all_permissions, created_at_ms, updated_at_ms, current_agent_id
+             ) VALUES (
+                'session_legacy', 'Legacy session', 'project_legacy', 'workspace_legacy',
+                '/tmp/vibex-legacy', 'current_checkout', 'claude', 'profile_legacy', 'idle',
+                'workspace_write', 1, 0, ?1, ?1, 'claude'
+             )",
+            params![now],
+        )
+        .unwrap();
+        for table in ["provider_bindings", "session_provider_bindings"] {
+            conn.execute(
+                &format!(
+                    "INSERT INTO {table} (
+                        session_id, provider_profile_id, provider_kind, native_session_id,
+                        native_thread_id, native_resume_token, redacted_metadata_json,
+                        created_at_ms, updated_at_ms, session_config_state_json
+                     ) VALUES (
+                        'session_legacy', 'profile_legacy', 'claude', 'native_legacy',
+                        NULL, NULL, '[]', ?1, ?1, NULL
+                     )"
+                ),
+                params![now],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO session_runtime_bindings (
+                binding_id, session_id, agent_id, transport_kind, adapter_id, adapter_version,
+                adapter_compatibility_identity, provider_profile_id, native_state_home_id,
+                process_spawn_fingerprint, session_runtime_config_state_json, binding_state,
+                created_at_ms, updated_at_ms
+             ) VALUES (
+                'binding_legacy', 'session_legacy', 'claude', 'acp', 'claude-agent-acp',
+                '0.58.1', 'adapter=claude-agent-acp@0.58.1', 'profile_legacy',
+                'home_legacy', 'fingerprint_legacy', '{}', 'current', ?1, ?1
+             )",
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO runtime_switches (
+                switch_id, session_id, idempotency_key, source_revision,
+                desired_selection_revision, target_agent_id, target_adapter_id,
+                target_profile_id, status, created_at_ms, updated_at_ms
+             ) VALUES (
+                'switch_legacy', 'session_legacy', 'switch:legacy', 0, 1, 'claude',
+                'claude-agent-acp', 'profile_legacy', 'requested', ?1, ?1
+             )",
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agent_message_submissions (
+                submission_id, session_id, message_idempotency_key,
+                desired_runtime_selection_json, message_payload_reference, status,
+                created_at_ms, updated_at_ms
+             ) VALUES (
+                'submission_legacy', 'session_legacy', 'message:legacy', '{}',
+                'payload_legacy', 'awaiting_runtime', ?1, ?1
+             )",
+            params![now],
+        )
+        .unwrap();
+
+        assert_eq!(current_schema_version(&conn).unwrap(), 27);
+        let applied = apply_migrations(&mut conn).unwrap();
+        assert_eq!(
+            applied,
+            vec![
+                "28:acp_only_runtime_cutover",
+                "29:remote_protocol_v2_pairing_offers",
+                "30:provider_runtime_option_snapshots"
+            ]
+        );
+        for table in [
+            "agent_sessions",
+            "session_runtime_bindings",
+            "runtime_switches",
+            "agent_message_submissions",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "v28 must clear legacy rows from {table}");
+        }
+        for table in ["provider_bindings", "session_provider_bindings"] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "v28 must drop {table}");
+        }
+        let columns = conn
+            .prepare("SELECT name FROM pragma_table_info('agent_sessions')")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            !columns.iter().any(|column| {
+                matches!(column.as_str(), "provider_kind" | "provider_profile_id")
+            })
+        );
+
+        let workspace_root = std::env::temp_dir().join(format!(
+            "vibex-schema-v28-new-{}",
+            RequestId::new().as_str()
+        ));
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "ACP-only session".to_string(),
+            project_id: project.id,
+            workspace_id: workspace.id,
+            workspace_root: workspace.root_path,
+            workspace_mode: workspace.mode,
+            agent_id: AgentId::parse("claude").unwrap(),
+            state: AgentSessionState::Initializing,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        SessionRepository::insert(&conn, &session).unwrap();
+        let selection = SessionRuntimeSelection {
+            agent_id: session.agent_id.clone(),
+            provider_profile_id: ProviderProfileId::parse("provider_acp_cutover").unwrap(),
+            model_id: "claude-sonnet".to_string(),
+            reasoning_effort: Some("high".to_string()),
+            mode_id: None,
+            config_values: Default::default(),
+        };
+        let switch_id = RuntimeSwitchId::new();
+        let target_binding_id = RuntimeBindingId::new();
+        let switch = AgentSessionRuntimeRepository::enqueue_initial_runtime_switch(
+            &mut conn,
+            switch_id.clone(),
+            &DesiredRuntimeSwitchEnqueueRequest {
+                session_id: session.id.clone(),
+                idempotency_key: format!("session-init:{}", session.id.as_str()),
+                expected_revision: 0,
+                expected_selection_revision: 0,
+                target_binding_id: target_binding_id.clone(),
+                target_adapter_id: AcpAdapterId::parse("claude-agent-acp").unwrap(),
+                desired: selection.clone(),
+                requested_policy: RuntimeSwitchPolicy::Automatic,
+                active_work_policy: RuntimeSwitchActiveWorkPolicy::default(),
+                requested_session_config: serde_json::json!({
+                    "effectiveSelection": selection,
+                    "profileRevision": 1,
+                }),
+            },
+        )
+        .unwrap();
+        assert_eq!(switch.switch_id, switch_id);
+
+        RuntimeBindingRepository::insert(
+            &conn,
+            &RuntimeBinding {
+                binding_id: target_binding_id,
+                session_id: session.id.clone(),
+                agent_id: session.agent_id.clone(),
+                transport_kind: TransportKind::Acp,
+                provider_profile_id: selection.provider_profile_id.clone(),
+                adapter_id: AcpAdapterId::parse("claude-agent-acp").unwrap(),
+                adapter_version: "0.58.1".to_string(),
+                adapter_compatibility_identity: "adapter=claude-agent-acp@0.58.1".to_string(),
+                native_session_id: Some("native_cutover".to_string()),
+                native_state_home_id: NativeStateHomeId::new(),
+                provider_resume_identity: None,
+                process_spawn_fingerprint: "fingerprint_cutover".to_string(),
+                session_runtime_config_state: SessionRuntimeConfigState::default(),
+                capability_snapshot: None,
+                restore_compatibility_key: None,
+                profile_revision: 1,
+                last_context_sequence: 0,
+                last_summary_sequence: 0,
+                context_bridge_version: 0,
+                activation_generation: 0,
+                binding_state: BindingState::Preparing,
+                created_by_switch_id: Some(switch_id),
+                created_at_ms: now,
+                updated_at_ms: now,
+            },
+        )
+        .unwrap();
+        let submission = MessageSubmissionRepository::enqueue(
+            &mut conn,
+            MessageSubmissionId::new(),
+            &SendAgentMessageRequest {
+                session_id: session.id.clone(),
+                message_idempotency_key: "message:cutover".to_string(),
+                desired_runtime: selection,
+                text: "cutover message".to_string(),
+                attachments: Vec::new(),
+                reasoning_effort: Some("high".to_string()),
+                correlation_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(submission.session_id, session.id);
+
+        drop(conn);
+        cleanup_db(temp);
+    }
+
+    fn automation_agent_node_request(
+        id: AutomationNodeId,
+        title: &str,
+    ) -> AutomationNodeCreateRequest {
+        AutomationNodeCreateRequest {
+            id: Some(id),
+            kind: AutomationNodeKind::AgentPrompt,
+            title: title.to_string(),
+            config: AutomationNodeConfig::AgentPrompt(AutomationAgentPromptConfig {
+                prompt_template: format!("Run {title}"),
+                provider_kind: Some(ProviderKind::Codex),
+                provider_profile_id: None,
+                safety: None,
+                workspace_root: None,
+                workspace_mode: Some(WorkspaceMode::CurrentCheckout),
+            }),
+            position: Some(AutomationNodePosition { x: 1, y: 2 }),
+        }
+    }
+
+    fn automation_approval_node_request(
+        id: AutomationNodeId,
+        title: &str,
+    ) -> AutomationNodeCreateRequest {
+        AutomationNodeCreateRequest {
+            id: Some(id),
+            kind: AutomationNodeKind::ApprovalGate,
+            title: title.to_string(),
+            config: AutomationNodeConfig::ApprovalGate(AutomationApprovalGateConfig {
+                title: title.to_string(),
+                details: "Review bounded automation output".to_string(),
+                risk_category: PermissionRiskCategory::Command,
+                allowed_responses: vec![
+                    PermissionResponseKind::Approve,
+                    PermissionResponseKind::Deny,
+                ],
+            }),
+            position: None,
+        }
+    }
+
+    #[test]
+    fn automation_graph_migration_creates_contract_tables() {
+        let temp = temp_db_path("automation-graph-migration");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        assert_eq!(
+            current_schema_version(&conn).unwrap(),
+            CURRENT_SCHEMA_VERSION
+        );
+        for table in [
+            "automation_graphs",
+            "automation_graph_nodes",
+            "automation_graph_edges",
+            "automation_graph_runs",
+            "automation_graph_run_steps",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "missing table {table}");
+        }
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn right_rail_plugin_seed_defaults_and_protects_system_plugins() {
+        let temp = temp_db_path("right-rail-plugin-seed");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let plugins = RightRailPluginRepository::list(&conn).unwrap();
+        assert_eq!(plugins.len(), 6);
+        let files = plugins
+            .iter()
+            .find(|plugin| plugin.id.as_str() == "rail_plugin_system_files")
+            .unwrap();
+        assert_eq!(files.kind, RightRailPluginKind::System);
+        assert_eq!(files.system_key, Some(RightRailSystemPluginKey::Files));
+        assert_eq!(files.status, RightRailPluginStatus::Enabled);
+        let yuanbao = plugins
+            .iter()
+            .find(|plugin| plugin.builtin_key.as_deref() == Some("yuanbao"))
+            .unwrap();
+        assert_eq!(yuanbao.display_name, "元宝");
+        assert_eq!(
+            yuanbao.url.as_deref(),
+            Some("https://yuanbao.tencent.com/chat")
+        );
+        assert_eq!(yuanbao.ua_mode, Some(RightRailWebPluginUaMode::Mobile));
+        assert!(!plugins.iter().any(|plugin| matches!(
+            plugin.builtin_key.as_deref(),
+            Some("deepseek" | "chatgpt" | "gemini")
+        )));
+
+        let err = RightRailPluginRepository::update(
+            &conn,
+            RightRailPluginUpdateRequest {
+                id: files.id.clone(),
+                display_name: Some("Changed".to_string()),
+                url: None,
+                logo: None,
+                clear_logo: false,
+                desktop_user_agent: None,
+                clear_desktop_user_agent: false,
+                mobile_user_agent: None,
+                clear_mobile_user_agent: false,
+                ua_mode: None,
+                status: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "right_rail_system_plugin_immutable");
+
+        let err = RightRailPluginRepository::soft_delete(
+            &conn,
+            RightRailPluginDeleteRequest {
+                id: files.id.clone(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "right_rail_system_plugin_immutable");
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn right_rail_plugin_seed_defaults_retire_deprecated_presets() {
+        let temp = temp_db_path("right-rail-plugin-retire-deprecated");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let now = unix_timestamp_ms();
+        conn.execute(
+            "
+            INSERT INTO right_rail_plugins (
+                plugin_id, kind, system_key, builtin_key, display_name, url, logo,
+                desktop_user_agent, mobile_user_agent, ua_mode, status, order_index,
+                data_directory, created_at_ms, updated_at_ms, deleted_at_ms
+            )
+            VALUES (?1, ?2, NULL, ?3, ?4, ?5, NULL, NULL, NULL, ?6, ?7, ?8, ?9, ?10, ?10, NULL)
+            ",
+            params![
+                "rail_plugin_builtin_chatgpt",
+                enum_to_db(&RightRailPluginKind::Web).unwrap(),
+                "chatgpt",
+                "ChatGPT",
+                "https://chatgpt.com/",
+                enum_to_db(&RightRailWebPluginUaMode::Desktop).unwrap(),
+                enum_to_db(&RightRailPluginStatus::Enabled).unwrap(),
+                13_i64,
+                "right-rail/rail_plugin_builtin_chatgpt",
+                now
+            ],
+        )
+        .unwrap();
+
+        let plugins = RightRailPluginRepository::list(&conn).unwrap();
+
+        assert!(
+            !plugins
+                .iter()
+                .any(|plugin| plugin.builtin_key.as_deref() == Some("chatgpt"))
+        );
+        let deleted_at_ms = conn
+            .query_row(
+                "SELECT deleted_at_ms FROM right_rail_plugins WHERE builtin_key = 'chatgpt'",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .unwrap();
+        assert!(deleted_at_ms.is_some());
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn right_rail_web_plugin_lifecycle_round_trip() {
+        let temp = temp_db_path("right-rail-plugin-lifecycle");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let created = RightRailPluginRepository::create(
+            &conn,
+            RightRailPluginCreateRequest {
+                display_name: "Example".to_string(),
+                url: "https://example.invalid/app".to_string(),
+                logo: Some("https://example.invalid/logo.png".to_string()),
+                desktop_user_agent: Some("Desktop UA".to_string()),
+                mobile_user_agent: Some("Mobile UA".to_string()),
+                ua_mode: RightRailWebPluginUaMode::Desktop,
+            },
+        )
+        .unwrap();
+        assert_eq!(created.kind, RightRailPluginKind::Web);
+        assert_eq!(created.status, RightRailPluginStatus::Enabled);
+        assert_eq!(created.url.as_deref(), Some("https://example.invalid/app"));
+        assert!(
+            created
+                .data_directory
+                .as_deref()
+                .unwrap()
+                .contains(created.id.as_str())
+        );
+
+        let updated = RightRailPluginRepository::update(
+            &conn,
+            RightRailPluginUpdateRequest {
+                id: created.id.clone(),
+                display_name: Some("Example Mobile".to_string()),
+                url: Some("https://example.invalid/mobile".to_string()),
+                logo: None,
+                clear_logo: true,
+                desktop_user_agent: None,
+                clear_desktop_user_agent: true,
+                mobile_user_agent: Some("Mobile UA 2".to_string()),
+                clear_mobile_user_agent: false,
+                ua_mode: Some(RightRailWebPluginUaMode::Mobile),
+                status: Some(RightRailPluginStatus::Disabled),
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.display_name, "Example Mobile");
+        assert_eq!(updated.logo, None);
+        assert_eq!(updated.desktop_user_agent, None);
+        assert_eq!(updated.mobile_user_agent.as_deref(), Some("Mobile UA 2"));
+        assert_eq!(updated.ua_mode, Some(RightRailWebPluginUaMode::Mobile));
+        assert_eq!(updated.status, RightRailPluginStatus::Disabled);
+
+        let deleted = RightRailPluginRepository::soft_delete(
+            &conn,
+            RightRailPluginDeleteRequest {
+                id: created.id.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(deleted.status, RightRailPluginStatus::Deleted);
+        assert!(deleted.deleted_at_ms.is_some());
+        assert!(
+            !RightRailPluginRepository::list(&conn)
+                .unwrap()
+                .iter()
+                .any(|plugin| plugin.id == created.id)
+        );
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn right_rail_plugin_reorder_preserves_missing_current_plugins() {
+        let temp = temp_db_path("right-rail-plugin-reorder");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let plugins = RightRailPluginRepository::list(&conn).unwrap();
+        let git_id = RightRailPluginId::parse("rail_plugin_system_git").unwrap();
+        let files_id = RightRailPluginId::parse("rail_plugin_system_files").unwrap();
+
+        let reordered = RightRailPluginRepository::reorder(
+            &conn,
+            RightRailPluginReorderRequest {
+                ordered_plugin_ids: vec![git_id.clone(), files_id.clone()],
+            },
+        )
+        .unwrap();
+        assert_eq!(reordered[0].id, git_id);
+        assert_eq!(reordered[1].id, files_id);
+        assert_eq!(reordered.len(), plugins.len());
+
+        let err = RightRailPluginRepository::reorder(
+            &conn,
+            RightRailPluginReorderRequest {
+                ordered_plugin_ids: vec![files_id.clone(), files_id],
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "right_rail_plugin_reorder_duplicate_id");
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn automation_graph_lifecycle_and_definition_replacement_round_trip() {
+        let temp = temp_db_path("automation-graph-lifecycle");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let (_project, workspace) = WorkspaceRepository::ensure(
+            &conn,
+            "/tmp/vibex-db-automation-graph",
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let first_node_id = AutomationNodeId::new();
+        let second_node_id = AutomationNodeId::new();
+        let graph = AutomationGraphRepository::create(
+            &mut conn,
+            AutomationGraphCreateRequest {
+                title: "Local review graph".to_string(),
+                description: Some("Provider-neutral graph contract".to_string()),
+                project_id: None,
+                workspace_id: Some(workspace.id.clone()),
+                workspace_root: workspace.root_path.clone(),
+                workspace_mode: workspace.mode,
+                provider_kind: Some(ProviderKind::Codex),
+                provider_profile_id: None,
+                trigger: AutomationGraphTrigger::Manual,
+                nodes: vec![
+                    automation_agent_node_request(first_node_id.clone(), "Prompt"),
+                    automation_approval_node_request(second_node_id.clone(), "Approve"),
+                ],
+                edges: vec![AutomationEdgeCreateRequest {
+                    source_node_id: first_node_id.clone(),
+                    target_node_id: second_node_id.clone(),
+                    condition: AutomationEdgeCondition {
+                        kind: AutomationEdgeConditionKind::OnSuccess,
+                        expression: Some("safe_to_continue".to_string()),
+                    },
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(graph.status, AutomationGraphStatus::Active);
+        assert_eq!(graph.version, 1);
+        assert_eq!(graph.nodes.len(), 2);
+        assert_eq!(graph.edges.len(), 1);
+
+        let loaded = AutomationGraphRepository::get(&conn, &graph.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.trigger, AutomationGraphTrigger::Manual);
+        assert!(loaded.nodes.iter().any(|node| node.id == first_node_id));
+        assert_eq!(loaded.edges[0].source_node_id, first_node_id);
+
+        let listed = AutomationGraphRepository::list(
+            &conn,
+            AutomationGraphListRequest {
+                workspace_id: Some(workspace.id.clone()),
+                status: Some(AutomationGraphStatus::Active),
+                include_deleted: false,
+                limit: Some(10),
+            },
+        )
+        .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, graph.id);
+
+        let updated = AutomationGraphRepository::update(
+            &conn,
+            AutomationGraphUpdateRequest {
+                id: graph.id.clone(),
+                title: Some("Updated local review graph".to_string()),
+                description: None,
+                clear_description: true,
+                project_id: None,
+                clear_project_id: false,
+                workspace_id: None,
+                clear_workspace_id: false,
+                workspace_root: None,
+                workspace_mode: None,
+                provider_kind: None,
+                clear_provider_kind: true,
+                provider_profile_id: None,
+                clear_provider_profile_id: false,
+                trigger: None,
+                status: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.title, "Updated local review graph");
+        assert!(updated.description.is_none());
+        assert!(updated.provider_kind.is_none());
+        assert_eq!(updated.version, 2);
+
+        let replacement_node_id = AutomationNodeId::new();
+        let replaced = AutomationGraphRepository::replace_definition(
+            &mut conn,
+            &graph.id,
+            vec![automation_agent_node_request(
+                replacement_node_id.clone(),
+                "Replacement",
+            )],
+            Vec::new(),
+            Some(2),
+        )
+        .unwrap();
+        assert_eq!(replaced.version, 3);
+        assert_eq!(replaced.nodes.len(), 1);
+        assert_eq!(replaced.nodes[0].id, replacement_node_id);
+        assert!(replaced.edges.is_empty());
+
+        let stale = AutomationGraphRepository::replace_definition(
+            &mut conn,
+            &graph.id,
+            vec![automation_agent_node_request(
+                AutomationNodeId::new(),
+                "Stale",
+            )],
+            Vec::new(),
+            Some(2),
+        )
+        .unwrap_err();
+        assert_eq!(stale.code, "automation_graph_version_conflict");
+        let current = AutomationGraphRepository::get(&conn, &graph.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.version, 3);
+        assert_eq!(current.nodes[0].id, replacement_node_id);
+
+        let deleted = AutomationGraphRepository::soft_delete(&conn, &graph.id).unwrap();
+        assert_eq!(deleted.status, AutomationGraphStatus::Deleted);
+        assert!(deleted.deleted_at_ms.is_some());
+        assert!(
+            AutomationGraphRepository::get(&conn, &graph.id)
+                .unwrap()
+                .is_none()
+        );
+
+        let deleted_list = AutomationGraphRepository::list(
+            &conn,
+            AutomationGraphListRequest {
+                workspace_id: Some(workspace.id),
+                status: Some(AutomationGraphStatus::Deleted),
+                include_deleted: true,
+                limit: Some(10),
+            },
+        )
+        .unwrap();
+        assert_eq!(deleted_list.len(), 1);
+        assert_eq!(deleted_list[0].id, graph.id);
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn automation_graph_run_and_step_history_bounds_diagnostics() {
+        let temp = temp_db_path("automation-graph-runs");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let node_id = AutomationNodeId::new();
+        let graph = AutomationGraphRepository::create(
+            &mut conn,
+            AutomationGraphCreateRequest {
+                title: "Run graph".to_string(),
+                description: None,
+                project_id: None,
+                workspace_id: None,
+                workspace_root: "/tmp/vibex-db-automation-runs".to_string(),
+                workspace_mode: WorkspaceMode::CurrentCheckout,
+                provider_kind: Some(ProviderKind::Codex),
+                provider_profile_id: None,
+                trigger: AutomationGraphTrigger::Manual,
+                nodes: vec![automation_agent_node_request(node_id.clone(), "Run step")],
+                edges: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let run = AutomationGraphRepository::create_run(
+            &conn,
+            AutomationRunCreateRequest {
+                graph_id: graph.id.clone(),
+                status: AutomationRunStatus::Failed,
+                trigger: AutomationRunTrigger::Manual,
+                scheduled_task_id: None,
+                session_id: None,
+                started_at_ms: Some(1_800_000_000_100),
+                ended_at_ms: Some(1_800_000_000_200),
+                error_code: Some("e".repeat(SCHEDULED_TASK_ERROR_CODE_MAX_CHARS + 1)),
+                error_message: Some("m".repeat(SCHEDULED_TASK_ERROR_MESSAGE_MAX_CHARS + 1)),
+                redacted_diagnostics: vec![RedactedDiagnostic {
+                    key: "k".repeat(SCHEDULED_TASK_DIAGNOSTIC_KEY_MAX_CHARS + 1),
+                    value: "v".repeat(SCHEDULED_TASK_DIAGNOSTIC_VALUE_MAX_CHARS + 1),
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            run.error_code.as_ref().unwrap().chars().count(),
+            SCHEDULED_TASK_ERROR_CODE_MAX_CHARS
+        );
+        assert_eq!(
+            run.redacted_diagnostics[0].value.chars().count(),
+            SCHEDULED_TASK_DIAGNOSTIC_VALUE_MAX_CHARS
+        );
+
+        let updated_run = AutomationGraphRepository::update_run(
+            &conn,
+            AutomationRunUpdateRequest {
+                id: run.id.clone(),
+                status: Some(AutomationRunStatus::Succeeded),
+                scheduled_task_id: None,
+                clear_scheduled_task_id: false,
+                session_id: None,
+                clear_session_id: false,
+                started_at_ms: None,
+                clear_started_at_ms: false,
+                ended_at_ms: Some(1_800_000_000_300),
+                clear_ended_at_ms: false,
+                error_code: None,
+                clear_error_code: true,
+                error_message: None,
+                clear_error_message: true,
+                redacted_diagnostics: Some(Vec::new()),
+            },
+        )
+        .unwrap();
+        assert_eq!(updated_run.status, AutomationRunStatus::Succeeded);
+        assert!(updated_run.error_code.is_none());
+
+        let runs = AutomationGraphRepository::list_runs(
+            &conn,
+            AutomationRunListRequest {
+                graph_id: Some(graph.id),
+                status: Some(AutomationRunStatus::Succeeded),
+                limit: Some(10),
+            },
+        )
+        .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, run.id);
+
+        let permission_id = RequestId::new();
+        let step = AutomationGraphRepository::create_run_step(
+            &conn,
+            AutomationRunStepCreateRequest {
+                run_id: run.id.clone(),
+                node_id: node_id.clone(),
+                status: AutomationRunStepStatus::WaitingForApproval,
+                session_id: None,
+                permission_request_id: Some(permission_id.clone()),
+                started_at_ms: Some(1_800_000_000_150),
+                ended_at_ms: None,
+                error_code: None,
+                error_message: None,
+                redacted_diagnostics: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(step.permission_request_id, Some(permission_id));
+
+        let updated_step = AutomationGraphRepository::update_run_step(
+            &conn,
+            AutomationRunStepUpdateRequest {
+                id: step.id.clone(),
+                status: Some(AutomationRunStepStatus::Succeeded),
+                session_id: None,
+                clear_session_id: false,
+                permission_request_id: None,
+                clear_permission_request_id: true,
+                started_at_ms: None,
+                clear_started_at_ms: false,
+                ended_at_ms: Some(1_800_000_000_250),
+                clear_ended_at_ms: false,
+                error_code: None,
+                clear_error_code: false,
+                error_message: None,
+                clear_error_message: false,
+                redacted_diagnostics: Some(vec![RedactedDiagnostic {
+                    key: "state".to_string(),
+                    value: "approved".to_string(),
+                }]),
+            },
+        )
+        .unwrap();
+        assert_eq!(updated_step.status, AutomationRunStepStatus::Succeeded);
+        assert!(updated_step.permission_request_id.is_none());
+
+        let steps = AutomationGraphRepository::list_run_steps(
+            &conn,
+            AutomationRunStepListRequest {
+                run_id: Some(run.id),
+                node_id: Some(node_id),
+                status: Some(AutomationRunStepStatus::Succeeded),
+                limit: Some(10),
+            },
+        )
+        .unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].id, step.id);
+        assert_eq!(steps[0].redacted_diagnostics[0].key, "state");
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn workspace_delete_project_soft_deletes_records_without_touching_files() {
+        let temp = temp_db_path("workspace-delete-project");
+        let project_dir = std::env::temp_dir().join(format!(
+            "vibex-project-delete-{}",
+            RequestId::new().as_str()
+        ));
+        fs::create_dir_all(&project_dir).unwrap();
+        let sentinel_path = project_dir.join("keep.txt");
+        fs::write(&sentinel_path, "do not delete").unwrap();
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &project_dir, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let now = unix_timestamp_ms();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "Project session".to_string(),
+            project_id: project.id.clone(),
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path.clone(),
+            workspace_mode: workspace.mode,
+            agent_id: AgentId::parse("codex").unwrap(),
+            state: AgentSessionState::Idle,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        SessionRepository::insert(&conn, &session).unwrap();
+
+        WorkspaceRepository::delete_project(&mut conn, &project.id).unwrap();
+
+        assert!(sentinel_path.exists());
+        assert!(WorkspaceRepository::list(&conn).unwrap().is_empty());
+        assert!(
+            WorkspaceRepository::get(&conn, &workspace.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(SessionRepository::list(&conn, false).unwrap().is_empty());
+
+        let (_restored_project, restored_workspace) =
+            WorkspaceRepository::ensure(&conn, &project_dir, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        assert_eq!(restored_workspace.id, workspace.id);
+        assert_eq!(WorkspaceRepository::list(&conn).unwrap().len(), 1);
+
+        cleanup_db(temp);
+        fs::remove_dir_all(project_dir).unwrap();
+    }
+
+    #[test]
+    fn scheduled_task_lifecycle_round_trip() {
+        let temp = temp_db_path("scheduled-task-lifecycle");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let (project, workspace) = WorkspaceRepository::ensure(
+            &conn,
+            "/tmp/vibex-db-scheduled-task",
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+
+        let task = ScheduledTaskRepository::create(
+            &conn,
+            ScheduledTaskCreateRequest {
+                title: "Daily summary".to_string(),
+                prompt: "Summarize the repository state".to_string(),
+                project_id: Some(project.id.clone()),
+                workspace_id: Some(workspace.id.clone()),
+                workspace_root: workspace.root_path.clone(),
+                workspace_mode: workspace.mode,
+                provider_kind: ProviderKind::Codex,
+                provider_profile_id: None,
+                schedule: ScheduledTaskSchedule::Daily(ScheduledTaskDailySchedule {
+                    local_time_minutes: 9 * 60,
+                    timezone: "Asia/Shanghai".to_string(),
+                    start_at_ms: 1_800_000_000_000,
+                    end_at_ms: None,
+                }),
+                safety: None,
+                next_run_at_ms: Some(1_800_003_600_000),
+            },
+        )
+        .unwrap();
+        assert_eq!(task.status, ScheduledTaskStatus::Active);
+
+        let loaded = ScheduledTaskRepository::get(&conn, &task.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.schedule, task.schedule);
+        assert_eq!(
+            loaded.safety,
+            AgentSessionSafety::workspace_write_ask_on_risk()
+        );
+
+        let listed = ScheduledTaskRepository::list(
+            &conn,
+            ScheduledTaskListRequest {
+                workspace_id: Some(workspace.id.clone()),
+                status: Some(ScheduledTaskStatus::Active),
+                include_deleted: false,
+                limit: Some(10),
+            },
+        )
+        .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, task.id);
+
+        let updated = ScheduledTaskRepository::update(
+            &conn,
+            ScheduledTaskUpdateRequest {
+                id: task.id.clone(),
+                title: Some("Hourly summary".to_string()),
+                prompt: Some("Summarize recent changes".to_string()),
+                project_id: None,
+                clear_project_id: false,
+                workspace_id: None,
+                clear_workspace_id: false,
+                workspace_root: None,
+                workspace_mode: None,
+                provider_kind: None,
+                provider_profile_id: None,
+                clear_provider_profile_id: false,
+                schedule: Some(ScheduledTaskSchedule::Interval(
+                    ScheduledTaskIntervalSchedule {
+                        every_seconds: 3600,
+                        start_at_ms: 1_800_000_000_000,
+                        end_at_ms: Some(1_800_086_400_000),
+                    },
+                )),
+                safety: None,
+                next_run_at_ms: None,
+                clear_next_run_at_ms: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.title, "Hourly summary");
+        assert_eq!(updated.next_run_at_ms, None);
+
+        let paused = ScheduledTaskRepository::pause(&conn, &task.id).unwrap();
+        assert_eq!(paused.status, ScheduledTaskStatus::Paused);
+        let resumed = ScheduledTaskRepository::resume(&conn, &task.id).unwrap();
+        assert_eq!(resumed.status, ScheduledTaskStatus::Active);
+
+        let deleted = ScheduledTaskRepository::soft_delete(&conn, &task.id).unwrap();
+        assert_eq!(deleted.status, ScheduledTaskStatus::Deleted);
+        assert!(deleted.deleted_at_ms.is_some());
+        assert!(
+            ScheduledTaskRepository::get(&conn, &task.id)
+                .unwrap()
+                .is_none()
+        );
+
+        let deleted_list = ScheduledTaskRepository::list(
+            &conn,
+            ScheduledTaskListRequest {
+                workspace_id: Some(workspace.id),
+                status: Some(ScheduledTaskStatus::Deleted),
+                include_deleted: true,
+                limit: Some(10),
+            },
+        )
+        .unwrap();
+        assert_eq!(deleted_list.len(), 1);
+        assert_eq!(deleted_list[0].id, task.id);
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn scheduled_task_run_history_bounds_diagnostics_and_updates() {
+        let temp = temp_db_path("scheduled-task-runs");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let (_project, workspace) = WorkspaceRepository::ensure(
+            &conn,
+            "/tmp/vibex-db-scheduled-task-run",
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let task = ScheduledTaskRepository::create(
+            &conn,
+            ScheduledTaskCreateRequest {
+                title: "One shot".to_string(),
+                prompt: "Run once".to_string(),
+                project_id: None,
+                workspace_id: Some(workspace.id),
+                workspace_root: workspace.root_path,
+                workspace_mode: WorkspaceMode::CurrentCheckout,
+                provider_kind: ProviderKind::Codex,
+                provider_profile_id: None,
+                schedule: ScheduledTaskSchedule::OneShot(ScheduledTaskOneShotSchedule {
+                    run_at_ms: 1_800_000_000_000,
+                }),
+                safety: None,
+                next_run_at_ms: Some(1_800_000_000_000),
+            },
+        )
+        .unwrap();
+
+        let run = ScheduledTaskRepository::create_run(
+            &conn,
+            ScheduledTaskRunCreateRequest {
+                task_id: task.id.clone(),
+                status: ScheduledTaskRunStatus::Failed,
+                trigger: ScheduledTaskRunTrigger::Scheduler,
+                session_id: None,
+                due_at_ms: 1_800_000_000_000,
+                started_at_ms: Some(1_800_000_000_100),
+                ended_at_ms: Some(1_800_000_000_200),
+                attempt: 1,
+                error_code: Some("x".repeat(SCHEDULED_TASK_ERROR_CODE_MAX_CHARS + 10)),
+                error_message: Some("y".repeat(SCHEDULED_TASK_ERROR_MESSAGE_MAX_CHARS + 10)),
+                redacted_diagnostics: vec![RedactedDiagnostic {
+                    key: "k".repeat(SCHEDULED_TASK_DIAGNOSTIC_KEY_MAX_CHARS + 10),
+                    value: "v".repeat(SCHEDULED_TASK_DIAGNOSTIC_VALUE_MAX_CHARS + 10),
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            run.error_code.as_ref().unwrap().chars().count(),
+            SCHEDULED_TASK_ERROR_CODE_MAX_CHARS
+        );
+        assert_eq!(
+            run.error_message.as_ref().unwrap().chars().count(),
+            SCHEDULED_TASK_ERROR_MESSAGE_MAX_CHARS
+        );
+        assert_eq!(
+            run.redacted_diagnostics[0].key.chars().count(),
+            SCHEDULED_TASK_DIAGNOSTIC_KEY_MAX_CHARS
+        );
+        assert_eq!(
+            run.redacted_diagnostics[0].value.chars().count(),
+            SCHEDULED_TASK_DIAGNOSTIC_VALUE_MAX_CHARS
+        );
+
+        let updated = ScheduledTaskRepository::update_run(
+            &conn,
+            ScheduledTaskRunUpdateRequest {
+                id: run.id.clone(),
+                status: Some(ScheduledTaskRunStatus::Succeeded),
+                session_id: None,
+                clear_session_id: false,
+                started_at_ms: None,
+                clear_started_at_ms: false,
+                ended_at_ms: Some(1_800_000_000_300),
+                clear_ended_at_ms: false,
+                attempt: Some(2),
+                error_code: None,
+                clear_error_code: true,
+                error_message: None,
+                clear_error_message: true,
+                redacted_diagnostics: Some(Vec::new()),
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.status, ScheduledTaskRunStatus::Succeeded);
+        assert_eq!(updated.attempt, 2);
+        assert!(updated.error_code.is_none());
+        assert!(updated.redacted_diagnostics.is_empty());
+
+        let runs = ScheduledTaskRepository::list_runs(
+            &conn,
+            ScheduledTaskRunListRequest {
+                task_id: Some(task.id),
+                session_id: None,
+                status: Some(ScheduledTaskRunStatus::Succeeded),
+                limit: Some(10),
+            },
+        )
+        .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, run.id);
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn scheduled_task_attention_and_audit_are_bounded_projections() {
+        let temp = temp_db_path("scheduled-task-audit");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let (_project, workspace) = WorkspaceRepository::ensure(
+            &conn,
+            "/tmp/vibex-db-scheduled-task-audit",
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let task = ScheduledTaskRepository::create(
+            &conn,
+            ScheduledTaskCreateRequest {
+                title: "Permission gated run".to_string(),
+                prompt: "Prompt text must stay out of audit projections".to_string(),
+                project_id: None,
+                workspace_id: Some(workspace.id.clone()),
+                workspace_root: workspace.root_path.clone(),
+                workspace_mode: WorkspaceMode::CurrentCheckout,
+                provider_kind: ProviderKind::Codex,
+                provider_profile_id: None,
+                schedule: ScheduledTaskSchedule::OneShot(ScheduledTaskOneShotSchedule {
+                    run_at_ms: 1_800_000_000_000,
+                }),
+                safety: None,
+                next_run_at_ms: Some(1_800_000_000_000),
+            },
+        )
+        .unwrap();
+        let run = ScheduledTaskRepository::create_run(
+            &conn,
+            ScheduledTaskRunCreateRequest {
+                task_id: task.id.clone(),
+                status: ScheduledTaskRunStatus::Skipped,
+                trigger: ScheduledTaskRunTrigger::Scheduler,
+                session_id: None,
+                due_at_ms: 1_800_000_000_000,
+                started_at_ms: Some(1_800_000_000_100),
+                ended_at_ms: Some(1_800_000_000_200),
+                attempt: 1,
+                error_code: Some(SCHEDULED_TASK_PERMISSION_REQUIRED_CODE.to_string()),
+                error_message: Some("Open session to review the provider request.".to_string()),
+                redacted_diagnostics: vec![RedactedDiagnostic {
+                    key: "state".to_string(),
+                    value: "needs_input".to_string(),
+                }],
+            },
+        )
+        .unwrap();
+        let _success = ScheduledTaskRepository::create_run(
+            &conn,
+            ScheduledTaskRunCreateRequest {
+                task_id: task.id.clone(),
+                status: ScheduledTaskRunStatus::Succeeded,
+                trigger: ScheduledTaskRunTrigger::Manual,
+                session_id: None,
+                due_at_ms: 1_800_000_001_000,
+                started_at_ms: Some(1_800_000_001_100),
+                ended_at_ms: Some(1_800_000_001_200),
+                attempt: 1,
+                error_code: None,
+                error_message: None,
+                redacted_diagnostics: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let attention = ScheduledTaskRepository::list_attention(
+            &conn,
+            ScheduledTaskAttentionListRequest {
+                workspace_id: Some(workspace.id.clone()),
+                limit: Some(10),
+            },
+        )
+        .unwrap();
+        assert_eq!(attention.len(), 1);
+        assert_eq!(attention[0].run_id, run.id);
+        assert_eq!(
+            attention[0].attention_kind,
+            ScheduledTaskAttentionKind::PermissionRequired
+        );
+        assert_eq!(attention[0].task_title, "Permission gated run");
+
+        let audit = ScheduledTaskRepository::list_audit(
+            &conn,
+            ScheduledTaskAuditListRequest {
+                workspace_id: Some(workspace.id),
+                status: Some(ScheduledTaskRunStatus::Skipped),
+                limit: Some(10),
+            },
+        )
+        .unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(
+            audit[0].audit_id,
+            format!("scheduled_audit:{}", run.id.as_str())
+        );
+        assert_eq!(
+            audit[0].outcome,
+            ScheduledTaskAuditOutcome::PermissionRequired
+        );
+        assert_eq!(audit[0].redacted_diagnostics[0].key, "state");
+        let audit_json = serde_json::to_string(&audit[0]).unwrap();
+        assert!(!audit_json.contains("Prompt text must stay out"));
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn scheduled_task_due_claim_and_recovery_helpers_are_deterministic() {
+        let temp = temp_db_path("scheduled-task-runtime");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let due_now = 1_800_000_000_000;
+        let later = due_now + 60_000;
+        let due_task = ScheduledTaskRepository::create(
+            &conn,
+            ScheduledTaskCreateRequest {
+                title: "Due task".to_string(),
+                prompt: "Run now".to_string(),
+                project_id: None,
+                workspace_id: None,
+                workspace_root: "/tmp/vibex-db-scheduled-task-due".to_string(),
+                workspace_mode: WorkspaceMode::CurrentCheckout,
+                provider_kind: ProviderKind::Codex,
+                provider_profile_id: None,
+                schedule: ScheduledTaskSchedule::OneShot(ScheduledTaskOneShotSchedule {
+                    run_at_ms: due_now,
+                }),
+                safety: None,
+                next_run_at_ms: Some(due_now),
+            },
+        )
+        .unwrap();
+        let future_task = ScheduledTaskRepository::create(
+            &conn,
+            ScheduledTaskCreateRequest {
+                title: "Future task".to_string(),
+                prompt: "Run later".to_string(),
+                project_id: None,
+                workspace_id: None,
+                workspace_root: "/tmp/vibex-db-scheduled-task-future".to_string(),
+                workspace_mode: WorkspaceMode::CurrentCheckout,
+                provider_kind: ProviderKind::Codex,
+                provider_profile_id: None,
+                schedule: ScheduledTaskSchedule::OneShot(ScheduledTaskOneShotSchedule {
+                    run_at_ms: later,
+                }),
+                safety: None,
+                next_run_at_ms: Some(later),
+            },
+        )
+        .unwrap();
+
+        let due = ScheduledTaskRepository::list_due(&conn, due_now, Some(10)).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, due_task.id);
+
+        let (claimed_task, run) =
+            ScheduledTaskRepository::claim_due(&mut conn, &due_task.id, due_now)
+                .unwrap()
+                .unwrap();
+        assert_eq!(claimed_task.next_run_at_ms, None);
+        assert_eq!(run.status, ScheduledTaskRunStatus::Running);
+        assert_eq!(run.trigger, ScheduledTaskRunTrigger::Scheduler);
+        assert_eq!(run.due_at_ms, due_now);
+        assert_eq!(run.started_at_ms, Some(due_now));
+        assert!(
+            ScheduledTaskRepository::claim_due(&mut conn, &due_task.id, due_now)
+                .unwrap()
+                .is_none()
+        );
+
+        let due_after_claim = ScheduledTaskRepository::list_due(&conn, later, Some(10)).unwrap();
+        assert_eq!(due_after_claim.len(), 1);
+        assert_eq!(due_after_claim[0].id, future_task.id);
+
+        let updated_task = ScheduledTaskRepository::mark_task_after_run(
+            &conn,
+            &due_task.id,
+            ScheduledTaskStatus::Paused,
+            None,
+            due_now + 1,
+        )
+        .unwrap();
+        assert_eq!(updated_task.status, ScheduledTaskStatus::Paused);
+        assert_eq!(updated_task.next_run_at_ms, None);
+
+        let stale =
+            ScheduledTaskRepository::list_stale_running_runs(&conn, due_now + 5_000, Some(10))
+                .unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].id, run.id);
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn managed_worktree_and_operation_round_trip() {
+        let temp = temp_db_path("worktree");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let (project, main_workspace) = WorkspaceRepository::ensure(
+            &conn,
+            "/tmp/vibex-db-worktree-main",
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let worktree_workspace = WorkspaceRepository::ensure_for_project(
+            &conn,
+            &project.id,
+            "/tmp/vibex-db-worktree-feature",
+            WorkspaceMode::VibexWorktree,
+        )
+        .unwrap();
+        assert_eq!(worktree_workspace.project_id, project.id);
+
+        let now = unix_timestamp_ms();
+        let record = ManagedWorktreeRecord {
+            worktree_id: RequestId::new(),
+            project_id: project.id.clone(),
+            workspace_id: Some(worktree_workspace.id.clone()),
+            repo_root: main_workspace.root_path.clone(),
+            worktree_path: worktree_workspace.root_path.clone(),
+            branch: Some("feature/demo".to_string()),
+            base_ref: Some("main".to_string()),
+            head: Some("abc1234".to_string()),
+            status: GitManagedWorktreeStatus::Active,
+            created_at_ms: now,
+            updated_at_ms: now,
+            closed_at_ms: None,
+        };
+        ManagedWorktreeRepository::insert(&conn, &record).unwrap();
+        let stored = ManagedWorktreeRepository::get_by_path(&conn, &record.worktree_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.branch, record.branch);
+        assert_eq!(stored.status, GitManagedWorktreeStatus::Active);
+
+        let operation = GitWorktreeOperationRecord {
+            operation_id: RequestId::new(),
+            project_id: project.id.clone(),
+            source_workspace_id: Some(worktree_workspace.id.clone()),
+            target_workspace_id: Some(main_workspace.id.clone()),
+            operation: GitWorktreeOperationKind::MergeBack,
+            status: GitWorktreeOperationStatus::Pending,
+            worktree_path: Some(record.worktree_path.clone()),
+            branch: record.branch.clone(),
+            base_ref: record.base_ref.clone(),
+            head_before: Some("abc1234".to_string()),
+            head_after: None,
+            error: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        WorktreeOperationRepository::insert(&conn, &operation).unwrap();
+        let completed = WorktreeOperationRepository::update(
+            &conn,
+            &operation.operation_id,
+            GitWorktreeOperationStatus::Completed,
+            Some("def5678"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(completed.status, GitWorktreeOperationStatus::Completed);
+        assert_eq!(completed.head_after.as_deref(), Some("def5678"));
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn provider_native_export_preview_apply_and_list_round_trip() {
+        let temp = temp_db_path("native-export");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let profile =
+            ProviderProfileRepository::from_create_request(ProviderProfileCreateRequest {
+                agent_id: None,
+                kind: ProviderKind::Codex,
+                display_name: "Native export profile".to_string(),
+                account_alias: None,
+                base_url: Some("https://api.example.test/v1".to_string()),
+                default_model: Some("gpt-test".to_string()),
+                small_model: None,
+                large_model: None,
+                configured_models: Vec::new(),
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: None,
+                secret_references: Vec::new(),
+            });
+        ProviderProfileRepository::insert(&conn, &profile).unwrap();
+
+        let now = unix_timestamp_ms();
+        let export_id = RequestId::new();
+        let file = ProviderNativeExportFilePlan {
+            operation_id: RequestId::new(),
+            source: ProviderNativeExportSource::Codex,
+            file_kind: ProviderNativeConfigFileKind::CodexConfigToml,
+            operation_kind: ProviderNativeExportOperationKind::UpdateFile,
+            target_path: "/tmp/vibex-native-export/config.toml".to_string(),
+            backup_path: Some("/tmp/vibex-native-export/config.toml.bak".to_string()),
+            temp_path: Some("/tmp/vibex-native-export/config.toml.tmp".to_string()),
+            marker: Some("Vibex managed TOML block".to_string()),
+            redacted_before: "model = \"old\"\n".to_string(),
+            redacted_after: "model = \"new\"\n".to_string(),
+            redacted_diff: "--- current\n+++ vibex\n-model = \"old\"\n+model = \"new\"\n"
+                .to_string(),
+            rollback_plan: "restore backup".to_string(),
+            diagnostics: Vec::new(),
+            status: ProviderNativeExportFileStatus::Ready,
+        };
+        let preview = ProviderNativeExportPreview {
+            export_id: export_id.clone(),
+            provider_profile_id: profile.id.clone(),
+            source: ProviderNativeExportSource::Codex,
+            mode: ProviderNativeExportMode::ProviderProfile,
+            files: vec![file.clone()],
+            diagnostics: vec![ProviderBindingMetadata {
+                key: "secretPolicy".to_string(),
+                value: "redacted references only".to_string(),
+            }],
+            created_at_ms: now,
+        };
+        ProviderNativeExportRepository::insert_preview(&conn, &preview).unwrap();
+
+        let loaded = ProviderNativeExportRepository::get_preview(&conn, &export_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.export_id, export_id);
+        assert_eq!(loaded.files[0].redacted_diff, file.redacted_diff);
+
+        let apply = ProviderNativeExportApplyResult {
+            export_id: export_id.clone(),
+            status: ProviderNativeExportApplyStatus::Applied,
+            files: vec![ProviderNativeExportFilePlan {
+                status: ProviderNativeExportFileStatus::Applied,
+                ..file
+            }],
+            diagnostics: Vec::new(),
+            applied_at_ms: now + 1,
+        };
+        ProviderNativeExportRepository::record_apply_result(&conn, &apply).unwrap();
+
+        let records = ProviderNativeExportRepository::list(
+            &conn,
+            ProviderNativeExportListRequest {
+                provider_profile_id: Some(profile.id),
+                limit: Some(10),
+            },
+        )
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, "applied");
+        assert_eq!(records[0].file_count, 1);
+        assert_eq!(records[0].blocked_count, 0);
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn provider_profile_secret_default_and_preview_round_trip() {
+        let temp = temp_db_path("provider");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        ProviderProfileRepository::ensure_local_defaults(&conn).unwrap();
+        let defaults = ProviderProfileRepository::list(&conn).unwrap();
+        assert!(defaults.iter().any(|profile| {
+            profile.id.as_str() == ProviderKind::Codex.local_default_profile_id()
+        }));
+
+        let create = ProviderProfileCreateRequest {
+            agent_id: None,
+            kind: ProviderKind::Claude,
+            display_name: "Claude work".to_string(),
+            account_alias: Some("work".to_string()),
+            base_url: Some("https://api.anthropic.invalid".to_string()),
+            default_model: Some("claude-sonnet".to_string()),
+            small_model: None,
+            large_model: None,
+            configured_models: Vec::new(),
+            reasoning_effort: None,
+            sandbox_defaults: None,
+            network_defaults: None,
+            permission_defaults: None,
+            provider_options: None,
+            secret_references: vec![ProviderSecretReferenceCreateRequest {
+                secret_kind: ProviderSecretKind::AuthToken,
+                backend: ProviderSecretBackend::Placeholder,
+                setup_state: ProviderSecretSetupState::Missing,
+                lookup_key: "ANTHROPIC_API_KEY".to_string(),
+                display_label: "Anthropic API key".to_string(),
+                redacted_hint: "not configured".to_string(),
+            }],
+        };
+        let profile = ProviderProfileRepository::from_create_request(create);
+        ProviderProfileRepository::insert(&conn, &profile).unwrap();
+        let loaded = ProviderProfileRepository::get(&conn, &profile.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.secrets.len(), 1);
+        assert_eq!(loaded.secrets[0].lookup_key, "ANTHROPIC_API_KEY");
+
+        let scope = ProviderProfileDefaultScope {
+            kind: ProviderDefaultScopeKind::Global,
+            project_id: None,
+            workspace_id: None,
+        };
+        ProviderDefaultProfileRepository::set(
+            &conn,
+            ProviderProfileSetDefaultRequest {
+                scope: scope.clone(),
+                provider_kind: ProviderKind::Claude,
+                provider_profile_id: profile.id.clone(),
+            },
+        )
+        .unwrap();
+        let selection =
+            ProviderDefaultProfileRepository::get(&conn, scope, ProviderKind::Claude).unwrap();
+        assert_eq!(selection.provider_profile_id.as_ref(), Some(&profile.id));
+
+        let preview = ProviderInjectionPreview {
+            preview_id: RequestId::new(),
+            profile: loaded.summary(),
+            strategy_order: Vec::new(),
+            endpoint: loaded.base_url.clone(),
+            model: loaded.default_model.clone(),
+            sdk_options: Vec::new(),
+            cli_args: Vec::new(),
+            env: Vec::new(),
+            overlay_files: Vec::new(),
+            mcp_servers: Vec::new(),
+            skills: Vec::new(),
+            sandbox_defaults: loaded.sandbox_defaults.clone(),
+            network_defaults: loaded.network_defaults.clone(),
+            permission_defaults: loaded.permission_defaults.clone(),
+            created_at_ms: unix_timestamp_ms(),
+        };
+        ProviderInjectionPreviewRepository::insert(
+            &conn,
+            &ProviderInjectionPreviewRequest {
+                provider_profile_id: loaded.id,
+                project_id: None,
+                workspace_id: None,
+                session_id: None,
+                persist: true,
+            },
+            &preview,
+        )
+        .unwrap();
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn provider_profiles_are_agent_scoped_with_default_and_failover_queue() {
+        let temp = temp_db_path("provider-agent-scope");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        ProviderProfileRepository::ensure_local_defaults(&conn).unwrap();
+        let codex_profiles = ProviderProfileRepository::list_by_agent(
+            &conn,
+            &AgentId::parse("codex").unwrap(),
+            true,
+        )
+        .unwrap();
+        assert!(
+            codex_profiles.iter().any(
+                |profile| profile.id.as_str() == ProviderKind::Codex.local_default_profile_id()
+            )
+        );
+        assert!(
+            codex_profiles
+                .iter()
+                .all(|profile| profile.agent_id.as_str() == "codex")
+        );
+
+        let agent_id = AgentId::parse("opencode").unwrap();
+        let profile =
+            ProviderProfileRepository::from_create_request(ProviderProfileCreateRequest {
+                agent_id: Some(agent_id.clone()),
+                kind: ProviderKind::Acp,
+                display_name: "OpenCode ACP scoped".to_string(),
+                account_alias: None,
+                base_url: None,
+                default_model: Some("opencode-default".to_string()),
+                small_model: None,
+                large_model: None,
+                configured_models: Vec::new(),
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: None,
+                secret_references: Vec::new(),
+            });
+        ProviderProfileRepository::insert(&conn, &profile).unwrap();
+
+        let acp_profiles =
+            ProviderProfileRepository::list_by_agent(&conn, &agent_id, true).unwrap();
+        assert!(
+            acp_profiles
+                .iter()
+                .any(|candidate| candidate.id == profile.id)
+        );
+
+        let scope = ProviderProfileDefaultScope {
+            kind: ProviderDefaultScopeKind::Global,
+            project_id: None,
+            workspace_id: None,
+        };
+        let default = AgentDefaultModelProviderProfileRepository::set(
+            &conn,
+            scope.clone(),
+            agent_id.clone(),
+            profile.id.clone(),
+        )
+        .unwrap();
+        assert_eq!(default.provider_profile_id.as_ref(), Some(&profile.id));
+        let loaded_default =
+            AgentDefaultModelProviderProfileRepository::get(&conn, scope.clone(), agent_id.clone())
+                .unwrap();
+        assert_eq!(
+            loaded_default.provider_profile_id.as_ref(),
+            Some(&profile.id)
+        );
+
+        let queue = AgentModelProviderFailoverRepository::replace(
+            &mut conn,
+            &agent_id,
+            &[AgentModelProviderFailoverEntry {
+                agent_id: agent_id.clone(),
+                provider_profile_id: profile.id.clone(),
+                display_name: profile.display_name.clone(),
+                status: profile.status,
+                order_index: 0,
+                enabled: true,
+                updated_at_ms: unix_timestamp_ms(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].provider_profile_id, profile.id);
+        assert!(queue[0].enabled);
+
+        ProviderDefaultProfileRepository::set(
+            &conn,
+            ProviderProfileSetDefaultRequest {
+                scope: scope.clone(),
+                provider_kind: ProviderKind::Acp,
+                provider_profile_id: profile.id.clone(),
+            },
+        )
+        .unwrap();
+
+        ProviderProfileRepository::soft_delete(&mut conn, &profile.id).unwrap();
+        assert!(
+            AgentDefaultModelProviderProfileRepository::get(&conn, scope.clone(), agent_id.clone())
+                .unwrap()
+                .provider_profile_id
+                .is_none()
+        );
+        assert!(
+            ProviderDefaultProfileRepository::get(&conn, scope.clone(), ProviderKind::Acp)
+                .unwrap()
+                .provider_profile_id
+                .is_none()
+        );
+        assert!(
+            AgentModelProviderFailoverRepository::list(&conn, &agent_id)
+                .unwrap()
+                .is_empty()
+        );
+        for table in [
+            "provider_default_profiles",
+            "agent_default_model_provider_profiles",
+            "agent_model_provider_failover",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE provider_profile_id = ?1"),
+                    params![profile.id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{table} retained a deleted profile reference");
+        }
+
+        let scope_kind = enum_to_db(&scope.kind).unwrap();
+        let scope_id = scope.storage_key();
+        let now = unix_timestamp_ms();
+        conn.execute(
+            "
+            INSERT INTO agent_default_model_provider_profiles (
+                scope_kind, scope_id, agent_id, provider_profile_id,
+                created_at_ms, updated_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+            ",
+            params![
+                scope_kind,
+                scope_id,
+                agent_id.as_str(),
+                profile.id.as_str(),
+                now
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "
+            INSERT INTO provider_default_profiles (
+                scope_kind, scope_id, provider_kind, provider_profile_id,
+                created_at_ms, updated_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+            ",
+            params![
+                enum_to_db(&scope.kind).unwrap(),
+                scope.storage_key(),
+                enum_to_db(&ProviderKind::Acp).unwrap(),
+                profile.id.as_str(),
+                now
+            ],
+        )
+        .unwrap();
+        assert!(
+            AgentDefaultModelProviderProfileRepository::get(&conn, scope.clone(), agent_id)
+                .unwrap()
+                .provider_profile_id
+                .is_none()
+        );
+        assert!(
+            ProviderDefaultProfileRepository::get(&conn, scope, ProviderKind::Acp)
+                .unwrap()
+                .provider_profile_id
+                .is_none()
+        );
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn agent_config_and_discovery_round_trip() {
+        let temp = temp_db_path("agent");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let agent_id = AgentId::parse("opencode").unwrap();
+        let mut env = BTreeMap::new();
+        env.insert("NO_BROWSER".to_string(), "1".to_string());
+        let now = unix_timestamp_ms();
+        let mut config = AgentConfig {
+            agent_id: agent_id.clone(),
+            runtime_kind: AgentRuntimeKind::Acp,
+            source_kind: AgentSourceKind::Catalog,
+            label_override: Some("OpenCode".to_string()),
+            description_override: Some("ACP backed OpenCode".to_string()),
+            enabled: true,
+            order_index: 10,
+            command: Some(AgentCommandConfig {
+                command: "opencode".to_string(),
+                args: vec!["serve".to_string()],
+            }),
+            env,
+            params: serde_json::json!({ "preset": "opencode" }),
+            created_at_ms: now,
+            updated_at_ms: now,
+            deleted_at_ms: None,
+        };
+        AgentConfigRepository::upsert(&conn, &config).unwrap();
+
+        config.enabled = false;
+        config.updated_at_ms = now + 1;
+        AgentConfigRepository::upsert(&conn, &config).unwrap();
+
+        let loaded = AgentConfigRepository::get(&conn, &agent_id)
+            .unwrap()
+            .unwrap();
+        assert!(!loaded.enabled);
+        assert_eq!(loaded.command.unwrap().command, "opencode");
+        assert_eq!(AgentConfigRepository::list(&conn).unwrap().len(), 1);
+
+        AgentDiscoveryRepository::insert(
+            &conn,
+            &AgentDiscoveryRecord {
+                discovery_record_id: "agent_discovery_old".to_string(),
+                agent_id: agent_id.clone(),
+                cwd_scope: "home".to_string(),
+                install_status: AgentInstallStatus::Missing,
+                config_status: AgentConfigStatus::NeedsConfiguration,
+                runtime_status: AgentRuntimeStatus::Unavailable,
+                binary_path: None,
+                version: None,
+                native_config_paths: Vec::new(),
+                models: Vec::new(),
+                modes: Vec::new(),
+                diagnostics: Vec::new(),
+                discovered_at_ms: now,
+            },
+        )
+        .unwrap();
+        AgentDiscoveryRepository::insert(
+            &conn,
+            &AgentDiscoveryRecord {
+                discovery_record_id: "agent_discovery_new".to_string(),
+                agent_id: agent_id.clone(),
+                cwd_scope: "home".to_string(),
+                install_status: AgentInstallStatus::Installed,
+                config_status: AgentConfigStatus::Configured,
+                runtime_status: AgentRuntimeStatus::Ready,
+                binary_path: Some("/usr/bin/opencode".to_string()),
+                version: Some("1.0.0".to_string()),
+                native_config_paths: vec!["/home/user/.opencode.json".to_string()],
+                models: vec!["anthropic/claude-sonnet".to_string()],
+                modes: vec!["chat".to_string(), "plan".to_string()],
+                diagnostics: Vec::new(),
+                discovered_at_ms: now + 1,
+            },
+        )
+        .unwrap();
+
+        let latest = AgentDiscoveryRepository::latest_for_agent(&conn, &agent_id, "home")
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.discovery_record_id, "agent_discovery_new");
+        assert_eq!(latest.models, vec!["anthropic/claude-sonnet"]);
+
+        let by_agent = AgentDiscoveryRepository::latest_by_agent(&conn, "home").unwrap();
+        assert_eq!(
+            by_agent.get(&agent_id).unwrap().discovery_record_id,
+            "agent_discovery_new"
+        );
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn mcp_server_secret_matrix_and_soft_delete_round_trip() {
+        let temp = temp_db_path("mcp");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let request = McpServerCreateRequest {
+            display_name: "Filesystem tools".to_string(),
+            transport_kind: McpServerTransportKind::Stdio,
+            status: McpServerStatus::Enabled,
+            scope_kind: McpServerScopeKind::Workspace,
+            project_id: None,
+            workspace_id: None,
+            command: Some("mcp-filesystem".to_string()),
+            args: vec!["--root".to_string(), "/tmp/workspace".to_string()],
+            url: None,
+            description: Some("Local filesystem MCP server".to_string()),
+            tags: vec!["local".to_string(), "filesystem".to_string()],
+            secret_references: vec![McpServerSecretReferenceCreateRequest {
+                secret_kind: ProviderSecretKind::Environment,
+                backend: ProviderSecretBackend::Placeholder,
+                setup_state: ProviderSecretSetupState::Missing,
+                lookup_key: "MCP_FILESYSTEM_TOKEN".to_string(),
+                display_label: "Filesystem token".to_string(),
+                redacted_hint: "not configured".to_string(),
+                target: McpSecretTarget::Environment,
+            }],
+            provider_matrix: vec![
+                McpServerProviderMatrix {
+                    provider_kind: ProviderKind::Codex,
+                    enabled: true,
+                    updated_at_ms: unix_timestamp_ms(),
+                },
+                McpServerProviderMatrix {
+                    provider_kind: ProviderKind::Codex,
+                    enabled: true,
+                    updated_at_ms: unix_timestamp_ms(),
+                },
+                McpServerProviderMatrix {
+                    provider_kind: ProviderKind::Claude,
+                    enabled: false,
+                    updated_at_ms: unix_timestamp_ms(),
+                },
+            ],
+        };
+        let mut server = McpServerRepository::from_create_request(request);
+        let server_id = server.id.clone();
+        server.agent_matrix = vec![
+            McpServerAgentMatrix {
+                agent_id: AgentId::parse("codex").unwrap(),
+                enabled: true,
+                source_kind: vibex_core::ResourceAgentMatrixSourceKind::Manual,
+                updated_at_ms: unix_timestamp_ms(),
+            },
+            McpServerAgentMatrix {
+                agent_id: AgentId::parse("opencode").unwrap(),
+                enabled: false,
+                source_kind: vibex_core::ResourceAgentMatrixSourceKind::Manual,
+                updated_at_ms: unix_timestamp_ms(),
+            },
+        ];
+        McpServerRepository::insert(&conn, &server).unwrap();
+
+        let loaded = McpServerRepository::get(&conn, &server_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.display_name, "Filesystem tools");
+        assert_eq!(loaded.secret_references.len(), 1);
+        assert_eq!(loaded.secret_references[0].redacted_hint, "not configured");
+        assert!(!format!("{loaded:?}").contains("secret-token"));
+        assert!(
+            loaded
+                .provider_matrix
+                .iter()
+                .any(|entry| { entry.provider_kind == ProviderKind::Codex && entry.enabled })
+        );
+        assert!(
+            loaded
+                .agent_matrix
+                .iter()
+                .any(|entry| entry.agent_id.as_str() == "codex" && entry.enabled)
+        );
+
+        let mock_enabled =
+            McpServerRepository::list_enabled_for_provider(&conn, ProviderKind::Codex).unwrap();
+        assert_eq!(mock_enabled.len(), 1);
+        assert_eq!(mock_enabled[0].id, server_id);
+        let claude_enabled =
+            McpServerRepository::list_enabled_for_provider(&conn, ProviderKind::Claude).unwrap();
+        assert!(claude_enabled.is_empty());
+        let codex_agent_enabled = McpServerRepository::list_enabled_for_agent(
+            &conn,
+            &AgentId::parse("codex").unwrap(),
+            ProviderKind::Codex,
+        )
+        .unwrap();
+        assert_eq!(codex_agent_enabled.len(), 1);
+        let opencode_agent_enabled = McpServerRepository::list_enabled_for_agent(
+            &conn,
+            &AgentId::parse("opencode").unwrap(),
+            ProviderKind::Acp,
+        )
+        .unwrap();
+        assert!(opencode_agent_enabled.is_empty());
+
+        McpServerRepository::replace_provider_matrix(
+            &conn,
+            &server_id,
+            &[McpServerProviderMatrix {
+                provider_kind: ProviderKind::Claude,
+                enabled: true,
+                updated_at_ms: unix_timestamp_ms(),
+            }],
+        )
+        .unwrap();
+        let claude_enabled =
+            McpServerRepository::list_enabled_for_provider(&conn, ProviderKind::Claude).unwrap();
+        assert_eq!(claude_enabled.len(), 1);
+        McpServerRepository::replace_agent_matrix(
+            &conn,
+            &server_id,
+            &[McpServerAgentMatrix {
+                agent_id: AgentId::parse("opencode").unwrap(),
+                enabled: true,
+                source_kind: vibex_core::ResourceAgentMatrixSourceKind::Manual,
+                updated_at_ms: unix_timestamp_ms(),
+            }],
+        )
+        .unwrap();
+        let opencode_agent_enabled = McpServerRepository::list_enabled_for_agent(
+            &conn,
+            &AgentId::parse("opencode").unwrap(),
+            ProviderKind::Acp,
+        )
+        .unwrap();
+        assert_eq!(opencode_agent_enabled.len(), 1);
+
+        McpServerRepository::soft_delete(&conn, &server_id).unwrap();
+        assert!(
+            McpServerRepository::get(&conn, &server_id)
+                .unwrap()
+                .is_none()
+        );
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn skill_matrix_and_soft_delete_round_trip() {
+        let temp = temp_db_path("skill");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let mut skill = SkillRepository::from_create_request(SkillCreateRequest {
+            display_name: "Rust workspace guide".to_string(),
+            source_kind: SkillSourceKind::Manual,
+            status: SkillStatus::Enabled,
+            scope_kind: SkillScopeKind::Workspace,
+            project_id: None,
+            workspace_id: None,
+            source_uri: None,
+            description: Some("Use cargo package-scoped checks".to_string()),
+            tags: vec!["rust".to_string(), "quality".to_string()],
+            content_preview: Some("Run package-scoped cargo checks.".to_string()),
+            provider_matrix: vec![
+                SkillProviderMatrix {
+                    provider_kind: ProviderKind::Codex,
+                    enabled: true,
+                    updated_at_ms: unix_timestamp_ms(),
+                },
+                SkillProviderMatrix {
+                    provider_kind: ProviderKind::Claude,
+                    enabled: false,
+                    updated_at_ms: unix_timestamp_ms(),
+                },
+            ],
+        });
+        let skill_id = skill.id.clone();
+        skill.agent_matrix = vec![SkillAgentMatrix {
+            agent_id: AgentId::parse("codex").unwrap(),
+            enabled: true,
+            source_kind: vibex_core::ResourceAgentMatrixSourceKind::Manual,
+            updated_at_ms: unix_timestamp_ms(),
+        }];
+        SkillRepository::insert(&conn, &skill).unwrap();
+
+        let loaded = SkillRepository::get(&conn, &skill_id).unwrap().unwrap();
+        assert_eq!(loaded.display_name, "Rust workspace guide");
+        assert_eq!(loaded.provider_matrix.len(), 2);
+        assert_eq!(loaded.agent_matrix.len(), 1);
+        assert!(
+            SkillRepository::list_enabled_for_provider(&conn, ProviderKind::Codex)
+                .unwrap()
+                .iter()
+                .any(|item| item.id == skill_id)
+        );
+        assert!(
+            SkillRepository::list_enabled_for_provider(&conn, ProviderKind::Claude)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            SkillRepository::list_enabled_for_agent(
+                &conn,
+                &AgentId::parse("codex").unwrap(),
+                ProviderKind::Codex,
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        assert!(
+            SkillRepository::list_enabled_for_agent(
+                &conn,
+                &AgentId::parse("claude").unwrap(),
+                ProviderKind::Claude,
+            )
+            .unwrap()
+            .is_empty()
+        );
+
+        SkillRepository::replace_provider_matrix(
+            &conn,
+            &skill_id,
+            &[SkillProviderMatrix {
+                provider_kind: ProviderKind::Claude,
+                enabled: true,
+                updated_at_ms: unix_timestamp_ms(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            SkillRepository::list_enabled_for_provider(&conn, ProviderKind::Claude)
+                .unwrap()
+                .len(),
+            1
+        );
+        SkillRepository::replace_agent_matrix(
+            &conn,
+            &skill_id,
+            &[SkillAgentMatrix {
+                agent_id: AgentId::parse("claude").unwrap(),
+                enabled: true,
+                source_kind: vibex_core::ResourceAgentMatrixSourceKind::Manual,
+                updated_at_ms: unix_timestamp_ms(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            SkillRepository::list_enabled_for_agent(
+                &conn,
+                &AgentId::parse("claude").unwrap(),
+                ProviderKind::Claude,
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+
+        SkillRepository::soft_delete(&conn, &skill_id).unwrap();
+        assert!(SkillRepository::get(&conn, &skill_id).unwrap().is_none());
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn prompt_persistence_and_soft_delete_round_trip() {
+        let temp = temp_db_path("prompt");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let mut prompt = PromptRepository::from_create_request(PromptCreateRequest {
+            display_name: "Release notes".to_string(),
+            kind: PromptKind::ReusablePrompt,
+            status: PromptStatus::Enabled,
+            scope_kind: PromptScopeKind::User,
+            project_id: None,
+            workspace_id: None,
+            body: "Summarize merged changes with risks.".to_string(),
+            description: Some("Reusable release summary prompt".to_string()),
+            tags: vec!["release".to_string()],
+        });
+        let prompt_id = prompt.id.clone();
+        PromptRepository::insert(&conn, &prompt).unwrap();
+
+        let loaded = PromptRepository::get(&conn, &prompt_id).unwrap().unwrap();
+        assert_eq!(loaded.body, "Summarize merged changes with risks.");
+        assert_eq!(PromptRepository::list_enabled(&conn).unwrap().len(), 1);
+
+        prompt.display_name = "Release digest".to_string();
+        prompt.updated_at_ms = unix_timestamp_ms();
+        PromptRepository::update(&conn, &prompt).unwrap();
+        assert_eq!(
+            PromptRepository::get(&conn, &prompt_id)
+                .unwrap()
+                .unwrap()
+                .display_name,
+            "Release digest"
+        );
+
+        PromptRepository::soft_delete(&conn, &prompt_id).unwrap();
+        assert!(PromptRepository::get(&conn, &prompt_id).unwrap().is_none());
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn hook_preview_metadata_round_trip_without_native_write() {
+        let temp = temp_db_path("hook");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let hook = HookRepository::from_create_request(HookCreateRequest {
+            display_name: "Terminal activity audit".to_string(),
+            provider_kind: ProviderKind::Claude,
+            event_kind: HookEventKind::TerminalActivity,
+            status: HookStatus::Draft,
+            command_preview: Some("vibex hook terminal-activity".to_string()),
+            managed_marker: Some("VIBEX-MANAGED-HOOK:test".to_string()),
+            description: Some("Preview only".to_string()),
+        });
+        let hook_id = hook.id.clone();
+        HookRepository::insert(&conn, &hook).unwrap();
+        assert_eq!(
+            HookRepository::get(&conn, &hook_id)
+                .unwrap()
+                .unwrap()
+                .managed_marker,
+            "VIBEX-MANAGED-HOOK:test"
+        );
+
+        let preview = HookInstallPreview {
+            preview_id: RequestId::new(),
+            hook_id: hook_id.clone(),
+            target_path: "~/.claude/settings.json".to_string(),
+            marker: "VIBEX-MANAGED-HOOK:test".to_string(),
+            redacted_preview: "Preview only; future install removes only Vibex-owned marker blocks"
+                .to_string(),
+            created_at_ms: unix_timestamp_ms(),
+        };
+        HookRepository::insert_install_preview(&conn, &preview).unwrap();
+
+        HookRepository::soft_delete(&conn, &hook_id).unwrap();
+        assert!(HookRepository::get(&conn, &hook_id).unwrap().is_none());
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn runtime_option_snapshot_failure_preserves_last_success() {
+        let temp = temp_db_path("runtime-option-snapshot");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let agent_id = AgentId::parse("opencode").unwrap();
+        let create_profile = |display_name: &str| {
+            ProviderProfileRepository::from_create_request(ProviderProfileCreateRequest {
+                agent_id: Some(agent_id.clone()),
+                kind: ProviderKind::Acp,
+                display_name: display_name.to_string(),
+                account_alias: None,
+                base_url: None,
+                default_model: None,
+                small_model: None,
+                large_model: None,
+                configured_models: Vec::new(),
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: None,
+                secret_references: Vec::new(),
+            })
+        };
+        let successful_profile = create_profile("Cached ACP profile");
+        let failed_profile = create_profile("Unavailable ACP profile");
+        ProviderProfileRepository::insert(&conn, &successful_profile).unwrap();
+        ProviderProfileRepository::insert(&conn, &failed_profile).unwrap();
+
+        let success = ProviderRuntimeOptionSnapshotRecord {
+            provider_profile_id: successful_profile.id.clone(),
+            agent_id: agent_id.clone(),
+            model_response: Some(AgentModelListResponse {
+                agent_id: Some(agent_id.clone()),
+                provider_kind: ProviderKind::Acp,
+                provider_profile_id: Some(successful_profile.id.clone()),
+                models: vec!["opencode/test-model".to_string()],
+                reasoning_efforts: vec![AgentReasoningEffort {
+                    value: "high".to_string(),
+                    description: None,
+                }],
+                model_capabilities: Vec::new(),
+                source: AgentModelListSource::Probed,
+                diagnostics: Vec::new(),
+            }),
+            session_config: Some(AgentSessionConfigProbe {
+                models: vec!["opencode/test-model".to_string()],
+                modes: vec![ProviderSessionConfigValue {
+                    value: "plan".to_string(),
+                    label: Some("Plan".to_string()),
+                }],
+                reasoning_efforts: vec![AgentReasoningEffort {
+                    value: "high".to_string(),
+                    description: None,
+                }],
+                options: Vec::new(),
+            }),
+            last_success_at_ms: Some(100),
+            last_attempt_at_ms: 100,
+            last_error_code: None,
+        };
+        ProviderRuntimeOptionSnapshotRepository::upsert_success(&conn, &success).unwrap();
+        ProviderRuntimeOptionSnapshotRepository::record_failure(
+            &conn,
+            &successful_profile.id,
+            &agent_id,
+            200,
+            "agent_probe_failed",
+        )
+        .unwrap();
+        ProviderRuntimeOptionSnapshotRepository::record_failure(
+            &conn,
+            &failed_profile.id,
+            &agent_id,
+            300,
+            "agent_not_installed",
+        )
+        .unwrap();
+
+        let snapshots = ProviderRuntimeOptionSnapshotRepository::list(&conn).unwrap();
+        let preserved = snapshots
+            .iter()
+            .find(|snapshot| snapshot.provider_profile_id == successful_profile.id)
+            .unwrap();
+        assert_eq!(preserved.model_response, success.model_response);
+        assert_eq!(preserved.session_config, success.session_config);
+        assert_eq!(preserved.last_success_at_ms, Some(100));
+        assert_eq!(preserved.last_attempt_at_ms, 200);
+        assert_eq!(
+            preserved.last_error_code.as_deref(),
+            Some("agent_probe_failed")
+        );
+
+        let first_failure = snapshots
+            .iter()
+            .find(|snapshot| snapshot.provider_profile_id == failed_profile.id)
+            .unwrap();
+        assert!(first_failure.model_response.is_none());
+        assert!(first_failure.session_config.is_none());
+        assert_eq!(first_failure.last_success_at_ms, None);
+        assert_eq!(first_failure.last_attempt_at_ms, 300);
+        assert_eq!(
+            first_failure.last_error_code.as_deref(),
+            Some("agent_not_installed")
+        );
+
+        ProviderProfileRepository::soft_delete(&mut conn, &successful_profile.id).unwrap();
+        assert!(
+            ProviderRuntimeOptionSnapshotRepository::list(&conn)
+                .unwrap()
+                .iter()
+                .all(|snapshot| snapshot.provider_profile_id != successful_profile.id)
+        );
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn provider_health_and_usage_records_round_trip() {
+        let temp = temp_db_path("provider-health-usage");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        ProviderProfileRepository::ensure_local_defaults(&conn).unwrap();
+
+        let profile_id =
+            ProviderProfileId::parse(ProviderKind::Codex.local_default_profile_id().to_string())
+                .unwrap();
+        let now = unix_timestamp_ms();
+        let health = ProviderHealthProbeResult {
+            health_record_id: RequestId::new(),
+            provider_profile_id: profile_id.clone(),
+            provider_kind: ProviderKind::Codex,
+            probe_kind: ProviderHealthProbeKind::AuthStatus,
+            status: ProviderHealthStatus::Pass,
+            summary: "Codex auth fixture is deterministic".to_string(),
+            latency_ms: Some(1),
+            checked_at_ms: now,
+            expires_at_ms: Some(now + 60_000),
+            diagnostics: vec![ProviderBindingMetadata {
+                key: "mode".to_string(),
+                value: "codex".to_string(),
+            }],
+        };
+        ProviderHealthRepository::insert(&conn, &health).unwrap();
+        let health_rows = ProviderHealthRepository::list_latest(&conn).unwrap();
+        assert!(health_rows.iter().any(|row| {
+            row.provider_profile_id == profile_id
+                && row.probe_kind == ProviderHealthProbeKind::AuthStatus
+                && row.status == ProviderHealthStatus::Pass
+        }));
+
+        let mut capabilities =
+            ProviderCapabilities::conservative(ProviderKind::Codex, "test-capability");
+        capabilities.tool_invocations = true;
+        let capability = ProviderCapabilityProbeResult {
+            capability_record_id: RequestId::new(),
+            provider_profile_id: profile_id.clone(),
+            provider_kind: ProviderKind::Codex,
+            status: ProviderCapabilityProbeStatus::Pass,
+            summary: "Codex capability projection is deterministic".to_string(),
+            capabilities,
+            source: "test".to_string(),
+            checked_at_ms: now,
+            expires_at_ms: Some(now + 60_000),
+            diagnostics: vec![ProviderBindingMetadata {
+                key: "redacted".to_string(),
+                value: "true".to_string(),
+            }],
+        };
+        ProviderCapabilityRepository::insert(&conn, &capability).unwrap();
+        let capability_rows = ProviderCapabilityRepository::list_latest(&conn).unwrap();
+        let stored_capability = capability_rows
+            .iter()
+            .find(|row| row.provider_profile_id == profile_id)
+            .unwrap();
+        assert_eq!(
+            stored_capability.status,
+            ProviderCapabilityProbeStatus::Pass
+        );
+        assert!(stored_capability.capabilities.tool_invocations);
+
+        let usage = ProviderUsageRecord {
+            usage_record_id: RequestId::new(),
+            provider_profile_id: profile_id.clone(),
+            provider_kind: ProviderKind::Codex,
+            source: "test".to_string(),
+            unit: ProviderUsageUnit::Percent,
+            label: "Codex quota".to_string(),
+            used: Some(40.0),
+            limit_value: Some(100.0),
+            remaining: Some(60.0),
+            window: Some(ProviderUsageWindow {
+                label: "monthly".to_string(),
+                started_at_ms: Some(now - 1_000),
+                ends_at_ms: Some(now + 1_000),
+            }),
+            recorded_at_ms: now,
+            metadata: vec![ProviderBindingMetadata {
+                key: "redacted".to_string(),
+                value: "true".to_string(),
+            }],
+        };
+        ProviderUsageRepository::insert(&conn, &usage).unwrap();
+        let usage_rows = ProviderUsageRepository::list_latest(&conn).unwrap();
+        let stored = usage_rows
+            .iter()
+            .find(|row| row.provider_profile_id == profile_id && row.label == "Codex quota")
+            .unwrap();
+        assert_eq!(stored.unit, ProviderUsageUnit::Percent);
+        assert_eq!(
+            stored.window.as_ref().map(|window| window.label.as_str()),
+            Some("monthly")
+        );
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn session_timeline_and_permission_round_trip() {
+        let temp = temp_db_path("agent");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let (_project, workspace) = WorkspaceRepository::ensure(
+            &conn,
+            "/tmp/vibex-db-test",
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let now = unix_timestamp_ms();
+        let profile_id =
+            ProviderProfileId::parse(ProviderKind::Codex.local_default_profile_id().to_string())
+                .unwrap();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "Codex session".to_string(),
+            project_id: workspace.project_id.clone(),
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path.clone(),
+            workspace_mode: workspace.mode,
+            agent_id: AgentId::parse("codex").unwrap(),
+            state: AgentSessionState::Initializing,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        SessionRepository::insert(&conn, &session).unwrap();
+        SessionRepository::update_state(&conn, &session.id, AgentSessionState::Idle).unwrap();
+
+        let first = TimelineRepository::append(
+            &mut conn,
+            &session.id,
+            TimelineSource::User,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "hello".to_string(),
+                attachments: Vec::new(),
+            }),
+            None,
+            None,
+            TimelineRedactionState::None,
+        )
+        .unwrap();
+        let attribution = TurnExecutionAttribution::new(
+            AgentId::parse("codex").unwrap(),
+            profile_id.clone(),
+            "gpt-5",
+            RuntimeBindingId::parse("binding_current").unwrap(),
+            3,
+            "Codex",
+            "OpenAI work",
+            "GPT-5",
+        )
+        .unwrap();
+        let second = TimelineRepository::append_with_attribution(
+            &mut conn,
+            &session.id,
+            TimelineSource::Agent,
+            TimelinePayload::AgentMessage(AgentMessagePayload {
+                text: "hi".to_string(),
+                is_final: true,
+            }),
+            None,
+            None,
+            TimelineRedactionState::None,
+            Some(&attribution),
+        )
+        .unwrap();
+        assert_eq!(first.sequence, 1);
+        assert_eq!(second.sequence, 2);
+        assert_eq!(first.execution_attribution, None);
+        assert_eq!(second.execution_attribution, Some(attribution.view()));
+
+        let page = TimelineRepository::fetch_after(&conn, &session.id, Some(1), 10).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].sequence, 2);
+        assert_eq!(
+            page.items[0].execution_attribution,
+            Some(attribution.view())
+        );
+
+        let coalesced = TimelineRepository::upsert_by_provider_correlation(
+            &mut conn,
+            &session.id,
+            TimelineSource::Provider,
+            TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                text_delta: "streaming".to_string(),
+                chunk_index: 1,
+            }),
+            "provider-turn-1",
+            2,
+            TimelineRedactionState::None,
+            Some(&attribution),
+        )
+        .unwrap();
+        assert_eq!(coalesced.execution_attribution, Some(attribution.view()));
+        let stale_attribution = TurnExecutionAttribution::new(
+            AgentId::parse("codex").unwrap(),
+            profile_id,
+            "gpt-5",
+            RuntimeBindingId::parse("binding_stale").unwrap(),
+            2,
+            "Codex",
+            "OpenAI work",
+            "GPT-5",
+        )
+        .unwrap();
+        let error = TimelineRepository::upsert_by_provider_correlation(
+            &mut conn,
+            &session.id,
+            TimelineSource::Provider,
+            TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                text_delta: "stale".to_string(),
+                chunk_index: 2,
+            }),
+            "provider-turn-1",
+            2,
+            TimelineRedactionState::None,
+            Some(&stale_attribution),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "turn_execution_attribution_conflict");
+
+        let request = PermissionRequest {
+            id: vibex_core::RequestId::new(),
+            session_id: session.id.clone(),
+            project_id: Some(session.project_id.clone()),
+            workspace_id: Some(session.workspace_id.clone()),
+            provider_request_id: Some("native-permission".to_string()),
+            risk_category: PermissionRiskCategory::Command,
+            title: "Run command".to_string(),
+            details: vec![PermissionActionDetail {
+                label: "command".to_string(),
+                value: "echo ok".to_string(),
+            }],
+            allowed_responses: vec![
+                PermissionResponseKind::Approve,
+                PermissionResponseKind::Deny,
+            ],
+            status: PermissionRequestStatus::Pending,
+            requested_at_ms: unix_timestamp_ms(),
+            expires_at_ms: None,
+        };
+        PermissionRepository::insert_request(&conn, &request).unwrap();
+        assert_eq!(
+            PermissionRepository::pending_for_session(&conn, &session.id)
+                .unwrap()
+                .len(),
+            1
+        );
+        PermissionRepository::resolve(
+            &conn,
+            &PermissionResolution {
+                request_id: request.id.clone(),
+                session_id: session.id.clone(),
+                response: PermissionResponseKind::Approve,
+                responder_device_id: None,
+                provider_resolution_id: None,
+                note: None,
+                resolved_at_ms: unix_timestamp_ms(),
+            },
+        )
+        .unwrap();
+        assert!(
+            PermissionRepository::pending_for_session(&conn, &session.id)
+                .unwrap()
+                .is_empty()
+        );
+
+        AdapterDiagnosticsRepository::insert(
+            &conn,
+            &AdapterDiagnostic {
+                session_id: Some(session.id.clone()),
+                provider_kind: ProviderKind::Codex,
+                level: AdapterDiagnosticLevel::Info,
+                code: "test".to_string(),
+                message: "diagnostic".to_string(),
+                redacted_details: Vec::new(),
+                timestamp_ms: unix_timestamp_ms(),
+            },
+        )
+        .unwrap();
+
+        let loaded = SessionRepository::get(&conn, &session.id).unwrap().unwrap();
+        assert_eq!(loaded.state, AgentSessionState::Idle);
+        assert_eq!(loaded.agent_id, AgentId::parse("codex").unwrap());
+
+        let notice = TimelineRepository::append(
+            &mut conn,
+            &session.id,
+            TimelineSource::System,
+            TimelinePayload::SystemNotice(SystemNoticePayload {
+                level: SystemNoticeLevel::Info,
+                message: "done".to_string(),
+            }),
+            None,
+            None,
+            TimelineRedactionState::None,
+        )
+        .unwrap();
+        assert_eq!(notice.sequence, 4);
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn timeline_batch_preserves_source_timestamp_and_archive_uses_end_sequence_cas() {
+        let temp = temp_db_path("timeline-fork-copy");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let (_project, workspace) = WorkspaceRepository::ensure(
+            &conn,
+            "/tmp/vibex-db-fork-copy-test",
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "Fork copy".to_string(),
+            project_id: workspace.project_id.clone(),
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path,
+            workspace_mode: workspace.mode,
+            agent_id: AgentId::parse("codex").unwrap(),
+            state: AgentSessionState::Idle,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: 200,
+            updated_at_ms: 200,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        let appended = TimelineRepository::insert_session_and_append_many(
+            &mut conn,
+            &session,
+            &[TimelineAppend {
+                source: TimelineSource::User,
+                payload: TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "preserve me".to_string(),
+                    attachments: Vec::new(),
+                }),
+                timestamp_ms: Some(123),
+                correlation_id: None,
+                provider_correlation_id: None,
+                redaction_state: TimelineRedactionState::None,
+                execution_attribution: None,
+            }],
+        )
+        .unwrap();
+        assert_eq!(appended[0].timestamp_ms, 123);
+        assert_eq!(
+            TimelineRepository::fetch_after(&conn, &session.id, Some(0), 10)
+                .unwrap()
+                .items[0]
+                .timestamp_ms,
+            123
+        );
+
+        let changed =
+            SessionRepository::archive_if_timeline_unchanged(&conn, &session.id, 0).unwrap_err();
+        assert_eq!(changed.code, "session_archive_source_changed");
+        assert_eq!(
+            SessionRepository::get(&conn, &session.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            AgentSessionState::Idle
+        );
+        SessionRepository::archive_if_timeline_unchanged(&conn, &session.id, 1).unwrap();
+        assert_eq!(
+            SessionRepository::get(&conn, &session.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            AgentSessionState::Archived
+        );
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn timeline_forward_pagination_preserves_complete_long_turn() {
+        let temp = temp_db_path("timeline-long-turn");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let (_project, workspace) = WorkspaceRepository::ensure(
+            &conn,
+            "/tmp/vibex-db-long-turn-test",
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let now = unix_timestamp_ms();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "Long turn".to_string(),
+            project_id: workspace.project_id.clone(),
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path.clone(),
+            workspace_mode: workspace.mode,
+            agent_id: AgentId::parse("codex").unwrap(),
+            state: AgentSessionState::Idle,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        SessionRepository::insert(&conn, &session).unwrap();
+
+        TimelineRepository::append(
+            &mut conn,
+            &session.id,
+            TimelineSource::User,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "please do a complex task".to_string(),
+                attachments: Vec::new(),
+            }),
+            None,
+            None,
+            TimelineRedactionState::None,
+        )
+        .unwrap();
+        for index in 0..600 {
+            TimelineRepository::append(
+                &mut conn,
+                &session.id,
+                TimelineSource::Agent,
+                TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                    text_delta: format!("chunk-{index};"),
+                    chunk_index: index,
+                }),
+                None,
+                None,
+                TimelineRedactionState::None,
+            )
+            .unwrap();
+        }
+        TimelineRepository::append(
+            &mut conn,
+            &session.id,
+            TimelineSource::Agent,
+            TimelinePayload::AgentMessage(AgentMessagePayload {
+                text: "complete final answer".to_string(),
+                is_final: true,
+            }),
+            None,
+            None,
+            TimelineRedactionState::None,
+        )
+        .unwrap();
+
+        let latest_window = TimelineRepository::fetch_after(&conn, &session.id, None, 150).unwrap();
+        assert!(latest_window.has_older);
+        assert_ne!(latest_window.start_sequence, Some(1));
+
+        let mut cursor = 0;
+        let mut all_items = Vec::new();
+        loop {
+            let page =
+                TimelineRepository::fetch_after(&conn, &session.id, Some(cursor), 500).unwrap();
+            if let Some(end_sequence) = page.end_sequence {
+                cursor = end_sequence;
+            }
+            all_items.extend(page.items);
+            if !page.has_newer {
+                break;
+            }
+        }
+
+        assert_eq!(all_items.len(), 602);
+        assert!(matches!(
+            &all_items[0].payload,
+            TimelinePayload::UserMessage(message)
+                if message.text == "please do a complex task"
+        ));
+        assert!(matches!(
+            &all_items[601].payload,
+            TimelinePayload::AgentMessage(message)
+                if message.text == "complete final answer" && message.is_final
+        ));
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn remote_device_pairing_and_audit_round_trip_without_plaintext_secret() {
+        let temp = temp_db_path("remote");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let now = unix_timestamp_ms();
+        let raw_pairing_code = "PAIR-123456";
+        let pairing_hash = "hash:pairing-code";
+        let auth_hash = "hash:auth-token";
+        let pairing = RemotePairingCodeRecord {
+            pairing: RemotePairingCode {
+                pairing_id: RequestId::new(),
+                permission_level: RemoteDevicePermissionLevel::ApproveOnly,
+                expires_at_ms: now + 60_000,
+                claimed_device_id: None,
+                created_at_ms: now,
+                claimed_at_ms: None,
+            },
+            code_hash: pairing_hash.to_string(),
+        };
+        RemotePairingCodeRepository::insert(&conn, &pairing).unwrap();
+
+        let raw_db = fs::read_to_string(&temp).unwrap_or_default();
+        assert!(!raw_db.contains(raw_pairing_code));
+        assert_eq!(
+            RemotePairingCodeRepository::get_by_hash(&conn, pairing_hash)
+                .unwrap()
+                .unwrap()
+                .pairing
+                .permission_level,
+            RemoteDevicePermissionLevel::ApproveOnly
+        );
+
+        let device_id = DeviceId::new();
+        let device = RemoteDeviceRecord {
+            detail: RemoteDeviceDetail {
+                device_id: device_id.clone(),
+                display_name: "iPhone".to_string(),
+                public_key: Some("pubkey-redacted".to_string()),
+                grant_revision: 1,
+                permission_level: RemoteDevicePermissionLevel::ApproveOnly,
+                status: RemoteDeviceStatus::Active,
+                paired_at_ms: Some(now),
+                last_seen_at_ms: Some(now),
+                revoked_at_ms: None,
+                created_at_ms: now,
+                updated_at_ms: now,
+            },
+            auth_secret_hash: auth_hash.to_string(),
+        };
+        RemoteDeviceRepository::upsert(&conn, &device).unwrap();
+        RemotePairingCodeRepository::mark_claimed(
+            &conn,
+            &pairing.pairing.pairing_id,
+            &device_id,
+            now + 1,
+        )
+        .unwrap();
+
+        let stored_device = RemoteDeviceRepository::get(&conn, &device_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_device.detail.display_name, "iPhone");
+        assert_eq!(stored_device.auth_secret_hash, auth_hash);
+        let claimed = RemotePairingCodeRepository::get_by_hash(&conn, pairing_hash)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.pairing.claimed_device_id, Some(device_id.clone()));
+
+        RemoteDeviceRepository::update_last_seen(&conn, &device_id, now + 2).unwrap();
+        let seen = RemoteDeviceRepository::get(&conn, &device_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(seen.detail.last_seen_at_ms, Some(now + 2));
+
+        let revoked = RemoteDeviceRepository::revoke(&conn, &device_id, now + 3).unwrap();
+        assert_eq!(revoked.detail.status, RemoteDeviceStatus::Revoked);
+
+        RemoteAuditRepository::insert(
+            &conn,
+            &RemoteAuditRecord {
+                audit_id: RequestId::new(),
+                device_id: Some(device_id.clone()),
+                action: RemoteAuditAction::DeviceRevoked,
+                target_kind: RemoteAuditTargetKind::Device,
+                target_id: Some(device_id.to_string()),
+                outcome: RemoteAuditOutcome::Revoked,
+                redacted_summary: "Device revoked by local owner".to_string(),
+                request_id: Some(RequestId::new()),
+                correlation_id: None,
+                created_at_ms: now + 4,
+            },
+        )
+        .unwrap();
+        let audits = RemoteAuditRepository::list(
+            &conn,
+            &RemoteAuditListRequest {
+                device_id: Some(device_id),
+                limit: Some(10),
+            },
+        )
+        .unwrap();
+        assert_eq!(audits.len(), 1);
+        assert!(!audits[0].redacted_summary.contains(raw_pairing_code));
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn workbench_metadata_round_trips() {
+        let temp = temp_db_path("workbench");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let (_project, workspace) = WorkspaceRepository::ensure(
+            &conn,
+            "/tmp/vibex-workbench-test",
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let now = unix_timestamp_ms();
+        let terminal = TerminalSession {
+            id: TerminalId::new(),
+            workspace_id: workspace.id.clone(),
+            title: "shell".to_string(),
+            shell: "/bin/sh".to_string(),
+            cwd: workspace.root_path.clone(),
+            rows: 24,
+            cols: 80,
+            status: TerminalStatus::Running,
+            created_at_ms: now,
+            updated_at_ms: now,
+            closed_at_ms: None,
+        };
+        TerminalSessionRepository::upsert(&conn, &terminal).unwrap();
+        RecentFileRepository::touch(&conn, &workspace.id, "src/main.rs").unwrap();
+        GitSnapshotRepository::upsert(
+            &conn,
+            &workspace.id,
+            Some("main"),
+            Some("abc1234"),
+            true,
+            2,
+            now,
+        )
+        .unwrap();
+
+        let terminals = TerminalSessionRepository::list(&conn, &workspace.id).unwrap();
+        assert_eq!(terminals, vec![terminal]);
+        let recent = RecentFileRepository::list(&conn, &workspace.id, 10).unwrap();
+        assert_eq!(recent, vec!["src/main.rs".to_string()]);
+
+        cleanup_db(temp);
+    }
+
+    fn temp_db_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "vibex-db-{label}-{}.db",
+            vibex_core::RequestId::new().as_str()
+        ))
+    }
+
+    fn cleanup_db(path: PathBuf) {
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("db-wal"));
+        let _ = fs::remove_file(path.with_extension("db-shm"));
+    }
+}

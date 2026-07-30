@@ -1,0 +1,2 @@
+{"type":"mcpToolCall","id":"item_mcp_1","server":"demo-server","tool":"lookup_docs","arguments":{"query":"serde tagged enums"},"result":{"matches":2},"status":"completed"}
+{"type":"mcpToolCall","id":"item_mcp_2","server":"demo-server","tool":"lookup_docs","arguments":{"query":"missing"},"status":"failed"}

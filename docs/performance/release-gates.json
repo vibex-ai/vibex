@@ -1,0 +1,52 @@
+{
+  "schemaVersion": "release-performance.v1",
+  "measurement": {
+    "platformScope": ["linux_x11", "linux_wayland"],
+    "releaseBuildRequired": true,
+    "completeProcessTree": true,
+    "minimumTrials": 5,
+    "statistics": ["median", "p95", "range"],
+    "sameHardwareAndFixture": true,
+    "webScenariosSeparated": true
+  },
+  "benchmarks": [
+    { "id": "cold_start_to_interactive", "owner": "desktop-shell" },
+    { "id": "idle_no_web_content", "owner": "desktop-shell" },
+    { "id": "timeline_5000_items", "owner": "desktop-agent", "itemCount": 5000 },
+    { "id": "streaming_30_tokens_per_second", "owner": "desktop-agent", "tokensPerSecond": 30 },
+    { "id": "file_tree_100000_entries", "owner": "desktop-workbench", "entryCount": 100000 },
+    { "id": "git_diff_20000_lines", "owner": "desktop-workbench", "lineCount": 20000 },
+    { "id": "terminal_10mb_output", "owner": "desktop-content", "bytes": 10485760 },
+    { "id": "external_web_open", "owner": "desktop-content", "surfaceCount": 0 },
+    { "id": "pdf_navigation", "owner": "desktop-content" },
+    { "id": "continuous_panel_resize", "owner": "desktop-shell" },
+    { "id": "idle_two_minutes", "owner": "desktop-shell", "durationSeconds": 120 }
+  ],
+  "soak": [
+    { "id": "idle_reconnect", "durationSeconds": 300 },
+    { "id": "streaming_session_switch", "durationSeconds": 300 },
+    { "id": "preview_dialog_web_open_close", "cycles": 100 },
+    { "id": "terminal_create_kill_restore", "cycles": 100 },
+    { "id": "large_diff_session_switch", "cycles": 100 },
+    { "id": "native_cache_eviction", "cycles": 100 },
+    { "id": "crash_restart", "cycles": 20 }
+  ],
+  "leakCounters": [
+    "tasks",
+    "entities",
+    "subscriptions",
+    "native_surfaces",
+    "child_processes",
+    "file_descriptors",
+    "rss_bytes"
+  ],
+  "evidencePolicy": {
+    "artifactIdentityRequired": true,
+    "signedCandidateRequiredForApproval": false,
+    "exactLinuxCandidateRequiredForApproval": true,
+    "locallyRebuiltSubstituteAllowed": false,
+    "userContentAllowed": false,
+    "rawLogsAllowed": false,
+    "secretsAllowed": false
+  }
+}

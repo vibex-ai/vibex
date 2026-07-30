@@ -1,0 +1,91 @@
+{
+  "schemaVersion": "upstream-dependency-revalidation.v1",
+  "status": "pending_physical_recapture",
+  "currentSource": {
+    "dependencySourcePolicy": "upstream_git_root_cargo_lock",
+    "zedRevision": "c9e8e611dbc279afa0914d28c4d37ad07f38c03b",
+    "gpuiComponentRevision": "031555662e99a1b5a549990b47f246d475b8288a",
+    "cargoLockSha256": "9f369bb4fef16ff737c1ac6951740e4f37b56e75bcbbb1b195e41221762e043a"
+  },
+  "historicalSources": [
+    {
+      "source": {
+        "zedRevision": "819fe337999551ce8177b14c8db1127645617ae4",
+        "gpuiComponentRevision": "3c270ed244d06fb211b47f156761c1d833eac535",
+        "cargoLockSha256": "6bafd6ea8d8aa706f6a51a01d7884c6f00209247b716f5cb6ba4e4b8a3aa80a4"
+      },
+      "evidence": [
+        "docs/platform/evidence/linux-x11-first-frame-xvfb.json",
+        "docs/platform/evidence/linux-native-first-frame.json",
+        "docs/platform/evidence/acp-lifecycle-linux.json",
+        "docs/platform/evidence/composer-linux.json",
+        "docs/platform/evidence/foundation-linux.json",
+        "docs/platform/evidence/terminal-linux.json"
+      ]
+    },
+    {
+      "source": {
+        "zedRevision": "c9e8e611dbc279afa0914d28c4d37ad07f38c03b",
+        "gpuiComponentRevision": "031555662e99a1b5a549990b47f246d475b8288a",
+        "cargoLockSha256": "7a5488b1882681707399417335bf61343f78b9afaa9fbe054a41c3c98c5db959"
+      },
+      "evidence": [
+        "docs/platform/evidence/native-content-x11-linux.json",
+        "docs/platform/evidence/pdf-linux.json"
+      ],
+      "sourceInputTreeSha256ByEvidence": {
+        "docs/platform/evidence/native-content-x11-linux.json": "f7795d84b9fb19626b91f4cda1c1426b0a5f15cda66ece457ab041ad6ad119ef"
+      }
+    },
+    {
+      "source": {
+        "zedRevision": "c9e8e611dbc279afa0914d28c4d37ad07f38c03b",
+        "gpuiComponentRevision": "031555662e99a1b5a549990b47f246d475b8288a",
+        "cargoLockSha256": "2a460e5cd42aa18f99a362401994793283f1f78f9de5dfdd5739e43e87610a41"
+      },
+      "evidence": [
+        "docs/platform/evidence/native-content-linux.json",
+        "docs/platform/evidence/terminal-stress-linux.json"
+      ],
+      "sourceInputTreeSha256ByEvidence": {
+        "docs/platform/evidence/native-content-linux.json": "2dde022e9adb29a56b22edfdf46be5aef2670a2d4e583c97fd8de51e40e422ba",
+        "docs/platform/evidence/terminal-stress-linux.json": "4d6fe838940deb043a80ba0c42a1ea7fa0d5ecc0bbd54638cfb9281716a039cb"
+      }
+    },
+    {
+      "source": {
+        "zedRevision": "c9e8e611dbc279afa0914d28c4d37ad07f38c03b",
+        "gpuiComponentRevision": "031555662e99a1b5a549990b47f246d475b8288a",
+        "cargoLockSha256": "4d7403b1d03a19381c6c30f7527bbbca9883518b8d562ac559c1582d33da367c"
+      },
+      "evidence": [
+        "docs/platform/evidence/document-interaction-linux.json",
+        "docs/platform/evidence/native-content-switch.json",
+        "docs/platform/evidence/pdf-surface-linux.json",
+        "docs/platform/evidence/pdf-worker-linux.json"
+      ],
+      "sourceInputTreeSha256ByEvidence": {
+        "docs/platform/evidence/document-interaction-linux.json": "3ca1ca4490c8b27ec13fe163941320d58075ef75f093ad7afb339cefafca7787"
+      }
+    },
+    {
+      "source": {
+        "zedRevision": "c9e8e611dbc279afa0914d28c4d37ad07f38c03b",
+        "gpuiComponentRevision": "031555662e99a1b5a549990b47f246d475b8288a",
+        "cargoLockSha256": "b6d779f0826f45c96ee8caa79ee92e8723c1a6dffa259d1bdfdf0ae086d1617b"
+      },
+      "evidence": [
+        "docs/platform/evidence/pdf-controller-linux.json"
+      ]
+    }
+  ],
+  "requiredRecaptures": [
+    "Linux X11 and Wayland native first frame",
+    "Linux Wayland Composer IME and clipboard",
+    "Linux Wayland ACP lifecycle",
+    "Linux GPUI Foundation viewport and lifecycle matrix",
+    "Linux package lifecycle",
+    "Linux Terminal and native PDF integration evidence"
+  ],
+  "rationale": "Each retained capture is bound to its recorded dependency graph. A capture with a non-current lock identity remains useful only for its bounded observation and must not be presented as proof of the dependencies selected by the current Cargo.lock."
+}

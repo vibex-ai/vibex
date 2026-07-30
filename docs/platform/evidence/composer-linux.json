@@ -1,0 +1,204 @@
+{
+  "schemaVersion": "composer-linux-evidence.v1",
+  "status": "partial",
+  "capturedAt": "2026-07-18T11:22:32.273Z",
+  "source": {
+    "vibexBaselineCommit": "f1c624f115401d6160a771545fa1ec73128394b1",
+    "captureParentCommit": "65efcb3ee74e711bb9d25ca0f55af7b36dc3b0c8",
+    "zedRevision": "819fe337999551ce8177b14c8db1127645617ae4",
+    "gpuiComponentRevision": "3c270ed244d06fb211b47f156761c1d833eac535",
+    "rustToolchain": "rustc 1.97.0 (2d8144b78 2026-07-07) (Arch Linux rust 1:1.97.0-1)",
+    "lockfileSha256": "6bafd6ea8d8aa706f6a51a01d7884c6f00209247b716f5cb6ba4e4b8a3aa80a4",
+    "sourceInputRoots": [
+      "Cargo.lock",
+      "Cargo.toml",
+      "rust-toolchain.toml",
+      "apps/desktop/Cargo.toml",
+      "apps/desktop/src",
+      "vendor/gpui-component/crates/ui/src/input/input.rs",
+      "vendor/gpui-component/crates/ui/src/input/state.rs",
+      "vendor/gpui-component/crates/ui/src/input/native.rs",
+      "scripts/capture-composer-linux.mjs"
+    ],
+    "sourceInputTreeSha256": "2467d01764c1d44867b2f91a4b31ff62b992f3ee3d74db9b913446b593446f6e"
+  },
+  "runner": {
+    "platform": "linux",
+    "architecture": "x64",
+    "kernelRelease": "7.1.3-arch1-3",
+    "displayBackend": "wayland-hyprland",
+    "compositor": "Hyprland",
+    "syntheticDisplay": false,
+    "inputMethod": {
+      "framework": "fcitx5",
+      "frameworkVersion": "5.1.21",
+      "engine": "rime"
+    },
+    "inputInjection": {
+      "name": "wtype",
+      "version": "0.4",
+      "sourceRevision": "d71be3a7b3f93b534a2823fd68cabd7ac2a02359",
+      "licenseExpression": "MIT",
+      "repository": "https://github.com/atx/wtype",
+      "binarySha256": "a7a4988f0e73844a689e1d22ca8991679ca19b9d066cd6cfd4c9bce84b0b9f13",
+      "packagedWithApplication": false
+    }
+  },
+  "window": {
+    "identity": "dev.vibex.desktop.preview",
+    "discovered": true,
+    "xwayland": false,
+    "width": 1200,
+    "height": 780
+  },
+  "captures": {
+    "preedit": {
+      "screenshotPath": "docs/parity/screenshots/current/spikes/linux-wayland-composer-preedit.png",
+      "screenshotSha256": "c191d9d3d4b29c3c3118f377bfcf380f9d865f543ae63ae5c18dc87d6bade98b",
+      "width": 1200,
+      "height": 780,
+      "uniqueColors": 2784,
+      "entropy": 0.119214,
+      "mean": 0.965031,
+      "standardDeviation": 0.0676308
+    },
+    "final": {
+      "screenshotPath": "docs/parity/screenshots/current/spikes/linux-wayland-composer-final.png",
+      "screenshotSha256": "f4c64c0e46dc2b543e6394b41298824598f0ee50c13f0f179c9079000d8ca469",
+      "width": 1200,
+      "height": 780,
+      "uniqueColors": 3767,
+      "entropy": 0.110188,
+      "mean": 0.96292,
+      "standardDeviation": 0.0673869
+    }
+  },
+  "clipboard": {
+    "pasteRoundTrip": true,
+    "copyRoundTrip": true,
+    "rawTextStored": false,
+    "priorTextRestored": true,
+    "source": "gpui_platform_clipboard_fixture"
+  },
+  "process": {
+    "processExited": true,
+    "appExitCode": 0,
+    "panicMentioned": false
+  },
+  "run": {
+    "schemaVersion": "composer-run.v1",
+    "status": "passed",
+    "input": {
+      "nativeInputHandler": true,
+      "multiline": true,
+      "accessibilityRole": "multiline_text_input",
+      "compositionObserved": true,
+      "markedFrameCount": 9,
+      "cjkCommitObserved": true,
+      "shiftEnterObserved": true,
+      "enterSubmitObserved": true,
+      "pasteObserved": true,
+      "selectionObserved": true,
+      "undoObserved": true,
+      "redoObserved": true,
+      "finalTextBytes": 31,
+      "rawTextStored": false
+    },
+    "attachments": {
+      "inlineImageTokenRendered": true,
+      "dropAdapterFixtureAccepted": true,
+      "nativeFileDropEventObserved": false
+    },
+    "suggestions": {
+      "triggerObserved": true,
+      "menuRendered": true
+    },
+    "focus": {
+      "focusEventCount": 2,
+      "blurEventCount": 1,
+      "focusedAfterSubmit": true
+    },
+    "failure": null,
+    "limitations": [
+      "The image token uses a sanitized adapter fixture; no user file content is retained.",
+      "Native Wayland file drag-and-drop remains unproven unless nativeFileDropEventObserved is true."
+    ]
+  },
+  "claims": [
+    {
+      "id": "native_cjk_preedit_commit",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "multiline_shift_enter",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "enter_submit_focus",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "native_clipboard_paste_copy",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "selection_undo_redo",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "suggestion_menu",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "multiline_accessibility_role",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "inline_image_token",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "drop_adapter_fixture",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "native_wayland_file_drop",
+      "status": "blocked",
+      "decisionBearing": true,
+      "blocker": {
+        "code": "native-file-drop-not-exercised",
+        "summary": "The keyboard/clipboard injector cannot originate a Wayland file drag from another application surface.",
+        "action": "Repeat the installed Composer flow with a real file-manager drag and verify nativeFileDropEventObserved before closing this claim."
+      }
+    }
+  ],
+  "summary": {
+    "passedClaims": 9,
+    "blockedClaims": 1,
+    "composerGateSatisfied": false
+  },
+  "limitations": [
+    "The committed screenshots use a sanitized input and attachment fixture.",
+    "The paste fixture is written through GPUI's native platform clipboard; external Wayland clipboard-owner interoperability is not claimed.",
+    "wtype is an MIT capture-only prerequisite and is not linked or packaged with Vibex.",
+    "Native Wayland file drag-and-drop remains decision-bearing and blocked."
+  ]
+}

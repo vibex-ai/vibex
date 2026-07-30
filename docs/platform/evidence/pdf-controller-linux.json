@@ -1,0 +1,224 @@
+{
+  "schemaVersion": "vibex-pdf-controller-evidence.v1",
+  "status": "passed",
+  "capturedAt": "2026-07-29T14:59:00.197Z",
+  "sourceInputs": [
+    {
+      "path": "Cargo.lock",
+      "bytes": 294601,
+      "sha256": "b6d779f0826f45c96ee8caa79ee92e8723c1a6dffa259d1bdfdf0ae086d1617b"
+    },
+    {
+      "path": "Cargo.toml",
+      "bytes": 3238,
+      "sha256": "4fd6bc3054c11df933be75892540d8829f9baea0864157ae8ee0de102907cbc5"
+    },
+    {
+      "path": "apps/desktop/Cargo.toml",
+      "bytes": 2028,
+      "sha256": "0f8f1125905c7c1667298d7a0edb7c599667f554601e89721ec351987b0b7281"
+    },
+    {
+      "path": "apps/desktop/src/main.rs",
+      "bytes": 16336,
+      "sha256": "7115185a420e3c92e08e86096a8925770fb332fa5ef0476c4d313a657f29f2e4"
+    },
+    {
+      "path": "apps/desktop/src/pdf_controller.rs",
+      "bytes": 23938,
+      "sha256": "6f38fe7806fad66c18405d911305b2e075e383edbb2a2250e3f72df95a029639"
+    },
+    {
+      "path": "crates/content/Cargo.toml",
+      "bytes": 429,
+      "sha256": "5d246edd732923e093c6903f1da7d3c1adf02d4c6af5cf5208b91db2fb111081"
+    },
+    {
+      "path": "crates/content/src/lifecycle.rs",
+      "bytes": 19869,
+      "sha256": "f22146f3ba6f308578baffc6f9d97d81f01e6b86b06e94d2ef577ceffd03f2b4"
+    },
+    {
+      "path": "crates/content/src/pdf.rs",
+      "bytes": 28210,
+      "sha256": "45ee5ff41ae6a637fc12eed6bd7ce6056882d8e09d3c63f142d0b258ee475fb6"
+    },
+    {
+      "path": "docs/platform/fixtures/pdf-feasibility.pdf",
+      "bytes": 246256,
+      "sha256": "5eee17047b63701cff30656d9f044cd6d205c175275d02429177294012ccde89"
+    },
+    {
+      "path": "docs/platform/fixtures/pdf-encrypted.pdf",
+      "bytes": 925,
+      "sha256": "2b3361f59f2534ffb1ed263de53c24e62ae671e813fa97ea790c2024f9c7d2b6"
+    },
+    {
+      "path": "docs/platform/fixtures/pdf-too-many-pages.pdf",
+      "bytes": 1028162,
+      "sha256": "dd534ec87c455deff158b2e3ccbbddbe59608627588c2a0b309ae271de7953cb"
+    },
+    {
+      "path": "docs/platform/fixtures/pdf-extreme-page.pdf",
+      "bytes": 339,
+      "sha256": "4a18789abdaf8bef7ed3b7d2e35d848f3227a8ff94b2f2e812398663d26ecada"
+    },
+    {
+      "path": "docs/licenses/pdfium-7881-review.json",
+      "bytes": 6481,
+      "sha256": "322775516a159f55eea0f829a1bdc4ddd19b0ee07c5f2b464c767a1496ebdac1"
+    },
+    {
+      "path": "scripts/capture-pdf-controller.mjs",
+      "bytes": 13687,
+      "sha256": "8272f2a649373895bfaf53d776afd8569a360e29435644ce08f6d391aab66922"
+    },
+    {
+      "path": "scripts/generate-pdf-encrypted-fixture.mjs",
+      "bytes": 5946,
+      "sha256": "aacb915b7abbe27656fa83598db92999ca2a93ba4befc36c46ac774bd4ecc502"
+    },
+    {
+      "path": "scripts/pdf-encrypted-fixture-contract.mjs",
+      "bytes": 315,
+      "sha256": "978eccf8201b0f1cf569ae7d75174b8e3babc15278b3a2f245d084fa93c37aa9"
+    },
+    {
+      "path": "scripts/generate-pdf-large-fixtures.mjs",
+      "bytes": 3949,
+      "sha256": "7daa738151c1b3c3088fa4827cf837f6c695b1aa47cce54e52eb00b11521e539"
+    },
+    {
+      "path": "scripts/pdf-large-fixture-contract.mjs",
+      "bytes": 344,
+      "sha256": "7628332ca45b73a9d7507cb90e0a56cb68577adab42b299c574431a2b6577aca"
+    },
+    {
+      "path": "scripts/prepare-pdfium-runtime.mjs",
+      "bytes": 8255,
+      "sha256": "795962ee19632773130a0f383d939f8ee610fc64e5c61dae34f24a02862a69e9"
+    }
+  ],
+  "nativeRuntime": {
+    "target": "linux-x86_64",
+    "libraryBytes": 7645184,
+    "librarySha256": "f728930966f503652b92acc89b9374a2eeca00ce42e26dccd3e4b5c5161b2d64"
+  },
+  "run": {
+    "schemaVersion": "vibex-pdf-controller-run.v1",
+    "status": "passed",
+    "platform": "linux",
+    "architecture": "x86_64",
+    "engine": {
+      "backend": "pdfium-render",
+      "wrapperVersion": "0.9.3",
+      "pdfiumVersion": "7881",
+      "binding": "explicit-dynamic-library"
+    },
+    "fixture": {
+      "bytes": 246256,
+      "sha256": "5eee17047b63701cff30656d9f044cd6d205c175275d02429177294012ccde89",
+      "pageCount": 12
+    },
+    "encryptedFixture": {
+      "bytes": 925,
+      "sha256": "2b3361f59f2534ffb1ed263de53c24e62ae671e813fa97ea790c2024f9c7d2b6",
+      "pageCount": 1,
+      "missingPasswordErrorCode": "pdf_password_required",
+      "incorrectPasswordErrorCode": "pdf_password_required",
+      "failedOpenClearedDocument": true,
+      "failedOpenClearedCache": true,
+      "correctPasswordOpened": true,
+      "correctPasswordRendered": true,
+      "loadFailuresAfterPasswordAttempts": 4
+    },
+    "largeInputs": {
+      "oversizedSourceBytes": 268435457,
+      "oversizedSourceErrorCode": "pdf_source_size_invalid",
+      "tooManyPagesFixture": {
+        "bytes": 1028162,
+        "sha256": "dd534ec87c455deff158b2e3ccbbddbe59608627588c2a0b309ae271de7953cb",
+        "pageCount": 10001
+      },
+      "tooManyPagesErrorCode": "pdf_page_count_unsupported",
+      "tooManyPagesClearedDocument": true,
+      "tooManyPagesClearedCache": true,
+      "extremePageFixture": {
+        "bytes": 339,
+        "sha256": "4a18789abdaf8bef7ed3b7d2e35d848f3227a8ff94b2f2e812398663d26ecada",
+        "pageCount": 1
+      },
+      "extremePageRenderErrorCode": "pdf_page_exceeds_cache_budget",
+      "extremePageRenderRequests": 0,
+      "extremePageCacheEmpty": true,
+      "loadFailuresAfterLargeAttempts": 5
+    },
+    "opening": {
+      "lifecycleActive": true,
+      "metadataComplete": true,
+      "positivePageDimensions": true
+    },
+    "viewport": {
+      "fit": {
+        "pageIndex": 0,
+        "width": 960,
+        "height": 1358,
+        "rgbaBytes": 5214720,
+        "rgbaSha256": "d141d7d28a8c8cc3c8eb107c0f0da10cbdf251239b51a27674b805c5d2a761ad",
+        "sampledUniqueColors": 80
+      },
+      "zoom150Percent": {
+        "pageIndex": 0,
+        "width": 1440,
+        "height": 2038,
+        "rgbaBytes": 11738880,
+        "rgbaSha256": "c5039cb1d068495452f7edf6ef28665fd5215092da53abdab67f7c820d8fb5c7",
+        "sampledUniqueColors": 75
+      },
+      "overscanPageIndexes": [
+        0,
+        1
+      ],
+      "aspectRatioPreserved": true,
+      "distinctZoomOutput": true,
+      "repeatedViewportReusedCache": true
+    },
+    "cache": {
+      "pageLimit": 3,
+      "budgetBytes": 67108864,
+      "renderedPageRequests": 16,
+      "evictions": 13,
+      "residentPages": 3,
+      "residentBytes": 15644160,
+      "budgetRespected": true
+    },
+    "cancellation": {
+      "preCancelledRenderRejected": true,
+      "errorCode": "pdf_render_cancelled",
+      "cancelledRequests": 1
+    },
+    "failures": {
+      "sourceSizeErrorCode": "pdf_source_size_invalid",
+      "corruptErrorCode": "pdf_document_corrupt",
+      "lifecycleError": true,
+      "failedReloadClearedDocument": true,
+      "failedReloadClearedCache": true,
+      "loadFailures": 2
+    },
+    "close": {
+      "lifecycleClosed": true,
+      "documentReleased": true,
+      "cacheReleased": true
+    },
+    "privacy": {
+      "diagnosticsContainFixturePath": false,
+      "diagnosticsContainDocumentSentinel": false,
+      "diagnosticsContainPageContent": false,
+      "diagnosticsContainPassword": false
+    },
+    "limitations": [
+      "this controller run is headless and does not claim GPUI page controls or physical input",
+      "PDFium native-call crash and hard-timeout isolation remain open and are not claimed by typed error tests"
+    ]
+  }
+}

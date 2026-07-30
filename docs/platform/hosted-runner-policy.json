@@ -1,0 +1,197 @@
+{
+  "schemaVersion": "hosted-runner-policy.v1",
+  "policyDecision": {
+    "status": "approved",
+    "approvedOn": "2026-07-17",
+    "scope": "GitHub-hosted macOS and Windows feasibility evidence",
+    "skipSemantics": "A skipped claim is outside the decision denominator. It is not a pass, failure, blocker, accepted deviation, or evidence of parity.",
+    "linuxScopeUnchanged": true
+  },
+  "toolchain": {
+    "rust": "1.97.0",
+    "nodeMajor": 22,
+    "pnpm": "11.3.0",
+    "cargoPackager": "0.11.8"
+  },
+  "actions": [
+    {
+      "id": "checkout",
+      "repository": "actions/checkout",
+      "revision": "11bd71901bbe5b1630ceea73d27597364c9af683",
+      "release": "v4.2.2"
+    },
+    {
+      "id": "pnpm_setup",
+      "repository": "pnpm/action-setup",
+      "revision": "7088e561eb65bb68695d245aa206f005ef30921d",
+      "release": "v4.1.0"
+    },
+    {
+      "id": "node_setup",
+      "repository": "actions/setup-node",
+      "revision": "49933ea5288caeca8642d1e84afbd3f7d6820020",
+      "release": "v4.4.0"
+    },
+    {
+      "id": "rust_toolchain",
+      "repository": "dtolnay/rust-toolchain",
+      "revision": "35a842e360814583e976785eeda0bd0655cb8e83",
+      "release": "1.97.0"
+    },
+    {
+      "id": "upload_artifact",
+      "repository": "actions/upload-artifact",
+      "revision": "ea165f8d65b6e75b540449e92b4886f43607fa02",
+      "release": "v4.6.2"
+    },
+    {
+      "id": "download_artifact",
+      "repository": "actions/download-artifact",
+      "revision": "d3f86a106a0bac45b974a628896c90dbdf5c8093",
+      "release": "v4.3.0"
+    }
+  ],
+  "requiredTargets": [
+    "macos",
+    "windows"
+  ],
+  "requiredDecisionChecks": [
+    {
+      "id": "pinned_toolchain",
+      "description": "The runner uses the reviewed Rust, Node, pnpm, and cargo-packager versions."
+    },
+    {
+      "id": "locked_cargo_metadata",
+      "description": "Cargo resolves the committed lockfile for the complete workspace."
+    },
+    {
+      "id": "locked_gpui_source_identity",
+      "description": "The production graph contains one reviewed Zed revision and the controlled gpui-component vendor."
+    },
+    {
+      "id": "workspace_rust_tests",
+      "description": "All Rust workspace tests pass from the committed lockfile."
+    },
+    {
+      "id": "desktop_tests",
+      "description": "The production-shaped GPUI package tests pass explicitly."
+    },
+    {
+      "id": "frontend_quality",
+      "description": "Frontend type checking and linting pass on the native runner."
+    },
+    {
+      "id": "supply_chain",
+      "description": "License, SBOM, notice, asset, and installer-input policy checks pass."
+    },
+    {
+      "id": "release_link",
+      "description": "The GPUI application links in release mode for the native target."
+    },
+    {
+      "id": "direct_probe",
+      "description": "The release binary reports the bounded source and platform probe."
+    },
+    {
+      "id": "terminal_feasibility",
+      "description": "The release binary exercises the Vibex PTY and Alacritty model with raw bytes, CJK, resize, alternate screen, selection, and 10 MiB lossless throughput; Windows must use ConPTY."
+    },
+    {
+      "id": "pdfium_headless_runtime",
+      "description": "The release binary loads the pinned native PDFium archive for the runner architecture and exercises CJK extraction, fit/zoom rendering, bounded page caching, and invalid-document handling without a window."
+    },
+    {
+      "id": "platform_initialization",
+      "description": "The native GPUI application initializes and remains alive for the bounded observation interval without making a pixel claim."
+    },
+    {
+      "id": "minimal_package",
+      "description": "cargo-packager creates the reviewed native package with the registered application icon input."
+    },
+    {
+      "id": "install_lifecycle",
+      "description": "The package installs into an isolated runner-owned location."
+    },
+    {
+      "id": "packaged_probe",
+      "description": "The installed package binary reports the same bounded source and platform probe."
+    },
+    {
+      "id": "artifact_hashes",
+      "description": "Release binary, installed binary, package, config, and icon identities are recorded and consistent."
+    },
+    {
+      "id": "uninstall_lifecycle",
+      "description": "The isolated installation and its executable are removed."
+    }
+  ],
+  "requiredSkippedClaims": [
+    {
+      "id": "real_window_screenshots_native_pixels",
+      "status": "skipped_by_product_decision",
+      "decisionImpact": false,
+      "decisionDenominator": "excluded",
+      "notEvidenceOfParity": true,
+      "reason": "GitHub-hosted runners are not used for reviewed real-window screenshots or native pixel comparison."
+    },
+    {
+      "id": "ime_composition",
+      "status": "skipped_by_product_decision",
+      "decisionImpact": false,
+      "decisionDenominator": "excluded",
+      "notEvidenceOfParity": true,
+      "reason": "Hosted runner automation does not provide reviewed physical IME composition evidence."
+    },
+    {
+      "id": "keyboard_pointer_clipboard_drag_drop_input",
+      "status": "skipped_by_product_decision",
+      "decisionImpact": false,
+      "decisionDenominator": "excluded",
+      "notEvidenceOfParity": true,
+      "reason": "Hosted runner automation does not provide reviewed real keyboard, pointer, clipboard, or drag-drop input evidence."
+    },
+    {
+      "id": "dpi_scale_transitions",
+      "status": "skipped_by_product_decision",
+      "decisionImpact": false,
+      "decisionDenominator": "excluded",
+      "notEvidenceOfParity": true,
+      "reason": "Hosted runner automation does not provide reviewed physical DPI or scale-transition evidence."
+    },
+    {
+      "id": "multi_monitor_behavior",
+      "status": "skipped_by_product_decision",
+      "decisionImpact": false,
+      "decisionDenominator": "excluded",
+      "notEvidenceOfParity": true,
+      "reason": "Hosted runner automation does not provide reviewed physical multi-monitor evidence."
+    }
+  ],
+  "targets": [
+    {
+      "id": "macos",
+      "runnerLabel": "macos-15",
+      "runnerOs": "macOS",
+      "nodePlatform": "darwin",
+      "allowedArchitectures": [
+        "x86_64",
+        "aarch64"
+      ],
+      "packageFormat": "app",
+      "productName": "Vibex Preview",
+      "installedBinaryRelativePath": "Vibex Preview.app/Contents/MacOS/vibex-desktop"
+    },
+    {
+      "id": "windows",
+      "runnerLabel": "windows-2022",
+      "runnerOs": "Windows",
+      "nodePlatform": "win32",
+      "allowedArchitectures": [
+        "x86_64"
+      ],
+      "packageFormat": "nsis",
+      "productName": "Vibex Preview",
+      "installedBinaryRelativePath": "vibex-desktop.exe"
+    }
+  ]
+}

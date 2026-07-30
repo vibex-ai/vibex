@@ -1,0 +1,106 @@
+name: Hosted Native Gate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-native-gate-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PACKAGER_VERSION: "0.11.8"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  native-target:
+    name: Native gate (${{ matrix.id }} / ${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: macos
+            runner: macos-15
+            package-format: app
+          - id: windows
+            runner: windows-2022
+            package-format: nsis
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: pnpm/action-setup@7088e561eb65bb68695d245aa206f005ef30921d # v4.1.0
+        with:
+          version: 11.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+        with:
+          components: rustfmt, clippy
+      - name: Install locked JavaScript dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Install pinned cargo-packager
+        run: cargo install cargo-packager --version "${{ env.CARGO_PACKAGER_VERSION }}" --locked
+      - name: Validate hosted-runner policy
+        run: node scripts/check-hosted-runner-evidence.mjs --policy
+      - name: Run decision-bearing native target gate
+        run: >-
+          node scripts/check-hosted-runner-evidence.mjs
+          --run-target ${{ matrix.id }}
+          --output target/hosted-evidence/${{ matrix.id }}.json
+      - name: Upload target evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hosted-evidence-${{ matrix.id }}
+          path: target/hosted-evidence/${{ matrix.id }}.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload native package
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hosted-package-${{ matrix.id }}
+          path: target/hosted-packages/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+  merge-evidence:
+    name: Merge hosted evidence matrix
+    if: always()
+    needs: native-target
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Download target evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: hosted-evidence-*
+          path: target/hosted-evidence
+          merge-multiple: true
+      - name: Merge and validate target evidence
+        id: merge
+        if: always()
+        continue-on-error: true
+        run: >-
+          node scripts/check-hosted-runner-evidence.mjs
+          --merge
+          target/hosted-evidence/macos.json
+          target/hosted-evidence/windows.json
+          --output docs/platform/evidence/hosted-runner-matrix.json
+      - name: Upload merged evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hosted-runner-matrix
+          path: docs/platform/evidence/hosted-runner-matrix.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Propagate matrix gate result
+        if: steps.merge.outcome != 'success'
+        run: exit 1

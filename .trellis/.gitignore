@@ -1,0 +1,39 @@
+# Developer identity (local only)
+.developer
+
+# The private task tree (tasks/, research/, workspace/<dev>/, .current-task,
+# .runtime/) is deliberately NOT ignored here. Those paths are tracked by the
+# separate task repository, whose work tree is this directory and whose git dir
+# is .trellis/.taskgit. The public vibex repository ignores them from the
+# repository-root .gitignore instead — a file this work tree never reads,
+# because it sits above the task repository's root.
+#
+# Do NOT move those rules back into this file. A .gitignore inside the work tree
+# outranks .taskgit/info/exclude, so it would make the task repository blind to
+# every new task, research note and journal entry.
+#
+# Everything below is genuine runtime junk that BOTH repositories must ignore.
+
+# Ralph Loop state file
+.ralph-state.json
+
+# Agent runtime files
+.agents/
+.agent-log
+.session-id
+
+# Task directory runtime files
+.plan-log
+
+# Atomic update temp files
+*.tmp
+
+# Update backup directories
+.backup-*
+
+# Conflict resolution temp files
+*.new
+
+# Python cache
+**/__pycache__/
+**/*.pyc

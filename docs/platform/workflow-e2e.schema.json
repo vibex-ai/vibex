@@ -1,0 +1,198 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vibex.dev/schemas/workflow-e2e.v1.json",
+  "title": "Vibex Web and Android workflow E2E evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "updatedAt", "candidate", "targets", "redaction"],
+  "properties": {
+    "schemaVersion": { "const": "vibex-workflow-e2e.v1" },
+    "updatedAt": { "type": "string", "format": "date-time" },
+    "candidate": { "$ref": "#/$defs/candidate" },
+    "targets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["web_browser", "android_physical"],
+      "properties": {
+        "web_browser": { "$ref": "#/$defs/transportTargets" },
+        "android_physical": { "$ref": "#/$defs/transportTargets" }
+      }
+    },
+    "redaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bounded",
+        "containsSecrets",
+        "containsUserContent",
+        "containsRawLogs",
+        "containsPairingMaterial"
+      ],
+      "properties": {
+        "bounded": { "const": true },
+        "containsSecrets": { "const": false },
+        "containsUserContent": { "const": false },
+        "containsRawLogs": { "const": false },
+        "containsPairingMaterial": { "const": false }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "gitRevision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "webBuild", "androidApk", "candidateDigest"],
+      "properties": {
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "sourceCommit",
+            "sourceTreeSha256",
+            "workflowSourceTreeSha256",
+            "mobileShellTreeSha256",
+            "cargoLockSha256",
+            "pnpmLockSha256",
+            "zedRevision",
+            "gpuiComponentRevision"
+          ],
+          "properties": {
+            "sourceCommit": { "$ref": "#/$defs/gitRevision" },
+            "sourceTreeSha256": { "$ref": "#/$defs/sha256" },
+            "workflowSourceTreeSha256": { "$ref": "#/$defs/sha256" },
+            "mobileShellTreeSha256": { "$ref": "#/$defs/sha256" },
+            "cargoLockSha256": { "$ref": "#/$defs/sha256" },
+            "pnpmLockSha256": { "$ref": "#/$defs/sha256" },
+            "zedRevision": { "$ref": "#/$defs/gitRevision" },
+            "gpuiComponentRevision": { "$ref": "#/$defs/gitRevision" }
+          }
+        },
+        "webBuild": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "buildId",
+            "profile",
+            "wasmBytes",
+            "wasmSha256",
+            "glueSha256",
+            "staticSha256",
+            "buildJsonSha256",
+            "hostJsSha256"
+          ],
+          "properties": {
+            "buildId": { "type": "string", "pattern": "^[0-9a-f]{24}$" },
+            "profile": { "const": "release" },
+            "wasmBytes": { "type": "integer", "minimum": 1 },
+            "wasmSha256": { "$ref": "#/$defs/sha256" },
+            "glueSha256": { "$ref": "#/$defs/sha256" },
+            "staticSha256": { "$ref": "#/$defs/sha256" },
+            "buildJsonSha256": { "$ref": "#/$defs/sha256" },
+            "hostJsSha256": { "$ref": "#/$defs/sha256" }
+          }
+        },
+        "androidApk": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["path", "bytes", "sha256", "applicationId"],
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "pattern": "^apps/mobile/artifacts/"
+                },
+                "bytes": { "type": "integer", "minimum": 1 },
+                "sha256": { "$ref": "#/$defs/sha256" },
+                "applicationId": { "const": "dev.vibex.remote" }
+              }
+            }
+          ]
+        },
+        "candidateDigest": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "transportTargets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["direct", "relay"],
+      "properties": {
+        "direct": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/target" }] },
+        "relay": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/target" }] }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target",
+        "transport",
+        "status",
+        "capturedAt",
+        "candidateDigest",
+        "environment",
+        "topology",
+        "workflows",
+        "permissionContractSha256",
+        "redactionScan"
+      ],
+      "properties": {
+        "target": { "enum": ["web_browser", "android_physical"] },
+        "transport": { "enum": ["direct", "relay"] },
+        "status": { "const": "passed" },
+        "capturedAt": { "type": "string", "format": "date-time" },
+        "candidateDigest": { "$ref": "#/$defs/sha256" },
+        "environment": { "type": "object" },
+        "topology": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "endpointSha256", "selfHosted", "e2ee", "officialService"],
+          "properties": {
+            "kind": { "enum": ["lan_or_private_network", "self_hosted_relay"] },
+            "endpointSha256": { "$ref": "#/$defs/sha256" },
+            "selfHosted": { "const": true },
+            "e2ee": { "type": "boolean" },
+            "officialService": { "const": false }
+          }
+        },
+        "workflows": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["agent", "files", "git", "terminal", "management"],
+          "properties": {
+            "agent": { "$ref": "#/$defs/workflowResult" },
+            "files": { "$ref": "#/$defs/workflowResult" },
+            "git": { "$ref": "#/$defs/workflowResult" },
+            "terminal": { "$ref": "#/$defs/workflowResult" },
+            "management": { "$ref": "#/$defs/workflowResult" }
+          }
+        },
+        "permissionContractSha256": { "$ref": "#/$defs/sha256" },
+        "redactionScan": { "const": "passed" }
+      }
+    },
+    "workflowResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "permission",
+        "businessResult",
+        "liveEvent",
+        "reconnectRecovery",
+        "errorCode"
+      ],
+      "properties": {
+        "status": { "const": "passed" },
+        "permission": { "const": "passed" },
+        "businessResult": { "const": "passed" },
+        "liveEvent": { "const": "passed" },
+        "reconnectRecovery": { "const": "passed" },
+        "errorCode": { "type": "null" }
+      }
+    }
+  }
+}

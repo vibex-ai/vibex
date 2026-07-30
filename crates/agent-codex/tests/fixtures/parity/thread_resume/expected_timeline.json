@@ -1,0 +1,54 @@
+{
+  "candidateStatus": "importable",
+  "continuationReason": null,
+  "continuationStatus": "resumable",
+  "diagnosticCodes": [],
+  "items": [
+    {
+      "payload": {
+        "data": {
+          "attachments": [],
+          "text": "First turn prompt"
+        },
+        "type": "user_message"
+      },
+      "providerCorrelationId": "item-user-1",
+      "source": "user"
+    },
+    {
+      "payload": {
+        "data": {
+          "isFinal": true,
+          "text": "First turn answer"
+        },
+        "type": "agent_message"
+      },
+      "providerCorrelationId": "item-assistant-1",
+      "source": "agent"
+    },
+    {
+      "payload": {
+        "data": {
+          "attachments": [],
+          "text": "Second turn prompt"
+        },
+        "type": "user_message"
+      },
+      "providerCorrelationId": "item-user-2",
+      "source": "user"
+    },
+    {
+      "payload": {
+        "data": {
+          "isFinal": true,
+          "text": "Second turn answer"
+        },
+        "type": "agent_message"
+      },
+      "providerCorrelationId": "item-assistant-2",
+      "source": "agent"
+    }
+  ],
+  "nativeThreadId": "codex-thread-parity-resume",
+  "workspaceRoot": "/home/user/workspace/demo"
+}

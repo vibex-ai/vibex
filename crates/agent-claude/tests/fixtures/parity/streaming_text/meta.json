@@ -1,0 +1,9 @@
+{
+  "capability": "streaming_text",
+  "mode": "stream_events",
+  "source": "synthetic-offline (mirrors Anthropic streaming content_block_delta/text_delta wire shape accepted by map_claude_stream_event)",
+  "sdk": "offline Serde wire mirror",
+  "recorded_at": "2026-07-11",
+  "known_defects": [],
+  "notes": "Replayed offline through parity::map_stream_event; text_delta becomes AgentMessageDelta with monotonically increasing chunk_index."
+}

@@ -1,0 +1,139 @@
+{
+  "schemaVersion": "linux-native-frame-evidence.v2",
+  "capturedAt": "2026-07-18T11:33:40.410Z",
+  "source": {
+    "vibexBaselineCommit": "f1c624f115401d6160a771545fa1ec73128394b1",
+    "captureParentCommit": "65efcb3ee74e711bb9d25ca0f55af7b36dc3b0c8",
+    "zedRevision": "819fe337999551ce8177b14c8db1127645617ae4",
+    "gpuiComponentRevision": "3c270ed244d06fb211b47f156761c1d833eac535",
+    "lockfileSha256": "6bafd6ea8d8aa706f6a51a01d7884c6f00209247b716f5cb6ba4e4b8a3aa80a4",
+    "gpuiShellTreeSha256": "86dcd7138fc80a5b421f9b4c35b350f18ff5115498c7987591eea72ec82c8aab",
+    "hostedRunnerPolicySha256": "4dd8867fce81d843cef446b001553a65331b4f6b013a952f575355ac9ccedf29"
+  },
+  "requiredTargets": [
+    "linux_x11",
+    "linux_wayland"
+  ],
+  "targets": [
+    {
+      "id": "linux_x11",
+      "status": "captured_physical",
+      "runner": {
+        "platform": "linux",
+        "architecture": "x64",
+        "displayBackend": "x11-xwayland-hyprland",
+        "compositor": "Hyprland",
+        "syntheticDisplay": false,
+        "gpu": {
+          "deviceName": "AMD Radeon 780M Graphics (RADV PHOENIX)",
+          "driverName": "radv",
+          "driverInfo": "Mesa 26.1.4-arch1.1"
+        },
+        "monitor": {
+          "width": 2560,
+          "height": 1440,
+          "physicalWidthMm": 530,
+          "physicalHeightMm": 300,
+          "refreshRateHz": 59.951,
+          "scaleFactor": 1,
+          "transform": 0
+        }
+      },
+      "window": {
+        "identity": "dev.vibex.desktop.preview",
+        "discovered": true,
+        "borderlessRequested": true,
+        "xwayland": true,
+        "width": 1200,
+        "height": 780
+      },
+      "capture": {
+        "screenshotPath": "docs/parity/screenshots/current/spikes/linux-x11-native.png",
+        "screenshotSha256": "b8d883f942c876fd67c2cabfd74c1e0d3e624ded9f9454cdbf3a3223878ed30f",
+        "width": 1200,
+        "height": 780,
+        "uniqueColors": 684,
+        "entropy": 0.106895,
+        "mean": 0.0484969,
+        "standardDeviation": 0.0427797
+      },
+      "nativePixelsVerified": true,
+      "blocker": null,
+      "limitations": [
+        "This first-frame capture proves application pixels only, not keyboard, pointer, clipboard, accessibility, or IME behavior.",
+        "One Linux workstation cannot substitute for macOS, Windows, another compositor, packaging, or multi-monitor DPI transition evidence."
+      ],
+      "processStderrSignals": {
+        "dri3Mentioned": false,
+        "panicMentioned": false
+      }
+    },
+    {
+      "id": "linux_wayland",
+      "status": "captured_physical",
+      "runner": {
+        "platform": "linux",
+        "architecture": "x64",
+        "displayBackend": "wayland-hyprland",
+        "compositor": "Hyprland",
+        "syntheticDisplay": false,
+        "gpu": {
+          "deviceName": "AMD Radeon 780M Graphics (RADV PHOENIX)",
+          "driverName": "radv",
+          "driverInfo": "Mesa 26.1.4-arch1.1"
+        },
+        "monitor": {
+          "width": 2560,
+          "height": 1440,
+          "physicalWidthMm": 530,
+          "physicalHeightMm": 300,
+          "refreshRateHz": 59.951,
+          "scaleFactor": 1,
+          "transform": 0
+        }
+      },
+      "window": {
+        "identity": "dev.vibex.desktop.preview",
+        "discovered": true,
+        "borderlessRequested": true,
+        "xwayland": false,
+        "width": 1200,
+        "height": 780
+      },
+      "capture": {
+        "screenshotPath": "docs/parity/screenshots/current/spikes/linux-wayland-native.png",
+        "screenshotSha256": "40939f8f7f0a94c53d2faa98456f72c5e6085f58a577af6b9ccb40b308f4f9df",
+        "width": 1200,
+        "height": 780,
+        "uniqueColors": 673,
+        "entropy": 0.105391,
+        "mean": 0.0482516,
+        "standardDeviation": 0.0415409
+      },
+      "nativePixelsVerified": true,
+      "blocker": null,
+      "limitations": [
+        "This first-frame capture proves application pixels only, not keyboard, pointer, clipboard, accessibility, or IME behavior.",
+        "One Linux workstation cannot substitute for macOS, Windows, another compositor, packaging, or multi-monitor DPI transition evidence."
+      ],
+      "processStderrSignals": {
+        "dri3Mentioned": false,
+        "panicMentioned": false
+      }
+    }
+  ],
+  "linuxNativePixelGateSatisfied": true,
+  "hostedPixelDisposition": {
+    "policyPath": "docs/platform/hosted-runner-policy.json",
+    "targets": [
+      "macos",
+      "windows"
+    ],
+    "claimId": "real_window_screenshots_native_pixels",
+    "status": "skipped_by_product_decision",
+    "decisionImpact": false,
+    "decisionDenominator": "excluded",
+    "notEvidenceOfParity": true,
+    "reason": "GitHub-hosted runners are not used for reviewed real-window screenshots or native pixel comparison."
+  }
+}

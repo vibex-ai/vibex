@@ -1,0 +1,398 @@
+{
+  "schemaVersion": "vibex-license-policy.v1",
+  "rootPackage": "vibex-desktop",
+  "graphScope": "all-target-normal-and-build",
+  "policy": "Every production-reachable Cargo package and redistributed input must have an approved SPDX license selection and reproducible provenance.",
+  "gplFallbackDisposition": {
+    "status": "activated",
+    "activated": true,
+    "rationale": "Vibex is licensed AGPL-3.0-or-later and intentionally uses the upstream Zed GPL-3.0-or-later tracing packages instead of maintaining a local compatibility shim.",
+    "activationGate": "GPL-3.0-or-later remains limited to the reviewed upstream Zed tracing family; any additional copyleft family requires explicit allowlist review."
+  },
+  "allowedLicenses": [
+    {
+      "id": "0BSD",
+      "rationale": "Permissive zero-clause BSD license, approved as an initial-policy equivalent."
+    },
+    {
+      "id": "Apache-2.0",
+      "rationale": "Permissive Apache license compatible with the Vibex distribution policy."
+    },
+    {
+      "id": "AGPL-3.0-or-later",
+      "rationale": "Vibex repository and application license."
+    },
+    {
+      "id": "BSD-2-Clause",
+      "rationale": "Permissive two-clause BSD license compatible with the Vibex distribution policy."
+    },
+    {
+      "id": "BSD-3-Clause",
+      "rationale": "Permissive three-clause BSD license compatible with the Vibex distribution policy."
+    },
+    {
+      "id": "BSL-1.0",
+      "rationale": "Permissive Boost license, approved as an initial-policy equivalent."
+    },
+    {
+      "id": "CC0-1.0",
+      "rationale": "Public-domain dedication with fallback license, approved for dependency data and code."
+    },
+    {
+      "id": "CDLA-Permissive-2.0",
+      "rationale": "Permissive data license used by the webpki-root-certs trust anchors in the ACP/reqwest platform-verifier graph."
+    },
+    {
+      "id": "FTL",
+      "rationale": "PDFium FreeType runtime license; binary distributions retain the required acknowledgement and disclaimer."
+    },
+    {
+      "id": "ISC",
+      "rationale": "Permissive ISC license compatible with the Vibex distribution policy."
+    },
+    {
+      "id": "GPL-3.0-or-later",
+      "rationale": "Approved for the upstream Zed tracing family used by the AGPL-3.0-or-later Vibex application."
+    },
+    {
+      "id": "IJG",
+      "rationale": "PDFium libjpeg-turbo runtime license; binary documentation retains the Independent JPEG Group acknowledgement."
+    },
+    {
+      "id": "MIT",
+      "rationale": "Permissive MIT license compatible with the Vibex distribution policy."
+    },
+    {
+      "id": "LicenseRef-AGG-2.3",
+      "rationale": "PDFium Anti-Grain Geometry 2.3 component license; the permissive notice permits redistribution when retained."
+    },
+    {
+      "id": "Libpng",
+      "rationale": "PDFium PNG runtime license; origin and copyright notices remain in the distributed license bundle."
+    },
+    {
+      "id": "MIT-0",
+      "rationale": "Permissive MIT variant, approved as an initial-policy equivalent."
+    },
+    {
+      "id": "MPL-2.0",
+      "rationale": "Separately approved file-scoped weak-copyleft dependency license; affected upstream files remain unmodified and source provenance is retained."
+    },
+    {
+      "id": "NCSA",
+      "rationale": "Permissive University of Illinois/NCSA license, approved as an initial-policy equivalent."
+    },
+    {
+      "id": "OFL-1.1",
+      "rationale": "Approved for the Inter variable fonts embedded in the GPUI-WASM Web and mobile runtime; the complete OFL notice is redistributed with the source assets."
+    },
+    {
+      "id": "Unicode-3.0",
+      "rationale": "Initial Unicode policy family."
+    },
+    {
+      "id": "Unlicense",
+      "rationale": "Public-domain dedication with fallback terms, approved as an initial-policy equivalent."
+    },
+    {
+      "id": "Zlib",
+      "rationale": "Permissive zlib license, approved as an initial-policy equivalent."
+    },
+    {
+      "id": "bzip2-1.0.6",
+      "rationale": "Permissive bzip2 license, approved as an initial-policy equivalent."
+    },
+    {
+      "id": "libtiff",
+      "rationale": "PDFium TIFF runtime license; copyright, permission, and non-endorsement terms remain in the distributed license bundle."
+    }
+  ],
+  "allowedExceptions": [
+    "LLVM-exception"
+  ],
+  "expressionNormalizations": {
+    "Apache-2.0 / MIT": "Apache-2.0 OR MIT",
+    "Apache-2.0/MIT": "Apache-2.0 OR MIT",
+    "MIT / Apache-2.0": "MIT OR Apache-2.0",
+    "MIT/Apache-2.0": "MIT OR Apache-2.0",
+    "Unlicense/MIT": "Unlicense OR MIT"
+  },
+  "packageLicenseOverrides": [
+    {
+      "name": "gpui_shared_string",
+      "version": "0.1.0",
+      "sourceRepository": "https://github.com/zed-industries/zed",
+      "licenseExpression": "Apache-2.0",
+      "evidencePath": "LICENSE-APACHE",
+      "upstreamPath": "crates/gpui_shared_string/LICENSE-APACHE@Cargo.lock",
+      "evidenceSha256": "752daf2fb234ca4a1fa372c073fe127f44b7b90fd2529ae44273a64f9d53da7a"
+    },
+    {
+      "name": "gpui_util",
+      "version": "0.1.0",
+      "sourceRepository": "https://github.com/zed-industries/zed",
+      "licenseExpression": "Apache-2.0",
+      "evidencePath": "LICENSE-APACHE",
+      "upstreamPath": "crates/gpui_util/LICENSE-APACHE@Cargo.lock",
+      "evidenceSha256": "752daf2fb234ca4a1fa372c073fe127f44b7b90fd2529ae44273a64f9d53da7a"
+    }
+  ],
+  "assetInputs": [
+    {
+      "id": "gpui-component-lucide-icons",
+      "name": "gpui-component bundled Lucide icon set",
+      "version": "Cargo.lock",
+      "ownerPackage": "gpui-component-assets",
+      "packageRelativeRoot": "assets/icons",
+      "extensions": [
+        ".svg"
+      ],
+      "expectedFileCount": 99,
+      "treeSha256": "6da0d2d4b0dd99f10536b9460c7f21691899183d50190655e2d21f2fac2bfdb8",
+      "licenseExpression": "Apache-2.0 AND ISC",
+      "source": "https://github.com/longbridge/gpui-component/tree/main/crates/assets/assets/icons"
+    },
+    {
+      "id": "vibex-desktop-reviewed-icons",
+      "name": "Vibex Desktop GPUI reviewed icon bundle",
+      "version": "0.1.0-rc.1",
+      "ownerPackage": "vibex-desktop",
+      "root": "apps/desktop/assets/icons",
+      "extensions": [
+        ".svg"
+      ],
+      "expectedFileCount": 73,
+      "treeSha256": "630d227f29cee7cde8064e2e3d52ad75a78ddb0dea6fc21d36b41c600653ea1d",
+      "licenseExpression": "AGPL-3.0-or-later AND ISC AND MIT AND CC0-1.0",
+      "source": "https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/icons",
+      "licenseEvidence": "52 Lucide SVGs (ISC); 15 SVG Logos and 3 Simple Icons SVGs (CC0-1.0); 1 Material Icon Theme and 1 VSCode Icons SVG (MIT); 1 Vibex mark (AGPL-3.0-or-later). Brand names and marks remain the property of their respective owners.",
+      "sourceComponents": [
+        {
+          "name": "Lucide",
+          "fileCount": 52,
+          "licenseExpression": "ISC",
+          "source": "https://github.com/lucide-icons/lucide"
+        },
+        {
+          "name": "SVG Logos",
+          "fileCount": 15,
+          "licenseExpression": "CC0-1.0",
+          "source": "https://github.com/gilbarbara/logos"
+        },
+        {
+          "name": "Simple Icons",
+          "fileCount": 3,
+          "licenseExpression": "CC0-1.0",
+          "source": "https://github.com/simple-icons/simple-icons"
+        },
+        {
+          "name": "Material Icon Theme",
+          "fileCount": 1,
+          "licenseExpression": "MIT",
+          "source": "https://github.com/material-extensions/vscode-material-icon-theme"
+        },
+        {
+          "name": "VSCode Icons",
+          "fileCount": 1,
+          "licenseExpression": "MIT",
+          "source": "https://github.com/vscode-icons/vscode-icons"
+        },
+        {
+          "name": "Vibex mark",
+          "fileCount": 1,
+          "licenseExpression": "AGPL-3.0-or-later",
+          "source": "https://github.com/vibex-ai/vibex"
+        }
+      ]
+    },
+    {
+      "id": "vibex-desktop-application-icons",
+      "name": "Vibex desktop application and tray icons",
+      "version": "0.1.0-rc.1",
+      "ownerPackage": "vibex-desktop",
+      "root": "apps/desktop/assets/app-icons",
+      "extensions": [
+        ".ico",
+        ".png"
+      ],
+      "expectedFileCount": 3,
+      "treeSha256": "0d76eae3f16fa4d5dcacc6a675856663f2a8cb984d603735c556e0925ead1101",
+      "licenseExpression": "AGPL-3.0-or-later",
+      "source": "https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/app-icons"
+    },
+    {
+      "id": "vibex-web-application-icon",
+      "name": "Vibex GPUI-WASM Web application icon",
+      "version": "0.1.0-rc.1",
+      "ownerPackage": "vibex-ui",
+      "root": "apps/web/web",
+      "files": [
+        "icon.svg"
+      ],
+      "extensions": [
+        ".svg"
+      ],
+      "expectedFileCount": 1,
+      "treeSha256": "55337e2a7ae8ba53e409bc494537ee94892fa3f5e611492a8d1eb93b15215dbd",
+      "licenseExpression": "AGPL-3.0-or-later",
+      "source": "https://github.com/vibex-ai/vibex/blob/main/apps/web/web/icon.svg",
+      "licenseEvidence": "Repository-authored Web application treatment of the registered Vibex mark; distributed under the repository AGPL-3.0-or-later license."
+    }
+  ],
+  "fontInputs": [
+    {
+      "id": "vibex-web-inter-variable-fonts",
+      "name": "Inter variable Web runtime fonts",
+      "version": "5.2.8",
+      "ownerPackage": "vibex-ui",
+      "root": "apps/web/assets/fonts",
+      "files": [
+        "OFL.txt",
+        "README.md",
+        "inter-latin-ext-wght-normal.ttf",
+        "inter-latin-wght-normal.ttf"
+      ],
+      "extensions": [
+        ".md",
+        ".ttf",
+        ".txt"
+      ],
+      "expectedFileCount": 4,
+      "treeSha256": "e10f9a6a0ef6976cc8bea761d3ec6e920d1639e460ce9c8fb56a783f459073e6",
+      "licenseExpression": "OFL-1.1",
+      "source": "https://www.npmjs.com/package/@fontsource-variable/inter/v/5.2.8",
+      "licenseEvidence": "The shared UI token family owns this font contract. The TTF files are deterministic decompressions of the locked Fontsource WOFF2 assets embedded only by Web/Android; OFL.txt is redistributed unchanged."
+    },
+    {
+      "id": "vibex-web-wenquanyi-cjk-fallback",
+      "name": "WenQuanYi Micro Hei CJK fallback",
+      "version": "0.2.0-beta",
+      "ownerPackage": "vibex-ui",
+      "root": "apps/web/assets/fonts",
+      "files": [
+        "APACHE-2.0.txt",
+        "wqy-microhei.ttc"
+      ],
+      "extensions": [
+        ".ttc",
+        ".txt"
+      ],
+      "expectedFileCount": 2,
+      "treeSha256": "5c1ac72fd0f922d911d5e31f8ee444dd719fcb34755b2893f5e9668a14ca775e",
+      "licenseExpression": "Apache-2.0",
+      "source": "https://wenq.org/wqy2/index.cgi?MicroHei",
+      "licenseEvidence": "WenQuanYi Micro Hei 0.2.0-beta is embedded as a CJK fallback for the GPUI-WASM Web and Android runtime. The Apache-2.0 license text is redistributed unchanged."
+    }
+  ],
+  "nativeInputs": [
+    {
+      "id": "pdfium-7881-linux-x86-64",
+      "name": "PDFium native runtime",
+      "version": "151.0.7881.0",
+      "platforms": [
+        "linux-x86_64"
+      ],
+      "licenseExpression": "MIT AND BSD-3-Clause AND Apache-2.0 AND LicenseRef-AGG-2.3 AND FTL AND Unicode-3.0 AND IJG AND Zlib AND BSD-2-Clause AND Libpng AND libtiff AND (Apache-2.0 WITH LLVM-exception)",
+      "source": "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F7881/pdfium-linux-x64.tgz",
+      "sha256": "1470e21b8b4a3b4ad7f85684e2da11d94f3b69a86d81dee11b9b6709d927ac1d",
+      "binaryPath": "lib/libpdfium.so",
+      "binarySha256": "f728930966f503652b92acc89b9374a2eeca00ce42e26dccd3e4b5c5161b2d64",
+      "binaryBytes": 7645184,
+      "licenseEvidence": "docs/licenses/pdfium-7881-review.json plus all 16 license files extracted from the verified archive",
+      "distribution": "verified Linux x86_64 PDF rendering runtime and complete license bundle"
+    }
+  ],
+  "installerInputs": [
+    {
+      "id": "cargo-packager",
+      "name": "cargo-packager configuration and package templates",
+      "version": "0.11.8",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "licenseExpression": "Apache-2.0 OR MIT",
+      "source": "https://crates.io/crates/cargo-packager/0.11.8",
+      "sha256": "9aa0f5056c4191007702931dce47054c98fe78cbbebbaff8c7c39d5ebeed123d",
+      "distribution": "pinned build tool; generated bundle and installer metadata"
+    },
+    {
+      "id": "nsis",
+      "name": "Nullsoft Scriptable Install System installer stub",
+      "version": "3.09",
+      "platforms": [
+        "windows"
+      ],
+      "licenseExpression": "Zlib",
+      "source": "https://github.com/tauri-apps/binary-releases/releases/tag/nsis-3.9",
+      "sha256": "f5dc52eef1f3884230520199bac6f36b82d643d86b003ce51bd24b05c6ba7c91",
+      "distribution": "embedded Windows installer runtime using only the zlib compression module"
+    },
+    {
+      "id": "nsis-application-id",
+      "name": "NSIS ApplicationID shortcut plugin",
+      "version": "2017-01-09",
+      "platforms": [
+        "windows"
+      ],
+      "licenseExpression": "Zlib",
+      "source": "https://github.com/tauri-apps/binary-releases/releases/download/nsis-plugins-v0/NSIS-ApplicationID.zip",
+      "sha256": "1c2772b0edfb0f96a7524734d6c8fac1fc011f26221faf88f3ed2c950f0c06c0",
+      "licenseEvidence": "NSIS COPYING applies the zlib/libpng license to bundled plug-ins unless otherwise noted.",
+      "distribution": "embedded Windows installer shortcut plugin"
+    },
+    {
+      "id": "nsis-tauri-utils",
+      "name": "Tauri NSIS utility plugin",
+      "version": "0.2.1",
+      "platforms": [
+        "windows"
+      ],
+      "licenseExpression": "Apache-2.0 OR MIT",
+      "source": "https://github.com/tauri-apps/nsis-tauri-utils/tree/nsis_tauri_utils-v0.2.1",
+      "sha256": "0eed48313a7f904d7cc1977b70000ab3f11f18cadc8e6a69b807d288ca71f9db",
+      "distribution": "embedded Windows installer plugin"
+    }
+  ],
+  "systemRuntimePrerequisites": [
+    {
+      "id": "linux-fontconfig",
+      "name": "Linux Fontconfig runtime",
+      "platforms": [
+        "linux-x11",
+        "linux-wayland"
+      ],
+      "licenseExpression": "MIT",
+      "distribution": "system-provided, not redistributed"
+    },
+    {
+      "id": "linux-vulkan-loader",
+      "name": "Linux Vulkan loader",
+      "platforms": [
+        "linux-x11",
+        "linux-wayland"
+      ],
+      "licenseExpression": "Apache-2.0",
+      "distribution": "system-provided, not redistributed"
+    },
+    {
+      "id": "linux-wayland-client",
+      "name": "Linux Wayland client libraries",
+      "platforms": [
+        "linux-wayland"
+      ],
+      "licenseExpression": "MIT",
+      "distribution": "system-provided, not redistributed"
+    },
+    {
+      "id": "linux-xcb-xkbcommon",
+      "name": "Linux XCB and xkbcommon libraries",
+      "platforms": [
+        "linux-x11"
+      ],
+      "licenseExpression": "MIT",
+      "distribution": "system-provided, not redistributed"
+    }
+  ]
+}

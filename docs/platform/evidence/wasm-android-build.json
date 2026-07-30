@@ -1,0 +1,161 @@
+{
+  "schemaVersion": "vibex-android-build.v1",
+  "capturedAt": "2026-07-30T13:51:54.497Z",
+  "status": "packaged_not_device_validated",
+  "source": {
+    "dependencySourcePolicy": "upstream_git_root_cargo_lock",
+    "zedRevision": "c9e8e611dbc279afa0914d28c4d37ad07f38c03b",
+    "gpuiComponentRevision": "031555662e99a1b5a549990b47f246d475b8288a",
+    "webSourceTreeSha256": "039e01ff3b1ac4a815b28c469622c47572684a7238f73892a89313787bb749d3",
+    "mobileShellTreeSha256": "0f3521bfc8ce2e0bab083de876f9f039fdaf8f21e4db0156dd97f946b2fe943c",
+    "cargoLockfileSha256": "9f369bb4fef16ff737c1ac6951740e4f37b56e75bcbbb1b195e41221762e043a",
+    "pnpmLockfileSha256": "ae6aa0f7a317118a33b9affbd66c26b550bf3bf4de1acea1d0643665a5787e17"
+  },
+  "artifact": {
+    "path": "apps/mobile/artifacts/vibex-gate-debug.apk",
+    "bytes": 48361164,
+    "sha256": "46af4b0fdfcb9ef94f20fc5c812df50b62e22050e1a3cf48ca476045e6f1ffc6",
+    "applicationId": "dev.vibex.remote",
+    "minSdk": 26,
+    "targetSdk": 36
+  },
+  "webBuild": {
+    "schemaVersion": "vibex-web-build.v1",
+    "buildId": "10386de3655e9b1843ed8b2a",
+    "packageVersion": "0.1.0-rc.1",
+    "profile": "release",
+    "gitCommit": "uncommitted-worktree",
+    "wasmBindgenVersion": "0.2.125",
+    "wasmBytes": 23818142,
+    "wasmSha256": "5b3759a3f808deeb0e54811df2087d6bd6d6884b895687b404ebfd41c328b6f3",
+    "glueSha256": "41ca01158be66de60f8f5bd41f3bede0d5de5128b6aa2cd68177c8f2edaa87c9",
+    "staticSha256": "1e605c527621ec75eb359e97276fe4dd90b7f35e1eef9db69918c6783cece0e9",
+    "cacheName": "vibex-static-10386de3655e9b1843ed8b2a",
+    "cacheAssets": [
+      "./",
+      "./index.html",
+      "./offline.html",
+      "./styles.css",
+      "./host.js",
+      "./host-services.js",
+      "./platform-compat.js",
+      "./manifest.webmanifest",
+      "./icon.svg",
+      "./build.json",
+      "./pkg/vibex_web.js",
+      "./pkg/vibex_web_bg.wasm"
+    ]
+  },
+  "toolchain": {
+    "java": "openjdk version \"21.0.11\" 2026-04-21 LTS",
+    "androidSdk": {
+      "buildTools": "36.0.0",
+      "platformTools": "Android SDK Platform-Tools 37.0.0"
+    },
+    "gradle": "Gradle 8.14.3",
+    "capacitor": "8.4.1"
+  },
+  "packageContract": {
+    "webDir": "../web/dist",
+    "containsGpuiHost": true,
+    "containsPlatformCompatibilityAdapter": true,
+    "containsGpuiWasm": true,
+    "containsLegacyReactDist": false,
+    "plugins": [
+      "@capacitor/app@8.1.1",
+      "@capacitor/barcode-scanner@3.1.0",
+      "@capacitor/browser@8.0.4",
+      "@capacitor/camera@8.2.1",
+      "@capacitor/keyboard@8.0.5",
+      "@capacitor/network@8.0.1",
+      "@capacitor/share@8.0.1",
+      "capacitor-secure-storage-plugin@0.13.0"
+    ]
+  },
+  "nativeShell": {
+    "contractSchemaVersion": "vibex-native-shell.v1",
+    "plugins": [
+      {
+        "package": "@capacitor/app",
+        "version": "8.1.1",
+        "classpath": "com.capacitorjs.plugins.app.AppPlugin"
+      },
+      {
+        "package": "@capacitor/barcode-scanner",
+        "version": "3.1.0",
+        "classpath": "com.capacitorjs.barcodescanner.CapacitorBarcodeScannerPlugin"
+      },
+      {
+        "package": "@capacitor/browser",
+        "version": "8.0.4",
+        "classpath": "com.capacitorjs.plugins.browser.BrowserPlugin"
+      },
+      {
+        "package": "@capacitor/camera",
+        "version": "8.2.1",
+        "classpath": "com.capacitorjs.plugins.camera.CameraPlugin"
+      },
+      {
+        "package": "@capacitor/keyboard",
+        "version": "8.0.5",
+        "classpath": "com.capacitorjs.plugins.keyboard.KeyboardPlugin"
+      },
+      {
+        "package": "@capacitor/network",
+        "version": "8.0.1",
+        "classpath": "com.capacitorjs.plugins.network.NetworkPlugin"
+      },
+      {
+        "package": "@capacitor/share",
+        "version": "8.0.1",
+        "classpath": "com.capacitorjs.plugins.share.SharePlugin"
+      },
+      {
+        "package": "capacitor-secure-storage-plugin",
+        "version": "0.13.0",
+        "classpath": "com.whitestein.securestorage.SecureStoragePluginPlugin"
+      }
+    ],
+    "android": {
+      "minSdk": 26,
+      "permissions": [
+        "android.permission.CAMERA"
+      ]
+    },
+    "generatedFiles": {
+      "android/app/src/main/assets/capacitor.plugins.json": {
+        "bytes": 838,
+        "sha256": "05b19f23f054c1360458b17fc871dc7ef6a135d93d02a8a25f34009a2c7764cc"
+      },
+      "android/app/src/main/AndroidManifest.xml": {
+        "bytes": 2103,
+        "sha256": "3c708a3a609197d2a8d9bd9769997fec4f59a0183bb063836585b0f7dc809898"
+      },
+      "android/app/src/main/res/values/strings.xml": {
+        "bytes": 296,
+        "sha256": "4729c25f4639bbe9cce6fda81849f380b1a71c3388cc0eec91e75613030b1724"
+      },
+      "android/app/build.gradle": {
+        "bytes": 2130,
+        "sha256": "37876560d268989ec752ef8f30a88296a85ba340c91d469fec397d5940acb2a3"
+      },
+      "android/app/capacitor.build.gradle": {
+        "bytes": 777,
+        "sha256": "ee365c5ffe5ccea32ca6a0d3ea3efe66caabf7cad5350e173971412e14c6b78c"
+      },
+      "android/capacitor.settings.gradle": {
+        "bytes": 1942,
+        "sha256": "5eb6110f29c24b4d37fd0d2785b9e8fc6dd74d196682e25a5c829ef98ca0379a"
+      },
+      "android/app/src/main/java/dev/vibex/remote/MainActivity.java": {
+        "bytes": 120,
+        "sha256": "cd4e1538c0c12f79998a6d7b5723b9a30aad4fee3f6f2b879e378a5f2817e9f7"
+      }
+    }
+  },
+  "physicalValidation": {
+    "android": "pending",
+    "ios": "pending",
+    "installVerified": false
+  }
+}

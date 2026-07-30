@@ -1,0 +1,81 @@
+{
+  "schemaVersion": "vibex-native-shell.v1",
+  "applicationId": "dev.vibex.remote",
+  "applicationName": "Vibex Remote",
+  "deepLink": {
+    "schemaVersion": "vibex-native-links.v1",
+    "customSchemes": ["vibex", "dev.vibex.remote"],
+    "universalLinkHostEnv": "VIBEX_APP_LINK_HOST",
+    "fragmentRoute": "#/pair/"
+  },
+  "platform": {
+    "android": {
+      "minSdk": 26,
+      "permissions": ["android.permission.CAMERA"]
+    },
+    "ios": {
+      "usageDescriptions": {
+        "NSCameraUsageDescription": "Scan a Vibex Desktop pairing QR code."
+      }
+    }
+  },
+  "plugins": [
+    {
+      "package": "@capacitor/app",
+      "version": "8.1.1",
+      "classpath": "com.capacitorjs.plugins.app.AppPlugin",
+      "gradleProject": "capacitor-app"
+    },
+    {
+      "package": "@capacitor/barcode-scanner",
+      "version": "3.1.0",
+      "classpath": "com.capacitorjs.barcodescanner.CapacitorBarcodeScannerPlugin",
+      "gradleProject": "capacitor-barcode-scanner"
+    },
+    {
+      "package": "@capacitor/browser",
+      "version": "8.0.4",
+      "classpath": "com.capacitorjs.plugins.browser.BrowserPlugin",
+      "gradleProject": "capacitor-browser"
+    },
+    {
+      "package": "@capacitor/camera",
+      "version": "8.2.1",
+      "classpath": "com.capacitorjs.plugins.camera.CameraPlugin",
+      "gradleProject": "capacitor-camera"
+    },
+    {
+      "package": "@capacitor/keyboard",
+      "version": "8.0.5",
+      "classpath": "com.capacitorjs.plugins.keyboard.KeyboardPlugin",
+      "gradleProject": "capacitor-keyboard"
+    },
+    {
+      "package": "@capacitor/network",
+      "version": "8.0.1",
+      "classpath": "com.capacitorjs.plugins.network.NetworkPlugin",
+      "gradleProject": "capacitor-network"
+    },
+    {
+      "package": "@capacitor/share",
+      "version": "8.0.1",
+      "classpath": "com.capacitorjs.plugins.share.SharePlugin",
+      "gradleProject": "capacitor-share"
+    },
+    {
+      "package": "capacitor-secure-storage-plugin",
+      "version": "0.13.0",
+      "classpath": "com.whitestein.securestorage.SecureStoragePluginPlugin",
+      "gradleProject": "capacitor-secure-storage-plugin"
+    }
+  ],
+  "generatedFiles": [
+    "android/app/src/main/assets/capacitor.plugins.json",
+    "android/app/src/main/AndroidManifest.xml",
+    "android/app/src/main/res/values/strings.xml",
+    "android/app/build.gradle",
+    "android/app/capacitor.build.gradle",
+    "android/capacitor.settings.gradle",
+    "android/app/src/main/java/dev/vibex/remote/MainActivity.java"
+  ]
+}

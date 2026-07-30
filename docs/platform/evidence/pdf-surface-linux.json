@@ -1,0 +1,449 @@
+{
+  "schemaVersion": "pdf-surface-evidence.v1",
+  "status": "ready_not_physical",
+  "capturedAt": "2026-07-25T10:45:43.820Z",
+  "sourceInputs": [
+    {
+      "path": "Cargo.lock",
+      "bytes": 299235,
+      "sha256": "4d7403b1d03a19381c6c30f7527bbbca9883518b8d562ac559c1582d33da367c"
+    },
+    {
+      "path": "Cargo.toml",
+      "bytes": 2928,
+      "sha256": "c250765f302b52767f12383e7d035181175602c53cc58c3066d884108a3051bf"
+    },
+    {
+      "path": "apps/desktop/Cargo.toml",
+      "bytes": 1776,
+      "sha256": "1ae05510cdabe3573d8633db6488236ce1ef160ac4226d7610c1f2d8e6b2568c"
+    },
+    {
+      "path": "apps/desktop/src/main.rs",
+      "bytes": 15218,
+      "sha256": "87a7fab7d4803a904f374efe548f28c816fdd2e713bdbeaf6661eaa32765489b"
+    },
+    {
+      "path": "apps/desktop/src/native_content.rs",
+      "bytes": 31599,
+      "sha256": "d5c9efee278b4a72f042056c39b8b3d5d8f1a157565af62799a512ca6fa196dd"
+    },
+    {
+      "path": "apps/desktop/src/pdf_surface.rs",
+      "bytes": 48169,
+      "sha256": "af48cc5544a6a4894bba10897d5cde69eae503a9604c2191a1483a7df3c7adf0"
+    },
+    {
+      "path": "apps/desktop/src/pdf_worker.rs",
+      "bytes": 31198,
+      "sha256": "7c6e035de487e4224212c0792dd6daefc2b11f095afaba713cd5eb72759ffa3c"
+    },
+    {
+      "path": "crates/content/src/lifecycle.rs",
+      "bytes": 19869,
+      "sha256": "f22146f3ba6f308578baffc6f9d97d81f01e6b86b06e94d2ef577ceffd03f2b4"
+    },
+    {
+      "path": "crates/content/src/pdf.rs",
+      "bytes": 28235,
+      "sha256": "51257343fde1d6d3cfd9608e2dd8344885b836cab137252d193733f14f3a88cd"
+    },
+    {
+      "path": "docs/platform/fixtures/pdf-feasibility.pdf",
+      "bytes": 246256,
+      "sha256": "5eee17047b63701cff30656d9f044cd6d205c175275d02429177294012ccde89"
+    },
+    {
+      "path": "docs/platform/fixtures/pdf-encrypted.pdf",
+      "bytes": 925,
+      "sha256": "e2f14039215617d0c7ac9d29addd96966797b0fa7715b0fb2d4ab9545296c1a9"
+    },
+    {
+      "path": "docs/platform/fixtures/pdf-too-many-pages.pdf",
+      "bytes": 1028162,
+      "sha256": "dd534ec87c455deff158b2e3ccbbddbe59608627588c2a0b309ae271de7953cb"
+    },
+    {
+      "path": "docs/platform/fixtures/pdf-extreme-page.pdf",
+      "bytes": 339,
+      "sha256": "4a18789abdaf8bef7ed3b7d2e35d848f3227a8ff94b2f2e812398663d26ecada"
+    },
+    {
+      "path": "docs/licenses/pdfium-7881-review.json",
+      "bytes": 6481,
+      "sha256": "322775516a159f55eea0f829a1bdc4ddd19b0ee07c5f2b464c767a1496ebdac1"
+    },
+    {
+      "path": "scripts/capture-pdf-surface.mjs",
+      "bytes": 14554,
+      "sha256": "1956455800c441c6bca74bb3a1c1a7d6d6ba5ca72f0f1a8a248f9886b1cba283"
+    },
+    {
+      "path": "scripts/generate-pdf-encrypted-fixture.mjs",
+      "bytes": 5956,
+      "sha256": "2b7ed5fa87b9f87d76822ce72372a7afd990668dbde9922d24655e4800c0b1d2"
+    },
+    {
+      "path": "scripts/pdf-encrypted-fixture-contract.mjs",
+      "bytes": 320,
+      "sha256": "d590fb7f0b3e785ea98b60afcd3364941c2f8ef186397c34e57f7e9f4bc7091a"
+    },
+    {
+      "path": "scripts/generate-pdf-large-fixtures.mjs",
+      "bytes": 3954,
+      "sha256": "c6e4de2e3f1fe351fbe626341af1ff8921dca06e980ae17053255177d0be5338"
+    },
+    {
+      "path": "scripts/pdf-large-fixture-contract.mjs",
+      "bytes": 354,
+      "sha256": "293e64a1a4a658bb7ce29329d23858354dfcd2c5e138893b19224386a8082e12"
+    },
+    {
+      "path": "scripts/prepare-pdfium-runtime.mjs",
+      "bytes": 8260,
+      "sha256": "df0302bc964e9b1f44ed6f04db108e2167e8070ea1c336ee0178eeb7e7291788"
+    }
+  ],
+  "nativeRuntime": {
+    "target": "linux-x86_64",
+    "libraryBytes": 7645184,
+    "librarySha256": "f728930966f503652b92acc89b9374a2eeca00ce42e26dccd3e4b5c5161b2d64"
+  },
+  "physical": {
+    "nativePixelsClaimed": false,
+    "inputClaimed": false,
+    "screenshot": null,
+    "followUp": "Run the PDF interaction protocol on an active physical Linux output."
+  },
+  "run": {
+    "schemaVersion": "pdf-surface-run.v1",
+    "status": "ready",
+    "pageCount": 12,
+    "currentPage": 0,
+    "targetWidth": 972,
+    "renderedPageIndexes": [
+      0,
+      1
+    ],
+    "zoomMode": "Fit width",
+    "controls": {
+      "pageList": true,
+      "scrolling": true,
+      "zoom": true,
+      "fitWidth": true,
+      "loading": true,
+      "typedError": true,
+      "retry": true,
+      "explicitSystemOpen": true
+    },
+    "resources": {
+      "residentItems": 0,
+      "residentBytes": 0,
+      "budgetItems": 4,
+      "budgetBytes": 50331648,
+      "evictions": 0
+    },
+    "lastWorkerResources": {
+      "residentItems": 2,
+      "residentBytes": 10692000,
+      "budgetItems": 4,
+      "budgetBytes": 50331648,
+      "evictions": 0
+    },
+    "workerProcesses": {
+      "currentProcesses": 0,
+      "childrenStarted": 1,
+      "childrenReaped": 1,
+      "cleanExits": 1,
+      "cancellations": 0,
+      "timeouts": 0,
+      "crashes": 0,
+      "protocolFailures": 0,
+      "lastDisposition": "clean_exit"
+    },
+    "uiImages": {
+      "residentItems": 2,
+      "residentBytes": 10692000,
+      "budgetItems": 3,
+      "budgetBytes": 75497472,
+      "evictions": 0
+    },
+    "error": null,
+    "privacy": {
+      "documentPathStored": false,
+      "pageContentStored": false,
+      "passwordStored": false
+    },
+    "limitations": [
+      "This report proves isolated-worker UI state, not native pixels or physical input.",
+      "Per-request worker isolation trades controller-cache reuse for crash containment.",
+      "Search, annotations, forms, and editing remain out of scope."
+    ]
+  },
+  "encryptedErrorRun": {
+    "schemaVersion": "pdf-surface-run.v1",
+    "status": "error",
+    "pageCount": 0,
+    "currentPage": 0,
+    "targetWidth": 972,
+    "renderedPageIndexes": [],
+    "zoomMode": "Fit width",
+    "controls": {
+      "pageList": true,
+      "scrolling": true,
+      "zoom": true,
+      "fitWidth": true,
+      "loading": true,
+      "typedError": true,
+      "retry": true,
+      "explicitSystemOpen": true
+    },
+    "resources": {
+      "residentItems": 0,
+      "residentBytes": 0,
+      "budgetItems": 4,
+      "budgetBytes": 50331648,
+      "evictions": 0
+    },
+    "lastWorkerResources": {
+      "residentItems": 0,
+      "residentBytes": 0,
+      "budgetItems": 4,
+      "budgetBytes": 50331648,
+      "evictions": 0
+    },
+    "workerProcesses": {
+      "currentProcesses": 0,
+      "childrenStarted": 1,
+      "childrenReaped": 1,
+      "cleanExits": 1,
+      "cancellations": 0,
+      "timeouts": 0,
+      "crashes": 0,
+      "protocolFailures": 0,
+      "lastDisposition": "clean_exit"
+    },
+    "uiImages": {
+      "residentItems": 0,
+      "residentBytes": 0,
+      "budgetItems": 3,
+      "budgetBytes": 75497472,
+      "evictions": 0
+    },
+    "error": {
+      "code": "pdf_password_required",
+      "retryAvailable": true,
+      "explicitSystemOpenAvailable": true
+    },
+    "privacy": {
+      "documentPathStored": false,
+      "pageContentStored": false,
+      "passwordStored": false
+    },
+    "limitations": [
+      "This report proves isolated-worker UI state, not native pixels or physical input.",
+      "Per-request worker isolation trades controller-cache reuse for crash containment.",
+      "Search, annotations, forms, and editing remain out of scope."
+    ]
+  },
+  "largeInputRuns": {
+    "oversizedSource": {
+      "schemaVersion": "pdf-surface-run.v1",
+      "status": "error",
+      "pageCount": 0,
+      "currentPage": 0,
+      "targetWidth": 972,
+      "renderedPageIndexes": [],
+      "zoomMode": "Fit width",
+      "controls": {
+        "pageList": true,
+        "scrolling": true,
+        "zoom": true,
+        "fitWidth": true,
+        "loading": true,
+        "typedError": true,
+        "retry": true,
+        "explicitSystemOpen": true
+      },
+      "resources": {
+        "residentItems": 0,
+        "residentBytes": 0,
+        "budgetItems": 4,
+        "budgetBytes": 50331648,
+        "evictions": 0
+      },
+      "lastWorkerResources": {
+        "residentItems": 0,
+        "residentBytes": 0,
+        "budgetItems": 4,
+        "budgetBytes": 50331648,
+        "evictions": 0
+      },
+      "workerProcesses": {
+        "currentProcesses": 0,
+        "childrenStarted": 1,
+        "childrenReaped": 1,
+        "cleanExits": 1,
+        "cancellations": 0,
+        "timeouts": 0,
+        "crashes": 0,
+        "protocolFailures": 0,
+        "lastDisposition": "clean_exit"
+      },
+      "uiImages": {
+        "residentItems": 0,
+        "residentBytes": 0,
+        "budgetItems": 3,
+        "budgetBytes": 75497472,
+        "evictions": 0
+      },
+      "error": {
+        "code": "pdf_source_size_invalid",
+        "retryAvailable": true,
+        "explicitSystemOpenAvailable": true
+      },
+      "privacy": {
+        "documentPathStored": false,
+        "pageContentStored": false,
+        "passwordStored": false
+      },
+      "limitations": [
+        "This report proves isolated-worker UI state, not native pixels or physical input.",
+        "Per-request worker isolation trades controller-cache reuse for crash containment.",
+        "Search, annotations, forms, and editing remain out of scope."
+      ]
+    },
+    "tooManyPages": {
+      "schemaVersion": "pdf-surface-run.v1",
+      "status": "error",
+      "pageCount": 0,
+      "currentPage": 0,
+      "targetWidth": 972,
+      "renderedPageIndexes": [],
+      "zoomMode": "Fit width",
+      "controls": {
+        "pageList": true,
+        "scrolling": true,
+        "zoom": true,
+        "fitWidth": true,
+        "loading": true,
+        "typedError": true,
+        "retry": true,
+        "explicitSystemOpen": true
+      },
+      "resources": {
+        "residentItems": 0,
+        "residentBytes": 0,
+        "budgetItems": 4,
+        "budgetBytes": 50331648,
+        "evictions": 0
+      },
+      "lastWorkerResources": {
+        "residentItems": 0,
+        "residentBytes": 0,
+        "budgetItems": 4,
+        "budgetBytes": 50331648,
+        "evictions": 0
+      },
+      "workerProcesses": {
+        "currentProcesses": 0,
+        "childrenStarted": 1,
+        "childrenReaped": 1,
+        "cleanExits": 1,
+        "cancellations": 0,
+        "timeouts": 0,
+        "crashes": 0,
+        "protocolFailures": 0,
+        "lastDisposition": "clean_exit"
+      },
+      "uiImages": {
+        "residentItems": 0,
+        "residentBytes": 0,
+        "budgetItems": 3,
+        "budgetBytes": 75497472,
+        "evictions": 0
+      },
+      "error": {
+        "code": "pdf_page_count_unsupported",
+        "retryAvailable": true,
+        "explicitSystemOpenAvailable": true
+      },
+      "privacy": {
+        "documentPathStored": false,
+        "pageContentStored": false,
+        "passwordStored": false
+      },
+      "limitations": [
+        "This report proves isolated-worker UI state, not native pixels or physical input.",
+        "Per-request worker isolation trades controller-cache reuse for crash containment.",
+        "Search, annotations, forms, and editing remain out of scope."
+      ]
+    },
+    "extremePage": {
+      "schemaVersion": "pdf-surface-run.v1",
+      "status": "error",
+      "pageCount": 0,
+      "currentPage": 0,
+      "targetWidth": 972,
+      "renderedPageIndexes": [],
+      "zoomMode": "Fit width",
+      "controls": {
+        "pageList": true,
+        "scrolling": true,
+        "zoom": true,
+        "fitWidth": true,
+        "loading": true,
+        "typedError": true,
+        "retry": true,
+        "explicitSystemOpen": true
+      },
+      "resources": {
+        "residentItems": 0,
+        "residentBytes": 0,
+        "budgetItems": 4,
+        "budgetBytes": 50331648,
+        "evictions": 0
+      },
+      "lastWorkerResources": {
+        "residentItems": 0,
+        "residentBytes": 0,
+        "budgetItems": 4,
+        "budgetBytes": 50331648,
+        "evictions": 0
+      },
+      "workerProcesses": {
+        "currentProcesses": 0,
+        "childrenStarted": 1,
+        "childrenReaped": 1,
+        "cleanExits": 1,
+        "cancellations": 0,
+        "timeouts": 0,
+        "crashes": 0,
+        "protocolFailures": 0,
+        "lastDisposition": "clean_exit"
+      },
+      "uiImages": {
+        "residentItems": 0,
+        "residentBytes": 0,
+        "budgetItems": 3,
+        "budgetBytes": 75497472,
+        "evictions": 0
+      },
+      "error": {
+        "code": "pdf_page_exceeds_cache_budget",
+        "retryAvailable": true,
+        "explicitSystemOpenAvailable": true
+      },
+      "privacy": {
+        "documentPathStored": false,
+        "pageContentStored": false,
+        "passwordStored": false
+      },
+      "limitations": [
+        "This report proves isolated-worker UI state, not native pixels or physical input.",
+        "Per-request worker isolation trades controller-cache reuse for crash containment.",
+        "Search, annotations, forms, and editing remain out of scope."
+      ]
+    }
+  }
+}

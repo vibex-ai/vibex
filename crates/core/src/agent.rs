@@ -1,0 +1,463 @@
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
+use crate::agent_config::AgentId;
+use crate::ids::{
+    CorrelationId, MessageSubmissionId, ProjectId, PromptId, ProviderProfileId, RequestId,
+    RuntimeSwitchId, SkillId, TimelineItemId, VibexSessionId, WorkspaceId,
+};
+use crate::permission::{PermissionMode, PermissionResolution};
+use crate::provider::{
+    ProviderBindingMetadata, ProviderCapabilities, ProviderKind, ProviderSessionConfigOption,
+    ProviderSessionConfigValue,
+};
+use crate::runtime::{MessageSubmissionStatus, SessionRuntimeSelection};
+use crate::timeline::{MessageAttachment, TimelineItem, TimelinePage};
+use crate::workspace::WorkspaceMode;
+
+pub const MAX_MESSAGE_IDEMPOTENCY_KEY_LEN: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSessionState {
+    Initializing,
+    Idle,
+    Running,
+    NeedsInput,
+    Error,
+    Closed,
+    Archived,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessionSafety {
+    pub permission_mode: PermissionMode,
+    pub ask_on_risk: bool,
+    pub bypass_all_permissions: bool,
+}
+
+impl AgentSessionSafety {
+    pub const fn workspace_write_ask_on_risk() -> Self {
+        Self {
+            permission_mode: PermissionMode::WorkspaceWrite,
+            ask_on_risk: true,
+            bypass_all_permissions: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSession {
+    pub id: VibexSessionId,
+    pub title: String,
+    pub project_id: ProjectId,
+    pub workspace_id: WorkspaceId,
+    pub workspace_root: String,
+    pub workspace_mode: WorkspaceMode,
+    /// Current Agent identity. Runtime Profile/Model state is exposed through
+    /// `AgentSessionRuntimeSelectionState`, not duplicated on the session DTO.
+    pub agent_id: AgentId,
+    pub state: AgentSessionState,
+    pub safety: AgentSessionSafety,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub archived_at_ms: Option<i64>,
+    pub deleted_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateAgentSessionRequest {
+    pub runtime: SessionRuntimeSelection,
+    pub workspace_root: String,
+    pub workspace_mode: WorkspaceMode,
+    pub title: Option<String>,
+    pub safety: Option<AgentSessionSafety>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkAgentSessionRequest {
+    pub source_session_id: VibexSessionId,
+    pub through_sequence: i64,
+    pub expected_source_end_sequence: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameAgentSessionRequest {
+    pub session_id: VibexSessionId,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContinueAgentTurnRequest {
+    pub session_id: VibexSessionId,
+    pub correlation_id: Option<CorrelationId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentModelListSource {
+    Probed,
+    Configured,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelListRequest {
+    #[serde(default)]
+    pub agent_id: Option<AgentId>,
+    pub provider_profile_id: Option<ProviderProfileId>,
+    pub session_id: Option<VibexSessionId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentReasoningEffort {
+    pub value: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelCapabilities {
+    pub model: String,
+    pub default_reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub reasoning_efforts: Vec<AgentReasoningEffort>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelListResponse {
+    #[serde(default)]
+    pub agent_id: Option<AgentId>,
+    pub provider_kind: ProviderKind,
+    pub provider_profile_id: Option<ProviderProfileId>,
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub reasoning_efforts: Vec<AgentReasoningEffort>,
+    #[serde(default)]
+    pub model_capabilities: Vec<AgentModelCapabilities>,
+    pub source: AgentModelListSource,
+    pub diagnostics: Vec<ProviderBindingMetadata>,
+}
+
+/// Session-level configuration evidence discovered through a stateless
+/// provider probe (e.g. an ACP `session/new` handshake). Values are
+/// product-safe: raw payloads and native session ids never cross this
+/// boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessionConfigProbe {
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub modes: Vec<ProviderSessionConfigValue>,
+    #[serde(default)]
+    pub reasoning_efforts: Vec<AgentReasoningEffort>,
+    #[serde(default)]
+    pub options: Vec<ProviderSessionConfigOption>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendAgentMessageRequest {
+    pub session_id: VibexSessionId,
+    pub message_idempotency_key: String,
+    pub desired_runtime: SessionRuntimeSelection,
+    pub text: String,
+    #[serde(default)]
+    pub attachments: Vec<MessageAttachment>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    pub correlation_id: Option<CorrelationId>,
+}
+
+impl fmt::Debug for SendAgentMessageRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SendAgentMessageRequest")
+            .field("session_id", &self.session_id)
+            .field(
+                "has_message_idempotency_key",
+                &!self.message_idempotency_key.is_empty(),
+            )
+            .field("desired_runtime", &self.desired_runtime)
+            .field("has_text", &!self.text.is_empty())
+            .field("attachment_count", &self.attachments.len())
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("correlation_id", &self.correlation_id)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetMessageSubmissionRequest {
+    pub session_id: VibexSessionId,
+    pub message_idempotency_key: String,
+}
+
+impl fmt::Debug for GetMessageSubmissionRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GetMessageSubmissionRequest")
+            .field("session_id", &self.session_id)
+            .field(
+                "has_message_idempotency_key",
+                &!self.message_idempotency_key.is_empty(),
+            )
+            .finish()
+    }
+}
+
+/// Product-safe projection of a durable message submission. Payload and
+/// provider dispatch internals deliberately stay behind the repository API.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageSubmissionState {
+    pub submission_id: MessageSubmissionId,
+    pub session_id: VibexSessionId,
+    pub message_idempotency_key: String,
+    pub submission_sequence: i64,
+    pub desired_runtime: SessionRuntimeSelection,
+    pub required_switch_id: Option<RuntimeSwitchId>,
+    pub status: MessageSubmissionStatus,
+    pub user_message_timeline_item_id: Option<TimelineItemId>,
+    pub error_code: Option<String>,
+    pub error_detail_redacted: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub dispatched_at_ms: Option<i64>,
+}
+
+impl fmt::Debug for MessageSubmissionState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MessageSubmissionState")
+            .field("submission_id", &self.submission_id)
+            .field("session_id", &self.session_id)
+            .field(
+                "has_message_idempotency_key",
+                &!self.message_idempotency_key.is_empty(),
+            )
+            .field("submission_sequence", &self.submission_sequence)
+            .field("required_switch_id", &self.required_switch_id)
+            .field("status", &self.status)
+            .field(
+                "user_message_timeline_item_id",
+                &self.user_message_timeline_item_id,
+            )
+            .field("error_code", &self.error_code)
+            .field("has_error_detail", &self.error_detail_redacted.is_some())
+            .field("created_at_ms", &self.created_at_ms)
+            .field("updated_at_ms", &self.updated_at_ms)
+            .field("dispatched_at_ms", &self.dispatched_at_ms)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchTimelineRequest {
+    pub session_id: VibexSessionId,
+    pub after_sequence: Option<i64>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvePermissionRequest {
+    pub session_id: VibexSessionId,
+    pub request_id: RequestId,
+    pub resolution: PermissionResolution,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessionSummary {
+    pub session: AgentSession,
+    pub latest_timeline: TimelinePage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCapabilitiesResponse {
+    pub providers: Vec<ProviderCapabilities>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCommandTrigger {
+    Slash,
+    Mention,
+    Dollar,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCommandSourceKind {
+    Provider,
+    Prompt,
+    Skill,
+    Reference,
+    ClientBuiltin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCommandSelectionBehavior {
+    Insert,
+    ExecuteImmediately,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCommandExecutionBehavior {
+    None,
+    ProviderCommand,
+    ExpandPromptAndSend,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentCommandEntry {
+    pub id: String,
+    pub trigger: AgentCommandTrigger,
+    pub source_kind: AgentCommandSourceKind,
+    pub label: String,
+    pub description: Option<String>,
+    pub insertion_text: String,
+    pub command_name: Option<String>,
+    pub provider_kind: Option<ProviderKind>,
+    pub prompt_id: Option<PromptId>,
+    pub skill_id: Option<SkillId>,
+    pub reference_path: Option<String>,
+    pub selection_behavior: AgentCommandSelectionBehavior,
+    pub execution_behavior: AgentCommandExecutionBehavior,
+    pub destructive: bool,
+    pub metadata: Vec<ProviderBindingMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentCommandDiscoverRequest {
+    #[serde(default)]
+    pub agent_id: Option<AgentId>,
+    pub provider_profile_id: Option<ProviderProfileId>,
+    pub session_id: Option<VibexSessionId>,
+    pub workspace_id: Option<WorkspaceId>,
+    pub trigger: Option<AgentCommandTrigger>,
+    pub query: Option<String>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentCommandDiscoverResponse {
+    pub entries: Vec<AgentCommandEntry>,
+    pub diagnostics: Vec<ProviderBindingMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentCommandExecuteRequest {
+    pub session_id: VibexSessionId,
+    pub command_id: Option<String>,
+    pub trigger: AgentCommandTrigger,
+    pub source_kind: AgentCommandSourceKind,
+    pub command_text: String,
+    pub command_name: Option<String>,
+    pub arguments: Option<String>,
+    pub prompt_id: Option<PromptId>,
+    #[serde(default)]
+    pub attachments: Vec<MessageAttachment>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    pub correlation_id: Option<CorrelationId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCommandExecuteStatus {
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentCommandExecuteResult {
+    pub status: AgentCommandExecuteStatus,
+    pub message: Option<String>,
+    pub items: Vec<TimelineItem>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durable_send_request_serializes_required_runtime_and_idempotency_key() {
+        let request = SendAgentMessageRequest {
+            session_id: VibexSessionId::new(),
+            message_idempotency_key: "message-1".to_string(),
+            desired_runtime: SessionRuntimeSelection {
+                agent_id: AgentId::parse("codex").unwrap(),
+                provider_profile_id: ProviderProfileId::parse("provider_openai").unwrap(),
+                model_id: "gpt-5".to_string(),
+                reasoning_effort: Some("high".to_string()),
+                mode_id: None,
+                config_values: Default::default(),
+            },
+            text: "prompt-secret-SHOULD-NOT-DEBUG".to_string(),
+            attachments: vec![MessageAttachment {
+                label: "secret-attachment".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                uri: Some("file:///private/secret.txt".to_string()),
+                inline_text_offset: None,
+            }],
+            reasoning_effort: Some("high".to_string()),
+            correlation_id: None,
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["messageIdempotencyKey"], "message-1");
+        assert_eq!(json["desiredRuntime"]["agentId"], "codex");
+        assert_eq!(json["desiredRuntime"]["modelId"], "gpt-5");
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("prompt-secret-SHOULD-NOT-DEBUG"));
+        assert!(!debug.contains("secret-attachment"));
+        assert!(!debug.contains("/private/secret.txt"));
+        assert!(!debug.contains("message-1"));
+
+        let query = GetMessageSubmissionRequest {
+            session_id: request.session_id.clone(),
+            message_idempotency_key: "message-query-secret".to_string(),
+        };
+        assert!(!format!("{query:?}").contains("message-query-secret"));
+
+        let state = MessageSubmissionState {
+            submission_id: MessageSubmissionId::new(),
+            session_id: request.session_id,
+            message_idempotency_key: "message-state-secret".to_string(),
+            submission_sequence: 1,
+            desired_runtime: request.desired_runtime,
+            required_switch_id: None,
+            status: MessageSubmissionStatus::Completed,
+            user_message_timeline_item_id: None,
+            error_code: None,
+            error_detail_redacted: None,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            dispatched_at_ms: Some(2),
+        };
+        assert!(!format!("{state:?}").contains("message-state-secret"));
+    }
+}

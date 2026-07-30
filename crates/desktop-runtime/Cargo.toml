@@ -1,0 +1,43 @@
+[package]
+name = "vibex-desktop-runtime"
+version = "0.1.0-rc.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+vibex-backup = { path = "../backup" }
+fs2 = "0.4"
+futures-util.workspace = true
+reqwest.workspace = true
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde.workspace = true
+sha2.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+url.workspace = true
+vibex-agent = { path = "../agent" }
+vibex-agent-acp = { path = "../agent-acp" }
+vibex-config-switch = { path = "../config-switch" }
+vibex-core = { path = "../core" }
+vibex-db = { path = "../db" }
+vibex-desktop-model = { path = "../desktop-model" }
+vibex-diagnostics = { path = "../diagnostics" }
+vibex-fs = { path = "../fs" }
+vibex-git = { path = "../git" }
+vibex-relay = { path = "../relay" }
+vibex-remote = { path = "../remote" }
+vibex-terminal = { path = "../terminal" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "vibex-home-lock-probe"
+path = "src/bin/vibex-home-lock-probe.rs"

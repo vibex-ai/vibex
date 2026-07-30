@@ -1,0 +1,4 @@
+{"type":"user","sessionId":"claude-session-parity-resume","uuid":"item-user-1","parentUuid":null,"cwd":"/home/user/workspace/demo","timestamp":"2026-07-11T00:00:00Z","message":{"role":"user","content":"First turn prompt"}}
+{"type":"assistant","sessionId":"claude-session-parity-resume","uuid":"item-assistant-1","parentUuid":"item-user-1","cwd":"/home/user/workspace/demo","timestamp":"2026-07-11T00:00:01Z","message":{"role":"assistant","content":"First turn answer"}}
+{"type":"user","sessionId":"claude-session-parity-resume","uuid":"item-user-2","parentUuid":"item-assistant-1","cwd":"/home/user/workspace/demo","timestamp":"2026-07-11T00:00:02Z","message":{"role":"user","content":"Second turn prompt"}}
+{"type":"assistant","sessionId":"claude-session-parity-resume","uuid":"item-assistant-2","parentUuid":"item-user-2","cwd":"/home/user/workspace/demo","timestamp":"2026-07-11T00:00:03Z","message":{"role":"assistant","content":"Second turn answer"}}

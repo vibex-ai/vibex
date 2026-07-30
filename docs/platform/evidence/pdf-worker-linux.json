@@ -1,0 +1,135 @@
+{
+  "schemaVersion": "pdf-worker-evidence.v1",
+  "status": "passed",
+  "capturedAt": "2026-07-25T10:45:05.448Z",
+  "sourceInputs": [
+    {
+      "path": "Cargo.lock",
+      "bytes": 299235,
+      "sha256": "4d7403b1d03a19381c6c30f7527bbbca9883518b8d562ac559c1582d33da367c"
+    },
+    {
+      "path": "Cargo.toml",
+      "bytes": 2928,
+      "sha256": "c250765f302b52767f12383e7d035181175602c53cc58c3066d884108a3051bf"
+    },
+    {
+      "path": "apps/desktop/Cargo.toml",
+      "bytes": 1776,
+      "sha256": "1ae05510cdabe3573d8633db6488236ce1ef160ac4226d7610c1f2d8e6b2568c"
+    },
+    {
+      "path": "apps/desktop/src/main.rs",
+      "bytes": 15218,
+      "sha256": "87a7fab7d4803a904f374efe548f28c816fdd2e713bdbeaf6661eaa32765489b"
+    },
+    {
+      "path": "apps/desktop/src/pdf_worker.rs",
+      "bytes": 31198,
+      "sha256": "7c6e035de487e4224212c0792dd6daefc2b11f095afaba713cd5eb72759ffa3c"
+    },
+    {
+      "path": "crates/content/Cargo.toml",
+      "bytes": 429,
+      "sha256": "5d246edd732923e093c6903f1da7d3c1adf02d4c6af5cf5208b91db2fb111081"
+    },
+    {
+      "path": "crates/content/src/lifecycle.rs",
+      "bytes": 19869,
+      "sha256": "f22146f3ba6f308578baffc6f9d97d81f01e6b86b06e94d2ef577ceffd03f2b4"
+    },
+    {
+      "path": "crates/content/src/pdf.rs",
+      "bytes": 28235,
+      "sha256": "51257343fde1d6d3cfd9608e2dd8344885b836cab137252d193733f14f3a88cd"
+    },
+    {
+      "path": "docs/platform/fixtures/pdf-feasibility.pdf",
+      "bytes": 246256,
+      "sha256": "5eee17047b63701cff30656d9f044cd6d205c175275d02429177294012ccde89"
+    },
+    {
+      "path": "docs/licenses/pdfium-7881-review.json",
+      "bytes": 6481,
+      "sha256": "322775516a159f55eea0f829a1bdc4ddd19b0ee07c5f2b464c767a1496ebdac1"
+    },
+    {
+      "path": "scripts/capture-pdf-worker.mjs",
+      "bytes": 9729,
+      "sha256": "1907711a2008dc71625643978f713bd15b909578ee364d83503dc6464b60f178"
+    },
+    {
+      "path": "scripts/prepare-pdfium-runtime.mjs",
+      "bytes": 8260,
+      "sha256": "df0302bc964e9b1f44ed6f04db108e2167e8070ea1c336ee0178eeb7e7291788"
+    }
+  ],
+  "nativeRuntime": {
+    "target": "linux-x86_64",
+    "libraryBytes": 7645184,
+    "librarySha256": "f728930966f503652b92acc89b9374a2eeca00ce42e26dccd3e4b5c5161b2d64"
+  },
+  "run": {
+    "schemaVersion": "pdf-worker-supervisor-run.v1",
+    "status": "passed",
+    "normalRenderPassed": true,
+    "crashDetected": true,
+    "crashErrorCode": "pdf_worker_crashed",
+    "timeoutDetected": true,
+    "timeoutErrorCode": "pdf_worker_timeout",
+    "recoveryAfterCrashPassed": true,
+    "recoveryAfterTimeoutPassed": true,
+    "childrenStarted": 5,
+    "childrenReaped": 5,
+    "privacy": {
+      "documentPathStored": false,
+      "pageContentStored": false,
+      "rawStderrStored": false
+    }
+  },
+  "soak": {
+    "schemaVersion": "pdf-worker-soak-run.v1",
+    "status": "passed",
+    "iterations": 49,
+    "normalRequests": 37,
+    "cancellations": 4,
+    "crashes": 4,
+    "timeouts": 4,
+    "recoveriesPassed": 12,
+    "unexpectedFailures": 0,
+    "childrenStarted": 49,
+    "childrenReaped": 49,
+    "initialParentRssBytes": 28827648,
+    "finalParentRssBytes": 41570304,
+    "peakParentRssBytes": 62296064,
+    "parentRssGrowthBytes": 12742656,
+    "rssGrowthBudgetBytes": 67108864,
+    "initialOpenFds": 4,
+    "finalOpenFds": 4,
+    "initialDirectChildren": 0,
+    "finalDirectChildren": 0,
+    "initialWorkerTempDirectories": 0,
+    "finalWorkerTempDirectories": 0,
+    "longestRequestMs": 434,
+    "currentResources": {
+      "residentItems": 0,
+      "residentBytes": 0,
+      "budgetItems": 4,
+      "budgetBytes": 50331648,
+      "evictions": 0
+    },
+    "lastWorkerResources": {
+      "residentItems": 2,
+      "residentBytes": 10429440,
+      "budgetItems": 4,
+      "budgetBytes": 50331648,
+      "evictions": 0
+    },
+    "privacy": {
+      "documentPathStored": false,
+      "pageContentStored": false,
+      "rawStderrStored": false,
+      "temporaryPathStored": false
+    }
+  }
+}

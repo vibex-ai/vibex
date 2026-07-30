@@ -1,0 +1,99 @@
+{
+  "schemaVersion": "vibex-pdfium-native-review.v1",
+  "engine": {
+    "name": "PDFium",
+    "version": "151.0.7881.0",
+    "build": "7881",
+    "sourceRepository": "https://pdfium.googlesource.com/pdfium/",
+    "binaryRepository": "https://github.com/bblanchon/pdfium-binaries",
+    "binaryRelease": "chromium/7881",
+    "wrapper": "pdfium-render 0.9.3",
+    "wrapperLicenseExpression": "MIT OR Apache-2.0"
+  },
+  "archives": [
+    {
+      "target": "linux-x86_64",
+      "asset": "pdfium-linux-x64.tgz",
+      "archiveSha256": "1470e21b8b4a3b4ad7f85684e2da11d94f3b69a86d81dee11b9b6709d927ac1d",
+      "archiveBytes": 3644759,
+      "libraryPath": "lib/libpdfium.so",
+      "librarySha256": "f728930966f503652b92acc89b9374a2eeca00ce42e26dccd3e4b5c5161b2d64",
+      "libraryBytes": 7645184
+    },
+    {
+      "target": "macos-x86_64",
+      "asset": "pdfium-mac-x64.tgz",
+      "archiveSha256": "6dedf83990e0e3d6b7c93c9e7589c5a126b0ae14b7464d76120cff7a26afb18b",
+      "archiveBytes": 3588813,
+      "libraryPath": "lib/libpdfium.dylib",
+      "librarySha256": "4eaad6c3e8d786cf6f66a45d7d014edf5c65f372f98c3070e66595ebb50e43d9",
+      "libraryBytes": 7471800
+    },
+    {
+      "target": "macos-aarch64",
+      "asset": "pdfium-mac-arm64.tgz",
+      "archiveSha256": "52e94ca5aa8847934330daf3f8150c190682c5ca93831468794f8b90d4392e40",
+      "archiveBytes": 3533019,
+      "libraryPath": "lib/libpdfium.dylib",
+      "librarySha256": "1bc45b15466b34cef96641ce25c77a876e70010c6b114f909dda2f5325fc5bd7",
+      "libraryBytes": 7732336
+    },
+    {
+      "target": "windows-x86_64",
+      "asset": "pdfium-win-x64.tgz",
+      "archiveSha256": "73cc0de638ac2095e7445bf56a38200a5b7c7ca0e9f4ba144598f2457377ac08",
+      "archiveBytes": 3733154,
+      "libraryPath": "bin/pdfium.dll",
+      "librarySha256": "79d4676b656cfb1abcea88f9ade3b4b0826c5200382db5f4ec72a636c598c118",
+      "libraryBytes": 7211520
+    }
+  ],
+  "licenseFiles": [
+    { "path": "LICENSE", "sha256": "ba26c1263131696b86c10496b5066b918a20b7161822a80c274d0080105f6c93", "expression": "MIT", "currentPolicyStatus": "approved" },
+    { "path": "licenses/abseil.txt", "sha256": "c79a7fea0e3cac04cd43f20e7b648e5a0ff8fa5344e644b0ee09ca1162b62747", "expression": "Apache-2.0", "currentPolicyStatus": "approved" },
+    { "path": "licenses/agg23.txt", "sha256": "c110d3ea2ad77467ce0dcff7d3337e6c8be8049a5103f4b9bd5fd911a77972e5", "expression": "LicenseRef-AGG-2.3", "currentPolicyStatus": "approved" },
+    { "path": "licenses/fast_float.txt", "sha256": "e562f3f974ced7e69dd1db77b820b36bcf8f30377f1aa105723fba449c53c4e6", "expression": "MIT", "currentPolicyStatus": "approved" },
+    { "path": "licenses/freetype.txt", "sha256": "f4b133e25df1f86ad3ffea453aa0e613f0474f34778dbbb3e437e7b2724937d8", "expression": "FTL", "currentPolicyStatus": "approved" },
+    { "path": "licenses/icu.txt", "sha256": "e55522d81edc687a341a4411e0776e54ca654e90147f354a90458aaced4116af", "expression": "Unicode-3.0", "currentPolicyStatus": "approved" },
+    { "path": "licenses/lcms.txt", "sha256": "7312b68c5b25e9bf2b828706fb4e29588f22705112f411fd42e1f7d84c3d139a", "expression": "MIT", "currentPolicyStatus": "approved" },
+    { "path": "licenses/libjpeg_turbo.ijg", "sha256": "75815e3bf6484201a3c3d17a1bbf10f2e8e3237f84df10a2357ea896db2a81d6", "expression": "IJG", "currentPolicyStatus": "approved" },
+    { "path": "licenses/libjpeg_turbo.md", "sha256": "96f5b328adbb78eeaaec6980d73fd558cb1e4d62560ed615646bc3cf5e532430", "expression": "IJG AND BSD-3-Clause AND Zlib", "currentPolicyStatus": "approved" },
+    { "path": "licenses/libopenjpeg.txt", "sha256": "c5ab0890a737c2dfa7ba675036554f6d17741d98629b0c2a145354d00617e6b2", "expression": "BSD-2-Clause", "currentPolicyStatus": "approved" },
+    { "path": "licenses/libpng.txt", "sha256": "bdb0a645ea18c60507d0368379b1ac5474b92255fcc2d115e07486a7672ba526", "expression": "Libpng", "currentPolicyStatus": "approved" },
+    { "path": "licenses/libtiff.txt", "sha256": "92b72ba97e6c2749c2a94bc0ef646b47080217f1e772a482b33cf5a5f98a6506", "expression": "libtiff", "currentPolicyStatus": "approved" },
+    { "path": "licenses/llvm-libc.txt", "sha256": "ebcd9bbf783a73d05c53ba4d586b8d5813dcdf3bbec50265860ccc885e606f47", "expression": "Apache-2.0 WITH LLVM-exception", "currentPolicyStatus": "approved" },
+    { "path": "licenses/pdfium.txt", "sha256": "961eacd9633fff6d051db7208b755e9210e30efac7adec3e6a6d52798f0ccf0e", "expression": "BSD-3-Clause AND Apache-2.0", "currentPolicyStatus": "approved" },
+    { "path": "licenses/simdutf.txt", "sha256": "fc8dbc04e03ad4efc08a647ffe7f995b811a95bc04c0e85a56d5277c6593fa5f", "expression": "MIT", "currentPolicyStatus": "approved" },
+    { "path": "licenses/zlib.txt", "sha256": "33fd641c9f3b0e0be64bc78fea9e94807674cdd70c48477599226cb8956565fe", "expression": "Zlib", "currentPolicyStatus": "approved" }
+  ],
+  "review": {
+    "status": "approved_for_linux_distribution",
+    "reviewedAgainstProjectLicenses": [
+      "AGPL-3.0-or-later"
+    ],
+    "prohibitedGplOrAgplComponentDetected": false,
+    "buildToolNoticesExcludedFromRuntimeCopyleft": [
+      "ICU aclocal.m4 pkg-config macro under GPL-2.0-or-later with Autoconf exception",
+      "ICU config.guess under GPL-3.0-or-later with Autoconf exception"
+    ],
+    "unapprovedExpressions": [],
+    "productionPolicyModified": true,
+    "nativeBinaryRegisteredForDistribution": true,
+    "registeredTargets": [
+      "linux-x86_64"
+    ],
+    "deferredRuntimeTargets": [
+      "macos-x86_64",
+      "macos-aarch64",
+      "windows-x86_64"
+    ],
+    "distributionObligations": [
+      "Distribute all 16 verified license files with the PDFium runtime.",
+      "Retain the FreeType and Independent JPEG Group acknowledgements in product documentation.",
+      "Retain copyright, permission, disclaimer, and non-endorsement notices.",
+      "Mark modifications to covered upstream source files if Vibex later ships a modified PDFium build.",
+      "The Linux AppImage packager may add only an $ORIGIN RUNPATH; the reviewed Build ID and NEEDED set must remain unchanged and the package gate records the transformed SHA-256."
+    ],
+    "reason": "The locked runtime license set is permissive and compatible with the current AGPL-3.0-or-later repository license. Linux distribution is approved when the verified binary and complete license bundle are packaged together; untested macOS and Windows runtimes remain package-disabled."
+  }
+}

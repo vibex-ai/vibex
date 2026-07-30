@@ -1,0 +1,9 @@
+{
+  "capability": "model_list",
+  "mode": "meta_only",
+  "source": "observation snapshot 2026-07-11",
+  "sdk": "offline compatibility metadata",
+  "recorded_at": "2026-07-11",
+  "known_defects": [],
+  "notes": "This historical observation has no replay input. Online models are published only from managed ACP catalog or negotiated session evidence."
+}

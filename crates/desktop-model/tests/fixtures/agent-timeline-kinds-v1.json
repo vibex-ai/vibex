@@ -1,0 +1,19 @@
+[
+  {"kind":"user_message","payload":{"type":"user_message","data":{"text":"hello","attachments":[]}}},
+  {"kind":"agent_message_delta","payload":{"type":"agent_message_delta","data":{"textDelta":"stream","chunkIndex":0}}},
+  {"kind":"agent_message","payload":{"type":"agent_message","data":{"text":"done","isFinal":true}}},
+  {"kind":"reasoning","payload":{"type":"reasoning","data":{"text":"thinking","isFinal":true}}},
+  {"kind":"plan","payload":{"type":"plan","data":{"title":"Plan","steps":[{"title":"Step","status":"completed"}]}}},
+  {"kind":"tool_call","payload":{"type":"tool_call","data":{"toolCallId":"tool-1","toolName":"read","status":"completed","summary":"read","inputSummary":null,"outputSummary":"ok"}}},
+  {"kind":"command","payload":{"type":"command","data":{"command":"cargo test","cwd":null,"status":"completed","exitCode":0,"outputSummary":"ok"}}},
+  {"kind":"file_operation","payload":{"type":"file_operation","data":{"operation":"edit","path":"src/lib.rs","summary":"edited"}}},
+  {"kind":"web_search","payload":{"type":"web_search","data":{"query":"gpui","status":"completed","resultSummary":"found"}}},
+  {"kind":"todo_update","payload":{"type":"todo_update","data":{"title":"Todo","items":[{"title":"Ship","status":"running"}]}}},
+  {"kind":"collaboration","payload":{"type":"collaboration","data":{"action":"delegate","status":"completed","summary":"done","agentLabel":"Reviewer"}}},
+  {"kind":"image_generation","payload":{"type":"image_generation","data":{"status":"completed","summary":"image","mimeType":"image/png","imageReference":"asset://image"}}},
+  {"kind":"git_notice","payload":{"type":"git_notice","data":{"summary":"branch changed"}}},
+  {"kind":"system_notice","payload":{"type":"system_notice","data":{"level":"info","message":"ready"}}},
+  {"kind":"permission_request","payload":{"type":"permission_request","data":{"id":"request_permission","sessionId":"session_current","projectId":null,"workspaceId":null,"providerRequestId":null,"riskCategory":"command","title":"Run command?","details":[],"allowedResponses":["approve","deny"],"status":"pending","requestedAtMs":1,"expiresAtMs":null}}},
+  {"kind":"permission_resolution","payload":{"type":"permission_resolution","data":{"requestId":"request_permission","sessionId":"session_current","response":"approve","responderDeviceId":null,"providerResolutionId":null,"note":null,"resolvedAtMs":2}}},
+  {"kind":"error","payload":{"type":"error","data":{"code":"turn_failed","message":"failed","recoverable":true}}}
+]

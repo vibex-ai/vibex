@@ -1,0 +1,24 @@
+{
+  "events": [
+    {
+      "payload": {
+        "data": {
+          "items": [
+            {
+              "status": "completed",
+              "title": "Write the fixture"
+            },
+            {
+              "status": "pending",
+              "title": "Verify the golden output"
+            }
+          ],
+          "title": "Codex todo"
+        },
+        "type": "todo_update"
+      },
+      "providerCorrelationId": null,
+      "source": "agent"
+    }
+  ]
+}

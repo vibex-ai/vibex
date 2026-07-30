@@ -1,0 +1,34 @@
+{
+  "events": [
+    {
+      "payload": {
+        "data": {
+          "inputSummary": "{\"query\":\"serde tagged enums\"}",
+          "outputSummary": "{\"matches\":2}",
+          "status": "completed",
+          "summary": "Codex tool call",
+          "toolCallId": "item_mcp_1",
+          "toolName": "demo-server:lookup_docs"
+        },
+        "type": "tool_call"
+      },
+      "providerCorrelationId": null,
+      "source": "agent"
+    },
+    {
+      "payload": {
+        "data": {
+          "inputSummary": "{\"query\":\"missing\"}",
+          "outputSummary": null,
+          "status": "failed",
+          "summary": "Codex tool call",
+          "toolCallId": "item_mcp_2",
+          "toolName": "demo-server:lookup_docs"
+        },
+        "type": "tool_call"
+      },
+      "providerCorrelationId": null,
+      "source": "agent"
+    }
+  ]
+}

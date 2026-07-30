@@ -1,0 +1,9 @@
+{
+  "capability": "reasoning_effort_probe",
+  "mode": "meta_only",
+  "source": "observation snapshot 2026-07-11",
+  "sdk": "claude CLI --effort probe",
+  "recorded_at": "2026-07-11",
+  "known_defects": [],
+  "notes": "Historical probe observation: low, medium, high, xhigh, max. Online selectors now publish only managed ACP catalog or negotiated effort evidence and do not synthesize static values."
+}

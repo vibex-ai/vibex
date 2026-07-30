@@ -1,0 +1,24 @@
+[package]
+name = "vibex-relay"
+version = "0.1.0-rc.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64.workspace = true
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+vibex-core = { path = "../core" }
+x25519-dalek.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+rand_core = { workspace = true, features = ["getrandom"] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+web-sys.workspace = true

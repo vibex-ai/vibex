@@ -1,0 +1,48 @@
+[package]
+name = "vibex-remote-client"
+version = "0.1.0-rc.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+base64.workspace = true
+futures-util.workspace = true
+futures-channel.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+url.workspace = true
+vibex-core = { path = "../core" }
+vibex-backend = { path = "../vibex-backend" }
+vibex-relay = { path = "../relay" }
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+web-sys.workspace = true
+x25519-dalek.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+rand_core = { workspace = true, features = ["getrandom"] }
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+js-sys = "0.3"
+
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+axum.workspace = true
+vibex-agent = { path = "../agent" }
+serde_json.workspace = true
+vibex-db = { path = "../db" }
+vibex-desktop-runtime = { path = "../desktop-runtime" }
+vibex-remote = { path = "../remote" }
+vibex-relay-server = { path = "../../apps/relay-server" }
+vibex-terminal = { path = "../terminal" }

@@ -1,0 +1,4 @@
+{"type":"session_meta","timestamp":"2026-06-25T00:00:00Z","payload":{"id":"codex-thread-fixture-1","cwd":"/tmp/vibex-codex-fixture","cli_version":"fixture","source":"synthetic"}}
+{"type":"response_item","timestamp":"2026-06-25T00:00:01Z","payload":{"type":"message","id":"item-user-1","role":"user","content":[{"type":"input_text","text":"Synthetic user import prompt"}]}}
+{"type":"response_item","timestamp":"2026-06-25T00:00:02Z","payload":{"type":"reasoning","id":"item-reasoning-1","summary":"Synthetic reasoning summary"}}
+{"type":"response_item","timestamp":"2026-06-25T00:00:03Z","payload":{"type":"message","id":"item-assistant-1","role":"assistant","content":[{"type":"output_text","text":"Synthetic assistant import answer"}]}}

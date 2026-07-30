@@ -1,0 +1,2 @@
+{"type":"agentMessage","id":"item_agent_1","text":"Interim commentary while working.","phase":"commentary"}
+{"type":"agentMessage","id":"item_agent_2","text":"The fix is applied and tests pass.","phase":"final_answer"}

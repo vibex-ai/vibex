@@ -1,0 +1,21631 @@
+//! Generic long-lived ACP runtime client.
+//!
+//! This module hosts the provider-neutral ACP process runtime that Vibex uses
+//! to run any Agent Client Protocol CLI (OpenCode, Gemini CLI, Copilot, custom
+//! agents, ...). Each Vibex agent session owns one spawned ACP process that
+//! stays alive across turns. The runtime speaks stdio NDJSON JSON-RPC:
+//!
+//! - client -> agent requests: `initialize`, `session/new`, `session/load`,
+//!   `session/prompt`; notifications: `session/cancel`.
+//! - agent -> client notifications: `session/update` (streamed into the Vibex
+//!   timeline while a turn is active).
+//! - agent -> client requests: `session/request_permission` (bridged into the
+//!   Vibex permission system and answered after the user resolves it),
+//!   `fs/read_text_file` / `fs/write_text_file` (served by Vibex).
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use command_group::AsyncCommandGroup;
+use command_group::AsyncGroupChild;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
+use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot};
+use tokio::time::{sleep, timeout};
+use vibex_agent::runtime_switch::{
+    OP_CANCEL_ACTIVE_TURN, OP_CANCEL_BACKGROUND_WORK, OP_CLOSE_TERMINAL,
+    OP_RESOLVE_PENDING_PERMISSION, OP_RESTORE_SESSION,
+};
+use vibex_agent::{
+    ActiveWorkGate, ActiveWorkSnapshot, AgentManager, ContextBridgeService, JournaledOperation,
+    OperationReconcileOutcome, PROVIDER_SELECTED_MODEL_METADATA_KEY, PreparedAttachment,
+    PreparedProcess, ProviderRuntimeMcpServer, ProviderRuntimeMcpTransport,
+    ProviderRuntimeResources, ProviderTurnAttachment, ProviderTurnExecutionIdentity,
+    ResolvedInitialRuntimeSelection, ResolvedRuntimeSelection, RestoreAssessment,
+    RuntimeBackendSnapshot, RuntimeLeaseGuard, RuntimeLeaseTarget, RuntimeLifecycleBackend,
+    RuntimeLifecyclePublisher, RuntimeLifecycleService, RuntimeLogContext, RuntimeLogLevel,
+    RuntimeMetricName, RuntimeMetricOperation, RuntimeMetricResult, RuntimeObservability,
+    RuntimeSelectionResolver, RuntimeSweepReport, RuntimeSwitchStrategy, SwitchIntent,
+    SwitchTargetAssessment, SwitchTargetExecutor, default_adapter_for_agent,
+};
+use vibex_config_switch::{
+    CODEX_MODEL_PROVIDER_ID_OPTION_KEY, CodexProviderRuntimeConfig, ProviderConfigService,
+    ProviderProfileChangeListener, codex_runtime_config_from_profile, provider_option_value,
+    secrets::resolve_provider_secret,
+};
+use vibex_core::{
+    AcpProcessStrategy, AcpProviderConfig, AcpProviderEnvSource, ActiveWorkKind,
+    AgentEventRawOutput, AgentEventRawOutputMode, AgentId, AgentModelCapabilities,
+    AgentModelListRequest, AgentModelListSource, AgentReasoningEffort, AgentRuntimeRouteKey,
+    AgentSessionRestoreCompatibility, AgentSessionRestoreCompatibilityKey,
+    AgentSessionRestoreMethod, AgentSessionRestoreOutcome, AgentSessionState, AgentTokenUsage,
+    BindingState, ExternalSessionContinuationStatus, ExternalSessionImportCandidate,
+    ExternalSessionImportCandidateStatus, ExternalSessionImportSource, NativeStateHomeId,
+    PermissionActionDetail, PermissionRequest, PermissionRequestStatus, PermissionResponseKind,
+    PermissionRiskCategory, PlanStepPayload, PlanStepStatus, ProviderBinding,
+    ProviderBindingMetadata, ProviderKind, ProviderModelWireApi, ProviderNativeBinding,
+    ProviderProfile, ProviderProfileId, ProviderProfileStatus, ProviderSecretBackend,
+    ProviderSessionConfigOption, ProviderSessionConfigOptionKind, ProviderSessionConfigState,
+    ProviderSessionConfigValue, RequestId, RuntimeAttachmentSnapshot, RuntimeAttachmentStatus,
+    RuntimeBinding, RuntimeBindingId, RuntimeLeaseRole, RuntimeLeaseRoleCounts,
+    RuntimeLiveMessageSnapshot, RuntimeLiveToolCallSnapshot, RuntimeMaterializationStatus,
+    RuntimeProcessConfigStatus, RuntimeProcessId, RuntimeProcessSnapshot,
+    RuntimeSwitchActiveWorkPolicy, RuntimeSwitchId, RuntimeSwitchPolicy, SessionConfigValue,
+    SessionRuntimeConfigApplyStatus, SessionRuntimeConfigFieldOutcome,
+    SessionRuntimeConfigMutationRequest, SessionRuntimeConfigMutationResult,
+    SessionRuntimeConfigPatch, SessionRuntimeConfigState, SessionRuntimeSelection,
+    SystemNoticeLevel, TerminalAuthActionDescriptor, TerminalId, TimelineRedactionState,
+    ToolCallStatus, TransportKind, VibexError, VibexResult, VibexSessionId, WorkspaceMode,
+    unix_timestamp_ms,
+};
+use vibex_db::{
+    AgentSessionRuntimeRepository, RuntimeBindingRepository, SessionRepository,
+    SwitchOperationRecord, apply_migrations, open_database,
+};
+
+use crate::process_registry::{
+    AcpProcessCrash, AcpProcessHandle, AcpProcessInstanceId, AcpProcessRegistry, AcpProcessStatus,
+    MultiSessionContractEvidence, ProcessAcquireKey, ProcessExitReporter, ProcessLease,
+    ProcessReuseDecision, WorkspaceScope, decide_process_reuse,
+};
+use crate::protocol::{
+    self, AcpDecodedPayload, AcpOperation, AcpOperationStability, AcpWireEncoding, CapabilitySource,
+};
+use crate::registry::{
+    AcpCompatibilityRegistry, AgentEventEnricherKind, CapabilitySupport, RestorePolicy,
+    known_reasoning_effort_values, known_session_mode_values,
+};
+use crate::session_attachment_registry::{
+    SessionAttachmentAcquireKey, SessionAttachmentAcquireOutput, SessionAttachmentAcquireResult,
+    SessionAttachmentEventFence, SessionAttachmentHandle, SessionAttachmentPromptGuard,
+    SessionAttachmentRegistry, SessionAttachmentRoute, SessionAttachmentState, redact_native_id,
+};
+use crate::session_config::{
+    CanonicalSessionConfigKey, SessionConfigFieldKind, SessionConfigFieldRequest,
+    SessionConfigOperationEvidence, SessionConfigPlan, SessionConfigPlanner, validate_effort_value,
+    validate_model_value,
+};
+use crate::session_restore::{
+    RestoreCapabilityEvidence, RestoreCapabilityMap, classify_restore_error,
+    resolve_restore_compatibility, restore_methods, result_for_failure, result_for_success,
+};
+use crate::spawn_config::{ProcessSpawnConfigSnapshot, secret_reference_version};
+use crate::{
+    AcpClient, AcpCreateSessionRequest, AcpEvent, AcpImportSessionRequest, AcpPermissionResolution,
+    AcpRuntimeCommand, AcpRuntimeSessionProbe, AcpSendTurnRequest, AcpSession, AcpTurn,
+    infer_permission_risk_category, looks_sensitive, redact_summary, redacted_args_summary,
+};
+use crate::{
+    AgentEventInput, AgentEventInputSource, ClaudeBackgroundWorkRegistry, ClaudeWorkKey,
+    decode_claude_extension, normalize_agent_event, stable_event_correlation_id,
+};
+
+/// Frozen wire expectation for tests; production initialize params carry the
+/// version through the typed schema (`sacp::schema::ProtocolVersion::V1`).
+#[cfg(test)]
+const ACP_PROTOCOL_VERSION: i64 = 1;
+const ACP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+const ACP_SESSION_LOAD_TIMEOUT: Duration = Duration::from_secs(120);
+const ACP_PROMPT_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+const ACP_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+#[cfg(not(test))]
+const ACP_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+// Keep tests faster than production while allowing OS process-group cleanup to run
+// during concurrent workspace checks.
+#[cfg(test)]
+const ACP_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const ACP_DEBUG_LOG_LIMIT: usize = 256;
+const ACP_FS_READ_BYTE_LIMIT: u64 = 10 * 1024 * 1024;
+const ACP_IMAGE_ATTACHMENT_BYTE_LIMIT: u64 = 5 * 1024 * 1024;
+const ACP_SUMMARY_LIMIT: usize = 2000;
+const ACP_ACTIVE_MESSAGE_LIMIT: usize = 64 * 1024;
+const ACP_ACTIVE_TOOL_CALL_LIMIT: usize = 32;
+const ACP_PENDING_PERMISSION_LIMIT: usize = 32;
+const ACP_TERMINAL_OUTPUT_LIMIT: usize = 24 * 1024;
+const ACP_PROCESS_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const ACP_PERMISSION_CANCELLED_RESPONSE: &str = "cancelled";
+const OPENCODE_AGENT_ID: &str = "opencode";
+const OPENCODE_DEFAULT_MODEL: &str = "opencode-default";
+const OPENCODE_INLINE_CONFIG_ENV: &str = "OPENCODE_CONFIG_CONTENT";
+const OPENCODE_PROVIDER_API_KEY_ENV: &str = "VIBEX_OPENCODE_PROVIDER_API_KEY";
+const OPENCODE_MODEL_API_ERROR_CODE: &str = "opencode_model_api_error";
+const OPENCODE_MODEL_API_RETRYING_CODE: &str = "opencode_model_api_retrying";
+// OpenCode retries transient model failures with a 2/4/8/16/30-second backoff.
+// Eight consecutive failures preserve a roughly two-minute recovery window.
+const OPENCODE_STREAM_ERROR_LIMIT: u8 = 8;
+// stdout RPC responses and stderr model failures are drained by independent
+// tasks, so a terminal RPC error must allow the stderr reader to catch up.
+const OPENCODE_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const OPENCODE_PROMPT_CORRELATION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(not(test))]
+const OPENCODE_STREAM_ERROR_RECOVERY_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+#[cfg(test)]
+const OPENCODE_STREAM_ERROR_RECOVERY_TIMEOUT: Duration = Duration::from_millis(250);
+const CODEX_ACP_API_KEY_ENV: &str = "CODEX_API_KEY";
+const CODEX_ACP_MODEL_PROVIDER_ENV: &str = "MODEL_PROVIDER";
+const CODEX_ACP_DEFAULT_AUTH_REQUEST_ENV: &str = "DEFAULT_AUTH_REQUEST";
+const CODEX_ACP_DEFAULT_API_KEY_AUTH_REQUEST: &str = r#"{"methodId":"api-key"}"#;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenCodeWireApi {
+    OpenaiResponses,
+    OpenaiChatCompletions,
+    AnthropicMessages,
+}
+
+const OPENCODE_WIRE_APIS: [OpenCodeWireApi; 3] = [
+    OpenCodeWireApi::OpenaiResponses,
+    OpenCodeWireApi::OpenaiChatCompletions,
+    OpenCodeWireApi::AnthropicMessages,
+];
+
+/// Environment variables that must never leak from a parent agent session into
+/// spawned ACP child processes ("cannot be launched inside another session").
+pub(crate) const PARENT_SESSION_ENV_KEYS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_SSE_PORT",
+    "CLAUDE_AGENT_SDK_VERSION",
+];
+
+/// Extra environment injected into short-lived probe processes so ACP CLIs do
+/// not open interactive login browsers while Vibex lists models.
+pub(crate) const PROBE_ENV: &[(&str, &str)] = &[
+    ("NO_BROWSER", "true"),
+    ("NO_OPEN_BROWSER", "true"),
+    ("GEMINI_CLI_NO_BROWSER", "true"),
+    ("CI", "true"),
+];
+
+/// Session-update kinds that are intentionally ignored without emitting an
+/// "unknown event" notice into the timeline.
+const IGNORED_SESSION_UPDATE_KINDS: &[&str] = &[
+    "user_message_chunk",
+    "config_option_update",
+    "config_options_update",
+    "session_info_update",
+    "current_model_update",
+];
+
+#[derive(Debug, Clone)]
+struct AcpRpcFailure {
+    code: String,
+    message: String,
+    data_kind: protocol::AcpRpcFailureDataKind,
+}
+
+impl AcpRpcFailure {
+    fn process_exited() -> Self {
+        Self {
+            code: "acp_process_exited".to_string(),
+            message: "ACP agent process exited before responding".to_string(),
+            data_kind: protocol::AcpRpcFailureDataKind::Other,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcpProcessPurpose {
+    Session,
+    Probe,
+}
+
+struct AcpProcessLaunch<'a> {
+    profile_id: &'a ProviderProfileId,
+    config: &'a AcpProviderConfig,
+    cwd: &'a Path,
+    runtime_resources: &'a ProviderRuntimeResources,
+    purpose: AcpProcessPurpose,
+    process_strategy_effective: AcpProcessStrategy,
+    pool_fallback_reason: Option<String>,
+}
+
+/// Values materialized for one process launch. `env_overlays` may contain
+/// resolved secrets briefly while the child is spawned, but it is never stored
+/// in a snapshot, registry record, event, or diagnostic.
+struct ProcessLaunchMaterialization {
+    snapshot: ProcessSpawnConfigSnapshot,
+    env_overlays: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcpDebugDirection {
+    Outgoing,
+    Incoming,
+    Stderr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AcpDebugMessage {
+    sequence: u64,
+    direction: AcpDebugDirection,
+    message: String,
+}
+
+#[derive(Debug, Default)]
+struct AcpDebugLog {
+    next_sequence: u64,
+    messages: VecDeque<AcpDebugMessage>,
+}
+
+impl AcpDebugLog {
+    fn record_json(&mut self, direction: AcpDebugDirection, value: &Value) {
+        self.record(direction, redact_debug_value(value).to_string());
+    }
+
+    fn record_line(&mut self, direction: AcpDebugDirection, line: &str) {
+        let fields = parse_logfmt_fields(line);
+        let native_session_id = fields
+            .iter()
+            .find_map(|(key, value)| debug_key_is_native_session_id(key).then_some(value));
+        let message = native_session_id
+            .map(|native_session_id| {
+                let message = fields
+                    .get("message")
+                    .map(|message| redact_summary(message))
+                    .unwrap_or_else(|| "ACP stderr".to_string());
+                let error = fields
+                    .get("error.error")
+                    .map(|error| redact_summary(error))
+                    .unwrap_or_default();
+                format!(
+                    "{message} nativeSession={} error={error}",
+                    native_session_fingerprint(native_session_id)
+                )
+            })
+            .unwrap_or_else(|| redact_summary(line));
+        self.record(direction, message);
+    }
+
+    fn record(&mut self, direction: AcpDebugDirection, message: String) {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        if self.messages.len() == ACP_DEBUG_LOG_LIMIT {
+            self.messages.pop_front();
+        }
+        self.messages.push_back(AcpDebugMessage {
+            sequence,
+            direction,
+            message,
+        });
+    }
+
+    #[cfg(test)]
+    fn messages(&self) -> Vec<AcpDebugMessage> {
+        self.messages.iter().cloned().collect()
+    }
+
+    fn trailing_stderr(&self) -> Option<String> {
+        let lines = self
+            .messages
+            .iter()
+            .filter(|message| message.direction == AcpDebugDirection::Stderr)
+            .map(|message| message.message.as_str())
+            .collect::<Vec<_>>();
+        if lines.is_empty() {
+            return None;
+        }
+        Some(lines.join("\n"))
+    }
+}
+
+fn build_initialize_params(
+    read_text_file: bool,
+    write_text_file: bool,
+    terminal_tools: bool,
+    terminal_auth: bool,
+    mcp_servers: bool,
+) -> Value {
+    // Typed construction lives in protocol.rs (P2-01); the wire shape is
+    // frozen and covered by protocol.rs unit tests.
+    protocol::build_initialize_params(
+        read_text_file,
+        write_text_file,
+        terminal_tools,
+        terminal_auth,
+        mcp_servers,
+    )
+}
+
+fn negotiated_session_config_operations(
+    initialize: &Value,
+    compatibility_identity: &str,
+) -> BTreeMap<AcpOperation, SessionConfigOperationEvidence> {
+    let candidates = [
+        (
+            AcpOperation::SessionSetModel,
+            ["setModel", "set_model", "session/set_model"],
+            AcpWireEncoding::VersionedRaw,
+            AcpOperationStability::VersionedUnstable,
+        ),
+        (
+            AcpOperation::SessionSetMode,
+            ["setMode", "set_mode", "session/set_mode"],
+            AcpWireEncoding::Typed,
+            AcpOperationStability::CapabilityGated,
+        ),
+        (
+            AcpOperation::SessionSetConfigOption,
+            [
+                "setConfigOption",
+                "set_config_option",
+                "session/set_config_option",
+            ],
+            AcpWireEncoding::VersionedRaw,
+            AcpOperationStability::VersionedUnstable,
+        ),
+    ];
+    candidates
+        .into_iter()
+        .filter_map(|(operation, keys, default_encoding, stability)| {
+            let value = keys.iter().find_map(|key| {
+                initialize
+                    .pointer(&format!("/agentCapabilities/sessionConfig/{key}"))
+                    .or_else(|| initialize.pointer(&format!("/sessionCapabilities/{key}")))
+                    .or_else(|| initialize.pointer(&format!("/agentCapabilities/{key}")))
+                    .or_else(|| initialize.pointer(&format!("/agentCapabilities/operations/{key}")))
+            })?;
+            let (support, encoding) = parse_operation_capability(value, default_encoding);
+            (support != CapabilitySupport::Unknown).then(|| {
+                (
+                    operation,
+                    SessionConfigOperationEvidence {
+                        support,
+                        source: CapabilitySource::NegotiatedRuntime,
+                        encoding,
+                        stability,
+                        compatibility_identity: compatibility_identity.to_string(),
+                        activation_generation: 0,
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
+fn parse_operation_capability(
+    value: &Value,
+    default_encoding: AcpWireEncoding,
+) -> (CapabilitySupport, AcpWireEncoding) {
+    let support = match value {
+        Value::Bool(true) => CapabilitySupport::Supported,
+        Value::Bool(false) => CapabilitySupport::Unsupported,
+        Value::String(value) if matches!(value.as_str(), "supported" | "typed" | "raw") => {
+            CapabilitySupport::Supported
+        }
+        Value::String(value) if matches!(value.as_str(), "unsupported" | "disabled") => {
+            CapabilitySupport::Unsupported
+        }
+        Value::Object(value) => value
+            .get("supported")
+            .and_then(Value::as_bool)
+            .map(|supported| {
+                if supported {
+                    CapabilitySupport::Supported
+                } else {
+                    CapabilitySupport::Unsupported
+                }
+            })
+            .unwrap_or(CapabilitySupport::Unknown),
+        _ => CapabilitySupport::Unknown,
+    };
+    let encoding = value
+        .get("encoding")
+        .and_then(Value::as_str)
+        .or_else(|| value.as_str())
+        .and_then(|encoding| match encoding {
+            "typed" => Some(AcpWireEncoding::Typed),
+            "raw" | "versioned_raw" => Some(AcpWireEncoding::VersionedRaw),
+            "extension" => Some(AcpWireEncoding::ExtensionCodec),
+            _ => None,
+        })
+        .unwrap_or(default_encoding);
+    (support, encoding)
+}
+
+fn build_session_new_params(cwd: &Path, mcp_servers: &[AcpMcpServerDescriptor]) -> Value {
+    protocol::build_session_new_params(cwd, mcp_servers_json(mcp_servers))
+}
+
+fn build_session_load_params(
+    native_session_id: &str,
+    cwd: &Path,
+    mcp_servers: &[AcpMcpServerDescriptor],
+) -> Value {
+    protocol::build_session_load_params(native_session_id, cwd, mcp_servers_json(mcp_servers))
+}
+
+fn resolve_acp_mcp_descriptors(
+    config: &AcpProviderConfig,
+    resources: &ProviderRuntimeResources,
+) -> VibexResult<Vec<AcpMcpServerDescriptor>> {
+    if !acp_config_mcp_forwarding_enabled(config) {
+        return Ok(Vec::new());
+    }
+    resources
+        .mcp_servers
+        .iter()
+        .map(resolve_acp_mcp_descriptor)
+        .collect()
+}
+
+fn resolve_acp_mcp_descriptor(
+    server: &ProviderRuntimeMcpServer,
+) -> VibexResult<AcpMcpServerDescriptor> {
+    let id = server.id.trim();
+    if id.is_empty() {
+        return Err(VibexError::validation(
+            "acp_mcp_server_id_missing",
+            "ACP MCP server descriptor requires a stable id",
+        ));
+    }
+
+    let name = server.display_name.trim();
+    if name.is_empty() {
+        return Err(VibexError::validation(
+            "acp_mcp_server_name_missing",
+            "ACP MCP server descriptor requires a display name",
+        )
+        .with_diagnostic("mcpServerId", id));
+    }
+
+    let transport = match server.transport {
+        ProviderRuntimeMcpTransport::Stdio => {
+            let command = server
+                .command
+                .as_deref()
+                .map(str::trim)
+                .filter(|command| !command.is_empty())
+                .ok_or_else(|| {
+                    VibexError::validation(
+                        "acp_mcp_stdio_command_missing",
+                        "stdio MCP server forwarding requires a command",
+                    )
+                    .with_diagnostic("mcpServerId", id)
+                })?;
+            AcpMcpTransportDescriptor::Stdio {
+                command: command.to_string(),
+                args: server.args.clone(),
+            }
+        }
+        ProviderRuntimeMcpTransport::Http => {
+            let url = valid_mcp_url(server.url.as_deref()).ok_or_else(|| {
+                VibexError::validation(
+                    "acp_mcp_url_invalid",
+                    "HTTP MCP server forwarding requires an http:// or https:// URL",
+                )
+                .with_diagnostic("mcpServerId", id)
+            })?;
+            AcpMcpTransportDescriptor::Http { url }
+        }
+        ProviderRuntimeMcpTransport::Sse => {
+            let url = valid_mcp_url(server.url.as_deref()).ok_or_else(|| {
+                VibexError::validation(
+                    "acp_mcp_url_invalid",
+                    "SSE MCP server forwarding requires an http:// or https:// URL",
+                )
+                .with_diagnostic("mcpServerId", id)
+            })?;
+            AcpMcpTransportDescriptor::Sse { url }
+        }
+    };
+
+    Ok(AcpMcpServerDescriptor {
+        id: id.to_string(),
+        name: name.to_string(),
+        transport,
+    })
+}
+
+fn acp_config_mcp_forwarding_enabled(config: &AcpProviderConfig) -> bool {
+    config.features.iter().any(|feature| {
+        let normalized = feature
+            .trim()
+            .to_ascii_lowercase()
+            .replace([' ', '-', '.'], "_");
+        matches!(normalized.as_str(), "mcp" | "mcp_servers")
+    })
+}
+
+fn valid_mcp_url(url: Option<&str>) -> Option<String> {
+    let url = url.map(str::trim).filter(|value| !value.is_empty())?;
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    (!rest.trim_matches('/').is_empty() && !url.contains(' ')).then(|| url.to_string())
+}
+
+fn mcp_servers_json(mcp_servers: &[AcpMcpServerDescriptor]) -> Value {
+    Value::Array(mcp_servers.iter().map(mcp_server_json).collect())
+}
+
+fn mcp_server_json(server: &AcpMcpServerDescriptor) -> Value {
+    match &server.transport {
+        AcpMcpTransportDescriptor::Stdio { command, args } => json!({
+            "id": server.id,
+            "name": server.name,
+            "transport": "stdio",
+            "command": command,
+            "args": args
+        }),
+        AcpMcpTransportDescriptor::Http { url } => json!({
+            "id": server.id,
+            "name": server.name,
+            "transport": "http",
+            "url": url
+        }),
+        AcpMcpTransportDescriptor::Sse { url } => json!({
+            "id": server.id,
+            "name": server.name,
+            "transport": "sse",
+            "url": url
+        }),
+    }
+}
+
+fn redact_debug_value(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut redacted = serde_json::Map::new();
+            for (key, value) in object {
+                if debug_key_is_native_session_id(key) {
+                    redacted.insert(
+                        key.clone(),
+                        value
+                            .as_str()
+                            .map(native_session_fingerprint)
+                            .map(Value::String)
+                            .unwrap_or_else(|| Value::String("[redacted]".to_string())),
+                    );
+                } else if looks_sensitive(key) || debug_key_is_sensitive(key) {
+                    redacted.insert(key.clone(), Value::String("[redacted]".to_string()));
+                } else {
+                    redacted.insert(key.clone(), redact_debug_value(value));
+                }
+            }
+            Value::Object(redacted)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(redact_debug_value).collect()),
+        Value::String(text) => {
+            if looks_sensitive(text) {
+                Value::String("[redacted]".to_string())
+            } else {
+                Value::String(redact_summary(text))
+            }
+        }
+        _ => value.clone(),
+    }
+}
+
+fn debug_key_is_sensitive(key: &str) -> bool {
+    let key = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect::<String>();
+    key.contains("token")
+        || key.contains("secret")
+        || key.contains("password")
+        || key.contains("apikey")
+        || key.contains("authorization")
+        || matches!(
+            key.as_str(),
+            "content"
+                | "env"
+                | "headers"
+                | "prompt"
+                | "rawinput"
+                | "rawoutput"
+                | "rawpayload"
+                | "payload"
+                | "body"
+        )
+}
+
+fn debug_key_is_native_session_id(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect::<String>();
+    matches!(normalized.as_str(), "sessionid" | "nativesessionid")
+}
+
+fn native_session_fingerprint(native_session_id: &str) -> String {
+    redact_native_id(native_session_id)
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct OpenCodeStreamError {
+    native_session_id: String,
+    message: String,
+    disposition: OpenCodeStreamErrorDisposition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenCodeStreamErrorDisposition {
+    Retryable,
+    UserActionRequired,
+}
+
+impl std::fmt::Debug for OpenCodeStreamError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenCodeStreamError")
+            .field(
+                "native_session_id",
+                &native_session_fingerprint(&self.native_session_id),
+            )
+            .field("message", &self.message)
+            .finish()
+    }
+}
+
+fn parse_logfmt_fields(line: &str) -> HashMap<String, String> {
+    let mut fields = HashMap::new();
+    let mut chars = line.chars().peekable();
+
+    loop {
+        while chars.peek().is_some_and(|ch| ch.is_whitespace()) {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+
+        let mut key = String::new();
+        while let Some(ch) = chars.peek().copied() {
+            if ch == '=' || ch.is_whitespace() {
+                break;
+            }
+            key.push(ch);
+            chars.next();
+        }
+        if chars.peek() != Some(&'=') {
+            while chars.peek().is_some_and(|ch| !ch.is_whitespace()) {
+                chars.next();
+            }
+            continue;
+        }
+        chars.next();
+
+        let mut value = String::new();
+        if chars.peek() == Some(&'"') {
+            chars.next();
+            let mut escaped = false;
+            for ch in chars.by_ref() {
+                if escaped {
+                    value.push(match ch {
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        other => other,
+                    });
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    break;
+                } else {
+                    value.push(ch);
+                }
+            }
+            if escaped {
+                value.push('\\');
+            }
+        } else {
+            while let Some(ch) = chars.peek().copied() {
+                if ch.is_whitespace() {
+                    break;
+                }
+                value.push(ch);
+                chars.next();
+            }
+        }
+
+        if !key.is_empty() {
+            fields.insert(key, value);
+        }
+    }
+
+    fields
+}
+
+fn parse_opencode_stream_error(line: &str) -> Option<OpenCodeStreamError> {
+    let fields = parse_logfmt_fields(line);
+    if fields.get("message").map(String::as_str) != Some("stream error")
+        || fields
+            .get("small")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+    {
+        return None;
+    }
+
+    let native_session_id = fields.get("session.id")?.trim();
+    let raw_message = fields.get("error.error")?.trim();
+    if native_session_id.is_empty() || raw_message.is_empty() {
+        return None;
+    }
+
+    let message = raw_message
+        .strip_prefix("AI_APICallError:")
+        .or_else(|| raw_message.strip_prefix("APICallError:"))
+        .or_else(|| raw_message.strip_prefix("AI_RetryError: Failed after 3 attempts. Last error:"))
+        .unwrap_or(raw_message)
+        .trim();
+    let message = redact_summary(message);
+    let message = if message.is_empty() {
+        "The upstream model API returned an error".to_string()
+    } else {
+        message
+    };
+    let disposition = opencode_stream_error_disposition(&message);
+
+    Some(OpenCodeStreamError {
+        native_session_id: native_session_id.to_string(),
+        message,
+        disposition,
+    })
+}
+
+fn opencode_stream_error_disposition(message: &str) -> OpenCodeStreamErrorDisposition {
+    let message = message.to_ascii_lowercase();
+    if [
+        "free usage exceeded",
+        "freeusagelimiterror",
+        "rate limit exceeded",
+        "rate limit reached",
+        "rate limited",
+        "too many requests",
+        "usage limit reached",
+        "usage limit exceeded",
+        "quota exceeded",
+        "insufficient account balance",
+        "insufficient balance",
+        "insufficient credit",
+        "payment required",
+        "subscribe to go",
+        "billing limit",
+        "invalid api key",
+        "authentication required",
+        "unauthorized",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+    {
+        OpenCodeStreamErrorDisposition::UserActionRequired
+    } else {
+        OpenCodeStreamErrorDisposition::Retryable
+    }
+}
+
+enum TurnSink {
+    Channel(mpsc::UnboundedSender<AcpEvent>),
+    Buffer(Vec<AcpEvent>),
+}
+
+struct ActiveTurn {
+    sink: TurnSink,
+    chunk_index: u32,
+    opencode_stream_error_count: u8,
+    opencode_stream_error_epoch: u64,
+    latest_opencode_stream_error: Option<String>,
+    opencode_stream_error_watchdog: Option<OpenCodeStreamErrorWatchdog>,
+    assistant_text: String,
+    assistant_text_truncated: bool,
+    assistant_segment: String,
+    assistant_segment_truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OpenCodeStreamErrorObservation {
+    epoch: u64,
+    started_window: bool,
+    reached_limit: bool,
+}
+
+struct OpenCodeStreamErrorWatchdog {
+    epoch: u64,
+    deadline: Instant,
+    message: String,
+}
+
+enum OpenCodeStreamErrorWatchdogState {
+    Stale,
+    Pending(Instant),
+    Expired(String),
+}
+
+fn append_bounded_assistant_text(buffer: &mut String, truncated: &mut bool, text: &str) {
+    if buffer.len() >= ACP_ACTIVE_MESSAGE_LIMIT {
+        *truncated = true;
+        return;
+    }
+    let remaining = ACP_ACTIVE_MESSAGE_LIMIT.saturating_sub(buffer.len());
+    let mut end = text.len().min(remaining);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    buffer.push_str(&text[..end]);
+    if end < text.len() {
+        *truncated = true;
+    }
+}
+
+struct PendingPermission {
+    rpc_id: Value,
+    options: Vec<PermissionOptionSummary>,
+    risk_category: PermissionRiskCategory,
+    title: String,
+    details: Vec<PermissionActionDetail>,
+}
+
+struct PendingTerminalCreate {
+    rpc_id: Value,
+    request: AcpTerminalCreateRequest,
+}
+
+#[derive(Debug, Clone)]
+struct PermissionOptionSummary {
+    option_id: String,
+    kind: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ToolCallOutputState {
+    byte_len: usize,
+    digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, Default)]
+struct ToolCallSnapshot {
+    title: String,
+    kind: String,
+    input_summary: Option<String>,
+    output_summary: Option<String>,
+    raw_input: Option<Value>,
+    raw_output_state: Option<ToolCallOutputState>,
+    content: Option<Value>,
+    locations: Vec<vibex_core::AgentEventLocation>,
+    meta: BTreeMap<String, String>,
+    started: bool,
+}
+
+#[derive(Default)]
+struct AcpAttachmentShared {
+    active_turn: Option<ActiveTurn>,
+    pending_permissions: HashMap<String, PendingPermission>,
+    pending_terminal_creates: HashMap<String, PendingTerminalCreate>,
+    terminal_creates_in_flight: usize,
+    active_terminal_ids: BTreeSet<TerminalId>,
+    available_commands: Vec<AcpRuntimeCommand>,
+    current_mode_id: Option<String>,
+    model_ids: Vec<String>,
+    current_model_id: Option<String>,
+    session_config_state: Option<ProviderSessionConfigState>,
+    session_runtime_config_state: SessionRuntimeConfigState,
+    session_config_planner: Option<SessionConfigPlanner>,
+    tool_calls: HashMap<String, ToolCallSnapshot>,
+    usage: Option<AgentTokenUsage>,
+    claude_background_work: ClaudeBackgroundWorkRegistry,
+}
+
+struct AcpSessionAttachment {
+    lease: ProcessLease<AcpProcess>,
+    native_session_id: String,
+    binding_id: RuntimeBindingId,
+    activation_generation: AtomicI64,
+    state: Mutex<AcpAttachmentShared>,
+    crash_receiver: Mutex<Option<broadcast::Receiver<AcpProcessCrash>>>,
+    crash_watcher: Mutex<Option<tokio::task::AbortHandle>>,
+    registration_barrier: Mutex<Option<AcpRegistrationBarrier>>,
+}
+
+struct TerminalCreateWorkGuard {
+    attachment: Arc<AcpSessionAttachment>,
+}
+
+impl Drop for TerminalCreateWorkGuard {
+    fn drop(&mut self) {
+        self.attachment.finish_terminal_create_work();
+    }
+}
+
+struct AcpAttachmentRouter {
+    registry: SessionAttachmentRegistry<AcpSessionAttachment>,
+    lifecycle_publisher: Mutex<Option<RuntimeLifecyclePublisher>>,
+    observability: Arc<RuntimeObservability>,
+}
+
+type AcpAttachmentHandle = SessionAttachmentHandle<AcpSessionAttachment>;
+
+impl AcpAttachmentRouter {
+    fn with_observability(observability: Arc<RuntimeObservability>) -> Self {
+        Self {
+            registry: SessionAttachmentRegistry::with_observability(observability.clone()),
+            lifecycle_publisher: Mutex::new(None),
+            observability,
+        }
+    }
+
+    fn install_lifecycle_publisher(&self, publisher: RuntimeLifecyclePublisher) {
+        if let Ok(mut current) = self.lifecycle_publisher.lock() {
+            *current = Some(publisher);
+        }
+    }
+
+    fn publish_attachment(&self, handle: &AcpAttachmentHandle, kind: vibex_core::RuntimeEventKind) {
+        let Ok(publisher) = self.lifecycle_publisher.lock() else {
+            return;
+        };
+        let Some(publisher) = publisher.as_ref() else {
+            return;
+        };
+        let process_id =
+            RuntimeProcessId::from_opaque(handle.fence().process_instance_id.as_str().to_string())
+                .ok();
+        let _ = publisher.publish(
+            handle.session_id(),
+            kind,
+            Some(handle.binding_id().clone()),
+            process_id,
+        );
+    }
+
+    fn handle_crash(&self, fence: &SessionAttachmentEventFence) {
+        let Ok(Some(handle)) = self.registry.mark_crashed(fence) else {
+            return;
+        };
+        handle.payload().on_process_crash();
+        self.publish_attachment(&handle, vibex_core::RuntimeEventKind::AttachmentCrashed);
+    }
+}
+
+#[derive(Clone)]
+struct LegacyAttachmentIdentity {
+    binding_id: RuntimeBindingId,
+    activation_generation: u64,
+    provider_profile_id: ProviderProfileId,
+    attached_process_id: Option<AcpProcessInstanceId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachmentActivationMode {
+    Immediate,
+    Prepared,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachmentMutationMode {
+    Current,
+    Fenced,
+}
+
+impl AttachmentActivationMode {
+    fn mutation_mode(self) -> AttachmentMutationMode {
+        match self {
+            Self::Immediate => AttachmentMutationMode::Current,
+            Self::Prepared => AttachmentMutationMode::Fenced,
+        }
+    }
+}
+
+impl AttachmentMutationMode {
+    fn apply<A, R, F>(
+        self,
+        registry: &SessionAttachmentRegistry<A>,
+        fence: &SessionAttachmentEventFence,
+        operation: F,
+    ) -> VibexResult<R>
+    where
+        F: FnOnce(&A) -> R,
+    {
+        match self {
+            Self::Current => registry.apply_current(fence, operation),
+            Self::Fenced => registry.apply_fenced(fence, operation),
+        }
+    }
+}
+
+struct OpenedAcpSession {
+    native_session_id: String,
+    state: AcpAttachmentShared,
+    registration_barrier: Option<AcpRegistrationBarrier>,
+}
+
+struct AcpRegistrationBarrier {
+    release: Option<oneshot::Sender<()>>,
+}
+
+impl AcpRegistrationBarrier {
+    fn release(mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+impl Drop for AcpRegistrationBarrier {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+struct PendingTransportResponse {
+    response: oneshot::Sender<Result<Value, AcpRpcFailure>>,
+    registration_release: Option<oneshot::Receiver<()>>,
+}
+
+struct StartedAcpRequest {
+    id: u64,
+    prompt_session_id: Option<String>,
+    response: oneshot::Receiver<Result<Value, AcpRpcFailure>>,
+    registration_release: Option<oneshot::Sender<()>>,
+}
+
+#[derive(Debug, Default)]
+struct ProcessShared {
+    closed: bool,
+    closing: bool,
+    protocol_version: Option<i64>,
+    agent_name: Option<String>,
+    agent_version: Option<String>,
+    supports_load_session: bool,
+    supports_resume_session: bool,
+    supports_list_sessions: bool,
+    operation_evidence: BTreeMap<AcpOperation, SessionConfigOperationEvidence>,
+}
+
+struct AcpProcess {
+    process_instance_id: AcpProcessInstanceId,
+    exit_reporter: Option<ProcessExitReporter<AcpProcess>>,
+    provider_profile_id: ProviderProfileId,
+    compatibility_identity: String,
+    event_enricher: AgentEventEnricherKind,
+    workspace_root: PathBuf,
+    command_display: String,
+    args_display: String,
+    outbound: Mutex<Option<mpsc::UnboundedSender<String>>>,
+    next_request_id: AtomicU64,
+    pending_requests: Mutex<HashMap<u64, PendingTransportResponse>>,
+    pending_prompt_requests: Mutex<HashMap<String, u64>>,
+    active_terminal_owners: Mutex<HashMap<TerminalId, Weak<AcpSessionAttachment>>>,
+    request_admission: Mutex<()>,
+    shared: Mutex<ProcessShared>,
+    debug_log: Arc<Mutex<AcpDebugLog>>,
+    child: tokio::sync::Mutex<Option<AsyncGroupChild>>,
+    shutdown_lock: tokio::sync::Mutex<()>,
+    terminal_host: Arc<dyn AcpTerminalHost>,
+    terminal_tools_enabled: bool,
+    terminal_auth_enabled: bool,
+    mcp_servers: Vec<AcpMcpServerDescriptor>,
+    process_strategy_requested: AcpProcessStrategy,
+    process_strategy_effective: AcpProcessStrategy,
+    pool_fallback_reason: Option<String>,
+    opencode_error_bridge_enabled: bool,
+    attachment_router: Weak<AcpAttachmentRouter>,
+    observability: Arc<RuntimeObservability>,
+    log_context: RuntimeLogContext,
+    #[cfg(test)]
+    lifecycle_events: Mutex<Vec<&'static str>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AcpMcpServerDescriptor {
+    id: String,
+    name: String,
+    transport: AcpMcpTransportDescriptor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AcpMcpTransportDescriptor {
+    Stdio { command: String, args: Vec<String> },
+    Http { url: String },
+    Sse { url: String },
+}
+
+#[derive(Clone)]
+pub struct AcpTerminalCreateRequest {
+    pub session_id: Option<String>,
+    pub command: String,
+    pub args: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    pub env: Vec<(String, String)>,
+    pub title: Option<String>,
+}
+
+impl std::fmt::Debug for AcpTerminalCreateRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let env_keys = self.env.iter().map(|(key, _)| key).collect::<Vec<_>>();
+        formatter
+            .debug_struct("AcpTerminalCreateRequest")
+            .field(
+                "session_id",
+                &self.session_id.as_deref().map(native_session_fingerprint),
+            )
+            .field("command", &redact_summary(&self.command))
+            .field("args", &redacted_args_summary(&self.args))
+            .field("cwd", &self.cwd)
+            .field("env_keys", &env_keys)
+            .field("title", &self.title.as_deref().map(redact_summary))
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AcpTerminalOutput {
+    pub text: String,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpTerminalExitStatus {
+    pub exit_code: Option<i32>,
+    pub signal: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct AcpTerminalAuthRequest {
+    pub provider_profile_id: ProviderProfileId,
+    pub method_id: String,
+    pub title: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub cwd: Option<String>,
+    pub env: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for AcpTerminalAuthRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let env_keys = self.env.iter().map(|(key, _)| key).collect::<Vec<_>>();
+        formatter
+            .debug_struct("AcpTerminalAuthRequest")
+            .field("provider_profile_id", &self.provider_profile_id)
+            .field("method_id", &self.method_id)
+            .field("title", &redact_summary(&self.title))
+            .field("command", &redact_summary(&self.command))
+            .field("args", &redacted_args_summary(&self.args))
+            .field("cwd", &self.cwd)
+            .field("env_keys", &env_keys)
+            .finish()
+    }
+}
+
+#[async_trait]
+pub trait AcpTerminalHost: Send + Sync {
+    async fn create(&self, request: AcpTerminalCreateRequest) -> VibexResult<TerminalId>;
+
+    async fn kill(&self, terminal_id: &TerminalId) -> VibexResult<()>;
+
+    async fn release(&self, terminal_id: &TerminalId) -> VibexResult<()>;
+
+    async fn output(
+        &self,
+        terminal_id: &TerminalId,
+        limit: usize,
+    ) -> VibexResult<AcpTerminalOutput>;
+
+    async fn wait_for_exit(&self, terminal_id: &TerminalId) -> VibexResult<AcpTerminalExitStatus>;
+
+    fn terminal_auth_descriptor(
+        &self,
+        request: AcpTerminalAuthRequest,
+    ) -> VibexResult<TerminalAuthActionDescriptor>;
+}
+
+impl AcpSessionAttachment {
+    fn new(
+        lease: ProcessLease<AcpProcess>,
+        opened: OpenedAcpSession,
+        crash_receiver: broadcast::Receiver<AcpProcessCrash>,
+        binding_id: RuntimeBindingId,
+        activation_generation: i64,
+    ) -> Self {
+        let OpenedAcpSession {
+            native_session_id,
+            state,
+            registration_barrier,
+        } = opened;
+        Self {
+            lease,
+            native_session_id,
+            binding_id,
+            activation_generation: AtomicI64::new(activation_generation),
+            state: Mutex::new(state),
+            crash_receiver: Mutex::new(Some(crash_receiver)),
+            crash_watcher: Mutex::new(None),
+            registration_barrier: Mutex::new(registration_barrier),
+        }
+    }
+
+    fn release_registration_barrier(&self) {
+        if let Ok(mut barrier) = self.registration_barrier.lock()
+            && let Some(barrier) = barrier.take()
+        {
+            barrier.release();
+        }
+    }
+
+    fn process(&self) -> Arc<AcpProcess> {
+        self.lease.process()
+    }
+
+    fn process_instance_id(&self) -> &AcpProcessInstanceId {
+        self.lease.process_instance_id()
+    }
+
+    fn activation_generation(&self) -> i64 {
+        self.activation_generation.load(Ordering::Acquire)
+    }
+
+    fn set_activation_generation(&self, next: i64) {
+        self.activation_generation.store(next, Ordering::Release);
+    }
+
+    fn lease_snapshot(&self) -> Option<crate::process_registry::AcpProcessSnapshot> {
+        self.lease.snapshot().ok()
+    }
+
+    fn take_crash_receiver(&self) -> Option<broadcast::Receiver<AcpProcessCrash>> {
+        self.crash_receiver
+            .lock()
+            .ok()
+            .and_then(|mut receiver| receiver.take())
+    }
+
+    fn set_crash_watcher(&self, watcher: tokio::task::AbortHandle) {
+        if let Ok(mut current) = self.crash_watcher.lock()
+            && let Some(previous) = current.replace(watcher)
+        {
+            previous.abort();
+        }
+    }
+
+    fn abort_crash_watcher(&self) {
+        if let Ok(mut watcher) = self.crash_watcher.lock()
+            && let Some(watcher) = watcher.take()
+        {
+            watcher.abort();
+        }
+    }
+
+    fn begin_turn(&self, sink: TurnSink) -> VibexResult<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| lock_poisoned_error("attachmentState"))?;
+        if state.active_turn.is_some() {
+            return Err(VibexError::conflict(
+                "acp_turn_already_running",
+                "ACP session already has an active turn",
+            ));
+        }
+        state.active_turn = Some(ActiveTurn {
+            sink,
+            chunk_index: 0,
+            opencode_stream_error_count: 0,
+            opencode_stream_error_epoch: 0,
+            latest_opencode_stream_error: None,
+            opencode_stream_error_watchdog: None,
+            assistant_text: String::new(),
+            assistant_text_truncated: false,
+            assistant_segment: String::new(),
+            assistant_segment_truncated: false,
+        });
+        Ok(())
+    }
+
+    fn finish_turn(&self, emit_final_message: bool) -> VibexResult<Vec<AcpEvent>> {
+        let active_turn = self
+            .state
+            .lock()
+            .map_err(|_| lock_poisoned_error("attachmentState"))?
+            .active_turn
+            .take();
+        Ok(match active_turn {
+            Some(ActiveTurn {
+                sink,
+                assistant_segment,
+                assistant_segment_truncated,
+                ..
+            }) => {
+                let final_message = (emit_final_message && !assistant_segment_truncated).then_some(
+                    AcpEvent::AssistantMessage {
+                        text: assistant_segment,
+                        is_final: true,
+                    },
+                );
+                match sink {
+                    TurnSink::Buffer(mut events) => {
+                        events.extend(final_message);
+                        events
+                    }
+                    TurnSink::Channel(sender) => {
+                        if let Some(event) = final_message {
+                            let _ = sender.send(event);
+                        }
+                        Vec::new()
+                    }
+                }
+            }
+            None => Vec::new(),
+        })
+    }
+
+    fn emit_turn_event(&self, event: AcpEvent) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let Some(turn) = state.active_turn.as_mut() else {
+            return false;
+        };
+        match &mut turn.sink {
+            TurnSink::Channel(sender) => sender.send(event).is_ok(),
+            TurnSink::Buffer(buffer) => {
+                buffer.push(event);
+                true
+            }
+        }
+    }
+
+    fn next_chunk_index(&self) -> u32 {
+        let Ok(mut state) = self.state.lock() else {
+            return 0;
+        };
+        let Some(turn) = state.active_turn.as_mut() else {
+            return 0;
+        };
+        let index = turn.chunk_index;
+        turn.chunk_index = turn.chunk_index.saturating_add(1);
+        index
+    }
+
+    fn append_assistant_text(&self, text: &str) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let Some(turn) = state.active_turn.as_mut() else {
+            return;
+        };
+        append_bounded_assistant_text(
+            &mut turn.assistant_text,
+            &mut turn.assistant_text_truncated,
+            text,
+        );
+        append_bounded_assistant_text(
+            &mut turn.assistant_segment,
+            &mut turn.assistant_segment_truncated,
+            text,
+        );
+    }
+
+    fn record_opencode_stream_error(
+        &self,
+        message: &str,
+    ) -> Option<OpenCodeStreamErrorObservation> {
+        let Ok(mut state) = self.state.lock() else {
+            return None;
+        };
+        let turn = state.active_turn.as_mut()?;
+        let started_window = turn.opencode_stream_error_count == 0;
+        if started_window {
+            turn.opencode_stream_error_epoch = turn.opencode_stream_error_epoch.wrapping_add(1);
+            turn.opencode_stream_error_watchdog = Some(OpenCodeStreamErrorWatchdog {
+                epoch: turn.opencode_stream_error_epoch,
+                deadline: Instant::now() + OPENCODE_STREAM_ERROR_RECOVERY_TIMEOUT,
+                message: message.to_string(),
+            });
+        } else if let Some(watchdog) = turn.opencode_stream_error_watchdog.as_mut() {
+            watchdog.message = message.to_string();
+        }
+        turn.opencode_stream_error_count = turn.opencode_stream_error_count.saturating_add(1);
+        turn.latest_opencode_stream_error = Some(message.to_string());
+        Some(OpenCodeStreamErrorObservation {
+            epoch: turn.opencode_stream_error_epoch,
+            started_window,
+            reached_limit: turn.opencode_stream_error_count >= OPENCODE_STREAM_ERROR_LIMIT,
+        })
+    }
+
+    fn latest_opencode_stream_error(&self) -> Option<String> {
+        self.state.lock().ok().and_then(|state| {
+            state
+                .active_turn
+                .as_ref()?
+                .latest_opencode_stream_error
+                .clone()
+        })
+    }
+
+    fn record_opencode_stream_progress(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let Some(turn) = state.active_turn.as_mut() else {
+            return;
+        };
+        turn.opencode_stream_error_count = 0;
+        turn.latest_opencode_stream_error = None;
+        if let Some(watchdog) = turn.opencode_stream_error_watchdog.as_mut() {
+            watchdog.deadline = Instant::now() + OPENCODE_STREAM_ERROR_RECOVERY_TIMEOUT;
+        }
+    }
+
+    fn claim_opencode_stream_error_watchdog(&self, epoch: u64) -> OpenCodeStreamErrorWatchdogState {
+        let Ok(mut state) = self.state.lock() else {
+            return OpenCodeStreamErrorWatchdogState::Stale;
+        };
+        let Some(turn) = state.active_turn.as_mut() else {
+            return OpenCodeStreamErrorWatchdogState::Stale;
+        };
+        let Some(watchdog) = turn.opencode_stream_error_watchdog.as_ref() else {
+            return OpenCodeStreamErrorWatchdogState::Stale;
+        };
+        if watchdog.epoch != epoch {
+            return OpenCodeStreamErrorWatchdogState::Stale;
+        }
+        if watchdog.deadline > Instant::now() {
+            return OpenCodeStreamErrorWatchdogState::Pending(watchdog.deadline);
+        }
+        let watchdog = turn
+            .opencode_stream_error_watchdog
+            .take()
+            .expect("OpenCode stream error watchdog was checked above");
+        OpenCodeStreamErrorWatchdogState::Expired(watchdog.message)
+    }
+
+    fn insert_pending_permission(
+        &self,
+        request_id: &RequestId,
+        pending: PendingPermission,
+    ) -> bool {
+        self.state
+            .lock()
+            .map(|mut state| {
+                state
+                    .pending_permissions
+                    .insert(request_id.as_str().to_string(), pending);
+                true
+            })
+            .unwrap_or(false)
+    }
+
+    fn remove_pending_permission(&self, request_id: &str) -> Option<PendingPermission> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|mut state| state.pending_permissions.remove(request_id))
+    }
+
+    fn insert_pending_terminal_create(
+        &self,
+        request_id: &RequestId,
+        pending: PendingTerminalCreate,
+    ) -> bool {
+        self.state
+            .lock()
+            .map(|mut state| {
+                state
+                    .pending_terminal_creates
+                    .insert(request_id.as_str().to_string(), pending);
+                true
+            })
+            .unwrap_or(false)
+    }
+
+    fn remove_pending_terminal_create(&self, request_id: &str) -> Option<PendingTerminalCreate> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|mut state| state.pending_terminal_creates.remove(request_id))
+    }
+
+    fn claim_pending_terminal_create(&self, request_id: &str) -> Option<PendingTerminalCreate> {
+        self.state.lock().ok().and_then(|mut state| {
+            let pending = state.pending_terminal_creates.remove(request_id)?;
+            state.terminal_creates_in_flight = state.terminal_creates_in_flight.saturating_add(1);
+            Some(pending)
+        })
+    }
+
+    fn finish_terminal_create_work(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.terminal_creates_in_flight = state.terminal_creates_in_flight.saturating_sub(1);
+        }
+    }
+
+    fn has_pending_permissions(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| {
+                !state.pending_permissions.is_empty()
+                    || !state.pending_terminal_creates.is_empty()
+                    || state.terminal_creates_in_flight > 0
+            })
+            .unwrap_or(false)
+    }
+
+    fn mark_terminal_active(&self, terminal_id: TerminalId) {
+        if let Ok(mut state) = self.state.lock() {
+            state.active_terminal_ids.insert(terminal_id);
+        }
+    }
+
+    fn mark_terminal_inactive(&self, terminal_id: &TerminalId) {
+        if let Ok(mut state) = self.state.lock() {
+            state.active_terminal_ids.remove(terminal_id);
+        }
+    }
+
+    fn active_terminal_ids(&self) -> Vec<TerminalId> {
+        self.state
+            .lock()
+            .map(|state| state.active_terminal_ids.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn active_work_snapshot(&self) -> ActiveWorkSnapshot {
+        self.state
+            .lock()
+            .map(|state| ActiveWorkSnapshot {
+                active_turn: state.active_turn.is_some(),
+                pending_permission: !state.pending_permissions.is_empty()
+                    || !state.pending_terminal_creates.is_empty()
+                    || state.terminal_creates_in_flight > 0,
+                active_terminal: !state.active_terminal_ids.is_empty(),
+                background_work: state.claude_background_work.has_active(&ClaudeWorkKey {
+                    binding_id: self.binding_id.as_str().to_string(),
+                    activation_generation: self.activation_generation(),
+                }),
+            })
+            .unwrap_or(ActiveWorkSnapshot {
+                active_turn: true,
+                pending_permission: true,
+                active_terminal: true,
+                background_work: true,
+            })
+    }
+
+    fn pending_host_callback_count(&self) -> usize {
+        self.state
+            .lock()
+            .map(|state| {
+                state
+                    .pending_permissions
+                    .len()
+                    .saturating_add(state.pending_terminal_creates.len())
+                    .saturating_add(state.terminal_creates_in_flight)
+            })
+            .unwrap_or(usize::MAX)
+    }
+
+    fn config_is_idle(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| {
+                state.active_turn.is_none()
+                    && state.pending_permissions.is_empty()
+                    && state.pending_terminal_creates.is_empty()
+                    && state.terminal_creates_in_flight == 0
+                    && state.active_terminal_ids.is_empty()
+                    && state.claude_background_work.can_idle_sweep(&ClaudeWorkKey {
+                        binding_id: self.binding_id.as_str().to_string(),
+                        activation_generation: self.activation_generation(),
+                    })
+            })
+            .unwrap_or(false)
+    }
+
+    fn runtime_config_state(&self) -> SessionRuntimeConfigState {
+        self.state
+            .lock()
+            .map(|state| state.session_runtime_config_state.clone())
+            .unwrap_or_default()
+    }
+
+    fn merge_token_usage(&self, incoming: AgentTokenUsage) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        match state.usage.as_mut() {
+            Some(current) => merge_agent_token_usage(current, incoming),
+            None => {
+                state.usage = Some(incoming);
+                true
+            }
+        }
+    }
+
+    fn merge_context_window_usage(&self, update: &Value) -> bool {
+        agent_token_usage_from_context_update(update)
+            .is_some_and(|usage| self.merge_token_usage(usage))
+    }
+
+    fn merge_prompt_response_usage(&self, response: &Value) -> bool {
+        agent_token_usage_from_prompt_response(response)
+            .is_some_and(|usage| self.merge_token_usage(usage))
+    }
+
+    fn runtime_attachment_snapshot(
+        &self,
+        session_id: &VibexSessionId,
+        status: RuntimeAttachmentStatus,
+    ) -> VibexResult<RuntimeAttachmentSnapshot> {
+        let process_id = RuntimeProcessId::from_opaque(self.process_instance_id().as_str())?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| lock_poisoned_error("attachmentState"))?;
+        let active_message = state
+            .active_turn
+            .as_ref()
+            .map(|turn| RuntimeLiveMessageSnapshot {
+                text: turn.assistant_text.clone(),
+                next_chunk_index: turn.chunk_index,
+                truncated: turn.assistant_text_truncated,
+            });
+        let mut active_tool_calls = state
+            .tool_calls
+            .iter()
+            .take(ACP_ACTIVE_TOOL_CALL_LIMIT)
+            .map(|(tool_call_id, call)| RuntimeLiveToolCallSnapshot {
+                tool_call_id: redact_summary(tool_call_id),
+                title: redact_summary(&call.title),
+                kind: redact_summary(&call.kind),
+                status: "in_progress".to_string(),
+                input_summary: call.input_summary.clone(),
+                output_summary: call.output_summary.clone(),
+            })
+            .collect::<Vec<_>>();
+        active_tool_calls.sort_by(|left, right| left.tool_call_id.cmp(&right.tool_call_id));
+        let pending_permissions = state
+            .pending_permissions
+            .iter()
+            .take(ACP_PENDING_PERMISSION_LIMIT)
+            .filter_map(|(request_id, pending)| {
+                let id = RequestId::parse(request_id.clone()).ok()?;
+                Some(PermissionRequest {
+                    id,
+                    session_id: session_id.clone(),
+                    project_id: None,
+                    workspace_id: None,
+                    provider_request_id: Some(redact_summary(request_id)),
+                    risk_category: pending.risk_category,
+                    title: redact_summary(&pending.title),
+                    details: pending.details.clone(),
+                    allowed_responses: pending
+                        .options
+                        .iter()
+                        .filter_map(|option| match option.kind.as_str() {
+                            "approve" => Some(PermissionResponseKind::Approve),
+                            "always_allow" | "alwaysAllow" => {
+                                Some(PermissionResponseKind::AlwaysAllowForSession)
+                            }
+                            "deny" => Some(PermissionResponseKind::Deny),
+                            _ => None,
+                        })
+                        .collect(),
+                    status: PermissionRequestStatus::Pending,
+                    requested_at_ms: unix_timestamp_ms(),
+                    expires_at_ms: None,
+                })
+            })
+            .collect::<Vec<_>>();
+        let config_options = state
+            .session_config_state
+            .as_ref()
+            .map(|config| {
+                config
+                    .options
+                    .iter()
+                    .filter_map(|option| option.current_value.as_ref())
+                    .map(|value| SessionConfigValue {
+                        value: redact_summary(&value.value),
+                        label: value.label.as_deref().map(redact_summary),
+                    })
+                    .take(128)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Ok(RuntimeAttachmentSnapshot {
+            binding_id: self.binding_id.clone(),
+            process_id,
+            activation_generation: self.activation_generation(),
+            status,
+            last_event_sequence: 0,
+            current_model: state
+                .current_model_id
+                .clone()
+                .map(|value| redact_summary(&value)),
+            current_mode: state
+                .current_mode_id
+                .clone()
+                .map(|value| redact_summary(&value)),
+            config_options,
+            active_message,
+            active_tool_calls,
+            pending_permissions,
+            active_terminal_count: state.active_terminal_ids.len().min(u32::MAX as usize) as u32,
+            active_background_work_count: state
+                .claude_background_work
+                .active_count(&ClaudeWorkKey {
+                    binding_id: self.binding_id.as_str().to_string(),
+                    activation_generation: self.activation_generation(),
+                })
+                .min(u32::MAX as usize) as u32,
+            lease_counts: RuntimeLeaseRoleCounts::default(),
+            usage: state.usage.clone(),
+        })
+    }
+
+    fn set_runtime_config_state(&self, next: SessionRuntimeConfigState) {
+        if let Ok(mut state) = self.state.lock() {
+            state.session_runtime_config_state = next;
+        }
+    }
+
+    fn set_session_config_planner(&self, planner: SessionConfigPlanner) {
+        if let Ok(mut state) = self.state.lock() {
+            state.session_config_planner = Some(planner);
+        }
+    }
+
+    fn session_config_planner(&self) -> Option<SessionConfigPlanner> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.session_config_planner.clone())
+    }
+
+    fn cancel_pending_host_requests(&self) {
+        let (permissions, terminal_creates) = match self.state.lock() {
+            Ok(mut state) => (
+                state
+                    .pending_permissions
+                    .drain()
+                    .map(|(_, pending)| pending)
+                    .collect::<Vec<_>>(),
+                state
+                    .pending_terminal_creates
+                    .drain()
+                    .map(|(_, pending)| pending)
+                    .collect::<Vec<_>>(),
+            ),
+            Err(_) => (Vec::new(), Vec::new()),
+        };
+        let process = self.process();
+        for pending in permissions {
+            process.respond_ok(pending.rpc_id, permission_cancelled_response());
+        }
+        for pending in terminal_creates {
+            process.respond_error(pending.rpc_id, -32000, "terminal permission cancelled");
+        }
+    }
+
+    fn clear_turn_and_host_requests(&self) {
+        self.cancel_pending_host_requests();
+        if let Ok(mut state) = self.state.lock() {
+            state.active_turn = None;
+            state.tool_calls.clear();
+            state.terminal_creates_in_flight = 0;
+            state.claude_background_work = ClaudeBackgroundWorkRegistry::default();
+            state.active_terminal_ids.clear();
+        }
+        self.process()
+            .clear_pending_prompt_for_session(&self.native_session_id);
+    }
+
+    fn on_process_crash(&self) {
+        let _ = self.emit_turn_event(AcpEvent::Error {
+            code: "acp_process_exited".to_string(),
+            message: "ACP agent process exited unexpectedly".to_string(),
+            recoverable: true,
+            provider_correlation_id: None,
+        });
+        if let Ok(mut state) = self.state.lock() {
+            state.pending_permissions.clear();
+            state.pending_terminal_creates.clear();
+            state.terminal_creates_in_flight = 0;
+            state.claude_background_work = ClaudeBackgroundWorkRegistry::default();
+        }
+    }
+
+    fn available_commands(&self) -> Vec<AcpRuntimeCommand> {
+        self.state
+            .lock()
+            .map(|state| state.available_commands.clone())
+            .unwrap_or_default()
+    }
+
+    fn acp_session(&self) -> AcpSession {
+        let process = self.process();
+        let state = self.state.lock().ok();
+        let session_config_state = state
+            .as_ref()
+            .and_then(|state| state.session_config_state.clone())
+            .map(|mut state| {
+                state.native_session_id = Some(self.native_session_id.clone());
+                state
+            });
+        let mut metadata = process.session_metadata();
+        metadata.retain(|entry| {
+            !matches!(
+                entry.key.as_str(),
+                "modelCount" | "currentModelId" | "currentModeId"
+            )
+        });
+        if let Some(state) = state.as_ref() {
+            metadata.push(ProviderBindingMetadata {
+                key: "modelCount".to_string(),
+                value: state.model_ids.len().to_string(),
+            });
+            if let Some(model) = state.current_model_id.as_deref() {
+                metadata.push(ProviderBindingMetadata {
+                    key: "currentModelId".to_string(),
+                    value: model.to_string(),
+                });
+            }
+            if let Some(mode) = state.current_mode_id.as_deref() {
+                metadata.push(ProviderBindingMetadata {
+                    key: "currentModeId".to_string(),
+                    value: mode.to_string(),
+                });
+            }
+        }
+        AcpSession {
+            native_session_id: Some(self.native_session_id.clone()),
+            native_thread_id: None,
+            native_resume_token: None,
+            session_config_state,
+            redacted_metadata: metadata,
+        }
+    }
+
+    fn handle_session_update(&self, params: &Value) {
+        let Some(update) = params.get("update") else {
+            return;
+        };
+        let Some(kind) = update.get("sessionUpdate").and_then(Value::as_str) else {
+            return;
+        };
+        match kind {
+            "agent_message_chunk" => {
+                let text = content_block_text(update.get("content"));
+                if !text.is_empty() {
+                    self.record_opencode_stream_progress();
+                    self.append_assistant_text(&text);
+                    let chunk_index = self.next_chunk_index();
+                    self.emit_turn_event(AcpEvent::AssistantDelta {
+                        text_delta: text,
+                        chunk_index,
+                    });
+                }
+            }
+            "agent_thought_chunk" => {
+                let text = content_block_text(update.get("content"));
+                if !text.is_empty() {
+                    self.record_opencode_stream_progress();
+                    self.emit_turn_event(AcpEvent::Reasoning {
+                        text,
+                        is_final: false,
+                    });
+                }
+            }
+            "tool_call" | "tool_call_update" => {
+                if kind == "tool_call" {
+                    self.record_opencode_stream_progress();
+                }
+                for event in self.merge_tool_call_update(kind, update) {
+                    self.emit_turn_event(event);
+                }
+            }
+            "plan" => {
+                let steps = plan_steps(update.get("entries"));
+                if !steps.is_empty() {
+                    self.emit_turn_event(AcpEvent::Plan {
+                        title: "Plan".to_string(),
+                        steps,
+                    });
+                }
+            }
+            "available_commands_update" => {
+                let commands = parse_available_commands(update.get("availableCommands"));
+                if let Ok(mut state) = self.state.lock() {
+                    state.available_commands = commands;
+                }
+            }
+            "current_mode_update" => {
+                let mode = update
+                    .get("currentModeId")
+                    .or_else(|| update.get("modeId"))
+                    .and_then(Value::as_str)
+                    .map(redact_summary)
+                    .filter(|value| !value.is_empty());
+                if let Some(mode) = mode {
+                    if let Ok(mut state) = self.state.lock() {
+                        state.current_mode_id = Some(mode.clone());
+                    }
+                    self.emit_turn_event(AcpEvent::SystemNotice {
+                        level: SystemNoticeLevel::Info,
+                        message: format!("ACP agent switched to mode {mode}"),
+                    });
+                }
+            }
+            "usage_update" | "token_usage" => {
+                self.merge_context_window_usage(update);
+            }
+            kind if IGNORED_SESSION_UPDATE_KINDS.contains(&kind) => {}
+            other => {
+                self.emit_turn_event(AcpEvent::Unknown {
+                    event_kind: other.to_string(),
+                });
+            }
+        }
+    }
+
+    fn handle_claude_extension(&self, method: &str, params: &Value) {
+        let Some(event) = decode_claude_extension(method, params) else {
+            return;
+        };
+        let work_key = ClaudeWorkKey {
+            binding_id: self.binding_id.as_str().to_string(),
+            activation_generation: self.activation_generation(),
+        };
+        if event.tool_name.contains("background")
+            && let Ok(mut state) = self.state.lock()
+        {
+            match event.status {
+                ToolCallStatus::Started | ToolCallStatus::Progress => state
+                    .claude_background_work
+                    .begin(work_key.clone(), event.native_event_id.clone()),
+                ToolCallStatus::Completed | ToolCallStatus::Failed => state
+                    .claude_background_work
+                    .finish(&work_key, &event.native_event_id),
+            }
+        }
+        let process = self.process();
+        let input = event.into_event_input(&process.compatibility_identity);
+        for event in normalize_agent_event(AgentEventEnricherKind::Claude, &input) {
+            self.emit_turn_event(AcpEvent::Canonical(event));
+        }
+    }
+
+    fn handle_codex_extension(&self, method: &str, params: &Value) {
+        let process = self.process();
+        let Some(input) =
+            crate::decode_codex_extension(method, params, &process.compatibility_identity)
+        else {
+            return;
+        };
+        for event in normalize_agent_event(AgentEventEnricherKind::Codex, &input) {
+            self.emit_turn_event(AcpEvent::Canonical(event));
+        }
+    }
+
+    fn merge_tool_call_update(&self, kind: &str, update: &Value) -> Vec<AcpEvent> {
+        let Some(tool_call_id) = update
+            .get("toolCallId")
+            .or_else(|| update.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            return Vec::new();
+        };
+        let Ok(mut state) = self.state.lock() else {
+            return Vec::new();
+        };
+        let snapshot = state.tool_calls.entry(tool_call_id.clone()).or_default();
+        if let Some(title) = update.get("title").and_then(Value::as_str) {
+            snapshot.title = redact_summary(title);
+        }
+        if let Some(tool_kind) = update.get("kind").and_then(Value::as_str) {
+            snapshot.kind = tool_kind.to_string();
+        }
+        if let Some(raw_input) = update.get("rawInput") {
+            snapshot.raw_input = Some(raw_input.clone());
+            snapshot.input_summary = truncate_optional_summary(raw_input.to_string());
+        }
+        let raw_output_text = update
+            .get("rawOutput")
+            .map(|value| match value {
+                Value::String(value) => value.clone(),
+                _ => value.to_string(),
+            })
+            .and_then(safe_tool_raw_output);
+        let raw_output = raw_output_text
+            .as_deref()
+            .and_then(|next| raw_output_delta(&mut snapshot.raw_output_state, next));
+        if update.get("rawOutput").is_some() {
+            snapshot.output_summary = raw_output_text
+                .as_deref()
+                .and_then(truncate_optional_summary);
+        }
+        if let Some(content) = update.get("content") {
+            snapshot.content = Some(content.clone());
+        }
+        if let Some(content_summary) = tool_call_content_summary(snapshot.content.as_ref()) {
+            snapshot.output_summary = truncate_optional_summary(content_summary);
+        }
+        if let Some(locations) = update.get("locations") {
+            snapshot.locations = crate::parse_event_locations(Some(locations));
+        }
+        if let Some(meta) = update.get("meta") {
+            snapshot.meta = crate::parse_event_meta(Some(meta));
+        }
+        let status_raw =
+            update
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or(if kind == "tool_call" {
+                    "pending"
+                } else {
+                    "in_progress"
+                });
+        let status = match status_raw {
+            "pending" | "in_progress" if !snapshot.started => ToolCallStatus::Started,
+            "pending" | "in_progress" => ToolCallStatus::Progress,
+            "completed" => ToolCallStatus::Completed,
+            "failed" | "cancelled" | "canceled" => ToolCallStatus::Failed,
+            _ => ToolCallStatus::Progress,
+        };
+        snapshot.started = true;
+        let completed = matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed);
+        let snapshot = snapshot.clone();
+        if completed {
+            state.tool_calls.remove(&tool_call_id);
+        }
+        if status == ToolCallStatus::Started
+            && let Some(turn) = state.active_turn.as_mut()
+        {
+            turn.assistant_segment.clear();
+            turn.assistant_segment_truncated = false;
+        }
+        drop(state);
+        let process = self.process();
+        let events = normalize_tool_call_snapshot(
+            process.event_enricher,
+            &process.compatibility_identity,
+            tool_call_id,
+            status,
+            snapshot,
+            raw_output,
+        );
+        if process.event_enricher != AgentEventEnricherKind::Passthrough
+            && events.iter().any(|event| {
+                matches!(
+                    event,
+                    AcpEvent::Canonical(crate::NormalizedAgentEvent {
+                        event: crate::CanonicalAgentEvent::ToolCall(_),
+                        ..
+                    })
+                )
+            })
+        {
+            process.observability.increment(
+                RuntimeMetricName::EventEnricherFallback,
+                None,
+                RuntimeMetricResult::Fallback,
+            );
+            process
+                .log_context
+                .for_operation("event_enricher")
+                .with_binding_id(&self.binding_id)
+                .with_activation_generation(self.activation_generation())
+                .with_native_session_id(&self.native_session_id)
+                .emit(
+                    RuntimeLogLevel::Debug,
+                    "acp_event_enricher_fallback",
+                    RuntimeMetricResult::Fallback,
+                    None,
+                    None,
+                );
+        }
+        events
+    }
+}
+
+impl AcpProcess {
+    fn publish_attachment_payload(&self, attachment: &Arc<AcpSessionAttachment>) {
+        let Some(router) = self.attachment_router.upgrade() else {
+            self.observability.increment(
+                RuntimeMetricName::UnroutableNativeEvent,
+                None,
+                RuntimeMetricResult::Unroutable,
+            );
+            return;
+        };
+        let Ok(Some(handle)) = router.registry.attachment(&attachment.binding_id) else {
+            return;
+        };
+        if !Arc::ptr_eq(&handle.payload(), attachment) {
+            return;
+        }
+        let _ = router.registry.touch(handle.fence(), unix_timestamp_ms());
+        router.publish_attachment(&handle, vibex_core::RuntimeEventKind::AttachmentUpdated);
+    }
+
+    fn register_active_terminal(
+        &self,
+        terminal_id: TerminalId,
+        attachment: &Arc<AcpSessionAttachment>,
+    ) -> bool {
+        let Some(router) = self.attachment_router.upgrade() else {
+            return false;
+        };
+        let Ok(Some(handle)) = router.registry.attachment(&attachment.binding_id) else {
+            return false;
+        };
+        if !Arc::ptr_eq(&handle.payload(), attachment) {
+            return false;
+        }
+        let registered = router.registry.apply_current(handle.fence(), |current| {
+            if !std::ptr::eq(current, attachment.as_ref()) {
+                return false;
+            }
+            let Ok(mut owners) = self.active_terminal_owners.lock() else {
+                return false;
+            };
+            current.mark_terminal_active(terminal_id.clone());
+            owners.insert(terminal_id.clone(), Arc::downgrade(attachment));
+            true
+        });
+        if !matches!(registered, Ok(true)) {
+            return false;
+        }
+        self.publish_attachment_payload(attachment);
+        true
+    }
+
+    fn finish_active_terminal(&self, terminal_id: &TerminalId) {
+        let owner = self
+            .active_terminal_owners
+            .lock()
+            .ok()
+            .and_then(|mut owners| owners.remove(terminal_id));
+        if let Some(attachment) = owner.and_then(|owner| owner.upgrade()) {
+            attachment.mark_terminal_inactive(terminal_id);
+            self.publish_attachment_payload(&attachment);
+        }
+    }
+
+    fn forget_attachment_terminals(&self, attachment: &AcpSessionAttachment) {
+        let terminal_ids = attachment.active_terminal_ids();
+        if let Ok(mut owners) = self.active_terminal_owners.lock() {
+            for terminal_id in &terminal_ids {
+                owners.remove(terminal_id);
+            }
+        }
+    }
+}
+
+fn normalize_tool_call_snapshot(
+    event_enricher: AgentEventEnricherKind,
+    compatibility_identity: &str,
+    tool_call_id: String,
+    status: ToolCallStatus,
+    snapshot: ToolCallSnapshot,
+    raw_output: Option<AgentEventRawOutput>,
+) -> Vec<AcpEvent> {
+    let tool_name = if snapshot.kind.is_empty() {
+        "tool".to_string()
+    } else {
+        snapshot.kind
+    };
+    let summary = if snapshot.title.is_empty() {
+        format!("ACP tool call {tool_call_id}")
+    } else {
+        snapshot.title
+    };
+    normalize_agent_event(
+        event_enricher,
+        &AgentEventInput {
+            source: AgentEventInputSource::Live,
+            compatibility_identity: compatibility_identity.to_string(),
+            native_event_id: tool_call_id,
+            tool_name,
+            title: summary,
+            status,
+            raw_input: snapshot.raw_input,
+            output_summary: snapshot.output_summary,
+            raw_output,
+            content: snapshot.content,
+            locations: snapshot.locations,
+            meta: snapshot.meta,
+        },
+    )
+    .into_iter()
+    .map(AcpEvent::Canonical)
+    .collect()
+}
+
+impl Drop for AcpSessionAttachment {
+    fn drop(&mut self) {
+        if let Ok(watcher) = self.crash_watcher.get_mut()
+            && let Some(watcher) = watcher.take()
+        {
+            watcher.abort();
+        }
+    }
+}
+
+struct AcpAttachmentTurnGuard {
+    attachment: Arc<AcpSessionAttachment>,
+    process: Arc<AcpProcess>,
+    request_id: u64,
+    prompt_guard: Option<SessionAttachmentPromptGuard<AcpSessionAttachment>>,
+    completed: bool,
+}
+
+impl AcpAttachmentTurnGuard {
+    fn new(
+        attachment: Arc<AcpSessionAttachment>,
+        process: Arc<AcpProcess>,
+        request_id: u64,
+        prompt_guard: SessionAttachmentPromptGuard<AcpSessionAttachment>,
+    ) -> Self {
+        Self {
+            attachment,
+            process,
+            request_id,
+            prompt_guard: Some(prompt_guard),
+            completed: false,
+        }
+    }
+
+    fn complete(mut self, emit_final_message: bool) -> VibexResult<Vec<AcpEvent>> {
+        self.completed = true;
+        self.prompt_guard.take();
+        self.attachment.finish_turn(emit_final_message)
+    }
+
+    fn abort(mut self, cancel_native_turn: bool) {
+        self.completed = true;
+        self.prompt_guard.take();
+        self.process.cancel_started_request(self.request_id);
+        if cancel_native_turn {
+            self.cancel_native_turn();
+        }
+        self.attachment.clear_turn_and_host_requests();
+    }
+
+    fn cancel_native_turn(&self) {
+        let _ = self.process.notify(
+            AcpOperation::SessionCancel.method(),
+            protocol::build_session_cancel_params(&self.attachment.native_session_id),
+        );
+    }
+}
+
+impl Drop for AcpAttachmentTurnGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.process.cancel_started_request(self.request_id);
+            self.cancel_native_turn();
+            self.attachment.clear_turn_and_host_requests();
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct DisabledAcpTerminalHost;
+
+#[async_trait]
+impl AcpTerminalHost for DisabledAcpTerminalHost {
+    async fn create(&self, _request: AcpTerminalCreateRequest) -> VibexResult<TerminalId> {
+        Err(VibexError::capability(
+            "acp_terminal_host_unavailable",
+            "ACP terminal tools require a configured terminal host",
+        ))
+    }
+
+    async fn kill(&self, _terminal_id: &TerminalId) -> VibexResult<()> {
+        Err(VibexError::capability(
+            "acp_terminal_host_unavailable",
+            "ACP terminal tools require a configured terminal host",
+        ))
+    }
+
+    async fn release(&self, _terminal_id: &TerminalId) -> VibexResult<()> {
+        Err(VibexError::capability(
+            "acp_terminal_host_unavailable",
+            "ACP terminal tools require a configured terminal host",
+        ))
+    }
+
+    async fn output(
+        &self,
+        _terminal_id: &TerminalId,
+        _limit: usize,
+    ) -> VibexResult<AcpTerminalOutput> {
+        Err(VibexError::capability(
+            "acp_terminal_host_unavailable",
+            "ACP terminal tools require a configured terminal host",
+        ))
+    }
+
+    async fn wait_for_exit(&self, _terminal_id: &TerminalId) -> VibexResult<AcpTerminalExitStatus> {
+        Err(VibexError::capability(
+            "acp_terminal_host_unavailable",
+            "ACP terminal tools require a configured terminal host",
+        ))
+    }
+
+    fn terminal_auth_descriptor(
+        &self,
+        _request: AcpTerminalAuthRequest,
+    ) -> VibexResult<TerminalAuthActionDescriptor> {
+        Err(VibexError::capability(
+            "acp_terminal_auth_host_unavailable",
+            "ACP terminal authentication requires a configured terminal host",
+        ))
+    }
+}
+
+impl AcpProcess {
+    #[cfg(test)]
+    fn record_lifecycle_event(&self, event: &'static str) {
+        if let Ok(mut events) = self.lifecycle_events.lock() {
+            events.push(event);
+        }
+    }
+
+    #[cfg(not(test))]
+    fn record_lifecycle_event(&self, _event: &'static str) {}
+
+    fn send_value(&self, value: &Value) -> VibexResult<()> {
+        let serialized = serde_json::to_string(value).map_err(|err| {
+            VibexError::provider(
+                "acp_request_encode_failed",
+                "ACP JSON-RPC message could not be encoded",
+            )
+            .with_diagnostic("error", err.to_string())
+        })?;
+        if let Ok(mut debug_log) = self.debug_log.lock() {
+            debug_log.record_json(AcpDebugDirection::Outgoing, value);
+        }
+        let outbound = self
+            .outbound
+            .lock()
+            .map_err(|_| lock_poisoned_error("outbound"))?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| {
+                VibexError::process(
+                    "acp_process_stdin_closed",
+                    "ACP agent process stdin is closed",
+                )
+                .with_diagnostic("command", self.command_display.clone())
+            })?;
+        outbound.send(serialized).map_err(|_| {
+            VibexError::process(
+                "acp_process_stdin_closed",
+                "ACP agent process stdin is closed",
+            )
+            .with_diagnostic("command", self.command_display.clone())
+        })
+    }
+
+    fn clear_pending_prompt_request(&self, native_session_id: Option<&str>, request_id: u64) {
+        let Some(native_session_id) = native_session_id else {
+            return;
+        };
+        let Ok(mut pending) = self.pending_prompt_requests.lock() else {
+            return;
+        };
+        if pending.get(native_session_id) == Some(&request_id) {
+            pending.remove(native_session_id);
+        }
+    }
+
+    fn clear_pending_prompt_request_id(&self, request_id: u64) {
+        if let Ok(mut pending) = self.pending_prompt_requests.lock() {
+            pending.retain(|_, pending_id| *pending_id != request_id);
+        }
+    }
+
+    fn is_pending_prompt_request_id(&self, request_id: u64) -> bool {
+        self.pending_prompt_requests
+            .lock()
+            .is_ok_and(|pending| pending.values().any(|pending_id| *pending_id == request_id))
+    }
+
+    fn clear_pending_prompt_for_session(&self, native_session_id: &str) {
+        if let Ok(mut pending) = self.pending_prompt_requests.lock() {
+            pending.remove(native_session_id);
+        }
+    }
+
+    fn cancel_started_request(&self, request_id: u64) {
+        if let Ok(mut pending) = self.pending_requests.lock() {
+            pending.remove(&request_id);
+        }
+        self.clear_pending_prompt_request_id(request_id);
+    }
+
+    async fn request(&self, method: &str, params: Value, wait: Duration) -> VibexResult<Value> {
+        self.request_internal(method, params, wait, false)
+            .await
+            .map(|(result, _)| result)
+    }
+
+    async fn request_with_registration_barrier(
+        &self,
+        method: &str,
+        params: Value,
+        wait: Duration,
+    ) -> VibexResult<(Value, AcpRegistrationBarrier)> {
+        let (result, barrier) = self.request_internal(method, params, wait, true).await?;
+        let barrier = barrier.ok_or_else(|| {
+            VibexError::process(
+                "acp_registration_barrier_missing",
+                "ACP attachment registration barrier was not created",
+            )
+        })?;
+        Ok((result, barrier))
+    }
+
+    fn start_request(
+        &self,
+        method: &str,
+        params: Value,
+        registration_barrier: bool,
+    ) -> VibexResult<StartedAcpRequest> {
+        let admission = self
+            .request_admission
+            .lock()
+            .map_err(|_| lock_poisoned_error("requestAdmission"))?;
+        if self.is_closed() {
+            return Err(self.closed_error(method));
+        }
+        let prompt_session_id = (method == AcpOperation::SessionPrompt.method())
+            .then(|| {
+                params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string)
+            })
+            .flatten();
+        let id = self.next_request_id.fetch_add(1, Ordering::SeqCst);
+        let (sender, response) = oneshot::channel();
+        let (registration_release, registration_wait) = if registration_barrier {
+            let (release, wait) = oneshot::channel();
+            (Some(release), Some(wait))
+        } else {
+            (None, None)
+        };
+        self.pending_requests
+            .lock()
+            .map_err(|_| lock_poisoned_error("pendingRequests"))?
+            .insert(
+                id,
+                PendingTransportResponse {
+                    response: sender,
+                    registration_release: registration_wait,
+                },
+            );
+        if let Some(native_session_id) = prompt_session_id.as_deref() {
+            let inserted = self
+                .pending_prompt_requests
+                .lock()
+                .map(|mut pending| {
+                    pending.insert(native_session_id.to_string(), id);
+                })
+                .map_err(|_| lock_poisoned_error("pendingPromptRequests"));
+            if let Err(error) = inserted {
+                if let Ok(mut pending) = self.pending_requests.lock() {
+                    pending.remove(&id);
+                }
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.send_value(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
+        })) {
+            if let Ok(mut pending) = self.pending_requests.lock() {
+                pending.remove(&id);
+            }
+            self.clear_pending_prompt_request(prompt_session_id.as_deref(), id);
+            return Err(error);
+        }
+        drop(admission);
+        Ok(StartedAcpRequest {
+            id,
+            prompt_session_id,
+            response,
+            registration_release,
+        })
+    }
+
+    async fn request_internal(
+        &self,
+        method: &str,
+        params: Value,
+        wait: Duration,
+        registration_barrier: bool,
+    ) -> VibexResult<(Value, Option<AcpRegistrationBarrier>)> {
+        let request = self.start_request(method, params, registration_barrier)?;
+        self.finish_started_request(method, wait, request).await
+    }
+
+    async fn finish_started_request(
+        &self,
+        method: &str,
+        wait: Duration,
+        request: StartedAcpRequest,
+    ) -> VibexResult<(Value, Option<AcpRegistrationBarrier>)> {
+        let StartedAcpRequest {
+            id,
+            prompt_session_id,
+            response,
+            registration_release,
+        } = request;
+        let outcome = timeout(wait, response).await;
+        if outcome.is_err()
+            && let Ok(mut pending) = self.pending_requests.lock()
+        {
+            pending.remove(&id);
+        }
+        let drained_opencode_stream_error = match (&outcome, prompt_session_id.as_deref()) {
+            (Ok(Ok(Err(_))), Some(native_session_id)) if self.opencode_error_bridge_enabled => {
+                self.wait_for_opencode_stream_error(native_session_id).await
+            }
+            _ => None,
+        };
+        self.clear_pending_prompt_request(prompt_session_id.as_deref(), id);
+        match outcome {
+            Ok(Ok(Ok(result))) => Ok((
+                result,
+                registration_release.map(|release| AcpRegistrationBarrier {
+                    release: Some(release),
+                }),
+            )),
+            Ok(Ok(Err(failure))) => {
+                let latest_stream_error = drained_opencode_stream_error.or_else(|| {
+                    prompt_session_id.as_deref().and_then(|native_session_id| {
+                        self.with_routed_native(
+                            Some(native_session_id),
+                            "opencode/prompt_failure",
+                            AcpSessionAttachment::latest_opencode_stream_error,
+                        )
+                        .flatten()
+                    })
+                });
+                let rpc_message = redact_summary(
+                    latest_stream_error
+                        .as_deref()
+                        .unwrap_or(failure.message.as_str()),
+                );
+                if latest_stream_error.is_some() || failure.code == OPENCODE_MODEL_API_ERROR_CODE {
+                    Err(VibexError::provider(
+                        OPENCODE_MODEL_API_ERROR_CODE,
+                        format!("OpenCode model request failed: {rpc_message}"),
+                    )
+                    .with_recovery_hint(
+                        "Retry when provider access is available. For usage, balance, billing, or authentication errors, update the account/provider configuration or switch models.",
+                    )
+                    .with_diagnostic("method", method)
+                    .with_diagnostic("rpcCode", failure.code)
+                    .with_diagnostic("rpcMessage", rpc_message)
+                    .with_diagnostic("stderrSummary", self.stderr_summary().unwrap_or_default()))
+                } else {
+                    // §7.2 error taxonomy: `-32601` is a single-operation
+                    // downgrade signal; callers inspect `protocolErrorKind`
+                    // instead of re-parsing raw JSON-RPC codes.
+                    let classified = protocol::classify_rpc_failure(
+                        AcpOperation::from_method(method),
+                        &failure.code,
+                        &rpc_message,
+                        failure.data_kind,
+                    );
+                    Err(VibexError::provider(
+                        "acp_rpc_error",
+                        "ACP agent returned a JSON-RPC error",
+                    )
+                    .with_diagnostic("method", method)
+                    .with_diagnostic("protocolErrorKind", classified.kind())
+                    .with_diagnostic("rpcCode", failure.code)
+                    .with_diagnostic("rpcMessage", rpc_message)
+                    .with_diagnostic("stderrSummary", self.stderr_summary().unwrap_or_default()))
+                }
+            }
+            Ok(Err(_)) => Err(VibexError::process(
+                "acp_process_exited",
+                "ACP agent process exited before returning a JSON-RPC response",
+            )
+            .with_diagnostic("method", method)
+            .with_diagnostic("command", self.command_display.clone())
+            .with_diagnostic("stderrSummary", self.stderr_summary().unwrap_or_default())),
+            Err(_) => Err(VibexError::process(
+                "acp_request_timeout",
+                "ACP agent did not answer the JSON-RPC request in time",
+            )
+            .with_diagnostic("method", method)
+            .with_diagnostic("timeoutMs", wait.as_millis().to_string())
+            .with_diagnostic("stderrSummary", self.stderr_summary().unwrap_or_default())),
+        }
+    }
+
+    async fn wait_for_opencode_stream_error(&self, native_session_id: &str) -> Option<String> {
+        let deadline = Instant::now() + OPENCODE_STDERR_DRAIN_TIMEOUT;
+        loop {
+            let error = self
+                .with_routed_native(
+                    Some(native_session_id),
+                    "opencode/prompt_failure_drain",
+                    AcpSessionAttachment::latest_opencode_stream_error,
+                )
+                .flatten();
+            if error.is_some() || Instant::now() >= deadline {
+                return error;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    fn notify(&self, method: &str, params: Value) -> VibexResult<()> {
+        self.send_value(&json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params
+        }))
+    }
+
+    fn respond_ok(&self, id: Value, result: Value) {
+        let _ = self.send_value(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result
+        }));
+    }
+
+    fn respond_error(&self, id: Value, code: i64, message: &str) {
+        let _ = self.send_value(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": code, "message": message }
+        }));
+    }
+
+    fn is_closed(&self) -> bool {
+        self.shared
+            .lock()
+            .map(|shared| shared.closed || shared.closing)
+            .unwrap_or(true)
+    }
+
+    fn closed_error(&self, operation: &str) -> VibexError {
+        VibexError::process(
+            "acp_process_closed",
+            "ACP agent process is no longer running",
+        )
+        .with_diagnostic("operation", operation)
+        .with_diagnostic("command", self.command_display.clone())
+        .with_diagnostic("stderrSummary", self.stderr_summary().unwrap_or_default())
+    }
+
+    fn stderr_summary(&self) -> Option<String> {
+        self.debug_log
+            .lock()
+            .ok()
+            .and_then(|debug_log| debug_log.trailing_stderr())
+    }
+
+    fn with_routed_native<R>(
+        &self,
+        native_session_id: Option<&str>,
+        method: &str,
+        operation: impl FnOnce(&AcpSessionAttachment) -> R,
+    ) -> Option<R> {
+        let method = protocol::safe_method_metadata(method);
+        let Some(router) = self.attachment_router.upgrade() else {
+            tracing::debug!(
+                target: "vibex_agent_acp",
+                process_instance = %self.process_instance_id.as_str(),
+                method = method.as_str(),
+                code = "acp_attachment_router_closed",
+                "ACP session-scoped message routed to process diagnostics"
+            );
+            return None;
+        };
+        match router.registry.route(
+            &self.process_instance_id,
+            native_session_id,
+            Some(method.as_str()),
+        ) {
+            SessionAttachmentRoute::Deliver(handle) => {
+                match router.registry.apply_current(handle.fence(), operation) {
+                    Ok(result) => {
+                        let _ = router.registry.touch(handle.fence(), unix_timestamp_ms());
+                        router.publish_attachment(
+                            &handle,
+                            vibex_core::RuntimeEventKind::AttachmentUpdated,
+                        );
+                        Some(result)
+                    }
+                    Err(error) => {
+                        router.observability.increment(
+                            RuntimeMetricName::UnroutableNativeEvent,
+                            None,
+                            RuntimeMetricResult::Unroutable,
+                        );
+                        tracing::debug!(
+                            target: "vibex_agent_acp",
+                            process_instance = %self.process_instance_id.as_str(),
+                            method = method.as_str(),
+                            code = %error.code,
+                            "ACP session-scoped message failed its final attachment fence"
+                        );
+                        None
+                    }
+                }
+            }
+            SessionAttachmentRoute::Quarantine(handle) => {
+                router.observability.increment(
+                    RuntimeMetricName::PreparedEventQuarantined,
+                    None,
+                    RuntimeMetricResult::Quarantined,
+                );
+                self.log_context
+                    .clone()
+                    .with_logical_session_id(handle.session_id())
+                    .with_binding_id(handle.binding_id())
+                    .with_activation_generation(handle.fence().activation_generation as i64)
+                    .with_native_session_id(&handle.fence().native_session_id)
+                    .emit(
+                        RuntimeLogLevel::Debug,
+                        "acp_prepared_event_quarantined",
+                        RuntimeMetricResult::Quarantined,
+                        Some("acp_event_attachment_prepared"),
+                        None,
+                    );
+                tracing::debug!(
+                    target: "vibex_agent_acp",
+                    process_instance = %self.process_instance_id.as_str(),
+                    method = method.as_str(),
+                    code = "acp_event_attachment_prepared",
+                    "ACP prepared-attachment message quarantined"
+                );
+                None
+            }
+            SessionAttachmentRoute::Diagnostic(diagnostic) => {
+                router.observability.increment(
+                    RuntimeMetricName::UnroutableNativeEvent,
+                    None,
+                    RuntimeMetricResult::Unroutable,
+                );
+                self.log_context.clone().emit(
+                    RuntimeLogLevel::Warn,
+                    "acp_native_event_unroutable",
+                    RuntimeMetricResult::Unroutable,
+                    Some(&diagnostic.code),
+                    None,
+                );
+                tracing::debug!(
+                    target: "vibex_agent_acp",
+                    process_instance = %diagnostic.process_instance_id.as_str(),
+                    method = diagnostic.method.as_deref().unwrap_or(method.as_str()),
+                    code = %diagnostic.code,
+                    native_session_hash = diagnostic.native_session_hash.as_deref().unwrap_or("none"),
+                    "ACP session-scoped message routed to process diagnostics"
+                );
+                None
+            }
+        }
+    }
+
+    fn with_routed_params<R>(
+        &self,
+        params: &Value,
+        method: &str,
+        operation: impl FnOnce(&AcpSessionAttachment) -> R,
+    ) -> Option<R> {
+        self.with_routed_native(
+            params.get("sessionId").and_then(Value::as_str),
+            method,
+            operation,
+        )
+    }
+
+    fn handle_stderr_line(self: &Arc<Self>, line: &str) {
+        if let Ok(mut debug_log) = self.debug_log.lock() {
+            debug_log.record_line(AcpDebugDirection::Stderr, line);
+        }
+        if !self.opencode_error_bridge_enabled {
+            return;
+        }
+        let Some(error) = parse_opencode_stream_error(line) else {
+            return;
+        };
+
+        let request_id = self
+            .pending_prompt_requests
+            .lock()
+            .ok()
+            .and_then(|pending| pending.get(&error.native_session_id).copied());
+        let Some(request_id) = request_id else {
+            return;
+        };
+
+        let correlation_id = stable_event_correlation_id(
+            &self.compatibility_identity,
+            &error.native_session_id,
+            OPENCODE_MODEL_API_RETRYING_CODE,
+            0,
+        );
+        let observation = self
+            .with_routed_native(
+                Some(&error.native_session_id),
+                "opencode/stream_error",
+                |attachment| {
+                    let observation = attachment.record_opencode_stream_error(&error.message);
+                    if error.disposition == OpenCodeStreamErrorDisposition::Retryable
+                        && observation.is_some_and(|observation| observation.started_window)
+                    {
+                        let _ = attachment.emit_turn_event(AcpEvent::Error {
+                            code: OPENCODE_MODEL_API_RETRYING_CODE.to_string(),
+                            message: format!(
+                                "OpenCode model request failed and is retrying: {}",
+                                error.message
+                            ),
+                            recoverable: true,
+                            provider_correlation_id: Some(correlation_id.clone()),
+                        });
+                    }
+                    observation
+                },
+            )
+            .flatten();
+        let Some(observation) = observation else {
+            return;
+        };
+
+        if error.disposition == OpenCodeStreamErrorDisposition::UserActionRequired
+            || observation.reached_limit
+        {
+            self.fail_pending_opencode_prompt(request_id, error);
+            return;
+        }
+
+        if !observation.started_window {
+            return;
+        }
+        let process = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                let Some(process) = process.upgrade() else {
+                    return;
+                };
+                let watchdog = process
+                    .with_routed_native(
+                        Some(&error.native_session_id),
+                        "opencode/stream_error_timeout",
+                        |attachment| {
+                            attachment.claim_opencode_stream_error_watchdog(observation.epoch)
+                        },
+                    )
+                    .unwrap_or(OpenCodeStreamErrorWatchdogState::Stale);
+                match watchdog {
+                    OpenCodeStreamErrorWatchdogState::Stale => return,
+                    OpenCodeStreamErrorWatchdogState::Pending(deadline) => {
+                        drop(process);
+                        sleep(deadline.saturating_duration_since(Instant::now())).await;
+                    }
+                    OpenCodeStreamErrorWatchdogState::Expired(message) => {
+                        process.fail_pending_opencode_prompt(
+                            request_id,
+                            OpenCodeStreamError {
+                                native_session_id: error.native_session_id,
+                                message,
+                                disposition: OpenCodeStreamErrorDisposition::Retryable,
+                            },
+                        );
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    fn fail_pending_opencode_prompt(&self, request_id: u64, error: OpenCodeStreamError) {
+        let is_current_prompt = self
+            .pending_prompt_requests
+            .lock()
+            .ok()
+            .and_then(|pending| pending.get(&error.native_session_id).copied())
+            == Some(request_id);
+        if !is_current_prompt {
+            return;
+        }
+        let sender = self
+            .pending_requests
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.remove(&request_id));
+        let Some(sender) = sender else {
+            return;
+        };
+        self.clear_pending_prompt_request(Some(&error.native_session_id), request_id);
+        let _ = self.notify(
+            AcpOperation::SessionCancel.method(),
+            protocol::build_session_cancel_params(&error.native_session_id),
+        );
+        let _ = sender.response.send(Err(AcpRpcFailure {
+            code: OPENCODE_MODEL_API_ERROR_CODE.to_string(),
+            message: error.message,
+            data_kind: protocol::AcpRpcFailureDataKind::Other,
+        }));
+    }
+
+    async fn handle_line(self: &Arc<Self>, line: &str) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            tracing::debug!(
+                target: "vibex_agent_acp",
+                process_instance = %self.process_instance_id.as_str(),
+                "ignored non-JSON stdout line from ACP agent"
+            );
+            return;
+        };
+        if !value.is_object() {
+            return;
+        }
+        if let Ok(mut debug_log) = self.debug_log.lock() {
+            debug_log.record_json(AcpDebugDirection::Incoming, &value);
+        }
+
+        let method = value
+            .get("method")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let has_id = value.get("id").is_some();
+        match (method, has_id) {
+            (Some(method), true) => self.handle_incoming_request(&method, &value),
+            (Some(method), false) => self.handle_notification(&method, &value),
+            (None, _) => self.handle_response(&value).await,
+        }
+    }
+
+    async fn handle_response(self: &Arc<Self>, value: &Value) {
+        // COMPAT: some ACP CLIs answer numeric request ids as strings.
+        let id = match value.get("id") {
+            Some(Value::Number(number)) => number.as_u64(),
+            Some(Value::String(raw)) => raw.parse::<u64>().ok(),
+            _ => None,
+        };
+        let Some(id) = id else {
+            return;
+        };
+        let pending_response = self
+            .pending_requests
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.remove(&id));
+        let preserve_prompt_correlation = value.get("error").is_some()
+            && self.opencode_error_bridge_enabled
+            && self.is_pending_prompt_request_id(id);
+        if !preserve_prompt_correlation {
+            self.clear_pending_prompt_request_id(id);
+        }
+        let Some(pending_response) = pending_response else {
+            return;
+        };
+        let outcome = if let Some(error) = value.get("error") {
+            Err(AcpRpcFailure {
+                code: error
+                    .get("code")
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                message: error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown ACP error")
+                    .to_string(),
+                data_kind: protocol::classify_rpc_failure_data(error.get("data")),
+            })
+        } else {
+            Ok(value.get("result").cloned().unwrap_or(Value::Null))
+        };
+        let _ = pending_response.response.send(outcome);
+        if preserve_prompt_correlation {
+            let process = Arc::downgrade(self);
+            tokio::spawn(async move {
+                sleep(OPENCODE_PROMPT_CORRELATION_CLEANUP_TIMEOUT).await;
+                if let Some(process) = process.upgrade() {
+                    process.clear_pending_prompt_request_id(id);
+                }
+            });
+        }
+        if let Some(registration_release) = pending_response.registration_release {
+            let _ = timeout(ACP_HANDSHAKE_TIMEOUT, registration_release).await;
+        }
+    }
+
+    fn handle_incoming_request(self: &Arc<Self>, method: &str, value: &Value) {
+        let id = value.get("id").cloned().unwrap_or(Value::Null);
+        let params = value.get("params").cloned().unwrap_or(Value::Null);
+        match AcpOperation::from_method(method) {
+            AcpOperation::PermissionRequest => self.handle_permission_request(id, &params),
+            AcpOperation::FsReadTextFile => self.handle_fs_read(id, &params),
+            AcpOperation::FsWriteTextFile => self.handle_fs_write(id, &params),
+            AcpOperation::TerminalCreate => self.handle_terminal_create(id, &params),
+            AcpOperation::TerminalKill => self.handle_terminal_kill(id, &params),
+            AcpOperation::TerminalRelease => self.handle_terminal_release(id, &params),
+            AcpOperation::TerminalOutput => self.handle_terminal_output(id, &params),
+            AcpOperation::TerminalWaitForExit => self.handle_terminal_wait_for_exit(id, &params),
+            // Vibex does not host this operation: single-operation
+            // method-not-found response; the connection stays alive.
+            _ => self.respond_error(
+                id,
+                protocol::JSON_RPC_METHOD_NOT_FOUND,
+                &format!("Method not found: {method}"),
+            ),
+        }
+    }
+
+    fn handle_permission_request(&self, rpc_id: Value, params: &Value) {
+        let admission = self.with_routed_params(
+            params,
+            AcpOperation::PermissionRequest.method(),
+            |attachment| {
+                let request_id = RequestId::new();
+                let tool_call = params.get("toolCall");
+                let options = parse_permission_options(params.get("options"));
+                let title = permission_title(tool_call, params);
+                let risk_source = permission_risk_source(tool_call, params, &title);
+                let mut details = Vec::new();
+                if let Some(kind) = string_field(tool_call, &["kind"]) {
+                    push_detail(&mut details, "tool", &kind);
+                }
+                if let Some(tool_call_id) = string_field(tool_call, &["toolCallId", "id"]) {
+                    push_detail(&mut details, "toolCallId", &tool_call_id);
+                }
+                if let Some(raw_input) = tool_call.and_then(|call| call.get("rawInput")) {
+                    push_detail(&mut details, "input", &raw_input.to_string());
+                }
+                if !options.is_empty() {
+                    push_detail(
+                        &mut details,
+                        "options",
+                        &options
+                            .iter()
+                            .map(|option| option.kind.clone())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    );
+                }
+                if details.is_empty() {
+                    push_detail(&mut details, "source", "ACP agent");
+                }
+                if !attachment.insert_pending_permission(
+                    &request_id,
+                    PendingPermission {
+                        rpc_id: rpc_id.clone(),
+                        options,
+                        risk_category: infer_permission_risk_category(&risk_source),
+                        title: title.clone(),
+                        details: details.clone(),
+                    },
+                ) {
+                    return false;
+                }
+                let delivered = attachment.emit_turn_event(AcpEvent::PermissionRequest {
+                    request_id: Some(request_id.clone()),
+                    provider_request_id: Some(request_id.as_str().to_string()),
+                    risk_category: infer_permission_risk_category(&risk_source),
+                    title,
+                    details,
+                });
+                if !delivered {
+                    attachment.remove_pending_permission(request_id.as_str());
+                }
+                delivered
+            },
+        );
+        if admission != Some(true) {
+            // Missing/stale routes and missing turn sinks fail closed so the
+            // agent never waits on a request Vibex cannot surface.
+            self.respond_ok(rpc_id, permission_cancelled_response());
+        }
+    }
+
+    fn handle_fs_read(&self, rpc_id: Value, params: &Value) {
+        let Some(path) = params.get("path").and_then(Value::as_str) else {
+            self.respond_error(rpc_id, -32602, "fs/read_text_file requires a path");
+            return;
+        };
+        let path = PathBuf::from(path);
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.len() > ACP_FS_READ_BYTE_LIMIT => {
+                self.respond_error(rpc_id, -32603, "file exceeds the ACP read size limit");
+                return;
+            }
+            Err(err) => {
+                self.respond_error(rpc_id, -32603, &format!("failed to stat file: {err}"));
+                return;
+            }
+            _ => {}
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                let line = params
+                    .get("line")
+                    .and_then(Value::as_u64)
+                    .map(|line| line.max(1) as usize);
+                let limit = params
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .map(|limit| limit as usize);
+                let content = match (line, limit) {
+                    (None, None) => content,
+                    (line, limit) => {
+                        let start = line.map(|line| line - 1).unwrap_or(0);
+                        let lines = content.lines().skip(start);
+                        let selected: Vec<&str> = match limit {
+                            Some(limit) => lines.take(limit).collect(),
+                            None => lines.collect(),
+                        };
+                        selected.join("\n")
+                    }
+                };
+                self.respond_ok(rpc_id, json!({ "content": content }));
+            }
+            Err(err) => {
+                self.respond_error(rpc_id, -32603, &format!("failed to read file: {err}"));
+            }
+        }
+    }
+
+    fn handle_fs_write(&self, rpc_id: Value, params: &Value) {
+        let Some(path) = params.get("path").and_then(Value::as_str) else {
+            self.respond_error(rpc_id, -32602, "fs/write_text_file requires a path");
+            return;
+        };
+        let Some(content) = params.get("content").and_then(Value::as_str) else {
+            self.respond_error(rpc_id, -32602, "fs/write_text_file requires content");
+            return;
+        };
+        let path = PathBuf::from(path);
+        if let Some(parent) = path.parent()
+            && let Err(err) = std::fs::create_dir_all(parent)
+        {
+            self.respond_error(
+                rpc_id,
+                -32603,
+                &format!("failed to prepare parent directory: {err}"),
+            );
+            return;
+        }
+        match std::fs::write(&path, content) {
+            Ok(()) => self.respond_ok(rpc_id, Value::Null),
+            Err(err) => {
+                self.respond_error(rpc_id, -32603, &format!("failed to write file: {err}"));
+            }
+        }
+    }
+
+    fn handle_terminal_create(self: &Arc<Self>, rpc_id: Value, params: &Value) {
+        let admission = self.with_routed_params(
+            params,
+            AcpOperation::TerminalCreate.method(),
+            |attachment| -> Result<(), (i64, String)> {
+                if !self.terminal_tools_enabled {
+                    return Err((-32601, "terminal tools are disabled".to_string()));
+                }
+                let request = parse_terminal_create_request(params, &self.workspace_root)
+                    .map_err(|message| (-32602, message))?;
+                let request_id = RequestId::new();
+                if !attachment.insert_pending_terminal_create(
+                    &request_id,
+                    PendingTerminalCreate {
+                        rpc_id: rpc_id.clone(),
+                        request: request.clone(),
+                    },
+                ) {
+                    return Err((
+                        -32603,
+                        "terminal attachment state is unavailable".to_string(),
+                    ));
+                }
+                let delivered = attachment.emit_turn_event(AcpEvent::PermissionRequest {
+                    request_id: Some(request_id.clone()),
+                    provider_request_id: Some(request_id.as_str().to_string()),
+                    risk_category: infer_permission_risk_category(
+                        &terminal_permission_risk_source(&request),
+                    ),
+                    title: terminal_permission_title(&request),
+                    details: terminal_permission_details(&request),
+                });
+                if !delivered {
+                    attachment.remove_pending_terminal_create(request_id.as_str());
+                    return Err((
+                        -32000,
+                        "terminal permission could not be surfaced".to_string(),
+                    ));
+                }
+                Ok(())
+            },
+        );
+        match admission {
+            Some(Ok(())) => {}
+            Some(Err((code, message))) => self.respond_error(rpc_id, code, &message),
+            None => self.respond_error(rpc_id, -32000, "terminal session route unavailable"),
+        }
+    }
+
+    fn handle_terminal_kill(self: &Arc<Self>, rpc_id: Value, params: &Value) {
+        let Some(terminal_id) = parse_terminal_id(params) else {
+            self.respond_error(rpc_id, -32602, "terminal/kill requires terminalId");
+            return;
+        };
+        let process = Arc::clone(self);
+        tokio::spawn(async move {
+            match process.terminal_host.kill(&terminal_id).await {
+                Ok(()) => {
+                    process.finish_active_terminal(&terminal_id);
+                    process.respond_ok(rpc_id, Value::Null);
+                }
+                Err(err) => process.respond_error(rpc_id, -32603, &redact_summary(&err.message)),
+            }
+        });
+    }
+
+    fn handle_terminal_release(self: &Arc<Self>, rpc_id: Value, params: &Value) {
+        let Some(terminal_id) = parse_terminal_id(params) else {
+            self.respond_error(rpc_id, -32602, "terminal/release requires terminalId");
+            return;
+        };
+        let process = Arc::clone(self);
+        tokio::spawn(async move {
+            match process.terminal_host.release(&terminal_id).await {
+                Ok(()) => {
+                    process.finish_active_terminal(&terminal_id);
+                    process.respond_ok(rpc_id, Value::Null);
+                }
+                Err(err) => process.respond_error(rpc_id, -32603, &redact_summary(&err.message)),
+            }
+        });
+    }
+
+    fn handle_terminal_output(self: &Arc<Self>, rpc_id: Value, params: &Value) {
+        let Some(terminal_id) = parse_terminal_id(params) else {
+            self.respond_error(rpc_id, -32602, "terminal/output requires terminalId");
+            return;
+        };
+        let limit = params
+            .get("limit")
+            .or_else(|| params.get("maxBytes"))
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(ACP_TERMINAL_OUTPUT_LIMIT)
+            .min(ACP_TERMINAL_OUTPUT_LIMIT);
+        let process = Arc::clone(self);
+        tokio::spawn(async move {
+            match process.terminal_host.output(&terminal_id, limit).await {
+                Ok(output) => {
+                    let (text, truncated) =
+                        bounded_terminal_output(&output.text, limit, output.truncated);
+                    process.respond_ok(
+                        rpc_id,
+                        json!({
+                            "output": text,
+                            "text": text,
+                            "truncated": truncated
+                        }),
+                    );
+                }
+                Err(err) => process.respond_error(rpc_id, -32603, &redact_summary(&err.message)),
+            }
+        });
+    }
+
+    fn handle_terminal_wait_for_exit(self: &Arc<Self>, rpc_id: Value, params: &Value) {
+        let Some(terminal_id) = parse_terminal_id(params) else {
+            self.respond_error(rpc_id, -32602, "terminal/wait_for_exit requires terminalId");
+            return;
+        };
+        let process = Arc::clone(self);
+        tokio::spawn(async move {
+            match process.terminal_host.wait_for_exit(&terminal_id).await {
+                Ok(status) => {
+                    process.finish_active_terminal(&terminal_id);
+                    process.respond_ok(
+                        rpc_id,
+                        json!({
+                            "exitStatus": {
+                                "exitCode": status.exit_code,
+                                "signal": status.signal
+                            },
+                            "exitCode": status.exit_code,
+                            "signal": status.signal
+                        }),
+                    );
+                }
+                Err(err) => process.respond_error(rpc_id, -32603, &redact_summary(&err.message)),
+            }
+        });
+    }
+
+    fn handle_notification(&self, method: &str, value: &Value) {
+        if method.starts_with("_claude/") {
+            let Some(params) = value.get("params") else {
+                return;
+            };
+            let _ = self.with_routed_params(params, method, |attachment| {
+                attachment.handle_claude_extension(method, params)
+            });
+            return;
+        }
+        if method.starts_with("_codex/") {
+            let Some(params) = value.get("params") else {
+                return;
+            };
+            let _ = self.with_routed_params(params, method, |attachment| {
+                attachment.handle_codex_extension(method, params)
+            });
+            return;
+        }
+        match AcpOperation::from_method(method) {
+            AcpOperation::SessionUpdate => {
+                let Some(params) = value.get("params") else {
+                    return;
+                };
+                self.handle_session_update(params);
+            }
+            // Raw preservation gate (§7.3): unknown or unhosted notifications
+            // must not disturb the session, but their bounded, redacted
+            // envelope is kept for diagnostics instead of being dropped.
+            _ => {
+                self.observability.increment(
+                    RuntimeMetricName::UnknownAcpEvent,
+                    None,
+                    RuntimeMetricResult::Fallback,
+                );
+                let decoded = protocol::decode_incoming(value);
+                let kind = match &decoded.decoded {
+                    AcpDecodedPayload::Extension { .. } => "extension",
+                    AcpDecodedPayload::Malformed { error, .. } => error.kind(),
+                    AcpDecodedPayload::Standard(message) => {
+                        let _ = message.operation.method();
+                        "unhosted_standard"
+                    }
+                };
+                tracing::debug!(
+                    target: "vibex_agent_acp",
+                    process_instance = %self.process_instance_id.as_str(),
+                    kind,
+                    truncated = decoded.raw.truncated,
+                    byte_len = decoded.raw.byte_len,
+                    "ACP notification routed to diagnostics"
+                );
+            }
+        }
+    }
+
+    fn handle_session_update(&self, params: &Value) {
+        let _ =
+            self.with_routed_params(params, AcpOperation::SessionUpdate.method(), |attachment| {
+                attachment.handle_session_update(params)
+            });
+    }
+
+    fn fail_pending_requests(&self, failure: AcpRpcFailure) {
+        if let Ok(mut pending) = self.pending_prompt_requests.lock() {
+            pending.clear();
+        }
+        let drained: Vec<PendingTransportResponse> = match self.pending_requests.lock() {
+            Ok(mut pending) => pending.drain().map(|(_, response)| response).collect(),
+            Err(_) => Vec::new(),
+        };
+        for pending in drained {
+            let _ = pending.response.send(Err(failure.clone()));
+        }
+    }
+
+    fn claim_shutdown(&self) -> Option<bool> {
+        let _admission = match self.request_admission.lock() {
+            Ok(admission) => admission,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut shared = self.shared.lock().ok()?;
+        if shared.closed {
+            return None;
+        }
+        let was_closing = shared.closing;
+        shared.closing = true;
+        Some(was_closing)
+    }
+
+    async fn exited_before_deadline(child: &mut AsyncGroupChild, wait: Duration) -> bool {
+        let deadline = Instant::now() + wait;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) if !Self::process_group_has_members(child) => return true,
+                Ok(Some(_)) | Ok(None) if Instant::now() < deadline => {
+                    tokio::time::sleep(ACP_PROCESS_WAIT_POLL_INTERVAL).await;
+                }
+                Ok(Some(_)) | Ok(None) | Err(_) => return false,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn process_group_has_members(child: &AsyncGroupChild) -> bool {
+        command_group::UnixChildExt::signal(child, command_group::Signal::SIGCONT).is_ok()
+    }
+
+    #[cfg(not(unix))]
+    fn process_group_has_members(_child: &AsyncGroupChild) -> bool {
+        false
+    }
+
+    async fn reap_killed_process_group(child: &mut AsyncGroupChild) -> bool {
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) if !Self::process_group_has_members(child) => return true,
+                Ok(Some(_)) => tokio::time::sleep(ACP_PROCESS_WAIT_POLL_INTERVAL).await,
+                Ok(None) => tokio::time::sleep(ACP_PROCESS_WAIT_POLL_INTERVAL).await,
+                Err(_) => return false,
+            }
+        }
+    }
+
+    async fn kill_process_group(&self) {
+        let mut child = self.child.lock().await;
+        if let Some(child) = child.as_mut() {
+            let kill_failed = child.start_kill().is_err();
+            let reaped = Self::reap_killed_process_group(child).await;
+            if kill_failed || !reaped {
+                self.record_process_tree_cleanup_failure();
+            }
+        }
+        *child = None;
+    }
+
+    fn record_process_tree_cleanup_failure(&self) {
+        self.observability.increment(
+            RuntimeMetricName::ProcessTreeCleanupFailure,
+            None,
+            RuntimeMetricResult::Failure,
+        );
+        self.log_context.for_operation("process_tree_cleanup").emit(
+            RuntimeLogLevel::Warn,
+            "acp_process_tree_cleanup_failed",
+            RuntimeMetricResult::Failure,
+            Some("acp_process_tree_cleanup_failed"),
+            None,
+        );
+    }
+
+    fn cleanup_closed_state(&self) {
+        self.fail_pending_requests(AcpRpcFailure::process_exited());
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.closed = true;
+            shared.closing = false;
+        }
+    }
+
+    async fn finish_explicit_shutdown(&self) {
+        self.record_lifecycle_event("stop_new_prompts");
+        self.record_lifecycle_event("cancel_sessions");
+
+        if let Ok(mut outbound) = self.outbound.lock() {
+            outbound.take();
+        }
+        self.record_lifecycle_event("graceful_shutdown");
+        let mut child = self.child.lock().await;
+        if let Some(child) = child.as_mut()
+            && !Self::exited_before_deadline(child, ACP_GRACEFUL_SHUTDOWN_TIMEOUT).await
+        {
+            let kill_failed = child.start_kill().is_err();
+            self.record_lifecycle_event("kill_process_group");
+            let reaped = Self::reap_killed_process_group(child).await;
+            if kill_failed || !reaped {
+                self.record_process_tree_cleanup_failure();
+            }
+        }
+        *child = None;
+        drop(child);
+
+        self.cleanup_closed_state();
+        self.record_lifecycle_event("cleanup_pending");
+        self.record_lifecycle_event("closed");
+    }
+
+    async fn handle_process_exit(self: Arc<Self>) {
+        let _shutdown_guard = self.shutdown_lock.lock().await;
+        let Some(was_closing) = self.claim_shutdown() else {
+            return;
+        };
+        if was_closing {
+            self.finish_explicit_shutdown().await;
+            return;
+        }
+
+        let _ = self
+            .exit_reporter
+            .as_ref()
+            .map(|reporter| reporter.report_crash());
+        if let Ok(mut outbound) = self.outbound.lock() {
+            outbound.take();
+        }
+        self.kill_process_group().await;
+        self.cleanup_closed_state();
+    }
+
+    async fn shutdown(&self) {
+        let _shutdown_guard = self.shutdown_lock.lock().await;
+        let Some(_) = self.claim_shutdown() else {
+            return;
+        };
+        self.finish_explicit_shutdown().await;
+    }
+
+    fn session_metadata(&self) -> Vec<ProviderBindingMetadata> {
+        let mut metadata = vec![
+            ProviderBindingMetadata {
+                key: "transport".to_string(),
+                value: "stdio_ndjson".to_string(),
+            },
+            ProviderBindingMetadata {
+                key: "command".to_string(),
+                value: self.command_display.clone(),
+            },
+            ProviderBindingMetadata {
+                key: "args".to_string(),
+                value: self.args_display.clone(),
+            },
+            ProviderBindingMetadata {
+                key: "workspacePath".to_string(),
+                value: self.workspace_root.display().to_string(),
+            },
+            ProviderBindingMetadata {
+                key: "processInstanceId".to_string(),
+                value: self.process_instance_id.as_str().to_string(),
+            },
+            ProviderBindingMetadata {
+                key: "processStrategyRequested".to_string(),
+                value: acp_process_strategy_name(self.process_strategy_requested).to_string(),
+            },
+            ProviderBindingMetadata {
+                key: "processStrategyEffective".to_string(),
+                value: acp_process_strategy_name(self.process_strategy_effective).to_string(),
+            },
+        ];
+        if let Some(reason) = self.pool_fallback_reason.as_deref() {
+            metadata.push(ProviderBindingMetadata {
+                key: "processPoolFallback".to_string(),
+                value: reason.to_string(),
+            });
+        }
+        if let Ok(shared) = self.shared.lock() {
+            if let Some(protocol_version) = shared.protocol_version {
+                metadata.push(ProviderBindingMetadata {
+                    key: "protocolVersion".to_string(),
+                    value: protocol_version.to_string(),
+                });
+            }
+            if let Some(agent_name) = shared.agent_name.as_deref() {
+                metadata.push(ProviderBindingMetadata {
+                    key: "agentName".to_string(),
+                    value: agent_name.to_string(),
+                });
+            }
+            if let Some(agent_version) = shared.agent_version.as_deref() {
+                metadata.push(ProviderBindingMetadata {
+                    key: "agentVersion".to_string(),
+                    value: agent_version.to_string(),
+                });
+            }
+            metadata.push(ProviderBindingMetadata {
+                key: "loadSessionSupported".to_string(),
+                value: shared.supports_load_session.to_string(),
+            });
+        }
+        metadata
+    }
+
+    fn operation_evidence(
+        &self,
+        generation: i64,
+    ) -> BTreeMap<AcpOperation, SessionConfigOperationEvidence> {
+        self.shared
+            .lock()
+            .map(|shared| {
+                shared
+                    .operation_evidence
+                    .iter()
+                    .map(|(operation, evidence)| {
+                        let mut evidence = evidence.clone();
+                        evidence.activation_generation = generation;
+                        (operation.clone(), evidence)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn restore_capabilities(&self, generation: i64) -> RestoreCapabilityMap {
+        self.shared
+            .lock()
+            .map(|shared| {
+                [
+                    (
+                        AgentSessionRestoreMethod::Resume,
+                        AcpOperation::SessionResume,
+                    ),
+                    (AgentSessionRestoreMethod::Load, AcpOperation::SessionLoad),
+                ]
+                .into_iter()
+                .filter_map(|(method, operation)| {
+                    let evidence = shared.operation_evidence.get(&operation)?;
+                    Some((
+                        method,
+                        RestoreCapabilityEvidence {
+                            support: evidence.support,
+                            source: evidence.source,
+                            encoding: evidence.encoding,
+                            stability: evidence.stability,
+                            compatibility_identity: evidence.compatibility_identity.clone(),
+                            activation_generation: generation,
+                        },
+                    ))
+                })
+                .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+#[async_trait]
+impl AcpProcessHandle for AcpProcess {
+    fn is_closed(&self) -> bool {
+        AcpProcess::is_closed(self)
+    }
+
+    fn protocol_version(&self) -> Option<i64> {
+        self.shared
+            .lock()
+            .ok()
+            .and_then(|shared| shared.protocol_version)
+    }
+
+    fn pending_request_count(&self) -> usize {
+        self.pending_requests
+            .lock()
+            .map(|pending| pending.len())
+            .unwrap_or_default()
+    }
+
+    async fn shutdown(&self) {
+        AcpProcess::shutdown(self).await;
+    }
+}
+
+/// Generic ACP runtime client keyed by Vibex session id. One spawned ACP
+/// process serves each active session and stays alive across turns.
+pub struct AcpRuntimeClient {
+    config_service: ProviderConfigService,
+    attachment_router: Arc<AcpAttachmentRouter>,
+    legacy_attachment_identities: Mutex<HashMap<String, LegacyAttachmentIdentity>>,
+    runtime_config_states: Mutex<HashMap<RuntimeBindingId, SessionRuntimeConfigState>>,
+    restore_compatibility_keys:
+        Mutex<HashMap<RuntimeBindingId, AgentSessionRestoreCompatibilityKey>>,
+    restore_results: Mutex<HashMap<String, vibex_core::AgentSessionRestoreResult>>,
+    session_operation_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    prompt_gate_sessions: Mutex<BTreeSet<VibexSessionId>>,
+    process_registry: AcpProcessRegistry<AcpProcess>,
+    observability: Arc<RuntimeObservability>,
+    compatibility_registry: AcpCompatibilityRegistry,
+    multi_session_contracts: Mutex<HashMap<String, MultiSessionContractEvidence>>,
+    #[cfg(test)]
+    test_multi_session_identities: Mutex<HashMap<String, String>>,
+    handshake_timeout: Duration,
+    restore_timeout: Duration,
+    prompt_timeout: Duration,
+    terminal_host: Option<Arc<dyn AcpTerminalHost>>,
+}
+
+/// Concrete ACP adapter for the provider-neutral durable runtime-switch
+/// coordinator. Opaque process handles are only an in-memory optimization;
+/// every attachment method can rebuild from the durable intent and binding.
+pub struct AcpRuntimeSwitchBridge {
+    db_path: PathBuf,
+    client: Arc<AcpRuntimeClient>,
+    manager: Arc<AgentManager>,
+    context_bridge: ContextBridgeService,
+    prepared_processes: Mutex<HashMap<RuntimeSwitchId, ProcessLease<AcpProcess>>>,
+    runtime_lifecycle: Mutex<Option<Weak<RuntimeLifecycleService>>>,
+    runtime_leases: Mutex<HashMap<RuntimeSwitchId, HashMap<RuntimeLeaseTarget, RuntimeLeaseGuard>>>,
+}
+
+struct AcpSwitchTargetContext {
+    profile: ProviderProfile,
+    config: AcpProviderConfig,
+    cwd: PathBuf,
+    runtime_resources: ProviderRuntimeResources,
+    process_strategy_effective: AcpProcessStrategy,
+    pool_fallback_reason: Option<String>,
+    spawn_snapshot: ProcessSpawnConfigSnapshot,
+}
+
+impl std::fmt::Debug for AcpRuntimeSwitchBridge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AcpRuntimeSwitchBridge")
+            .field("db_path", &self.db_path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AcpRuntimeSwitchBridge {
+    pub fn new(
+        db_path: impl Into<PathBuf>,
+        client: Arc<AcpRuntimeClient>,
+        manager: Arc<AgentManager>,
+    ) -> VibexResult<Self> {
+        let db_path = db_path.into();
+        let mut conn = open_database(&db_path)?;
+        apply_migrations(&mut conn)?;
+        let context_bridge = ContextBridgeService::new(db_path.clone())?;
+        Ok(Self {
+            db_path,
+            client,
+            manager,
+            context_bridge,
+            prepared_processes: Mutex::new(HashMap::new()),
+            runtime_lifecycle: Mutex::new(None),
+            runtime_leases: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub fn install_runtime_lifecycle(
+        &self,
+        lifecycle: &Arc<RuntimeLifecycleService>,
+    ) -> VibexResult<()> {
+        *self
+            .runtime_lifecycle
+            .lock()
+            .map_err(|_| lock_poisoned_error("runtimeLifecycle"))? =
+            Some(Arc::downgrade(lifecycle));
+        Ok(())
+    }
+
+    async fn protect_switch_target(
+        &self,
+        intent: &SwitchIntent,
+        target: RuntimeLeaseTarget,
+    ) -> VibexResult<()> {
+        let lifecycle = self
+            .runtime_lifecycle
+            .lock()
+            .map_err(|_| lock_poisoned_error("runtimeLifecycle"))?
+            .as_ref()
+            .and_then(Weak::upgrade);
+        let Some(lifecycle) = lifecycle else {
+            return Ok(());
+        };
+        if self
+            .runtime_leases
+            .lock()
+            .map_err(|_| lock_poisoned_error("runtimeLeases"))?
+            .get(&intent.switch_id)
+            .is_some_and(|leases| leases.contains_key(&target))
+        {
+            return Ok(());
+        }
+        let guard = lifecycle
+            .acquire_internal(
+                intent.session_id.clone(),
+                target.clone(),
+                RuntimeLeaseRole::SwitchPreparation,
+                format!("switch:{}", intent.switch_id.as_str()),
+            )
+            .await?;
+        self.runtime_leases
+            .lock()
+            .map_err(|_| lock_poisoned_error("runtimeLeases"))?
+            .entry(intent.switch_id.clone())
+            .or_default()
+            .entry(target)
+            .or_insert(guard);
+        Ok(())
+    }
+
+    async fn protect_switch_process(
+        &self,
+        intent: &SwitchIntent,
+        lease: &ProcessLease<AcpProcess>,
+    ) -> VibexResult<()> {
+        let process_id =
+            RuntimeProcessId::from_opaque(lease.process_instance_id().as_str().to_string())?;
+        self.protect_switch_target(intent, RuntimeLeaseTarget::Process(process_id))
+            .await
+    }
+
+    async fn protect_switch_attachment(
+        &self,
+        intent: &SwitchIntent,
+        handle: &AcpAttachmentHandle,
+    ) -> VibexResult<()> {
+        let activation_generation =
+            i64::try_from(handle.fence().activation_generation).map_err(|_| {
+                VibexError::validation(
+                    "runtime_switch_generation_invalid",
+                    "runtime activation generation is invalid",
+                )
+            })?;
+        let process_id =
+            RuntimeProcessId::from_opaque(handle.fence().process_instance_id.as_str().to_string())?;
+        self.protect_switch_target(
+            intent,
+            RuntimeLeaseTarget::Attachment {
+                binding_id: handle.binding_id().clone(),
+                activation_generation,
+                process_id,
+            },
+        )
+        .await
+    }
+
+    fn release_switch_targets(&self, switch_id: &RuntimeSwitchId) {
+        let leases = self
+            .runtime_leases
+            .lock()
+            .ok()
+            .and_then(|mut leases| leases.remove(switch_id));
+        drop(leases);
+    }
+
+    fn target_context(
+        &self,
+        session_id: &VibexSessionId,
+        selection: &SessionRuntimeSelection,
+    ) -> VibexResult<AcpSwitchTargetContext> {
+        let conn = open_database(&self.db_path)?;
+        let session = SessionRepository::get(&conn, session_id)?.ok_or_else(|| {
+            VibexError::validation("session_not_found", "Agent session was not found")
+        })?;
+        if session.deleted_at_ms.is_some() {
+            return Err(VibexError::validation(
+                "session_not_found",
+                "Agent session was not found",
+            ));
+        }
+        let profile = self
+            .client
+            .config_service
+            .get_profile(&selection.provider_profile_id)?
+            .ok_or_else(|| runtime_configuration_unavailable("provider_profile_not_found"))?;
+        if profile.agent_id != selection.agent_id
+            || profile.kind != ProviderKind::Acp
+            || profile.status != ProviderProfileStatus::Enabled
+        {
+            return Err(runtime_configuration_unavailable(
+                "provider_profile_route_unavailable",
+            ));
+        }
+        let config = self
+            .client
+            .profile_config(&selection.provider_profile_id)
+            .map_err(|error| runtime_configuration_unavailable(&error.code))?;
+        let cwd = AcpRuntimeClient::resolve_workspace_cwd(&config, &session.workspace_root)
+            .map_err(|error| runtime_configuration_unavailable(&error.code))?;
+        let runtime_resources = self
+            .manager
+            .runtime_resources_for_profile(ProviderKind::Acp, &selection.provider_profile_id)?;
+        let (process_strategy_effective, pool_fallback_reason) = self
+            .client
+            .pool_decision(&selection.provider_profile_id, &config)?;
+        let (_, materialization) = self.client.process_launch_materialization(
+            &selection.provider_profile_id,
+            &config,
+            &cwd,
+            &runtime_resources,
+        )?;
+        Ok(AcpSwitchTargetContext {
+            profile,
+            config,
+            cwd,
+            runtime_resources,
+            process_strategy_effective,
+            pool_fallback_reason,
+            spawn_snapshot: materialization.snapshot,
+        })
+    }
+
+    fn process_handle(intent: &SwitchIntent) -> String {
+        format!("acp-switch-process:{}", intent.switch_id.as_str())
+    }
+
+    fn attachment_handle(binding_id: &RuntimeBindingId) -> String {
+        format!("acp-switch-attachment:{}", binding_id.as_str())
+    }
+
+    async fn ensure_process_lease(
+        &self,
+        intent: &SwitchIntent,
+    ) -> VibexResult<ProcessLease<AcpProcess>> {
+        let cached = self
+            .prepared_processes
+            .lock()
+            .map_err(|_| lock_poisoned_error("runtimeSwitchProcesses"))?
+            .get(&intent.switch_id)
+            .cloned();
+        if let Some(lease) = cached {
+            if lease
+                .snapshot()
+                .is_ok_and(|snapshot| snapshot.status == AcpProcessStatus::Ready)
+            {
+                return Ok(lease);
+            }
+            self.prepared_processes
+                .lock()
+                .map_err(|_| lock_poisoned_error("runtimeSwitchProcesses"))?
+                .remove(&intent.switch_id);
+            self.client.release_process_reservation(&lease).await;
+        }
+
+        let context = self.target_context(&intent.session_id, &intent.target_selection)?;
+        let lease = self
+            .client
+            .acquire_initialized_process(AcpProcessLaunch {
+                profile_id: &intent.target_selection.provider_profile_id,
+                config: &context.config,
+                cwd: &context.cwd,
+                runtime_resources: &context.runtime_resources,
+                purpose: AcpProcessPurpose::Session,
+                process_strategy_effective: context.process_strategy_effective,
+                pool_fallback_reason: context.pool_fallback_reason,
+            })
+            .await?;
+        self.prepared_processes
+            .lock()
+            .map_err(|_| lock_poisoned_error("runtimeSwitchProcesses"))?
+            .insert(intent.switch_id.clone(), lease.clone());
+        Ok(lease)
+    }
+
+    async fn process_lease(
+        &self,
+        intent: &SwitchIntent,
+        process: &PreparedProcess,
+    ) -> VibexResult<ProcessLease<AcpProcess>> {
+        if process.opaque_handle != Self::process_handle(intent) {
+            return Err(VibexError::conflict(
+                "runtime_switch_process_handle_stale",
+                "prepared ACP process handle does not match the durable switch",
+            ));
+        }
+        self.ensure_process_lease(intent).await
+    }
+
+    fn target_generation(&self, intent: &SwitchIntent) -> VibexResult<i64> {
+        let conn = open_database(&self.db_path)?;
+        if let Some(binding_id) = intent.target_binding_id.as_ref()
+            && let Some(binding) = RuntimeBindingRepository::get(&conn, binding_id)?
+        {
+            return Ok(binding.activation_generation);
+        }
+        let state = AgentSessionRuntimeRepository::get_runtime_state(&conn, &intent.session_id)?
+            .ok_or_else(|| {
+                VibexError::validation("session_not_found", "Agent session was not found")
+            })?;
+        state.activation_generation.checked_add(1).ok_or_else(|| {
+            VibexError::conflict(
+                "runtime_switch_generation_exhausted",
+                "runtime activation generation is exhausted",
+            )
+        })
+    }
+
+    fn is_live_mutation(intent: &SwitchIntent) -> bool {
+        intent.source_binding_id.is_some() && intent.source_binding_id == intent.target_binding_id
+    }
+
+    fn target_identity(
+        &self,
+        intent: &SwitchIntent,
+        generation: i64,
+    ) -> VibexResult<LegacyAttachmentIdentity> {
+        let binding_id = intent.target_binding_id.clone().ok_or_else(|| {
+            VibexError::validation(
+                "runtime_switch_target_binding_missing",
+                "runtime switch target binding is missing",
+            )
+        })?;
+        let activation_generation = u64::try_from(generation).map_err(|_| {
+            VibexError::validation(
+                "runtime_switch_generation_invalid",
+                "runtime activation generation is invalid",
+            )
+        })?;
+        Ok(LegacyAttachmentIdentity {
+            binding_id,
+            activation_generation,
+            provider_profile_id: intent.target_selection.provider_profile_id.clone(),
+            attached_process_id: None,
+        })
+    }
+
+    fn source_binding(&self, intent: &SwitchIntent) -> VibexResult<Option<RuntimeBinding>> {
+        let Some(binding_id) = intent.source_binding_id.as_ref() else {
+            return Ok(None);
+        };
+        let conn = open_database(&self.db_path)?;
+        RuntimeBindingRepository::get(&conn, binding_id)
+    }
+
+    fn expected_adapter_compatibility_identity(&self, agent_id: &vibex_core::AgentId) -> String {
+        self.client
+            .compatibility_registry
+            .for_agent(agent_id)
+            .map(|descriptor| descriptor.expected_compatibility_identity().to_string())
+            .unwrap_or_else(|| "unmanaged".to_string())
+    }
+
+    fn exact_restore_compatible(
+        &self,
+        binding: &RuntimeBinding,
+        intent: &SwitchIntent,
+        context: &AcpSwitchTargetContext,
+    ) -> bool {
+        binding.agent_id == intent.target_selection.agent_id
+            && binding.provider_profile_id == intent.target_selection.provider_profile_id
+            && binding.adapter_id == intent.target_adapter_id
+            && binding.transport_kind == TransportKind::Acp
+            && binding.native_session_id.is_some()
+            && binding.native_state_home_id == context.spawn_snapshot.native_state_home_id
+            && binding.adapter_compatibility_identity
+                == self.expected_adapter_compatibility_identity(&intent.target_selection.agent_id)
+            && binding.provider_resume_identity.as_deref() == Some("acp-session-resume-v1")
+    }
+
+    fn source_restore_probeable(&self, binding: &RuntimeBinding, intent: &SwitchIntent) -> bool {
+        binding.native_session_id.is_some()
+            && binding.agent_id == intent.target_selection.agent_id
+            && binding.provider_profile_id == intent.target_selection.provider_profile_id
+            && binding.adapter_id == intent.target_adapter_id
+            && binding.transport_kind == TransportKind::Acp
+    }
+
+    fn historical_resume_binding(
+        &self,
+        intent: &SwitchIntent,
+        context: &AcpSwitchTargetContext,
+        source: Option<&RuntimeBinding>,
+    ) -> VibexResult<Option<RuntimeBinding>> {
+        let conn = open_database(&self.db_path)?;
+        let mut candidates = RuntimeBindingRepository::list_by_session(&conn, &intent.session_id)?;
+        let source_binding_id = source.map(|value| value.binding_id.clone());
+        candidates.retain(|binding| {
+            source_binding_id.as_ref() != Some(&binding.binding_id)
+                && binding.binding_state == BindingState::Inactive
+                && self.exact_restore_compatible(binding, intent, context)
+        });
+        candidates.sort_by(|left, right| {
+            left.last_context_sequence
+                .cmp(&right.last_context_sequence)
+                .then(left.last_summary_sequence.cmp(&right.last_summary_sequence))
+                .then(left.updated_at_ms.cmp(&right.updated_at_ms))
+                .then(left.binding_id.as_str().cmp(right.binding_id.as_str()))
+        });
+        Ok(candidates.pop())
+    }
+
+    fn resume_binding(
+        &self,
+        intent: &SwitchIntent,
+        context: &AcpSwitchTargetContext,
+        source: Option<&RuntimeBinding>,
+    ) -> VibexResult<Option<RuntimeBinding>> {
+        if let Some(source) = source
+            && (self.exact_restore_compatible(source, intent, context)
+                || self.source_restore_probeable(source, intent))
+        {
+            return Ok(Some(source.clone()));
+        }
+        self.historical_resume_binding(intent, context, source)
+    }
+
+    fn inherit_context_bridge_cursors(target: &mut RuntimeBinding, source: &RuntimeBinding) {
+        target.last_context_sequence = source.last_context_sequence;
+        target.last_summary_sequence = source.last_summary_sequence;
+        target.context_bridge_version = source.context_bridge_version;
+    }
+
+    fn registered_attachment(
+        &self,
+        binding: &RuntimeBinding,
+        allow_previous_generation: bool,
+    ) -> VibexResult<Option<AcpAttachmentHandle>> {
+        let Some(handle) = self
+            .client
+            .attachment_router
+            .registry
+            .attachment(&binding.binding_id)?
+        else {
+            return Ok(None);
+        };
+        let expected_generation = u64::try_from(binding.activation_generation).map_err(|_| {
+            VibexError::validation(
+                "runtime_switch_generation_invalid",
+                "runtime activation generation is invalid",
+            )
+        })?;
+        let handle_generation = handle.fence().activation_generation;
+        let generation_matches = handle_generation == expected_generation
+            || (allow_previous_generation
+                && handle_generation.checked_add(1) == Some(expected_generation));
+        if handle.session_id() != &binding.session_id
+            || !generation_matches
+            || binding.native_session_id.as_deref()
+                != Some(handle.fence().native_session_id.as_str())
+            || !matches!(
+                handle.state()?,
+                SessionAttachmentState::Prepared | SessionAttachmentState::Committed
+            )
+        {
+            return Err(VibexError::conflict(
+                "runtime_switch_attachment_fence_stale",
+                "ACP attachment does not match the durable runtime binding fence",
+            ));
+        }
+        Ok(Some(handle))
+    }
+
+    fn restore_provider_binding(
+        intent: &SwitchIntent,
+        source: &RuntimeBinding,
+    ) -> VibexResult<ProviderBinding> {
+        let native_session_id = source.native_session_id.clone().ok_or_else(|| {
+            VibexError::validation(
+                "runtime_switch_restore_native_session_missing",
+                "runtime switch source binding has no native session to restore",
+            )
+        })?;
+        let now = unix_timestamp_ms();
+        Ok(ProviderBinding {
+            session_id: intent.session_id.clone(),
+            provider_kind: ProviderKind::Acp,
+            provider_profile_id: intent.target_selection.provider_profile_id.clone(),
+            native: ProviderNativeBinding {
+                native_session_id: Some(native_session_id),
+                native_thread_id: None,
+                native_resume_token: None,
+                session_config_state: None,
+                redacted_metadata: Vec::new(),
+            },
+            created_at_ms: now,
+            updated_at_ms: now,
+        })
+    }
+
+    fn seed_prepared_binding_state(&self, binding: &RuntimeBinding) -> VibexResult<()> {
+        self.client
+            .runtime_config_states
+            .lock()
+            .map_err(|_| lock_poisoned_error("runtimeConfigStates"))?
+            .insert(
+                binding.binding_id.clone(),
+                binding.session_runtime_config_state.clone(),
+            );
+        if let Some(key) = binding.restore_compatibility_key.clone() {
+            self.client
+                .restore_compatibility_keys
+                .lock()
+                .map_err(|_| lock_poisoned_error("restoreCompatibilityKeys"))?
+                .insert(binding.binding_id.clone(), key);
+        }
+        Ok(())
+    }
+
+    fn runtime_binding_for_attachment(
+        &self,
+        intent: &SwitchIntent,
+        context: &AcpSwitchTargetContext,
+        lease: &ProcessLease<AcpProcess>,
+        attachment: &AcpAttachmentHandle,
+    ) -> VibexResult<RuntimeBinding> {
+        self.build_runtime_binding_for_attachment(
+            &intent.session_id,
+            &intent.target_selection,
+            &intent.target_adapter_id,
+            BindingState::Preparing,
+            Some(intent.switch_id.clone()),
+            context,
+            lease,
+            attachment,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_runtime_binding_for_attachment(
+        &self,
+        session_id: &VibexSessionId,
+        selection: &SessionRuntimeSelection,
+        adapter_id: &vibex_core::AcpAdapterId,
+        binding_state: BindingState,
+        created_by_switch_id: Option<RuntimeSwitchId>,
+        context: &AcpSwitchTargetContext,
+        lease: &ProcessLease<AcpProcess>,
+        attachment: &AcpAttachmentHandle,
+    ) -> VibexResult<RuntimeBinding> {
+        let native_session_id = attachment.fence().native_session_id.clone();
+        let process = attachment.payload().process();
+        let restore_compatibility_key = AgentSessionRestoreCompatibilityKey::new(
+            selection.agent_id.clone(),
+            native_session_id.clone(),
+            context.spawn_snapshot.native_state_home_id.clone(),
+            process.compatibility_identity.clone(),
+            None,
+            "acp-session-resume-v1",
+            context.cwd.to_string_lossy().to_string(),
+        )?;
+        self.client
+            .restore_compatibility_keys
+            .lock()
+            .map_err(|_| lock_poisoned_error("restoreCompatibilityKeys"))?
+            .insert(
+                attachment.binding_id().clone(),
+                restore_compatibility_key.clone(),
+            );
+        let adapter_version = self
+            .client
+            .compatibility_registry
+            .for_agent(&selection.agent_id)
+            .map(|descriptor| descriptor.distribution.exact_version.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let now = unix_timestamp_ms();
+        Ok(RuntimeBinding {
+            binding_id: attachment.binding_id().clone(),
+            session_id: session_id.clone(),
+            agent_id: selection.agent_id.clone(),
+            transport_kind: TransportKind::Acp,
+            provider_profile_id: selection.provider_profile_id.clone(),
+            adapter_id: adapter_id.clone(),
+            adapter_version,
+            adapter_compatibility_identity: process.compatibility_identity.clone(),
+            native_session_id: Some(native_session_id),
+            native_state_home_id: context.spawn_snapshot.native_state_home_id.clone(),
+            provider_resume_identity: Some("acp-session-resume-v1".to_string()),
+            process_spawn_fingerprint: lease.key().process_spawn_fingerprint.clone(),
+            session_runtime_config_state: attachment.payload().runtime_config_state(),
+            capability_snapshot: None,
+            restore_compatibility_key: Some(restore_compatibility_key),
+            profile_revision: context.profile.updated_at_ms,
+            last_context_sequence: 0,
+            last_summary_sequence: 0,
+            context_bridge_version: 0,
+            activation_generation: attachment.fence().activation_generation as i64,
+            binding_state,
+            created_by_switch_id,
+            created_at_ms: now,
+            updated_at_ms: now,
+        })
+    }
+
+    fn prepared_attachment(
+        binding: RuntimeBinding,
+        restore_result: Option<vibex_core::AgentSessionRestoreResult>,
+    ) -> PreparedAttachment {
+        PreparedAttachment {
+            opaque_handle: Self::attachment_handle(&binding.binding_id),
+            binding,
+            restore_result,
+        }
+    }
+
+    async fn acquire_durable_binding(
+        &self,
+        intent: &SwitchIntent,
+        binding: &RuntimeBinding,
+    ) -> VibexResult<AcpAttachmentHandle> {
+        self.acquire_durable_binding_with_persistence(intent, binding, true)
+            .await
+    }
+
+    async fn acquire_durable_binding_with_persistence(
+        &self,
+        intent: &SwitchIntent,
+        binding: &RuntimeBinding,
+        persist_rebuilt_state: bool,
+    ) -> VibexResult<AcpAttachmentHandle> {
+        let allow_previous_generation = Self::is_live_mutation(intent)
+            && intent.target_binding_id.as_ref() == Some(&binding.binding_id);
+        if let Some(handle) = self.registered_attachment(binding, allow_previous_generation)? {
+            return Ok(handle);
+        }
+        let native_session_id = binding.native_session_id.clone().ok_or_else(|| {
+            VibexError::validation(
+                "runtime_switch_restore_native_session_missing",
+                "runtime binding has no native session to reacquire",
+            )
+        })?;
+        self.seed_prepared_binding_state(binding)?;
+        let lease = self.ensure_process_lease(intent).await?;
+        let context = self.target_context(&intent.session_id, &intent.target_selection)?;
+        let identity = LegacyAttachmentIdentity {
+            binding_id: binding.binding_id.clone(),
+            activation_generation: u64::try_from(binding.activation_generation).map_err(|_| {
+                VibexError::validation(
+                    "runtime_switch_generation_invalid",
+                    "runtime activation generation is invalid",
+                )
+            })?,
+            provider_profile_id: binding.provider_profile_id.clone(),
+            attached_process_id: None,
+        };
+        let provider_binding = ProviderBinding {
+            session_id: binding.session_id.clone(),
+            provider_kind: ProviderKind::Acp,
+            provider_profile_id: binding.provider_profile_id.clone(),
+            native: ProviderNativeBinding {
+                native_session_id: Some(native_session_id.clone()),
+                native_thread_id: None,
+                native_resume_token: None,
+                session_config_state: None,
+                redacted_metadata: Vec::new(),
+            },
+            created_at_ms: binding.created_at_ms,
+            updated_at_ms: binding.updated_at_ms,
+        };
+        let identity_for_restore = identity.clone();
+        let cwd = context.cwd.clone();
+        let handle = self
+            .client
+            .acquire_attachment(
+                binding.session_id.clone(),
+                identity,
+                lease,
+                Some(native_session_id),
+                AttachmentActivationMode::Prepared,
+                move |process| async move {
+                    self.client
+                        .restore_existing_session_for_attachment(
+                            &process,
+                            &provider_binding,
+                            &cwd,
+                            &identity_for_restore,
+                        )
+                        .await
+                },
+            )
+            .await
+            .map_err(map_runtime_switch_acp_error)?;
+        let rebuilt_state = handle.payload().runtime_config_state();
+        if persist_rebuilt_state && rebuilt_state != binding.session_runtime_config_state {
+            self.persist_runtime_config_state(
+                &binding.binding_id,
+                &binding.session_runtime_config_state,
+                binding.activation_generation,
+                &rebuilt_state,
+            )?;
+        }
+        Ok(handle)
+    }
+
+    fn mark_materialized_current_runtime_ready(
+        &self,
+        session_id: &VibexSessionId,
+        binding_id: &RuntimeBindingId,
+        activation_generation: i64,
+    ) -> VibexResult<()> {
+        let conn = open_database(&self.db_path)?;
+        AgentSessionRuntimeRepository::mark_materialized_current_runtime_ready(
+            &conn,
+            session_id,
+            binding_id,
+            activation_generation,
+        )?;
+        Ok(())
+    }
+
+    /// Rebuilds the durable current binding on demand. This is shared by
+    /// public Owner attach and background work so neither path invents a
+    /// provider-specific restore sequence.
+    async fn materialize_current_runtime(
+        &self,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<AcpAttachmentHandle> {
+        let conn = open_database(&self.db_path)?;
+        let runtime_state = AgentSessionRuntimeRepository::get_runtime_state(&conn, session_id)?
+            .ok_or_else(|| {
+                VibexError::validation("session_not_found", "Agent session was not found")
+            })?;
+        let binding_id = runtime_state.current_binding_id.clone().ok_or_else(|| {
+            VibexError::conflict(
+                "runtime_not_materialized",
+                "Agent session has no durable current runtime binding",
+            )
+        })?;
+        let binding = RuntimeBindingRepository::get(&conn, &binding_id)?.ok_or_else(|| {
+            VibexError::storage(
+                "runtime_current_binding_missing",
+                "durable current runtime binding is missing",
+            )
+        })?;
+        if binding.session_id != *session_id || binding.binding_state != BindingState::Current {
+            return Err(VibexError::conflict(
+                "runtime_current_binding_stale",
+                "durable current runtime binding is not current",
+            ));
+        }
+        if let Some(existing) = self
+            .client
+            .attachment_router
+            .registry
+            .attachment(&binding_id)?
+        {
+            let existing_state = existing.state()?;
+            if matches!(
+                existing_state,
+                SessionAttachmentState::Prepared | SessionAttachmentState::Committed
+            ) && existing.fence().activation_generation
+                == u64::try_from(binding.activation_generation).map_err(|_| {
+                    VibexError::validation(
+                        "runtime_switch_generation_invalid",
+                        "runtime activation generation is invalid",
+                    )
+                })?
+                && existing.payload().lease_snapshot().is_some_and(|snapshot| {
+                    snapshot.status == AcpProcessStatus::Ready
+                        && snapshot.process_spawn_fingerprint == binding.process_spawn_fingerprint
+                })
+            {
+                let activated = self.client.activate_attachment(&existing)?;
+                self.mark_materialized_current_runtime_ready(
+                    session_id,
+                    &binding_id,
+                    binding.activation_generation,
+                )?;
+                return Ok(activated);
+            }
+            self.client.detach_attachment(existing.fence()).await;
+        }
+
+        let expected_generation = runtime_state.activation_generation;
+        let next_generation = expected_generation.checked_add(1).ok_or_else(|| {
+            VibexError::conflict(
+                "runtime_activation_generation_exhausted",
+                "activation generation is exhausted",
+            )
+        })?;
+        let selection = runtime_state
+            .effective_runtime_selection
+            .clone()
+            .or(runtime_state.desired_runtime_selection.clone())
+            .ok_or_else(|| {
+                VibexError::conflict(
+                    "runtime_selection_unavailable",
+                    "Agent session has no effective runtime selection",
+                )
+            })?;
+        let mut prepared_binding = binding.clone();
+        prepared_binding.activation_generation = next_generation;
+        let intent = SwitchIntent {
+            switch_id: RuntimeSwitchId::new(),
+            session_id: session_id.clone(),
+            source_revision: runtime_state.revision,
+            source_binding_id: None,
+            desired_selection_revision: runtime_state.selection_revision,
+            target_binding_id: Some(binding_id.clone()),
+            target_adapter_id: binding.adapter_id.clone(),
+            target_selection: selection,
+            requested_policy: RuntimeSwitchPolicy::PreferResume,
+            active_work_policy: RuntimeSwitchActiveWorkPolicy::default(),
+            requested_session_config: None,
+            created_at_ms: unix_timestamp_ms(),
+        };
+        let prepared = match self
+            .acquire_durable_binding_with_persistence(&intent, &prepared_binding, false)
+            .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                let lease = self
+                    .prepared_processes
+                    .lock()
+                    .ok()
+                    .and_then(|mut processes| processes.remove(&intent.switch_id));
+                if let Some(lease) = lease {
+                    self.client.release_process_reservation(&lease).await;
+                }
+                return Err(error);
+            }
+        };
+        let cas = open_database(&self.db_path).and_then(|mut conn| {
+            AgentSessionRuntimeRepository::advance_current_activation_generation(
+                &mut conn,
+                session_id,
+                &binding_id,
+                expected_generation,
+            )
+        });
+        if let Err(error) = cas {
+            self.client.detach_attachment(prepared.fence()).await;
+            let _ = self.prepared_processes.lock().map(|mut processes| {
+                processes.remove(&intent.switch_id);
+            });
+            return Err(error);
+        }
+        let rebuilt_state = prepared.payload().runtime_config_state();
+        if rebuilt_state != prepared_binding.session_runtime_config_state
+            && let Err(error) = self.persist_runtime_config_state(
+                &binding_id,
+                &prepared_binding.session_runtime_config_state,
+                next_generation,
+                &rebuilt_state,
+            )
+        {
+            self.client.detach_attachment(prepared.fence()).await;
+            let _ = self.prepared_processes.lock().map(|mut processes| {
+                processes.remove(&intent.switch_id);
+            });
+            return Err(error);
+        }
+        match self.client.activate_attachment(&prepared) {
+            Ok(activated) => {
+                let _ = self.prepared_processes.lock().map(|mut processes| {
+                    processes.remove(&intent.switch_id);
+                });
+                self.client.commit_attachment_identity(
+                    session_id,
+                    &LegacyAttachmentIdentity {
+                        binding_id: binding_id.clone(),
+                        activation_generation: next_generation as u64,
+                        provider_profile_id: binding.provider_profile_id,
+                        attached_process_id: Some(activated.fence().process_instance_id.clone()),
+                    },
+                    activated.fence().process_instance_id.clone(),
+                );
+                self.mark_materialized_current_runtime_ready(
+                    session_id,
+                    &binding_id,
+                    next_generation,
+                )?;
+                Ok(activated)
+            }
+            Err(error) => {
+                self.client.detach_attachment(prepared.fence()).await;
+                let _ = self.prepared_processes.lock().map(|mut processes| {
+                    processes.remove(&intent.switch_id);
+                });
+                Err(error)
+            }
+        }
+    }
+
+    fn requested_patch(intent: &SwitchIntent) -> VibexResult<Option<SessionRuntimeConfigPatch>> {
+        intent
+            .requested_session_config
+            .clone()
+            .map(|value| {
+                serde_json::from_value(value).map_err(|_| {
+                    VibexError::validation(
+                        "runtime_switch_requested_session_config_invalid",
+                        "runtime switch requested session configuration is invalid",
+                    )
+                })
+            })
+            .transpose()
+    }
+
+    fn persist_runtime_config_state(
+        &self,
+        binding_id: &RuntimeBindingId,
+        previous: &SessionRuntimeConfigState,
+        generation: i64,
+        next: &SessionRuntimeConfigState,
+    ) -> VibexResult<()> {
+        let conn = open_database(&self.db_path)?;
+        RuntimeBindingRepository::compare_and_set_session_runtime_config_state(
+            &conn, binding_id, previous, generation, next,
+        )
+    }
+
+    async fn apply_requested_config(
+        &self,
+        intent: &SwitchIntent,
+        attachment: &PreparedAttachment,
+        mutation_mode: AttachmentMutationMode,
+    ) -> VibexResult<()> {
+        let Some(patch) = Self::requested_patch(intent)? else {
+            return Ok(());
+        };
+        let handle = self
+            .client
+            .attachment_router
+            .registry
+            .attachment(&attachment.binding.binding_id)?
+            .ok_or_else(|| {
+                VibexError::conflict(
+                    "runtime_switch_attachment_missing",
+                    "prepared ACP attachment is missing",
+                )
+            })?;
+        if Self::attachment_handle(&attachment.binding.binding_id) != attachment.opaque_handle {
+            return Err(VibexError::conflict(
+                "runtime_switch_attachment_handle_stale",
+                "prepared ACP attachment handle is stale",
+            ));
+        }
+        let previous = handle.payload().runtime_config_state();
+        let request = SessionRuntimeConfigMutationRequest {
+            session_id: intent.session_id.clone(),
+            expected_revision: previous.state_revision,
+            expected_binding_id: attachment.binding.binding_id.clone(),
+            expected_activation_generation: attachment.binding.activation_generation,
+            patch,
+        };
+        let result = self
+            .client
+            .apply_runtime_config_mutation(&handle, request, true, mutation_mode)
+            .await?;
+        if result.outcomes.iter().any(|outcome| {
+            !matches!(
+                outcome.status,
+                SessionRuntimeConfigApplyStatus::Applied | SessionRuntimeConfigApplyStatus::NoOp
+            )
+        }) || !result.state.is_converged()
+            || result.state.applied_activation_generation
+                != Some(attachment.binding.activation_generation)
+        {
+            return Err(runtime_configuration_unavailable(
+                result
+                    .outcomes
+                    .iter()
+                    .find_map(|outcome| outcome.error_code.as_deref())
+                    .unwrap_or("session_config_not_converged"),
+            ));
+        }
+        self.persist_runtime_config_state(
+            &attachment.binding.binding_id,
+            &previous,
+            attachment.binding.activation_generation,
+            &result.state,
+        )
+    }
+
+    fn live_mutation_supported(
+        &self,
+        source: &RuntimeBinding,
+        intent: &SwitchIntent,
+    ) -> VibexResult<bool> {
+        let Some(handle) = self.registered_attachment(source, false)? else {
+            return Ok(false);
+        };
+        let payload = handle.payload();
+        let Some(planner) = payload.session_config_planner() else {
+            return Ok(false);
+        };
+        let Some(patch) = Self::requested_patch(intent)? else {
+            return Ok(true);
+        };
+        let state = payload.runtime_config_state();
+        for field in normalize_runtime_config_patch(&patch)? {
+            if runtime_config_field_value(&state, &field) == field.value {
+                continue;
+            }
+            let plan = planner
+                .plan(&field.as_planner_request())
+                .map_err(canonical_key_error)?;
+            if !matches!(
+                plan,
+                SessionConfigPlan::Live { .. } | SessionConfigPlan::Extension { .. }
+            ) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn attachment_for_prepared(
+        &self,
+        prepared: &PreparedAttachment,
+    ) -> VibexResult<AcpAttachmentHandle> {
+        if prepared.opaque_handle != Self::attachment_handle(&prepared.binding.binding_id) {
+            return Err(VibexError::conflict(
+                "runtime_switch_attachment_handle_stale",
+                "prepared ACP attachment handle is stale",
+            ));
+        }
+        self.client
+            .attachment_router
+            .registry
+            .attachment(&prepared.binding.binding_id)?
+            .ok_or_else(|| {
+                VibexError::conflict(
+                    "runtime_switch_attachment_missing",
+                    "prepared ACP attachment is missing",
+                )
+            })
+    }
+}
+
+#[async_trait]
+impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
+    async fn resolve(
+        &self,
+        session_id: &VibexSessionId,
+        selection: &SessionRuntimeSelection,
+        preferred_adapter_id: Option<&vibex_core::AcpAdapterId>,
+    ) -> VibexResult<ResolvedRuntimeSelection> {
+        let context = self.target_context(session_id, selection)?;
+        let adapter_id = self
+            .client
+            .route_key_for_profile(&context.profile)
+            .adapter_id;
+        if preferred_adapter_id.is_some_and(|preferred| preferred != &adapter_id) {
+            return Err(VibexError::conflict(
+                "runtime_selection_adapter_mismatch",
+                "requested ACP adapter does not match the selected Agent route",
+            ));
+        }
+
+        let model_id =
+            validate_model_value(&selection.model_id).map_err(runtime_configuration_unavailable)?;
+        let models = self
+            .manager
+            .list_models(AgentModelListRequest {
+                agent_id: Some(selection.agent_id.clone()),
+                provider_profile_id: Some(selection.provider_profile_id.clone()),
+                session_id: None,
+            })
+            .await?;
+        if models.source == AgentModelListSource::Unavailable
+            || !models.models.iter().any(|candidate| candidate == &model_id)
+        {
+            return Err(runtime_configuration_unavailable("model_unavailable"));
+        }
+        let session_probe = if selection.reasoning_effort.is_some() || selection.mode_id.is_some() {
+            self.manager
+                .probe_session_config(
+                    selection.agent_id.clone(),
+                    selection.provider_profile_id.clone(),
+                )
+                .await
+                .ok()
+        } else {
+            None
+        };
+        if let Some(effort) = selection.reasoning_effort.as_deref() {
+            let effort =
+                validate_effort_value(effort).map_err(runtime_configuration_unavailable)?;
+            // Discovery evidence first; the registry acceptance set keeps
+            // selections working when no probe evidence reached this response
+            // (the pinned adapter, not this gate, stays the final authority).
+            let supported = models
+                .model_capabilities
+                .iter()
+                .find(|capability| capability.model == model_id)
+                .map(|capability| &capability.reasoning_efforts)
+                .unwrap_or(&models.reasoning_efforts)
+                .iter()
+                .any(|candidate| candidate.value == effort)
+                || session_probe.as_ref().is_some_and(|probe| {
+                    probe
+                        .reasoning_efforts
+                        .iter()
+                        .any(|candidate| candidate.value == effort)
+                })
+                || known_reasoning_effort_values(&context.profile.agent_id)
+                    .contains(&effort.as_str());
+            if !supported {
+                return Err(runtime_configuration_unavailable(
+                    "reasoning_effort_unavailable",
+                ));
+            }
+        }
+        if let Some(mode) = selection.mode_id.as_deref() {
+            let mode = validate_effort_value(mode).map_err(runtime_configuration_unavailable)?;
+            let supported = context
+                .config
+                .modes
+                .iter()
+                .any(|candidate| candidate == &mode)
+                || session_probe.as_ref().is_some_and(|probe| {
+                    probe.modes.iter().any(|candidate| candidate.value == mode)
+                })
+                || known_session_mode_values(&context.profile.agent_id).contains(&mode.as_str());
+            if !supported {
+                return Err(runtime_configuration_unavailable("mode_unavailable"));
+            }
+        }
+
+        let session_config = serde_json::to_value(SessionRuntimeConfigPatch {
+            model_id: Some(model_id),
+            reasoning_effort: selection.reasoning_effort.clone(),
+            mode_id: selection.mode_id.clone(),
+            config_values: selection.config_values.clone(),
+            ..Default::default()
+        })
+        .map_err(|_| {
+            VibexError::validation(
+                "runtime_switch_requested_session_config_invalid",
+                "runtime selection configuration could not be serialized",
+            )
+        })?;
+        Ok(ResolvedRuntimeSelection {
+            adapter_id,
+            session_config: Some(session_config),
+        })
+    }
+
+    async fn resolve_current(
+        &self,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<ResolvedInitialRuntimeSelection> {
+        let attachment = self.client.current_attachment(session_id).ok_or_else(|| {
+            VibexError::conflict(
+                "runtime_selection_current_attachment_missing",
+                "current ACP attachment is unavailable for runtime selection initialization",
+            )
+        })?;
+        if attachment.state()? != SessionAttachmentState::Committed {
+            return Err(VibexError::conflict(
+                "runtime_selection_current_attachment_uncommitted",
+                "current ACP attachment is not committed",
+            ));
+        }
+        let payload = attachment.payload();
+        let process = payload.process();
+        let profile = self
+            .client
+            .config_service
+            .get_profile(&process.provider_profile_id)?
+            .ok_or_else(|| runtime_configuration_unavailable("provider_profile_not_found"))?;
+        if profile.kind != ProviderKind::Acp || profile.status != ProviderProfileStatus::Enabled {
+            return Err(runtime_configuration_unavailable(
+                "provider_profile_route_unavailable",
+            ));
+        }
+        let runtime_state = payload.runtime_config_state();
+        let generation = attachment.fence().activation_generation as i64;
+        if !runtime_state.is_applied_to_generation(generation) {
+            return Err(runtime_configuration_unavailable(
+                "session_config_not_converged",
+            ));
+        }
+        let model_id = runtime_state
+            .effective_model
+            .as_deref()
+            .ok_or_else(|| runtime_configuration_unavailable("effective_model_unavailable"))
+            .and_then(|value| {
+                validate_model_value(value).map_err(runtime_configuration_unavailable)
+            })?;
+        let reasoning_effort = runtime_state
+            .effective_reasoning_effort
+            .as_deref()
+            .map(validate_effort_value)
+            .transpose()
+            .map_err(runtime_configuration_unavailable)?;
+        let mode_id = runtime_state
+            .effective_mode
+            .as_deref()
+            .map(validate_effort_value)
+            .transpose()
+            .map_err(runtime_configuration_unavailable)?;
+        let selection = SessionRuntimeSelection {
+            agent_id: profile.agent_id.clone(),
+            provider_profile_id: profile.id.clone(),
+            model_id,
+            reasoning_effort,
+            mode_id,
+            config_values: runtime_state
+                .config_values
+                .iter()
+                .filter_map(|(key, state)| {
+                    state
+                        .effective
+                        .as_ref()
+                        .map(|value| (key.clone(), value.value.clone()))
+                })
+                .collect(),
+        };
+        let context = self.target_context(session_id, &selection)?;
+        let adapter_id = self
+            .client
+            .route_key_for_profile(&context.profile)
+            .adapter_id;
+        let binding = self.build_runtime_binding_for_attachment(
+            session_id,
+            &selection,
+            &adapter_id,
+            BindingState::Current,
+            None,
+            &context,
+            &payload.lease,
+            &attachment,
+        )?;
+        Ok(ResolvedInitialRuntimeSelection { binding, selection })
+    }
+
+    async fn materialize_current_runtime(&self, session_id: &VibexSessionId) -> VibexResult<()> {
+        AcpRuntimeSwitchBridge::materialize_current_runtime(self, session_id).await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl SwitchTargetExecutor for AcpRuntimeSwitchBridge {
+    async fn assess_target(&self, intent: &SwitchIntent) -> VibexResult<SwitchTargetAssessment> {
+        let context = self.target_context(&intent.session_id, &intent.target_selection)?;
+        let source = self.source_binding(intent)?;
+        let same_route = source.as_ref().is_some_and(|source| {
+            source.agent_id == intent.target_selection.agent_id
+                && source.provider_profile_id == intent.target_selection.provider_profile_id
+                && source.adapter_id == intent.target_adapter_id
+                && source.transport_kind == TransportKind::Acp
+        });
+        let process_config_changed = source.as_ref().is_none_or(|source| {
+            source.process_spawn_fingerprint != context.spawn_snapshot.process_spawn_fingerprint()
+        });
+        let activity = self.probe(&intent.session_id).await?;
+        let live_ops_supported = source.as_ref().is_some_and(|source| {
+            self.live_mutation_supported(source, intent)
+                .unwrap_or(false)
+        });
+        let restore = match source.as_ref() {
+            None => RestoreAssessment::NoNativeSession,
+            Some(source) if source.native_session_id.is_none() => {
+                RestoreAssessment::NoNativeSession
+            }
+            Some(source) => {
+                if self.exact_restore_compatible(source, intent, &context) {
+                    RestoreAssessment::Compatible
+                } else if self.source_restore_probeable(source, intent) {
+                    RestoreAssessment::ProbeAllowed
+                } else {
+                    RestoreAssessment::Incompatible
+                }
+            }
+        };
+        let resumable_historical_binding = self
+            .historical_resume_binding(intent, &context, source.as_ref())?
+            .is_some();
+        Ok(SwitchTargetAssessment {
+            same_route,
+            process_config_changed,
+            session_scoped_changes_only: same_route && !process_config_changed,
+            live_ops_supported,
+            active_turn: activity.active_turn,
+            restore,
+            resumable_historical_binding,
+            supports_client_idempotency: false,
+        })
+    }
+
+    async fn ensure_process(
+        &self,
+        intent: &SwitchIntent,
+        _operation: &JournaledOperation,
+    ) -> VibexResult<PreparedProcess> {
+        let lease = self.ensure_process_lease(intent).await?;
+        self.protect_switch_process(intent, &lease).await?;
+        Ok(PreparedProcess {
+            opaque_handle: Self::process_handle(intent),
+        })
+    }
+
+    async fn reacquire_process(&self, intent: &SwitchIntent) -> VibexResult<PreparedProcess> {
+        let lease = self.ensure_process_lease(intent).await?;
+        self.protect_switch_process(intent, &lease).await?;
+        Ok(PreparedProcess {
+            opaque_handle: Self::process_handle(intent),
+        })
+    }
+
+    async fn restore_or_create_session(
+        &self,
+        intent: &SwitchIntent,
+        process: &PreparedProcess,
+        strategy: RuntimeSwitchStrategy,
+        _operation: &JournaledOperation,
+    ) -> VibexResult<PreparedAttachment> {
+        let lease = self.process_lease(intent, process).await?;
+        let context = self.target_context(&intent.session_id, &intent.target_selection)?;
+        let generation = self.target_generation(intent)?;
+        let identity = self.target_identity(intent, generation)?;
+        let resume_origin = if strategy == RuntimeSwitchStrategy::RestartAndResume {
+            self.resume_binding(intent, &context, self.source_binding(intent)?.as_ref())?
+        } else {
+            None
+        };
+        let attachment = match strategy {
+            RuntimeSwitchStrategy::RestartFreshAndBridge => {
+                self.client
+                    .acquire_attachment(
+                        intent.session_id.clone(),
+                        identity,
+                        lease.clone(),
+                        None,
+                        AttachmentActivationMode::Prepared,
+                        move |process| async move {
+                            self.client.open_new_session_for_attachment(&process).await
+                        },
+                    )
+                    .await
+            }
+            RuntimeSwitchStrategy::RestartAndResume => {
+                let source = resume_origin.clone().ok_or_else(|| {
+                    VibexError::validation(
+                        "runtime_switch_restore_source_missing",
+                        "runtime switch source binding is missing",
+                    )
+                })?;
+                let provider_binding = Self::restore_provider_binding(intent, &source)?;
+                if let Some(key) = source.restore_compatibility_key.clone() {
+                    self.client
+                        .restore_compatibility_keys
+                        .lock()
+                        .map_err(|_| lock_poisoned_error("restoreCompatibilityKeys"))?
+                        .insert(identity.binding_id.clone(), key);
+                }
+                let native_session_id = provider_binding
+                    .native
+                    .native_session_id
+                    .clone()
+                    .expect("restore provider binding requires a native session id");
+                let identity_for_restore = identity.clone();
+                let cwd = context.cwd.clone();
+                self.client
+                    .acquire_attachment(
+                        intent.session_id.clone(),
+                        identity,
+                        lease.clone(),
+                        Some(native_session_id),
+                        AttachmentActivationMode::Prepared,
+                        move |process| async move {
+                            self.client
+                                .restore_existing_session_for_attachment(
+                                    &process,
+                                    &provider_binding,
+                                    &cwd,
+                                    &identity_for_restore,
+                                )
+                                .await
+                        },
+                    )
+                    .await
+            }
+            RuntimeSwitchStrategy::LiveMutation => {
+                return Err(VibexError::validation(
+                    "runtime_switch_strategy_invalid",
+                    "live mutation does not create a prepared ACP attachment",
+                ));
+            }
+        }
+        .map_err(map_runtime_switch_acp_error)?;
+        self.protect_switch_attachment(intent, &attachment).await?;
+        let mut binding =
+            self.runtime_binding_for_attachment(intent, &context, &lease, &attachment)?;
+        if let Some(source) = resume_origin {
+            Self::inherit_context_bridge_cursors(&mut binding, &source);
+        }
+        let restore_result = (strategy == RuntimeSwitchStrategy::RestartAndResume)
+            .then(|| self.client.last_restore_result(&intent.session_id))
+            .flatten();
+        Ok(Self::prepared_attachment(binding, restore_result))
+    }
+
+    async fn recover_attachment(
+        &self,
+        intent: &SwitchIntent,
+        operation: &SwitchOperationRecord,
+    ) -> VibexResult<PreparedAttachment> {
+        if let Some(binding_id) = intent.target_binding_id.as_ref() {
+            let conn = open_database(&self.db_path)?;
+            if let Some(binding) = RuntimeBindingRepository::get(&conn, binding_id)? {
+                let handle = self.acquire_durable_binding(intent, &binding).await?;
+                self.protect_switch_attachment(intent, &handle).await?;
+                return Ok(Self::prepared_attachment(
+                    binding,
+                    self.client.last_restore_result(&intent.session_id),
+                ));
+            }
+        }
+        let native_session_id = operation.native_result_reference.clone().ok_or_else(|| {
+            VibexError::conflict(
+                "runtime_switch_operation_result_missing",
+                "runtime switch operation has no recoverable native result",
+            )
+        })?;
+        let lease = self.ensure_process_lease(intent).await?;
+        let context = self.target_context(&intent.session_id, &intent.target_selection)?;
+        let identity = self.target_identity(intent, self.target_generation(intent)?)?;
+        let expected_native_session_id = native_session_id.clone();
+        let attachment = self
+            .client
+            .acquire_attachment(
+                intent.session_id.clone(),
+                identity,
+                lease.clone(),
+                Some(native_session_id),
+                AttachmentActivationMode::Prepared,
+                move |process| async move {
+                    let (supports_resume, supports_load) = process
+                        .shared
+                        .lock()
+                        .map(|shared| {
+                            (shared.supports_resume_session, shared.supports_load_session)
+                        })
+                        .unwrap_or_default();
+                    if supports_resume {
+                        self.client
+                            .resume_existing_session_for_attachment(
+                                &process,
+                                &expected_native_session_id,
+                            )
+                            .await
+                    } else if supports_load {
+                        self.client
+                            .load_existing_session_for_attachment(
+                                &process,
+                                &expected_native_session_id,
+                            )
+                            .await
+                    } else {
+                        Err(VibexError::capability(
+                            "runtime_switch_recovery_unsupported",
+                            "ACP runtime cannot reacquire the prepared native session",
+                        ))
+                    }
+                },
+            )
+            .await
+            .map_err(map_runtime_switch_acp_error)?;
+        self.protect_switch_attachment(intent, &attachment).await?;
+        let mut binding =
+            self.runtime_binding_for_attachment(intent, &context, &lease, &attachment)?;
+        if operation.operation_kind == OP_RESTORE_SESSION {
+            let source = self.source_binding(intent)?;
+            let resume_origin = self
+                .resume_binding(intent, &context, source.as_ref())?
+                .ok_or_else(|| {
+                    VibexError::conflict(
+                        "runtime_switch_restore_source_missing",
+                        "recovered runtime switch restore source is unavailable",
+                    )
+                })?;
+            Self::inherit_context_bridge_cursors(&mut binding, &resume_origin);
+        }
+        Ok(Self::prepared_attachment(
+            binding,
+            self.client.last_restore_result(&intent.session_id),
+        ))
+    }
+
+    async fn acquire_prepared(
+        &self,
+        intent: &SwitchIntent,
+        binding: &RuntimeBinding,
+    ) -> VibexResult<PreparedAttachment> {
+        let handle = self.acquire_durable_binding(intent, binding).await?;
+        self.protect_switch_attachment(intent, &handle).await?;
+        Ok(Self::prepared_attachment(
+            binding.clone(),
+            self.client.last_restore_result(&intent.session_id),
+        ))
+    }
+
+    async fn apply_session_config(
+        &self,
+        intent: &SwitchIntent,
+        attachment: &PreparedAttachment,
+        _operation: &JournaledOperation,
+    ) -> VibexResult<()> {
+        self.apply_requested_config(intent, attachment, AttachmentMutationMode::Fenced)
+            .await
+    }
+
+    async fn apply_live_mutation(
+        &self,
+        intent: &SwitchIntent,
+        attachment: &PreparedAttachment,
+        _operation: &JournaledOperation,
+    ) -> VibexResult<()> {
+        self.apply_requested_config(intent, attachment, AttachmentMutationMode::Current)
+            .await
+    }
+
+    async fn build_context_delta(
+        &self,
+        intent: &SwitchIntent,
+        attachment: &PreparedAttachment,
+    ) -> VibexResult<()> {
+        self.context_bridge
+            .prepare_for_switch(&intent.switch_id, &attachment.binding)?;
+        Ok(())
+    }
+
+    async fn revalidate_prepared(
+        &self,
+        intent: &SwitchIntent,
+        attachment: &PreparedAttachment,
+    ) -> VibexResult<()> {
+        let handle = self.attachment_for_prepared(attachment)?;
+        if handle.session_id() != &intent.session_id
+            || handle.fence().activation_generation as i64
+                != attachment.binding.activation_generation
+            || !matches!(
+                handle.state()?,
+                SessionAttachmentState::Prepared | SessionAttachmentState::Committed
+            )
+        {
+            return Err(VibexError::conflict(
+                "runtime_switch_attachment_fence_stale",
+                "prepared ACP attachment fence is stale",
+            ));
+        }
+        let snapshot = handle.payload().lease_snapshot().ok_or_else(|| {
+            VibexError::process(
+                "runtime_switch_process_snapshot_missing",
+                "prepared ACP process snapshot is unavailable",
+            )
+        })?;
+        if snapshot.status != AcpProcessStatus::Ready
+            || snapshot.process_config_status != Some(crate::ProcessConfigStatus::Current)
+            || snapshot.process_spawn_fingerprint != attachment.binding.process_spawn_fingerprint
+        {
+            return Err(VibexError::conflict(
+                "runtime_switch_prepared_process_stale",
+                "prepared ACP process configuration is stale",
+            ));
+        }
+        let state = handle.payload().runtime_config_state();
+        if !state.is_converged()
+            || state.applied_activation_generation != Some(attachment.binding.activation_generation)
+        {
+            return Err(runtime_configuration_unavailable(
+                "session_config_not_converged",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn activate(
+        &self,
+        intent: &SwitchIntent,
+        attachment: &PreparedAttachment,
+        activation_generation: i64,
+    ) -> VibexResult<()> {
+        let live_mutation = Self::is_live_mutation(intent);
+        let target_generation = u64::try_from(activation_generation).map_err(|_| {
+            VibexError::validation(
+                "runtime_switch_generation_invalid",
+                "runtime activation generation is invalid",
+            )
+        })?;
+        let prepared_generation =
+            u64::try_from(attachment.binding.activation_generation).map_err(|_| {
+                VibexError::validation(
+                    "runtime_switch_generation_invalid",
+                    "runtime activation generation is invalid",
+                )
+            })?;
+        let prepared_generation_matches = prepared_generation == target_generation
+            || (live_mutation && prepared_generation.checked_add(1) == Some(target_generation));
+        if !prepared_generation_matches {
+            return Err(VibexError::conflict(
+                "runtime_switch_activation_generation_mismatch",
+                "durable activation generation does not match the prepared ACP fence",
+            ));
+        }
+        let mut handle = self.attachment_for_prepared(attachment)?;
+        if live_mutation {
+            let handle_generation = handle.fence().activation_generation;
+            if handle_generation.checked_add(1) == Some(target_generation) {
+                let previous_fence = handle.fence().clone();
+                handle = self
+                    .client
+                    .attachment_router
+                    .registry
+                    .advance_generation(&previous_fence, target_generation)?;
+            } else if handle_generation != target_generation {
+                return Err(VibexError::conflict(
+                    "runtime_switch_activation_generation_mismatch",
+                    "durable activation generation does not match the live ACP fence",
+                ));
+            }
+            handle
+                .payload()
+                .set_activation_generation(activation_generation);
+            let mut runtime_config = handle.payload().runtime_config_state();
+            runtime_config.mark_generation_if_converged(activation_generation);
+            handle
+                .payload()
+                .set_runtime_config_state(runtime_config.clone());
+            self.client
+                .runtime_config_states
+                .lock()
+                .map_err(|_| lock_poisoned_error("runtimeConfigStates"))?
+                .insert(attachment.binding.binding_id.clone(), runtime_config);
+        }
+        let activated = self.client.activate_attachment(&handle)?;
+        self.client.commit_attachment_identity(
+            &intent.session_id,
+            &LegacyAttachmentIdentity {
+                binding_id: attachment.binding.binding_id.clone(),
+                activation_generation: target_generation,
+                provider_profile_id: intent.target_selection.provider_profile_id.clone(),
+                attached_process_id: Some(activated.fence().process_instance_id.clone()),
+            },
+            activated.fence().process_instance_id.clone(),
+        );
+        self.prepared_processes
+            .lock()
+            .map_err(|_| lock_poisoned_error("runtimeSwitchProcesses"))?
+            .remove(&intent.switch_id);
+        self.release_switch_targets(&intent.switch_id);
+        Ok(())
+    }
+
+    async fn cleanup_target(
+        &self,
+        intent: &SwitchIntent,
+        attachment: Option<&PreparedAttachment>,
+    ) -> VibexResult<()> {
+        let result = async {
+            let binding_id = attachment
+                .map(|attachment| attachment.binding.binding_id.clone())
+                .or_else(|| intent.target_binding_id.clone());
+            let mut detached = false;
+            if let Some(binding_id) = binding_id {
+                if let Some(handle) = self
+                    .client
+                    .attachment_router
+                    .registry
+                    .attachment(&binding_id)?
+                {
+                    self.client.detach_attachment(handle.fence()).await;
+                    detached = true;
+                }
+                self.client
+                    .runtime_config_states
+                    .lock()
+                    .map_err(|_| lock_poisoned_error("runtimeConfigStates"))?
+                    .remove(&binding_id);
+                self.client
+                    .restore_compatibility_keys
+                    .lock()
+                    .map_err(|_| lock_poisoned_error("restoreCompatibilityKeys"))?
+                    .remove(&binding_id);
+            }
+            let lease = self
+                .prepared_processes
+                .lock()
+                .map_err(|_| lock_poisoned_error("runtimeSwitchProcesses"))?
+                .remove(&intent.switch_id);
+            if !detached && let Some(lease) = lease {
+                self.client.release_process_reservation(&lease).await;
+            }
+            Ok(())
+        }
+        .await;
+        self.release_switch_targets(&intent.switch_id);
+        result
+    }
+
+    async fn cleanup_source_after_commit(&self, intent: &SwitchIntent) -> VibexResult<()> {
+        // Keep the old exact-fenced attachment as an inactive warm candidate.
+        // The lifecycle backend will reclaim it only after active-work, lease,
+        // idle-timeout and LRU checks all pass. Explicit session deletion uses
+        // the force-cleanup path instead.
+        let _ = intent.source_binding_id.as_ref();
+        Ok(())
+    }
+
+    async fn reconcile_operation(
+        &self,
+        intent: &SwitchIntent,
+        operation: &SwitchOperationRecord,
+    ) -> VibexResult<OperationReconcileOutcome> {
+        if matches!(
+            operation.operation_kind.as_str(),
+            OP_CANCEL_ACTIVE_TURN
+                | OP_RESOLVE_PENDING_PERMISSION
+                | OP_CLOSE_TERMINAL
+                | OP_CANCEL_BACKGROUND_WORK
+        ) {
+            let snapshot = self.probe(&intent.session_id).await?;
+            let inactive = match operation.operation_kind.as_str() {
+                OP_CANCEL_ACTIVE_TURN => !snapshot.active_turn,
+                OP_RESOLVE_PENDING_PERMISSION => !snapshot.pending_permission,
+                OP_CLOSE_TERMINAL => !snapshot.active_terminal,
+                OP_CANCEL_BACKGROUND_WORK => !snapshot.background_work,
+                _ => unreachable!(),
+            };
+            return Ok(if inactive {
+                OperationReconcileOutcome::Confirmed {
+                    native_result_reference: None,
+                }
+            } else {
+                OperationReconcileOutcome::NotFound
+            });
+        }
+        if let Some(binding_id) = intent.target_binding_id.as_ref()
+            && let Some(handle) = self
+                .client
+                .attachment_router
+                .registry
+                .attachment(binding_id)?
+        {
+            return Ok(OperationReconcileOutcome::Confirmed {
+                native_result_reference: Some(handle.fence().native_session_id.clone()),
+            });
+        }
+        Ok(OperationReconcileOutcome::NotFound)
+    }
+}
+
+#[async_trait]
+impl ActiveWorkGate for AcpRuntimeSwitchBridge {
+    async fn probe(&self, session_id: &VibexSessionId) -> VibexResult<ActiveWorkSnapshot> {
+        if let Some(handle) = self.client.attachment_router.registry.current(session_id)? {
+            return Ok(handle.payload().active_work_snapshot());
+        }
+        let conn = open_database(&self.db_path)?;
+        let session = SessionRepository::get(&conn, session_id)?.ok_or_else(|| {
+            VibexError::validation("session_not_found", "Agent session was not found")
+        })?;
+        Ok(ActiveWorkSnapshot {
+            active_turn: session.state == AgentSessionState::Running,
+            pending_permission: session.state == AgentSessionState::NeedsInput,
+            active_terminal: false,
+            background_work: false,
+        })
+    }
+
+    async fn set_prompt_gate(&self, session_id: &VibexSessionId, closed: bool) -> VibexResult<()> {
+        self.client.set_session_prompt_gate(session_id, closed)
+    }
+
+    async fn cancel(
+        &self,
+        session_id: &VibexSessionId,
+        kind: ActiveWorkKind,
+        _operation: &JournaledOperation,
+    ) -> VibexResult<()> {
+        let Some(handle) = self.client.attachment_router.registry.current(session_id)? else {
+            return Ok(());
+        };
+        let payload = handle.payload();
+        match kind {
+            ActiveWorkKind::ActiveTurn => {
+                payload.process().notify(
+                    AcpOperation::SessionCancel.method(),
+                    protocol::build_session_cancel_params(&payload.native_session_id),
+                )?;
+                if let Ok(mut state) = payload.state.lock() {
+                    state.active_turn = None;
+                    state.tool_calls.clear();
+                }
+                payload
+                    .process()
+                    .clear_pending_prompt_for_session(&payload.native_session_id);
+                Ok(())
+            }
+            ActiveWorkKind::PendingPermission => {
+                payload.cancel_pending_host_requests();
+                Ok(())
+            }
+            ActiveWorkKind::ActiveTerminal => {
+                let process = payload.process();
+                for terminal_id in payload.active_terminal_ids() {
+                    process.terminal_host.kill(&terminal_id).await?;
+                    process.terminal_host.release(&terminal_id).await?;
+                    process.finish_active_terminal(&terminal_id);
+                }
+                Ok(())
+            }
+            ActiveWorkKind::BackgroundWork => Err(VibexError::capability(
+                "runtime_switch_background_cancel_unsupported",
+                "ACP background work cannot be cancelled with confirmed semantics",
+            )),
+        }
+    }
+}
+
+fn runtime_configuration_unavailable(cause_code: &str) -> VibexError {
+    VibexError::capability(
+        "runtime_switch_configuration_unavailable",
+        "selected Agent runtime configuration is unavailable",
+    )
+    .with_diagnostic("causeCode", redact_summary(cause_code))
+}
+
+fn map_runtime_switch_acp_error(error: VibexError) -> VibexError {
+    match error.code.as_str() {
+        "acp_restore_authentication_required" | "provider_authentication_required" => {
+            VibexError::capability(
+                "runtime_switch_authentication_required",
+                "selected Agent runtime requires authentication",
+            )
+            .with_diagnostic("causeCode", error.code)
+        }
+        _ => error,
+    }
+}
+
+/// ACP implementation of the provider-neutral runtime lifecycle contract.
+/// The bridge remains the sole owner of process/attachment side effects; this
+/// adapter only projects bounded state and performs exact-fence claims.
+pub struct AcpRuntimeLifecycleBackend {
+    bridge: Arc<AcpRuntimeSwitchBridge>,
+    publisher: Mutex<Option<RuntimeLifecyclePublisher>>,
+    attachment_idle_timeout: Duration,
+    warm_attachment_limit: usize,
+    process_idle_timeout: Duration,
+    global_process_limit: usize,
+}
+
+impl std::fmt::Debug for AcpRuntimeLifecycleBackend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AcpRuntimeLifecycleBackend")
+            .field("attachment_idle_timeout", &self.attachment_idle_timeout)
+            .field("warm_attachment_limit", &self.warm_attachment_limit)
+            .field("process_idle_timeout", &self.process_idle_timeout)
+            .field("global_process_limit", &self.global_process_limit)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AcpRuntimeLifecycleBackend {
+    pub const DEFAULT_ATTACHMENT_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+    pub const DEFAULT_PROCESS_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+    pub const DEFAULT_WARM_ATTACHMENT_LIMIT: usize = 2;
+    pub const DEFAULT_GLOBAL_PROCESS_LIMIT: usize = 8;
+
+    pub fn new(bridge: Arc<AcpRuntimeSwitchBridge>) -> Self {
+        Self {
+            bridge,
+            publisher: Mutex::new(None),
+            attachment_idle_timeout: Self::DEFAULT_ATTACHMENT_IDLE_TIMEOUT,
+            warm_attachment_limit: Self::DEFAULT_WARM_ATTACHMENT_LIMIT,
+            process_idle_timeout: Self::DEFAULT_PROCESS_IDLE_TIMEOUT,
+            global_process_limit: Self::DEFAULT_GLOBAL_PROCESS_LIMIT,
+        }
+    }
+
+    pub fn with_limits(
+        mut self,
+        attachment_idle_timeout: Duration,
+        warm_attachment_limit: usize,
+        process_idle_timeout: Duration,
+        global_process_limit: usize,
+    ) -> VibexResult<Self> {
+        if attachment_idle_timeout.is_zero()
+            || process_idle_timeout.is_zero()
+            || warm_attachment_limit == 0
+            || global_process_limit == 0
+        {
+            return Err(VibexError::validation(
+                "acp_runtime_lifecycle_limits_invalid",
+                "ACP runtime lifecycle limits must be positive",
+            ));
+        }
+        self.attachment_idle_timeout = attachment_idle_timeout;
+        self.warm_attachment_limit = warm_attachment_limit;
+        self.process_idle_timeout = process_idle_timeout;
+        self.global_process_limit = global_process_limit;
+        Ok(self)
+    }
+
+    fn publish(
+        &self,
+        session_id: &VibexSessionId,
+        kind: vibex_core::RuntimeEventKind,
+        binding_id: Option<RuntimeBindingId>,
+        process_id: Option<RuntimeProcessId>,
+    ) {
+        if let Ok(publisher) = self.publisher.lock()
+            && let Some(publisher) = publisher.as_ref()
+        {
+            let _ = publisher.publish(session_id, kind, binding_id, process_id);
+        }
+    }
+
+    fn attachment_snapshot(
+        &self,
+        handle: &AcpAttachmentHandle,
+    ) -> VibexResult<RuntimeAttachmentSnapshot> {
+        let status = match handle.state()? {
+            SessionAttachmentState::Preparing | SessionAttachmentState::Prepared => {
+                RuntimeAttachmentStatus::Preparing
+            }
+            SessionAttachmentState::Committed => RuntimeAttachmentStatus::Ready,
+            SessionAttachmentState::Inactive => RuntimeAttachmentStatus::Inactive,
+            SessionAttachmentState::Crashed => RuntimeAttachmentStatus::Crashed,
+            SessionAttachmentState::Closing | SessionAttachmentState::Closed => {
+                RuntimeAttachmentStatus::Closing
+            }
+        };
+        handle
+            .payload()
+            .runtime_attachment_snapshot(handle.session_id(), status)
+    }
+
+    fn process_snapshot_for(
+        &self,
+        process_id: &RuntimeProcessId,
+    ) -> VibexResult<RuntimeProcessSnapshot> {
+        let internal = AcpProcessInstanceId::from_opaque(process_id.opaque_value().to_string())?;
+        let snapshot = self.bridge.client.process_registry.snapshot(&internal)?;
+        let status = match snapshot.status {
+            AcpProcessStatus::Starting => vibex_core::RuntimeProcessStatus::Starting,
+            AcpProcessStatus::Ready => vibex_core::RuntimeProcessStatus::Ready,
+            AcpProcessStatus::Closing => vibex_core::RuntimeProcessStatus::Closing,
+            AcpProcessStatus::Closed => vibex_core::RuntimeProcessStatus::Closed,
+            AcpProcessStatus::Crashed => vibex_core::RuntimeProcessStatus::Crashed,
+        };
+        let config_status = snapshot.process_config_status.map(|status| match status {
+            crate::ProcessConfigStatus::Current => RuntimeProcessConfigStatus::Current,
+            crate::ProcessConfigStatus::StaleLiveMutationAvailable => {
+                RuntimeProcessConfigStatus::StaleLiveMutationAvailable
+            }
+            crate::ProcessConfigStatus::StaleRestartRequired
+            | crate::ProcessConfigStatus::PreparingReplacement
+            | crate::ProcessConfigStatus::ReplacementFailed => {
+                RuntimeProcessConfigStatus::StaleRestartRequired
+            }
+        });
+        let fingerprint = snapshot
+            .process_spawn_fingerprint
+            .strip_prefix("sha256:")
+            .unwrap_or(&snapshot.process_spawn_fingerprint);
+        let pending_host_callbacks = self
+            .bridge
+            .client
+            .attachment_router
+            .registry
+            .attachments()?
+            .into_iter()
+            .filter(|handle| handle.fence().process_instance_id == internal)
+            .map(|handle| handle.payload().pending_host_callback_count())
+            .fold(0usize, usize::saturating_add);
+        Ok(RuntimeProcessSnapshot {
+            process_id: process_id.clone(),
+            status,
+            config_status,
+            protocol_version: snapshot.protocol_version,
+            attached_session_count: snapshot.attached_session_count.min(u32::MAX as usize) as u32,
+            pending_request_count: snapshot.pending_request_count.min(u32::MAX as usize) as u32,
+            pending_host_callback_count: pending_host_callbacks.min(u32::MAX as usize) as u32,
+            lease_counts: RuntimeLeaseRoleCounts::default(),
+            spawn_fingerprint_prefix: Some(fingerprint.chars().take(12).collect()),
+        })
+    }
+}
+
+#[async_trait]
+impl RuntimeLifecycleBackend for AcpRuntimeLifecycleBackend {
+    fn install_publisher(&self, publisher: RuntimeLifecyclePublisher) {
+        if let Ok(mut current) = self.publisher.lock() {
+            *current = Some(publisher.clone());
+        }
+        self.bridge
+            .client
+            .attachment_router
+            .install_lifecycle_publisher(publisher);
+    }
+
+    fn snapshot(&self, session_id: &VibexSessionId) -> VibexResult<RuntimeBackendSnapshot> {
+        let conn = open_database(&self.bridge.db_path)?;
+        if SessionRepository::get(&conn, session_id)?.is_none() {
+            return Err(VibexError::validation(
+                "session_not_found",
+                "Agent session was not found",
+            ));
+        }
+        let Some(handle) = self
+            .bridge
+            .client
+            .attachment_router
+            .registry
+            .current(session_id)?
+        else {
+            return Ok(RuntimeBackendSnapshot {
+                materialization_status: RuntimeMaterializationStatus::NotMaterialized,
+                attachment: None,
+            });
+        };
+        let attachment = self.attachment_snapshot(&handle)?;
+        let materialization_status = if attachment.status == RuntimeAttachmentStatus::Crashed {
+            RuntimeMaterializationStatus::Unavailable
+        } else {
+            RuntimeMaterializationStatus::Available
+        };
+        Ok(RuntimeBackendSnapshot {
+            materialization_status,
+            attachment: Some(attachment),
+        })
+    }
+
+    fn process_snapshot(
+        &self,
+        process_id: &RuntimeProcessId,
+    ) -> VibexResult<RuntimeProcessSnapshot> {
+        self.process_snapshot_for(process_id)
+    }
+
+    fn touch(&self, target: &RuntimeLeaseTarget, now_ms: i64) -> VibexResult<()> {
+        match target {
+            RuntimeLeaseTarget::Process(process_id) => {
+                let process_id =
+                    AcpProcessInstanceId::from_opaque(process_id.opaque_value().to_string())?;
+                self.bridge
+                    .client
+                    .process_registry
+                    .touch(&process_id, now_ms)
+            }
+            RuntimeLeaseTarget::Attachment {
+                binding_id,
+                activation_generation,
+                process_id,
+            } => {
+                let process_id =
+                    AcpProcessInstanceId::from_opaque(process_id.opaque_value().to_string())?;
+                let handle = self
+                    .bridge
+                    .client
+                    .attachment_router
+                    .registry
+                    .attachment(binding_id)?
+                    .ok_or_else(|| {
+                        VibexError::conflict(
+                            "runtime_not_materialized",
+                            "runtime attachment is no longer materialized",
+                        )
+                    })?;
+                if handle.fence().activation_generation as i64 != *activation_generation
+                    || handle.fence().process_instance_id != process_id
+                {
+                    return Err(VibexError::conflict(
+                        "runtime_switch_attachment_fence_stale",
+                        "runtime attachment lease target is stale",
+                    ));
+                }
+                self.bridge
+                    .client
+                    .attachment_router
+                    .registry
+                    .touch(handle.fence(), now_ms)?;
+                self.bridge
+                    .client
+                    .process_registry
+                    .touch(&process_id, now_ms)
+            }
+        }
+    }
+
+    async fn materialize_owner(
+        &self,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<RuntimeBackendSnapshot> {
+        let handle = self.bridge.materialize_current_runtime(session_id).await?;
+        let attachment = self.attachment_snapshot(&handle)?;
+        let process_id = attachment.process_id.clone();
+        self.publish(
+            session_id,
+            vibex_core::RuntimeEventKind::AttachmentActivated,
+            Some(attachment.binding_id.clone()),
+            Some(process_id),
+        );
+        Ok(RuntimeBackendSnapshot {
+            materialization_status: RuntimeMaterializationStatus::Available,
+            attachment: Some(attachment),
+        })
+    }
+
+    async fn sweep(
+        &self,
+        now_ms: i64,
+        protected_targets: &[RuntimeLeaseTarget],
+    ) -> VibexResult<RuntimeSweepReport> {
+        let registry = &self.bridge.client.attachment_router.registry;
+        let handles = registry.attachments()?;
+        let mut by_session: HashMap<VibexSessionId, Vec<(AcpAttachmentHandle, i64, bool)>> =
+            HashMap::new();
+        for handle in handles {
+            let state = match handle.state() {
+                Ok(state) => state,
+                Err(_) => continue,
+            };
+            if !matches!(
+                state,
+                SessionAttachmentState::Committed | SessionAttachmentState::Inactive
+            ) {
+                continue;
+            }
+            let work = handle.payload().active_work_snapshot();
+            if work.active_turn
+                || work.pending_permission
+                || work.active_terminal
+                || work.background_work
+            {
+                continue;
+            }
+            let (_, last_used) = match registry.usage_timestamps(handle.fence()) {
+                Ok(timestamps) => timestamps,
+                Err(_) => continue,
+            };
+            let process_id = match RuntimeProcessId::from_opaque(
+                handle.fence().process_instance_id.as_str().to_string(),
+            ) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+            let target = RuntimeLeaseTarget::Attachment {
+                binding_id: handle.binding_id().clone(),
+                activation_generation: handle.fence().activation_generation as i64,
+                process_id: process_id.clone(),
+            };
+            if protected_targets.iter().any(|protected| match protected {
+                RuntimeLeaseTarget::Process(candidate) => candidate == &process_id,
+                RuntimeLeaseTarget::Attachment { .. } => protected == &target,
+            }) {
+                continue;
+            }
+            let is_current = state == SessionAttachmentState::Committed;
+            by_session
+                .entry(handle.session_id().clone())
+                .or_default()
+                .push((handle, last_used, is_current));
+        }
+
+        let mut attachments_removed = 0;
+        for (session_id, mut candidates) in by_session {
+            candidates.sort_by(|left, right| {
+                left.1.cmp(&right.1).then(
+                    left.0
+                        .binding_id()
+                        .as_str()
+                        .cmp(right.0.binding_id().as_str()),
+                )
+            });
+            let warm_count = candidates.len();
+            let mut quota_remaining = warm_count.saturating_sub(self.warm_attachment_limit);
+            for (handle, last_used, is_current) in candidates {
+                let quota_victim = !is_current && quota_remaining > 0;
+                let process_instance_id = handle.fence().process_instance_id.clone();
+                let claim = registry.claim_idle_close_if(
+                    handle.fence(),
+                    last_used,
+                    now_ms,
+                    self.attachment_idle_timeout
+                        .as_millis()
+                        .min(i64::MAX as u128) as i64,
+                    |payload, is_current, idle| {
+                        let work = payload.active_work_snapshot();
+                        if work.active_turn
+                            || work.pending_permission
+                            || work.active_terminal
+                            || work.background_work
+                        {
+                            return false;
+                        }
+                        let Ok(process) = self
+                            .bridge
+                            .client
+                            .process_registry
+                            .snapshot(&process_instance_id)
+                        else {
+                            return false;
+                        };
+                        if process.status != AcpProcessStatus::Ready {
+                            return false;
+                        }
+                        let stale = process
+                            .process_config_status
+                            .is_some_and(|status| status != crate::ProcessConfigStatus::Current);
+                        idle || stale || (quota_victim && !is_current)
+                    },
+                );
+                let claimed = match claim {
+                    Ok(Some(claimed)) => claimed,
+                    Ok(None) | Err(_) => {
+                        if quota_victim {
+                            // A changed oldest candidate invalidates this LRU
+                            // pass. Rebuild the ordered set on the next sweep.
+                            quota_remaining = 0;
+                        }
+                        continue;
+                    }
+                };
+                if quota_victim {
+                    quota_remaining = quota_remaining.saturating_sub(1);
+                }
+                let binding_id = claimed.binding_id().clone();
+                let process_id = RuntimeProcessId::from_opaque(
+                    claimed.fence().process_instance_id.as_str().to_string(),
+                )
+                .ok();
+                self.bridge.client.detach_attachment(claimed.fence()).await;
+                attachments_removed += 1;
+                self.publish(
+                    &session_id,
+                    vibex_core::RuntimeEventKind::AttachmentRemoved,
+                    Some(binding_id),
+                    process_id,
+                );
+            }
+        }
+
+        let mut process_candidates = self.bridge.client.process_registry.snapshots()?;
+        process_candidates.retain(|snapshot| {
+            let host_callbacks = self
+                .bridge
+                .client
+                .attachment_router
+                .registry
+                .attachments()
+                .ok()
+                .map(|handles| {
+                    handles
+                        .into_iter()
+                        .filter(|handle| {
+                            handle.fence().process_instance_id == snapshot.process_instance_id
+                        })
+                        .map(|handle| handle.payload().pending_host_callback_count())
+                        .fold(0usize, usize::saturating_add)
+                })
+                .unwrap_or(usize::MAX);
+            snapshot.status == AcpProcessStatus::Ready
+                && snapshot.attached_session_count == 0
+                && snapshot.pending_request_count == 0
+                && host_callbacks == 0
+                && snapshot.reusable
+                && RuntimeProcessId::from_opaque(snapshot.process_instance_id.as_str().to_string())
+                    .ok()
+                    .is_some_and(|process_id| {
+                        !protected_targets.iter().any(|target| match target {
+                            RuntimeLeaseTarget::Process(candidate) => candidate == &process_id,
+                            RuntimeLeaseTarget::Attachment {
+                                process_id: candidate,
+                                ..
+                            } => candidate == &process_id,
+                        })
+                    })
+        });
+        process_candidates.sort_by(|left, right| {
+            left.last_used_at_ms.cmp(&right.last_used_at_ms).then(
+                left.process_instance_id
+                    .as_str()
+                    .cmp(right.process_instance_id.as_str()),
+            )
+        });
+        let process_overage = process_candidates
+            .iter()
+            .filter(|snapshot| {
+                !snapshot
+                    .process_config_status
+                    .is_some_and(|status| status != crate::ProcessConfigStatus::Current)
+            })
+            .count()
+            .saturating_sub(self.global_process_limit);
+        let mut quota_remaining = process_overage;
+        let mut processes_removed = 0;
+        for snapshot in process_candidates {
+            let idle = now_ms.saturating_sub(snapshot.last_used_at_ms)
+                >= self.process_idle_timeout.as_millis().min(i64::MAX as u128) as i64;
+            let stale = snapshot
+                .process_config_status
+                .is_some_and(|status| status != crate::ProcessConfigStatus::Current);
+            let quota_victim = !stale && quota_remaining > 0;
+            if !idle && !stale && !quota_victim {
+                continue;
+            }
+            let Some(lease) = self.bridge.client.process_registry.claim_idle_close(
+                &snapshot.process_instance_id,
+                snapshot.last_used_at_ms,
+                now_ms,
+                self.process_idle_timeout.as_millis().min(i64::MAX as u128) as i64,
+                quota_victim,
+            )?
+            else {
+                if quota_victim {
+                    // A concurrent touch or state change invalidates the LRU
+                    // ordering. Recompute candidates on the next sweep.
+                    quota_remaining = 0;
+                }
+                continue;
+            };
+            if quota_victim {
+                quota_remaining = quota_remaining.saturating_sub(1);
+            }
+            lease.process().shutdown().await;
+            self.bridge
+                .client
+                .process_registry
+                .remove(&snapshot.process_instance_id)?;
+            processes_removed += 1;
+        }
+
+        Ok(RuntimeSweepReport {
+            attachments_removed,
+            processes_removed,
+        })
+    }
+}
+
+impl std::fmt::Debug for AcpRuntimeClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AcpRuntimeClient")
+            .field("handshake_timeout", &self.handshake_timeout)
+            .field("restore_timeout", &self.restore_timeout)
+            .field("prompt_timeout", &self.prompt_timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AcpRuntimeClient {
+    pub fn new(config_service: ProviderConfigService) -> Self {
+        Self::new_with_observability(config_service, Arc::new(RuntimeObservability::new()))
+    }
+
+    pub fn new_with_observability(
+        config_service: ProviderConfigService,
+        observability: Arc<RuntimeObservability>,
+    ) -> Self {
+        Self {
+            config_service,
+            attachment_router: Arc::new(AcpAttachmentRouter::with_observability(
+                observability.clone(),
+            )),
+            legacy_attachment_identities: Mutex::new(HashMap::new()),
+            runtime_config_states: Mutex::new(HashMap::new()),
+            restore_compatibility_keys: Mutex::new(HashMap::new()),
+            restore_results: Mutex::new(HashMap::new()),
+            session_operation_locks: Mutex::new(HashMap::new()),
+            prompt_gate_sessions: Mutex::new(BTreeSet::new()),
+            process_registry: AcpProcessRegistry::with_observability(observability.clone()),
+            observability,
+            compatibility_registry: AcpCompatibilityRegistry::builtin()
+                .expect("builtin ACP compatibility descriptors must be valid"),
+            multi_session_contracts: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            test_multi_session_identities: Mutex::new(HashMap::new()),
+            handshake_timeout: ACP_HANDSHAKE_TIMEOUT,
+            restore_timeout: ACP_SESSION_LOAD_TIMEOUT,
+            prompt_timeout: ACP_PROMPT_TIMEOUT,
+            terminal_host: None,
+        }
+    }
+
+    pub fn with_terminal_host(
+        config_service: ProviderConfigService,
+        terminal_host: Arc<dyn AcpTerminalHost>,
+    ) -> Self {
+        Self::with_terminal_host_and_observability(
+            config_service,
+            terminal_host,
+            Arc::new(RuntimeObservability::new()),
+        )
+    }
+
+    pub fn with_terminal_host_and_observability(
+        config_service: ProviderConfigService,
+        terminal_host: Arc<dyn AcpTerminalHost>,
+        observability: Arc<RuntimeObservability>,
+    ) -> Self {
+        Self {
+            config_service,
+            attachment_router: Arc::new(AcpAttachmentRouter::with_observability(
+                observability.clone(),
+            )),
+            legacy_attachment_identities: Mutex::new(HashMap::new()),
+            runtime_config_states: Mutex::new(HashMap::new()),
+            restore_compatibility_keys: Mutex::new(HashMap::new()),
+            restore_results: Mutex::new(HashMap::new()),
+            session_operation_locks: Mutex::new(HashMap::new()),
+            prompt_gate_sessions: Mutex::new(BTreeSet::new()),
+            process_registry: AcpProcessRegistry::with_observability(observability.clone()),
+            observability,
+            compatibility_registry: AcpCompatibilityRegistry::builtin()
+                .expect("builtin ACP compatibility descriptors must be valid"),
+            multi_session_contracts: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            test_multi_session_identities: Mutex::new(HashMap::new()),
+            handshake_timeout: ACP_HANDSHAKE_TIMEOUT,
+            restore_timeout: ACP_SESSION_LOAD_TIMEOUT,
+            prompt_timeout: ACP_PROMPT_TIMEOUT,
+            terminal_host: Some(terminal_host),
+        }
+    }
+
+    pub fn observability(&self) -> Arc<RuntimeObservability> {
+        self.observability.clone()
+    }
+
+    pub fn route_key_for_agent(&self, agent_id: &AgentId) -> AgentRuntimeRouteKey {
+        self.compatibility_registry
+            .for_agent(agent_id)
+            .map(|compatibility| compatibility.route_key())
+            .unwrap_or_else(|| AgentRuntimeRouteKey {
+                agent_id: agent_id.clone(),
+                transport_kind: TransportKind::Acp,
+                adapter_id: default_adapter_for_agent(agent_id),
+            })
+    }
+
+    /// Returns the last bounded restore result for a logical session. This is
+    /// an attachment-local transient seam for the future switch coordinator;
+    /// it is not a durable current-binding pointer.
+    pub fn last_restore_result(
+        &self,
+        session_id: &VibexSessionId,
+    ) -> Option<vibex_core::AgentSessionRestoreResult> {
+        self.restore_results
+            .lock()
+            .ok()
+            .and_then(|results| results.get(session_id.as_str()).cloned())
+    }
+
+    pub fn restore_compatibility_key(
+        &self,
+        binding_id: &RuntimeBindingId,
+    ) -> Option<AgentSessionRestoreCompatibilityKey> {
+        self.restore_compatibility_keys
+            .lock()
+            .ok()
+            .and_then(|keys| keys.get(binding_id).cloned())
+    }
+
+    fn record_restore_result(
+        &self,
+        session_id: &VibexSessionId,
+        result: vibex_core::AgentSessionRestoreResult,
+    ) {
+        let metric_result = restore_metric_result(result.outcome);
+        self.observability
+            .increment(RuntimeMetricName::Restore, None, metric_result);
+        RuntimeLogContext::new("restore")
+            .with_logical_session_id(session_id)
+            .with_restore_outcome(metric_result)
+            .emit(
+                if matches!(
+                    result.outcome,
+                    AgentSessionRestoreOutcome::Resumed | AgentSessionRestoreOutcome::Loaded
+                ) {
+                    RuntimeLogLevel::Info
+                } else {
+                    RuntimeLogLevel::Warn
+                },
+                "acp_runtime_restore",
+                metric_result,
+                result.error_code.as_deref(),
+                None,
+            );
+        if let Ok(mut results) = self.restore_results.lock() {
+            results.insert(session_id.as_str().to_string(), result);
+        }
+    }
+
+    /// Applies a session-scoped configuration patch against the committed
+    /// attachment.  The operation lock is held for the complete preferred /
+    /// wire / effective sequence so concurrent prompts, replacement, and
+    /// mutations cannot cross the fence.
+    pub async fn update_session_runtime_config(
+        &self,
+        request: SessionRuntimeConfigMutationRequest,
+    ) -> VibexResult<SessionRuntimeConfigMutationResult> {
+        let lock = self.session_operation_lock(&request.session_id)?;
+        let _guard = lock.lock().await;
+        let attachment = self
+            .current_attachment(&request.session_id)
+            .ok_or_else(|| {
+                VibexError::conflict(
+                    "acp_session_config_attachment_missing",
+                    "ACP session has no committed current attachment",
+                )
+            })?;
+        self.apply_runtime_config_mutation(
+            &attachment,
+            request,
+            false,
+            AttachmentMutationMode::Current,
+        )
+        .await
+    }
+
+    /// Returns the attachment-local model catalog used by the later catalog
+    /// API. Profile-only models intentionally carry no synthesized effort
+    /// capability.
+    pub fn session_model_catalog(
+        &self,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<Vec<crate::session_config::SessionModelCatalogEntry>> {
+        let attachment = self.current_attachment(session_id).ok_or_else(|| {
+            VibexError::conflict(
+                "acp_session_config_attachment_missing",
+                "ACP session has no committed current attachment",
+            )
+        })?;
+        let payload = attachment.payload();
+        let model_ids = payload
+            .state
+            .lock()
+            .map(|state| state.model_ids.clone())
+            .map_err(|_| lock_poisoned_error("attachmentState"))?;
+        // ACP's generic reasoning-effort option is session-global evidence.
+        // It does not prove that any particular model accepts those values.
+        // Per-model efforts remain empty until a probe/extension supplies an
+        // explicit model association.
+        let session_entries =
+            model_ids
+                .into_iter()
+                .map(|model_id| crate::session_config::SessionModelCatalogEntry {
+                    model_id,
+                    reasoning_efforts: Vec::new(),
+                    default_reasoning_effort: None,
+                    source: crate::session_config::SessionModelCatalogSource::Session,
+                });
+        let profile_models = payload.process().provider_profile_id.clone();
+        let profile_models = self
+            .config_service
+            .get_acp_profile_config(profile_models)
+            .map(|config| config.models)
+            .unwrap_or_default();
+        Ok(crate::session_config::merge_model_catalog(
+            session_entries,
+            Vec::new(),
+            profile_models,
+            Vec::new(),
+        ))
+    }
+
+    pub fn subscribe_process_config_status(
+        &self,
+    ) -> broadcast::Receiver<crate::ProcessConfigStatusEvent> {
+        self.process_registry.subscribe_config_status()
+    }
+
+    pub fn refresh_profile_process_config_status(
+        &self,
+        provider_profile_id: &ProviderProfileId,
+    ) -> VibexResult<usize> {
+        let targets = self
+            .process_registry
+            .process_configs_for_profile(provider_profile_id)?;
+        if targets.is_empty() {
+            return Ok(0);
+        }
+        let config = self.profile_config(provider_profile_id)?;
+        let mut changed_count = 0;
+        let mut changed_processes = Vec::new();
+        for (instance_id, workspace_scope, launch) in targets {
+            let mut current = self.process_spawn_config_snapshot(
+                provider_profile_id,
+                &config,
+                workspace_scope.path(),
+                &ProviderRuntimeResources::default(),
+            )?;
+            // Profile saves do not rewrite workspace-scoped resource input.
+            // Preserve the exact launch revisions until the MCP/Skills owner
+            // publishes its own refresh signal.
+            current.mcp_revision = launch.mcp_revision.clone();
+            current.skills_revision = launch.skills_revision.clone();
+            current.native_state_home_id = launch.native_state_home_id.clone();
+            current = current.with_content_revision();
+            match self
+                .process_registry
+                .refresh_config_status(&instance_id, current)
+            {
+                Ok(Some(_)) => {
+                    changed_count += 1;
+                    changed_processes.push(instance_id);
+                }
+                Ok(None) => {}
+                Err(error) if error.code == "acp_process_instance_missing" => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if !changed_processes.is_empty() {
+            for handle in self.attachment_router.registry.attachments()? {
+                if changed_processes.contains(&handle.fence().process_instance_id) {
+                    self.attachment_router
+                        .publish_attachment(&handle, vibex_core::RuntimeEventKind::ProcessChanged);
+                }
+            }
+        }
+        Ok(changed_count)
+    }
+
+    fn session_operation_lock(
+        &self,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<Arc<AsyncMutex<()>>> {
+        let mut locks = self
+            .session_operation_locks
+            .lock()
+            .map_err(|_| lock_poisoned_error("sessionOperationLocks"))?;
+        Ok(Arc::clone(
+            locks
+                .entry(session_id.as_str().to_string())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+        ))
+    }
+
+    fn current_attachment(&self, session_id: &VibexSessionId) -> Option<AcpAttachmentHandle> {
+        let handle = self
+            .attachment_router
+            .registry
+            .current(session_id)
+            .ok()
+            .flatten()?;
+        if handle.payload().process().is_closed() {
+            self.attachment_router.handle_crash(handle.fence());
+            return None;
+        }
+        Some(handle)
+    }
+
+    fn prompt_gate_closed(&self, session_id: &VibexSessionId) -> bool {
+        self.prompt_gate_sessions
+            .lock()
+            .map(|sessions| sessions.contains(session_id))
+            .unwrap_or(true)
+    }
+
+    fn activate_attachment(
+        &self,
+        handle: &AcpAttachmentHandle,
+    ) -> VibexResult<AcpAttachmentHandle> {
+        self.attachment_router.registry.activate_with_prompt_closed(
+            handle.fence(),
+            self.prompt_gate_closed(handle.session_id()),
+        )
+    }
+
+    fn set_session_prompt_gate(
+        &self,
+        session_id: &VibexSessionId,
+        closed: bool,
+    ) -> VibexResult<()> {
+        {
+            let mut sessions = self
+                .prompt_gate_sessions
+                .lock()
+                .map_err(|_| lock_poisoned_error("promptGateSessions"))?;
+            if closed {
+                sessions.insert(session_id.clone());
+            } else {
+                sessions.remove(session_id);
+            }
+        }
+        if let Some(current) = self.current_attachment(session_id) {
+            self.attachment_router
+                .registry
+                .set_prompt_closed(current.fence(), closed)?;
+        }
+        Ok(())
+    }
+
+    fn attachment_identity_candidate(
+        &self,
+        session_id: &VibexSessionId,
+        provider_profile_id: &ProviderProfileId,
+    ) -> VibexResult<LegacyAttachmentIdentity> {
+        let mut identities = self
+            .legacy_attachment_identities
+            .lock()
+            .map_err(|_| lock_poisoned_error("legacyAttachmentIdentities"))?;
+        let key = session_id.as_str().to_string();
+        let mut replaced_binding_id = None;
+        let candidate = match identities.get(&key).cloned() {
+            None => LegacyAttachmentIdentity {
+                binding_id: RuntimeBindingId::new(),
+                activation_generation: 0,
+                provider_profile_id: provider_profile_id.clone(),
+                attached_process_id: None,
+            },
+            Some(mut identity) if identity.provider_profile_id == *provider_profile_id => {
+                if identity.attached_process_id.is_some() {
+                    identity.activation_generation = identity
+                        .activation_generation
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            VibexError::conflict(
+                                "acp_attachment_generation_exhausted",
+                                "ACP attachment activation generation is exhausted",
+                            )
+                        })?;
+                    identity.attached_process_id = None;
+                }
+                identity
+            }
+            Some(identity) => {
+                replaced_binding_id = Some(identity.binding_id);
+                LegacyAttachmentIdentity {
+                    binding_id: RuntimeBindingId::new(),
+                    activation_generation: identity
+                        .activation_generation
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            VibexError::conflict(
+                                "acp_attachment_generation_exhausted",
+                                "ACP attachment activation generation is exhausted",
+                            )
+                        })?,
+                    provider_profile_id: provider_profile_id.clone(),
+                    attached_process_id: None,
+                }
+            }
+        };
+        identities.insert(key, candidate.clone());
+        drop(identities);
+        if let Some(binding_id) = replaced_binding_id {
+            self.runtime_config_states
+                .lock()
+                .map_err(|_| lock_poisoned_error("runtimeConfigStates"))?
+                .remove(&binding_id);
+        }
+        Ok(candidate)
+    }
+
+    fn fresh_attachment_identity(
+        &self,
+        session_id: &VibexSessionId,
+        provider_profile_id: &ProviderProfileId,
+        previous: &LegacyAttachmentIdentity,
+    ) -> VibexResult<LegacyAttachmentIdentity> {
+        let candidate = LegacyAttachmentIdentity {
+            binding_id: RuntimeBindingId::new(),
+            activation_generation: previous.activation_generation.checked_add(1).ok_or_else(
+                || {
+                    VibexError::conflict(
+                        "acp_attachment_generation_exhausted",
+                        "ACP attachment activation generation is exhausted",
+                    )
+                },
+            )?,
+            provider_profile_id: provider_profile_id.clone(),
+            attached_process_id: None,
+        };
+        self.legacy_attachment_identities
+            .lock()
+            .map_err(|_| lock_poisoned_error("legacyAttachmentIdentities"))?
+            .insert(session_id.as_str().to_string(), candidate.clone());
+        self.runtime_config_states
+            .lock()
+            .map_err(|_| lock_poisoned_error("runtimeConfigStates"))?
+            .remove(&previous.binding_id);
+        if let Ok(mut keys) = self.restore_compatibility_keys.lock() {
+            keys.remove(&previous.binding_id);
+        }
+        Ok(candidate)
+    }
+
+    fn commit_attachment_identity(
+        &self,
+        session_id: &VibexSessionId,
+        identity: &LegacyAttachmentIdentity,
+        process_instance_id: AcpProcessInstanceId,
+    ) {
+        if let Ok(mut identities) = self.legacy_attachment_identities.lock() {
+            let mut committed = identity.clone();
+            committed.attached_process_id = Some(process_instance_id);
+            identities.insert(session_id.as_str().to_string(), committed);
+        }
+    }
+
+    fn forget_attachment_identity(&self, session_id: &VibexSessionId) -> VibexResult<()> {
+        let binding_id = self
+            .legacy_attachment_identities
+            .lock()
+            .map_err(|_| lock_poisoned_error("legacyAttachmentIdentities"))?
+            .remove(session_id.as_str())
+            .map(|identity| identity.binding_id);
+        if let Some(binding_id) = binding_id {
+            self.runtime_config_states
+                .lock()
+                .map_err(|_| lock_poisoned_error("runtimeConfigStates"))?
+                .remove(&binding_id);
+            self.restore_compatibility_keys
+                .lock()
+                .map_err(|_| lock_poisoned_error("restoreCompatibilityKeys"))?
+                .remove(&binding_id);
+        }
+        self.restore_results
+            .lock()
+            .map_err(|_| lock_poisoned_error("restoreResults"))?
+            .remove(session_id.as_str());
+        self.session_operation_locks
+            .lock()
+            .map_err(|_| lock_poisoned_error("sessionOperationLocks"))?
+            .remove(session_id.as_str());
+        self.prompt_gate_sessions
+            .lock()
+            .map_err(|_| lock_poisoned_error("promptGateSessions"))?
+            .remove(session_id);
+        Ok(())
+    }
+
+    fn arm_attachment_crash_watcher(&self, handle: &AcpAttachmentHandle) {
+        let attachment = handle.payload();
+        let Some(mut receiver) = attachment.take_crash_receiver() else {
+            return;
+        };
+        let weak_router = Arc::downgrade(&self.attachment_router);
+        let fence = handle.fence().clone();
+        let process_instance_id = fence.process_instance_id.clone();
+        let watcher = tokio::spawn(async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(crash) if crash.process_instance_id == process_instance_id => {
+                        if let Some(router) = weak_router.upgrade() {
+                            router.handle_crash(&fence);
+                        }
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        attachment.set_crash_watcher(watcher.abort_handle());
+    }
+
+    async fn detach_attachment(&self, expected: &SessionAttachmentEventFence) {
+        let Ok(Some(handle)) = self.attachment_router.registry.remove(expected) else {
+            return;
+        };
+        let attachment = handle.payload();
+        attachment.abort_crash_watcher();
+        attachment.cancel_pending_host_requests();
+        let process = attachment.process();
+        process.forget_attachment_terminals(&attachment);
+        let _ = process.notify(
+            AcpOperation::SessionCancel.method(),
+            protocol::build_session_cancel_params(&attachment.native_session_id),
+        );
+        attachment.clear_turn_and_host_requests();
+        let remaining = attachment.lease.detach().unwrap_or_default();
+        if remaining == 0 {
+            let instance_id = attachment.process_instance_id().clone();
+            let keep_warm = self
+                .process_registry
+                .snapshot(&instance_id)
+                .is_ok_and(|snapshot| {
+                    snapshot.reusable && snapshot.status == AcpProcessStatus::Ready
+                });
+            if !keep_warm {
+                let _ = self.process_registry.shutdown(&instance_id).await;
+                let _ = self.process_registry.remove(&instance_id);
+            }
+        }
+    }
+
+    async fn detach_stale_attachment(&self, session_id: &VibexSessionId) {
+        let binding_id = self
+            .legacy_attachment_identities
+            .lock()
+            .ok()
+            .and_then(|identities| identities.get(session_id.as_str()).cloned())
+            .map(|identity| identity.binding_id);
+        let Some(binding_id) = binding_id else {
+            return;
+        };
+        let Ok(Some(handle)) = self.attachment_router.registry.attachment(&binding_id) else {
+            return;
+        };
+        self.detach_attachment(handle.fence()).await;
+    }
+
+    async fn acquire_attachment<F, Fut>(
+        &self,
+        session_id: VibexSessionId,
+        identity: LegacyAttachmentIdentity,
+        lease: ProcessLease<AcpProcess>,
+        expected_native_session_id: Option<String>,
+        activation_mode: AttachmentActivationMode,
+        operation: F,
+    ) -> VibexResult<AcpAttachmentHandle>
+    where
+        F: FnOnce(Arc<AcpProcess>) -> Fut,
+        Fut: std::future::Future<Output = VibexResult<OpenedAcpSession>>,
+    {
+        let crash_receiver = match lease.subscribe_crashes() {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                self.release_process_reservation(&lease).await;
+                return Err(error);
+            }
+        };
+        let key = match SessionAttachmentAcquireKey::new(
+            identity.binding_id.clone(),
+            expected_native_session_id,
+            lease.process_instance_id().clone(),
+            identity.activation_generation,
+        ) {
+            Ok(key) => key,
+            Err(error) => {
+                self.release_process_reservation(&lease).await;
+                return Err(error);
+            }
+        };
+        let payload_lease = lease.clone();
+        let created_native_session_id = Arc::new(Mutex::new(None::<String>));
+        let operation_native_session_id = Arc::clone(&created_native_session_id);
+        let attachment_key = key.clone();
+        let result = self
+            .attachment_router
+            .registry
+            .acquire(session_id.clone(), key, || async move {
+                let opened = operation(payload_lease.process()).await?;
+                let native_session_id = opened.native_session_id.clone();
+                if let Ok(mut created) = operation_native_session_id.lock() {
+                    *created = Some(native_session_id.clone());
+                }
+                Ok(SessionAttachmentAcquireOutput {
+                    native_session_id,
+                    payload: AcpSessionAttachment::new(
+                        payload_lease,
+                        opened,
+                        crash_receiver,
+                        attachment_key.binding_id.clone(),
+                        attachment_key.activation_generation as i64,
+                    ),
+                })
+            })
+            .await;
+
+        match result {
+            Ok(SessionAttachmentAcquireResult::Existing(handle)) => {
+                self.release_process_reservation(&lease).await;
+                let handle = match activation_mode {
+                    AttachmentActivationMode::Immediate => self.activate_attachment(&handle)?,
+                    AttachmentActivationMode::Prepared => handle,
+                };
+                if activation_mode == AttachmentActivationMode::Immediate {
+                    self.commit_attachment_identity(
+                        &session_id,
+                        &identity,
+                        handle.fence().process_instance_id.clone(),
+                    );
+                }
+                self.configure_attachment_runtime_state(&handle, activation_mode.mutation_mode())?;
+                self.replay_attachment_preferred_state(&handle, activation_mode.mutation_mode())
+                    .await?;
+                self.attachment_router.publish_attachment(
+                    &handle,
+                    if activation_mode == AttachmentActivationMode::Immediate {
+                        vibex_core::RuntimeEventKind::AttachmentActivated
+                    } else {
+                        vibex_core::RuntimeEventKind::AttachmentUpdated
+                    },
+                );
+                Ok(handle)
+            }
+            Ok(SessionAttachmentAcquireResult::Created(handle)) => {
+                let ready = match activation_mode {
+                    AttachmentActivationMode::Immediate => {
+                        match self.activate_attachment(&handle) {
+                            Ok(handle) => handle,
+                            Err(error) => {
+                                let _ = self.attachment_router.registry.remove(handle.fence());
+                                handle.payload().release_registration_barrier();
+                                if let Some(native_session_id) = created_native_session_id
+                                    .lock()
+                                    .ok()
+                                    .and_then(|created| created.clone())
+                                {
+                                    let _ = lease.process().notify(
+                                        AcpOperation::SessionCancel.method(),
+                                        protocol::build_session_cancel_params(&native_session_id),
+                                    );
+                                }
+                                self.release_process_reservation(&lease).await;
+                                return Err(error);
+                            }
+                        }
+                    }
+                    AttachmentActivationMode::Prepared => handle,
+                };
+                // The exact native route now exists. Releasing the reader
+                // barrier is safe even while Prepared because routed events
+                // are quarantined until durable Commit activates this fence.
+                ready.payload().release_registration_barrier();
+                self.arm_attachment_crash_watcher(&ready);
+                let status = ready
+                    .payload()
+                    .lease
+                    .snapshot()
+                    .ok()
+                    .map(|snapshot| snapshot.status);
+                if status != Some(AcpProcessStatus::Ready) {
+                    self.attachment_router.handle_crash(ready.fence());
+                    self.detach_attachment(ready.fence()).await;
+                    return Err(VibexError::process(
+                        "acp_process_exited",
+                        "ACP process exited before the session attachment became ready",
+                    ));
+                }
+                if activation_mode == AttachmentActivationMode::Immediate {
+                    self.commit_attachment_identity(
+                        &session_id,
+                        &identity,
+                        ready.fence().process_instance_id.clone(),
+                    );
+                }
+                self.configure_attachment_runtime_state(&ready, activation_mode.mutation_mode())?;
+                self.replay_attachment_preferred_state(&ready, activation_mode.mutation_mode())
+                    .await?;
+                self.attachment_router.publish_attachment(
+                    &ready,
+                    if activation_mode == AttachmentActivationMode::Immediate {
+                        vibex_core::RuntimeEventKind::AttachmentActivated
+                    } else {
+                        vibex_core::RuntimeEventKind::AttachmentCreated
+                    },
+                );
+                Ok(ready)
+            }
+            Err(error) => {
+                if let Some(native_session_id) = created_native_session_id
+                    .lock()
+                    .ok()
+                    .and_then(|created| created.clone())
+                {
+                    let _ = lease.process().notify(
+                        AcpOperation::SessionCancel.method(),
+                        protocol::build_session_cancel_params(&native_session_id),
+                    );
+                }
+                self.release_process_reservation(&lease).await;
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn live_process(&self, session_id: &VibexSessionId) -> Option<Arc<AcpProcess>> {
+        self.current_attachment(session_id)
+            .map(|attachment| attachment.payload().process())
+    }
+
+    fn profile_config(&self, profile_id: &ProviderProfileId) -> VibexResult<AcpProviderConfig> {
+        self.config_service
+            .get_acp_profile_config(profile_id.clone())
+            .map_err(|err| {
+                err.with_recovery_hint(
+                    "Create or select an ACP provider profile with a typed command in the config center before starting ACP sessions.",
+                )
+            })
+    }
+
+    fn is_opencode_profile(&self, profile_id: &ProviderProfileId) -> bool {
+        self.config_service
+            .get_profile(profile_id)
+            .ok()
+            .flatten()
+            .is_some_and(|profile| profile.agent_id.as_str() == OPENCODE_AGENT_ID)
+    }
+
+    fn resolve_env_overlays_for_profile(
+        &self,
+        profile: &ProviderProfile,
+        config: &AcpProviderConfig,
+        cwd: &Path,
+    ) -> VibexResult<Vec<(String, String)>> {
+        let mut overlays = Vec::new();
+        for reference in &config.env {
+            let key = reference.key.trim();
+            if key.is_empty() {
+                continue;
+            }
+            let value = match reference.source {
+                AcpProviderEnvSource::Literal => reference.value.clone(),
+                AcpProviderEnvSource::ProcessEnvironment => std::env::var(key).ok(),
+                AcpProviderEnvSource::SecretReference => reference
+                    .secret_lookup_key
+                    .as_deref()
+                    .and_then(|lookup_key| {
+                        profile
+                            .secrets
+                            .iter()
+                            .find(|secret| secret.lookup_key == lookup_key)
+                            .and_then(|secret| resolve_provider_secret(secret).ok().flatten())
+                    }),
+            };
+            if let Some(value) = value
+                && !value.trim().is_empty()
+            {
+                overlays.push((key.to_string(), value));
+            }
+        }
+        for (key, value) in opencode_model_provider_env(profile) {
+            upsert_env_overlay(&mut overlays, key, value);
+        }
+        match profile.agent_id.as_str() {
+            "claude" => project_claude_provider_env(profile, &mut overlays)?,
+            "codex" => self.project_codex_provider_env(profile, cwd, &mut overlays)?,
+            _ => {}
+        }
+        Ok(overlays)
+    }
+
+    fn resolve_env_overlays(
+        &self,
+        profile_id: &ProviderProfileId,
+        config: &AcpProviderConfig,
+        cwd: &Path,
+    ) -> VibexResult<Vec<(String, String)>> {
+        let profile = self
+            .config_service
+            .get_profile(profile_id)
+            .map_err(|error| error.with_diagnostic("providerProfileId", profile_id.as_str()))?;
+        profile.map_or_else(
+            || Ok(Vec::new()),
+            |profile| self.resolve_env_overlays_for_profile(&profile, config, cwd),
+        )
+    }
+
+    fn project_codex_provider_env(
+        &self,
+        profile: &ProviderProfile,
+        cwd: &Path,
+        overlays: &mut Vec<(String, String)>,
+    ) -> VibexResult<()> {
+        let runtime = codex_runtime_config_from_profile(profile, None)?;
+        if let Some(api_key) = runtime
+            .api_key
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            upsert_env_overlay(
+                overlays,
+                codex_api_key_env_key(&runtime).to_string(),
+                api_key.to_string(),
+            );
+            upsert_env_overlay(
+                overlays,
+                CODEX_ACP_API_KEY_ENV.to_string(),
+                api_key.to_string(),
+            );
+            upsert_env_overlay(
+                overlays,
+                CODEX_ACP_DEFAULT_AUTH_REQUEST_ENV.to_string(),
+                CODEX_ACP_DEFAULT_API_KEY_AUTH_REQUEST.to_string(),
+            );
+        }
+        let Some(config) = render_codex_runtime_config(profile, &runtime) else {
+            return Ok(());
+        };
+        let model_provider_id = runtime.model_provider_id.trim();
+        if !model_provider_id.is_empty() {
+            upsert_env_overlay(
+                overlays,
+                CODEX_ACP_MODEL_PROVIDER_ENV.to_string(),
+                model_provider_id.to_string(),
+            );
+        }
+        let runtime_root = self
+            .config_service
+            .database_path()
+            .parent()
+            .ok_or_else(|| {
+                VibexError::storage(
+                    "acp_runtime_data_parent_missing",
+                    "ACP runtime database path has no parent directory",
+                )
+            })?
+            .join("runtime")
+            .join("codex-profiles")
+            .join(profile.id.as_str())
+            .join(workspace_runtime_key(cwd));
+        crate::ensure_private_runtime_directory(&runtime_root)?;
+        crate::write_private_runtime_file_atomic(
+            &runtime_root.join("config.toml"),
+            config.as_bytes(),
+        )?;
+        upsert_env_overlay(
+            overlays,
+            "CODEX_HOME".to_string(),
+            runtime_root.to_string_lossy().into_owned(),
+        );
+        Ok(())
+    }
+
+    fn selected_model_for_profile(
+        &self,
+        profile_id: &ProviderProfileId,
+        model: Option<&str>,
+    ) -> Option<String> {
+        let model = model.map(str::trim).filter(|model| !model.is_empty())?;
+        let profile = self.config_service.get_profile(profile_id).ok().flatten();
+        if profile.as_ref().is_some_and(|profile| {
+            profile.agent_id.as_str() == OPENCODE_AGENT_ID && is_opencode_default_model(model)
+        }) {
+            return None;
+        }
+        Some(
+            profile
+                .as_ref()
+                .and_then(|profile| opencode_qualified_model_id(profile, model))
+                .unwrap_or_else(|| model.to_string()),
+        )
+    }
+
+    #[cfg(test)]
+    fn route_key(&self, profile_id: &ProviderProfileId) -> VibexResult<AgentRuntimeRouteKey> {
+        let profile = self
+            .config_service
+            .get_profile(profile_id)?
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "provider_profile_not_found",
+                    "Provider Profile was not found for ACP process acquisition",
+                )
+                .with_diagnostic("providerProfileId", profile_id.to_string())
+            })?;
+        Ok(self.route_key_for_profile(&profile))
+    }
+
+    fn route_key_for_profile(&self, profile: &ProviderProfile) -> AgentRuntimeRouteKey {
+        self.route_key_for_agent(&profile.agent_id)
+    }
+
+    #[cfg(test)]
+    fn process_acquire_key(
+        &self,
+        profile_id: &ProviderProfileId,
+        config: &AcpProviderConfig,
+        cwd: &Path,
+        runtime_resources: &ProviderRuntimeResources,
+    ) -> VibexResult<ProcessAcquireKey> {
+        let (key, _) = self.process_key_and_snapshot(profile_id, config, cwd, runtime_resources)?;
+        Ok(key)
+    }
+
+    #[cfg(test)]
+    fn process_key_and_snapshot(
+        &self,
+        profile_id: &ProviderProfileId,
+        config: &AcpProviderConfig,
+        cwd: &Path,
+        runtime_resources: &ProviderRuntimeResources,
+    ) -> VibexResult<(ProcessAcquireKey, ProcessSpawnConfigSnapshot)> {
+        let snapshot =
+            self.process_spawn_config_snapshot(profile_id, config, cwd, runtime_resources)?;
+        let workspace_scope = WorkspaceScope::from_canonical(cwd.to_path_buf())?;
+        let route_key = self.route_key(profile_id)?;
+        let key = ProcessAcquireKey::new(
+            route_key,
+            profile_id.clone(),
+            snapshot.process_spawn_fingerprint(),
+            workspace_scope,
+        )?;
+        Ok((key, snapshot))
+    }
+
+    fn process_launch_materialization(
+        &self,
+        profile_id: &ProviderProfileId,
+        config: &AcpProviderConfig,
+        cwd: &Path,
+        runtime_resources: &ProviderRuntimeResources,
+    ) -> VibexResult<(ProcessAcquireKey, ProcessLaunchMaterialization)> {
+        let profile = self
+            .config_service
+            .get_profile(profile_id)?
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "provider_profile_not_found",
+                    "Provider Profile was not found for ACP process launch",
+                )
+                .with_diagnostic("providerProfileId", profile_id.as_str())
+            })?;
+        // Resolve the actual environment exactly once. The resulting values
+        // are passed to the child only; the snapshot keeps reference metadata.
+        let env_overlays = self.resolve_env_overlays_for_profile(&profile, config, cwd)?;
+        let snapshot = self.process_spawn_config_snapshot_from_profile(
+            profile_id,
+            &profile,
+            config,
+            cwd,
+            runtime_resources,
+            Some(&env_overlays),
+        )?;
+        let workspace_scope = WorkspaceScope::from_canonical(cwd.to_path_buf())?;
+        let route_key = self.route_key_for_profile(&profile);
+        let key = ProcessAcquireKey::new(
+            route_key,
+            profile_id.clone(),
+            snapshot.process_spawn_fingerprint(),
+            workspace_scope,
+        )?;
+        Ok((
+            key,
+            ProcessLaunchMaterialization {
+                snapshot,
+                env_overlays,
+            },
+        ))
+    }
+
+    fn process_spawn_config_snapshot(
+        &self,
+        profile_id: &ProviderProfileId,
+        config: &AcpProviderConfig,
+        cwd: &Path,
+        runtime_resources: &ProviderRuntimeResources,
+    ) -> VibexResult<ProcessSpawnConfigSnapshot> {
+        let profile = self
+            .config_service
+            .get_profile(profile_id)?
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "provider_profile_not_found",
+                    "Provider Profile was not found for ACP process snapshot",
+                )
+                .with_diagnostic("providerProfileId", profile_id.as_str())
+            })?;
+        self.process_spawn_config_snapshot_from_profile(
+            profile_id,
+            &profile,
+            config,
+            cwd,
+            runtime_resources,
+            None,
+        )
+    }
+
+    fn process_spawn_config_snapshot_from_profile(
+        &self,
+        profile_id: &ProviderProfileId,
+        profile: &ProviderProfile,
+        config: &AcpProviderConfig,
+        cwd: &Path,
+        runtime_resources: &ProviderRuntimeResources,
+        effective_env: Option<&[(String, String)]>,
+    ) -> VibexResult<ProcessSpawnConfigSnapshot> {
+        let route_key = self.route_key_for_profile(profile);
+        let process_args =
+            effective_acp_process_args(config, profile.agent_id.as_str() == OPENCODE_AGENT_ID);
+        let mut non_secret_env = BTreeMap::new();
+        let mut secret_reference_versions = BTreeMap::new();
+        self.populate_env_snapshot(
+            profile,
+            config,
+            effective_env,
+            &mut non_secret_env,
+            &mut secret_reference_versions,
+        )?;
+        let (adapter_version, adapter_identity) = self
+            .compatibility_registry
+            .for_agent(&profile.agent_id)
+            .map(|descriptor| {
+                (
+                    descriptor.distribution.exact_version.to_string(),
+                    descriptor.expected_compatibility_identity().to_string(),
+                )
+            })
+            .unwrap_or_else(|| ("unknown".to_string(), "unmanaged".to_string()));
+        let terminal_host_available = self.terminal_host_for_config(config).is_some();
+        non_secret_env.insert(
+            "__vibex_terminal_tools".to_string(),
+            (terminal_host_available && terminal_tools_enabled(config)).to_string(),
+        );
+        non_secret_env.insert(
+            "__vibex_terminal_auth".to_string(),
+            (terminal_host_available && config.terminal_auth).to_string(),
+        );
+        if let Some(revision) = profile_process_options_revision(profile) {
+            non_secret_env.insert("__vibex_opencode_process_projection".to_string(), revision);
+        }
+        let mcp_servers = resolve_acp_mcp_descriptors(config, runtime_resources)?;
+        let mcp_revision = (!mcp_servers.is_empty()).then(|| mcp_servers_fingerprint(&mcp_servers));
+        let skills_revision = runtime_skills_fingerprint(runtime_resources);
+        let native_state_home_id = stable_native_state_home_id(profile_id, cwd)?;
+        let model_provider_id = process_model_provider_id(profile);
+        Ok(ProcessSpawnConfigSnapshot {
+            agent_id: profile.agent_id.clone(),
+            adapter_id: route_key.adapter_id,
+            adapter_version,
+            adapter_binary_identity: format!(
+                "{adapter_identity};binary={}",
+                binary_identity(&config.command)
+            ),
+            provider_profile_id: profile_id.clone(),
+            profile_revision: 0,
+            command: config.command.clone(),
+            args: process_args,
+            cwd_policy: config
+                .cwd_template
+                .clone()
+                .unwrap_or_else(|| "{workspaceRoot}".to_string()),
+            base_url: profile
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
+            model_provider_id,
+            non_secret_env,
+            secret_reference_versions,
+            mcp_revision,
+            skills_revision,
+            native_state_home_id,
+        }
+        .with_content_revision())
+    }
+
+    fn populate_env_snapshot(
+        &self,
+        profile: &ProviderProfile,
+        config: &AcpProviderConfig,
+        effective_env: Option<&[(String, String)]>,
+        non_secret_env: &mut BTreeMap<String, String>,
+        secret_reference_versions: &mut BTreeMap<String, String>,
+    ) -> VibexResult<()> {
+        let secret_env_keys = config
+            .env
+            .iter()
+            .filter(|reference| reference.source == AcpProviderEnvSource::SecretReference)
+            .map(|reference| reference.key.trim().to_string())
+            .filter(|key| !key.is_empty())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        for reference in &config.env {
+            let key = reference.key.trim();
+            if key.is_empty() {
+                continue;
+            }
+            let sensitive = looks_sensitive(key);
+            match reference.source {
+                AcpProviderEnvSource::Literal if !sensitive => {}
+                AcpProviderEnvSource::ProcessEnvironment if !sensitive => {}
+                AcpProviderEnvSource::SecretReference => {
+                    let version = profile
+                        .secrets
+                        .iter()
+                        .find(|secret| {
+                            reference
+                                .secret_lookup_key
+                                .as_deref()
+                                .is_some_and(|lookup| lookup == secret.lookup_key)
+                        })
+                        .map(|secret| {
+                            secret_reference_version(
+                                &secret.lookup_key,
+                                provider_secret_backend_name(secret.backend),
+                                secret.updated_at_ms,
+                            )
+                        })
+                        .transpose()?
+                        .unwrap_or_else(|| format!("ref:missing:{key}"));
+                    secret_reference_versions.insert(key.to_string(), version);
+                }
+                AcpProviderEnvSource::Literal => {
+                    return Err(VibexError::validation(
+                        "acp_sensitive_literal_env",
+                        "sensitive ACP environment values must use a secret reference",
+                    )
+                    .with_diagnostic("envKey", key));
+                }
+                AcpProviderEnvSource::ProcessEnvironment => {
+                    // The parent environment is outside Profile ownership;
+                    // retain only a stable reference identity and never copy
+                    // a credential-like value into the snapshot.
+                    secret_reference_versions.insert(key.to_string(), format!("env-ref:{key}"));
+                }
+            }
+        }
+
+        // Copy only effective, non-secret values from the one launch
+        // materialization. Generated OpenCode config contains model metadata
+        // and secret placeholders, so it is represented by the bounded
+        // projection revision above instead of being copied here.
+        if let Some(effective_env) = effective_env {
+            for (key, value) in effective_env {
+                if key == OPENCODE_INLINE_CONFIG_ENV
+                    || key == OPENCODE_PROVIDER_API_KEY_ENV
+                    || secret_env_keys.contains(key)
+                    || looks_sensitive(key)
+                    || value.trim().is_empty()
+                {
+                    continue;
+                }
+                non_secret_env.insert(key.clone(), value.clone());
+            }
+        } else {
+            for reference in &config.env {
+                let key = reference.key.trim();
+                if key.is_empty()
+                    || secret_env_keys.contains(key)
+                    || looks_sensitive(key)
+                    || reference.source == AcpProviderEnvSource::SecretReference
+                {
+                    continue;
+                }
+                let value = match reference.source {
+                    AcpProviderEnvSource::Literal => reference.value.clone(),
+                    AcpProviderEnvSource::ProcessEnvironment => std::env::var(key).ok(),
+                    AcpProviderEnvSource::SecretReference => None,
+                };
+                if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+                    non_secret_env.insert(key.to_string(), value);
+                }
+            }
+        }
+
+        // OpenCode's provider helper selects a Profile secret at spawn time
+        // even when no ACP env reference names it. Include opaque versions for
+        // all candidates so a secret/reference update conservatively marks the
+        // process stale without resolving a value merely to hash it.
+        if matches!(
+            profile.agent_id.as_str(),
+            OPENCODE_AGENT_ID | "claude" | "codex"
+        ) {
+            let mut secrets = profile.secrets.iter().collect::<Vec<_>>();
+            secrets.sort_by(|left, right| left.lookup_key.cmp(&right.lookup_key));
+            for (index, secret) in secrets.into_iter().enumerate() {
+                secret_reference_versions.insert(
+                    format!("__vibex_profile_secret_{index}"),
+                    secret_reference_version(
+                        &secret.lookup_key,
+                        provider_secret_backend_name(secret.backend),
+                        secret.updated_at_ms,
+                    )?,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn register_multi_session_contract_evidence(
+        &self,
+        evidence: MultiSessionContractEvidence,
+    ) -> VibexResult<()> {
+        if evidence.compatibility_identity.trim().is_empty() {
+            return Err(VibexError::validation(
+                "acp_multi_session_identity_missing",
+                "ACP multi-session contract evidence requires a compatibility identity",
+            ));
+        }
+        self.multi_session_contracts
+            .lock()
+            .map_err(|_| lock_poisoned_error("multiSessionContracts"))?
+            .insert(evidence.compatibility_identity.clone(), evidence);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn enable_test_multi_session_for_agent(&self, agent_id: &str) {
+        let identity = format!("adapter={agent_id}-acp@test");
+        self.test_multi_session_identities
+            .lock()
+            .unwrap()
+            .insert(agent_id.to_string(), identity.clone());
+        self.register_multi_session_contract_evidence(MultiSessionContractEvidence::real(
+            identity, true, true,
+        ))
+        .unwrap();
+    }
+
+    fn pool_decision(
+        &self,
+        profile_id: &ProviderProfileId,
+        config: &AcpProviderConfig,
+    ) -> VibexResult<(AcpProcessStrategy, Option<String>)> {
+        if config.process_strategy == AcpProcessStrategy::PerSession {
+            return Ok((AcpProcessStrategy::PerSession, None));
+        }
+        let profile = self
+            .config_service
+            .get_profile(profile_id)?
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "provider_profile_not_found",
+                    "Provider Profile was not found for ACP process reuse",
+                )
+            })?;
+        let descriptor = self.compatibility_registry.for_agent(&profile.agent_id);
+        let descriptor_support = descriptor.map(|value| value.safe_multi_session.support);
+        let expected_identity =
+            descriptor.map(|value| value.expected_compatibility_identity().to_string());
+
+        #[cfg(test)]
+        let (descriptor_support, expected_identity) = self
+            .test_multi_session_identities
+            .lock()
+            .ok()
+            .and_then(|identities| identities.get(profile.agent_id.as_str()).cloned())
+            .map(|identity| (Some(CapabilitySupport::Supported), Some(identity)))
+            .unwrap_or((descriptor_support, expected_identity));
+
+        let evidence = expected_identity.as_deref().and_then(|identity| {
+            self.multi_session_contracts
+                .lock()
+                .ok()
+                .and_then(|contracts| contracts.get(identity).cloned())
+        });
+        let decision = decide_process_reuse(
+            true,
+            descriptor_support,
+            expected_identity.as_deref(),
+            evidence.as_ref(),
+        );
+        Ok(match decision {
+            ProcessReuseDecision::Shared { .. } => (AcpProcessStrategy::PerProfilePool, None),
+            ProcessReuseDecision::Dedicated { fallback_reason } => {
+                let fallback_reason = if matches!(
+                    fallback_reason.as_deref(),
+                    Some("acp_multi_session_descriptor_not_verified")
+                        | Some("acp_multi_session_identity_missing")
+                ) {
+                    match config.process_strategy {
+                        AcpProcessStrategy::Auto => {
+                            Some("acp_auto_pool_requires_safe_multi_session".to_string())
+                        }
+                        AcpProcessStrategy::PerProfilePool => {
+                            Some("acp_multi_session_capability_missing".to_string())
+                        }
+                        AcpProcessStrategy::PerSession => None,
+                    }
+                } else {
+                    fallback_reason
+                };
+                (AcpProcessStrategy::PerSession, fallback_reason)
+            }
+        })
+    }
+
+    fn terminal_host_for_config(
+        &self,
+        config: &AcpProviderConfig,
+    ) -> Option<Arc<dyn AcpTerminalHost>> {
+        (terminal_tools_enabled(config) || config.terminal_auth)
+            .then(|| self.terminal_host.clone())
+            .flatten()
+    }
+
+    fn resolve_workspace_cwd(
+        config: &AcpProviderConfig,
+        workspace_root: &str,
+    ) -> VibexResult<PathBuf> {
+        let raw = PathBuf::from(workspace_root);
+        if !raw.is_absolute() {
+            return Err(VibexError::validation(
+                "acp_workspace_relative",
+                "ACP session workspace must be an absolute path",
+            )
+            .with_diagnostic("workspaceRoot", workspace_root));
+        }
+        let workspace = raw.canonicalize().map_err(|err| {
+            VibexError::validation(
+                "acp_workspace_missing",
+                "ACP session workspace must exist before starting the agent",
+            )
+            .with_diagnostic("workspaceRoot", workspace_root)
+            .with_diagnostic("error", err.to_string())
+        })?;
+
+        let cwd = match config.cwd_template.as_deref() {
+            None | Some("{workspaceRoot}") => workspace,
+            Some(template) => {
+                let substituted =
+                    template.replace("{workspaceRoot}", workspace.to_string_lossy().as_ref());
+                let path = PathBuf::from(substituted);
+                if !path.is_absolute() {
+                    return Err(VibexError::validation(
+                        "acp_cwd_template_relative",
+                        "ACP cwd template must resolve to an absolute path",
+                    )
+                    .with_diagnostic("cwdTemplate", template));
+                }
+                path.canonicalize().map_err(|error| {
+                    VibexError::validation(
+                        "acp_cwd_missing",
+                        "ACP session working directory must exist before starting the agent",
+                    )
+                    .with_diagnostic("error", error.to_string())
+                })?
+            }
+        };
+        Ok(cwd)
+    }
+
+    fn resolve_probe_cwd(
+        config: &AcpProviderConfig,
+        workspace_root: Option<&str>,
+    ) -> VibexResult<PathBuf> {
+        if let Some(workspace_root) = workspace_root
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let raw = PathBuf::from(workspace_root);
+            if raw.is_absolute() && raw.exists() {
+                return Self::resolve_workspace_cwd(config, workspace_root);
+            }
+        }
+
+        let fallback = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute() && path.exists())
+            .unwrap_or_else(std::env::temp_dir);
+        let fallback = fallback.canonicalize().unwrap_or(fallback);
+        Ok(match config.cwd_template.as_deref() {
+            None | Some("{workspaceRoot}") => fallback,
+            Some(template) => {
+                let substituted =
+                    template.replace("{workspaceRoot}", fallback.to_string_lossy().as_ref());
+                let path = PathBuf::from(substituted);
+                if path.is_absolute() { path } else { fallback }
+            }
+        })
+    }
+
+    fn process_log_context(
+        &self,
+        process_instance_id: &AcpProcessInstanceId,
+        provider_profile_id: &ProviderProfileId,
+        process_spawn_fingerprint: Option<&str>,
+    ) -> RuntimeLogContext {
+        let mut context = RuntimeLogContext::new("acp_process")
+            .with_process_instance_id(process_instance_id.as_str())
+            .with_provider_profile_id(provider_profile_id);
+        if let Some(fingerprint) = process_spawn_fingerprint {
+            context = context.with_process_spawn_fingerprint(fingerprint);
+        }
+        if let Ok(Some(profile)) = self.config_service.get_profile(provider_profile_id) {
+            context = context.with_agent_id(&profile.agent_id);
+            if let Some(descriptor) = self.compatibility_registry.for_agent(&profile.agent_id) {
+                context = context
+                    .with_adapter_id(&descriptor.adapter_id)
+                    .with_adapter_version(&descriptor.distribution.exact_version);
+            }
+        }
+        context
+    }
+
+    async fn acquire_initialized_process(
+        &self,
+        launch: AcpProcessLaunch<'_>,
+    ) -> VibexResult<ProcessLease<AcpProcess>> {
+        let (key, materialization) = self.process_launch_materialization(
+            launch.profile_id,
+            launch.config,
+            launch.cwd,
+            launch.runtime_resources,
+        )?;
+        let ProcessLaunchMaterialization {
+            snapshot: spawn_config,
+            env_overlays,
+        } = materialization;
+        let process_args = spawn_config.args.clone();
+        let process_spawn_fingerprint = spawn_config.process_spawn_fingerprint();
+        let effective_strategy = launch.process_strategy_effective;
+        let spawn = |process_instance_id| {
+            self.spawn_process(
+                process_instance_id,
+                launch,
+                Some(process_args),
+                Some(env_overlays),
+                Some(process_spawn_fingerprint),
+            )
+        };
+        let initialize =
+            |process: Arc<AcpProcess>| async move { self.initialize_process(&process).await };
+        let lease = if effective_strategy == AcpProcessStrategy::PerProfilePool {
+            self.process_registry
+                .acquire_reusable_with_snapshot(key, Some(spawn_config), spawn, initialize)
+                .await?
+        } else {
+            self.process_registry
+                .acquire_dedicated_with_snapshot(key, Some(spawn_config), spawn, initialize)
+                .await?
+        };
+        if let Err(error) = lease.attach() {
+            let instance_id = lease.process_instance_id().clone();
+            let _ = self.process_registry.shutdown(&instance_id).await;
+            let _ = self.process_registry.remove(&instance_id);
+            return Err(error);
+        }
+        Ok(lease)
+    }
+
+    async fn spawn_process(
+        &self,
+        process_instance_id: AcpProcessInstanceId,
+        launch: AcpProcessLaunch<'_>,
+        materialized_args: Option<Vec<String>>,
+        materialized_env: Option<Vec<(String, String)>>,
+        process_spawn_fingerprint: Option<String>,
+    ) -> VibexResult<Arc<AcpProcess>> {
+        let started = Instant::now();
+        let log_context = self.process_log_context(
+            &process_instance_id,
+            launch.profile_id,
+            process_spawn_fingerprint.as_deref(),
+        );
+        let result = self
+            .spawn_process_inner(
+                process_instance_id,
+                launch,
+                materialized_args,
+                materialized_env,
+                log_context.clone(),
+            )
+            .await;
+        let metric_result = result
+            .as_ref()
+            .map(|_| RuntimeMetricResult::Success)
+            .unwrap_or_else(|_| RuntimeMetricResult::Failure);
+        self.observability.observe_duration(
+            RuntimeMetricName::SpawnDuration,
+            None,
+            metric_result,
+            started.elapsed(),
+        );
+        log_context.emit(
+            if result.is_ok() {
+                RuntimeLogLevel::Info
+            } else {
+                RuntimeLogLevel::Warn
+            },
+            "acp_runtime_spawn",
+            metric_result,
+            result.as_ref().err().map(|error| error.code.as_str()),
+            Some(elapsed_ms(started)),
+        );
+        result
+    }
+
+    async fn spawn_process_inner(
+        &self,
+        process_instance_id: AcpProcessInstanceId,
+        launch: AcpProcessLaunch<'_>,
+        materialized_args: Option<Vec<String>>,
+        materialized_env: Option<Vec<(String, String)>>,
+        log_context: RuntimeLogContext,
+    ) -> VibexResult<Arc<AcpProcess>> {
+        let AcpProcessLaunch {
+            profile_id,
+            config,
+            cwd,
+            runtime_resources,
+            purpose,
+            process_strategy_effective,
+            pool_fallback_reason,
+        } = launch;
+        let agent_id = self
+            .config_service
+            .get_profile(profile_id)?
+            .map(|profile| profile.agent_id)
+            .unwrap_or_else(|| {
+                vibex_core::AgentId::parse("unknown-agent")
+                    .expect("static fallback agent id is valid")
+            });
+        let (compatibility_identity, event_enricher) = self
+            .compatibility_registry
+            .for_agent(&agent_id)
+            .map(|descriptor| {
+                let identity = descriptor.expected_compatibility_identity();
+                (
+                    identity.to_string(),
+                    descriptor
+                        .event_enricher_for_identity(&identity)
+                        .unwrap_or(AgentEventEnricherKind::Passthrough),
+                )
+            })
+            .unwrap_or_else(|| ("unmanaged".to_string(), AgentEventEnricherKind::Passthrough));
+        let command_path = Path::new(&config.command);
+        if command_path.is_absolute() && !command_path.is_file() {
+            return Err(VibexError::process(
+                "acp_binary_missing",
+                "ACP agent binary was not found at the configured path",
+            )
+            .with_diagnostic("command", config.command.clone()));
+        }
+
+        let opencode_error_bridge_enabled = self.is_opencode_profile(profile_id);
+        let process_args = materialized_args
+            .unwrap_or_else(|| effective_acp_process_args(config, opencode_error_bridge_enabled));
+        let env_overlays = match materialized_env {
+            Some(env) => env,
+            None => self.resolve_env_overlays(profile_id, config, cwd)?,
+        };
+        let mut command = Command::new(&config.command);
+        command
+            .args(&process_args)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        for key in PARENT_SESSION_ENV_KEYS {
+            command.env_remove(key);
+        }
+        for (key, value) in env_overlays {
+            command.env(key, value);
+        }
+        if purpose == AcpProcessPurpose::Probe {
+            for (key, value) in PROBE_ENV {
+                command.env(key, value);
+            }
+        }
+
+        let mut child = command.group().kill_on_drop(true).spawn().map_err(|err| {
+            VibexError::process("acp_spawn_failed", "ACP agent process could not be started")
+                .with_diagnostic("command", config.command.clone())
+                .with_diagnostic("args", redacted_args_summary(&process_args))
+                .with_diagnostic("cwd", cwd.display().to_string())
+                .with_diagnostic("error", err.to_string())
+        })?;
+
+        let stdin = child.inner().stdin.take().ok_or_else(|| {
+            VibexError::process("acp_stdio_unavailable", "ACP agent stdin was not available")
+        })?;
+        let stdout = child.inner().stdout.take().ok_or_else(|| {
+            VibexError::process(
+                "acp_stdio_unavailable",
+                "ACP agent stdout was not available",
+            )
+        })?;
+        let stderr = child.inner().stderr.take().ok_or_else(|| {
+            VibexError::process(
+                "acp_stdio_unavailable",
+                "ACP agent stderr was not available",
+            )
+        })?;
+
+        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<String>();
+        let debug_log = Arc::new(Mutex::new(AcpDebugLog::default()));
+        let terminal_host = self.terminal_host_for_config(config);
+        let mcp_servers = if purpose == AcpProcessPurpose::Session {
+            resolve_acp_mcp_descriptors(config, runtime_resources)?
+        } else {
+            Vec::new()
+        };
+
+        let process = Arc::new(AcpProcess {
+            exit_reporter: (purpose == AcpProcessPurpose::Session).then(|| {
+                self.process_registry
+                    .exit_reporter(process_instance_id.clone())
+            }),
+            process_instance_id,
+            provider_profile_id: profile_id.clone(),
+            compatibility_identity,
+            event_enricher,
+            workspace_root: cwd.to_path_buf(),
+            command_display: config.command.clone(),
+            args_display: redacted_args_summary(&process_args),
+            outbound: Mutex::new(Some(outbound_tx)),
+            next_request_id: AtomicU64::new(1),
+            pending_requests: Mutex::new(HashMap::new()),
+            pending_prompt_requests: Mutex::new(HashMap::new()),
+            active_terminal_owners: Mutex::new(HashMap::new()),
+            request_admission: Mutex::new(()),
+            shared: Mutex::new(ProcessShared::default()),
+            debug_log: Arc::clone(&debug_log),
+            child: tokio::sync::Mutex::new(Some(child)),
+            shutdown_lock: tokio::sync::Mutex::new(()),
+            terminal_host: terminal_host
+                .clone()
+                .unwrap_or_else(|| Arc::new(DisabledAcpTerminalHost)),
+            terminal_tools_enabled: terminal_host.is_some() && terminal_tools_enabled(config),
+            terminal_auth_enabled: terminal_host.is_some() && config.terminal_auth,
+            mcp_servers,
+            process_strategy_requested: config.process_strategy,
+            process_strategy_effective,
+            pool_fallback_reason,
+            opencode_error_bridge_enabled,
+            attachment_router: Arc::downgrade(&self.attachment_router),
+            observability: self.observability.clone(),
+            log_context,
+            #[cfg(test)]
+            lifecycle_events: Mutex::new(Vec::new()),
+        });
+
+        // Writer task: serialize outgoing JSON-RPC lines into agent stdin.
+        tokio::spawn(async move {
+            let mut stdin = stdin;
+            while let Some(line) = outbound_rx.recv().await {
+                if stdin.write_all(line.as_bytes()).await.is_err() {
+                    break;
+                }
+                if stdin.write_all(b"\n").await.is_err() {
+                    break;
+                }
+                if stdin.flush().await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Reader task: dispatch agent stdout JSON-RPC traffic.
+        let reader_process = Arc::clone(&process);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                reader_process.handle_line(&line).await;
+            }
+            reader_process.handle_process_exit().await;
+        });
+
+        // Stderr task: retain diagnostics and bridge OpenCode model failures.
+        let stderr_process = Arc::clone(&process);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                stderr_process.handle_stderr_line(&line);
+            }
+        });
+
+        Ok(process)
+    }
+
+    async fn initialize_process(&self, process: &Arc<AcpProcess>) -> VibexResult<()> {
+        let started = Instant::now();
+        let result = self.initialize_process_inner(process).await;
+        let metric_result = result
+            .as_ref()
+            .map(|_| RuntimeMetricResult::Success)
+            .unwrap_or_else(|_| RuntimeMetricResult::Failure);
+        self.observability.observe_duration(
+            RuntimeMetricName::InitializeDuration,
+            None,
+            metric_result,
+            started.elapsed(),
+        );
+        process.log_context.for_operation("initialize").emit(
+            if result.is_ok() {
+                RuntimeLogLevel::Info
+            } else {
+                RuntimeLogLevel::Warn
+            },
+            "acp_runtime_initialize",
+            metric_result,
+            result.as_ref().err().map(|error| error.code.as_str()),
+            Some(elapsed_ms(started)),
+        );
+        result
+    }
+
+    async fn initialize_process_inner(&self, process: &Arc<AcpProcess>) -> VibexResult<()> {
+        let result = process
+            .request(
+                AcpOperation::Initialize.method(),
+                build_initialize_params(
+                    true,
+                    true,
+                    process.terminal_tools_enabled,
+                    process.terminal_auth_enabled,
+                    !process.mcp_servers.is_empty(),
+                ),
+                self.handshake_timeout,
+            )
+            .await?;
+
+        let protocol_version = result.get("protocolVersion").and_then(Value::as_i64);
+        let supports_load_session = result
+            .get("agentCapabilities")
+            .and_then(|capabilities| capabilities.get("loadSession"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let supports_resume_session = result
+            .get("agentCapabilities")
+            .and_then(|capabilities| capabilities.get("sessionCapabilities"))
+            .and_then(|capabilities| capabilities.get("resume"))
+            .is_some();
+        let supports_list_sessions = result
+            .get("agentCapabilities")
+            .and_then(|capabilities| capabilities.get("listSessions"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let agent_name = result
+            .get("agentInfo")
+            .and_then(|info| info.get("name"))
+            .and_then(Value::as_str)
+            .map(redact_summary);
+        let agent_version = result
+            .get("agentInfo")
+            .and_then(|info| info.get("version"))
+            .and_then(Value::as_str)
+            .map(redact_summary);
+        let mut operation_evidence =
+            negotiated_session_config_operations(&result, &process.compatibility_identity);
+        if supports_load_session {
+            operation_evidence.insert(
+                AcpOperation::SessionLoad,
+                SessionConfigOperationEvidence {
+                    support: CapabilitySupport::Supported,
+                    source: CapabilitySource::NegotiatedRuntime,
+                    encoding: AcpWireEncoding::Typed,
+                    stability: AcpOperationStability::CapabilityGated,
+                    compatibility_identity: process.compatibility_identity.clone(),
+                    activation_generation: 0,
+                },
+            );
+        }
+        if supports_resume_session {
+            operation_evidence.insert(
+                AcpOperation::SessionResume,
+                SessionConfigOperationEvidence {
+                    support: CapabilitySupport::Supported,
+                    source: CapabilitySource::NegotiatedRuntime,
+                    encoding: AcpWireEncoding::VersionedRaw,
+                    stability: AcpOperationStability::VersionedUnstable,
+                    compatibility_identity: process.compatibility_identity.clone(),
+                    activation_generation: 0,
+                },
+            );
+        }
+        if let Ok(Some(profile)) = self
+            .config_service
+            .get_profile(&process.provider_profile_id)
+            && let Some(descriptor) = self.compatibility_registry.for_agent(&profile.agent_id)
+        {
+            for operation in [
+                AcpOperation::SessionSetModel,
+                AcpOperation::SessionSetMode,
+                AcpOperation::SessionSetConfigOption,
+            ] {
+                if operation_evidence.contains_key(&operation) {
+                    continue;
+                }
+                let Some(versioned) = descriptor.operation_support.get(&operation) else {
+                    continue;
+                };
+                if versioned.support == CapabilitySupport::Unknown {
+                    continue;
+                }
+                operation_evidence.insert(
+                    operation,
+                    SessionConfigOperationEvidence {
+                        support: versioned.support,
+                        source: CapabilitySource::VersionedRegistry,
+                        encoding: versioned.encoding,
+                        stability: versioned.stability,
+                        compatibility_identity: process.compatibility_identity.clone(),
+                        activation_generation: 0,
+                    },
+                );
+            }
+        }
+
+        if let Ok(mut shared) = process.shared.lock() {
+            shared.protocol_version = protocol_version;
+            shared.supports_load_session = supports_load_session;
+            shared.supports_resume_session = supports_resume_session;
+            shared.supports_list_sessions = supports_list_sessions;
+            shared.agent_name = agent_name;
+            shared.agent_version = agent_version;
+            shared.operation_evidence = operation_evidence;
+        }
+        Ok(())
+    }
+
+    async fn open_new_session_for_attachment(
+        &self,
+        process: &Arc<AcpProcess>,
+    ) -> VibexResult<OpenedAcpSession> {
+        let started = Instant::now();
+        let result = self.open_new_session_for_attachment_inner(process).await;
+        self.record_session_open(
+            process,
+            RuntimeMetricOperation::New,
+            started,
+            result.as_ref().err(),
+        );
+        result
+    }
+
+    async fn open_new_session_for_attachment_inner(
+        &self,
+        process: &Arc<AcpProcess>,
+    ) -> VibexResult<OpenedAcpSession> {
+        let (result, registration_barrier) = process
+            .request_with_registration_barrier(
+                AcpOperation::SessionNew.method(),
+                build_session_new_params(&process.workspace_root, &process.mcp_servers),
+                self.handshake_timeout,
+            )
+            .await?;
+        let native_session_id = result
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                VibexError::provider(
+                    "acp_session_new_invalid",
+                    "ACP session/new response did not include a session id",
+                )
+            })?
+            .to_string();
+        let mut state = AcpAttachmentShared::default();
+        apply_session_state_to_attachment(
+            &mut state,
+            &process.provider_profile_id,
+            &native_session_id,
+            &result,
+        );
+        Ok(OpenedAcpSession {
+            native_session_id,
+            state,
+            registration_barrier: Some(registration_barrier),
+        })
+    }
+
+    async fn resume_existing_session_for_attachment(
+        &self,
+        process: &Arc<AcpProcess>,
+        native_session_id: &str,
+    ) -> VibexResult<OpenedAcpSession> {
+        let started = Instant::now();
+        let result = self
+            .resume_existing_session_for_attachment_inner(process, native_session_id)
+            .await;
+        self.record_session_open(
+            process,
+            RuntimeMetricOperation::Resume,
+            started,
+            result.as_ref().err(),
+        );
+        result
+    }
+
+    async fn resume_existing_session_for_attachment_inner(
+        &self,
+        process: &Arc<AcpProcess>,
+        native_session_id: &str,
+    ) -> VibexResult<OpenedAcpSession> {
+        let result = process
+            .request(
+                AcpOperation::SessionResume.method(),
+                protocol::build_session_resume_params(
+                    native_session_id,
+                    &process.workspace_root,
+                    mcp_servers_json(&process.mcp_servers),
+                ),
+                self.restore_timeout,
+            )
+            .await?;
+        validate_restore_response(AcpOperation::SessionResume, &result, native_session_id)?;
+        let mut state = AcpAttachmentShared::default();
+        apply_session_state_to_attachment(
+            &mut state,
+            &process.provider_profile_id,
+            native_session_id,
+            &result,
+        );
+        Ok(OpenedAcpSession {
+            native_session_id: native_session_id.to_string(),
+            state,
+            registration_barrier: None,
+        })
+    }
+
+    async fn load_existing_session_for_attachment(
+        &self,
+        process: &Arc<AcpProcess>,
+        native_session_id: &str,
+    ) -> VibexResult<OpenedAcpSession> {
+        let started = Instant::now();
+        let result = self
+            .load_existing_session_for_attachment_inner(process, native_session_id)
+            .await;
+        self.record_session_open(
+            process,
+            RuntimeMetricOperation::Load,
+            started,
+            result.as_ref().err(),
+        );
+        result
+    }
+
+    async fn load_existing_session_for_attachment_inner(
+        &self,
+        process: &Arc<AcpProcess>,
+        native_session_id: &str,
+    ) -> VibexResult<OpenedAcpSession> {
+        let result = process
+            .request(
+                AcpOperation::SessionLoad.method(),
+                build_session_load_params(
+                    native_session_id,
+                    &process.workspace_root,
+                    &process.mcp_servers,
+                ),
+                self.restore_timeout,
+            )
+            .await?;
+        validate_restore_response(AcpOperation::SessionLoad, &result, native_session_id)?;
+        let mut state = AcpAttachmentShared::default();
+        apply_session_state_to_attachment(
+            &mut state,
+            &process.provider_profile_id,
+            native_session_id,
+            &result,
+        );
+        Ok(OpenedAcpSession {
+            native_session_id: native_session_id.to_string(),
+            state,
+            registration_barrier: None,
+        })
+    }
+
+    fn record_session_open(
+        &self,
+        process: &AcpProcess,
+        operation: RuntimeMetricOperation,
+        started: Instant,
+        error: Option<&VibexError>,
+    ) {
+        let result = if error.is_some() {
+            RuntimeMetricResult::Failure
+        } else {
+            RuntimeMetricResult::Success
+        };
+        self.observability.observe_duration(
+            RuntimeMetricName::SessionOpenDuration,
+            Some(operation),
+            result,
+            started.elapsed(),
+        );
+        process.log_context.for_operation(operation.as_str()).emit(
+            if error.is_some() {
+                RuntimeLogLevel::Warn
+            } else {
+                RuntimeLogLevel::Info
+            },
+            "acp_runtime_session_open",
+            result,
+            error.map(|error| error.code.as_str()),
+            Some(elapsed_ms(started)),
+        );
+    }
+
+    async fn release_process_reservation(&self, lease: &ProcessLease<AcpProcess>) {
+        let remaining = lease.detach().unwrap_or_default();
+        if remaining == 0 {
+            let instance_id = lease.process_instance_id().clone();
+            let _ = self.process_registry.shutdown(&instance_id).await;
+            let _ = self.process_registry.remove(&instance_id);
+        }
+    }
+
+    fn restore_policy_for_profile(&self, profile_id: &ProviderProfileId) -> RestorePolicy {
+        self.config_service
+            .get_profile(profile_id)
+            .ok()
+            .flatten()
+            .and_then(|profile| self.compatibility_registry.for_agent(&profile.agent_id))
+            .map(|descriptor| descriptor.restore_policy)
+            .unwrap_or(RestorePolicy::ResumeThenLoadThenNew)
+    }
+
+    fn restore_key_for_binding(
+        &self,
+        binding: &ProviderBinding,
+        cwd: &Path,
+        adapter_compatibility_identity: &str,
+    ) -> VibexResult<Option<AgentSessionRestoreCompatibilityKey>> {
+        let Some(native_session_id) = binding.native.native_session_id.clone() else {
+            return Ok(None);
+        };
+        let profile = self
+            .config_service
+            .get_profile(&binding.provider_profile_id)?
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "provider_profile_not_found",
+                    "Provider Profile was not found for restore compatibility",
+                )
+            })?;
+        let state_home = stable_native_state_home_id(&binding.provider_profile_id, cwd)?;
+        AgentSessionRestoreCompatibilityKey::new(
+            profile.agent_id,
+            native_session_id,
+            state_home,
+            adapter_compatibility_identity.to_string(),
+            None,
+            "acp-session-resume-v1",
+            cwd.to_string_lossy().to_string(),
+        )
+        .map(Some)
+    }
+
+    fn restore_fresh_allowed_error(outcome: AgentSessionRestoreOutcome) -> VibexError {
+        VibexError::capability(
+            "acp_restore_fresh_allowed",
+            "ACP native session restore did not find a usable session",
+        )
+        .with_diagnostic("restoreOutcome", format!("{outcome:?}"))
+    }
+
+    fn restore_stopped_error(error: VibexError, outcome: AgentSessionRestoreOutcome) -> VibexError {
+        let code = match outcome {
+            AgentSessionRestoreOutcome::AuthenticationRequired => {
+                "acp_restore_authentication_required"
+            }
+            AgentSessionRestoreOutcome::TransientFailure => "acp_restore_transient_failure",
+            AgentSessionRestoreOutcome::FatalFailure => "acp_restore_fatal_failure",
+            _ => "acp_restore_failed",
+        };
+        VibexError::new(error.category, code, "ACP native session restore stopped")
+            .with_diagnostic("restoreOutcome", format!("{outcome:?}"))
+    }
+
+    async fn restore_existing_session_for_attachment(
+        &self,
+        process: &Arc<AcpProcess>,
+        binding: &ProviderBinding,
+        cwd: &Path,
+        identity: &LegacyAttachmentIdentity,
+    ) -> VibexResult<OpenedAcpSession> {
+        let Some(target_key) =
+            self.restore_key_for_binding(binding, cwd, &process.compatibility_identity)?
+        else {
+            self.record_restore_result(
+                &binding.session_id,
+                vibex_core::AgentSessionRestoreResult {
+                    outcome: AgentSessionRestoreOutcome::NotFound,
+                    compatibility: AgentSessionRestoreCompatibility::ProbeRequired {
+                        allowed_methods: Vec::new(),
+                    },
+                    attempts: Vec::new(),
+                    method: None,
+                    encoding: None,
+                    capability_source: None,
+                    error_code: Some("native_session_id_missing".to_string()),
+                    activation_generation: identity.activation_generation as i64,
+                    fresh_allowed: true,
+                },
+            );
+            return Err(Self::restore_fresh_allowed_error(
+                AgentSessionRestoreOutcome::NotFound,
+            ));
+        };
+        let source_key = self
+            .restore_compatibility_keys
+            .lock()
+            .ok()
+            .and_then(|keys| keys.get(&identity.binding_id).cloned())
+            .unwrap_or_else(|| target_key.clone());
+        let generation = identity.activation_generation as i64;
+        let capabilities = process.restore_capabilities(generation);
+        let compatibility =
+            resolve_restore_compatibility(&source_key, &target_key, &capabilities, generation);
+        if let AgentSessionRestoreCompatibility::Incompatible { .. } = compatibility {
+            self.record_restore_result(
+                &binding.session_id,
+                vibex_core::AgentSessionRestoreResult {
+                    outcome: AgentSessionRestoreOutcome::Unsupported,
+                    compatibility: compatibility.clone(),
+                    attempts: Vec::new(),
+                    method: None,
+                    encoding: None,
+                    capability_source: None,
+                    error_code: Some("restore_identity_incompatible".to_string()),
+                    activation_generation: generation,
+                    fresh_allowed: true,
+                },
+            );
+            return Err(Self::restore_fresh_allowed_error(
+                AgentSessionRestoreOutcome::Unsupported,
+            ));
+        }
+        let policy = self.restore_policy_for_profile(&binding.provider_profile_id);
+        let mut last_outcome = AgentSessionRestoreOutcome::Unsupported;
+        let mut attempts = Vec::new();
+        for method in restore_methods(policy) {
+            let Some(evidence) = capabilities.get(&method) else {
+                continue;
+            };
+            if !evidence.supported_for(&process.compatibility_identity, generation) {
+                continue;
+            }
+            let opened = match method {
+                AgentSessionRestoreMethod::Resume => {
+                    self.resume_existing_session_for_attachment(
+                        process,
+                        &source_key.native_session_id,
+                    )
+                    .await
+                }
+                AgentSessionRestoreMethod::Load => {
+                    self.load_existing_session_for_attachment(
+                        process,
+                        &source_key.native_session_id,
+                    )
+                    .await
+                }
+                AgentSessionRestoreMethod::New => unreachable!("fresh is outside restore closure"),
+            };
+            match opened {
+                Ok(opened) => {
+                    if let Ok(mut keys) = self.restore_compatibility_keys.lock() {
+                        keys.insert(identity.binding_id.clone(), target_key.clone());
+                    }
+                    let mut result =
+                        result_for_success(compatibility.clone(), method, evidence, generation);
+                    attempts.extend(result.attempts.clone());
+                    result.attempts = attempts;
+                    self.record_restore_result(&binding.session_id, result);
+                    return Ok(opened);
+                }
+                Err(error) => {
+                    let outcome = classify_restore_error(&error);
+                    let failure = result_for_failure(
+                        compatibility.clone(),
+                        method,
+                        Some(evidence.encoding),
+                        Some(evidence.source),
+                        &error,
+                        generation,
+                    );
+                    attempts.extend(failure.attempts.clone());
+                    last_outcome = outcome;
+                    if matches!(
+                        outcome,
+                        AgentSessionRestoreOutcome::NotFound
+                            | AgentSessionRestoreOutcome::Unsupported
+                    ) {
+                        continue;
+                    }
+                    let mut result = failure;
+                    result.attempts = attempts;
+                    self.record_restore_result(&binding.session_id, result);
+                    return Err(Self::restore_stopped_error(error, outcome));
+                }
+            }
+        }
+        self.record_restore_result(
+            &binding.session_id,
+            vibex_core::AgentSessionRestoreResult {
+                outcome: last_outcome,
+                compatibility,
+                attempts,
+                method: None,
+                encoding: None,
+                capability_source: None,
+                error_code: None,
+                activation_generation: generation,
+                fresh_allowed: true,
+            },
+        );
+        Err(Self::restore_fresh_allowed_error(last_outcome))
+    }
+
+    /// Legacy create/prompt callers now use the same planner and state/fence
+    /// contract as the public mutation API.  The wrapper keeps the existing
+    /// model-only error code expected by older provider-neutral callers.
+    async fn apply_requested_model_to_attachment(
+        &self,
+        attachment: &AcpAttachmentHandle,
+        model: Option<&str>,
+    ) -> VibexResult<()> {
+        let Some(model) = self
+            .selected_model_for_profile(&attachment.payload().process().provider_profile_id, model)
+        else {
+            return Ok(());
+        };
+        let state = attachment.payload().runtime_config_state();
+        let request = SessionRuntimeConfigMutationRequest {
+            session_id: attachment.session_id().clone(),
+            expected_revision: state.state_revision,
+            expected_binding_id: attachment.binding_id().clone(),
+            expected_activation_generation: attachment.fence().activation_generation as i64,
+            patch: SessionRuntimeConfigPatch {
+                model_id: Some(model.clone()),
+                ..Default::default()
+            },
+        };
+        let result = self
+            .apply_runtime_config_mutation(
+                attachment,
+                request,
+                true,
+                AttachmentMutationMode::Current,
+            )
+            .await?;
+        if result.outcomes.iter().any(|outcome| {
+            matches!(
+                outcome.status,
+                SessionRuntimeConfigApplyStatus::Failed
+                    | SessionRuntimeConfigApplyStatus::Unavailable
+                    | SessionRuntimeConfigApplyStatus::RestartRequired
+                    | SessionRuntimeConfigApplyStatus::ReconciliationRequired
+            )
+        }) {
+            return Err(VibexError::capability(
+                "acp_model_switch_unsupported",
+                "ACP Agent does not expose a supported model switching operation",
+            )
+            .with_diagnostic("model", redact_summary(&model))
+            .with_diagnostic(
+                "outcome",
+                result
+                    .outcomes
+                    .first()
+                    .map(|outcome| format!("{:?}", outcome.status))
+                    .unwrap_or_else(|| "unavailable".to_string()),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn apply_runtime_config_mutation(
+        &self,
+        attachment: &AcpAttachmentHandle,
+        request: SessionRuntimeConfigMutationRequest,
+        allow_unadvertised_selection: bool,
+        mutation_mode: AttachmentMutationMode,
+    ) -> VibexResult<SessionRuntimeConfigMutationResult> {
+        let fields = normalize_runtime_config_patch(&request.patch)?;
+        let payload = attachment.payload();
+        let current_state = payload.runtime_config_state();
+        let empty_result = |state: SessionRuntimeConfigState,
+                            status: SessionRuntimeConfigApplyStatus,
+                            code: &str|
+         -> SessionRuntimeConfigMutationResult {
+            SessionRuntimeConfigMutationResult {
+                state,
+                outcomes: fields
+                    .iter()
+                    .map(|field| runtime_config_outcome(field, status, None, Some(code)))
+                    .collect(),
+            }
+        };
+
+        // The request fence is checked before any state or wire side effect.
+        if request.session_id != *attachment.session_id()
+            || request.expected_binding_id != *attachment.binding_id()
+            || request.expected_activation_generation
+                != attachment.fence().activation_generation as i64
+            || request.expected_revision != current_state.state_revision
+        {
+            return Ok(empty_result(
+                current_state,
+                SessionRuntimeConfigApplyStatus::StaleConfirmation,
+                "acp_session_config_fence_stale",
+            ));
+        }
+
+        let process = payload.process();
+        let process_snapshot = payload.lease_snapshot();
+        let Some(snapshot) = process_snapshot else {
+            return Ok(empty_result(
+                current_state,
+                SessionRuntimeConfigApplyStatus::StaleConfirmation,
+                "acp_session_config_process_snapshot_missing",
+            ));
+        };
+        if snapshot.status != AcpProcessStatus::Ready {
+            return Ok(empty_result(
+                current_state,
+                SessionRuntimeConfigApplyStatus::StaleConfirmation,
+                "acp_session_config_process_not_ready",
+            ));
+        }
+        if snapshot.process_config_status != Some(crate::spawn_config::ProcessConfigStatus::Current)
+        {
+            return Ok(empty_result(
+                current_state,
+                SessionRuntimeConfigApplyStatus::RestartRequired,
+                "acp_session_config_process_stale",
+            ));
+        }
+        if !payload.config_is_idle() {
+            return Ok(empty_result(
+                current_state,
+                SessionRuntimeConfigApplyStatus::Busy,
+                "acp_session_config_busy",
+            ));
+        }
+
+        let Some(mut planner) = payload.session_config_planner() else {
+            return Ok(empty_result(
+                current_state,
+                SessionRuntimeConfigApplyStatus::Unavailable,
+                "acp_session_config_capability_unknown",
+            ));
+        };
+
+        let mut plans = Vec::with_capacity(fields.len());
+        for field in &fields {
+            if field.value.is_some()
+                && !(allow_unadvertised_selection
+                    && matches!(
+                        field.kind,
+                        SessionConfigFieldKind::Model | SessionConfigFieldKind::Mode
+                    ))
+                && !runtime_config_value_is_advertised(&payload, &planner, field)
+            {
+                return Ok(SessionRuntimeConfigMutationResult {
+                    state: current_state,
+                    outcomes: fields
+                        .iter()
+                        .map(|item| {
+                            runtime_config_outcome(
+                                item,
+                                if item.key == field.key {
+                                    SessionRuntimeConfigApplyStatus::Unavailable
+                                } else {
+                                    SessionRuntimeConfigApplyStatus::NoOp
+                                },
+                                None,
+                                Some("acp_session_config_value_unavailable"),
+                            )
+                        })
+                        .collect(),
+                });
+            }
+            let effective = runtime_config_field_value(&current_state, field);
+            if field.value.is_none() && effective.is_some() {
+                let plan = planner
+                    .plan(&field.as_planner_request())
+                    .map_err(canonical_key_error)?;
+                if !matches!(plan, SessionConfigPlan::RestartAndResume) {
+                    return Ok(SessionRuntimeConfigMutationResult {
+                        state: current_state,
+                        outcomes: fields
+                            .iter()
+                            .map(|item| {
+                                runtime_config_outcome(
+                                    item,
+                                    if item.key == field.key {
+                                        SessionRuntimeConfigApplyStatus::Unavailable
+                                    } else {
+                                        SessionRuntimeConfigApplyStatus::NoOp
+                                    },
+                                    None,
+                                    Some("acp_session_config_clear_unsupported"),
+                                )
+                            })
+                            .collect(),
+                    });
+                }
+                plans.push((field.clone(), plan));
+                continue;
+            }
+            let plan = planner
+                .plan(&field.as_planner_request())
+                .map_err(canonical_key_error)?;
+            if matches!(plan, SessionConfigPlan::Unavailable) && effective != field.value {
+                return Ok(SessionRuntimeConfigMutationResult {
+                    state: current_state,
+                    outcomes: fields
+                        .iter()
+                        .map(|item| {
+                            runtime_config_outcome(
+                                item,
+                                if item.key == field.key {
+                                    SessionRuntimeConfigApplyStatus::Unavailable
+                                } else {
+                                    SessionRuntimeConfigApplyStatus::NoOp
+                                },
+                                None,
+                                Some("acp_session_config_unavailable"),
+                            )
+                        })
+                        .collect(),
+                });
+            }
+            plans.push((field.clone(), plan));
+        }
+
+        if fields.is_empty() {
+            return Ok(SessionRuntimeConfigMutationResult {
+                state: current_state,
+                outcomes: Vec::new(),
+            });
+        }
+
+        let mut next_state = current_state.clone();
+        let mut preferred_changed = false;
+        for field in &fields {
+            if runtime_config_preferred_value(&next_state, field) != field.value {
+                set_runtime_config_preferred(&mut next_state, field);
+                preferred_changed = true;
+            }
+        }
+        if preferred_changed {
+            next_state.state_revision =
+                next_state.state_revision.checked_add(1).ok_or_else(|| {
+                    VibexError::conflict(
+                        "acp_session_config_revision_exhausted",
+                        "session runtime config revision is exhausted",
+                    )
+                })?;
+            next_state.applied_activation_generation = None;
+            next_state
+                .mark_generation_if_converged(attachment.fence().activation_generation as i64);
+            self.store_runtime_config_state(attachment, &next_state, mutation_mode)?;
+        }
+        let mutation_revision = next_state.state_revision;
+
+        let mut outcomes = Vec::with_capacity(fields.len());
+        for (field, mut plan) in plans {
+            let effective = runtime_config_field_value(&next_state, &field);
+            if effective == field.value {
+                outcomes.push(runtime_config_outcome(
+                    &field,
+                    SessionRuntimeConfigApplyStatus::NoOp,
+                    Some(&plan),
+                    None,
+                ));
+                continue;
+            }
+            if field.value.is_none() {
+                outcomes.push(runtime_config_outcome(
+                    &field,
+                    if matches!(plan, SessionConfigPlan::RestartAndResume) {
+                        SessionRuntimeConfigApplyStatus::RestartRequired
+                    } else {
+                        SessionRuntimeConfigApplyStatus::Unavailable
+                    },
+                    Some(&plan),
+                    Some(if matches!(plan, SessionConfigPlan::RestartAndResume) {
+                        "acp_session_config_restart_required"
+                    } else {
+                        "acp_session_config_clear_unsupported"
+                    }),
+                ));
+                continue;
+            }
+
+            let mut attempted_fallback = false;
+            loop {
+                match &plan {
+                    SessionConfigPlan::RestartAndResume => {
+                        outcomes.push(runtime_config_outcome(
+                            &field,
+                            SessionRuntimeConfigApplyStatus::RestartRequired,
+                            Some(&plan),
+                            Some("acp_session_config_restart_required"),
+                        ));
+                        break;
+                    }
+                    SessionConfigPlan::Unavailable => {
+                        outcomes.push(runtime_config_outcome(
+                            &field,
+                            SessionRuntimeConfigApplyStatus::Unavailable,
+                            Some(&plan),
+                            Some("acp_session_config_unavailable"),
+                        ));
+                        break;
+                    }
+                    SessionConfigPlan::Live { .. } | SessionConfigPlan::Extension { .. } => {
+                        let option_kind = planner
+                            .option_for_key(&field.key)
+                            .map_err(canonical_key_error)?
+                            .map(|option| option.kind);
+                        let response = self
+                            .send_runtime_config_plan(
+                                &process,
+                                &payload.native_session_id,
+                                &field,
+                                &plan,
+                                option_kind.as_ref(),
+                            )
+                            .await;
+                        match response {
+                            Ok(response) => {
+                                if let Some(error_code) =
+                                    runtime_config_response_conflict(&response, &field, &plan)
+                                {
+                                    outcomes.push(runtime_config_outcome(
+                                        &field,
+                                        SessionRuntimeConfigApplyStatus::Failed,
+                                        Some(&plan),
+                                        Some(error_code),
+                                    ));
+                                    break;
+                                }
+                                match self.confirm_runtime_config_field(
+                                    attachment,
+                                    &field,
+                                    mutation_revision,
+                                    &response,
+                                    mutation_mode,
+                                )? {
+                                    RuntimeConfigConfirmation::Applied(state) => {
+                                        next_state = state;
+                                        outcomes.push(runtime_config_outcome(
+                                            &field,
+                                            SessionRuntimeConfigApplyStatus::Applied,
+                                            Some(&plan),
+                                            None,
+                                        ));
+                                    }
+                                    RuntimeConfigConfirmation::Stale(state) => {
+                                        next_state = state;
+                                        outcomes.push(runtime_config_outcome(
+                                            &field,
+                                            SessionRuntimeConfigApplyStatus::StaleConfirmation,
+                                            Some(&plan),
+                                            Some("acp_session_config_confirmation_stale"),
+                                        ));
+                                    }
+                                    RuntimeConfigConfirmation::ReconciliationRequired(state) => {
+                                        next_state = state;
+                                        outcomes.push(runtime_config_outcome(
+                                            &field,
+                                            SessionRuntimeConfigApplyStatus::ReconciliationRequired,
+                                            Some(&plan),
+                                            Some("acp_session_config_state_persist_failed"),
+                                        ));
+                                    }
+                                }
+                                break;
+                            }
+                            Err(error)
+                                if !attempted_fallback
+                                    && is_capability_negative(&error)
+                                    && plan.operation().is_some() =>
+                            {
+                                let operation = plan
+                                    .operation()
+                                    .expect("capability-negative guard requires an operation")
+                                    .clone();
+                                planner = planner.with_capability_negative(&operation);
+                                payload.set_session_config_planner(planner.clone());
+                                plan = planner
+                                    .plan(&field.as_planner_request())
+                                    .map_err(canonical_key_error)?;
+                                attempted_fallback = true;
+                            }
+                            Err(error) => {
+                                outcomes.push(runtime_config_outcome(
+                                    &field,
+                                    SessionRuntimeConfigApplyStatus::Failed,
+                                    Some(&plan),
+                                    Some(error.code.as_str()),
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut final_state = payload.runtime_config_state();
+        if final_state.is_converged()
+            && final_state.applied_activation_generation
+                != Some(attachment.fence().activation_generation as i64)
+        {
+            final_state
+                .mark_generation_if_converged(attachment.fence().activation_generation as i64);
+            self.store_runtime_config_state(attachment, &final_state, mutation_mode)?;
+        }
+        Ok(SessionRuntimeConfigMutationResult {
+            state: final_state,
+            outcomes,
+        })
+    }
+
+    async fn send_runtime_config_plan(
+        &self,
+        process: &AcpProcess,
+        native_session_id: &str,
+        field: &RuntimeConfigField,
+        plan: &SessionConfigPlan,
+        option_kind: Option<&ProviderSessionConfigOptionKind>,
+    ) -> VibexResult<Value> {
+        let (method, params) = match plan {
+            SessionConfigPlan::Live {
+                operation,
+                encoding,
+                option_id,
+                ..
+            } => {
+                let method = operation.method();
+                let params = match field.kind {
+                    SessionConfigFieldKind::Model
+                        if *operation == AcpOperation::SessionSetConfigOption =>
+                    {
+                        if *encoding == AcpWireEncoding::Typed
+                            && !matches!(
+                                option_kind,
+                                Some(
+                                    ProviderSessionConfigOptionKind::Boolean
+                                        | ProviderSessionConfigOptionKind::String
+                                )
+                            )
+                        {
+                            protocol::build_session_set_config_option_params(
+                                native_session_id,
+                                option_id.as_deref().unwrap_or(field.key.as_str()),
+                                field.value.as_deref().unwrap_or_default(),
+                            )
+                        } else {
+                            protocol::build_session_set_config_option_raw_params(
+                                native_session_id,
+                                option_id.as_deref().unwrap_or(field.key.as_str()),
+                                runtime_config_wire_value(field, option_kind),
+                            )
+                        }
+                    }
+                    SessionConfigFieldKind::Model => protocol::build_session_set_model_params(
+                        native_session_id,
+                        field.value.as_deref().unwrap_or_default(),
+                    ),
+                    SessionConfigFieldKind::Mode if *encoding == AcpWireEncoding::Typed => {
+                        protocol::build_session_set_mode_params(
+                            native_session_id,
+                            field.value.as_deref().unwrap_or_default(),
+                        )
+                    }
+                    SessionConfigFieldKind::Generic | SessionConfigFieldKind::ReasoningEffort
+                        if *encoding == AcpWireEncoding::Typed
+                            && *operation == AcpOperation::SessionSetConfigOption =>
+                    {
+                        if matches!(
+                            option_kind,
+                            Some(
+                                ProviderSessionConfigOptionKind::Boolean
+                                    | ProviderSessionConfigOptionKind::String
+                            )
+                        ) {
+                            protocol::build_session_set_config_option_raw_params(
+                                native_session_id,
+                                option_id.as_deref().unwrap_or(field.key.as_str()),
+                                runtime_config_wire_value(field, option_kind),
+                            )
+                        } else {
+                            protocol::build_session_set_config_option_params(
+                                native_session_id,
+                                option_id.as_deref().unwrap_or(field.key.as_str()),
+                                field.value.as_deref().unwrap_or_default(),
+                            )
+                        }
+                    }
+                    _ => match operation {
+                        AcpOperation::SessionSetMode => json!({
+                            "sessionId": native_session_id,
+                            "modeId": field.value.as_deref().unwrap_or_default(),
+                        }),
+                        AcpOperation::SessionSetConfigOption => {
+                            protocol::build_session_set_config_option_raw_params(
+                                native_session_id,
+                                option_id.as_deref().unwrap_or(field.key.as_str()),
+                                runtime_config_wire_value(field, option_kind),
+                            )
+                        }
+                        _ => protocol::build_session_set_model_params(
+                            native_session_id,
+                            field.value.as_deref().unwrap_or_default(),
+                        ),
+                    },
+                };
+                (method.to_string(), params)
+            }
+            SessionConfigPlan::Extension { id, operation } => {
+                let method = operation.method().to_string();
+                let params = match field.kind {
+                    SessionConfigFieldKind::Model => protocol::build_session_set_model_params(
+                        native_session_id,
+                        field.value.as_deref().unwrap_or_default(),
+                    ),
+                    SessionConfigFieldKind::Mode => json!({
+                        "sessionId": native_session_id,
+                        "modeId": field.value.as_deref().unwrap_or_default(),
+                    }),
+                    SessionConfigFieldKind::ReasoningEffort | SessionConfigFieldKind::Generic => {
+                        protocol::build_session_set_config_option_raw_params(
+                            native_session_id,
+                            id,
+                            runtime_config_wire_value(field, option_kind),
+                        )
+                    }
+                };
+                (method, params)
+            }
+            SessionConfigPlan::RestartAndResume | SessionConfigPlan::Unavailable => {
+                return Err(VibexError::capability(
+                    "acp_session_config_unavailable",
+                    "session configuration operation is not live",
+                ));
+            }
+        };
+        process
+            .request(&method, params, self.handshake_timeout)
+            .await
+    }
+
+    fn store_runtime_config_state(
+        &self,
+        attachment: &AcpAttachmentHandle,
+        next: &SessionRuntimeConfigState,
+        mutation_mode: AttachmentMutationMode,
+    ) -> VibexResult<()> {
+        let previous = attachment.payload().runtime_config_state();
+        let next = next.clone();
+        mutation_mode.apply(
+            &self.attachment_router.registry,
+            attachment.fence(),
+            |current| {
+                current.set_runtime_config_state(next.clone());
+            },
+        )?;
+        let mut states = match self.runtime_config_states.lock() {
+            Ok(states) => states,
+            Err(_) => {
+                let _ = mutation_mode.apply(
+                    &self.attachment_router.registry,
+                    attachment.fence(),
+                    |current| current.set_runtime_config_state(previous.clone()),
+                );
+                return Err(lock_poisoned_error("runtimeConfigStates"));
+            }
+        };
+        states.insert(attachment.binding_id().clone(), next);
+        Ok(())
+    }
+
+    fn confirm_runtime_config_field(
+        &self,
+        attachment: &AcpAttachmentHandle,
+        field: &RuntimeConfigField,
+        mutation_revision: i64,
+        response: &Value,
+        mutation_mode: AttachmentMutationMode,
+    ) -> VibexResult<RuntimeConfigConfirmation> {
+        let previous_runtime_state = attachment.payload().runtime_config_state();
+        let mut persisted = None;
+        let confirmation_result = mutation_mode.apply(
+            &self.attachment_router.registry,
+            attachment.fence(),
+            |current| -> VibexResult<RuntimeConfigConfirmation> {
+                let mut state = current
+                    .state
+                    .lock()
+                    .map_err(|_| lock_poisoned_error("attachmentState"))?;
+                if state.session_runtime_config_state.state_revision != mutation_revision {
+                    return Ok(RuntimeConfigConfirmation::Stale(
+                        state.session_runtime_config_state.clone(),
+                    ));
+                }
+                set_runtime_config_effective(&mut state.session_runtime_config_state, field);
+                // Discovery is attachment-local as well.  Apply the response
+                // only after the revision/fence check, so a late response
+                // cannot overwrite a replacement generation's view.
+                let process_profile_id = current.process().provider_profile_id.clone();
+                let model_ids = extract_model_ids(response);
+                let current_model_id = extract_current_model_id(response);
+                let current_mode_id = extract_current_mode_id(response);
+                let discovery = extract_provider_session_config_state(
+                    response,
+                    &process_profile_id,
+                    Some(&current.native_session_id),
+                );
+                if !model_ids.is_empty() {
+                    state.model_ids = model_ids;
+                }
+                if current_model_id.is_some() {
+                    state.current_model_id = current_model_id;
+                }
+                if current_mode_id.is_some() {
+                    state.current_mode_id = current_mode_id;
+                }
+                if let Some(mut discovery) = discovery {
+                    if let Some(existing) = state.session_config_state.as_ref() {
+                        if discovery.models.is_empty() {
+                            discovery.models = existing.models.clone();
+                        }
+                        if discovery.modes.is_empty() {
+                            discovery.modes = existing.modes.clone();
+                        }
+                        if discovery.options.is_empty() {
+                            discovery.options = existing.options.clone();
+                        } else {
+                            let mut options = existing.options.clone();
+                            for option in discovery.options.drain(..) {
+                                if let Some(current) =
+                                    options.iter_mut().find(|current| current.id == option.id)
+                                {
+                                    *current = option;
+                                } else {
+                                    options.push(option);
+                                }
+                            }
+                            discovery.options = options;
+                        }
+                    }
+                    state.session_config_state = Some(discovery);
+                }
+                match field.kind {
+                    SessionConfigFieldKind::Model => {
+                        if let Some(value) = field.value.as_deref() {
+                            state.current_model_id = Some(value.to_string());
+                            if let Some(config) = state.session_config_state.as_mut() {
+                                config.current_model = Some(ProviderSessionConfigValue {
+                                    value: value.to_string(),
+                                    label: None,
+                                });
+                            }
+                        }
+                    }
+                    SessionConfigFieldKind::Mode => {
+                        if let Some(value) = field.value.as_deref() {
+                            state.current_mode_id = Some(value.to_string());
+                            if let Some(config) = state.session_config_state.as_mut() {
+                                config.current_mode = Some(ProviderSessionConfigValue {
+                                    value: value.to_string(),
+                                    label: None,
+                                });
+                            }
+                        }
+                    }
+                    SessionConfigFieldKind::ReasoningEffort | SessionConfigFieldKind::Generic => {}
+                }
+                state
+                    .session_runtime_config_state
+                    .mark_generation_if_converged(attachment.fence().activation_generation as i64);
+                persisted = Some(state.session_runtime_config_state.clone());
+                Ok(RuntimeConfigConfirmation::Applied(
+                    state.session_runtime_config_state.clone(),
+                ))
+            },
+        );
+        let confirmation = match confirmation_result {
+            Ok(Ok(confirmation)) => confirmation,
+            Ok(Err(error)) => return Err(error),
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "acp_attachment_fence_stale"
+                        | "acp_attachment_missing"
+                        | "acp_attachment_not_current"
+                ) =>
+            {
+                let state = if mutation_mode == AttachmentMutationMode::Current {
+                    self.current_attachment(attachment.session_id())
+                        .map(|current| current.payload().runtime_config_state())
+                        .unwrap_or_else(|| attachment.payload().runtime_config_state())
+                } else {
+                    attachment.payload().runtime_config_state()
+                };
+                return Ok(RuntimeConfigConfirmation::Stale(state));
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(state) = persisted {
+            if let Ok(mut states) = self.runtime_config_states.lock() {
+                states.insert(attachment.binding_id().clone(), state);
+            } else {
+                let rollback = previous_runtime_state.clone();
+                let _ = mutation_mode.apply(
+                    &self.attachment_router.registry,
+                    attachment.fence(),
+                    |current| current.set_runtime_config_state(rollback.clone()),
+                );
+                return Ok(RuntimeConfigConfirmation::ReconciliationRequired(
+                    previous_runtime_state,
+                ));
+            }
+        }
+        Ok(confirmation)
+    }
+
+    async fn replay_attachment_preferred_state(
+        &self,
+        attachment: &AcpAttachmentHandle,
+        mutation_mode: AttachmentMutationMode,
+    ) -> VibexResult<SessionRuntimeConfigMutationResult> {
+        let state = attachment.payload().runtime_config_state();
+        let mut patch = SessionRuntimeConfigPatch::default();
+        if state.preferred_model != state.effective_model {
+            patch.model_id = state.preferred_model.clone();
+            patch.clear_model = state.preferred_model.is_none();
+        }
+        if state.preferred_mode != state.effective_mode {
+            patch.mode_id = state.preferred_mode.clone();
+            patch.clear_mode = state.preferred_mode.is_none();
+        }
+        if state.preferred_reasoning_effort != state.effective_reasoning_effort {
+            patch.reasoning_effort = state.preferred_reasoning_effort.clone();
+            patch.clear_reasoning_effort = state.preferred_reasoning_effort.is_none();
+        }
+        for (key, value) in &state.config_values {
+            if value.preferred.as_ref().map(|value| &value.value)
+                != value.effective.as_ref().map(|value| &value.value)
+            {
+                if let Some(preferred) = &value.preferred {
+                    patch
+                        .config_values
+                        .insert(key.clone(), preferred.value.clone());
+                } else {
+                    patch.clear_config_keys.push(key.clone());
+                }
+            }
+        }
+        // A rebuild may return no option catalogue. Replay only fields for
+        // which this generation has an actionable live/restart plan; leave
+        // the other preferred values pending so prompt admission remains
+        // blocked instead of letting one unknown option suppress Model/Mode
+        // reconciliation.
+        if let Some(planner) = attachment.payload().session_config_planner() {
+            let actionable = normalize_runtime_config_patch(&patch)?
+                .into_iter()
+                .filter(|field| {
+                    (matches!(
+                        field.kind,
+                        SessionConfigFieldKind::Model | SessionConfigFieldKind::Mode
+                    ) || runtime_config_value_is_advertised(
+                        &attachment.payload(),
+                        &planner,
+                        field,
+                    )) && planner
+                        .plan(&field.as_planner_request())
+                        .map(|plan| !matches!(plan, SessionConfigPlan::Unavailable))
+                        .unwrap_or(false)
+                })
+                .map(|field| field.key)
+                .collect::<BTreeSet<_>>();
+            let has_key = |key: &str| actionable.iter().any(|candidate| candidate.as_str() == key);
+            if !has_key(crate::session_config::CANONICAL_MODEL) {
+                patch.model_id = None;
+                patch.clear_model = false;
+            }
+            if !has_key(crate::session_config::CANONICAL_REASONING_EFFORT) {
+                patch.reasoning_effort = None;
+                patch.clear_reasoning_effort = false;
+            }
+            if !has_key("mode") {
+                patch.mode_id = None;
+                patch.clear_mode = false;
+            }
+            patch.config_values.retain(|key, _| has_key(key));
+            patch.clear_config_keys.retain(|key| has_key(key));
+        }
+        if patch == SessionRuntimeConfigPatch::default() {
+            return Ok(SessionRuntimeConfigMutationResult {
+                state,
+                outcomes: Vec::new(),
+            });
+        }
+        let request = SessionRuntimeConfigMutationRequest {
+            session_id: attachment.session_id().clone(),
+            expected_revision: state.state_revision,
+            expected_binding_id: attachment.binding_id().clone(),
+            expected_activation_generation: attachment.fence().activation_generation as i64,
+            patch,
+        };
+        self.apply_runtime_config_mutation(attachment, request, true, mutation_mode)
+            .await
+    }
+
+    /// Ensures a session attachment exists and is the only owner of all
+    /// session-scoped ACP state. Process acquisition remains independent from
+    /// this session operation lock.
+    async fn ensure_attachment(
+        &self,
+        binding: &ProviderBinding,
+        workspace_root: &str,
+        runtime_resources: &ProviderRuntimeResources,
+    ) -> VibexResult<AcpAttachmentHandle> {
+        let operation_lock = self.session_operation_lock(&binding.session_id)?;
+        let _operation_guard = operation_lock.lock().await;
+
+        if let Some(current) = self.current_attachment(&binding.session_id) {
+            let process = current.payload().process();
+            let native_matches =
+                binding
+                    .native
+                    .native_session_id
+                    .as_deref()
+                    .is_none_or(|native_session_id| {
+                        current.payload().native_session_id == native_session_id
+                    });
+            if process.provider_profile_id == binding.provider_profile_id && native_matches {
+                self.apply_requested_model_to_attachment(
+                    &current,
+                    selected_model_from_binding(binding).as_deref(),
+                )
+                .await?;
+                return Ok(current);
+            }
+            self.detach_attachment(current.fence()).await;
+        }
+        self.detach_stale_attachment(&binding.session_id).await;
+
+        let identity =
+            self.attachment_identity_candidate(&binding.session_id, &binding.provider_profile_id)?;
+        let config = self.profile_config(&binding.provider_profile_id)?;
+        let cwd = Self::resolve_workspace_cwd(&config, workspace_root)?;
+        let (effective_strategy, fallback_reason) =
+            self.pool_decision(&binding.provider_profile_id, &config)?;
+        let lease = self
+            .acquire_initialized_process(AcpProcessLaunch {
+                profile_id: &binding.provider_profile_id,
+                config: &config,
+                cwd: &cwd,
+                runtime_resources,
+                purpose: AcpProcessPurpose::Session,
+                process_strategy_effective: effective_strategy,
+                pool_fallback_reason: fallback_reason,
+            })
+            .await?;
+        let selected_model = selected_model_from_binding(binding);
+        let stored_native = binding.native.native_session_id.clone();
+        let attachment = if stored_native.is_some() {
+            let restore_identity = identity.clone();
+            let restore_identity_for_closure = identity.clone();
+            let restore_cwd = cwd.clone();
+            let restore = self
+                .acquire_attachment(
+                    binding.session_id.clone(),
+                    restore_identity,
+                    lease,
+                    stored_native.clone(),
+                    AttachmentActivationMode::Immediate,
+                    move |process| {
+                        let restore_cwd = restore_cwd.clone();
+                        async move {
+                            self.restore_existing_session_for_attachment(
+                                &process,
+                                binding,
+                                &restore_cwd,
+                                &restore_identity_for_closure,
+                            )
+                            .await
+                        }
+                    },
+                )
+                .await;
+            match restore {
+                Ok(attachment) => attachment,
+                Err(error) if error.code == "acp_restore_fresh_allowed" => {
+                    // A fresh retry receives a new transient binding identity;
+                    // it must never reuse the old native-id acquire key.
+                    let fresh_identity = self.fresh_attachment_identity(
+                        &binding.session_id,
+                        &binding.provider_profile_id,
+                        &identity,
+                    )?;
+                    let fresh_lease = self
+                        .acquire_initialized_process(AcpProcessLaunch {
+                            profile_id: &binding.provider_profile_id,
+                            config: &config,
+                            cwd: &cwd,
+                            runtime_resources,
+                            purpose: AcpProcessPurpose::Session,
+                            process_strategy_effective: effective_strategy,
+                            pool_fallback_reason: None,
+                        })
+                        .await?;
+                    self.acquire_attachment(
+                        binding.session_id.clone(),
+                        fresh_identity,
+                        fresh_lease,
+                        None,
+                        AttachmentActivationMode::Immediate,
+                        move |process| async move {
+                            self.open_new_session_for_attachment(&process).await
+                        },
+                    )
+                    .await?
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            self.acquire_attachment(
+                binding.session_id.clone(),
+                identity,
+                lease,
+                None,
+                AttachmentActivationMode::Immediate,
+                move |process| async move { self.open_new_session_for_attachment(&process).await },
+            )
+            .await?
+        };
+        if let Err(error) = self
+            .apply_requested_model_to_attachment(&attachment, selected_model.as_deref())
+            .await
+        {
+            self.detach_attachment(attachment.fence()).await;
+            return Err(error);
+        }
+        Ok(attachment)
+    }
+
+    fn validate_fenced_turn_attachment(
+        &self,
+        attachment: &AcpAttachmentHandle,
+        required_runtime: &SessionRuntimeSelection,
+        execution_identity: &ProviderTurnExecutionIdentity,
+    ) -> VibexResult<()> {
+        let payload = attachment.payload();
+        let process = payload.process();
+        let config = payload.runtime_config_state();
+        let profile = self
+            .config_service
+            .get_profile(&process.provider_profile_id)?;
+        let matches = attachment.state()? == SessionAttachmentState::Committed
+            && execution_identity.binding_id == *attachment.binding_id()
+            && execution_identity.activation_generation
+                == attachment.fence().activation_generation as i64
+            && execution_identity.model_id == required_runtime.model_id
+            && process.provider_profile_id == required_runtime.provider_profile_id
+            && profile.as_ref().is_some_and(|profile| {
+                profile.kind == ProviderKind::Acp
+                    && profile.status == ProviderProfileStatus::Enabled
+                    && profile.agent_id == required_runtime.agent_id
+            })
+            && required_runtime.matches_effective_config(&config)
+            && config.is_applied_to_generation(execution_identity.activation_generation);
+        if !matches {
+            return Err(VibexError::conflict(
+                "turn_execution_identity_mismatch",
+                "ACP current attachment does not match the turn execution fence",
+            ));
+        }
+        Ok(())
+    }
+}
+
+// Durable messages require a captured runtime. Continue and slash commands are
+// not durable submissions, but still carry a runtime to enforce the same fence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MissingTurnExecutionRuntimeRequirement;
+
+fn turn_execution_runtime_requirement(
+    has_submission_identity: bool,
+    required_runtime: Option<&SessionRuntimeSelection>,
+) -> Result<Option<&SessionRuntimeSelection>, MissingTurnExecutionRuntimeRequirement> {
+    if has_submission_identity && required_runtime.is_none() {
+        return Err(MissingTurnExecutionRuntimeRequirement);
+    }
+    Ok(required_runtime)
+}
+
+fn missing_turn_execution_runtime_requirement_error(
+    _: MissingTurnExecutionRuntimeRequirement,
+) -> VibexError {
+    VibexError::conflict(
+        "turn_execution_runtime_requirement_missing",
+        "durable ACP turn is missing its captured runtime selection",
+    )
+}
+
+impl ProviderProfileChangeListener for AcpRuntimeClient {
+    fn on_provider_profile_saved(
+        &self,
+        provider_profile_id: &ProviderProfileId,
+        profile_updated_at_ms: i64,
+    ) {
+        match self.refresh_profile_process_config_status(provider_profile_id) {
+            Ok(changed_processes) if changed_processes > 0 => {
+                tracing::info!(
+                    target: "vibex_agent_acp",
+                    provider_profile_id = %provider_profile_id,
+                    profile_updated_at_ms,
+                    changed_processes,
+                    "ACP process configuration status refreshed after Profile save"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    target: "vibex_agent_acp",
+                    provider_profile_id = %provider_profile_id,
+                    profile_updated_at_ms,
+                    error_code = %error.code,
+                    "ACP process configuration refresh failed after Profile save"
+                );
+            }
+        }
+    }
+}
+
+fn selected_model_from_binding(binding: &ProviderBinding) -> Option<String> {
+    binding
+        .native
+        .redacted_metadata
+        .iter()
+        .find(|entry| entry.key == PROVIDER_SELECTED_MODEL_METADATA_KEY)
+        .map(|entry| entry.value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn validate_restore_response(
+    operation: AcpOperation,
+    response: &Value,
+    expected_native_session_id: &str,
+) -> VibexResult<()> {
+    let Some(object) = response.as_object() else {
+        return Err(VibexError::provider(
+            "acp_restore_invalid_response",
+            "ACP restore response was not an object",
+        )
+        .with_diagnostic("operation", operation.method()));
+    };
+    // Standard resume/load responses do not echo the session id from the request.
+    let Some(session_id) = object.get("sessionId") else {
+        return Ok(());
+    };
+    let Some(session_id) = session_id.as_str() else {
+        return Err(VibexError::provider(
+            "acp_restore_invalid_response",
+            "ACP restore response included an invalid native session id",
+        )
+        .with_diagnostic("operation", operation.method()));
+    };
+    if session_id.trim() != expected_native_session_id {
+        return Err(VibexError::conflict(
+            "acp_restore_native_session_mismatch",
+            "ACP restore response returned a different native session id",
+        )
+        .with_diagnostic("operation", operation.method()));
+    }
+    Ok(())
+}
+
+fn apply_session_state_to_attachment(
+    state: &mut AcpAttachmentShared,
+    provider_profile_id: &ProviderProfileId,
+    native_session_id: &str,
+    response: &Value,
+) {
+    state.model_ids = extract_model_ids(response);
+    state.current_model_id = extract_current_model_id(response);
+    state.current_mode_id = extract_current_mode_id(response);
+    state.session_config_state = extract_provider_session_config_state(
+        response,
+        provider_profile_id,
+        Some(native_session_id),
+    );
+}
+
+impl AcpRuntimeClient {
+    fn session_config_planner_for_attachment(
+        &self,
+        process: &AcpProcess,
+        generation: i64,
+        discovery: &ProviderSessionConfigState,
+    ) -> SessionConfigPlanner {
+        let aliases = self
+            .config_service
+            .get_profile(&process.provider_profile_id)
+            .ok()
+            .flatten()
+            .and_then(|profile| self.compatibility_registry.for_agent(&profile.agent_id))
+            .filter(|descriptor| {
+                descriptor.expected_compatibility_identity().to_string()
+                    == process.compatibility_identity
+            })
+            .map(|descriptor| descriptor.config_option_aliases.clone())
+            .unwrap_or_default();
+        let mut operations = process.operation_evidence(generation);
+        if !discovery.options.is_empty() {
+            operations
+                .entry(AcpOperation::SessionSetConfigOption)
+                .or_insert(SessionConfigOperationEvidence {
+                    support: CapabilitySupport::Supported,
+                    source: CapabilitySource::NegotiatedRuntime,
+                    encoding: AcpWireEncoding::VersionedRaw,
+                    stability: AcpOperationStability::VersionedUnstable,
+                    compatibility_identity: process.compatibility_identity.clone(),
+                    activation_generation: generation,
+                });
+        }
+        if !discovery.modes.is_empty() {
+            operations.entry(AcpOperation::SessionSetMode).or_insert(
+                SessionConfigOperationEvidence {
+                    support: CapabilitySupport::Supported,
+                    source: CapabilitySource::NegotiatedRuntime,
+                    encoding: AcpWireEncoding::Typed,
+                    stability: AcpOperationStability::CapabilityGated,
+                    compatibility_identity: process.compatibility_identity.clone(),
+                    activation_generation: generation,
+                },
+            );
+        }
+        let config_option_needs_raw_fallback = !discovery.options.is_empty()
+            && operations
+                .get(&AcpOperation::SessionSetConfigOption)
+                .is_some_and(|evidence| evidence.encoding == AcpWireEncoding::Typed);
+        let mut planner = SessionConfigPlanner::new(
+            process.compatibility_identity.clone(),
+            generation,
+            aliases,
+            operations,
+            discovery.options.clone(),
+        );
+        if config_option_needs_raw_fallback {
+            let fallback = SessionConfigOperationEvidence {
+                support: CapabilitySupport::Supported,
+                source: CapabilitySource::NegotiatedRuntime,
+                encoding: AcpWireEncoding::VersionedRaw,
+                stability: AcpOperationStability::VersionedUnstable,
+                compatibility_identity: process.compatibility_identity.clone(),
+                activation_generation: generation,
+            };
+            planner =
+                planner.with_operation_fallback(AcpOperation::SessionSetConfigOption, fallback);
+        }
+        if let Some(descriptor) = self
+            .config_service
+            .get_profile(&process.provider_profile_id)
+            .ok()
+            .flatten()
+            .and_then(|profile| self.compatibility_registry.for_agent(&profile.agent_id))
+            .filter(|descriptor| {
+                descriptor.expected_compatibility_identity().to_string()
+                    == process.compatibility_identity
+            })
+            && descriptor
+                .known_quirks
+                .iter()
+                .any(|quirk| quirk.operation == Some(AcpOperation::SessionSetModel))
+        {
+            planner = planner.with_extension(
+                "model",
+                crate::session_config::SessionConfigExtension {
+                    id: "legacy-set-model".to_string(),
+                    operation: AcpOperation::SessionSetModel,
+                },
+            );
+        }
+        planner
+    }
+
+    fn configure_attachment_runtime_state(
+        &self,
+        attachment: &AcpAttachmentHandle,
+        mutation_mode: AttachmentMutationMode,
+    ) -> VibexResult<()> {
+        let payload = attachment.payload();
+        let process = payload.process();
+        let generation = attachment.fence().activation_generation as i64;
+        let (discovery, current_model, current_mode) = payload
+            .state
+            .lock()
+            .map(|state| {
+                (
+                    state.session_config_state.clone(),
+                    state.current_model_id.clone(),
+                    state.current_mode_id.clone(),
+                )
+            })
+            .map_err(|_| lock_poisoned_error("attachmentState"))?;
+        // Some ACP agents omit optional model/mode/config fields from
+        // `session/new` and `session/load`. Keep a generation-local empty
+        // discovery snapshot so negotiated typed operations can still replay
+        // a persisted preferred value; an absent option is never treated as
+        // evidence for a generic config operation.
+        let discovery = discovery.unwrap_or_else(|| ProviderSessionConfigState {
+            provider_kind: ProviderKind::Acp,
+            provider_profile_id: Some(process.provider_profile_id.clone()),
+            native_session_id: None,
+            current_model: current_model
+                .clone()
+                .map(|value| ProviderSessionConfigValue { value, label: None }),
+            models: Vec::new(),
+            current_mode: current_mode
+                .clone()
+                .map(|value| ProviderSessionConfigValue { value, label: None }),
+            modes: Vec::new(),
+            options: Vec::new(),
+            source: "runtime_operation_evidence".to_string(),
+            updated_at_ms: unix_timestamp_ms(),
+            metadata: Vec::new(),
+        });
+        let planner = self.session_config_planner_for_attachment(&process, generation, &discovery);
+        let binding_id = attachment.fence().binding_id.clone();
+        let mut runtime_state = self
+            .runtime_config_states
+            .lock()
+            .map_err(|_| lock_poisoned_error("runtimeConfigStates"))?
+            .get(&binding_id)
+            .cloned()
+            .unwrap_or_default();
+
+        // A new generation starts from the values explicitly reported by the
+        // Agent. Never carry an old effective value as if it were confirmed.
+        for value in runtime_state.config_values.values_mut() {
+            value.effective = None;
+        }
+        runtime_state.effective_model = current_model.or_else(|| {
+            discovery
+                .current_model
+                .as_ref()
+                .map(|value| value.value.clone())
+        });
+        runtime_state.effective_mode = current_mode.or_else(|| {
+            discovery
+                .current_mode
+                .as_ref()
+                .map(|value| value.value.clone())
+        });
+        runtime_state.effective_reasoning_effort = None;
+        if runtime_state.preferred_model.is_none() {
+            runtime_state.preferred_model = runtime_state.effective_model.clone();
+        }
+        if runtime_state.preferred_mode.is_none() {
+            runtime_state.preferred_mode = runtime_state.effective_mode.clone();
+        }
+        for option in &discovery.options {
+            let Ok(key) = planner.option_key(&option.id) else {
+                continue;
+            };
+            if key.as_str() == crate::session_config::CANONICAL_MODEL
+                || key.as_str() == crate::session_config::CANONICAL_REASONING_EFFORT
+                || key.as_str() == "mode"
+            {
+                if key.as_str() == crate::session_config::CANONICAL_REASONING_EFFORT {
+                    let effective = option
+                        .current_value
+                        .as_ref()
+                        .map(|value| value.value.clone());
+                    if effective.is_some() {
+                        runtime_state.effective_reasoning_effort = effective;
+                        if runtime_state.preferred_reasoning_effort.is_none() {
+                            runtime_state.preferred_reasoning_effort =
+                                runtime_state.effective_reasoning_effort.clone();
+                        }
+                    }
+                } else if key.as_str() == "mode"
+                    && let Some(effective) = option
+                        .current_value
+                        .as_ref()
+                        .map(|value| value.value.clone())
+                {
+                    runtime_state.effective_mode = Some(effective);
+                    if runtime_state.preferred_mode.is_none() {
+                        runtime_state.preferred_mode = runtime_state.effective_mode.clone();
+                    }
+                }
+                continue;
+            }
+            let effective = option.current_value.clone();
+            let entry = runtime_state
+                .config_values
+                .entry(key.to_string())
+                .or_default();
+            entry.effective = effective;
+            if entry.preferred.is_none() {
+                entry.preferred = entry.effective.clone();
+            }
+        }
+        runtime_state.applied_activation_generation = None;
+        runtime_state.mark_generation_if_converged(generation);
+        mutation_mode.apply(
+            &self.attachment_router.registry,
+            attachment.fence(),
+            |current| {
+                current.set_runtime_config_state(runtime_state.clone());
+                current.set_session_config_planner(planner.clone());
+            },
+        )?;
+        self.runtime_config_states
+            .lock()
+            .map_err(|_| lock_poisoned_error("runtimeConfigStates"))?
+            .insert(binding_id, runtime_state);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeConfigField {
+    key: CanonicalSessionConfigKey,
+    kind: SessionConfigFieldKind,
+    value: Option<String>,
+}
+
+impl RuntimeConfigField {
+    fn as_planner_request(&self) -> SessionConfigFieldRequest {
+        SessionConfigFieldRequest {
+            key: self.key.clone(),
+            kind: self.kind,
+            value: self.value.clone().unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeConfigConfirmation {
+    Applied(SessionRuntimeConfigState),
+    Stale(SessionRuntimeConfigState),
+    ReconciliationRequired(SessionRuntimeConfigState),
+}
+
+fn canonical_key_error(error: crate::session_config::CanonicalKeyError) -> VibexError {
+    VibexError::validation(
+        error.code(),
+        "ACP session config option alias is invalid or ambiguous",
+    )
+}
+
+fn normalize_runtime_config_patch(
+    patch: &SessionRuntimeConfigPatch,
+) -> VibexResult<Vec<RuntimeConfigField>> {
+    let mut fields = Vec::new();
+    let add_explicit = |fields: &mut Vec<RuntimeConfigField>,
+                        key: &str,
+                        kind: SessionConfigFieldKind,
+                        value: Option<&String>,
+                        clear: bool|
+     -> VibexResult<()> {
+        if clear && value.is_some() {
+            return Err(VibexError::validation(
+                "acp_session_config_patch_conflict",
+                "a session config field cannot be set and cleared together",
+            ));
+        }
+        let value = if clear {
+            None
+        } else if let Some(value) = value {
+            let value = value.trim();
+            if value.is_empty() || value.len() > 256 {
+                return Err(VibexError::validation(
+                    "acp_session_config_value_invalid",
+                    "session config value must be bounded and non-empty",
+                ));
+            }
+            Some(value.to_string())
+        } else {
+            return Ok(());
+        };
+        fields.push(RuntimeConfigField {
+            key: CanonicalSessionConfigKey::parse(key).map_err(|_| {
+                VibexError::validation(
+                    "acp_session_config_key_invalid",
+                    "session config key is invalid",
+                )
+            })?,
+            kind,
+            value,
+        });
+        Ok(())
+    };
+
+    if patch.model_id.is_some() && patch.clear_model
+        || patch.reasoning_effort.is_some() && patch.clear_reasoning_effort
+        || patch.mode_id.is_some() && patch.clear_mode
+    {
+        return Err(VibexError::validation(
+            "acp_session_config_patch_conflict",
+            "a session config field cannot be set and cleared together",
+        ));
+    }
+    if let Some(model) = patch.model_id.as_ref() {
+        let value = validate_model_value(model)
+            .map_err(|code| VibexError::validation(code, "model value is invalid"))?;
+        add_explicit(
+            &mut fields,
+            crate::session_config::CANONICAL_MODEL,
+            SessionConfigFieldKind::Model,
+            Some(&value),
+            false,
+        )?;
+    } else if patch.clear_model {
+        add_explicit(
+            &mut fields,
+            crate::session_config::CANONICAL_MODEL,
+            SessionConfigFieldKind::Model,
+            None,
+            true,
+        )?;
+    }
+    if let Some(effort) = patch.reasoning_effort.as_ref() {
+        let value = validate_effort_value(effort)
+            .map_err(|code| VibexError::validation(code, "reasoning effort value is invalid"))?;
+        add_explicit(
+            &mut fields,
+            crate::session_config::CANONICAL_REASONING_EFFORT,
+            SessionConfigFieldKind::ReasoningEffort,
+            Some(&value),
+            false,
+        )?;
+    } else if patch.clear_reasoning_effort {
+        add_explicit(
+            &mut fields,
+            crate::session_config::CANONICAL_REASONING_EFFORT,
+            SessionConfigFieldKind::ReasoningEffort,
+            None,
+            true,
+        )?;
+    }
+    if let Some(mode) = patch.mode_id.as_ref() {
+        add_explicit(
+            &mut fields,
+            "mode",
+            SessionConfigFieldKind::Mode,
+            Some(mode),
+            false,
+        )?;
+    } else if patch.clear_mode {
+        add_explicit(
+            &mut fields,
+            "mode",
+            SessionConfigFieldKind::Mode,
+            None,
+            true,
+        )?;
+    }
+
+    let mut generic_keys = BTreeMap::<String, Option<String>>::new();
+    for (raw_key, raw_value) in &patch.config_values {
+        let key = CanonicalSessionConfigKey::parse(raw_key).map_err(|_| {
+            VibexError::validation(
+                "acp_session_config_key_invalid",
+                "session config key is invalid",
+            )
+        })?;
+        if matches!(
+            key.as_str(),
+            crate::session_config::CANONICAL_MODEL
+                | crate::session_config::CANONICAL_REASONING_EFFORT
+                | "mode"
+        ) {
+            return Err(VibexError::validation(
+                "acp_session_config_reserved_key",
+                "reserved session config keys must use their explicit fields",
+            ));
+        }
+        let value = raw_value.trim();
+        if value.is_empty() || value.len() > 256 {
+            return Err(VibexError::validation(
+                "acp_session_config_value_invalid",
+                "session config value must be bounded and non-empty",
+            ));
+        }
+        if generic_keys
+            .insert(key.to_string(), Some(value.to_string()))
+            .is_some()
+        {
+            return Err(VibexError::validation(
+                "acp_session_config_patch_duplicate",
+                "session config patch contains a duplicate key",
+            ));
+        }
+    }
+    for raw_key in &patch.clear_config_keys {
+        let key = CanonicalSessionConfigKey::parse(raw_key).map_err(|_| {
+            VibexError::validation(
+                "acp_session_config_key_invalid",
+                "session config key is invalid",
+            )
+        })?;
+        if matches!(
+            key.as_str(),
+            crate::session_config::CANONICAL_MODEL
+                | crate::session_config::CANONICAL_REASONING_EFFORT
+                | "mode"
+        ) {
+            return Err(VibexError::validation(
+                "acp_session_config_reserved_key",
+                "reserved session config keys must use their explicit fields",
+            ));
+        }
+        if generic_keys.insert(key.to_string(), None).is_some() {
+            return Err(VibexError::validation(
+                "acp_session_config_patch_duplicate",
+                "session config patch contains a duplicate key",
+            ));
+        }
+    }
+    for (key, value) in generic_keys {
+        fields.push(RuntimeConfigField {
+            key: CanonicalSessionConfigKey::parse(&key).expect("normalized key is valid"),
+            kind: SessionConfigFieldKind::Generic,
+            value,
+        });
+    }
+    fields.sort_by(|left, right| {
+        runtime_config_field_order(left.kind)
+            .cmp(&runtime_config_field_order(right.kind))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    Ok(fields)
+}
+
+fn runtime_config_field_order(kind: SessionConfigFieldKind) -> u8 {
+    match kind {
+        SessionConfigFieldKind::Model => 0,
+        SessionConfigFieldKind::ReasoningEffort => 1,
+        SessionConfigFieldKind::Mode => 2,
+        SessionConfigFieldKind::Generic => 3,
+    }
+}
+
+fn runtime_config_field_value(
+    state: &SessionRuntimeConfigState,
+    field: &RuntimeConfigField,
+) -> Option<String> {
+    match field.kind {
+        SessionConfigFieldKind::Model => state.effective_model.clone(),
+        SessionConfigFieldKind::Mode => state.effective_mode.clone(),
+        SessionConfigFieldKind::ReasoningEffort => state.effective_reasoning_effort.clone(),
+        SessionConfigFieldKind::Generic => state
+            .config_values
+            .get(field.key.as_str())
+            .and_then(|value| value.effective.as_ref())
+            .map(|value| value.value.clone()),
+    }
+}
+
+fn runtime_config_wire_value(
+    field: &RuntimeConfigField,
+    option_kind: Option<&ProviderSessionConfigOptionKind>,
+) -> Value {
+    let value = field.value.as_deref().unwrap_or_default();
+    if matches!(option_kind, Some(ProviderSessionConfigOptionKind::Boolean)) {
+        return Value::Bool(value == "true");
+    }
+    Value::String(value.to_string())
+}
+
+fn runtime_config_value_is_advertised(
+    payload: &AcpSessionAttachment,
+    planner: &SessionConfigPlanner,
+    field: &RuntimeConfigField,
+) -> bool {
+    let Some(value) = field.value.as_deref() else {
+        return true;
+    };
+    let Ok(state) = payload.state.lock() else {
+        return false;
+    };
+    match field.kind {
+        SessionConfigFieldKind::Model => {
+            state.model_ids.is_empty() || state.model_ids.iter().any(|model| model == value)
+        }
+        SessionConfigFieldKind::Mode => state
+            .session_config_state
+            .as_ref()
+            .map(|config| {
+                config.modes.is_empty() || config.modes.iter().any(|mode| mode.value == value)
+            })
+            .unwrap_or(true),
+        SessionConfigFieldKind::ReasoningEffort | SessionConfigFieldKind::Generic => planner
+            .option_for_key(&field.key)
+            .ok()
+            .flatten()
+            .map(|option| match option.kind {
+                ProviderSessionConfigOptionKind::Boolean => matches!(value, "true" | "false"),
+                ProviderSessionConfigOptionKind::Select => {
+                    option.values.is_empty() || option.values.iter().any(|item| item.value == value)
+                }
+                ProviderSessionConfigOptionKind::String => {
+                    !value.trim().is_empty() && value.len() <= 256
+                }
+            })
+            .unwrap_or(false),
+    }
+}
+
+fn runtime_config_preferred_value(
+    state: &SessionRuntimeConfigState,
+    field: &RuntimeConfigField,
+) -> Option<String> {
+    match field.kind {
+        SessionConfigFieldKind::Model => state.preferred_model.clone(),
+        SessionConfigFieldKind::Mode => state.preferred_mode.clone(),
+        SessionConfigFieldKind::ReasoningEffort => state.preferred_reasoning_effort.clone(),
+        SessionConfigFieldKind::Generic => state
+            .config_values
+            .get(field.key.as_str())
+            .and_then(|value| value.preferred.as_ref())
+            .map(|value| value.value.clone()),
+    }
+}
+
+fn set_runtime_config_preferred(state: &mut SessionRuntimeConfigState, field: &RuntimeConfigField) {
+    match field.kind {
+        SessionConfigFieldKind::Model => state.preferred_model = field.value.clone(),
+        SessionConfigFieldKind::Mode => state.preferred_mode = field.value.clone(),
+        SessionConfigFieldKind::ReasoningEffort => {
+            state.preferred_reasoning_effort = field.value.clone()
+        }
+        SessionConfigFieldKind::Generic => {
+            state
+                .config_values
+                .entry(field.key.to_string())
+                .or_default()
+                .preferred = field
+                .value
+                .as_ref()
+                .map(|value| ProviderSessionConfigValue {
+                    value: value.clone(),
+                    label: None,
+                });
+        }
+    }
+}
+
+fn set_runtime_config_effective(state: &mut SessionRuntimeConfigState, field: &RuntimeConfigField) {
+    match field.kind {
+        SessionConfigFieldKind::Model => state.effective_model = field.value.clone(),
+        SessionConfigFieldKind::Mode => state.effective_mode = field.value.clone(),
+        SessionConfigFieldKind::ReasoningEffort => {
+            state.effective_reasoning_effort = field.value.clone()
+        }
+        SessionConfigFieldKind::Generic => {
+            state
+                .config_values
+                .entry(field.key.to_string())
+                .or_default()
+                .effective = field
+                .value
+                .as_ref()
+                .map(|value| ProviderSessionConfigValue {
+                    value: value.clone(),
+                    label: None,
+                });
+        }
+    }
+}
+
+fn runtime_config_outcome(
+    field: &RuntimeConfigField,
+    status: SessionRuntimeConfigApplyStatus,
+    plan: Option<&SessionConfigPlan>,
+    error_code: Option<&str>,
+) -> SessionRuntimeConfigFieldOutcome {
+    SessionRuntimeConfigFieldOutcome {
+        key: field.key.to_string(),
+        status,
+        operation: plan
+            .and_then(SessionConfigPlan::operation)
+            .map(|operation| operation.method().to_string()),
+        encoding: plan
+            .and_then(SessionConfigPlan::encoding_name)
+            .map(str::to_string),
+        error_code: error_code.map(str::to_string),
+    }
+}
+
+fn is_capability_negative(error: &VibexError) -> bool {
+    error.diagnostics.iter().any(|diagnostic| {
+        (diagnostic.key == "protocolErrorKind"
+            && matches!(
+                diagnostic.value.as_str(),
+                "method_not_found" | "unsupported"
+            ))
+            || (diagnostic.key == "rpcCode" && diagnostic.value == "-32601")
+            || (diagnostic.key == "rpcMessage"
+                && matches!(
+                    diagnostic.value.trim().to_ascii_lowercase().as_str(),
+                    "unsupported"
+                        | "not supported"
+                        | "method unsupported"
+                        | "operation unsupported"
+                ))
+    })
+}
+
+fn runtime_config_response_conflict(
+    response: &Value,
+    field: &RuntimeConfigField,
+    plan: &SessionConfigPlan,
+) -> Option<&'static str> {
+    let target = field.value.as_deref()?;
+    let explicit = match field.kind {
+        SessionConfigFieldKind::Model => extract_current_model_id(response),
+        SessionConfigFieldKind::Mode => extract_current_mode_id(response),
+        SessionConfigFieldKind::ReasoningEffort | SessionConfigFieldKind::Generic => {
+            let option_id = match plan {
+                SessionConfigPlan::Live { option_id, .. } => option_id.as_deref(),
+                _ => None,
+            };
+            response
+                .get("currentValue")
+                .and_then(value_as_config_string)
+                .or_else(|| {
+                    response
+                        .get("configOptions")
+                        .and_then(Value::as_array)
+                        .and_then(|options| {
+                            options.iter().find_map(|option| {
+                                let id = option.get("id").and_then(Value::as_str);
+                                (option_id.is_none() || id == option_id)
+                                    .then(|| {
+                                        option.get("currentValue").and_then(value_as_config_string)
+                                    })
+                                    .flatten()
+                            })
+                        })
+                })
+        }
+    };
+    explicit
+        .filter(|value| value != target)
+        .map(|_| "acp_session_config_response_mismatch")
+}
+
+fn value_as_config_string(value: &Value) -> Option<String> {
+    value_to_string(value).and_then(|value| {
+        let value = value.trim();
+        (!value.is_empty() && value.len() <= 256).then(|| value.to_string())
+    })
+}
+
+fn upsert_env_overlay(overlays: &mut Vec<(String, String)>, key: String, value: String) {
+    if let Some((_, existing_value)) = overlays
+        .iter_mut()
+        .find(|(existing_key, _)| existing_key == &key)
+    {
+        *existing_value = value;
+    } else {
+        overlays.push((key, value));
+    }
+}
+
+fn project_claude_provider_env(
+    profile: &ProviderProfile,
+    overlays: &mut Vec<(String, String)>,
+) -> VibexResult<()> {
+    if let Some(base_url) = profile
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        upsert_env_overlay(
+            overlays,
+            "ANTHROPIC_BASE_URL".to_string(),
+            base_url.to_string(),
+        );
+    }
+    let secret = profile
+        .secrets
+        .iter()
+        .find(|secret| secret.backend != ProviderSecretBackend::Placeholder)
+        .or_else(|| profile.secrets.first());
+    let Some((secret, value)) = secret
+        .map(|secret| resolve_provider_secret(secret).map(|value| (secret, value)))
+        .transpose()?
+        .and_then(|(secret, value)| value.map(|value| (secret, value)))
+    else {
+        return Ok(());
+    };
+    let env_key = [secret.display_label.as_str(), secret.lookup_key.as_str()]
+        .into_iter()
+        .find(|key| matches!(*key, "ANTHROPIC_API_KEY" | "ANTHROPIC_AUTH_TOKEN"))
+        .unwrap_or("ANTHROPIC_API_KEY");
+    upsert_env_overlay(overlays, env_key.to_string(), value);
+    Ok(())
+}
+
+fn codex_api_key_env_key(runtime: &CodexProviderRuntimeConfig) -> &str {
+    let key = runtime.api_key_env_key.trim();
+    if is_process_env_key(key) {
+        key
+    } else {
+        "OPENAI_API_KEY"
+    }
+}
+
+fn is_process_env_key(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn render_codex_runtime_config(
+    profile: &ProviderProfile,
+    runtime: &CodexProviderRuntimeConfig,
+) -> Option<String> {
+    let fragment = runtime
+        .provider_config_toml
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if fragment.is_some_and(codex_config_is_complete) {
+        let mut config = fragment.unwrap().to_string();
+        if !config.ends_with('\n') {
+            config.push('\n');
+        }
+        return Some(config);
+    }
+    if fragment.is_none()
+        && runtime
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+    {
+        return None;
+    }
+
+    let provider_id = runtime.model_provider_id.trim();
+    let provider_id = if provider_id.is_empty() {
+        "vibex"
+    } else {
+        provider_id
+    };
+    let mut lines = vec![format!(
+        "model_provider = {}",
+        toml_quoted_string(provider_id)
+    )];
+    if let Some(model) = runtime
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("model = {}", toml_quoted_string(model)));
+    }
+    lines.push(String::new());
+    lines.push(format!(
+        "[model_providers.{}]",
+        toml_quoted_string(provider_id)
+    ));
+    if let Some(fragment) = fragment {
+        lines.extend(fragment.lines().map(ToString::to_string));
+    } else {
+        lines.push(format!(
+            "name = {}",
+            toml_quoted_string(profile.display_name.trim())
+        ));
+        if let Some(base_url) = runtime
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            lines.push(format!("base_url = {}", toml_quoted_string(base_url)));
+        }
+        lines.push(format!(
+            "wire_api = {}",
+            toml_quoted_string(runtime.wire_api.as_deref().unwrap_or("responses"))
+        ));
+        lines.push("requires_openai_auth = true".to_string());
+    }
+    if !runtime
+        .provider_config_toml_keys
+        .iter()
+        .any(|key| key == "env_key")
+    {
+        lines.push(format!(
+            "env_key = {}",
+            toml_quoted_string(codex_api_key_env_key(runtime))
+        ));
+    }
+    Some(format!("{}\n", lines.join("\n")))
+}
+
+fn codex_config_is_complete(config: &str) -> bool {
+    config.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("model_provider") && line.contains('=')
+    }) || config
+        .lines()
+        .any(|line| line.trim_start().starts_with("[model_providers"))
+}
+
+fn toml_quoted_string(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for character in value.chars() {
+        match character {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            character if character.is_control() => continue,
+            character => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+fn workspace_runtime_key(cwd: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hash_component(&mut hasher, b"vibex/acp/codex-profile-workspace-home/v1");
+    hash_component(&mut hasher, cwd.to_string_lossy().as_bytes());
+    let digest = hex_digest(hasher.finalize().as_slice());
+    format!("workspace_{}", &digest[..32])
+}
+
+fn opencode_model_provider_id(profile: &ProviderProfile) -> Option<String> {
+    if profile.agent_id.as_str() != OPENCODE_AGENT_ID {
+        return None;
+    }
+    let candidate = provider_option_value(
+        &profile.provider_options,
+        CODEX_MODEL_PROVIDER_ID_OPTION_KEY,
+    )
+    .or_else(|| {
+        profile
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|base_url| !base_url.is_empty())
+            .map(|_| profile.id.as_str().to_string())
+    })?;
+    let mut provider_id = String::new();
+    let mut previous_separator = false;
+    for ch in candidate.trim().to_ascii_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-') {
+            provider_id.push(ch);
+            previous_separator = false;
+        } else if !previous_separator && !provider_id.is_empty() {
+            provider_id.push('-');
+            previous_separator = true;
+        }
+        if provider_id.len() == 80 {
+            break;
+        }
+    }
+    let provider_id = provider_id.trim_matches('-').to_string();
+    (!provider_id.is_empty()).then_some(provider_id)
+}
+
+impl OpenCodeWireApi {
+    fn npm(self) -> &'static str {
+        match self {
+            Self::OpenaiResponses => "@ai-sdk/openai",
+            Self::OpenaiChatCompletions => "@ai-sdk/openai-compatible",
+            Self::AnthropicMessages => "@ai-sdk/anthropic",
+        }
+    }
+
+    fn provider_suffix(self) -> &'static str {
+        match self {
+            Self::OpenaiResponses => "responses",
+            Self::OpenaiChatCompletions => "chat",
+            Self::AnthropicMessages => "anthropic",
+        }
+    }
+
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::OpenaiResponses => "OpenAI Responses",
+            Self::OpenaiChatCompletions => "OpenAI Chat Completions",
+            Self::AnthropicMessages => "Anthropic Messages",
+        }
+    }
+}
+
+impl From<ProviderModelWireApi> for OpenCodeWireApi {
+    fn from(value: ProviderModelWireApi) -> Self {
+        match value {
+            ProviderModelWireApi::OpenaiResponses => Self::OpenaiResponses,
+            ProviderModelWireApi::OpenaiChatCompletions => Self::OpenaiChatCompletions,
+            ProviderModelWireApi::AnthropicMessages => Self::AnthropicMessages,
+        }
+    }
+}
+
+fn is_opencode_default_model(model: &str) -> bool {
+    model.trim().eq_ignore_ascii_case(OPENCODE_DEFAULT_MODEL)
+}
+
+fn opencode_default_wire_api(profile: &ProviderProfile) -> OpenCodeWireApi {
+    let wire_api = provider_option_value(&profile.provider_options, "wireApi")
+        .unwrap_or_else(|| "responses".to_string())
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', ' '], "_");
+    if wire_api.contains("anthropic") || wire_api == "messages" {
+        OpenCodeWireApi::AnthropicMessages
+    } else if wire_api.contains("response") {
+        OpenCodeWireApi::OpenaiResponses
+    } else {
+        OpenCodeWireApi::OpenaiChatCompletions
+    }
+}
+
+fn opencode_provider_id_for_wire_api(
+    base_provider_id: &str,
+    wire_api: OpenCodeWireApi,
+    default_wire_api: OpenCodeWireApi,
+) -> String {
+    if wire_api == default_wire_api {
+        return base_provider_id.to_string();
+    }
+    let suffix = wire_api.provider_suffix();
+    let stem_limit = 80_usize.saturating_sub(suffix.len() + 1);
+    let stem = &base_provider_id[..base_provider_id.len().min(stem_limit)];
+    format!("{stem}-{suffix}")
+}
+
+fn opencode_unqualified_model_id(
+    base_provider_id: &str,
+    default_wire_api: OpenCodeWireApi,
+    model: &str,
+) -> String {
+    for wire_api in OPENCODE_WIRE_APIS {
+        let provider_id =
+            opencode_provider_id_for_wire_api(base_provider_id, wire_api, default_wire_api);
+        if let Some(model) = model.strip_prefix(&format!("{provider_id}/")) {
+            return model.to_string();
+        }
+    }
+    model.to_string()
+}
+
+fn opencode_model_wire_api(
+    profile: &ProviderProfile,
+    base_provider_id: &str,
+    default_wire_api: OpenCodeWireApi,
+    model_id: &str,
+) -> OpenCodeWireApi {
+    profile
+        .configured_models
+        .iter()
+        .find(|model| {
+            opencode_unqualified_model_id(base_provider_id, default_wire_api, model.id.trim())
+                == model_id
+        })
+        .and_then(|model| model.wire_api)
+        .map(OpenCodeWireApi::from)
+        .unwrap_or(default_wire_api)
+}
+
+fn opencode_qualified_model_id(profile: &ProviderProfile, model: &str) -> Option<String> {
+    let base_provider_id = opencode_model_provider_id(profile)?;
+    let default_wire_api = opencode_default_wire_api(profile);
+    let model = opencode_unqualified_model_id(&base_provider_id, default_wire_api, model.trim());
+    let wire_api = opencode_model_wire_api(profile, &base_provider_id, default_wire_api, &model);
+    let provider_id =
+        opencode_provider_id_for_wire_api(&base_provider_id, wire_api, default_wire_api);
+    Some(format!("{provider_id}/{model}"))
+}
+
+fn opencode_model_provider_env(profile: &ProviderProfile) -> Vec<(String, String)> {
+    let Some(base_provider_id) = opencode_model_provider_id(profile) else {
+        return Vec::new();
+    };
+    let default_wire_api = opencode_default_wire_api(profile);
+    let mut model_buckets = OPENCODE_WIRE_APIS
+        .into_iter()
+        .map(|wire_api| (wire_api, serde_json::Map::new()))
+        .collect::<Vec<_>>();
+    for model in profile
+        .configured_models
+        .iter()
+        .filter(|model| model.enabled)
+    {
+        let model_id =
+            opencode_unqualified_model_id(&base_provider_id, default_wire_api, model.id.trim());
+        if model_id.is_empty() || is_opencode_default_model(&model_id) {
+            continue;
+        }
+        let wire_api = model
+            .wire_api
+            .map(OpenCodeWireApi::from)
+            .unwrap_or(default_wire_api);
+        let mut model_config = serde_json::Map::new();
+        if let Some(name) = model
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            model_config.insert("name".to_string(), Value::String(name.to_string()));
+        }
+        if let Some((_, models)) = model_buckets
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == wire_api)
+        {
+            models.insert(model_id, Value::Object(model_config));
+        }
+    }
+    if model_buckets.iter().all(|(_, models)| models.is_empty())
+        && let Some(model) = profile
+            .default_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty() && !is_opencode_default_model(model))
+    {
+        let model = opencode_unqualified_model_id(&base_provider_id, default_wire_api, model);
+        let wire_api =
+            opencode_model_wire_api(profile, &base_provider_id, default_wire_api, &model);
+        if let Some((_, models)) = model_buckets
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == wire_api)
+        {
+            models.insert(model, json!({}));
+        }
+    }
+    let mut options = serde_json::Map::new();
+    if let Some(base_url) = profile
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|base_url| !base_url.is_empty())
+    {
+        options.insert("baseURL".to_string(), Value::String(base_url.to_string()));
+    }
+
+    let api_key = profile.secrets.iter().find_map(|secret| {
+        resolve_provider_secret(secret)
+            .ok()
+            .flatten()
+            .filter(|value| !value.trim().is_empty())
+    });
+    if api_key.is_some() {
+        options.insert(
+            "apiKey".to_string(),
+            Value::String(format!("{{env:{OPENCODE_PROVIDER_API_KEY_ENV}}}")),
+        );
+    }
+    if let Some(headers) = provider_option_value(&profile.provider_options, "headerOverrideJson")
+        .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+        .and_then(|value| value.as_object().cloned())
+    {
+        let headers = headers
+            .into_iter()
+            .filter(|(_, value)| value.is_string())
+            .collect::<serde_json::Map<String, Value>>();
+        if !headers.is_empty() {
+            options.insert("headers".to_string(), Value::Object(headers));
+        }
+    }
+    if let Some(user_agent) = provider_option_value(&profile.provider_options, "customUserAgent") {
+        let headers = options
+            .entry("headers".to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(headers) = headers.as_object_mut() {
+            headers.insert("User-Agent".to_string(), Value::String(user_agent));
+        }
+    }
+
+    let mut providers = serde_json::Map::new();
+    let mut enabled_providers = Vec::new();
+    for (wire_api, models) in model_buckets {
+        if models.is_empty() {
+            continue;
+        }
+        let provider_id =
+            opencode_provider_id_for_wire_api(&base_provider_id, wire_api, default_wire_api);
+        let mut provider = serde_json::Map::new();
+        provider.insert("npm".to_string(), Value::String(wire_api.npm().to_string()));
+        provider.insert(
+            "name".to_string(),
+            Value::String(if wire_api == default_wire_api {
+                profile.display_name.clone()
+            } else {
+                format!("{} ({})", profile.display_name, wire_api.display_name())
+            }),
+        );
+        provider.insert("options".to_string(), Value::Object(options.clone()));
+        provider.insert("models".to_string(), Value::Object(models));
+        enabled_providers.push(Value::String(provider_id.clone()));
+        providers.insert(provider_id, Value::Object(provider));
+    }
+    if providers.is_empty() {
+        return Vec::new();
+    }
+    let default_model = profile
+        .default_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && !is_opencode_default_model(model))
+        .and_then(|model| opencode_qualified_model_id(profile, model));
+    let mut root = serde_json::Map::new();
+    root.insert(
+        "$schema".to_string(),
+        Value::String("https://opencode.ai/config.json".to_string()),
+    );
+    root.insert("provider".to_string(), Value::Object(providers));
+    root.insert(
+        "enabled_providers".to_string(),
+        Value::Array(enabled_providers),
+    );
+    if let Some(model) = default_model {
+        root.insert("model".to_string(), Value::String(model));
+    }
+
+    let Some(config_content) = serde_json::to_string(&Value::Object(root)).ok() else {
+        return Vec::new();
+    };
+    let mut env = vec![(OPENCODE_INLINE_CONFIG_ENV.to_string(), config_content)];
+    if let Some(api_key) = api_key {
+        env.push((OPENCODE_PROVIDER_API_KEY_ENV.to_string(), api_key));
+    }
+    env
+}
+
+fn terminal_tools_enabled(config: &AcpProviderConfig) -> bool {
+    config.terminal_tools
+        || config.features.iter().any(|feature| {
+            let normalized = feature.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+            matches!(
+                normalized.as_str(),
+                "terminal" | "terminals" | "terminal_tools"
+            )
+        })
+}
+
+fn acp_process_strategy_name(strategy: AcpProcessStrategy) -> &'static str {
+    match strategy {
+        AcpProcessStrategy::PerSession => "per_session",
+        AcpProcessStrategy::PerProfilePool => "per_profile_pool",
+        AcpProcessStrategy::Auto => "auto",
+    }
+}
+
+fn effective_acp_process_args(config: &AcpProviderConfig, is_opencode: bool) -> Vec<String> {
+    let mut args = config.args.clone();
+    if !is_opencode {
+        return args;
+    }
+
+    let has_print_logs = args
+        .iter()
+        .any(|arg| arg == "--print-logs" || arg.starts_with("--print-logs="));
+    if !has_print_logs {
+        args.push("--print-logs".to_string());
+    }
+
+    let has_log_level = args
+        .iter()
+        .any(|arg| arg == "--log-level" || arg.starts_with("--log-level="));
+    if !has_log_level {
+        args.push("--log-level".to_string());
+        args.push("ERROR".to_string());
+    }
+    args
+}
+
+fn binary_identity(command: &str) -> String {
+    let resolved = vibex_config_switch::resolve_binary_path(command);
+    let path = resolved
+        .as_deref()
+        .map(Path::new)
+        .unwrap_or_else(|| Path::new(command));
+    match fs::read(path) {
+        Ok(bytes) if path.is_file() => {
+            format!("sha256:{}", hex_digest(Sha256::digest(bytes).as_slice()))
+        }
+        _ => {
+            let mut hasher = Sha256::new();
+            hash_component(&mut hasher, b"vibex/acp/command-identity/v1");
+            hash_component(&mut hasher, command.as_bytes());
+            format!(
+                "command:sha256:{}",
+                hex_digest(hasher.finalize().as_slice())
+            )
+        }
+    }
+}
+
+fn stable_native_state_home_id(
+    provider_profile_id: &ProviderProfileId,
+    cwd: &Path,
+) -> VibexResult<NativeStateHomeId> {
+    let mut hasher = Sha256::new();
+    hash_component(&mut hasher, b"vibex/acp/native-state-home/v1");
+    hash_component(&mut hasher, provider_profile_id.as_str().as_bytes());
+    hash_component(&mut hasher, cwd.to_string_lossy().as_bytes());
+    let digest = hex_digest(hasher.finalize().as_slice());
+    NativeStateHomeId::parse(format!("statehome_{}", &digest[..32]))
+}
+
+fn process_model_provider_id(profile: &ProviderProfile) -> Option<String> {
+    opencode_model_provider_id(profile).or_else(|| {
+        provider_option_value(
+            &profile.provider_options,
+            CODEX_MODEL_PROVIDER_ID_OPTION_KEY,
+        )
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    })
+}
+
+fn provider_secret_backend_name(backend: ProviderSecretBackend) -> &'static str {
+    match backend {
+        ProviderSecretBackend::Placeholder => "placeholder",
+        ProviderSecretBackend::OsKeychain => "os_keychain",
+        ProviderSecretBackend::Environment => "environment",
+        ProviderSecretBackend::External => "external",
+    }
+}
+
+fn provider_model_wire_api_name(wire_api: OpenCodeWireApi) -> &'static str {
+    match wire_api {
+        OpenCodeWireApi::OpenaiResponses => "openai_responses",
+        OpenCodeWireApi::OpenaiChatCompletions => "openai_chat_completions",
+        OpenCodeWireApi::AnthropicMessages => "anthropic_messages",
+    }
+}
+
+/// Hashes only OpenCode fields that affect the generated provider overlay.
+/// Session defaults, display metadata, ACP modes and disabled tools are
+/// deliberately absent.
+fn profile_process_options_revision(profile: &ProviderProfile) -> Option<String> {
+    if profile.agent_id.as_str() != OPENCODE_AGENT_ID {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hash_component(&mut hasher, b"vibex/acp/opencode-process-projection/v1");
+    let base_provider_id = opencode_model_provider_id(profile).unwrap_or_default();
+    let default_wire_api = opencode_default_wire_api(profile);
+    hash_named_component(
+        &mut hasher,
+        b"default_wire_api",
+        provider_model_wire_api_name(default_wire_api).as_bytes(),
+    );
+
+    let mut models = profile
+        .configured_models
+        .iter()
+        .filter(|model| model.enabled)
+        .filter_map(|model| {
+            let id =
+                opencode_unqualified_model_id(&base_provider_id, default_wire_api, model.id.trim());
+            (!id.is_empty() && !is_opencode_default_model(&id)).then(|| {
+                let wire_api = model
+                    .wire_api
+                    .map(OpenCodeWireApi::from)
+                    .unwrap_or(default_wire_api);
+                (id, wire_api)
+            })
+        })
+        .collect::<Vec<_>>();
+    models.sort_by(|left, right| {
+        left.0.cmp(&right.0).then_with(|| {
+            provider_model_wire_api_name(left.1).cmp(provider_model_wire_api_name(right.1))
+        })
+    });
+    hash_named_component(
+        &mut hasher,
+        b"configured_model_count",
+        &(models.len() as u64).to_be_bytes(),
+    );
+    for model in models {
+        hash_named_component(&mut hasher, b"model_id", model.0.as_bytes());
+        hash_named_component(
+            &mut hasher,
+            b"model_wire_api",
+            provider_model_wire_api_name(model.1).as_bytes(),
+        );
+    }
+
+    let mut headers = provider_option_value(&profile.provider_options, "headerOverrideJson")
+        .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+        .and_then(|value| value.as_object().cloned())
+        .map(|headers| {
+            headers
+                .into_iter()
+                .filter_map(|(key, value)| value.as_str().map(|value| (key, value.to_string())))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    headers.sort();
+    hash_named_component(
+        &mut hasher,
+        b"header_count",
+        &(headers.len() as u64).to_be_bytes(),
+    );
+    for (key, value) in headers {
+        hash_named_component(&mut hasher, b"header_name", key.as_bytes());
+        if looks_sensitive(&key) || looks_sensitive(&value) {
+            hash_named_component(&mut hasher, b"header_value", b"[redacted]");
+        } else {
+            hash_named_component(&mut hasher, b"header_value", value.as_bytes());
+        }
+    }
+
+    if let Some(user_agent) = provider_option_value(&profile.provider_options, "customUserAgent") {
+        let user_agent = if looks_sensitive(&user_agent) {
+            "[redacted]"
+        } else {
+            user_agent.as_str()
+        };
+        hash_named_component(&mut hasher, b"custom_user_agent", user_agent.as_bytes());
+    } else {
+        hash_named_absent(&mut hasher, b"custom_user_agent");
+    }
+
+    Some(format!(
+        "sha256:{}",
+        hex_digest(hasher.finalize().as_slice())
+    ))
+}
+
+fn runtime_skills_fingerprint(resources: &ProviderRuntimeResources) -> Option<String> {
+    if resources.skills.is_empty() {
+        return None;
+    }
+    let mut skills = resources.skills.iter().collect::<Vec<_>>();
+    skills.sort_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| left.display_name.cmp(&right.display_name))
+            .then_with(|| left.source_uri.cmp(&right.source_uri))
+    });
+    let mut hasher = Sha256::new();
+    hash_component(&mut hasher, b"vibex/acp/runtime-skills/v1");
+    hash_named_component(
+        &mut hasher,
+        b"skill_count",
+        &(skills.len() as u64).to_be_bytes(),
+    );
+    for skill in skills {
+        hash_named_component(&mut hasher, b"skill_id", skill.id.as_bytes());
+        hash_named_component(
+            &mut hasher,
+            b"skill_display_name",
+            skill.display_name.as_bytes(),
+        );
+        match skill.source_uri.as_deref() {
+            Some(source_uri) => {
+                hash_named_component(&mut hasher, b"skill_source_uri", source_uri.as_bytes())
+            }
+            None => hash_named_absent(&mut hasher, b"skill_source_uri"),
+        }
+    }
+    Some(format!(
+        "sha256:{}",
+        hex_digest(hasher.finalize().as_slice())
+    ))
+}
+
+fn mcp_servers_fingerprint(servers: &[AcpMcpServerDescriptor]) -> String {
+    let mut hasher = Sha256::new();
+    hash_component(&mut hasher, b"vibex/acp/runtime-mcp/v1");
+    let mut servers = servers.iter().collect::<Vec<_>>();
+    servers.sort_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    hash_named_component(
+        &mut hasher,
+        b"server_count",
+        &(servers.len() as u64).to_be_bytes(),
+    );
+    for server in servers {
+        hash_named_component(&mut hasher, b"server_id", server.id.as_bytes());
+        hash_named_component(&mut hasher, b"server_name", server.name.as_bytes());
+        match &server.transport {
+            AcpMcpTransportDescriptor::Stdio { command, args } => {
+                hash_named_component(&mut hasher, b"transport", b"stdio");
+                hash_named_component(&mut hasher, b"command", command.as_bytes());
+                hash_named_component(
+                    &mut hasher,
+                    b"arg_count",
+                    &(args.len() as u64).to_be_bytes(),
+                );
+                for arg in args {
+                    hash_named_component(&mut hasher, b"arg", arg.as_bytes());
+                }
+            }
+            AcpMcpTransportDescriptor::Http { url } => {
+                hash_named_component(&mut hasher, b"transport", b"http");
+                hash_named_component(&mut hasher, b"url", url.as_bytes());
+            }
+            AcpMcpTransportDescriptor::Sse { url } => {
+                hash_named_component(&mut hasher, b"transport", b"sse");
+                hash_named_component(&mut hasher, b"url", url.as_bytes());
+            }
+        }
+    }
+    format!("sha256:{}", hex_digest(hasher.finalize().as_slice()))
+}
+
+fn hash_component(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn hash_named_component(hasher: &mut Sha256, name: &[u8], bytes: &[u8]) {
+    hash_component(hasher, name);
+    hasher.update([1]);
+    hash_component(hasher, bytes);
+}
+
+fn hash_named_absent(hasher: &mut Sha256, name: &[u8]) {
+    hash_component(hasher, name);
+    hasher.update([0]);
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn parse_terminal_create_request(
+    params: &Value,
+    workspace_root: &Path,
+) -> Result<AcpTerminalCreateRequest, String> {
+    let command = string_field(Some(params), &["command", "program", "cmd"])
+        .or_else(|| {
+            params
+                .get("command")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .map(|value| redact_summary(&value))
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "terminal/create requires command".to_string())?;
+
+    let args = params
+        .get("args")
+        .or_else(|| params.get("arguments"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .or_else(|| {
+            params
+                .get("command")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .skip(1)
+                        .filter_map(Value::as_str)
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                })
+        })
+        .unwrap_or_default();
+
+    let cwd = string_field(Some(params), &["cwd", "workingDirectory"])
+        .map(PathBuf::from)
+        .or_else(|| Some(workspace_root.to_path_buf()));
+    let env = params
+        .get("env")
+        .and_then(Value::as_object)
+        .map(|object| {
+            object
+                .iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|value| (key.clone(), value.to_string()))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Ok(AcpTerminalCreateRequest {
+        session_id: string_field(Some(params), &["sessionId"]),
+        command,
+        args,
+        cwd,
+        env,
+        title: string_field(Some(params), &["title", "name"]),
+    })
+}
+
+fn parse_terminal_id(params: &Value) -> Option<TerminalId> {
+    string_field(Some(params), &["terminalId", "terminal_id", "id"])
+        .and_then(|value| TerminalId::parse(value).ok())
+}
+
+fn terminal_permission_title(request: &AcpTerminalCreateRequest) -> String {
+    request
+        .title
+        .as_deref()
+        .map(redact_summary)
+        .filter(|value| !value.is_empty() && !looks_sensitive(value))
+        .unwrap_or_else(|| format!("Run terminal command: {}", request.command))
+}
+
+fn terminal_permission_risk_source(request: &AcpTerminalCreateRequest) -> String {
+    let mut parts = vec![request.command.clone()];
+    parts.extend(request.args.clone());
+    parts.join(" ")
+}
+
+fn terminal_permission_details(request: &AcpTerminalCreateRequest) -> Vec<PermissionActionDetail> {
+    let mut details = Vec::new();
+    push_detail(&mut details, "tool", "terminal");
+    push_detail(&mut details, "command", &request.command);
+    if !request.args.is_empty() {
+        push_detail(&mut details, "args", &redacted_args_summary(&request.args));
+    }
+    if let Some(cwd) = request.cwd.as_ref() {
+        push_detail(&mut details, "cwd", &cwd.display().to_string());
+    }
+    if !request.env.is_empty() {
+        let keys = request
+            .env
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        push_detail(&mut details, "envKeys", &keys);
+    }
+    details
+}
+
+fn bounded_terminal_output(text: &str, limit: usize, already_truncated: bool) -> (String, bool) {
+    let redacted = redact_summary(text);
+    if redacted.len() <= limit {
+        return (redacted, already_truncated);
+    }
+    let mut end = 0;
+    for (index, _) in redacted.char_indices() {
+        if index > limit {
+            break;
+        }
+        end = index;
+    }
+    (redacted[..end].to_string(), true)
+}
+
+async fn resolve_terminal_create_permission(
+    process: Arc<AcpProcess>,
+    attachment: Option<Arc<AcpSessionAttachment>>,
+    pending: PendingTerminalCreate,
+    response: PermissionResponseKind,
+) -> VibexResult<()> {
+    match response {
+        PermissionResponseKind::Approve | PermissionResponseKind::AlwaysAllowForSession => {
+            let terminal_id = process.terminal_host.create(pending.request).await?;
+            if let Some(attachment) = attachment.as_ref()
+                && !process.register_active_terminal(terminal_id.clone(), attachment)
+            {
+                let _ = process.terminal_host.kill(&terminal_id).await;
+                let _ = process.terminal_host.release(&terminal_id).await;
+                return Err(VibexError::conflict(
+                    "acp_terminal_attachment_stale",
+                    "ACP attachment changed while the terminal was being created",
+                ));
+            }
+            process.respond_ok(
+                pending.rpc_id,
+                json!({
+                    "terminalId": terminal_id.as_str(),
+                    "id": terminal_id.as_str()
+                }),
+            );
+        }
+        PermissionResponseKind::Deny => {
+            process.respond_error(pending.rpc_id, -32000, "terminal command denied");
+        }
+    }
+    Ok(())
+}
+
+#[async_trait]
+impl AcpClient for AcpRuntimeClient {
+    async fn create_session(&self, request: AcpCreateSessionRequest) -> VibexResult<AcpSession> {
+        let operation_lock = self.session_operation_lock(&request.session_id)?;
+        let _operation_guard = operation_lock.lock().await;
+        if let Some(current) = self.current_attachment(&request.session_id) {
+            self.detach_attachment(current.fence()).await;
+        }
+        self.detach_stale_attachment(&request.session_id).await;
+        let identity =
+            self.attachment_identity_candidate(&request.session_id, &request.provider_profile_id)?;
+        let config = self.profile_config(&request.provider_profile_id)?;
+        let cwd = Self::resolve_workspace_cwd(&config, &request.workspace_root)?;
+        let (effective_strategy, fallback_reason) =
+            self.pool_decision(&request.provider_profile_id, &config)?;
+        let lease = self
+            .acquire_initialized_process(AcpProcessLaunch {
+                profile_id: &request.provider_profile_id,
+                config: &config,
+                cwd: &cwd,
+                runtime_resources: &request.runtime_resources,
+                purpose: AcpProcessPurpose::Session,
+                process_strategy_effective: effective_strategy,
+                pool_fallback_reason: fallback_reason,
+            })
+            .await?;
+        let attachment = self
+            .acquire_attachment(
+                request.session_id.clone(),
+                identity,
+                lease,
+                None,
+                AttachmentActivationMode::Immediate,
+                move |process| async move { self.open_new_session_for_attachment(&process).await },
+            )
+            .await?;
+        if let Err(error) = self
+            .apply_requested_model_to_attachment(&attachment, request.model.as_deref())
+            .await
+        {
+            self.detach_attachment(attachment.fence()).await;
+            return Err(error);
+        }
+        Ok(attachment.payload().acp_session())
+    }
+
+    async fn update_session_runtime_config(
+        &self,
+        request: SessionRuntimeConfigMutationRequest,
+    ) -> VibexResult<SessionRuntimeConfigMutationResult> {
+        AcpRuntimeClient::update_session_runtime_config(self, request).await
+    }
+
+    async fn resume_session(&self, binding: ProviderBinding) -> VibexResult<AcpSession> {
+        // Resume is a cheap handle refresh: a live process reports its current
+        // native session state, otherwise the stored binding is echoed and the
+        // actual process is (re)spawned lazily on the next turn.
+        if let Some(attachment) = self.current_attachment(&binding.session_id)
+            && attachment.payload().process().provider_profile_id == binding.provider_profile_id
+        {
+            return Ok(attachment.payload().acp_session());
+        }
+        Ok(AcpSession {
+            native_session_id: binding.native.native_session_id.clone(),
+            native_thread_id: binding.native.native_thread_id.clone(),
+            native_resume_token: binding.native.native_resume_token.clone(),
+            session_config_state: binding.native.session_config_state.clone(),
+            redacted_metadata: binding.native.redacted_metadata.clone(),
+        })
+    }
+
+    async fn prepare_turn_execution(
+        &self,
+        request: &AcpSendTurnRequest,
+    ) -> VibexResult<Option<ProviderTurnExecutionIdentity>> {
+        let required_runtime = turn_execution_runtime_requirement(
+            request.message_submission_id.is_some(),
+            request.required_runtime.as_ref(),
+        )
+        .map_err(missing_turn_execution_runtime_requirement_error)?;
+        if let Some(required_runtime) = required_runtime {
+            let execution_identity = request.execution_identity.as_ref().ok_or_else(|| {
+                VibexError::conflict(
+                    "turn_execution_identity_missing",
+                    "fenced ACP turn is missing its committed execution identity",
+                )
+            })?;
+            let operation_lock = self.session_operation_lock(&request.session_id)?;
+            let _operation_guard = operation_lock.lock().await;
+            let attachment = self
+                .current_attachment(&request.session_id)
+                .ok_or_else(|| {
+                    VibexError::conflict(
+                        "turn_execution_identity_mismatch",
+                        "fenced ACP turn has no current committed attachment",
+                    )
+                })?;
+            self.validate_fenced_turn_attachment(
+                &attachment,
+                required_runtime,
+                execution_identity,
+            )?;
+            return Ok(Some(execution_identity.clone()));
+        }
+        let attachment = self
+            .ensure_attachment(
+                &request.binding,
+                &request.workspace_root,
+                &request.runtime_resources,
+            )
+            .await?;
+        let model_id = attachment
+            .payload()
+            .runtime_config_state()
+            .effective_model
+            .ok_or_else(|| {
+                VibexError::capability(
+                    "turn_execution_model_unavailable",
+                    "ACP attachment did not report an effective model for turn attribution",
+                )
+            })?;
+        Ok(Some(ProviderTurnExecutionIdentity {
+            binding_id: attachment.binding_id().clone(),
+            activation_generation: attachment.fence().activation_generation as i64,
+            model_id,
+        }))
+    }
+
+    async fn list_sessions(
+        &self,
+        provider_profile_id: &ProviderProfileId,
+        workspace_root: Option<&str>,
+    ) -> VibexResult<Vec<ExternalSessionImportCandidate>> {
+        let config = self.profile_config(provider_profile_id)?;
+        let cwd = Self::resolve_probe_cwd(&config, workspace_root)?;
+        let probe_resources = ProviderRuntimeResources::default();
+        let process = self
+            .spawn_process(
+                AcpProcessInstanceId::new(),
+                AcpProcessLaunch {
+                    profile_id: provider_profile_id,
+                    config: &config,
+                    cwd: &cwd,
+                    runtime_resources: &probe_resources,
+                    purpose: AcpProcessPurpose::Probe,
+                    process_strategy_effective: AcpProcessStrategy::PerSession,
+                    pool_fallback_reason: None,
+                },
+                None,
+                None,
+                None,
+            )
+            .await?;
+
+        let result = async {
+            self.initialize_process(&process).await?;
+            let supports_list_sessions = process
+                .shared
+                .lock()
+                .map(|shared| shared.supports_list_sessions)
+                .unwrap_or(false);
+            if !supports_list_sessions {
+                return Err(VibexError::capability(
+                    "acp_session_list_unsupported",
+                    "ACP native session listing is not supported by this provider",
+                ));
+            }
+            let response = process
+                .request(
+                    AcpOperation::SessionList.method(),
+                    json!({ "cwd": cwd.display().to_string() }),
+                    ACP_PROBE_TIMEOUT,
+                )
+                .await?;
+            Ok(normalize_session_list_candidates(
+                &response,
+                provider_profile_id,
+                &cwd,
+            ))
+        }
+        .await;
+
+        process.shutdown().await;
+        result
+    }
+
+    async fn import_session(&self, request: AcpImportSessionRequest) -> VibexResult<AcpSession> {
+        let native_session_id = request
+            .native_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "acp_import_session_id_missing",
+                    "ACP import requires a native session id",
+                )
+            })?
+            .to_string();
+        let operation_lock = self.session_operation_lock(&request.session_id)?;
+        let _operation_guard = operation_lock.lock().await;
+        if let Some(current) = self.current_attachment(&request.session_id) {
+            self.detach_attachment(current.fence()).await;
+        }
+        self.detach_stale_attachment(&request.session_id).await;
+        let identity =
+            self.attachment_identity_candidate(&request.session_id, &request.provider_profile_id)?;
+        let config = self.profile_config(&request.provider_profile_id)?;
+        let cwd = Self::resolve_workspace_cwd(&config, &request.workspace_root)?;
+        let lease = self
+            .acquire_initialized_process(AcpProcessLaunch {
+                profile_id: &request.provider_profile_id,
+                config: &config,
+                cwd: &cwd,
+                runtime_resources: &request.runtime_resources,
+                purpose: AcpProcessPurpose::Session,
+                process_strategy_effective: AcpProcessStrategy::PerSession,
+                pool_fallback_reason: Some("acp_import_uses_dedicated_process".to_string()),
+            })
+            .await?;
+        let requested_native_session_id = native_session_id.clone();
+        let attachment = self
+            .acquire_attachment(
+                request.session_id.clone(),
+                identity,
+                lease,
+                Some(native_session_id),
+                AttachmentActivationMode::Immediate,
+                move |process| async move {
+                    let supports_load_session = process
+                        .shared
+                        .lock()
+                        .map(|shared| shared.supports_load_session)
+                        .unwrap_or(false);
+                    if !supports_load_session {
+                        return Err(VibexError::capability(
+                            "acp_session_load_unsupported",
+                            "ACP native session loading is not supported by this provider",
+                        ));
+                    }
+                    self.load_existing_session_for_attachment(
+                        &process,
+                        &requested_native_session_id,
+                    )
+                    .await
+                },
+            )
+            .await?;
+        Ok(attachment.payload().acp_session())
+    }
+
+    async fn send_turn(&self, request: AcpSendTurnRequest) -> VibexResult<AcpTurn> {
+        // Serialize prompt admission with session-config mutations and
+        // attachment replacement. The guard is released immediately after
+        // the prompt is marked active so a mutation can return `Busy` rather
+        // than waiting for the complete turn round trip.
+        let operation_lock = self.session_operation_lock(&request.session_id)?;
+        let operation_guard = operation_lock.lock().await;
+        let attachment = self
+            .current_attachment(&request.session_id)
+            .ok_or_else(|| {
+                VibexError::conflict(
+                    "turn_execution_identity_mismatch",
+                    "ACP attachment changed after turn execution attribution was prepared",
+                )
+            })?;
+        let payload = attachment.payload();
+        let runtime_state = payload.runtime_config_state();
+        let execution_identity = request.execution_identity.as_ref().ok_or_else(|| {
+            VibexError::conflict(
+                "turn_execution_identity_missing",
+                "ACP turn is missing its prepared execution identity",
+            )
+        })?;
+        if request.binding.session_id != request.session_id
+            || execution_identity.binding_id != *attachment.binding_id()
+            || execution_identity.activation_generation
+                != attachment.fence().activation_generation as i64
+            || runtime_state.effective_model.as_deref()
+                != Some(execution_identity.model_id.as_str())
+        {
+            return Err(VibexError::conflict(
+                "turn_execution_identity_mismatch",
+                "ACP attachment changed after turn execution attribution was prepared",
+            ));
+        }
+        if let Some(required_runtime) = turn_execution_runtime_requirement(
+            request.message_submission_id.is_some(),
+            request.required_runtime.as_ref(),
+        )
+        .map_err(missing_turn_execution_runtime_requirement_error)?
+        {
+            self.validate_fenced_turn_attachment(
+                &attachment,
+                required_runtime,
+                execution_identity,
+            )?;
+        }
+        if payload.session_config_planner().is_some() && !runtime_state.is_converged() {
+            return Err(VibexError::conflict(
+                "acp_session_config_reconciliation_required",
+                "ACP session configuration has not converged for the current attachment",
+            ));
+        }
+        let prompt_guard = self
+            .attachment_router
+            .registry
+            .acquire_prompt(attachment.fence())
+            .await?;
+        let process = payload.process();
+        let sink = match request.event_sender.clone() {
+            Some(sender) => TurnSink::Channel(sender),
+            None => TurnSink::Buffer(Vec::new()),
+        };
+        let prompt = runtime_prompt_content(&request.text, &request.attachments);
+        let started = self.attachment_router.registry.apply_current(
+            attachment.fence(),
+            |current| -> VibexResult<StartedAcpRequest> {
+                current.begin_turn(sink)?;
+                match process.start_request(
+                    AcpOperation::SessionPrompt.method(),
+                    protocol::build_session_prompt_params(&current.native_session_id, prompt),
+                    false,
+                ) {
+                    Ok(request) => Ok(request),
+                    Err(error) => {
+                        let _ = current.finish_turn(false);
+                        Err(error)
+                    }
+                }
+            },
+        )??;
+        drop(operation_guard);
+        let turn_guard = AcpAttachmentTurnGuard::new(
+            payload.clone(),
+            Arc::clone(&process),
+            started.id,
+            prompt_guard,
+        );
+        let prompt_started = Instant::now();
+        let result = process
+            .finish_started_request(
+                AcpOperation::SessionPrompt.method(),
+                self.prompt_timeout,
+                started,
+            )
+            .await
+            .map(|(response, _)| response);
+        let prompt_result = if result.is_ok() {
+            RuntimeMetricResult::Success
+        } else {
+            RuntimeMetricResult::Failure
+        };
+        self.observability.observe_duration(
+            RuntimeMetricName::PromptLatency,
+            None,
+            prompt_result,
+            prompt_started.elapsed(),
+        );
+        process
+            .log_context
+            .for_operation("prompt")
+            .with_logical_session_id(&request.session_id)
+            .with_binding_id(attachment.binding_id())
+            .with_activation_generation(attachment.fence().activation_generation as i64)
+            .with_native_session_id(&attachment.fence().native_session_id)
+            .emit(
+                if result.is_ok() {
+                    RuntimeLogLevel::Info
+                } else {
+                    RuntimeLogLevel::Warn
+                },
+                "acp_runtime_prompt",
+                prompt_result,
+                result.as_ref().err().map(|error| error.code.as_str()),
+                Some(elapsed_ms(prompt_started)),
+            );
+        let response = match result {
+            Ok(response) => response,
+            Err(err) => {
+                turn_guard.abort(err.code != OPENCODE_MODEL_API_ERROR_CODE);
+                return Err(err);
+            }
+        };
+        let usage_changed = payload.merge_prompt_response_usage(&response);
+        let has_pending_permissions = payload.has_pending_permissions();
+        let buffered_events = turn_guard.complete(!has_pending_permissions)?;
+        if usage_changed {
+            process.publish_attachment_payload(&payload);
+        }
+
+        let stop_reason = response
+            .get("stopReason")
+            .and_then(Value::as_str)
+            .unwrap_or("end_turn")
+            .to_string();
+        let mut events = buffered_events;
+        if stop_reason != "end_turn" {
+            events.push(AcpEvent::SystemNotice {
+                level: SystemNoticeLevel::Info,
+                message: format!("ACP turn stopped: {stop_reason}"),
+            });
+        }
+
+        Ok(AcpTurn {
+            events,
+            binding_update: Some(payload.acp_session()),
+            completed: !has_pending_permissions,
+        })
+    }
+
+    async fn resolve_permission(&self, request: AcpPermissionResolution) -> VibexResult<()> {
+        let attachment = self
+            .current_attachment(&request.binding.session_id)
+            .ok_or_else(|| {
+                VibexError::conflict(
+                    "acp_permission_process_missing",
+                    "ACP agent process for this permission request is no longer running",
+                )
+            })?;
+        let payload = attachment.payload();
+        let process = payload.process();
+        let (pending, terminal_pending) =
+            self.attachment_router
+                .registry
+                .apply_current(attachment.fence(), |current| {
+                    let request_id = request.resolution.request_id.as_str();
+                    let pending = current.remove_pending_permission(request_id);
+                    let terminal_pending = pending
+                        .is_none()
+                        .then(|| current.claim_pending_terminal_create(request_id))
+                        .flatten();
+                    (pending, terminal_pending)
+                })?;
+        let Some(pending) = pending else {
+            let Some(terminal_pending) = terminal_pending else {
+                // Duplicate UI/remote resolution attempts are harmless after the
+                // first response removed the native JSON-RPC request.
+                return Ok(());
+            };
+            let _terminal_create_guard = TerminalCreateWorkGuard {
+                attachment: Arc::clone(&payload),
+            };
+            return resolve_terminal_create_permission(
+                Arc::clone(&process),
+                Some(Arc::clone(&payload)),
+                terminal_pending,
+                request.resolution.response,
+            )
+            .await;
+        };
+
+        let response = match select_resolution_permission_option(
+            &pending.options,
+            request.resolution.response,
+        ) {
+            Some(option_id) => json!({
+                "outcome": {
+                    "outcome": "selected",
+                    "optionId": option_id
+                }
+            }),
+            None => permission_cancelled_response(),
+        };
+        process.respond_ok(pending.rpc_id, response);
+        Ok(())
+    }
+
+    async fn interrupt(&self, binding: &ProviderBinding) -> VibexResult<()> {
+        let Some(attachment) = self.current_attachment(&binding.session_id) else {
+            return Ok(());
+        };
+        self.attachment_router
+            .registry
+            .apply_current(attachment.fence(), |current| {
+                current.cancel_pending_host_requests();
+                current.process().notify(
+                    AcpOperation::SessionCancel.method(),
+                    protocol::build_session_cancel_params(&current.native_session_id),
+                )
+            })?
+    }
+
+    async fn close_session(&self, binding: &ProviderBinding) -> VibexResult<()> {
+        let operation_lock = self.session_operation_lock(&binding.session_id)?;
+        let _operation_guard = operation_lock.lock().await;
+        if let Some(attachment) = self.current_attachment(&binding.session_id) {
+            self.detach_attachment(attachment.fence()).await;
+        }
+        self.detach_stale_attachment(&binding.session_id).await;
+        self.forget_attachment_identity(&binding.session_id)?;
+        Ok(())
+    }
+
+    async fn list_runtime_models(
+        &self,
+        provider_profile_id: &ProviderProfileId,
+    ) -> VibexResult<Vec<String>> {
+        Ok(self
+            .probe_runtime_session_config(provider_profile_id)
+            .await?
+            .models)
+    }
+
+    async fn probe_runtime_session_config(
+        &self,
+        provider_profile_id: &ProviderProfileId,
+    ) -> VibexResult<AcpRuntimeSessionProbe> {
+        let config = self.profile_config(provider_profile_id)?;
+        let probe_cwd = std::env::var("HOME")
+            .map(PathBuf::from)
+            .ok()
+            .filter(|path| path.is_dir())
+            .unwrap_or_else(std::env::temp_dir);
+        let probe_resources = ProviderRuntimeResources::default();
+        let process = self
+            .spawn_process(
+                AcpProcessInstanceId::new(),
+                AcpProcessLaunch {
+                    profile_id: provider_profile_id,
+                    config: &config,
+                    cwd: &probe_cwd,
+                    runtime_resources: &probe_resources,
+                    purpose: AcpProcessPurpose::Probe,
+                    process_strategy_effective: AcpProcessStrategy::PerSession,
+                    pool_fallback_reason: None,
+                },
+                None,
+                None,
+                None,
+            )
+            .await?;
+
+        let probe = async {
+            let initialize = process
+                .request(
+                    AcpOperation::Initialize.method(),
+                    build_initialize_params(false, false, false, false, false),
+                    ACP_PROBE_TIMEOUT,
+                )
+                .await?;
+            let _ = initialize;
+            let session = process
+                .request(
+                    AcpOperation::SessionNew.method(),
+                    build_session_new_params(&probe_cwd, &[]),
+                    ACP_PROBE_TIMEOUT,
+                )
+                .await?;
+            Ok::<AcpRuntimeSessionProbe, VibexError>(AcpRuntimeSessionProbe {
+                models: extract_model_ids(&session),
+                modes: extract_config_values(mode_candidates(&session)),
+                reasoning_efforts: extract_probe_reasoning_efforts(&session),
+                options: extract_config_options(&session),
+            })
+        };
+
+        let probed = probe.await;
+        process.shutdown().await;
+        probed
+    }
+
+    async fn list_runtime_model_capabilities(
+        &self,
+        provider_profile_id: &ProviderProfileId,
+    ) -> VibexResult<Vec<AgentModelCapabilities>> {
+        let profile = self
+            .config_service
+            .get_profile(provider_profile_id)?
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "provider_profile_not_found",
+                    "Provider Profile was not found for model capability probing",
+                )
+                .with_diagnostic("providerProfileId", provider_profile_id.as_str())
+            })?;
+        if profile.agent_id.as_str() != "codex" {
+            return Ok(Vec::new());
+        }
+
+        let config = self.profile_config(provider_profile_id)?;
+        let probe_cwd = std::env::var("HOME")
+            .map(PathBuf::from)
+            .ok()
+            .filter(|path| path.is_dir())
+            .unwrap_or_else(std::env::temp_dir);
+        let probe_resources = ProviderRuntimeResources::default();
+        let mut process_args = config.args.clone();
+        process_args.extend(["cli".to_string(), "app-server".to_string()]);
+        let env_overlays = self.resolve_env_overlays_for_profile(&profile, &config, &probe_cwd)?;
+        let process = self
+            .spawn_process(
+                AcpProcessInstanceId::new(),
+                AcpProcessLaunch {
+                    profile_id: provider_profile_id,
+                    config: &config,
+                    cwd: &probe_cwd,
+                    runtime_resources: &probe_resources,
+                    purpose: AcpProcessPurpose::Probe,
+                    process_strategy_effective: AcpProcessStrategy::PerSession,
+                    pool_fallback_reason: None,
+                },
+                Some(process_args),
+                Some(env_overlays),
+                None,
+            )
+            .await?;
+
+        let probe = async {
+            process
+                .request(
+                    "initialize",
+                    json!({
+                        "capabilities": null,
+                        "clientInfo": {
+                            "name": "vibex-model-probe",
+                            "title": "Vibex model probe",
+                            "version": env!("CARGO_PKG_VERSION")
+                        }
+                    }),
+                    ACP_PROBE_TIMEOUT,
+                )
+                .await?;
+
+            let mut cursor = None;
+            let mut capabilities = BTreeMap::new();
+            for _ in 0..16 {
+                let response = process
+                    .request(
+                        "model/list",
+                        json!({ "cursor": cursor, "limit": null }),
+                        ACP_PROBE_TIMEOUT,
+                    )
+                    .await?;
+                let (page, next_cursor) = parse_codex_model_capabilities_page(&response)?;
+                for capability in page {
+                    capabilities.insert(capability.model.clone(), capability);
+                }
+                let Some(next_cursor) = next_cursor else {
+                    return Ok(capabilities.into_values().collect::<Vec<_>>());
+                };
+                cursor = Some(next_cursor);
+            }
+            Err(VibexError::provider(
+                "codex_model_list_page_limit_exceeded",
+                "Codex model capability probe exceeded the page limit",
+            ))
+        }
+        .await;
+
+        process.shutdown().await;
+        probe
+    }
+
+    async fn list_session_commands(
+        &self,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<Vec<AcpRuntimeCommand>> {
+        let Some(attachment) = self.current_attachment(session_id) else {
+            return Ok(Vec::new());
+        };
+        Ok(attachment.payload().available_commands())
+    }
+}
+
+fn parse_codex_model_capabilities_page(
+    response: &Value,
+) -> VibexResult<(Vec<AgentModelCapabilities>, Option<String>)> {
+    let data = response
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            VibexError::provider(
+                "codex_model_list_invalid_response",
+                "Codex model capability response did not contain a model list",
+            )
+        })?;
+    let mut capabilities = Vec::new();
+    for model in data.iter().take(256) {
+        let Some(model_id) = model
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let mut reasoning_efforts = Vec::new();
+        if let Some(efforts) = model
+            .get("supportedReasoningEfforts")
+            .and_then(Value::as_array)
+        {
+            for effort in efforts.iter().take(16) {
+                let Some(value) = effort
+                    .get("reasoningEffort")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                else {
+                    continue;
+                };
+                if reasoning_efforts
+                    .iter()
+                    .any(|existing: &AgentReasoningEffort| existing.value == value)
+                {
+                    continue;
+                }
+                reasoning_efforts.push(AgentReasoningEffort {
+                    value: value.to_string(),
+                    description: effort
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(redact_summary)
+                        .filter(|value| !value.is_empty()),
+                });
+            }
+        }
+        capabilities.push(AgentModelCapabilities {
+            model: model_id.to_string(),
+            default_reasoning_effort: model
+                .get("defaultReasoningEffort")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string),
+            reasoning_efforts,
+        });
+    }
+    let next_cursor = response
+        .get("nextCursor")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    Ok((capabilities, next_cursor))
+}
+
+fn lock_poisoned_error(scope: &str) -> VibexError {
+    VibexError::provider(
+        "acp_runtime_lock_poisoned",
+        "ACP runtime state could not be locked",
+    )
+    .with_diagnostic("scope", scope)
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn restore_metric_result(outcome: AgentSessionRestoreOutcome) -> RuntimeMetricResult {
+    match outcome {
+        AgentSessionRestoreOutcome::Resumed => RuntimeMetricResult::Resumed,
+        AgentSessionRestoreOutcome::Loaded => RuntimeMetricResult::Loaded,
+        AgentSessionRestoreOutcome::NotFound => RuntimeMetricResult::NotFound,
+        AgentSessionRestoreOutcome::AuthenticationRequired => {
+            RuntimeMetricResult::AuthenticationRequired
+        }
+        AgentSessionRestoreOutcome::Unsupported => RuntimeMetricResult::Unsupported,
+        AgentSessionRestoreOutcome::TransientFailure => RuntimeMetricResult::TransientFailure,
+        AgentSessionRestoreOutcome::FatalFailure => RuntimeMetricResult::FatalFailure,
+    }
+}
+
+fn permission_cancelled_response() -> Value {
+    json!({ "outcome": { "outcome": ACP_PERMISSION_CANCELLED_RESPONSE } })
+}
+
+fn select_resolution_permission_option(
+    options: &[PermissionOptionSummary],
+    response: PermissionResponseKind,
+) -> Option<String> {
+    match response {
+        PermissionResponseKind::Approve => {
+            select_permission_option(options, &["allow_once", "allow_always", "approve"])
+        }
+        PermissionResponseKind::AlwaysAllowForSession => {
+            select_permission_option(options, &["allow_always", "allow_once", "approve"])
+        }
+        PermissionResponseKind::Deny => {
+            select_permission_option(options, &["reject_once", "reject_always", "deny", "reject"])
+        }
+    }
+}
+
+fn select_permission_option(
+    options: &[PermissionOptionSummary],
+    preferred_kinds: &[&str],
+) -> Option<String> {
+    for preferred in preferred_kinds {
+        if let Some(option) = options.iter().find(|option| option.kind == *preferred) {
+            return Some(option.option_id.clone());
+        }
+    }
+    // Approvals fall back to the first allow-flavored option before giving up.
+    if preferred_kinds
+        .first()
+        .map(|kind| kind.starts_with("allow"))
+        .unwrap_or(false)
+    {
+        return options
+            .iter()
+            .find(|option| option.kind.starts_with("allow"))
+            .map(|option| option.option_id.clone());
+    }
+    if preferred_kinds
+        .first()
+        .map(|kind| kind.starts_with("reject") || *kind == "deny")
+        .unwrap_or(false)
+    {
+        return options
+            .iter()
+            .find(|option| option.kind.starts_with("reject") || option.kind == "deny")
+            .map(|option| option.option_id.clone());
+    }
+    None
+}
+
+fn parse_permission_options(value: Option<&Value>) -> Vec<PermissionOptionSummary> {
+    value
+        .and_then(Value::as_array)
+        .map(|options| {
+            options
+                .iter()
+                .filter_map(|option| {
+                    let option_id = option
+                        .get("optionId")
+                        .or_else(|| option.get("id"))
+                        .and_then(Value::as_str)?
+                        .to_string();
+                    let kind = option
+                        .get("kind")
+                        .or_else(|| option.get("type"))
+                        .or_else(|| option.get("name"))
+                        .and_then(Value::as_str)
+                        .map(normalize_permission_option_kind)
+                        .unwrap_or_else(|| "unknown".to_string());
+                    Some(PermissionOptionSummary { option_id, kind })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn normalize_permission_option_kind(kind: &str) -> String {
+    let normalized = kind
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', ' ', '.'], "_");
+    match normalized.as_str() {
+        "allow" | "approve" | "approved" => "allow_once".to_string(),
+        "always_allow" | "allow_always" | "allow_for_session" | "always_allow_for_session" => {
+            "allow_always".to_string()
+        }
+        "deny" | "reject" | "rejected" => "reject_once".to_string(),
+        "deny_always" | "reject_always" | "always_deny" | "always_reject" => {
+            "reject_always".to_string()
+        }
+        "cancel" | "canceled" | "cancelled" => ACP_PERMISSION_CANCELLED_RESPONSE.to_string(),
+        "" => "unknown".to_string(),
+        _ => normalized,
+    }
+}
+
+fn permission_title(tool_call: Option<&Value>, params: &Value) -> String {
+    let raw = string_field(tool_call, &["title", "name", "kind"])
+        .or_else(|| string_field(Some(params), &["title", "name"]));
+    let Some(raw) = raw else {
+        return "ACP permission request".to_string();
+    };
+    let title = redact_summary(&raw);
+    if title.is_empty() || looks_sensitive(&title) {
+        "ACP permission request".to_string()
+    } else {
+        title
+    }
+}
+
+fn permission_risk_source(tool_call: Option<&Value>, params: &Value, title: &str) -> String {
+    let mut candidates = vec![title.to_string()];
+    for key in ["kind", "name", "title", "description"] {
+        if let Some(value) = string_field(tool_call, &[key]) {
+            candidates.push(value);
+        }
+        if let Some(value) = string_field(Some(params), &[key]) {
+            candidates.push(value);
+        }
+    }
+    if let Some(raw_input) = tool_call.and_then(|call| call.get("rawInput")) {
+        candidates.push(raw_input.to_string());
+    }
+    candidates.join(" ")
+}
+
+fn string_field(value: Option<&Value>, keys: &[&str]) -> Option<String> {
+    let object = value?.as_object()?;
+    keys.iter().find_map(|key| {
+        object
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
+}
+
+fn push_detail(details: &mut Vec<PermissionActionDetail>, label: &str, value: &str) {
+    let value = redact_summary(value);
+    if value.is_empty() {
+        return;
+    }
+    let value = if value.len() > ACP_SUMMARY_LIMIT {
+        let prefix: String = value.chars().take(ACP_SUMMARY_LIMIT).collect();
+        format!("{prefix}...(truncated)")
+    } else {
+        value
+    };
+    details.push(PermissionActionDetail {
+        label: label.to_string(),
+        value,
+    });
+}
+
+fn truncate_optional_summary(value: impl AsRef<str>) -> Option<String> {
+    let value = value.as_ref().trim();
+    if value.is_empty() || value == "null" {
+        return None;
+    }
+    if looks_sensitive(value) {
+        return Some("[redacted-sensitive-output]".to_string());
+    }
+    if value.len() > ACP_SUMMARY_LIMIT {
+        let prefix: String = value.chars().take(ACP_SUMMARY_LIMIT).collect();
+        Some(format!("{prefix}...(truncated)"))
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn safe_tool_raw_output(value: String) -> Option<String> {
+    if value.trim().is_empty() || value.trim() == "null" {
+        return None;
+    }
+    if looks_sensitive(&value) {
+        return Some("[redacted-sensitive-output]".to_string());
+    }
+    Some(value)
+}
+
+fn raw_output_delta(
+    previous: &mut Option<ToolCallOutputState>,
+    next: &str,
+) -> Option<AgentEventRawOutput> {
+    let next_digest: [u8; 32] = Sha256::digest(next.as_bytes()).into();
+    let output = match previous.as_ref() {
+        Some(previous)
+            if previous.byte_len <= next.len()
+                && next.is_char_boundary(previous.byte_len)
+                && Sha256::digest(&next.as_bytes()[..previous.byte_len]).as_slice()
+                    == previous.digest.as_slice() =>
+        {
+            let suffix = &next[previous.byte_len..];
+            (!suffix.is_empty())
+                .then(|| AgentEventRawOutput::new(AgentEventRawOutputMode::Append, suffix).0)
+        }
+        Some(_) => Some(AgentEventRawOutput::new(AgentEventRawOutputMode::Snapshot, next).0),
+        None => Some(AgentEventRawOutput::new(AgentEventRawOutputMode::Snapshot, next).0),
+    };
+    *previous = Some(ToolCallOutputState {
+        byte_len: next.len(),
+        digest: next_digest,
+    });
+    output
+}
+
+fn content_block_text(content: Option<&Value>) -> String {
+    let Some(content) = content else {
+        return String::new();
+    };
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Object(_) => {
+            if content.get("type").and_then(Value::as_str) == Some("text") {
+                content
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            } else {
+                String::new()
+            }
+        }
+        Value::Array(items) => items
+            .iter()
+            .map(|item| content_block_text(Some(item)))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+fn tool_call_content_summary(content: Option<&Value>) -> Option<String> {
+    let items = content?.as_array()?;
+    let mut parts = Vec::new();
+    for item in items {
+        match item.get("type").and_then(Value::as_str) {
+            Some("content") => {
+                let text = content_block_text(item.get("content"));
+                if !text.trim().is_empty() {
+                    parts.push(text);
+                }
+            }
+            Some("diff") => {
+                if let Some(path) = item.get("path").and_then(Value::as_str) {
+                    parts.push(format!("edited {path}"));
+                }
+            }
+            Some("terminal") => {
+                parts.push("terminal output".to_string());
+            }
+            _ => {}
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
+fn agent_token_usage_from_context_update(update: &Value) -> Option<AgentTokenUsage> {
+    let used = update.get("used").and_then(Value::as_u64)?;
+    let size = update.get("size").and_then(Value::as_u64)?;
+    if size == 0 {
+        return None;
+    }
+    Some(AgentTokenUsage {
+        context_window_used_tokens: Some(used),
+        context_window_size_tokens: Some(size),
+        ..AgentTokenUsage::default()
+    })
+}
+
+fn agent_token_usage_from_prompt_response(response: &Value) -> Option<AgentTokenUsage> {
+    let usage = response.get("usage")?;
+    let parsed = AgentTokenUsage {
+        input_tokens: usage.get("inputTokens").and_then(Value::as_u64),
+        output_tokens: usage.get("outputTokens").and_then(Value::as_u64),
+        thought_tokens: usage.get("thoughtTokens").and_then(Value::as_u64),
+        cached_read_tokens: usage.get("cachedReadTokens").and_then(Value::as_u64),
+        cached_write_tokens: usage.get("cachedWriteTokens").and_then(Value::as_u64),
+        total_tokens: usage.get("totalTokens").and_then(Value::as_u64),
+        ..AgentTokenUsage::default()
+    };
+    [
+        parsed.input_tokens,
+        parsed.output_tokens,
+        parsed.thought_tokens,
+        parsed.cached_read_tokens,
+        parsed.cached_write_tokens,
+        parsed.total_tokens,
+    ]
+    .into_iter()
+    .any(|value| value.is_some())
+    .then_some(parsed)
+}
+
+fn merge_agent_token_usage(current: &mut AgentTokenUsage, incoming: AgentTokenUsage) -> bool {
+    let previous = current.clone();
+    if incoming.input_tokens.is_some() {
+        current.input_tokens = incoming.input_tokens;
+    }
+    if incoming.output_tokens.is_some() {
+        current.output_tokens = incoming.output_tokens;
+    }
+    if incoming.thought_tokens.is_some() {
+        current.thought_tokens = incoming.thought_tokens;
+    }
+    if incoming.cached_read_tokens.is_some() {
+        current.cached_read_tokens = incoming.cached_read_tokens;
+    }
+    if incoming.cached_write_tokens.is_some() {
+        current.cached_write_tokens = incoming.cached_write_tokens;
+    }
+    if incoming.total_tokens.is_some() {
+        current.total_tokens = incoming.total_tokens;
+    }
+    if incoming.context_window_used_tokens.is_some() {
+        current.context_window_used_tokens = incoming.context_window_used_tokens;
+    }
+    if incoming.context_window_size_tokens.is_some() {
+        current.context_window_size_tokens = incoming.context_window_size_tokens;
+    }
+    *current != previous
+}
+
+fn plan_steps(entries: Option<&Value>) -> Vec<PlanStepPayload> {
+    entries
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let title = entry
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())?
+                        .to_string();
+                    let status = match entry.get("status").and_then(Value::as_str) {
+                        Some("completed") => PlanStepStatus::Completed,
+                        Some("in_progress") => PlanStepStatus::Running,
+                        Some("failed") => PlanStepStatus::Failed,
+                        _ => PlanStepStatus::Pending,
+                    };
+                    Some(PlanStepPayload { title, status })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_available_commands(value: Option<&Value>) -> Vec<AcpRuntimeCommand> {
+    value
+        .and_then(Value::as_array)
+        .map(|commands| {
+            commands
+                .iter()
+                .filter_map(|command| {
+                    let name = command
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())?
+                        .to_string();
+                    if looks_sensitive(&name) {
+                        return None;
+                    }
+                    let description = command
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(redact_summary)
+                        .filter(|value| !value.is_empty());
+                    Some(AcpRuntimeCommand { name, description })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn extract_model_ids(response: &Value) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut push_model = |value: &Value| {
+        let id = if let Some(id) = value.as_str() {
+            Some(id.to_string())
+        } else {
+            value
+                .get("modelId")
+                .or_else(|| value.get("value"))
+                .or_else(|| value.get("id"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        };
+        if let Some(id) = id {
+            let id = id.trim().to_string();
+            if !id.is_empty() && !looks_sensitive(&id) && !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    };
+
+    let candidates = [
+        response.get("availableModels"),
+        response
+            .get("models")
+            .and_then(|models| models.get("availableModels")),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        if let Some(models) = candidate.as_array() {
+            for model in models {
+                push_model(model);
+            }
+        }
+    }
+    if let Some(config_options) = response.get("configOptions").and_then(Value::as_array) {
+        for option in config_options {
+            if option.get("category").and_then(Value::as_str) != Some("model") {
+                continue;
+            }
+            if let Some(options) = option.get("options").and_then(Value::as_array) {
+                for model in options {
+                    push_model(model);
+                }
+            }
+        }
+    }
+    ids
+}
+
+/// Reasoning-effort choices advertised by a `session/new` response. Efforts
+/// travel as a select `configOptions` entry whose category or id matches the
+/// registry `reasoning_effort` alias family. The "default" sentinel is
+/// dropped: catalog cascades add their own Default choice that clears the
+/// override instead of pinning it.
+pub(crate) fn extract_probe_reasoning_efforts(response: &Value) -> Vec<AgentReasoningEffort> {
+    const EFFORT_OPTION_KEYS: [&str; 4] = [
+        "effort",
+        "thinking_level",
+        "thought_level",
+        "reasoning_effort",
+    ];
+    let mut efforts: Vec<AgentReasoningEffort> = Vec::new();
+    for option in config_options_array(response).map_or(&[][..], Vec::as_slice) {
+        let category = option
+            .get("category")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        let id = option
+            .get("id")
+            .or_else(|| option.get("configId"))
+            .or_else(|| option.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if !EFFORT_OPTION_KEYS.contains(&category) && !EFFORT_OPTION_KEYS.contains(&id) {
+            continue;
+        }
+        let Some(values) = option.get("options").or_else(|| option.get("values")) else {
+            continue;
+        };
+        for value in extract_config_values(vec![values]) {
+            if value.value == "default"
+                || efforts.iter().any(|existing| existing.value == value.value)
+            {
+                continue;
+            }
+            efforts.push(AgentReasoningEffort {
+                value: value.value,
+                description: value.label,
+            });
+        }
+    }
+    efforts
+}
+
+fn extract_current_model_id(response: &Value) -> Option<String> {
+    response
+        .get("currentModelId")
+        .and_then(Value::as_str)
+        .or_else(|| response.get("model").and_then(Value::as_str))
+        .or_else(|| {
+            response
+                .get("models")
+                .and_then(|models| models.get("currentModelId"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            response
+                .get("configOptions")
+                .and_then(Value::as_array)
+                .and_then(|options| {
+                    options
+                        .iter()
+                        .find(|option| {
+                            option.get("category").and_then(Value::as_str) == Some("model")
+                        })
+                        .and_then(|option| option.get("currentValue"))
+                        .and_then(Value::as_str)
+                })
+        })
+        .map(redact_summary)
+        .filter(|value| !value.is_empty())
+}
+
+fn extract_current_mode_id(response: &Value) -> Option<String> {
+    response
+        .get("currentModeId")
+        .and_then(Value::as_str)
+        .or_else(|| response.get("mode").and_then(Value::as_str))
+        .or_else(|| {
+            response
+                .get("modes")
+                .and_then(|modes| modes.get("currentModeId"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            config_options_array(response).and_then(|options| {
+                options
+                    .iter()
+                    .find(|option| option.get("category").and_then(Value::as_str) == Some("mode"))
+                    .and_then(|option| option.get("currentValue"))
+                    .and_then(Value::as_str)
+            })
+        })
+        .map(redact_summary)
+        .filter(|value| !value.is_empty())
+}
+
+fn extract_provider_session_config_state(
+    response: &Value,
+    provider_profile_id: &ProviderProfileId,
+    native_session_id: Option<&str>,
+) -> Option<ProviderSessionConfigState> {
+    let models = extract_config_values(model_candidates(response));
+    let modes = extract_config_values(mode_candidates(response));
+    let options = extract_config_options(response);
+    let current_model = extract_current_model_id(response)
+        .map(|value| ProviderSessionConfigValue { value, label: None });
+    let current_mode = extract_current_mode_id(response)
+        .map(|value| ProviderSessionConfigValue { value, label: None });
+
+    if models.is_empty()
+        && modes.is_empty()
+        && options.is_empty()
+        && current_model.is_none()
+        && current_mode.is_none()
+    {
+        return None;
+    }
+
+    Some(ProviderSessionConfigState {
+        provider_kind: ProviderKind::Acp,
+        provider_profile_id: Some(provider_profile_id.clone()),
+        native_session_id: native_session_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && !looks_sensitive(value))
+            .map(ToString::to_string),
+        current_model,
+        models,
+        current_mode,
+        modes,
+        options,
+        source: "native_session_config".to_string(),
+        updated_at_ms: unix_timestamp_ms(),
+        metadata: Vec::new(),
+    })
+}
+
+fn model_candidates(response: &Value) -> Vec<&Value> {
+    let mut candidates = Vec::new();
+    if let Some(value) = response.get("availableModels") {
+        candidates.push(value);
+    }
+    if let Some(value) = response
+        .get("models")
+        .and_then(|models| models.get("availableModels"))
+    {
+        candidates.push(value);
+    }
+    if let Some(value) = response
+        .get("models")
+        .filter(|models| models.as_array().is_some())
+    {
+        candidates.push(value);
+    }
+    for option in config_options_array(response).map_or(&[][..], Vec::as_slice) {
+        if option.get("category").and_then(Value::as_str) == Some("model")
+            && let Some(value) = option.get("options").or_else(|| option.get("values"))
+        {
+            candidates.push(value);
+        }
+    }
+    candidates
+}
+
+fn mode_candidates(response: &Value) -> Vec<&Value> {
+    let mut candidates = Vec::new();
+    if let Some(value) = response.get("availableModes") {
+        candidates.push(value);
+    }
+    if let Some(value) = response
+        .get("modes")
+        .and_then(|modes| modes.get("availableModes"))
+    {
+        candidates.push(value);
+    }
+    if let Some(value) = response
+        .get("modes")
+        .filter(|modes| modes.as_array().is_some())
+    {
+        candidates.push(value);
+    }
+    for option in config_options_array(response).map_or(&[][..], Vec::as_slice) {
+        if option.get("category").and_then(Value::as_str) == Some("mode")
+            && let Some(value) = option.get("options").or_else(|| option.get("values"))
+        {
+            candidates.push(value);
+        }
+    }
+    candidates
+}
+
+fn config_options_array(response: &Value) -> Option<&Vec<Value>> {
+    response
+        .get("configOptions")
+        .or_else(|| response.get("config_options"))
+        .and_then(Value::as_array)
+}
+
+fn extract_config_values(candidates: Vec<&Value>) -> Vec<ProviderSessionConfigValue> {
+    let mut values: Vec<ProviderSessionConfigValue> = Vec::new();
+    for candidate in candidates {
+        let Some(items) = candidate.as_array() else {
+            continue;
+        };
+        for item in items {
+            if let Some(value) = config_value_from_json(item)
+                && !values.iter().any(|existing| existing.value == value.value)
+            {
+                values.push(value);
+            }
+        }
+    }
+    values
+}
+
+fn config_value_label(value: &Value) -> Option<String> {
+    value
+        .get("label")
+        .or_else(|| value.get("title"))
+        .or_else(|| value.get("name"))
+        .and_then(Value::as_str)
+        .and_then(sanitize_config_string)
+}
+
+fn extract_config_options(response: &Value) -> Vec<ProviderSessionConfigOption> {
+    config_options_array(response)
+        .map(|options| options.iter().filter_map(config_option_from_json).collect())
+        .unwrap_or_default()
+}
+
+fn config_option_from_json(option: &Value) -> Option<ProviderSessionConfigOption> {
+    let id = option
+        .get("id")
+        .or_else(|| option.get("configId"))
+        .or_else(|| option.get("name"))
+        .and_then(value_to_string)
+        .and_then(|value| sanitize_config_string(&value))?;
+    let label = option
+        .get("label")
+        .or_else(|| option.get("title"))
+        .or_else(|| option.get("name"))
+        .and_then(Value::as_str)
+        .and_then(sanitize_config_string)
+        .unwrap_or_else(|| id.clone());
+    let category = option
+        .get("category")
+        .and_then(Value::as_str)
+        .and_then(sanitize_config_string);
+    let description = option
+        .get("description")
+        .or_else(|| option.get("help"))
+        .or_else(|| option.get("tooltip"))
+        .and_then(Value::as_str)
+        .and_then(sanitize_config_string);
+    let kind = config_option_kind(option)?;
+    let values = option
+        .get("values")
+        .or_else(|| option.get("options"))
+        .map(|value| extract_config_values(vec![value]))
+        .unwrap_or_default();
+    let current_value = option
+        .get("currentValue")
+        .or_else(|| option.get("current_value"))
+        .and_then(config_value_from_json);
+    let default_value = option
+        .get("defaultValue")
+        .or_else(|| option.get("default_value"))
+        .and_then(config_value_from_json);
+
+    Some(ProviderSessionConfigOption {
+        id,
+        label,
+        category,
+        description,
+        kind,
+        current_value,
+        default_value,
+        values,
+    })
+}
+
+fn config_option_kind(option: &Value) -> Option<ProviderSessionConfigOptionKind> {
+    let raw = option
+        .get("type")
+        .or_else(|| option.get("kind"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match raw.as_str() {
+        "boolean" | "bool" | "checkbox" => Some(ProviderSessionConfigOptionKind::Boolean),
+        "select" | "enum" | "dropdown" => Some(ProviderSessionConfigOptionKind::Select),
+        "string" | "text" | "input" => Some(ProviderSessionConfigOptionKind::String),
+        "" if option.get("options").is_some() || option.get("values").is_some() => {
+            Some(ProviderSessionConfigOptionKind::Select)
+        }
+        "" => Some(ProviderSessionConfigOptionKind::String),
+        _ => None,
+    }
+}
+
+fn config_value_from_json(value: &Value) -> Option<ProviderSessionConfigValue> {
+    let raw_value = value_to_string(value)?;
+    let normalized = sanitize_config_string(&raw_value)?;
+    let label = match value {
+        Value::Object(_) => config_value_label(value),
+        _ => None,
+    };
+    Some(ProviderSessionConfigValue {
+        value: normalized,
+        label,
+    })
+}
+
+fn value_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Bool(value) => Some(value.to_string()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Object(_) => value
+            .get("value")
+            .or_else(|| value.get("id"))
+            .or_else(|| value.get("modelId"))
+            .or_else(|| value.get("modeId"))
+            .and_then(value_to_string),
+        _ => None,
+    }
+}
+
+fn sanitize_config_string(value: &str) -> Option<String> {
+    let raw = value.trim();
+    if raw.is_empty() || looks_sensitive(raw) {
+        return None;
+    }
+    let value = redact_summary(value);
+    if value.is_empty() || looks_sensitive(&value) {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn normalize_session_list_candidates(
+    response: &Value,
+    provider_profile_id: &ProviderProfileId,
+    fallback_workspace_root: &Path,
+) -> Vec<ExternalSessionImportCandidate> {
+    let sessions = response
+        .get("sessions")
+        .and_then(Value::as_array)
+        .or_else(|| response.as_array());
+    let Some(sessions) = sessions else {
+        return Vec::new();
+    };
+
+    sessions
+        .iter()
+        .enumerate()
+        .map(|(index, session)| {
+            let native_session_id = session
+                .get("sessionId")
+                .or_else(|| session.get("id"))
+                .and_then(value_to_string)
+                .and_then(|value| sanitize_config_string(&value));
+            let title = session
+                .get("title")
+                .or_else(|| session.get("name"))
+                .and_then(Value::as_str)
+                .and_then(sanitize_config_string)
+                .unwrap_or_else(|| {
+                    native_session_id
+                        .as_deref()
+                        .map(|id| format!("ACP session {id}"))
+                        .unwrap_or_else(|| format!("ACP session {}", index + 1))
+                });
+            let workspace_root = session
+                .get("workspaceRoot")
+                .or_else(|| session.get("cwd"))
+                .and_then(Value::as_str)
+                .and_then(sanitize_config_string)
+                .unwrap_or_else(|| fallback_workspace_root.display().to_string());
+            let read_only = session
+                .get("readOnly")
+                .or_else(|| session.get("read_only"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let continuation_status = if native_session_id.is_some() && !read_only {
+                ExternalSessionContinuationStatus::Resumable
+            } else {
+                ExternalSessionContinuationStatus::ReadOnly
+            };
+            let continuation_reason = if native_session_id.is_none() {
+                Some("native session id is unavailable".to_string())
+            } else if read_only {
+                Some("native session is marked read-only".to_string())
+            } else {
+                None
+            };
+            let status = if continuation_status == ExternalSessionContinuationStatus::Resumable {
+                ExternalSessionImportCandidateStatus::Importable
+            } else if native_session_id.is_some() {
+                ExternalSessionImportCandidateStatus::Partial
+            } else {
+                ExternalSessionImportCandidateStatus::Blocked
+            };
+            let candidate_id = native_session_id
+                .as_deref()
+                .map(|id| format!("acp:{id}"))
+                .unwrap_or_else(|| format!("acp:list:{index}"));
+
+            ExternalSessionImportCandidate {
+                candidate_id,
+                source: ExternalSessionImportSource::Acp,
+                provider_kind: ProviderKind::Acp,
+                provider_profile_id: Some(provider_profile_id.clone()),
+                workspace_root,
+                workspace_mode: WorkspaceMode::CurrentCheckout,
+                title,
+                native_session_id,
+                native_thread_id: None,
+                native_resume_token: None,
+                continuation_status,
+                continuation_reason,
+                updated_at_ms: session_updated_at_ms(session),
+                session_config_state: extract_provider_session_config_state(
+                    session,
+                    provider_profile_id,
+                    session
+                        .get("sessionId")
+                        .or_else(|| session.get("id"))
+                        .and_then(Value::as_str),
+                ),
+                status,
+                redaction_state: TimelineRedactionState::None,
+                timeline_items: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        })
+        .collect()
+}
+
+fn session_updated_at_ms(session: &Value) -> Option<i64> {
+    session
+        .get("updatedAtMs")
+        .or_else(|| session.get("updated_at_ms"))
+        .and_then(|value| {
+            value.as_i64().or_else(|| {
+                value
+                    .as_str()
+                    .and_then(|text| text.trim().parse::<i64>().ok())
+            })
+        })
+}
+
+fn runtime_prompt_content(text: &str, attachments: &[ProviderTurnAttachment]) -> Vec<Value> {
+    let mut content = Vec::new();
+    if !text.trim().is_empty() {
+        content.push(json!({ "type": "text", "text": text }));
+    }
+
+    for attachment in attachments {
+        if attachment.is_image()
+            && let Some(block) = image_content_block(attachment)
+        {
+            content.push(block);
+            continue;
+        }
+        if let Some(path) = attachment.local_path.as_ref() {
+            content.push(json!({
+                "type": "resource_link",
+                "uri": format!("file://{}", path.display()),
+                "name": attachment.label
+            }));
+        } else if let Some(uri) = attachment.uri.as_ref() {
+            content.push(json!({
+                "type": "resource_link",
+                "uri": uri,
+                "name": attachment.label
+            }));
+        }
+    }
+
+    if content.is_empty() {
+        content.push(json!({ "type": "text", "text": text }));
+    }
+    content
+}
+
+fn image_content_block(attachment: &ProviderTurnAttachment) -> Option<Value> {
+    use base64::Engine as _;
+
+    let path = attachment.local_path.as_ref()?;
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.len() > ACP_IMAGE_ATTACHMENT_BYTE_LIMIT {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let mime_type = attachment
+        .mime_type
+        .clone()
+        .unwrap_or_else(|| "image/png".to_string());
+    Some(json!({
+        "type": "image",
+        "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+        "mimeType": mime_type
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vibex_agent::AgentProvider;
+
+    #[test]
+    fn standard_context_and_prompt_usage_are_merged_without_losing_fields() {
+        let mut usage =
+            agent_token_usage_from_context_update(&json!({ "used": 12_500, "size": 200_000 }))
+                .unwrap();
+        let prompt = agent_token_usage_from_prompt_response(&json!({
+            "stopReason": "end_turn",
+            "usage": {
+                "inputTokens": 600,
+                "outputTokens": 90,
+                "thoughtTokens": 30,
+                "cachedReadTokens": 1_400,
+                "cachedWriteTokens": 250,
+                "totalTokens": 2_370
+            }
+        }))
+        .unwrap();
+
+        assert!(merge_agent_token_usage(&mut usage, prompt));
+        assert_eq!(usage.context_window_used_tokens, Some(12_500));
+        assert_eq!(usage.context_window_size_tokens, Some(200_000));
+        assert_eq!(usage.input_tokens, Some(600));
+        assert_eq!(usage.cached_read_tokens, Some(1_400));
+        assert_eq!(usage.cached_write_tokens, Some(250));
+        assert_eq!(usage.total_tokens, Some(2_370));
+    }
+
+    #[test]
+    fn malformed_usage_values_do_not_replace_valid_usage() {
+        assert!(
+            agent_token_usage_from_context_update(&json!({ "used": -1, "size": 200_000 }))
+                .is_none()
+        );
+        assert!(agent_token_usage_from_context_update(&json!({ "used": 1, "size": 0 })).is_none());
+        assert!(
+            agent_token_usage_from_prompt_response(&json!({
+                "usage": {
+                    "inputTokens": -1,
+                    "cachedReadTokens": 1.5,
+                    "totalTokens": "unknown"
+                }
+            }))
+            .is_none()
+        );
+
+        let mut current = AgentTokenUsage {
+            input_tokens: Some(10),
+            cached_read_tokens: Some(20),
+            context_window_used_tokens: Some(30),
+            context_window_size_tokens: Some(40),
+            ..AgentTokenUsage::default()
+        };
+        let partial =
+            agent_token_usage_from_prompt_response(&json!({ "usage": { "outputTokens": 5 } }))
+                .unwrap();
+        assert!(merge_agent_token_usage(&mut current, partial));
+        assert_eq!(current.input_tokens, Some(10));
+        assert_eq!(current.cached_read_tokens, Some(20));
+        assert_eq!(current.output_tokens, Some(5));
+        assert_eq!(current.context_window_size_tokens, Some(40));
+    }
+
+    #[test]
+    fn fenced_command_runtime_does_not_require_a_submission_identity() {
+        let required_runtime = SessionRuntimeSelection {
+            agent_id: AgentId::parse(OPENCODE_AGENT_ID).unwrap(),
+            provider_profile_id: ProviderProfileId::new(),
+            model_id: "mock/model-1".to_string(),
+            reasoning_effort: None,
+            mode_id: Some("build".to_string()),
+            config_values: Default::default(),
+        };
+
+        assert_eq!(
+            turn_execution_runtime_requirement(false, Some(&required_runtime)).unwrap(),
+            Some(&required_runtime)
+        );
+        assert!(
+            turn_execution_runtime_requirement(false, None)
+                .unwrap()
+                .is_none()
+        );
+
+        let error = turn_execution_runtime_requirement(true, None)
+            .map_err(missing_turn_execution_runtime_requirement_error)
+            .unwrap_err();
+        assert_eq!(error.code, "turn_execution_runtime_requirement_missing");
+    }
+
+    #[test]
+    fn generic_policy_features_use_the_config_option_path() {
+        let patch = SessionRuntimeConfigPatch {
+            config_values: BTreeMap::from([
+                (
+                    crate::session_config::CANONICAL_APPROVAL_MODE.to_string(),
+                    "ask".to_string(),
+                ),
+                (
+                    crate::session_config::CANONICAL_SANDBOX_MODE.to_string(),
+                    "workspace-write".to_string(),
+                ),
+            ]),
+            ..Default::default()
+        };
+        let fields = normalize_runtime_config_patch(&patch).unwrap();
+        assert_eq!(fields.len(), 2);
+        assert!(
+            fields
+                .iter()
+                .all(|field| field.kind == SessionConfigFieldKind::Generic)
+        );
+        assert!(fields.iter().any(|field| {
+            field.key.as_str() == crate::session_config::CANONICAL_APPROVAL_MODE
+                && field.value.as_deref() == Some("ask")
+        }));
+        assert!(fields.iter().any(|field| {
+            field.key.as_str() == crate::session_config::CANONICAL_SANDBOX_MODE
+                && field.value.as_deref() == Some("workspace-write")
+        }));
+    }
+
+    #[test]
+    fn cumulative_tool_output_uses_snapshot_then_append_without_duplicates() {
+        let mut previous = None;
+        let first = raw_output_delta(&mut previous, "first").unwrap();
+        assert_eq!(first.mode, AgentEventRawOutputMode::Snapshot);
+        assert_eq!(first.text, "first");
+        let second = raw_output_delta(&mut previous, "first second").unwrap();
+        assert_eq!(second.mode, AgentEventRawOutputMode::Append);
+        assert_eq!(second.text, " second");
+        assert!(raw_output_delta(&mut previous, "first second").is_none());
+        let replacement = raw_output_delta(&mut previous, "replacement").unwrap();
+        assert_eq!(replacement.mode, AgentEventRawOutputMode::Snapshot);
+        assert_eq!(replacement.text, "replacement");
+    }
+
+    #[test]
+    fn cumulative_tool_output_keeps_appending_after_large_state_limit() {
+        let mut previous = None;
+        let first = "a".repeat(70_000);
+        let first_event = raw_output_delta(&mut previous, &first).unwrap();
+        assert_eq!(first_event.mode, AgentEventRawOutputMode::Snapshot);
+        assert!(first_event.text.len() < first.len());
+
+        let mut second = first.clone();
+        second.push_str(&"b".repeat(3_000));
+        let second_event = raw_output_delta(&mut previous, &second).unwrap();
+        assert_eq!(second_event.mode, AgentEventRawOutputMode::Append);
+        assert_eq!(second_event.text, "b".repeat(3_000));
+
+        assert!(raw_output_delta(&mut previous, &second).is_none());
+        let replacement = raw_output_delta(&mut previous, "replacement").unwrap();
+        assert_eq!(replacement.mode, AgentEventRawOutputMode::Snapshot);
+    }
+
+    #[test]
+    fn events_runtime_snapshot_uses_exact_enricher_or_passthrough() {
+        let snapshot = ToolCallSnapshot {
+            title: "Run tests".to_string(),
+            kind: "command_execution".to_string(),
+            input_summary: Some("cargo test".to_string()),
+            output_summary: Some("ok".to_string()),
+            raw_input: Some(json!({"command":"cargo test","cwd":"workspace"})),
+            raw_output_state: Some(ToolCallOutputState {
+                byte_len: 2,
+                digest: Sha256::digest(b"ok").into(),
+            }),
+            content: None,
+            locations: Vec::new(),
+            meta: BTreeMap::from([("exitCode".to_string(), "0".to_string())]),
+            started: true,
+        };
+        let raw_output = AgentEventRawOutput::new(AgentEventRawOutputMode::Append, "ok").0;
+        let codex = normalize_tool_call_snapshot(
+            AgentEventEnricherKind::Codex,
+            "adapter=codex-acp@1.1.2",
+            "native-command-id".to_string(),
+            ToolCallStatus::Completed,
+            snapshot.clone(),
+            Some(raw_output.clone()),
+        );
+        assert!(matches!(
+            &codex[0],
+            AcpEvent::Canonical(crate::NormalizedAgentEvent {
+                event: crate::CanonicalAgentEvent::CommandExecution(_),
+                ..
+            })
+        ));
+        let passthrough = normalize_tool_call_snapshot(
+            AgentEventEnricherKind::Passthrough,
+            "unmanaged",
+            "native-command-id".to_string(),
+            ToolCallStatus::Completed,
+            snapshot,
+            Some(raw_output),
+        );
+        assert!(matches!(
+            &passthrough[0],
+            AcpEvent::Canonical(crate::NormalizedAgentEvent {
+                event: crate::CanonicalAgentEvent::ToolCall(_),
+                ..
+            })
+        ));
+        let provider = match &codex[0] {
+            AcpEvent::Canonical(event) => event.clone().into_provider_event(),
+            _ => unreachable!(),
+        };
+        assert!(
+            !provider
+                .provider_correlation_id
+                .as_deref()
+                .unwrap()
+                .contains("native-command-id")
+        );
+    }
+    use crate::ProcessConfigStatus;
+
+    #[test]
+    fn initialize_params_keep_phase_one_capabilities() {
+        assert_eq!(
+            build_initialize_params(true, true, false, false, false),
+            json!({
+                "protocolVersion": ACP_PROTOCOL_VERSION,
+                "clientCapabilities": {
+                    "fs": {
+                        "readTextFile": true,
+                        "writeTextFile": true
+                    },
+                    "terminal": false,
+                    "auth": {
+                        "terminal": false
+                    },
+                    "mcpServers": false,
+                    "meta": {
+                        "terminal_output": false,
+                        "terminal-auth": false,
+                        "mcpServers": false
+                    }
+                },
+                "clientInfo": {
+                    "name": "vibex",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            })
+        );
+        assert_eq!(
+            build_initialize_params(false, false, false, false, false)["clientCapabilities"]["fs"],
+            json!({ "readTextFile": false, "writeTextFile": false })
+        );
+        assert_eq!(
+            build_initialize_params(true, true, true, true, false)["clientCapabilities"]["terminal"],
+            json!(true)
+        );
+        assert_eq!(
+            build_initialize_params(true, true, true, true, false)["clientCapabilities"]["auth"]["terminal"],
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn restore_response_treats_session_id_as_optional_consistency_evidence() {
+        let native_session_id = "native-session";
+
+        validate_restore_response(AcpOperation::SessionResume, &json!({}), native_session_id)
+            .unwrap();
+        validate_restore_response(
+            AcpOperation::SessionLoad,
+            &json!({
+                "modes": {
+                    "availableModes": [],
+                    "currentModeId": "agent"
+                }
+            }),
+            native_session_id,
+        )
+        .unwrap();
+        validate_restore_response(
+            AcpOperation::SessionResume,
+            &json!({ "sessionId": native_session_id }),
+            native_session_id,
+        )
+        .unwrap();
+
+        let invalid = validate_restore_response(
+            AcpOperation::SessionResume,
+            &json!({ "sessionId": null }),
+            native_session_id,
+        )
+        .unwrap_err();
+        assert_eq!(invalid.code, "acp_restore_invalid_response");
+
+        let mismatch = validate_restore_response(
+            AcpOperation::SessionLoad,
+            &json!({ "sessionId": "different-session" }),
+            native_session_id,
+        )
+        .unwrap_err();
+        assert_eq!(mismatch.code, "acp_restore_native_session_mismatch");
+
+        let non_object =
+            validate_restore_response(AcpOperation::SessionResume, &json!([]), native_session_id)
+                .unwrap_err();
+        assert_eq!(non_object.code, "acp_restore_invalid_response");
+    }
+
+    #[derive(Debug, Default)]
+    struct MockTerminalHost {
+        created: std::sync::Mutex<Vec<AcpTerminalCreateRequest>>,
+        created_ids: std::sync::Mutex<Vec<TerminalId>>,
+        killed: std::sync::Mutex<Vec<TerminalId>>,
+        released: std::sync::Mutex<Vec<TerminalId>>,
+        waited: std::sync::Mutex<Vec<TerminalId>>,
+    }
+
+    #[async_trait]
+    impl AcpTerminalHost for MockTerminalHost {
+        async fn create(&self, request: AcpTerminalCreateRequest) -> VibexResult<TerminalId> {
+            self.created.lock().unwrap().push(request);
+            let terminal_id = TerminalId::new();
+            self.created_ids.lock().unwrap().push(terminal_id.clone());
+            Ok(terminal_id)
+        }
+
+        async fn kill(&self, terminal_id: &TerminalId) -> VibexResult<()> {
+            self.killed.lock().unwrap().push(terminal_id.clone());
+            Ok(())
+        }
+
+        async fn release(&self, terminal_id: &TerminalId) -> VibexResult<()> {
+            self.released.lock().unwrap().push(terminal_id.clone());
+            Ok(())
+        }
+
+        async fn output(
+            &self,
+            _terminal_id: &TerminalId,
+            _limit: usize,
+        ) -> VibexResult<AcpTerminalOutput> {
+            Ok(AcpTerminalOutput {
+                text: "safe output".to_string(),
+                truncated: false,
+            })
+        }
+
+        async fn wait_for_exit(
+            &self,
+            terminal_id: &TerminalId,
+        ) -> VibexResult<AcpTerminalExitStatus> {
+            self.waited.lock().unwrap().push(terminal_id.clone());
+            Ok(AcpTerminalExitStatus {
+                exit_code: Some(0),
+                signal: None,
+            })
+        }
+
+        fn terminal_auth_descriptor(
+            &self,
+            request: AcpTerminalAuthRequest,
+        ) -> VibexResult<TerminalAuthActionDescriptor> {
+            Ok(TerminalAuthActionDescriptor {
+                id: request.method_id,
+                provider_profile_id: request.provider_profile_id.into_string(),
+                title: request.title,
+                command: request.command,
+                args: request.args,
+                cwd: request.cwd,
+                env_keys: request.env.iter().map(|(key, _)| key.clone()).collect(),
+                redacted_env_summary: request
+                    .env
+                    .iter()
+                    .map(|(key, _)| format!("{key}=[redacted]"))
+                    .collect(),
+            })
+        }
+    }
+
+    fn test_process(
+        process_instance_id: AcpProcessInstanceId,
+        exit_reporter: Option<ProcessExitReporter<AcpProcess>>,
+        outbound: Option<mpsc::UnboundedSender<String>>,
+        child: Option<AsyncGroupChild>,
+        terminal_host: Arc<dyn AcpTerminalHost>,
+        terminal_tools_enabled: bool,
+        terminal_auth_enabled: bool,
+    ) -> Arc<AcpProcess> {
+        Arc::new(AcpProcess {
+            process_instance_id,
+            exit_reporter,
+            provider_profile_id: ProviderProfileId::new(),
+            compatibility_identity: "test-acp@1".to_string(),
+            event_enricher: AgentEventEnricherKind::Passthrough,
+            workspace_root: std::env::temp_dir(),
+            command_display: "mock".to_string(),
+            args_display: String::new(),
+            outbound: Mutex::new(outbound),
+            next_request_id: AtomicU64::new(1),
+            pending_requests: Mutex::new(HashMap::new()),
+            pending_prompt_requests: Mutex::new(HashMap::new()),
+            active_terminal_owners: Mutex::new(HashMap::new()),
+            request_admission: Mutex::new(()),
+            shared: Mutex::new(ProcessShared::default()),
+            debug_log: Arc::new(Mutex::new(AcpDebugLog::default())),
+            child: tokio::sync::Mutex::new(child),
+            shutdown_lock: tokio::sync::Mutex::new(()),
+            terminal_host,
+            terminal_tools_enabled,
+            terminal_auth_enabled,
+            mcp_servers: Vec::new(),
+            process_strategy_requested: AcpProcessStrategy::PerSession,
+            process_strategy_effective: AcpProcessStrategy::PerSession,
+            pool_fallback_reason: None,
+            opencode_error_bridge_enabled: false,
+            attachment_router: Weak::new(),
+            observability: Arc::new(RuntimeObservability::new()),
+            log_context: RuntimeLogContext::new("test_process"),
+            lifecycle_events: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn lifecycle_spawn_snapshot(profile_id: ProviderProfileId) -> ProcessSpawnConfigSnapshot {
+        ProcessSpawnConfigSnapshot {
+            agent_id: vibex_core::AgentId::parse("opencode").unwrap(),
+            adapter_id: vibex_core::AcpAdapterId::parse("opencode-acp").unwrap(),
+            adapter_version: "1.0.0".to_string(),
+            adapter_binary_identity: "command:mock".to_string(),
+            provider_profile_id: profile_id,
+            profile_revision: 0,
+            command: "mock".to_string(),
+            args: Vec::new(),
+            cwd_policy: "{workspaceRoot}".to_string(),
+            base_url: None,
+            model_provider_id: None,
+            non_secret_env: BTreeMap::new(),
+            secret_reference_versions: BTreeMap::new(),
+            mcp_revision: None,
+            skills_revision: None,
+            native_state_home_id: NativeStateHomeId::parse("statehome_lifecycle_test").unwrap(),
+        }
+        .with_content_revision()
+    }
+
+    fn lifecycle_process_key(
+        workspace: &Path,
+        snapshot: &ProcessSpawnConfigSnapshot,
+    ) -> ProcessAcquireKey {
+        ProcessAcquireKey::new(
+            AgentRuntimeRouteKey {
+                agent_id: snapshot.agent_id.clone(),
+                transport_kind: TransportKind::Acp,
+                adapter_id: snapshot.adapter_id.clone(),
+            },
+            snapshot.provider_profile_id.clone(),
+            snapshot.process_spawn_fingerprint(),
+            WorkspaceScope::new(workspace).unwrap(),
+        )
+        .unwrap()
+    }
+
+    async fn acquire_lifecycle_process(
+        client: &AcpRuntimeClient,
+        key: &ProcessAcquireKey,
+        snapshot: &ProcessSpawnConfigSnapshot,
+    ) -> ProcessLease<AcpProcess> {
+        client
+            .process_registry
+            .acquire_reusable_with_snapshot(
+                key.clone(),
+                Some(snapshot.clone()),
+                |process_instance_id| async move {
+                    Ok(test_process(
+                        process_instance_id,
+                        None,
+                        None,
+                        None,
+                        Arc::new(DisabledAcpTerminalHost),
+                        false,
+                        false,
+                    ))
+                },
+                |_| async { Ok(()) },
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn register_lifecycle_attachment(
+        client: &AcpRuntimeClient,
+        session_id: &VibexSessionId,
+        lease: ProcessLease<AcpProcess>,
+        activation_generation: u64,
+    ) -> AcpAttachmentHandle {
+        lease.attach().unwrap();
+        let binding_id = RuntimeBindingId::new();
+        let native_session_id = format!(
+            "native-lifecycle-{activation_generation}-{}",
+            binding_id.as_str()
+        );
+        let key = SessionAttachmentAcquireKey::new(
+            binding_id.clone(),
+            None,
+            lease.process_instance_id().clone(),
+            activation_generation,
+        )
+        .unwrap();
+        let crash_receiver = lease.subscribe_crashes().unwrap();
+        let payload_binding_id = binding_id.clone();
+        let result = client
+            .attachment_router
+            .registry
+            .acquire(session_id.clone(), key, move || async move {
+                Ok(SessionAttachmentAcquireOutput {
+                    native_session_id: native_session_id.clone(),
+                    payload: AcpSessionAttachment::new(
+                        lease,
+                        OpenedAcpSession {
+                            native_session_id,
+                            state: AcpAttachmentShared::default(),
+                            registration_barrier: None,
+                        },
+                        crash_receiver,
+                        payload_binding_id,
+                        activation_generation as i64,
+                    ),
+                })
+            })
+            .await
+            .unwrap();
+        let SessionAttachmentAcquireResult::Created(handle) = result else {
+            panic!("lifecycle test attachment unexpectedly reused an existing fence");
+        };
+        client
+            .attachment_router
+            .registry
+            .activate(handle.fence())
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn spawn_lifecycle_test_process(
+        script: &str,
+        pid_file: Option<&Path>,
+    ) -> (Arc<AcpProcess>, u32) {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some(pid_file) = pid_file {
+            command.env("VIBEX_TEST_PID_FILE", pid_file);
+        }
+        let mut child = command.group().kill_on_drop(true).spawn().unwrap();
+        let leader_pid = child.id().unwrap();
+        let mut stdin = child.inner().stdin.take().unwrap();
+        let (outbound, mut outbound_rx) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            while let Some(line) = outbound_rx.recv().await {
+                if stdin.write_all(line.as_bytes()).await.is_err()
+                    || stdin.write_all(b"\n").await.is_err()
+                    || stdin.flush().await.is_err()
+                {
+                    break;
+                }
+            }
+        });
+        (
+            test_process(
+                AcpProcessInstanceId::new(),
+                None,
+                Some(outbound),
+                Some(child),
+                Arc::new(DisabledAcpTerminalHost),
+                false,
+                false,
+            ),
+            leader_pid,
+        )
+    }
+
+    #[test]
+    fn terminal_create_request_parses_and_redacts_permission_details() {
+        let request = parse_terminal_create_request(
+            &json!({
+                "sessionId": "native-session",
+                "command": "bash",
+                "args": ["-lc", "echo hello"],
+                "cwd": "/tmp/vibex-terminal",
+                "env": {
+                    "OPENCODE_AUTH_TOKEN": "secret-token-value"
+                }
+            }),
+            Path::new("/tmp/fallback"),
+        )
+        .unwrap();
+
+        assert_eq!(request.command, "bash");
+        assert_eq!(request.args, vec!["-lc", "echo hello"]);
+        assert_eq!(request.session_id.as_deref(), Some("native-session"));
+        assert_eq!(request.env[0].0, "OPENCODE_AUTH_TOKEN");
+
+        let details = terminal_permission_details(&request);
+        let rendered = format!("{details:?}");
+        assert!(rendered.contains("env"));
+        assert!(!rendered.contains("secret-token-value"));
+        assert!(terminal_permission_risk_source(&request).contains("echo hello"));
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("native-session"));
+        assert!(!debug.contains("secret-token-value"));
+        assert!(debug.contains("OPENCODE_AUTH_TOKEN"));
+        assert!(debug.contains("sha256:"));
+    }
+
+    #[test]
+    fn terminal_output_is_bounded_and_redacted() {
+        let (text, truncated) =
+            bounded_terminal_output("token=secret-token-value\nhello", 12, false);
+        assert!(truncated);
+        assert!(!text.contains("secret-token-value"));
+
+        let (text, truncated) = bounded_terminal_output("hello", 12, false);
+        assert_eq!(text, "hello");
+        assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn mock_terminal_host_create_uses_permission_resolution() {
+        let host = std::sync::Arc::new(MockTerminalHost::default());
+        let pending = PendingTerminalCreate {
+            rpc_id: json!(7),
+            request: AcpTerminalCreateRequest {
+                session_id: Some("native-session".to_string()),
+                command: "bash".to_string(),
+                args: vec!["-lc".to_string(), "echo hello".to_string()],
+                cwd: Some(PathBuf::from("/tmp/vibex-terminal")),
+                env: Vec::new(),
+                title: None,
+            },
+        };
+        let (outbound, mut outbound_rx) = mpsc::unbounded_channel();
+        let process = test_process(
+            AcpProcessInstanceId::new(),
+            None,
+            Some(outbound),
+            None,
+            host.clone(),
+            true,
+            true,
+        );
+
+        resolve_terminal_create_permission(process, None, pending, PermissionResponseKind::Approve)
+            .await
+            .unwrap();
+
+        let response = outbound_rx.recv().await.unwrap();
+        assert!(response.contains("\"terminalId\""));
+        assert_eq!(host.created.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn process_shutdown_cleans_transport_pending_once() {
+        let (outbound, mut outbound_rx) = mpsc::unbounded_channel();
+        let process = test_process(
+            AcpProcessInstanceId::new(),
+            None,
+            Some(outbound),
+            None,
+            Arc::new(DisabledAcpTerminalHost),
+            false,
+            false,
+        );
+        let (pending_sender, pending_receiver) = oneshot::channel();
+        process.pending_requests.lock().unwrap().insert(
+            7,
+            PendingTransportResponse {
+                response: pending_sender,
+                registration_release: None,
+            },
+        );
+        tokio::join!(process.shutdown(), process.shutdown());
+        process.shutdown().await;
+
+        let mut messages = Vec::new();
+        while let Some(line) = outbound_rx.recv().await {
+            messages.push(serde_json::from_str::<Value>(&line).unwrap());
+        }
+        let cancel_messages: Vec<&Value> = messages
+            .iter()
+            .filter(|message| {
+                message.get("method").and_then(Value::as_str)
+                    == Some(AcpOperation::SessionCancel.method())
+            })
+            .collect();
+        assert!(cancel_messages.is_empty());
+        let pending_failure = pending_receiver.await.unwrap().unwrap_err();
+        assert_eq!(pending_failure.code, "acp_process_exited");
+        assert!(process.pending_requests.lock().unwrap().is_empty());
+        assert_eq!(
+            *process.lifecycle_events.lock().unwrap(),
+            vec![
+                "stop_new_prompts",
+                "cancel_sessions",
+                "graceful_shutdown",
+                "cleanup_pending",
+                "closed",
+            ]
+        );
+        let error = process
+            .request(
+                AcpOperation::SessionPrompt.method(),
+                json!({ "sessionId": "native-dedicated", "prompt": [] }),
+                Duration::from_millis(10),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "acp_process_closed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_shutdown_allows_graceful_group_exit_without_kill() {
+        let (process, _) =
+            spawn_lifecycle_test_process("while IFS= read -r line; do :; done", None);
+
+        tokio::time::timeout(Duration::from_secs(3), process.shutdown())
+            .await
+            .expect("graceful ACP fixture must exit after stdin closes");
+
+        let events = process.lifecycle_events.lock().unwrap().clone();
+        assert!(!events.contains(&"kill_process_group"));
+        assert_eq!(events.last(), Some(&"closed"));
+        assert!(process.child.lock().await.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn process_shutdown_kills_leader_and_descendant_after_graceful_timeout() {
+        let root = tempfile::tempdir().unwrap();
+        let pid_file = root.path().join("process-tree.pids");
+        let script = r#"
+sleep 30 &
+descendant=$!
+printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
+"#;
+        let (process, leader_pid) = spawn_lifecycle_test_process(script, Some(&pid_file));
+        let pid_contents = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(&pid_file)
+                    && !contents.trim().is_empty()
+                {
+                    break contents;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("process-tree fixture must publish its pids");
+        let pids: Vec<u32> = pid_contents
+            .split_whitespace()
+            .map(|value| value.parse().unwrap())
+            .collect();
+        assert_eq!(pids.len(), 2);
+        assert_eq!(pids[0], leader_pid);
+        let descendant_pid = pids[1];
+
+        tokio::time::timeout(Duration::from_secs(3), process.shutdown())
+            .await
+            .expect("forced ACP process-tree shutdown must remain bounded");
+        assert!(
+            process
+                .lifecycle_events
+                .lock()
+                .unwrap()
+                .contains(&"kill_process_group")
+        );
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let leader_exists = Path::new(&format!("/proc/{leader_pid}")).exists();
+                let descendant_exists = Path::new(&format!("/proc/{descendant_pid}")).exists();
+                if !leader_exists && !descendant_exists {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("leader and descendant must both leave the process table");
+    }
+
+    #[tokio::test]
+    async fn unexpected_exit_reports_registry_crash_and_cleans_runtime_state() {
+        let workspace = tempfile::tempdir().unwrap();
+        let agent_id = vibex_core::AgentId::parse("opencode").unwrap();
+        let key = ProcessAcquireKey::new(
+            AgentRuntimeRouteKey {
+                agent_id,
+                transport_kind: TransportKind::Acp,
+                adapter_id: vibex_core::AcpAdapterId::parse("opencode-acp").unwrap(),
+            },
+            ProviderProfileId::new(),
+            "runtime-crash-test",
+            WorkspaceScope::new(workspace.path()).unwrap(),
+        )
+        .unwrap();
+        let registry = AcpProcessRegistry::<AcpProcess>::new();
+        let spawn_registry = registry.clone();
+        let lease = registry
+            .acquire_reusable(
+                key.clone(),
+                move |process_instance_id| {
+                    let reporter = spawn_registry.exit_reporter(process_instance_id.clone());
+                    async move {
+                        Ok(test_process(
+                            process_instance_id,
+                            Some(reporter),
+                            None,
+                            None,
+                            Arc::new(DisabledAcpTerminalHost),
+                            false,
+                            false,
+                        ))
+                    }
+                },
+                |_| async { Ok(()) },
+            )
+            .await
+            .unwrap();
+        lease.attach().unwrap();
+        lease.attach().unwrap();
+        let mut left_crash = lease.subscribe_crashes().unwrap();
+        let mut right_crash = lease.subscribe_crashes().unwrap();
+        let process = lease.process();
+        let (pending_sender, pending_receiver) = oneshot::channel();
+        process.pending_requests.lock().unwrap().insert(
+            11,
+            PendingTransportResponse {
+                response: pending_sender,
+                registration_release: None,
+            },
+        );
+
+        Arc::clone(&process).handle_process_exit().await;
+
+        let left = left_crash.recv().await.unwrap();
+        let right = right_crash.recv().await.unwrap();
+        assert_eq!(left, right);
+        assert_eq!(left.code, "acp_process_exited");
+        assert_eq!(
+            lease.snapshot().unwrap().status,
+            crate::AcpProcessStatus::Crashed
+        );
+        assert_eq!(
+            pending_receiver.await.unwrap().unwrap_err().code,
+            "acp_process_exited"
+        );
+        let replacement_registry = registry.clone();
+        let replacement = registry
+            .acquire_reusable(
+                key,
+                move |process_instance_id| {
+                    let reporter = replacement_registry.exit_reporter(process_instance_id.clone());
+                    async move {
+                        Ok(test_process(
+                            process_instance_id,
+                            Some(reporter),
+                            None,
+                            None,
+                            Arc::new(DisabledAcpTerminalHost),
+                            false,
+                            false,
+                        ))
+                    }
+                },
+                |_| async { Ok(()) },
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            replacement.process_instance_id(),
+            lease.process_instance_id()
+        );
+    }
+
+    #[tokio::test]
+    async fn crash_between_attachment_operation_and_registration_fails_closed() {
+        let workspace = tempfile::tempdir().unwrap();
+        let client = AcpRuntimeClient::new(ProviderConfigService::new(
+            workspace.path().join("vibex.db"),
+        ));
+        let process_key = ProcessAcquireKey::new(
+            AgentRuntimeRouteKey {
+                agent_id: vibex_core::AgentId::parse("opencode").unwrap(),
+                transport_kind: TransportKind::Acp,
+                adapter_id: vibex_core::AcpAdapterId::parse("opencode-acp").unwrap(),
+            },
+            ProviderProfileId::new(),
+            "attachment-registration-race",
+            WorkspaceScope::new(workspace.path()).unwrap(),
+        )
+        .unwrap();
+        let lease = client
+            .process_registry
+            .acquire_reusable(
+                process_key,
+                |process_instance_id| async move {
+                    Ok(test_process(
+                        process_instance_id,
+                        None,
+                        None,
+                        None,
+                        Arc::new(DisabledAcpTerminalHost),
+                        false,
+                        false,
+                    ))
+                },
+                |_| async { Ok(()) },
+            )
+            .await
+            .unwrap();
+        lease.attach().unwrap();
+        let process_instance_id = lease.process_instance_id().clone();
+        let binding_id = RuntimeBindingId::new();
+        let identity = LegacyAttachmentIdentity {
+            binding_id: binding_id.clone(),
+            activation_generation: 0,
+            provider_profile_id: ProviderProfileId::new(),
+            attached_process_id: None,
+        };
+        let process_registry = client.process_registry.clone();
+        let error = client
+            .acquire_attachment(
+                VibexSessionId::new(),
+                identity,
+                lease,
+                None,
+                AttachmentActivationMode::Immediate,
+                move |process| async move {
+                    process_registry.report_crash(&process.process_instance_id)?;
+                    Ok(OpenedAcpSession {
+                        native_session_id: "native-registration-race".to_string(),
+                        state: AcpAttachmentShared::default(),
+                        registration_barrier: None,
+                    })
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "acp_process_exited");
+        assert!(
+            client
+                .attachment_router
+                .registry
+                .attachment(&binding_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            client
+                .process_registry
+                .snapshot(&process_instance_id)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn mock_terminal_host_produces_auth_descriptor_without_secret_values() {
+        let host = MockTerminalHost::default();
+        let descriptor = host
+            .terminal_auth_descriptor(AcpTerminalAuthRequest {
+                provider_profile_id: ProviderProfileId::new(),
+                method_id: "login".to_string(),
+                title: "Login".to_string(),
+                command: "opencode".to_string(),
+                args: vec!["auth".to_string()],
+                cwd: Some("/tmp/workspace".to_string()),
+                env: vec![(
+                    "OPENCODE_AUTH_TOKEN".to_string(),
+                    "secret-token-value".to_string(),
+                )],
+            })
+            .unwrap();
+
+        let rendered = format!("{descriptor:?}");
+        assert!(rendered.contains("OPENCODE_AUTH_TOKEN"));
+        assert!(!rendered.contains("secret-token-value"));
+    }
+
+    #[test]
+    fn session_request_builders_keep_empty_mcp_servers() {
+        let cwd = PathBuf::from("/tmp/vibex-workspace");
+
+        assert_eq!(
+            build_session_new_params(&cwd, &[]),
+            json!({
+                "cwd": "/tmp/vibex-workspace",
+                "mcpServers": []
+            })
+        );
+        assert_eq!(
+            build_session_load_params("native-1", &cwd, &[]),
+            json!({
+                "sessionId": "native-1",
+                "cwd": "/tmp/vibex-workspace",
+                "mcpServers": []
+            })
+        );
+    }
+
+    #[test]
+    fn session_request_builders_include_mcp_descriptors() {
+        let cwd = PathBuf::from("/tmp/vibex-workspace");
+        let servers = vec![
+            AcpMcpServerDescriptor {
+                id: "fs".to_string(),
+                name: "Filesystem".to_string(),
+                transport: AcpMcpTransportDescriptor::Stdio {
+                    command: "npx".to_string(),
+                    args: vec![
+                        "-y".to_string(),
+                        "@modelcontextprotocol/server-filesystem".to_string(),
+                    ],
+                },
+            },
+            AcpMcpServerDescriptor {
+                id: "remote".to_string(),
+                name: "Remote".to_string(),
+                transport: AcpMcpTransportDescriptor::Http {
+                    url: "https://example.invalid/mcp".to_string(),
+                },
+            },
+        ];
+
+        assert_eq!(
+            build_session_new_params(&cwd, &servers),
+            json!({
+                "cwd": "/tmp/vibex-workspace",
+                "mcpServers": [
+                    {
+                        "id": "fs",
+                        "name": "Filesystem",
+                        "transport": "stdio",
+                        "command": "npx",
+                        "args": ["-y", "@modelcontextprotocol/server-filesystem"]
+                    },
+                    {
+                        "id": "remote",
+                        "name": "Remote",
+                        "transport": "http",
+                        "url": "https://example.invalid/mcp"
+                    }
+                ]
+            })
+        );
+        assert_eq!(
+            build_session_load_params("native-1", &cwd, &servers)["mcpServers"],
+            build_session_new_params(&cwd, &servers)["mcpServers"]
+        );
+    }
+
+    #[test]
+    fn acp_mcp_descriptors_are_flag_gated_and_validated() {
+        let mut config = AcpProviderConfig {
+            command: "mock".to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd_template: Some("{workspaceRoot}".to_string()),
+            process_strategy: vibex_core::AcpProcessStrategy::default(),
+            terminal_tools: false,
+            terminal_auth: false,
+            models: Vec::new(),
+            modes: Vec::new(),
+            features: Vec::new(),
+            disabled_tools: Vec::new(),
+        };
+        let invalid = ProviderRuntimeResources {
+            mcp_servers: vec![ProviderRuntimeMcpServer {
+                id: "broken".to_string(),
+                display_name: "Broken".to_string(),
+                transport: ProviderRuntimeMcpTransport::Stdio,
+                command: None,
+                args: Vec::new(),
+                url: None,
+            }],
+            skills: Vec::new(),
+        };
+
+        assert!(
+            resolve_acp_mcp_descriptors(&config, &invalid)
+                .unwrap()
+                .is_empty()
+        );
+        config.features.push("mcp_servers".to_string());
+        let err = resolve_acp_mcp_descriptors(&config, &invalid).unwrap_err();
+        assert_eq!(err.code, "acp_mcp_stdio_command_missing");
+
+        let resources = ProviderRuntimeResources {
+            mcp_servers: vec![ProviderRuntimeMcpServer {
+                id: "web".to_string(),
+                display_name: "Web MCP".to_string(),
+                transport: ProviderRuntimeMcpTransport::Sse,
+                command: None,
+                args: Vec::new(),
+                url: Some("https://example.invalid/sse".to_string()),
+            }],
+            skills: Vec::new(),
+        };
+        let descriptors = resolve_acp_mcp_descriptors(&config, &resources).unwrap();
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(mcp_server_json(&descriptors[0])["transport"], json!("sse"));
+    }
+
+    #[test]
+    fn acp_debug_log_records_bounded_redacted_messages() {
+        let mut log = AcpDebugLog::default();
+        log.record_json(
+            AcpDebugDirection::Outgoing,
+            &json!({
+                "id": 1,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": "native-secret-session",
+                    "prompt": [{ "type": "text", "text": "private prompt text" }],
+                    "token": "secret-token-value",
+                    "env": { "API_KEY": "sk-test-secret" },
+                    "safe": "hello"
+                }
+            }),
+        );
+        log.record_json(
+            AcpDebugDirection::Incoming,
+            &json!({ "id": 1, "result": { "sessionId": "session-1" } }),
+        );
+        log.record_line(AcpDebugDirection::Stderr, "stderr with password=hidden");
+        log.record_line(
+            AcpDebugDirection::Stderr,
+            "message=stream_error session.id=native-stderr-session",
+        );
+
+        let messages = log.messages();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].sequence, 0);
+        assert_eq!(messages[1].direction, AcpDebugDirection::Incoming);
+        let rendered = messages
+            .iter()
+            .map(|message| message.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("session/prompt"));
+        assert!(rendered.contains("hello"));
+        assert!(!rendered.contains("secret-token-value"));
+        assert!(!rendered.contains("sk-test-secret"));
+        assert!(!rendered.contains("hidden"));
+        assert!(!rendered.contains("native-secret-session"));
+        assert!(!rendered.contains("native-stderr-session"));
+        assert!(!rendered.contains("session-1"));
+        assert!(!rendered.contains("private prompt text"));
+        assert!(rendered.contains("sha256:"));
+
+        for index in 0..(ACP_DEBUG_LOG_LIMIT + 10) {
+            log.record_line(AcpDebugDirection::Stderr, &format!("line-{index}"));
+        }
+        let messages = log.messages();
+        assert_eq!(messages.len(), ACP_DEBUG_LOG_LIMIT);
+        assert_eq!(messages[0].sequence, 14);
+    }
+
+    #[test]
+    fn cross_surface_sentinel_gate_redacts_debug_envelope_timeline_and_diagnostics() {
+        use vibex_core::{
+            AgentEventRawOutputMode, DiagnosticBundleRequest, ProviderSecretKind,
+            ProviderSecretReference, ProviderSecretSetupState,
+        };
+        use vibex_db::ProviderSecretReferenceRepository;
+        use vibex_diagnostics::{DiagnosticBundleService, DiagnosticBundleServiceConfig};
+
+        const API_KEY: &str = "sk-cross-surface-api-key-sentinel";
+        const OAUTH_TOKEN: &str = "oauth-token-cross-surface-sentinel";
+        const ENV_VALUE: &str = "env-value-cross-surface-sentinel";
+        const NATIVE_ID: &str = "native-session-cross-surface-sentinel";
+        const RAW_PAYLOAD: &str = "raw-payload-cross-surface-sentinel";
+        const PROMPT: &str = "prompt-cross-surface-sentinel";
+        let oversized = "safe-envelope-data".repeat(2_048);
+        let payload = json!({
+            "sessionId": NATIVE_ID,
+            "apiKey": API_KEY,
+            "oauthToken": OAUTH_TOKEN,
+            "env": { "VIBEX_PRIVATE_VALUE": ENV_VALUE },
+            "rawPayload": RAW_PAYLOAD,
+            "prompt": PROMPT,
+            "oversized": oversized,
+        });
+
+        let mut debug_log = AcpDebugLog::default();
+        debug_log.record_json(
+            AcpDebugDirection::Incoming,
+            &json!({
+                "method": "_custom/private_event",
+                "params": payload.clone(),
+            }),
+        );
+        let debug_output = debug_log.messages()[0].message.clone();
+
+        let decoded = protocol::decode_incoming(&json!({
+            "jsonrpc": "2.0",
+            "method": format!("_custom/private event={RAW_PAYLOAD}"),
+            "params": payload.clone(),
+        }));
+        assert!(matches!(
+            decoded.decoded,
+            AcpDecodedPayload::Extension { .. }
+        ));
+        assert!(decoded.raw.truncated);
+        assert!(decoded.raw.byte_len > protocol::DEFAULT_RAW_ENVELOPE_LIMIT_BYTES);
+        let envelope_output = format!("{decoded:?}\n{}", decoded.raw.redacted_body);
+
+        let timeline = normalize_agent_event(
+            AgentEventEnricherKind::Passthrough,
+            &AgentEventInput {
+                source: AgentEventInputSource::Live,
+                compatibility_identity: "adapter=safe@1.0.0".to_string(),
+                native_event_id: NATIVE_ID.to_string(),
+                tool_name: "private_event".to_string(),
+                title: "Private event redacted".to_string(),
+                status: ToolCallStatus::Completed,
+                raw_input: Some(payload),
+                output_summary: Some(OAUTH_TOKEN.to_string()),
+                raw_output: Some(
+                    AgentEventRawOutput::new(AgentEventRawOutputMode::Snapshot, RAW_PAYLOAD).0,
+                ),
+                content: None,
+                locations: Vec::new(),
+                meta: BTreeMap::from([
+                    ("oauthToken".to_string(), OAUTH_TOKEN.to_string()),
+                    ("safe".to_string(), "metadata".to_string()),
+                ]),
+            },
+        )
+        .into_iter()
+        .next()
+        .unwrap()
+        .into_provider_event()
+        .payload;
+        let timeline_output = serde_json::to_string(&timeline).unwrap();
+        assert!(timeline_output.contains("\"truncated\":true"));
+
+        let Some(fixture) = MockAcpFixture::create("cross-surface-sentinel") else {
+            return;
+        };
+        ProviderSecretReferenceRepository::replace_for_profile(
+            &open_database(&fixture.db_path).unwrap(),
+            &fixture.profile_id,
+            &[ProviderSecretReference {
+                id: RequestId::new(),
+                provider_profile_id: fixture.profile_id.clone(),
+                secret_kind: ProviderSecretKind::ApiKey,
+                backend: ProviderSecretBackend::Placeholder,
+                setup_state: ProviderSecretSetupState::Missing,
+                lookup_key: [
+                    API_KEY,
+                    OAUTH_TOKEN,
+                    ENV_VALUE,
+                    NATIVE_ID,
+                    RAW_PAYLOAD,
+                    PROMPT,
+                ]
+                .join(":"),
+                display_label: "Private credential".to_string(),
+                redacted_hint: "not configured".to_string(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            }],
+        )
+        .unwrap();
+        let observability = Arc::new(RuntimeObservability::new());
+        observability.increment(
+            RuntimeMetricName::UnknownAcpEvent,
+            None,
+            RuntimeMetricResult::Fallback,
+        );
+        let diagnostic_output = serde_json::to_string(
+            &DiagnosticBundleService::new(
+                DiagnosticBundleServiceConfig::new(fixture.db_path.clone())
+                    .with_runtime_observability(observability),
+            )
+            .export_bundle(DiagnosticBundleRequest {
+                record_limit: Some(10),
+                include_smoke_references: Some(false),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let combined = [
+            debug_output.as_str(),
+            envelope_output.as_str(),
+            timeline_output.as_str(),
+            diagnostic_output.as_str(),
+        ]
+        .join("\n");
+        for sentinel in [
+            API_KEY,
+            OAUTH_TOKEN,
+            ENV_VALUE,
+            NATIVE_ID,
+            RAW_PAYLOAD,
+            PROMPT,
+        ] {
+            assert!(
+                !combined.contains(sentinel),
+                "security surface leaked {sentinel}: {combined}"
+            );
+        }
+        assert!(debug_output.contains("sha256:"));
+        assert!(envelope_output.contains("native_session_id_hash"));
+        assert!(envelope_output.contains("invalid_method"));
+        assert!(diagnostic_output.contains("diagnostic_bundle.v2"));
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn parses_only_main_opencode_stream_errors() {
+        let line = concat!(
+            "timestamp=2026-07-10T03:00:45.015Z level=ERROR ",
+            "message=\"stream error\" providerID=vibex-anthropic ",
+            "modelID=claude-haiku-4-5-20251001 session.id=ses_main ",
+            "small=false agent=build mode=primary ",
+            "error.error=\"AI_APICallError: Service Unavailable\""
+        );
+        let parsed = parse_opencode_stream_error(line).unwrap();
+        assert_eq!(
+            parsed,
+            OpenCodeStreamError {
+                native_session_id: "ses_main".to_string(),
+                message: "Service Unavailable".to_string(),
+                disposition: OpenCodeStreamErrorDisposition::Retryable,
+            }
+        );
+        let debug = format!("{parsed:?}");
+        assert!(!debug.contains("ses_main"));
+        assert!(debug.contains("sha256:"));
+
+        let title_error = line.replace("small=false", "small=true");
+        assert_eq!(parse_opencode_stream_error(&title_error), None);
+        assert_eq!(
+            parse_opencode_stream_error(
+                "timestamp=2026-07-10T03:00:45Z level=ERROR message=cleanup"
+            ),
+            None
+        );
+
+        for message in [
+            "AI_APICallError: Free usage exceeded, subscribe to Go",
+            "AI_APICallError: Rate limit exceeded. Please try again later.",
+            "AI_APICallError: Insufficient account balance for the selected group",
+        ] {
+            let parsed = parse_opencode_stream_error(
+                &line.replace("AI_APICallError: Service Unavailable", message),
+            )
+            .unwrap();
+            assert_eq!(
+                parsed.disposition,
+                OpenCodeStreamErrorDisposition::UserActionRequired
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_process_args_enable_error_logs_without_duplicates() {
+        let mut config = AcpProviderConfig {
+            command: "opencode".to_string(),
+            args: vec!["acp".to_string()],
+            env: Vec::new(),
+            cwd_template: Some("{workspaceRoot}".to_string()),
+            process_strategy: AcpProcessStrategy::PerSession,
+            terminal_tools: false,
+            terminal_auth: false,
+            models: Vec::new(),
+            modes: Vec::new(),
+            features: Vec::new(),
+            disabled_tools: Vec::new(),
+        };
+
+        assert_eq!(effective_acp_process_args(&config, false), config.args);
+        assert_eq!(
+            effective_acp_process_args(&config, true),
+            vec!["acp", "--print-logs", "--log-level", "ERROR"]
+        );
+
+        config.args = vec![
+            "acp".to_string(),
+            "--print-logs".to_string(),
+            "--log-level=INFO".to_string(),
+        ];
+        assert_eq!(effective_acp_process_args(&config, true), config.args);
+    }
+
+    #[test]
+    fn extracts_model_ids_from_available_models_and_config_options() {
+        let response = json!({
+            "sessionId": "s1",
+            "models": {
+                "availableModels": [
+                    { "modelId": "anthropic/claude-sonnet-4", "name": "Sonnet" },
+                    "openai/gpt-5"
+                ],
+                "currentModelId": "anthropic/claude-sonnet-4"
+            },
+            "configOptions": [
+                {
+                    "category": "model",
+                    "currentValue": "anthropic/claude-sonnet-4",
+                    "options": [
+                        { "value": "google/gemini-2.5-pro" },
+                        { "modelId": "anthropic/claude-sonnet-4" }
+                    ]
+                }
+            ]
+        });
+
+        let ids = extract_model_ids(&response);
+        assert_eq!(
+            ids,
+            vec![
+                "anthropic/claude-sonnet-4".to_string(),
+                "openai/gpt-5".to_string(),
+                "google/gemini-2.5-pro".to_string(),
+            ]
+        );
+        assert_eq!(
+            extract_current_model_id(&response).as_deref(),
+            Some("anthropic/claude-sonnet-4")
+        );
+    }
+
+    #[test]
+    fn extracts_probe_reasoning_efforts_from_thought_level_config_option() {
+        // Shape emitted by claude-agent-acp 0.58.1: id "effort", category
+        // "thought_level", options carrying a "default" sentinel first.
+        let response = json!({
+            "sessionId": "s1",
+            "configOptions": [
+                {
+                    "id": "mode",
+                    "category": "mode",
+                    "type": "select",
+                    "options": [ { "value": "plan", "name": "Plan Mode" } ]
+                },
+                {
+                    "id": "effort",
+                    "name": "Effort",
+                    "category": "thought_level",
+                    "type": "select",
+                    "currentValue": "high",
+                    "options": [
+                        { "value": "default", "name": "Default" },
+                        { "value": "high", "name": "High" },
+                        { "value": "max", "name": "Max" }
+                    ]
+                }
+            ]
+        });
+
+        let efforts = extract_probe_reasoning_efforts(&response);
+        assert_eq!(
+            efforts
+                .iter()
+                .map(|effort| (effort.value.as_str(), effort.description.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![("high", Some("High")), ("max", Some("Max"))]
+        );
+    }
+
+    #[test]
+    fn extracts_probe_reasoning_efforts_by_option_id_alias() {
+        // Adapters without a category still match through the id alias
+        // family (mock agent uses "reasoning_effort").
+        let response = json!({
+            "sessionId": "s1",
+            "configOptions": [
+                {
+                    "id": "reasoning_effort",
+                    "type": "select",
+                    "options": [
+                        { "value": "low", "label": "Low" },
+                        { "value": "low", "label": "Low again" },
+                        { "value": "medium" }
+                    ]
+                },
+                {
+                    "id": "autoApply",
+                    "type": "boolean",
+                    "currentValue": true
+                }
+            ]
+        });
+
+        let efforts = extract_probe_reasoning_efforts(&response);
+        assert_eq!(
+            efforts
+                .iter()
+                .map(|effort| effort.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "medium"]
+        );
+        assert_eq!(efforts[0].description.as_deref(), Some("Low"));
+    }
+
+    #[test]
+    fn probe_session_modes_capture_labels_from_available_modes() {
+        let response = json!({
+            "sessionId": "s1",
+            "modes": {
+                "availableModes": [
+                    { "id": "default", "name": "Manual" },
+                    { "id": "acceptEdits", "name": "Accept Edits" }
+                ],
+                "currentModeId": "default"
+            }
+        });
+
+        let modes = extract_config_values(mode_candidates(&response));
+        assert_eq!(
+            modes
+                .iter()
+                .map(|mode| (mode.value.as_str(), mode.label.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("default", Some("Manual")),
+                ("acceptEdits", Some("Accept Edits")),
+            ]
+        );
+    }
+
+    #[test]
+    fn pooled_model_state_never_falls_back_to_another_session() {
+        let first = AcpAttachmentShared {
+            current_model_id: Some("global/model".to_string()),
+            ..AcpAttachmentShared::default()
+        };
+        let mut second = AcpAttachmentShared::default();
+        assert_eq!(first.current_model_id.as_deref(), Some("global/model"));
+        assert!(second.current_model_id.is_none());
+
+        let state = extract_provider_session_config_state(
+            &json!({
+                "models": {
+                    "currentModelId": "session/model"
+                }
+            }),
+            &ProviderProfileId::new(),
+            Some("native-2"),
+        )
+        .unwrap();
+        second.session_config_state = Some(state);
+        assert_eq!(
+            second
+                .session_config_state
+                .as_ref()
+                .and_then(|state| state.current_model.as_ref())
+                .map(|model| model.value.as_str()),
+            Some("session/model")
+        );
+    }
+
+    #[test]
+    fn opencode_provider_env_overrides_inherited_runtime_env() {
+        let mut overlays = vec![
+            (
+                OPENCODE_INLINE_CONFIG_ENV.to_string(),
+                "stale-config".to_string(),
+            ),
+            ("UNCHANGED".to_string(), "value".to_string()),
+        ];
+
+        upsert_env_overlay(
+            &mut overlays,
+            OPENCODE_INLINE_CONFIG_ENV.to_string(),
+            "selected-profile-config".to_string(),
+        );
+
+        assert_eq!(overlays.len(), 2);
+        assert_eq!(
+            overlays
+                .iter()
+                .find(|(key, _)| key == OPENCODE_INLINE_CONFIG_ENV)
+                .map(|(_, value)| value.as_str()),
+            Some("selected-profile-config")
+        );
+    }
+
+    #[test]
+    fn claude_provider_projection_uses_anthropic_environment_contract() {
+        const SECRET_ENV: &str = "VIBEX_TEST_CLAUDE_PROVIDER_KEY";
+        unsafe {
+            std::env::set_var(SECRET_ENV, "claude-provider-secret");
+        }
+        let mut profile = ProviderProfile::local_default(ProviderKind::Acp);
+        profile.agent_id = AgentId::parse("claude").unwrap();
+        profile.base_url = Some("https://claude.example.invalid".to_string());
+        profile.secrets = vec![vibex_core::ProviderSecretReference {
+            id: RequestId::new(),
+            provider_profile_id: profile.id.clone(),
+            secret_kind: vibex_core::ProviderSecretKind::AuthToken,
+            backend: ProviderSecretBackend::Environment,
+            setup_state: vibex_core::ProviderSecretSetupState::Available,
+            lookup_key: SECRET_ENV.to_string(),
+            display_label: "ANTHROPIC_AUTH_TOKEN".to_string(),
+            redacted_hint: "test environment".to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }];
+        let mut overlays = Vec::new();
+
+        project_claude_provider_env(&profile, &mut overlays).unwrap();
+
+        assert!(overlays.iter().any(|(key, value)| {
+            key == "ANTHROPIC_BASE_URL" && value == "https://claude.example.invalid"
+        }));
+        assert!(overlays.iter().any(|(key, value)| {
+            key == "ANTHROPIC_AUTH_TOKEN" && value == "claude-provider-secret"
+        }));
+        unsafe {
+            std::env::remove_var(SECRET_ENV);
+        }
+    }
+
+    #[test]
+    fn codex_provider_projection_wraps_imported_fragment_in_private_runtime_config() {
+        let mut profile = ProviderProfile::local_default(ProviderKind::Acp);
+        profile.agent_id = AgentId::parse("codex").unwrap();
+        profile.display_name = "Relay".to_string();
+        let runtime = CodexProviderRuntimeConfig {
+            model: Some("gpt-test".to_string()),
+            model_provider_id: "relay".to_string(),
+            provider_config_toml: Some(
+                "base_url = \"https://relay.example.invalid/v1\"\nwire_api = \"responses\""
+                    .to_string(),
+            ),
+            provider_config_toml_keys: vec!["base_url".to_string(), "wire_api".to_string()],
+            base_url: Some("https://relay.example.invalid/v1".to_string()),
+            wire_api: Some("responses".to_string()),
+            api_key_env_key: "OPENAI_API_KEY".to_string(),
+            api_key: Some("must-not-be-rendered".to_string()),
+        };
+
+        let config = render_codex_runtime_config(&profile, &runtime).unwrap();
+
+        assert!(config.contains("model_provider = \"relay\""));
+        assert!(config.contains("model = \"gpt-test\""));
+        assert!(config.contains("[model_providers.\"relay\"]"));
+        assert!(config.contains("env_key = \"OPENAI_API_KEY\""));
+        assert!(!config.contains("must-not-be-rendered"));
+    }
+
+    #[test]
+    fn codex_provider_projection_supplies_managed_adapter_auth_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let lookup_key = format!("codex-provider-secret-{}", RequestId::new().as_str());
+        vibex_config_switch::secrets::store_provider_secret(&lookup_key, "codex-test-secret")
+            .unwrap();
+        let mut profile = ProviderProfile::local_default(ProviderKind::Acp);
+        profile.agent_id = AgentId::parse("codex").unwrap();
+        profile.display_name = "Relay".to_string();
+        profile.base_url = Some("https://relay.example.invalid/v1".to_string());
+        profile.default_model = Some("gpt-test".to_string());
+        profile.provider_options.entries.extend([
+            ProviderBindingMetadata {
+                key: CODEX_MODEL_PROVIDER_ID_OPTION_KEY.to_string(),
+                value: "relay".to_string(),
+            },
+            ProviderBindingMetadata {
+                key: "wireApi".to_string(),
+                value: "responses".to_string(),
+            },
+        ]);
+        profile.secrets = vec![vibex_core::ProviderSecretReference {
+            id: RequestId::new(),
+            provider_profile_id: profile.id.clone(),
+            secret_kind: vibex_core::ProviderSecretKind::ApiKey,
+            backend: ProviderSecretBackend::OsKeychain,
+            setup_state: vibex_core::ProviderSecretSetupState::Available,
+            lookup_key: lookup_key.clone(),
+            display_label: "OPENAI_API_KEY".to_string(),
+            redacted_hint: "test secret".to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }];
+        let client = AcpRuntimeClient::new(ProviderConfigService::new(dir.path().join("vibex.db")));
+        let mut overlays = Vec::new();
+
+        client
+            .project_codex_provider_env(&profile, dir.path(), &mut overlays)
+            .unwrap();
+
+        assert!(
+            overlays
+                .iter()
+                .any(|(key, value)| { key == CODEX_ACP_MODEL_PROVIDER_ENV && value == "relay" })
+        );
+        assert!(
+            overlays
+                .iter()
+                .any(|(key, value)| { key == "OPENAI_API_KEY" && value == "codex-test-secret" })
+        );
+        assert!(
+            overlays.iter().any(|(key, value)| {
+                key == CODEX_ACP_API_KEY_ENV && value == "codex-test-secret"
+            })
+        );
+        assert!(overlays.iter().any(|(key, value)| {
+            key == CODEX_ACP_DEFAULT_AUTH_REQUEST_ENV
+                && value == CODEX_ACP_DEFAULT_API_KEY_AUTH_REQUEST
+        }));
+        vibex_config_switch::secrets::delete_provider_secret(&lookup_key).unwrap();
+    }
+
+    #[test]
+    fn codex_official_profile_does_not_invent_a_custom_model_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let lookup_key = format!("codex-official-secret-{}", RequestId::new().as_str());
+        vibex_config_switch::secrets::store_provider_secret(&lookup_key, "official-test-secret")
+            .unwrap();
+        let mut profile = ProviderProfile::local_default(ProviderKind::Acp);
+        profile.agent_id = AgentId::parse("codex").unwrap();
+        profile.display_name = "OpenAI Official".to_string();
+        profile.secrets = vec![vibex_core::ProviderSecretReference {
+            id: RequestId::new(),
+            provider_profile_id: profile.id.clone(),
+            secret_kind: vibex_core::ProviderSecretKind::ApiKey,
+            backend: ProviderSecretBackend::OsKeychain,
+            setup_state: vibex_core::ProviderSecretSetupState::Available,
+            lookup_key: lookup_key.clone(),
+            display_label: "OPENAI_API_KEY".to_string(),
+            redacted_hint: "test secret".to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }];
+        let client = AcpRuntimeClient::new(ProviderConfigService::new(dir.path().join("vibex.db")));
+        let mut overlays = Vec::new();
+
+        client
+            .project_codex_provider_env(&profile, dir.path(), &mut overlays)
+            .unwrap();
+
+        assert!(
+            overlays
+                .iter()
+                .all(|(key, _)| key != CODEX_ACP_MODEL_PROVIDER_ENV && key != "CODEX_HOME")
+        );
+        assert!(overlays.iter().any(|(key, value)| {
+            key == CODEX_ACP_API_KEY_ENV && value == "official-test-secret"
+        }));
+        assert!(overlays.iter().any(|(key, value)| {
+            key == CODEX_ACP_DEFAULT_AUTH_REQUEST_ENV
+                && value == CODEX_ACP_DEFAULT_API_KEY_AUTH_REQUEST
+        }));
+        vibex_config_switch::secrets::delete_provider_secret(&lookup_key).unwrap();
+    }
+
+    #[test]
+    fn extracts_provider_session_config_state_from_session_response() {
+        let profile_id = ProviderProfileId::new();
+        let response = json!({
+            "sessionId": "native-1",
+            "models": {
+                "availableModels": [
+                    { "modelId": "mock/model-1", "label": "Model One" },
+                    { "modelId": "mock/model-2" }
+                ],
+                "currentModelId": "mock/model-1"
+            },
+            "modes": {
+                "availableModes": [
+                    { "id": "build", "label": "Build" },
+                    { "id": "ask", "label": "Ask" }
+                ],
+                "currentModeId": "build"
+            },
+            "configOptions": [
+                {
+                    "id": "autoApply",
+                    "label": "Auto apply",
+                    "category": "behavior",
+                    "description": "Apply edits automatically",
+                    "type": "boolean",
+                    "currentValue": true,
+                    "defaultValue": false
+                },
+                {
+                    "configId": "reviewDepth",
+                    "title": "Review depth",
+                    "kind": "select",
+                    "currentValue": "deep",
+                    "options": [
+                        { "value": "quick", "label": "Quick" },
+                        { "value": "deep", "label": "Deep" }
+                    ]
+                },
+                {
+                    "id": "apiKey",
+                    "label": "Secret",
+                    "type": "string",
+                    "currentValue": "sk-secret-value"
+                }
+            ]
+        });
+
+        let state = extract_provider_session_config_state(&response, &profile_id, Some("native-1"))
+            .expect("config state");
+
+        assert_eq!(state.provider_kind, ProviderKind::Acp);
+        assert_eq!(state.provider_profile_id.as_ref(), Some(&profile_id));
+        assert_eq!(state.native_session_id.as_deref(), Some("native-1"));
+        assert_eq!(state.current_model.unwrap().value, "mock/model-1");
+        assert_eq!(state.models.len(), 2);
+        assert_eq!(state.current_mode.unwrap().value, "build");
+        assert_eq!(state.modes.len(), 2);
+        assert_eq!(state.options.len(), 2);
+        assert!(state.options.iter().any(|option| {
+            option.id == "autoApply"
+                && option.kind == ProviderSessionConfigOptionKind::Boolean
+                && option.category.as_deref() == Some("behavior")
+                && option.description.as_deref() == Some("Apply edits automatically")
+                && option.current_value.as_ref().unwrap().value == "true"
+        }));
+        assert!(state.options.iter().any(|option| {
+            option.id == "reviewDepth"
+                && option.kind == ProviderSessionConfigOptionKind::Select
+                && option.values.len() == 2
+        }));
+        assert_eq!(state.source, "native_session_config");
+    }
+
+    #[test]
+    fn normalizes_acp_session_list_candidates() {
+        let profile_id = ProviderProfileId::new();
+        let fallback_root = PathBuf::from("/tmp/vibex-acp-list");
+        let response = json!({
+            "sessions": [
+                {
+                    "sessionId": "native-1",
+                    "title": "Existing ACP session",
+                    "workspaceRoot": "/tmp/workspace-one",
+                    "updatedAtMs": 42,
+                    "models": {
+                        "availableModels": [{ "modelId": "mock/model-1" }],
+                        "currentModelId": "mock/model-1"
+                    }
+                },
+                {
+                    "id": "native-2",
+                    "name": "Read only ACP session",
+                    "cwd": "/tmp/workspace-two",
+                    "readOnly": true
+                },
+                {
+                    "name": "Missing id"
+                }
+            ]
+        });
+
+        let candidates = normalize_session_list_candidates(&response, &profile_id, &fallback_root);
+
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(candidates[0].candidate_id, "acp:native-1");
+        assert_eq!(candidates[0].source, ExternalSessionImportSource::Acp);
+        assert_eq!(candidates[0].provider_kind, ProviderKind::Acp);
+        assert_eq!(
+            candidates[0].provider_profile_id.as_ref(),
+            Some(&profile_id)
+        );
+        assert_eq!(candidates[0].workspace_root, "/tmp/workspace-one");
+        assert_eq!(
+            candidates[0].continuation_status,
+            ExternalSessionContinuationStatus::Resumable
+        );
+        assert_eq!(
+            candidates[0].status,
+            ExternalSessionImportCandidateStatus::Importable
+        );
+        assert_eq!(candidates[0].updated_at_ms, Some(42));
+        assert!(candidates[0].session_config_state.is_some());
+        assert_eq!(
+            candidates[1].continuation_status,
+            ExternalSessionContinuationStatus::ReadOnly
+        );
+        assert_eq!(
+            candidates[1].status,
+            ExternalSessionImportCandidateStatus::Partial
+        );
+        assert_eq!(
+            candidates[2].status,
+            ExternalSessionImportCandidateStatus::Blocked
+        );
+        assert_eq!(candidates[2].workspace_root, "/tmp/vibex-acp-list");
+    }
+
+    #[test]
+    fn plan_entries_map_to_plan_steps() {
+        let steps = plan_steps(Some(&json!([
+            { "content": "Explore repo", "status": "completed" },
+            { "content": "Write code", "status": "in_progress" },
+            { "content": "Run tests", "status": "pending" }
+        ])));
+
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].status, PlanStepStatus::Completed);
+        assert_eq!(steps[1].status, PlanStepStatus::Running);
+        assert_eq!(steps[2].status, PlanStepStatus::Pending);
+    }
+
+    #[test]
+    fn permission_options_prefer_matching_kind() {
+        let options = vec![
+            PermissionOptionSummary {
+                option_id: "allow-1".to_string(),
+                kind: "allow_once".to_string(),
+            },
+            PermissionOptionSummary {
+                option_id: "reject-1".to_string(),
+                kind: "reject_once".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            select_permission_option(&options, &["allow_once", "allow_always"]).as_deref(),
+            Some("allow-1")
+        );
+        assert_eq!(
+            select_permission_option(&options, &["reject_once", "reject_always"]).as_deref(),
+            Some("reject-1")
+        );
+        assert_eq!(
+            select_permission_option(&options, &["allow_always", "allow_once"]).as_deref(),
+            Some("allow-1")
+        );
+
+        let normalized = parse_permission_options(Some(&json!([
+            {"id": "allow-kind", "kind": "Always Allow"},
+            {"id": "reject-type", "type": "deny-always"},
+            {"id": "allow-name", "name": "Approve"}
+        ])));
+        assert_eq!(
+            select_resolution_permission_option(
+                &normalized,
+                PermissionResponseKind::AlwaysAllowForSession
+            )
+            .as_deref(),
+            Some("allow-kind")
+        );
+        assert_eq!(
+            select_resolution_permission_option(&normalized, PermissionResponseKind::Deny)
+                .as_deref(),
+            Some("reject-type")
+        );
+    }
+
+    #[test]
+    fn content_block_text_handles_object_and_array_shapes() {
+        assert_eq!(
+            content_block_text(Some(&json!({ "type": "text", "text": "hello" }))),
+            "hello"
+        );
+        assert_eq!(
+            content_block_text(Some(&json!([
+                { "type": "text", "text": "a" },
+                { "type": "text", "text": "b" }
+            ]))),
+            "ab"
+        );
+        assert_eq!(
+            content_block_text(Some(&json!({ "type": "image", "data": "x" }))),
+            ""
+        );
+    }
+
+    #[test]
+    fn runtime_prompt_content_uses_resource_links_for_non_images() {
+        let attachment = ProviderTurnAttachment {
+            label: "notes.txt".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            uri: Some("file:///tmp/notes.txt".to_string()),
+            local_path: Some(PathBuf::from("/tmp/notes.txt")),
+        };
+
+        let content = runtime_prompt_content("inspect", &[attachment]);
+
+        assert_eq!(content[0], json!({ "type": "text", "text": "inspect" }));
+        assert_eq!(
+            content[1],
+            json!({
+                "type": "resource_link",
+                "uri": "file:///tmp/notes.txt",
+                "name": "notes.txt"
+            })
+        );
+    }
+
+    #[test]
+    fn available_commands_parse_names_and_descriptions() {
+        let commands = parse_available_commands(Some(&json!([
+            { "name": "compact", "description": "Compact history" },
+            { "name": "  ", "description": "ignored" },
+            { "name": "plan" }
+        ])));
+
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].name, "compact");
+        assert_eq!(commands[0].description.as_deref(), Some("Compact history"));
+        assert_eq!(commands[1].name, "plan");
+        assert!(commands[1].description.is_none());
+    }
+
+    #[test]
+    fn opencode_model_provider_env_is_profile_scoped_and_secret_safe() {
+        const SECRET_ENV: &str = "VIBEX_TEST_OPENCODE_PROFILE_KEY";
+        unsafe {
+            std::env::set_var(SECRET_ENV, "sk-opencode-profile-secret");
+        }
+        let mut profile = ProviderProfile::local_default(ProviderKind::Acp);
+        profile.agent_id = vibex_core::AgentId::parse(OPENCODE_AGENT_ID).unwrap();
+        profile.display_name = "Relay Profile".to_string();
+        profile.base_url = Some("https://relay.example.invalid/v1".to_string());
+        profile.default_model = Some("gpt-test".to_string());
+        profile.configured_models = vec![vibex_core::ProviderConfiguredModel {
+            id: "gpt-test".to_string(),
+            display_name: Some("GPT Test".to_string()),
+            enabled: true,
+            wire_api: None,
+        }];
+        profile.provider_options = vibex_core::ProviderOptions {
+            schema_version: 1,
+            entries: vec![
+                ProviderBindingMetadata {
+                    key: CODEX_MODEL_PROVIDER_ID_OPTION_KEY.to_string(),
+                    value: "relay".to_string(),
+                },
+                ProviderBindingMetadata {
+                    key: "wireApi".to_string(),
+                    value: "responses".to_string(),
+                },
+            ],
+        };
+        profile.secrets = vec![vibex_core::ProviderSecretReference {
+            id: RequestId::new(),
+            provider_profile_id: profile.id.clone(),
+            secret_kind: vibex_core::ProviderSecretKind::ApiKey,
+            backend: vibex_core::ProviderSecretBackend::Environment,
+            setup_state: vibex_core::ProviderSecretSetupState::Available,
+            lookup_key: SECRET_ENV.to_string(),
+            display_label: "API key".to_string(),
+            redacted_hint: "test environment".to_string(),
+            created_at_ms: unix_timestamp_ms(),
+            updated_at_ms: unix_timestamp_ms(),
+        }];
+
+        let env = opencode_model_provider_env(&profile);
+        let config_content = env
+            .iter()
+            .find(|(key, _)| key == OPENCODE_INLINE_CONFIG_ENV)
+            .map(|(_, value)| value)
+            .unwrap();
+        let config: Value = serde_json::from_str(config_content).unwrap();
+        assert_eq!(config["model"], "relay/gpt-test");
+        assert_eq!(config["enabled_providers"], json!(["relay"]));
+        assert_eq!(config["provider"]["relay"]["npm"], "@ai-sdk/openai");
+        assert_eq!(
+            config["provider"]["relay"]["options"]["baseURL"],
+            "https://relay.example.invalid/v1"
+        );
+        assert_eq!(
+            config["provider"]["relay"]["options"]["apiKey"],
+            format!("{{env:{OPENCODE_PROVIDER_API_KEY_ENV}}}")
+        );
+        assert!(!config_content.contains("sk-opencode-profile-secret"));
+        assert_eq!(
+            env.iter()
+                .find(|(key, _)| key == OPENCODE_PROVIDER_API_KEY_ENV)
+                .map(|(_, value)| value.as_str()),
+            Some("sk-opencode-profile-secret")
+        );
+        unsafe {
+            std::env::remove_var(SECRET_ENV);
+        }
+    }
+
+    #[test]
+    fn opencode_implicit_provider_id_uses_stable_profile_identity() {
+        let mut profile = ProviderProfile::local_default(ProviderKind::Acp);
+        profile.agent_id = vibex_core::AgentId::parse(OPENCODE_AGENT_ID).unwrap();
+        profile.base_url = Some("https://relay.example.invalid/v1".to_string());
+        let initial = opencode_model_provider_id(&profile).unwrap();
+        profile.display_name = "Renamed Profile".to_string();
+        assert_eq!(
+            opencode_model_provider_id(&profile).as_deref(),
+            Some(initial.as_str())
+        );
+        profile.base_url = Some(String::new());
+        assert_eq!(opencode_model_provider_id(&profile), None);
+    }
+
+    #[test]
+    fn opencode_models_are_partitioned_by_wire_api() {
+        let mut profile = ProviderProfile::local_default(ProviderKind::Acp);
+        profile.agent_id = vibex_core::AgentId::parse(OPENCODE_AGENT_ID).unwrap();
+        profile.display_name = "Mixed Relay".to_string();
+        profile.base_url = Some("https://relay.example.invalid/v1".to_string());
+        profile.default_model = Some("claude-test".to_string());
+        profile.configured_models = vec![
+            vibex_core::ProviderConfiguredModel {
+                id: "gpt-responses".to_string(),
+                display_name: Some("GPT Responses".to_string()),
+                enabled: true,
+                wire_api: Some(ProviderModelWireApi::OpenaiResponses),
+            },
+            vibex_core::ProviderConfiguredModel {
+                id: "gpt-chat".to_string(),
+                display_name: Some("GPT Chat".to_string()),
+                enabled: true,
+                wire_api: Some(ProviderModelWireApi::OpenaiChatCompletions),
+            },
+            vibex_core::ProviderConfiguredModel {
+                id: "claude-test".to_string(),
+                display_name: Some("Claude Test".to_string()),
+                enabled: true,
+                wire_api: Some(ProviderModelWireApi::AnthropicMessages),
+            },
+        ];
+        profile.provider_options = vibex_core::ProviderOptions {
+            schema_version: 1,
+            entries: vec![
+                ProviderBindingMetadata {
+                    key: CODEX_MODEL_PROVIDER_ID_OPTION_KEY.to_string(),
+                    value: "mixed-relay".to_string(),
+                },
+                ProviderBindingMetadata {
+                    key: "wireApi".to_string(),
+                    value: "responses".to_string(),
+                },
+            ],
+        };
+
+        let env = opencode_model_provider_env(&profile);
+        let config_content = env
+            .iter()
+            .find(|(key, _)| key == OPENCODE_INLINE_CONFIG_ENV)
+            .map(|(_, value)| value)
+            .unwrap();
+        let config: Value = serde_json::from_str(config_content).unwrap();
+
+        assert_eq!(
+            config["enabled_providers"],
+            json!(["mixed-relay", "mixed-relay-chat", "mixed-relay-anthropic"])
+        );
+        assert_eq!(config["provider"]["mixed-relay"]["npm"], "@ai-sdk/openai");
+        assert_eq!(
+            config["provider"]["mixed-relay-chat"]["npm"],
+            "@ai-sdk/openai-compatible"
+        );
+        assert_eq!(
+            config["provider"]["mixed-relay-anthropic"]["npm"],
+            "@ai-sdk/anthropic"
+        );
+        assert_eq!(
+            config["provider"]["mixed-relay"]["models"]["gpt-responses"]["name"],
+            "GPT Responses"
+        );
+        assert!(
+            config["provider"]["mixed-relay-chat"]["models"]
+                .get("gpt-chat")
+                .is_some()
+        );
+        assert!(
+            config["provider"]["mixed-relay-anthropic"]["models"]
+                .get("claude-test")
+                .is_some()
+        );
+        assert_eq!(config["model"], "mixed-relay-anthropic/claude-test");
+        assert_eq!(
+            opencode_qualified_model_id(&profile, "gpt-responses").as_deref(),
+            Some("mixed-relay/gpt-responses")
+        );
+        assert_eq!(
+            opencode_qualified_model_id(&profile, "gpt-chat").as_deref(),
+            Some("mixed-relay-chat/gpt-chat")
+        );
+        assert_eq!(
+            opencode_qualified_model_id(&profile, "mixed-relay-anthropic/claude-test").as_deref(),
+            Some("mixed-relay-anthropic/claude-test")
+        );
+    }
+
+    const MOCK_ACP_AGENT: &str = r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+import time
+
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def send_stream_error(session_id, small, message):
+    escaped = message.replace("\\", "\\\\").replace('"', '\\"')
+    sys.stderr.write(
+        'timestamp=2026-07-10T03:00:45.015Z level=ERROR '
+        'message="stream error" providerID=mock modelID=mock/model-1 '
+        'session.id=' + session_id + ' small=' + ('true' if small else 'false') + ' '
+        'agent=build mode=primary error.error="' + escaped + '"\n'
+    )
+    sys.stderr.flush()
+
+
+session_counter = 0
+pending_prompt_id = None
+request_log_path = os.environ.get("VIBEX_MOCK_ACP_REQUEST_LOG")
+set_model_mode = os.environ.get("VIBEX_MOCK_ACP_SET_MODEL_MODE", "supported")
+prompt_mode = os.environ.get("VIBEX_MOCK_ACP_PROMPT_MODE", "success")
+restore_mode = os.environ.get("VIBEX_MOCK_ACP_RESTORE_MODE", "success")
+advertise_resume = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_RESUME") == "true"
+session_new_delay = float(os.environ.get("VIBEX_MOCK_ACP_SESSION_NEW_DELAY", "0"))
+fail_first_session_new = os.environ.get("VIBEX_MOCK_ACP_FAIL_FIRST_SESSION_NEW") == "true"
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    if request_log_path:
+        with open(request_log_path, "a", encoding="utf-8") as log:
+            log.write(json.dumps(msg) + "\n")
+    method = msg.get("method")
+    mid = msg.get("id")
+    if method == "initialize":
+        capabilities = {
+            "loadSession": True,
+            "listSessions": True,
+            "sessionConfig": {
+                "setModel": {"supported": True, "encoding": "typed"},
+                "setMode": {"supported": True, "encoding": "typed"},
+                "setConfigOption": {"supported": True, "encoding": "versioned_raw"},
+            },
+        }
+        if advertise_resume:
+            capabilities["sessionCapabilities"] = {"resume": {}}
+        send({
+            "jsonrpc": "2.0",
+            "id": mid,
+            "result": {
+                "protocolVersion": 1,
+                "agentCapabilities": capabilities,
+                "agentInfo": {"name": "mock-acp", "version": "1.0.0"},
+            },
+        })
+    elif method == "model/list":
+        send({
+            "jsonrpc": "2.0",
+            "id": mid,
+            "result": {
+                "data": [
+                    {
+                        "id": "mock/model-1",
+                        "defaultReasoningEffort": "medium",
+                        "supportedReasoningEfforts": [
+                            {"reasoningEffort": "low", "description": "Low"},
+                            {"reasoningEffort": "medium", "description": "Medium"},
+                            {"reasoningEffort": "high", "description": "High"},
+                        ],
+                    },
+                    {
+                        "id": "mock/model-2",
+                        "defaultReasoningEffort": "high",
+                        "supportedReasoningEfforts": [
+                            {"reasoningEffort": "high", "description": "High"},
+                        ],
+                    },
+                ],
+                "nextCursor": None,
+            },
+        })
+    elif method == "session/new":
+        if session_new_delay > 0:
+            time.sleep(session_new_delay)
+        session_counter += 1
+        if fail_first_session_new and session_counter == 1:
+            send({
+                "jsonrpc": "2.0",
+                "id": mid,
+                "error": {"code": -32000, "message": "mock first session/new failure"},
+            })
+            continue
+        session_id = "mock-session-" + str(session_counter)
+        send({
+            "jsonrpc": "2.0",
+            "id": mid,
+            "result": {
+                "sessionId": session_id,
+                "models": {
+                    "availableModels": [{"modelId": "mock/model-1"}],
+                    "currentModelId": "mock/model-1",
+                },
+                "modes": {
+                    "availableModes": [
+                        {"id": "build", "label": "Build"},
+                        {"id": "review", "label": "Review"},
+                    ],
+                    "currentModeId": "build",
+                },
+                "configOptions": [
+                    {
+                        "id": "model",
+                        "category": "model",
+                        "label": "Model",
+                        "type": "select",
+                        "currentValue": "mock/model-1",
+                        "options": [
+                            {"value": "mock/model-1", "label": "Model 1"},
+                            {"value": "mock/model-2", "label": "Model 2"},
+                        ],
+                    },
+                    {
+                        "id": "autoApply",
+                        "label": "Auto apply",
+                        "type": "boolean",
+                        "currentValue": True,
+                        "defaultValue": False,
+                    },
+                    {
+                        "id": "reasoning_effort",
+                        "label": "Reasoning effort",
+                        "type": "select",
+                        "currentValue": "medium",
+                        "options": [
+                            {"value": "low", "label": "Low"},
+                            {"value": "medium", "label": "Medium"},
+                            {"value": "high", "label": "High"},
+                        ],
+                    }
+                ],
+            },
+        })
+        send({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [
+                        {"name": "compact", "description": "Compact context"}
+                    ],
+                },
+            },
+        })
+    elif method == "session/set_model":
+        session_id = msg.get("params", {}).get("sessionId", "mock-session-1")
+        model_id = msg.get("params", {}).get("modelId", "mock/model-1")
+        if set_model_mode == "unsupported":
+            send({
+                "jsonrpc": "2.0",
+                "id": mid,
+                "error": {"code": -32601, "message": "method not found"},
+            })
+        elif set_model_mode == "auth":
+            send({
+                "jsonrpc": "2.0",
+                "id": mid,
+                "error": {"code": -32003, "message": "permission denied"},
+            })
+        else:
+            send({
+                "jsonrpc": "2.0",
+                "id": mid,
+                "result": {
+                    "sessionId": session_id,
+                    "models": {
+                        "availableModels": [
+                            {"modelId": "mock/model-1"},
+                            {"modelId": "mock/model-2"},
+                        ],
+                        "currentModelId": model_id,
+                    },
+                },
+            })
+    elif method == "session/set_mode":
+        session_id = msg.get("params", {}).get("sessionId", "mock-session-1")
+        mode_id = msg.get("params", {}).get("modeId", "build")
+        send({
+            "jsonrpc": "2.0",
+            "id": mid,
+            "result": {
+                "sessionId": session_id,
+                "modes": {
+                    "availableModes": [
+                        {"id": "build", "label": "Build"},
+                        {"id": "review", "label": "Review"},
+                    ],
+                    "currentModeId": mode_id,
+                },
+            },
+        })
+    elif method == "session/set_config_option":
+        session_id = msg.get("params", {}).get("sessionId", "mock-session-1")
+        config_id = msg.get("params", {}).get("configId", "model")
+        value = msg.get("params", {}).get("value", "mock/model-1")
+        option = {
+            "id": config_id,
+            "label": config_id,
+            "type": "select",
+            "currentValue": value,
+            "options": [{"value": value, "label": value}],
+        }
+        if config_id == "model":
+            option.update({
+                "category": "model",
+                "label": "Model",
+                "options": [
+                    {"value": "mock/model-1", "label": "Model 1"},
+                    {"value": "mock/model-2", "label": "Model 2"},
+                ],
+            })
+        send({
+            "jsonrpc": "2.0",
+            "id": mid,
+            "result": {"configOptions": [option]},
+        })
+    elif method == "session/list":
+        send({
+            "jsonrpc": "2.0",
+            "id": mid,
+            "result": {
+                "sessions": [
+                    {
+                        "sessionId": "mock-import-session",
+                        "title": "Mock imported ACP session",
+                        "workspaceRoot": msg.get("params", {}).get("cwd", ""),
+                        "updatedAtMs": 123,
+                        "models": {
+                            "availableModels": [{"modelId": "mock/model-1"}],
+                            "currentModelId": "mock/model-1",
+                        },
+                    }
+                ]
+            },
+        })
+    elif method == "session/resume":
+        session_id = msg.get("params", {}).get("sessionId", "mock-import-session")
+        if restore_mode == "timeout":
+            time.sleep(0.25)
+        if restore_mode == "resume_unsupported":
+            send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "method not found"}})
+        elif restore_mode == "not_found":
+            send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32004, "message": "session not found"}})
+        elif restore_mode == "codex_rollout_missing":
+            send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": "Internal error", "data": {"details": "no rollout found for thread id " + session_id}}})
+        elif restore_mode == "auth":
+            send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32003, "message": "authentication required"}})
+        elif restore_mode == "provider_failure":
+            send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32000, "message": "provider failed"}})
+        elif restore_mode == "invalid":
+            send({"jsonrpc": "2.0", "id": mid, "result": []})
+        elif restore_mode == "native_mismatch":
+            send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "wrong-native-session"}})
+        else:
+            send({
+                "jsonrpc": "2.0",
+                "id": mid,
+                "result": {
+                    "models": {
+                        "availableModels": [{"modelId": "mock/model-2"}],
+                        "currentModelId": "mock/model-2",
+                    },
+                },
+            })
+    elif method == "session/load":
+        session_id = msg.get("params", {}).get("sessionId", "mock-import-session")
+        if restore_mode == "timeout":
+            time.sleep(0.25)
+        if restore_mode == "delayed_success":
+            time.sleep(0.1)
+        if restore_mode == "not_found":
+            send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32004, "message": "session not found"}})
+            continue
+        if restore_mode == "codex_rollout_missing":
+            send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": "Internal error", "data": {"details": "no rollout found for thread id " + session_id}}})
+            continue
+        if restore_mode == "auth":
+            send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32003, "message": "permission denied"}})
+            continue
+        if restore_mode == "provider_failure":
+            send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32000, "message": "provider failed"}})
+            continue
+        if restore_mode == "invalid":
+            send({"jsonrpc": "2.0", "id": mid, "result": []})
+            continue
+        if restore_mode == "load_unsupported":
+            send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "method not found"}})
+            continue
+        if restore_mode == "native_mismatch":
+            send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "wrong-native-session"}})
+            continue
+        send({
+            "jsonrpc": "2.0",
+            "id": mid,
+            "result": {
+                "models": {
+                    "availableModels": [{"modelId": "mock/model-2"}],
+                    "currentModelId": "mock/model-2",
+                },
+                "modes": {
+                    "availableModes": [{"id": "review", "label": "Review"}],
+                    "currentModeId": "review",
+                },
+                "configOptions": [
+                    {
+                        "id": "reviewDepth",
+                        "label": "Review depth",
+                        "type": "select",
+                        "currentValue": "deep",
+                        "options": [
+                            {"value": "quick", "label": "Quick"},
+                            {"value": "deep", "label": "Deep"},
+                        ],
+                    },
+                    {
+                        "id": "reasoning_effort",
+                        "label": "Reasoning effort",
+                        "type": "select",
+                        "currentValue": "medium",
+                        "options": [
+                            {"value": "low", "label": "Low"},
+                            {"value": "medium", "label": "Medium"},
+                            {"value": "high", "label": "High"},
+                        ],
+                    },
+                    {
+                        "id": "autoApply",
+                        "label": "Auto apply",
+                        "type": "boolean",
+                        "currentValue": True,
+                    }
+                ],
+            },
+        })
+    elif method == "session/prompt":
+        session_id = msg["params"]["sessionId"]
+        prompt = msg["params"]["prompt"]
+        text = prompt[0].get("text", "") if prompt else ""
+        # Unknown adapter-extension notification injected mid-turn: the
+        # client must route it to diagnostics without disturbing the
+        # session (raw preservation gate). Existing event assertions in
+        # the Rust tests prove non-interference.
+        send({
+            "jsonrpc": "2.0",
+            "method": "_mock/heartbeat",
+            "params": {"sessionId": session_id, "apiKey": "mock-secret"},
+        })
+        send({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": {"type": "text", "text": "thinking"},
+                },
+            },
+        })
+        if prompt_mode == "stream_error":
+            send_stream_error(session_id, True, "AI_RetryError: title generation failed")
+            for _ in range(8):
+                send_stream_error(
+                    session_id,
+                    False,
+                    "AI_APICallError: Internal server error",
+                )
+            continue
+        if prompt_mode == "stream_error_once":
+            send_stream_error(session_id, False, "AI_APICallError: Service Unavailable")
+            time.sleep(0.05)
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_thought_chunk",
+                        "content": {"type": "text", "text": "one recovery update"},
+                    },
+                },
+            })
+            continue
+        if prompt_mode == "usage_limit":
+            send_stream_error(
+                session_id,
+                False,
+                "AI_APICallError: Rate limit exceeded. Please try again later.",
+            )
+            continue
+        if prompt_mode == "stream_error_rpc_failure":
+            send_stream_error(session_id, False, "AI_APICallError: No provider available")
+            time.sleep(0.05)
+            send({
+                "jsonrpc": "2.0",
+                "id": mid,
+                "error": {"code": -32603, "message": "Internal error"},
+            })
+            continue
+        if prompt_mode == "stream_error_recovery":
+            for _ in range(7):
+                send_stream_error(session_id, False, "AI_APICallError: Internal server error")
+            time.sleep(0.1)
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_thought_chunk",
+                        "content": {"type": "text", "text": "model stream recovered"},
+                    },
+                },
+            })
+            time.sleep(0.1)
+            for _ in range(7):
+                send_stream_error(session_id, False, "AI_APICallError: Internal server error")
+            time.sleep(0.1)
+        if prompt_mode == "title_error":
+            send_stream_error(session_id, True, "AI_RetryError: title generation failed")
+        if "permission" in text:
+            pending_prompt_id = mid
+            send({
+                "jsonrpc": "2.0",
+                "id": 991,
+                    "method": "session/request_permission",
+                    "params": {
+                    "sessionId": session_id,
+                    "toolCall": {
+                        "toolCallId": "tc-1",
+                        "title": "Run ls",
+                        "kind": "execute",
+                    },
+                    "options": [
+                        {"optionId": "opt-allow", "kind": "allow_once", "name": "Allow"},
+                        {"optionId": "opt-reject", "kind": "reject_once", "name": "Reject"},
+                    ],
+                },
+            })
+            if prompt_mode == "permission_unresolved":
+                send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
+        else:
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": session_id + ":" + text},
+                    },
+                },
+            })
+            send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
+    elif method == "session/cancel":
+        pass
+    elif method is None and msg.get("id") == 991:
+        response = msg.get("result", {}).get("outcome", {})
+        outcome = response.get("outcome")
+        option_id = response.get("optionId")
+        if outcome == "selected" and option_id == "opt-allow":
+            verdict = "approved"
+        elif outcome == "selected" and option_id == "opt-reject":
+            verdict = "rejected"
+        elif outcome == "cancelled":
+            verdict = "cancelled"
+        else:
+            verdict = "unknown"
+        send({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "mock-session-1",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "tc-1",
+                    "status": "completed",
+                },
+            },
+        })
+        send({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "mock-session-1",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "permission " + verdict},
+                },
+            },
+        })
+        send({
+            "jsonrpc": "2.0",
+            "id": pending_prompt_id,
+            "result": {"stopReason": "end_turn"},
+        })
+"#;
+
+    struct MockAcpFixture {
+        root: PathBuf,
+        db_path: PathBuf,
+        workspace: PathBuf,
+        profile_id: ProviderProfileId,
+        request_log: PathBuf,
+        verified_multi_session: std::sync::atomic::AtomicBool,
+    }
+
+    impl MockAcpFixture {
+        fn create(label: &str) -> Option<Self> {
+            Self::create_for_agent(label, None)
+        }
+
+        fn create_for_agent(label: &str, agent_id: Option<vibex_core::AgentId>) -> Option<Self> {
+            if which_python().is_none() {
+                eprintln!("skipping mock ACP runtime test: python3 not found on PATH");
+                return None;
+            }
+            let unique = format!("{label}-{}", RequestId::new().as_str());
+            let root = std::env::temp_dir().join(format!("vibex-acp-runtime-{unique}"));
+            let workspace = root.join("workspace");
+            std::fs::create_dir_all(&workspace).unwrap();
+            let script_path = root.join("mock-acp-agent.py");
+            std::fs::write(&script_path, MOCK_ACP_AGENT).unwrap();
+            let request_log = root.join("requests.jsonl");
+            let db_path = root.join("vibex.db");
+            let service = ProviderConfigService::new(db_path.clone());
+            let profile = service
+                .create_acp_profile(vibex_core::AcpProviderProfileCreateRequest {
+                    agent_id,
+                    display_name: "Mock ACP".to_string(),
+                    account_alias: None,
+                    preset_id: None,
+                    config: Some(AcpProviderConfig {
+                        command: which_python().unwrap(),
+                        args: vec![script_path.display().to_string()],
+                        env: vec![vibex_core::AcpProviderEnvReference {
+                            key: "VIBEX_MOCK_ACP_REQUEST_LOG".to_string(),
+                            source: AcpProviderEnvSource::Literal,
+                            value: Some(request_log.display().to_string()),
+                            secret_lookup_key: None,
+                            redacted_hint: "mock request log".to_string(),
+                        }],
+                        cwd_template: Some("{workspaceRoot}".to_string()),
+                        process_strategy: vibex_core::AcpProcessStrategy::default(),
+                        terminal_tools: false,
+                        terminal_auth: false,
+                        models: Vec::new(),
+                        modes: Vec::new(),
+                        features: vec![
+                            "streaming".to_string(),
+                            "mcp_servers".to_string(),
+                            "tool_calls".to_string(),
+                            "permission_requests".to_string(),
+                            "reasoning".to_string(),
+                            "interrupt".to_string(),
+                        ],
+                        disabled_tools: Vec::new(),
+                    }),
+                })
+                .unwrap();
+            Some(Self {
+                root,
+                db_path,
+                workspace,
+                profile_id: profile.id,
+                request_log,
+                verified_multi_session: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+
+        fn service(&self) -> ProviderConfigService {
+            ProviderConfigService::new(self.db_path.clone())
+        }
+
+        fn client(&self) -> AcpRuntimeClient {
+            let service = self.service();
+            let client = AcpRuntimeClient::new(service);
+            if self
+                .verified_multi_session
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                client.enable_test_multi_session_for_agent(OPENCODE_AGENT_ID);
+            }
+            client
+        }
+
+        fn enable_per_profile_pool(&self, safe: bool) {
+            self.verified_multi_session
+                .store(safe, std::sync::atomic::Ordering::SeqCst);
+            let service = self.service();
+            let mut config = service
+                .get_acp_profile_config(self.profile_id.clone())
+                .unwrap();
+            config.process_strategy = AcpProcessStrategy::PerProfilePool;
+            if !config
+                .features
+                .iter()
+                .any(|feature| feature.trim().eq_ignore_ascii_case("safe_multi_session"))
+            {
+                config.features.push("safe_multi_session".to_string());
+            }
+            service
+                .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                    provider_profile_id: self.profile_id.clone(),
+                    config,
+                })
+                .unwrap();
+        }
+
+        fn force_model_config_option_fallback(&self) {
+            let service = self.service();
+            let mut config = service
+                .get_acp_profile_config(self.profile_id.clone())
+                .unwrap();
+            config.env.push(vibex_core::AcpProviderEnvReference {
+                key: "VIBEX_MOCK_ACP_SET_MODEL_MODE".to_string(),
+                source: AcpProviderEnvSource::Literal,
+                value: Some("unsupported".to_string()),
+                secret_lookup_key: None,
+                redacted_hint: "mock set-model fallback".to_string(),
+            });
+            service
+                .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                    provider_profile_id: self.profile_id.clone(),
+                    config,
+                })
+                .unwrap();
+        }
+
+        fn set_model_failure_mode(&self, mode: &str) {
+            let service = self.service();
+            let mut config = service
+                .get_acp_profile_config(self.profile_id.clone())
+                .unwrap();
+            config.env.push(vibex_core::AcpProviderEnvReference {
+                key: "VIBEX_MOCK_ACP_SET_MODEL_MODE".to_string(),
+                source: AcpProviderEnvSource::Literal,
+                value: Some(mode.to_string()),
+                secret_lookup_key: None,
+                redacted_hint: "mock set-model failure mode".to_string(),
+            });
+            service
+                .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                    provider_profile_id: self.profile_id.clone(),
+                    config,
+                })
+                .unwrap();
+        }
+
+        fn set_prompt_mode(&self, mode: &str) {
+            let service = self.service();
+            let mut config = service
+                .get_acp_profile_config(self.profile_id.clone())
+                .unwrap();
+            config.env.push(vibex_core::AcpProviderEnvReference {
+                key: "VIBEX_MOCK_ACP_PROMPT_MODE".to_string(),
+                source: AcpProviderEnvSource::Literal,
+                value: Some(mode.to_string()),
+                secret_lookup_key: None,
+                redacted_hint: "mock prompt mode".to_string(),
+            });
+            service
+                .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                    provider_profile_id: self.profile_id.clone(),
+                    config,
+                })
+                .unwrap();
+        }
+
+        fn set_restore_mode(&self, mode: &str, advertise_resume: bool) {
+            let service = self.service();
+            let mut config = service
+                .get_acp_profile_config(self.profile_id.clone())
+                .unwrap();
+            config.env.push(vibex_core::AcpProviderEnvReference {
+                key: "VIBEX_MOCK_ACP_RESTORE_MODE".to_string(),
+                source: AcpProviderEnvSource::Literal,
+                value: Some(mode.to_string()),
+                secret_lookup_key: None,
+                redacted_hint: "mock restore mode".to_string(),
+            });
+            if advertise_resume {
+                config.env.push(vibex_core::AcpProviderEnvReference {
+                    key: "VIBEX_MOCK_ACP_ADVERTISE_RESUME".to_string(),
+                    source: AcpProviderEnvSource::Literal,
+                    value: Some("true".to_string()),
+                    secret_lookup_key: None,
+                    redacted_hint: "mock resume capability".to_string(),
+                });
+            }
+            service
+                .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                    provider_profile_id: self.profile_id.clone(),
+                    config,
+                })
+                .unwrap();
+        }
+
+        fn set_session_new_delay(&self, delay_seconds: &str) {
+            let service = self.service();
+            let mut config = service
+                .get_acp_profile_config(self.profile_id.clone())
+                .unwrap();
+            config.env.push(vibex_core::AcpProviderEnvReference {
+                key: "VIBEX_MOCK_ACP_SESSION_NEW_DELAY".to_string(),
+                source: AcpProviderEnvSource::Literal,
+                value: Some(delay_seconds.to_string()),
+                secret_lookup_key: None,
+                redacted_hint: "mock session/new delay".to_string(),
+            });
+            service
+                .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                    provider_profile_id: self.profile_id.clone(),
+                    config,
+                })
+                .unwrap();
+        }
+
+        fn fail_first_session_new(&self) {
+            let service = self.service();
+            let mut config = service
+                .get_acp_profile_config(self.profile_id.clone())
+                .unwrap();
+            config.env.push(vibex_core::AcpProviderEnvReference {
+                key: "VIBEX_MOCK_ACP_FAIL_FIRST_SESSION_NEW".to_string(),
+                source: AcpProviderEnvSource::Literal,
+                value: Some("true".to_string()),
+                secret_lookup_key: None,
+                redacted_hint: "mock first session/new failure".to_string(),
+            });
+            service
+                .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                    provider_profile_id: self.profile_id.clone(),
+                    config,
+                })
+                .unwrap();
+        }
+
+        fn alternate_workspace(&self, label: &str) -> PathBuf {
+            let workspace = self.root.join(label);
+            std::fs::create_dir_all(&workspace).unwrap();
+            workspace
+        }
+
+        fn request_log(&self) -> Vec<Value> {
+            let Ok(contents) = std::fs::read_to_string(&self.request_log) else {
+                return Vec::new();
+            };
+            contents
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .collect()
+        }
+
+        fn cleanup(self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn fixture_mcp_resources() -> ProviderRuntimeResources {
+        ProviderRuntimeResources {
+            mcp_servers: vec![
+                ProviderRuntimeMcpServer {
+                    id: "filesystem".to_string(),
+                    display_name: "Filesystem".to_string(),
+                    transport: ProviderRuntimeMcpTransport::Stdio,
+                    command: Some("mcp-server-filesystem".to_string()),
+                    args: vec!["--root".to_string(), "/tmp/workspace".to_string()],
+                    url: None,
+                },
+                ProviderRuntimeMcpServer {
+                    id: "remote".to_string(),
+                    display_name: "Remote".to_string(),
+                    transport: ProviderRuntimeMcpTransport::Http,
+                    command: None,
+                    args: Vec::new(),
+                    url: Some("https://example.invalid/mcp".to_string()),
+                },
+            ],
+            skills: Vec::new(),
+        }
+    }
+
+    fn find_logged_request(log: &[Value], method: &str) -> Value {
+        log.iter()
+            .find(|entry| entry.get("method").and_then(Value::as_str) == Some(method))
+            .cloned()
+            .unwrap_or_else(|| panic!("{method} request missing in {log:?}"))
+    }
+
+    fn logged_request_count(log: &[Value], method: &str) -> usize {
+        log.iter()
+            .filter(|entry| entry.get("method").and_then(Value::as_str) == Some(method))
+            .count()
+    }
+
+    fn runtime_metric_count(
+        observability: &RuntimeObservability,
+        name: RuntimeMetricName,
+        operation: Option<RuntimeMetricOperation>,
+        result: RuntimeMetricResult,
+    ) -> u64 {
+        observability
+            .snapshot()
+            .series
+            .into_iter()
+            .find(|series| {
+                series.name == name && series.operation == operation && series.result == result
+            })
+            .map(|series| series.count)
+            .unwrap_or_default()
+    }
+
+    fn collect_text_events(
+        receiver: &mut tokio::sync::mpsc::UnboundedReceiver<AcpEvent>,
+    ) -> String {
+        let mut text = String::new();
+        while let Ok(event) = receiver.try_recv() {
+            if let AcpEvent::AssistantDelta { text_delta, .. } = event {
+                text.push_str(&text_delta);
+            }
+        }
+        text
+    }
+
+    fn which_python() -> Option<String> {
+        let path = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("python3");
+            if candidate.is_file() {
+                return Some(candidate.display().to_string());
+            }
+        }
+        None
+    }
+
+    fn test_binding_for(
+        session_id: &VibexSessionId,
+        profile_id: &ProviderProfileId,
+        session: &AcpSession,
+    ) -> ProviderBinding {
+        ProviderBinding {
+            session_id: session_id.clone(),
+            provider_kind: vibex_core::ProviderKind::Acp,
+            provider_profile_id: profile_id.clone(),
+            native: vibex_core::ProviderNativeBinding {
+                native_session_id: session.native_session_id.clone(),
+                native_thread_id: None,
+                native_resume_token: None,
+                session_config_state: session.session_config_state.clone(),
+                redacted_metadata: session.redacted_metadata.clone(),
+            },
+            created_at_ms: vibex_core::unix_timestamp_ms(),
+            updated_at_ms: vibex_core::unix_timestamp_ms(),
+        }
+    }
+
+    fn test_restore_binding(
+        session_id: &VibexSessionId,
+        profile_id: &ProviderProfileId,
+        native_session_id: &str,
+    ) -> ProviderBinding {
+        ProviderBinding {
+            session_id: session_id.clone(),
+            provider_kind: ProviderKind::Acp,
+            provider_profile_id: profile_id.clone(),
+            native: vibex_core::ProviderNativeBinding {
+                native_session_id: Some(native_session_id.to_string()),
+                native_thread_id: None,
+                native_resume_token: None,
+                session_config_state: None,
+                redacted_metadata: Vec::new(),
+            },
+            created_at_ms: unix_timestamp_ms(),
+            updated_at_ms: unix_timestamp_ms(),
+        }
+    }
+
+    struct RuntimeSwitchFixture {
+        fixture: MockAcpFixture,
+        client: Arc<AcpRuntimeClient>,
+        manager: Arc<AgentManager>,
+        bridge: Arc<AcpRuntimeSwitchBridge>,
+        runtime_selection: Arc<vibex_agent::RuntimeSelectionService>,
+        message_submission: Arc<vibex_agent::MessageSubmissionCoordinator>,
+        observability: Arc<RuntimeObservability>,
+        session: vibex_core::AgentSession,
+        selection: SessionRuntimeSelection,
+        source_binding: RuntimeBinding,
+        source_revision: i64,
+        source_selection_revision: i64,
+    }
+
+    async fn runtime_switch_fixture(label: &str) -> Option<RuntimeSwitchFixture> {
+        use vibex_agent::{
+            MessageSubmissionCoordinator, MessageSubmissionCoordinatorConfig,
+            RuntimeSelectionService, RuntimeSelectionServiceConfig, RuntimeSwitchCoordinator,
+            RuntimeSwitchCoordinatorConfig, manager_message_dispatcher,
+        };
+        use vibex_core::{AgentUpdateConfigRequest, CreateAgentSessionRequest};
+
+        let fixture = MockAcpFixture::create(label)?;
+        let service = fixture.service();
+        service
+            .update_agent_config(AgentUpdateConfigRequest {
+                agent_id: vibex_core::AgentId::parse(OPENCODE_AGENT_ID).unwrap(),
+                added: Some(true),
+                enabled: Some(true),
+                label_override: None,
+                description_override: None,
+                order_index: None,
+                command: None,
+                env: None,
+                params: None,
+            })
+            .unwrap();
+        let mut config = service
+            .get_acp_profile_config(fixture.profile_id.clone())
+            .unwrap();
+        config.models = vec!["mock/model-1".to_string(), "mock/model-2".to_string()];
+        config.modes = vec!["build".to_string(), "review".to_string()];
+        service
+            .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                provider_profile_id: fixture.profile_id.clone(),
+                config,
+            })
+            .unwrap();
+
+        let observability = Arc::new(RuntimeObservability::new());
+        let client = Arc::new(AcpRuntimeClient::new_with_observability(
+            fixture.service(),
+            observability.clone(),
+        ));
+        let provider_client: Arc<dyn AcpClient> = client.clone();
+        let provider =
+            crate::AcpAgentProvider::with_config_service(provider_client, fixture.service());
+        let agent_id = vibex_core::AgentId::parse(OPENCODE_AGENT_ID).unwrap();
+        let mut manager = AgentManager::new(&fixture.db_path).unwrap();
+        manager
+            .register_runtime(client.route_key_for_agent(&agent_id), Arc::new(provider))
+            .unwrap();
+        let manager = Arc::new(manager);
+        let bridge = Arc::new(
+            AcpRuntimeSwitchBridge::new(
+                &fixture.db_path,
+                Arc::clone(&client),
+                Arc::clone(&manager),
+            )
+            .unwrap(),
+        );
+        let coordinator = RuntimeSwitchCoordinator::new_with_observability(
+            &fixture.db_path,
+            bridge.clone(),
+            bridge.clone(),
+            RuntimeSwitchCoordinatorConfig::default(),
+            observability.clone(),
+        )
+        .unwrap();
+        let runtime_selection = Arc::new(
+            RuntimeSelectionService::new(
+                coordinator,
+                bridge.clone(),
+                RuntimeSelectionServiceConfig::default(),
+            )
+            .unwrap(),
+        );
+        manager
+            .install_runtime_selection_service(&runtime_selection)
+            .unwrap();
+        let message_submission = Arc::new(
+            MessageSubmissionCoordinator::new_with_observability(
+                &fixture.db_path,
+                runtime_selection.clone(),
+                manager_message_dispatcher(&manager),
+                MessageSubmissionCoordinatorConfig::default(),
+                observability.clone(),
+            )
+            .unwrap(),
+        );
+        manager
+            .install_message_submission_coordinator(&message_submission)
+            .unwrap();
+        let selection = SessionRuntimeSelection {
+            agent_id,
+            provider_profile_id: fixture.profile_id.clone(),
+            model_id: "mock/model-1".to_string(),
+            reasoning_effort: None,
+            mode_id: Some("build".to_string()),
+            config_values: Default::default(),
+        };
+        let session = manager
+            .create_session(CreateAgentSessionRequest {
+                runtime: selection.clone(),
+                workspace_root: fixture.workspace.display().to_string(),
+                workspace_mode: WorkspaceMode::CurrentCheckout,
+                title: Some("runtime switch fixture".to_string()),
+                safety: None,
+            })
+            .await
+            .unwrap();
+        let conn = open_database(&fixture.db_path).unwrap();
+        let state = AgentSessionRuntimeRepository::get_runtime_state(&conn, &session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.runtime_selection_status,
+            Some(vibex_core::SessionRuntimeSelectionStatus::Ready)
+        );
+        let source_binding = RuntimeBindingRepository::get(
+            &conn,
+            state
+                .current_binding_id
+                .as_ref()
+                .expect("initial ACP switch must commit a current binding"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(source_binding.session_id, session.id);
+        assert_eq!(source_binding.agent_id, selection.agent_id);
+        assert_eq!(
+            source_binding.provider_profile_id,
+            selection.provider_profile_id
+        );
+        assert_eq!(source_binding.transport_kind, TransportKind::Acp);
+        assert_eq!(source_binding.binding_state, BindingState::Current);
+        assert_eq!(
+            source_binding.activation_generation,
+            state.activation_generation
+        );
+        assert!(selection.matches_effective_config(&source_binding.session_runtime_config_state));
+        assert!(
+            source_binding
+                .session_runtime_config_state
+                .is_applied_to_generation(state.activation_generation)
+        );
+
+        Some(RuntimeSwitchFixture {
+            fixture,
+            client,
+            manager,
+            bridge,
+            runtime_selection,
+            message_submission,
+            observability,
+            session,
+            selection,
+            source_binding,
+            source_revision: state.revision,
+            source_selection_revision: state.selection_revision,
+        })
+    }
+
+    fn switch_operation(kind: &str) -> JournaledOperation {
+        JournaledOperation {
+            operation_id: vibex_core::RuntimeSwitchOperationId::new(),
+            sequence: 0,
+            operation_kind: kind.to_string(),
+            adapter_idempotency_token: None,
+        }
+    }
+
+    fn switch_intent(
+        fixture: &RuntimeSwitchFixture,
+        target_binding_id: RuntimeBindingId,
+        model_id: &str,
+        mode_id: &str,
+    ) -> SwitchIntent {
+        let mut target = fixture.selection.clone();
+        target.model_id = model_id.to_string();
+        target.mode_id = Some(mode_id.to_string());
+        SwitchIntent {
+            switch_id: RuntimeSwitchId::new(),
+            session_id: fixture.session.id.clone(),
+            source_revision: fixture.source_revision,
+            source_binding_id: Some(fixture.source_binding.binding_id.clone()),
+            desired_selection_revision: fixture.source_selection_revision,
+            target_binding_id: Some(target_binding_id),
+            target_adapter_id: fixture.source_binding.adapter_id.clone(),
+            target_selection: target,
+            requested_policy: vibex_core::RuntimeSwitchPolicy::Automatic,
+            active_work_policy: Default::default(),
+            requested_session_config: Some(
+                serde_json::to_value(SessionRuntimeConfigPatch {
+                    model_id: Some(model_id.to_string()),
+                    mode_id: Some(mode_id.to_string()),
+                    ..Default::default()
+                })
+                .unwrap(),
+            ),
+            created_at_ms: unix_timestamp_ms(),
+        }
+    }
+
+    async fn force_fresh_context_bridge_target(
+        fixture: &RuntimeSwitchFixture,
+        key_prefix: &str,
+        prompt_mode: &str,
+    ) -> (
+        RuntimeBindingId,
+        vibex_db::ContextBridgeRecord,
+        RuntimeBinding,
+    ) {
+        use vibex_agent::{
+            MessageDispatchExecutor, RuntimeSwitchCoordinator, RuntimeSwitchCoordinatorConfig,
+            RuntimeSwitchRequest,
+        };
+        use vibex_core::{MessageSubmissionId, RuntimeSwitchPolicy, SendAgentMessageRequest};
+        use vibex_db::ContextBridgeRepository;
+
+        MessageDispatchExecutor::dispatch_message(
+            fixture.manager.as_ref(),
+            MessageSubmissionId::new(),
+            SendAgentMessageRequest {
+                session_id: fixture.session.id.clone(),
+                message_idempotency_key: format!("{key_prefix}-history"),
+                desired_runtime: fixture.selection.clone(),
+                text: format!("history before {key_prefix}"),
+                attachments: Vec::new(),
+                reasoning_effort: fixture.selection.reasoning_effort.clone(),
+                correlation_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        fixture.fixture.set_prompt_mode(prompt_mode);
+        let coordinator = RuntimeSwitchCoordinator::new(
+            &fixture.fixture.db_path,
+            fixture.bridge.clone(),
+            fixture.bridge.clone(),
+            RuntimeSwitchCoordinatorConfig::default(),
+        )
+        .unwrap();
+        coordinator
+            .request_switch(RuntimeSwitchRequest {
+                session_id: fixture.session.id.clone(),
+                idempotency_key: format!("{key_prefix}-switch"),
+                expected_revision: fixture.source_revision,
+                expected_current_binding_id: Some(fixture.source_binding.binding_id.clone()),
+                desired_selection_revision: fixture.source_selection_revision,
+                target_adapter_id: fixture.source_binding.adapter_id.clone(),
+                target_selection: fixture.selection.clone(),
+                requested_policy: RuntimeSwitchPolicy::ForceFreshSession,
+                active_work_policy: Default::default(),
+                requested_session_config: Some(
+                    serde_json::to_value(SessionRuntimeConfigPatch {
+                        model_id: Some(fixture.selection.model_id.clone()),
+                        reasoning_effort: fixture.selection.reasoning_effort.clone(),
+                        mode_id: fixture.selection.mode_id.clone(),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                ),
+            })
+            .await
+            .unwrap();
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        let target_binding_id =
+            AgentSessionRuntimeRepository::get_runtime_state(&conn, &fixture.session.id)
+                .unwrap()
+                .unwrap()
+                .current_binding_id
+                .unwrap();
+        let pending = ContextBridgeRepository::get_pending_for_binding(&conn, &target_binding_id)
+            .unwrap()
+            .unwrap();
+        let binding = RuntimeBindingRepository::get(&conn, &target_binding_id)
+            .unwrap()
+            .unwrap();
+        (target_binding_id, pending, binding)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runtime_switch_bridge_materializes_initial_selection_from_current_attachment() {
+        let Some(fixture) = runtime_switch_fixture("switch-initial-selection").await else {
+            return;
+        };
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        let state = AgentSessionRuntimeRepository::get_runtime_state(&conn, &fixture.session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.current_binding_id,
+            Some(fixture.source_binding.binding_id.clone())
+        );
+        assert_eq!(
+            state.desired_runtime_selection,
+            Some(fixture.selection.clone())
+        );
+        assert_eq!(
+            state.effective_runtime_selection,
+            Some(fixture.selection.clone())
+        );
+        assert_eq!(
+            state.runtime_selection_status,
+            Some(vibex_core::SessionRuntimeSelectionStatus::Ready)
+        );
+        assert_eq!(fixture.source_binding.binding_state, BindingState::Current);
+        assert!(fixture.source_binding.created_by_switch_id.is_some());
+        drop(conn);
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runtime_selection_retry_recovers_failed_status_for_existing_attachment() {
+        let Some(fixture) = runtime_switch_fixture("selection-retry-existing").await else {
+            return;
+        };
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        conn.execute(
+            "UPDATE agent_sessions
+             SET runtime_selection_status = 'failed_using_previous',
+                 runtime_selection_error_code = 'acp_restore_fatal_failure'
+             WHERE session_id = ?1",
+            [fixture.session.id.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let recovered = fixture
+            .runtime_selection
+            .set_desired_runtime(vibex_core::SetDesiredAgentSessionRuntimeRequest {
+                session_id: fixture.session.id.clone(),
+                idempotency_key: "retry-current-after-restore-failure".to_string(),
+                expected_revision: fixture.source_revision,
+                expected_selection_revision: fixture.source_selection_revision,
+                desired: fixture.selection.clone(),
+                interaction: vibex_core::RuntimeSelectionInteraction::Seamless,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered.status,
+            vibex_core::SessionRuntimeSelectionStatus::Ready
+        );
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        let state = AgentSessionRuntimeRepository::get_runtime_state(&conn, &fixture.session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.runtime_selection_status,
+            Some(vibex_core::SessionRuntimeSelectionStatus::Ready)
+        );
+        assert_eq!(state.runtime_selection_error_code, None);
+        drop(conn);
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lifecycle_materialization_prepares_then_advances_the_durable_fence() {
+        let Some(fixture) = runtime_switch_fixture("lifecycle-materialize-current").await else {
+            return;
+        };
+        let source_generation = fixture.source_binding.activation_generation;
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        conn.execute(
+            "UPDATE agent_sessions
+             SET runtime_selection_status = 'failed_using_previous',
+                 runtime_selection_error_code = 'acp_restore_fatal_failure'
+             WHERE session_id = ?1",
+            [fixture.session.id.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+        let previous = fixture
+            .client
+            .current_attachment(&fixture.session.id)
+            .unwrap();
+        fixture.client.detach_attachment(previous.fence()).await;
+
+        let rebuilt = fixture
+            .bridge
+            .materialize_current_runtime(&fixture.session.id)
+            .await
+            .unwrap();
+        assert_eq!(rebuilt.binding_id(), &fixture.source_binding.binding_id);
+        assert_eq!(
+            rebuilt.fence().activation_generation,
+            u64::try_from(source_generation + 1).unwrap()
+        );
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        let state = AgentSessionRuntimeRepository::get_runtime_state(&conn, &fixture.session.id)
+            .unwrap()
+            .unwrap();
+        let binding = RuntimeBindingRepository::get(&conn, &fixture.source_binding.binding_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.activation_generation, source_generation + 1);
+        assert_eq!(binding.activation_generation, source_generation + 1);
+        assert_eq!(
+            state.current_binding_id,
+            Some(fixture.source_binding.binding_id.clone())
+        );
+        assert_eq!(
+            state.runtime_selection_status,
+            Some(vibex_core::SessionRuntimeSelectionStatus::Ready)
+        );
+        assert_eq!(state.runtime_selection_error_code, None);
+        drop(conn);
+        fixture.client.detach_attachment(rebuilt.fence()).await;
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lifecycle_prepare_failure_does_not_advance_generation_or_leak_reservation() {
+        let Some(fixture) = runtime_switch_fixture("lifecycle-materialize-failure").await else {
+            return;
+        };
+        let source_generation = fixture.source_binding.activation_generation;
+        let previous = fixture
+            .client
+            .current_attachment(&fixture.session.id)
+            .unwrap();
+        fixture.client.detach_attachment(previous.fence()).await;
+        std::fs::remove_file(fixture.fixture.root.join("mock-acp-agent.py")).unwrap();
+
+        assert!(
+            fixture
+                .bridge
+                .materialize_current_runtime(&fixture.session.id)
+                .await
+                .is_err()
+        );
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        let state = AgentSessionRuntimeRepository::get_runtime_state(&conn, &fixture.session.id)
+            .unwrap()
+            .unwrap();
+        let binding = RuntimeBindingRepository::get(&conn, &fixture.source_binding.binding_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.activation_generation, source_generation);
+        assert_eq!(binding.activation_generation, source_generation);
+        assert!(fixture.bridge.prepared_processes.lock().unwrap().is_empty());
+        drop(conn);
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn switch_preparation_process_lease_is_visible_and_cleanup_releases_it() {
+        let Some(fixture) = runtime_switch_fixture("switch-runtime-lease").await else {
+            return;
+        };
+        let lifecycle = Arc::new(
+            RuntimeLifecycleService::new(
+                Arc::new(AcpRuntimeLifecycleBackend::new(fixture.bridge.clone())),
+                vibex_agent::RuntimeLifecycleConfig::default(),
+            )
+            .unwrap(),
+        );
+        fixture
+            .bridge
+            .install_runtime_lifecycle(&lifecycle)
+            .unwrap();
+        let intent = switch_intent(&fixture, RuntimeBindingId::new(), "mock/model-2", "review");
+        fixture
+            .bridge
+            .ensure_process(&intent, &switch_operation("spawn"))
+            .await
+            .unwrap();
+        let process_id = {
+            let processes = fixture.bridge.prepared_processes.lock().unwrap();
+            RuntimeProcessId::from_opaque(
+                processes[&intent.switch_id]
+                    .process_instance_id()
+                    .as_str()
+                    .to_string(),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            lifecycle
+                .process_snapshot(&process_id)
+                .unwrap()
+                .lease_counts
+                .switch_preparation,
+            1
+        );
+        fixture.bridge.cleanup_target(&intent, None).await.unwrap();
+        assert!(fixture.bridge.runtime_leases.lock().unwrap().is_empty());
+        assert!(fixture.bridge.prepared_processes.lock().unwrap().is_empty());
+
+        drop(lifecycle);
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    #[tokio::test]
+    async fn lifecycle_attachment_snapshot_is_bounded_redacted_and_authoritative() {
+        let workspace = tempfile::tempdir().unwrap();
+        let db_path = workspace.path().join("vibex.db");
+        let client = Arc::new(AcpRuntimeClient::new(ProviderConfigService::new(&db_path)));
+        let spawn_snapshot = lifecycle_spawn_snapshot(ProviderProfileId::new());
+        let process_key = lifecycle_process_key(workspace.path(), &spawn_snapshot);
+        let session_id = VibexSessionId::new();
+        let handle = register_lifecycle_attachment(
+            &client,
+            &session_id,
+            acquire_lifecycle_process(&client, &process_key, &spawn_snapshot).await,
+            0,
+        )
+        .await;
+        let process_id = handle.fence().process_instance_id.clone();
+        let native_session_id = handle.fence().native_session_id.clone();
+        let payload = handle.payload();
+        payload.begin_turn(TurnSink::Buffer(Vec::new())).unwrap();
+        payload.append_assistant_text(&"x".repeat(ACP_ACTIVE_MESSAGE_LIMIT + 128));
+        assert_eq!(payload.next_chunk_index(), 0);
+        {
+            let mut state = payload.state.lock().unwrap();
+            for index in 0..(ACP_ACTIVE_TOOL_CALL_LIMIT + 8) {
+                state.tool_calls.insert(
+                    format!("tool-{index:02}"),
+                    ToolCallSnapshot {
+                        title: format!("Tool {index}"),
+                        kind: "test".to_string(),
+                        input_summary: Some("safe input".to_string()),
+                        output_summary: Some("safe output".to_string()),
+                        started: true,
+                        ..ToolCallSnapshot::default()
+                    },
+                );
+            }
+        }
+        for index in 0..(ACP_PENDING_PERMISSION_LIMIT + 8) {
+            let request_id = RequestId::new();
+            assert!(payload.insert_pending_permission(
+                &request_id,
+                PendingPermission {
+                    rpc_id: json!(index),
+                    options: Vec::new(),
+                    risk_category: PermissionRiskCategory::CustomTool,
+                    title: format!("Permission {index}"),
+                    details: Vec::new(),
+                },
+            ));
+        }
+        payload.mark_terminal_active(TerminalId::new());
+        payload.mark_terminal_active(TerminalId::new());
+        let work_key = ClaudeWorkKey {
+            binding_id: handle.binding_id().as_str().to_string(),
+            activation_generation: 0,
+        };
+        {
+            let mut state = payload.state.lock().unwrap();
+            state
+                .claude_background_work
+                .begin(work_key.clone(), "work-1");
+            state.claude_background_work.begin(work_key, "work-2");
+            state.usage = Some(AgentTokenUsage {
+                input_tokens: Some(600),
+                cached_read_tokens: Some(1_400),
+                context_window_used_tokens: Some(12_500),
+                context_window_size_tokens: Some(200_000),
+                ..AgentTokenUsage::default()
+            });
+        }
+
+        let snapshot = payload
+            .runtime_attachment_snapshot(&session_id, RuntimeAttachmentStatus::Ready)
+            .unwrap();
+        let active_message = snapshot.active_message.as_ref().unwrap();
+        assert_eq!(active_message.text.len(), ACP_ACTIVE_MESSAGE_LIMIT);
+        assert_eq!(active_message.next_chunk_index, 1);
+        assert!(active_message.truncated);
+        assert_eq!(snapshot.active_tool_calls.len(), ACP_ACTIVE_TOOL_CALL_LIMIT);
+        assert_eq!(
+            snapshot.pending_permissions.len(),
+            ACP_PENDING_PERMISSION_LIMIT
+        );
+        assert_eq!(snapshot.active_terminal_count, 2);
+        assert_eq!(snapshot.active_background_work_count, 2);
+        let usage = snapshot.usage.as_ref().unwrap();
+        assert_eq!(usage.cached_read_tokens, Some(1_400));
+        assert_eq!(usage.context_window_used_tokens, Some(12_500));
+        assert_eq!(usage.context_window_size_tokens, Some(200_000));
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        assert!(!encoded.contains(&native_session_id));
+
+        client.detach_attachment(handle.fence()).await;
+        client.process_registry.shutdown(&process_id).await.unwrap();
+        client.process_registry.remove(&process_id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn lifecycle_sweep_evicts_oldest_inactive_attachment_before_shared_process() {
+        let workspace = tempfile::tempdir().unwrap();
+        let db_path = workspace.path().join("vibex.db");
+        let client = Arc::new(AcpRuntimeClient::new(ProviderConfigService::new(&db_path)));
+        let manager = Arc::new(AgentManager::new(&db_path).unwrap());
+        let bridge =
+            Arc::new(AcpRuntimeSwitchBridge::new(&db_path, client.clone(), manager).unwrap());
+        let backend = AcpRuntimeLifecycleBackend::new(bridge)
+            .with_limits(
+                Duration::from_secs(24 * 60 * 60),
+                2,
+                Duration::from_secs(24 * 60 * 60),
+                8,
+            )
+            .unwrap();
+        let profile_id = ProviderProfileId::new();
+        let spawn_snapshot = lifecycle_spawn_snapshot(profile_id);
+        let process_key = lifecycle_process_key(workspace.path(), &spawn_snapshot);
+        let session_id = VibexSessionId::new();
+
+        let first = register_lifecycle_attachment(
+            &client,
+            &session_id,
+            acquire_lifecycle_process(&client, &process_key, &spawn_snapshot).await,
+            0,
+        )
+        .await;
+        let second = register_lifecycle_attachment(
+            &client,
+            &session_id,
+            acquire_lifecycle_process(&client, &process_key, &spawn_snapshot).await,
+            1,
+        )
+        .await;
+        let third = register_lifecycle_attachment(
+            &client,
+            &session_id,
+            acquire_lifecycle_process(&client, &process_key, &spawn_snapshot).await,
+            2,
+        )
+        .await;
+        let process_id = third.fence().process_instance_id.clone();
+        let now = unix_timestamp_ms();
+        client
+            .attachment_router
+            .registry
+            .touch(first.fence(), now)
+            .unwrap();
+        client
+            .attachment_router
+            .registry
+            .touch(second.fence(), now + 1)
+            .unwrap();
+        client
+            .attachment_router
+            .registry
+            .touch(third.fence(), now + 2)
+            .unwrap();
+
+        let report = backend.sweep(now + 3, &[]).await.unwrap();
+        assert_eq!(report.attachments_removed, 1);
+        assert_eq!(report.processes_removed, 0);
+        assert!(
+            client
+                .attachment_router
+                .registry
+                .attachment(first.binding_id())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            client
+                .attachment_router
+                .registry
+                .attachment(second.binding_id())
+                .unwrap()
+                .unwrap()
+                .state()
+                .unwrap(),
+            SessionAttachmentState::Inactive
+        );
+        assert_eq!(
+            client
+                .attachment_router
+                .registry
+                .current(&session_id)
+                .unwrap()
+                .unwrap()
+                .binding_id(),
+            third.binding_id()
+        );
+        assert_eq!(
+            client
+                .process_registry
+                .snapshot(&process_id)
+                .unwrap()
+                .attached_session_count,
+            2
+        );
+
+        client.detach_attachment(second.fence()).await;
+        client.detach_attachment(third.fence()).await;
+        client.process_registry.shutdown(&process_id).await.unwrap();
+        client.process_registry.remove(&process_id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn lifecycle_sweep_enforces_global_reusable_process_lru_independently() {
+        let workspace = tempfile::tempdir().unwrap();
+        let db_path = workspace.path().join("vibex.db");
+        let client = Arc::new(AcpRuntimeClient::new(ProviderConfigService::new(&db_path)));
+        let manager = Arc::new(AgentManager::new(&db_path).unwrap());
+        let bridge =
+            Arc::new(AcpRuntimeSwitchBridge::new(&db_path, client.clone(), manager).unwrap());
+        let backend = AcpRuntimeLifecycleBackend::new(bridge)
+            .with_limits(
+                Duration::from_secs(24 * 60 * 60),
+                2,
+                Duration::from_secs(24 * 60 * 60),
+                1,
+            )
+            .unwrap();
+        let first_snapshot = lifecycle_spawn_snapshot(ProviderProfileId::new());
+        let first_key = lifecycle_process_key(workspace.path(), &first_snapshot);
+        let first = acquire_lifecycle_process(&client, &first_key, &first_snapshot).await;
+        let mut second_snapshot = first_snapshot.clone();
+        second_snapshot.command = "mock-second".to_string();
+        second_snapshot = second_snapshot.with_content_revision();
+        let second_key = lifecycle_process_key(workspace.path(), &second_snapshot);
+        let second = acquire_lifecycle_process(&client, &second_key, &second_snapshot).await;
+        let mut third_snapshot = first_snapshot.clone();
+        third_snapshot.command = "mock-third".to_string();
+        third_snapshot = third_snapshot.with_content_revision();
+        let third_key = lifecycle_process_key(workspace.path(), &third_snapshot);
+        let third = acquire_lifecycle_process(&client, &third_key, &third_snapshot).await;
+        let first_id = first.process_instance_id().clone();
+        let second_id = second.process_instance_id().clone();
+        let third_id = third.process_instance_id().clone();
+        let mut stale_third_snapshot = third_snapshot;
+        stale_third_snapshot.command = "mock-third-stale".to_string();
+        stale_third_snapshot = stale_third_snapshot.with_content_revision();
+        client
+            .process_registry
+            .refresh_config_status(&third_id, stale_third_snapshot)
+            .unwrap()
+            .expect("changed third process configuration should become stale");
+        let now = unix_timestamp_ms();
+        client.process_registry.touch(&first_id, now).unwrap();
+        client.process_registry.touch(&second_id, now + 1).unwrap();
+        client.process_registry.touch(&third_id, now + 2).unwrap();
+
+        let report = backend.sweep(now + 2, &[]).await.unwrap();
+        assert_eq!(report.attachments_removed, 0);
+        assert_eq!(report.processes_removed, 2);
+        assert!(client.process_registry.snapshot(&first_id).is_err());
+        assert!(client.process_registry.snapshot(&third_id).is_err());
+        let remaining = client.process_registry.snapshot(&second_id).unwrap();
+        assert_eq!(remaining.status, AcpProcessStatus::Ready);
+        assert_eq!(remaining.attached_session_count, 0);
+
+        client.process_registry.shutdown(&second_id).await.unwrap();
+        client.process_registry.remove(&second_id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn lifecycle_sweep_rechecks_all_active_work_and_drains_stale_process() {
+        let workspace = tempfile::tempdir().unwrap();
+        let db_path = workspace.path().join("vibex.db");
+        let client = Arc::new(AcpRuntimeClient::new(ProviderConfigService::new(&db_path)));
+        let manager = Arc::new(AgentManager::new(&db_path).unwrap());
+        let bridge =
+            Arc::new(AcpRuntimeSwitchBridge::new(&db_path, client.clone(), manager).unwrap());
+        let backend = AcpRuntimeLifecycleBackend::new(bridge)
+            .with_limits(
+                Duration::from_secs(24 * 60 * 60),
+                2,
+                Duration::from_secs(24 * 60 * 60),
+                8,
+            )
+            .unwrap();
+        let spawn_snapshot = lifecycle_spawn_snapshot(ProviderProfileId::new());
+        let process_key = lifecycle_process_key(workspace.path(), &spawn_snapshot);
+        let session_id = VibexSessionId::new();
+        let handle = register_lifecycle_attachment(
+            &client,
+            &session_id,
+            acquire_lifecycle_process(&client, &process_key, &spawn_snapshot).await,
+            0,
+        )
+        .await;
+        let process_id = handle.fence().process_instance_id.clone();
+        let now = unix_timestamp_ms();
+        client
+            .attachment_router
+            .registry
+            .touch(handle.fence(), now)
+            .unwrap();
+        let idle_now = now + Duration::from_secs(24 * 60 * 60).as_millis() as i64 + 1;
+        let payload = handle.payload();
+
+        payload.begin_turn(TurnSink::Buffer(Vec::new())).unwrap();
+        assert_eq!(
+            backend
+                .sweep(idle_now, &[])
+                .await
+                .unwrap()
+                .attachments_removed,
+            0
+        );
+        payload.finish_turn(false).unwrap();
+
+        let permission_id = RequestId::new();
+        assert!(payload.insert_pending_permission(
+            &permission_id,
+            PendingPermission {
+                rpc_id: json!(1),
+                options: Vec::new(),
+                risk_category: PermissionRiskCategory::CustomTool,
+                title: "test permission".to_string(),
+                details: Vec::new(),
+            },
+        ));
+        assert_eq!(
+            backend
+                .sweep(idle_now, &[])
+                .await
+                .unwrap()
+                .attachments_removed,
+            0
+        );
+        payload
+            .remove_pending_permission(permission_id.as_str())
+            .unwrap();
+
+        let terminal_request_id = RequestId::new();
+        assert!(payload.insert_pending_terminal_create(
+            &terminal_request_id,
+            PendingTerminalCreate {
+                rpc_id: json!(2),
+                request: AcpTerminalCreateRequest {
+                    session_id: None,
+                    command: "test".to_string(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: Vec::new(),
+                    title: None,
+                },
+            },
+        ));
+        assert_eq!(
+            backend
+                .sweep(idle_now, &[])
+                .await
+                .unwrap()
+                .attachments_removed,
+            0
+        );
+        let _claimed_terminal = payload
+            .claim_pending_terminal_create(terminal_request_id.as_str())
+            .unwrap();
+        let terminal_create_guard = TerminalCreateWorkGuard {
+            attachment: payload.clone(),
+        };
+        assert_eq!(payload.pending_host_callback_count(), 1);
+        assert_eq!(
+            backend
+                .sweep(idle_now, &[])
+                .await
+                .unwrap()
+                .attachments_removed,
+            0
+        );
+        drop(terminal_create_guard);
+        assert_eq!(payload.pending_host_callback_count(), 0);
+
+        let terminal_id = TerminalId::new();
+        payload.mark_terminal_active(terminal_id.clone());
+        assert_eq!(
+            backend
+                .sweep(idle_now, &[])
+                .await
+                .unwrap()
+                .attachments_removed,
+            0
+        );
+        payload.mark_terminal_inactive(&terminal_id);
+
+        let work_key = ClaudeWorkKey {
+            binding_id: handle.binding_id().as_str().to_string(),
+            activation_generation: handle.fence().activation_generation as i64,
+        };
+        payload
+            .state
+            .lock()
+            .unwrap()
+            .claude_background_work
+            .begin(work_key.clone(), "work-1");
+        assert_eq!(
+            backend
+                .sweep(idle_now, &[])
+                .await
+                .unwrap()
+                .attachments_removed,
+            0
+        );
+        payload
+            .state
+            .lock()
+            .unwrap()
+            .claude_background_work
+            .finish(&work_key, "work-1");
+
+        let recent = idle_now + 1;
+        client
+            .attachment_router
+            .registry
+            .touch(handle.fence(), recent)
+            .unwrap();
+        let mut stale_snapshot = spawn_snapshot;
+        stale_snapshot.command = "mock-stale".to_string();
+        stale_snapshot = stale_snapshot.with_content_revision();
+        client
+            .process_registry
+            .refresh_config_status(&process_id, stale_snapshot)
+            .unwrap()
+            .expect("changed process configuration should become stale");
+
+        let report = backend.sweep(recent + 1, &[]).await.unwrap();
+        assert_eq!(report.attachments_removed, 1);
+        assert_eq!(report.processes_removed, 1);
+        assert!(
+            client
+                .attachment_router
+                .registry
+                .attachment(handle.binding_id())
+                .unwrap()
+                .is_none()
+        );
+        assert!(client.process_registry.snapshot(&process_id).is_err());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_sweep_honors_process_lease_and_lease_touch() {
+        let workspace = tempfile::tempdir().unwrap();
+        let db_path = workspace.path().join("vibex.db");
+        let client = Arc::new(AcpRuntimeClient::new(ProviderConfigService::new(&db_path)));
+        let manager = Arc::new(AgentManager::new(&db_path).unwrap());
+        let bridge =
+            Arc::new(AcpRuntimeSwitchBridge::new(&db_path, client.clone(), manager).unwrap());
+        let backend = AcpRuntimeLifecycleBackend::new(bridge)
+            .with_limits(
+                Duration::from_millis(10),
+                2,
+                Duration::from_secs(24 * 60 * 60),
+                8,
+            )
+            .unwrap();
+        let spawn_snapshot = lifecycle_spawn_snapshot(ProviderProfileId::new());
+        let process_key = lifecycle_process_key(workspace.path(), &spawn_snapshot);
+        let session_id = VibexSessionId::new();
+        let handle = register_lifecycle_attachment(
+            &client,
+            &session_id,
+            acquire_lifecycle_process(&client, &process_key, &spawn_snapshot).await,
+            0,
+        )
+        .await;
+        let process_id =
+            RuntimeProcessId::from_opaque(handle.fence().process_instance_id.as_str().to_string())
+                .unwrap();
+        let target = RuntimeLeaseTarget::Attachment {
+            binding_id: handle.binding_id().clone(),
+            activation_generation: handle.fence().activation_generation as i64,
+            process_id: process_id.clone(),
+        };
+        let now = unix_timestamp_ms();
+        client
+            .attachment_router
+            .registry
+            .touch(handle.fence(), now)
+            .unwrap();
+
+        let protected = backend
+            .sweep(now + 20, &[RuntimeLeaseTarget::Process(process_id.clone())])
+            .await
+            .unwrap();
+        assert_eq!(protected.attachments_removed, 0);
+        backend.touch(&target, now + 20).unwrap();
+        assert_eq!(
+            backend
+                .sweep(now + 29, &[])
+                .await
+                .unwrap()
+                .attachments_removed,
+            0
+        );
+        let report = backend.sweep(now + 30, &[]).await.unwrap();
+        assert_eq!(report.attachments_removed, 1);
+        assert_eq!(report.processes_removed, 0);
+
+        let internal_process_id = handle.fence().process_instance_id.clone();
+        client
+            .process_registry
+            .shutdown(&internal_process_id)
+            .await
+            .unwrap();
+        client
+            .process_registry
+            .remove(&internal_process_id)
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovered_restore_attachment_inherits_source_context_bridge_cursors() {
+        let Some(fixture) = runtime_switch_fixture("switch-restore-recovery-cursors").await else {
+            return;
+        };
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        conn.execute(
+            "UPDATE session_runtime_bindings
+             SET last_context_sequence = 7,
+                 last_summary_sequence = 3,
+                 context_bridge_version = 2
+             WHERE binding_id = ?1",
+            [fixture.source_binding.binding_id.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let intent = switch_intent(
+            &fixture,
+            RuntimeBindingId::new(),
+            &fixture.selection.model_id,
+            fixture.selection.mode_id.as_deref().unwrap_or("build"),
+        );
+        let operation = SwitchOperationRecord {
+            operation_id: vibex_core::RuntimeSwitchOperationId::new(),
+            switch_id: intent.switch_id.clone(),
+            sequence: 0,
+            operation_kind: OP_RESTORE_SESSION.to_string(),
+            request_fingerprint: "restore-recovery-cursor-test".to_string(),
+            adapter_idempotency_token: None,
+            retry_semantics: vibex_core::RetrySemantics::ReconcileBeforeRetry,
+            status: vibex_core::SwitchOperationStatus::Succeeded,
+            native_result_reference: fixture.source_binding.native_session_id.clone(),
+        };
+        let recovered = fixture
+            .bridge
+            .recover_attachment(&intent, &operation)
+            .await
+            .unwrap();
+        assert_eq!(recovered.binding.last_context_sequence, 7);
+        assert_eq!(recovered.binding.last_summary_sequence, 3);
+        assert_eq!(recovered.binding.context_bridge_version, 2);
+
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runtime_switch_bridge_live_mutation_uses_current_fence_and_persists_config() {
+        let Some(fixture) = runtime_switch_fixture("switch-live").await else {
+            return;
+        };
+        let intent = switch_intent(
+            &fixture,
+            fixture.source_binding.binding_id.clone(),
+            "mock/model-2",
+            "review",
+        );
+        let assessment = fixture.bridge.assess_target(&intent).await.unwrap();
+        assert!(assessment.same_route);
+        assert!(!assessment.process_config_changed);
+        assert!(assessment.live_ops_supported);
+        let prepared = fixture
+            .bridge
+            .acquire_prepared(&intent, &fixture.source_binding)
+            .await
+            .unwrap();
+        fixture
+            .bridge
+            .apply_live_mutation(&intent, &prepared, &switch_operation("live"))
+            .await
+            .unwrap();
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        let durable = RuntimeBindingRepository::get(&conn, &fixture.source_binding.binding_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            durable
+                .session_runtime_config_state
+                .effective_model
+                .as_deref(),
+            Some("mock/model-2")
+        );
+        assert_eq!(
+            durable
+                .session_runtime_config_state
+                .effective_mode
+                .as_deref(),
+            Some("review")
+        );
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn startup_reconcile_refences_committed_live_mutation_once() {
+        use vibex_agent::RuntimeSwitchCoordinator;
+        use vibex_core::RuntimeSwitchStatus;
+        use vibex_db::{
+            RuntimeSwitchCommitRequest, RuntimeSwitchRepository, RuntimeSwitchReserveRequest,
+        };
+
+        let Some(fixture) = runtime_switch_fixture("switch-live-reconcile-fence").await else {
+            return;
+        };
+        let original = fixture
+            .client
+            .current_attachment(&fixture.session.id)
+            .unwrap();
+        let original_fence = original.fence().clone();
+        let intent = switch_intent(
+            &fixture,
+            fixture.source_binding.binding_id.clone(),
+            "mock/model-2",
+            "review",
+        );
+        let prepared = fixture
+            .bridge
+            .acquire_prepared(&intent, &fixture.source_binding)
+            .await
+            .unwrap();
+        fixture
+            .bridge
+            .apply_live_mutation(&intent, &prepared, &switch_operation("live"))
+            .await
+            .unwrap();
+
+        let durable_config = RuntimeSwitchCoordinator::encode_requested_config(
+            &intent.target_selection,
+            intent.requested_session_config.clone(),
+        )
+        .unwrap();
+        let mut conn = open_database(&fixture.fixture.db_path).unwrap();
+        RuntimeSwitchRepository::reserve(
+            &mut conn,
+            intent.switch_id.clone(),
+            &RuntimeSwitchReserveRequest {
+                session_id: intent.session_id.clone(),
+                idempotency_key: "switch-live-reconcile-fence".to_string(),
+                expected_revision: intent.source_revision,
+                expected_current_binding_id: intent.source_binding_id.clone(),
+                desired_selection_revision: intent.desired_selection_revision,
+                target_binding_id: intent.target_binding_id.clone(),
+                target_agent_id: intent.target_selection.agent_id.clone(),
+                target_adapter_id: intent.target_adapter_id.clone(),
+                target_profile_id: intent.target_selection.provider_profile_id.clone(),
+                requested_policy: Some(
+                    serde_json::to_value(RuntimeSwitchPolicy::PreferLiveMutation).unwrap(),
+                ),
+                active_work_policy: Some(serde_json::to_value(intent.active_work_policy).unwrap()),
+                requested_session_config: Some(durable_config),
+            },
+        )
+        .unwrap();
+        RuntimeSwitchRepository::advance_status(
+            &conn,
+            &intent.switch_id,
+            RuntimeSwitchStatus::Reserved,
+            RuntimeSwitchStatus::Preparing,
+        )
+        .unwrap();
+        RuntimeSwitchRepository::advance_status(
+            &conn,
+            &intent.switch_id,
+            RuntimeSwitchStatus::Preparing,
+            RuntimeSwitchStatus::Prepared,
+        )
+        .unwrap();
+        RuntimeSwitchRepository::advance_status(
+            &conn,
+            &intent.switch_id,
+            RuntimeSwitchStatus::Prepared,
+            RuntimeSwitchStatus::Committing,
+        )
+        .unwrap();
+        RuntimeSwitchRepository::commit(
+            &mut conn,
+            &RuntimeSwitchCommitRequest {
+                switch_id: intent.switch_id.clone(),
+                session_id: intent.session_id.clone(),
+                source_revision: intent.source_revision,
+                desired_selection_revision: intent.desired_selection_revision,
+                source_binding_id: intent.source_binding_id.clone(),
+                target_binding_id: fixture.source_binding.binding_id.clone(),
+                target_agent_id: intent.target_selection.agent_id.clone(),
+                effective_selection: intent.target_selection.clone(),
+            },
+        )
+        .unwrap();
+        let state = AgentSessionRuntimeRepository::get_runtime_state(&conn, &fixture.session.id)
+            .unwrap()
+            .unwrap();
+        let durable = RuntimeBindingRepository::get(&conn, &fixture.source_binding.binding_id)
+            .unwrap()
+            .unwrap();
+        drop(conn);
+        assert_eq!(
+            state.activation_generation,
+            fixture.source_binding.activation_generation + 1
+        );
+        assert_eq!(durable.activation_generation, state.activation_generation);
+        assert_eq!(
+            original.fence().activation_generation,
+            original_fence.activation_generation
+        );
+
+        let first = fixture
+            .runtime_selection
+            .reconcile_on_startup()
+            .await
+            .unwrap();
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        assert!(first.outcomes.iter().any(|outcome| {
+            outcome.switch_id == intent.switch_id
+                && outcome.status == RuntimeSwitchStatus::Committed
+        }));
+        let activated = fixture
+            .client
+            .current_attachment(&fixture.session.id)
+            .unwrap();
+        let activated_fence = activated.fence().clone();
+        assert_eq!(
+            activated_fence.activation_generation,
+            u64::try_from(state.activation_generation).unwrap()
+        );
+        assert_eq!(
+            activated.payload().activation_generation(),
+            state.activation_generation
+        );
+        assert!(
+            activated
+                .payload()
+                .runtime_config_state()
+                .is_applied_to_generation(state.activation_generation)
+        );
+        assert!(matches!(
+            fixture
+                .client
+                .attachment_router
+                .registry
+                .route_fenced(&original_fence, Some("session/update")),
+            SessionAttachmentRoute::Diagnostic(_)
+        ));
+
+        let second = fixture
+            .runtime_selection
+            .reconcile_on_startup()
+            .await
+            .unwrap();
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert_eq!(
+            fixture
+                .client
+                .current_attachment(&fixture.session.id)
+                .unwrap()
+                .fence(),
+            &activated_fence
+        );
+
+        drop(fixture.message_submission);
+        drop(fixture.runtime_selection);
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runtime_switch_bridge_reacquire_persists_rebuilt_config_before_requested_cas() {
+        let Some(mut fixture) = runtime_switch_fixture("switch-reacquire-config-cas").await else {
+            return;
+        };
+        let original_state = fixture.source_binding.session_runtime_config_state.clone();
+        let mut replay_state = original_state.clone();
+        replay_state.preferred_model = Some("mock/model-2".to_string());
+        replay_state.preferred_mode = Some("review".to_string());
+        replay_state.applied_activation_generation = None;
+        replay_state.state_revision += 1;
+        {
+            let conn = open_database(&fixture.fixture.db_path).unwrap();
+            RuntimeBindingRepository::compare_and_set_session_runtime_config_state(
+                &conn,
+                &fixture.source_binding.binding_id,
+                &original_state,
+                fixture.source_binding.activation_generation,
+                &replay_state,
+            )
+            .unwrap();
+        }
+        fixture.source_binding.session_runtime_config_state = replay_state;
+        let current = fixture
+            .client
+            .current_attachment(&fixture.session.id)
+            .unwrap();
+        fixture.client.detach_attachment(current.fence()).await;
+
+        let intent = switch_intent(
+            &fixture,
+            fixture.source_binding.binding_id.clone(),
+            "mock/model-2",
+            "review",
+        );
+        let prepared = fixture
+            .bridge
+            .acquire_prepared(&intent, &fixture.source_binding)
+            .await
+            .unwrap();
+        fixture
+            .bridge
+            .apply_session_config(&intent, &prepared, &switch_operation("config"))
+            .await
+            .unwrap();
+
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        let durable = RuntimeBindingRepository::get(&conn, &fixture.source_binding.binding_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            durable
+                .session_runtime_config_state
+                .effective_model
+                .as_deref(),
+            Some("mock/model-2")
+        );
+        assert_eq!(
+            durable
+                .session_runtime_config_state
+                .effective_mode
+                .as_deref(),
+            Some("review")
+        );
+        assert!(durable.session_runtime_config_state.is_converged());
+        drop(conn);
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runtime_switch_bridge_keeps_fresh_target_quarantined_until_activation() {
+        let Some(fixture) = runtime_switch_fixture("switch-prepared").await else {
+            return;
+        };
+        let target_binding_id = RuntimeBindingId::new();
+        let intent = switch_intent(
+            &fixture,
+            target_binding_id.clone(),
+            "mock/model-2",
+            "review",
+        );
+        let process = fixture
+            .bridge
+            .ensure_process(&intent, &switch_operation("spawn"))
+            .await
+            .unwrap();
+        let prepared = fixture
+            .bridge
+            .restore_or_create_session(
+                &intent,
+                &process,
+                RuntimeSwitchStrategy::RestartFreshAndBridge,
+                &switch_operation("create"),
+            )
+            .await
+            .unwrap();
+        let prepared_handle = fixture
+            .client
+            .attachment_router
+            .registry
+            .attachment(&target_binding_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            prepared_handle.state().unwrap(),
+            SessionAttachmentState::Prepared
+        );
+        assert!(matches!(
+            fixture
+                .client
+                .attachment_router
+                .registry
+                .route_fenced(prepared_handle.fence(), Some("session/update")),
+            SessionAttachmentRoute::Quarantine(_)
+        ));
+        assert_eq!(
+            fixture
+                .client
+                .current_attachment(&fixture.session.id)
+                .unwrap()
+                .binding_id(),
+            &fixture.source_binding.binding_id
+        );
+
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        RuntimeBindingRepository::insert(&conn, &prepared.binding).unwrap();
+        fixture
+            .bridge
+            .apply_session_config(&intent, &prepared, &switch_operation("config"))
+            .await
+            .unwrap();
+        fixture
+            .bridge
+            .revalidate_prepared(&intent, &prepared)
+            .await
+            .unwrap();
+        fixture
+            .bridge
+            .activate(&intent, &prepared, prepared.binding.activation_generation)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .client
+                .current_attachment(&fixture.session.id)
+                .unwrap()
+                .binding_id(),
+            &target_binding_id
+        );
+        fixture
+            .bridge
+            .cleanup_source_after_commit(&intent)
+            .await
+            .unwrap();
+        let warm_source = fixture
+            .client
+            .attachment_router
+            .registry
+            .attachment(&fixture.source_binding.binding_id)
+            .unwrap()
+            .expect("committed source should remain as a warm attachment");
+        assert_eq!(
+            warm_source.state().unwrap(),
+            SessionAttachmentState::Inactive
+        );
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn continue_turn_uses_exact_current_fence_without_submission_identity() {
+        use vibex_core::{ContinueAgentTurnRequest, FetchTimelineRequest, TimelinePayload};
+
+        let Some(fixture) = runtime_switch_fixture("continue-current-fence").await else {
+            return;
+        };
+        let initial_attachment = fixture
+            .client
+            .current_attachment(&fixture.session.id)
+            .expect("initial ACP attachment must be current");
+        let initial_binding_id = initial_attachment.binding_id().clone();
+        let initial_generation = initial_attachment.fence().activation_generation;
+        let initial_native_session_id = initial_attachment.fence().native_session_id.clone();
+        drop(initial_attachment);
+
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        SessionRepository::update_state(&conn, &fixture.session.id, AgentSessionState::Error)
+            .unwrap();
+        drop(conn);
+
+        let prompt_count = logged_request_count(&fixture.fixture.request_log(), "session/prompt");
+        let items = fixture
+            .manager
+            .continue_turn(ContinueAgentTurnRequest {
+                session_id: fixture.session.id.clone(),
+                correlation_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            items
+                .iter()
+                .all(|item| !matches!(&item.payload, TimelinePayload::UserMessage(_)))
+        );
+        assert_eq!(
+            fixture
+                .manager
+                .get_session(&fixture.session.id)
+                .await
+                .unwrap()
+                .state,
+            AgentSessionState::Idle
+        );
+        let timeline = fixture
+            .manager
+            .fetch_timeline(FetchTimelineRequest {
+                session_id: fixture.session.id.clone(),
+                after_sequence: Some(0),
+                limit: 200,
+            })
+            .await
+            .unwrap();
+        assert!(
+            timeline
+                .items
+                .iter()
+                .all(|item| !matches!(&item.payload, TimelinePayload::UserMessage(_)))
+        );
+
+        let log = fixture.fixture.request_log();
+        assert_eq!(
+            logged_request_count(&log, "session/prompt"),
+            prompt_count + 1
+        );
+        let prompt = log
+            .iter()
+            .rev()
+            .find(|entry| entry["method"] == "session/prompt")
+            .expect("continuation prompt request");
+        assert_eq!(
+            prompt["params"]["sessionId"].as_str(),
+            Some(initial_native_session_id.as_str())
+        );
+        assert!(
+            prompt["params"]["prompt"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Continue from where you stopped."))
+        );
+        let current_attachment = fixture
+            .client
+            .current_attachment(&fixture.session.id)
+            .expect("continuation must retain the current attachment");
+        assert_eq!(current_attachment.binding_id(), &initial_binding_id);
+        assert_eq!(
+            current_attachment.fence().activation_generation,
+            initial_generation
+        );
+
+        let current_fence = current_attachment.fence().clone();
+        drop(current_attachment);
+        fixture.client.detach_attachment(&current_fence).await;
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        SessionRepository::update_state(&conn, &fixture.session.id, AgentSessionState::Error)
+            .unwrap();
+        drop(conn);
+        let prompt_count = logged_request_count(&fixture.fixture.request_log(), "session/prompt");
+
+        let error = fixture
+            .manager
+            .continue_turn(ContinueAgentTurnRequest {
+                session_id: fixture.session.id.clone(),
+                correlation_id: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "turn_execution_identity_mismatch");
+        assert_eq!(
+            logged_request_count(&fixture.fixture.request_log(), "session/prompt"),
+            prompt_count
+        );
+        assert_eq!(
+            fixture
+                .manager
+                .get_session(&fixture.session.id)
+                .await
+                .unwrap()
+                .state,
+            AgentSessionState::Error
+        );
+
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn durable_message_after_force_fresh_switch_prompts_only_current_target_attachment() {
+        use vibex_agent::{
+            MessageDispatchExecutor, RuntimeSwitchCoordinator, RuntimeSwitchCoordinatorConfig,
+            RuntimeSwitchRequest,
+        };
+        use vibex_core::{
+            MessageSubmissionId, RuntimeSwitchPolicy, RuntimeSwitchStatus, SendAgentMessageRequest,
+            TimelinePayload,
+        };
+        use vibex_db::{ContextBridgeRepository, RuntimeSwitchEventRepository};
+
+        let Some(fixture) = runtime_switch_fixture("durable-send-current-target").await else {
+            return;
+        };
+        let source_fence = fixture
+            .client
+            .current_attachment(&fixture.session.id)
+            .expect("initial ACP attachment must be current")
+            .fence()
+            .clone();
+        MessageDispatchExecutor::dispatch_message(
+            fixture.manager.as_ref(),
+            MessageSubmissionId::new(),
+            SendAgentMessageRequest {
+                session_id: fixture.session.id.clone(),
+                message_idempotency_key: "durable-source-history".to_string(),
+                desired_runtime: fixture.selection.clone(),
+                text: "remember source history".to_string(),
+                attachments: Vec::new(),
+                reasoning_effort: fixture.selection.reasoning_effort.clone(),
+                correlation_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let target_selection = fixture.selection.clone();
+        let switch_coordinator = RuntimeSwitchCoordinator::new(
+            &fixture.fixture.db_path,
+            fixture.bridge.clone(),
+            fixture.bridge.clone(),
+            RuntimeSwitchCoordinatorConfig::default(),
+        )
+        .unwrap();
+        let requested_config = serde_json::to_value(SessionRuntimeConfigPatch {
+            model_id: Some(target_selection.model_id.clone()),
+            reasoning_effort: target_selection.reasoning_effort.clone(),
+            mode_id: target_selection.mode_id.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+        let switched = switch_coordinator
+            .request_switch(RuntimeSwitchRequest {
+                session_id: fixture.session.id.clone(),
+                idempotency_key: "force-fresh-before-durable-send".to_string(),
+                expected_revision: fixture.source_revision,
+                expected_current_binding_id: Some(fixture.source_binding.binding_id.clone()),
+                desired_selection_revision: fixture.source_selection_revision,
+                target_adapter_id: fixture.source_binding.adapter_id.clone(),
+                target_selection: target_selection.clone(),
+                requested_policy: RuntimeSwitchPolicy::ForceFreshSession,
+                active_work_policy: Default::default(),
+                requested_session_config: Some(requested_config),
+            })
+            .await
+            .unwrap();
+        assert_eq!(switched.status, RuntimeSwitchStatus::Committed);
+        let target_binding_id = AgentSessionRuntimeRepository::get_runtime_state(
+            &open_database(&fixture.fixture.db_path).unwrap(),
+            &fixture.session.id,
+        )
+        .unwrap()
+        .unwrap()
+        .current_binding_id
+        .expect("force-fresh switch must commit a target binding");
+        assert_ne!(target_binding_id, fixture.source_binding.binding_id);
+        let target_attachment = fixture
+            .client
+            .current_attachment(&fixture.session.id)
+            .expect("force-fresh target attachment must be current");
+        assert_eq!(target_attachment.binding_id(), &target_binding_id);
+        let target_native_session_id = target_attachment.fence().native_session_id.clone();
+        assert_ne!(
+            target_attachment.fence().process_instance_id,
+            source_fence.process_instance_id
+        );
+        let pending_bridge = ContextBridgeRepository::get_pending_for_binding(
+            &open_database(&fixture.fixture.db_path).unwrap(),
+            &target_binding_id,
+        )
+        .unwrap()
+        .expect("force-fresh target must have a pending context bridge");
+
+        let prompt_count = logged_request_count(&fixture.fixture.request_log(), "session/prompt");
+        let items = MessageDispatchExecutor::dispatch_message(
+            fixture.manager.as_ref(),
+            MessageSubmissionId::new(),
+            SendAgentMessageRequest {
+                session_id: fixture.session.id.clone(),
+                message_idempotency_key: "durable-send-after-force-fresh".to_string(),
+                desired_runtime: target_selection.clone(),
+                text: "dispatch to the committed target".to_string(),
+                attachments: Vec::new(),
+                reasoning_effort: target_selection.reasoning_effort.clone(),
+                correlation_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!items.is_empty());
+        let log = fixture.fixture.request_log();
+        assert_eq!(
+            logged_request_count(&log, "session/prompt"),
+            prompt_count + 1
+        );
+        let prompt = log
+            .iter()
+            .rev()
+            .find(|entry| entry["method"] == "session/prompt")
+            .cloned()
+            .expect("latest session/prompt request");
+        assert_eq!(
+            prompt["params"]["sessionId"].as_str(),
+            Some(target_native_session_id.as_str())
+        );
+        let provider_text = prompt["params"]["prompt"][0]["text"]
+            .as_str()
+            .expect("prompt text");
+        assert!(provider_text.contains("VIBEX_CONTEXT_BRIDGE_BEGIN"));
+        assert!(provider_text.contains("remember source history"));
+        assert!(provider_text.contains("VIBEX_CURRENT_USER_MESSAGE_BEGIN"));
+        assert!(provider_text.contains("dispatch to the committed target"));
+        let persisted_user_messages = items
+            .iter()
+            .filter_map(|item| match &item.payload {
+                TimelinePayload::UserMessage(payload) => Some(payload.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            persisted_user_messages,
+            vec!["dispatch to the committed target"]
+        );
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        assert!(
+            ContextBridgeRepository::get_pending_for_binding(&conn, &target_binding_id)
+                .unwrap()
+                .is_none()
+        );
+        let applied = ContextBridgeRepository::get_by_switch(&conn, &switched.switch_id)
+            .unwrap()
+            .unwrap();
+        assert!(applied.applied_at_ms.is_some());
+        assert_eq!(
+            applied.applied_context_sequence,
+            items.iter().map(|item| item.sequence).max()
+        );
+        assert_eq!(applied.prepare_sequence, pending_bridge.prepare_sequence);
+        let target_binding = RuntimeBindingRepository::get(&conn, &target_binding_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            target_binding.last_context_sequence,
+            items.iter().map(|item| item.sequence).max().unwrap()
+        );
+        assert_eq!(target_binding.context_bridge_version, 1);
+        assert!(
+            RuntimeSwitchEventRepository::list_by_switch(&conn, &switched.switch_id)
+                .unwrap()
+                .iter()
+                .any(|event| {
+                    event.kind == vibex_core::RuntimeSwitchEventKind::ContextBridgeApplied
+                        && event.visibility == vibex_core::RuntimeSwitchEventVisibility::Audit
+                })
+        );
+        assert_eq!(
+            fixture
+                .client
+                .current_attachment(&fixture.session.id)
+                .unwrap()
+                .binding_id(),
+            &target_binding_id
+        );
+
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_observer_spans_durable_switch_queue_prompt_and_acquires() {
+        use vibex_agent::MessageDispatchExecutor;
+        use vibex_core::{MessageSubmissionId, SendAgentMessageRequest};
+
+        let Some(fixture) = runtime_switch_fixture("shared-observer").await else {
+            return;
+        };
+        let mut desired = fixture.selection.clone();
+        desired.model_id = "mock/model-2".to_string();
+        desired.mode_id = Some("review".to_string());
+        let request = SendAgentMessageRequest {
+            session_id: fixture.session.id.clone(),
+            message_idempotency_key: "shared-observer-message".to_string(),
+            desired_runtime: desired,
+            text: "observe one durable prompt".to_string(),
+            attachments: Vec::new(),
+            reasoning_effort: None,
+            correlation_id: None,
+        };
+
+        let prompt_count = logged_request_count(&fixture.fixture.request_log(), "session/prompt");
+        let first = match fixture.manager.send_message(request.clone()).await {
+            Ok(items) => items,
+            Err(submission_error) => {
+                let direct = MessageDispatchExecutor::dispatch_message(
+                    fixture.manager.as_ref(),
+                    MessageSubmissionId::new(),
+                    request.clone(),
+                )
+                .await;
+                panic!("submission failed: {submission_error:?}; direct dispatch: {direct:?}");
+            }
+        };
+        let second = fixture.manager.send_message(request).await.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            logged_request_count(&fixture.fixture.request_log(), "session/prompt"),
+            prompt_count + 1
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if runtime_metric_count(
+                    &fixture.observability,
+                    RuntimeMetricName::DesiredToEffectiveDuration,
+                    None,
+                    RuntimeMetricResult::Committed,
+                ) == 1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("desired-to-effective observation must reach the shared collector");
+
+        assert!(
+            runtime_metric_count(
+                &fixture.observability,
+                RuntimeMetricName::SwitchPhaseDuration,
+                Some(RuntimeMetricOperation::Prepare),
+                RuntimeMetricResult::Success,
+            ) >= 2
+        );
+        assert!(
+            runtime_metric_count(
+                &fixture.observability,
+                RuntimeMetricName::SwitchPhaseDuration,
+                Some(RuntimeMetricOperation::Commit),
+                RuntimeMetricResult::Committed,
+            ) >= 2
+        );
+        assert_eq!(
+            runtime_metric_count(
+                &fixture.observability,
+                RuntimeMetricName::QueuedMessageWait,
+                None,
+                RuntimeMetricResult::Success,
+            ),
+            1
+        );
+        assert_eq!(
+            runtime_metric_count(
+                &fixture.observability,
+                RuntimeMetricName::PromptLatency,
+                None,
+                RuntimeMetricResult::Success,
+            ),
+            1
+        );
+        assert_eq!(
+            runtime_metric_count(
+                &fixture.observability,
+                RuntimeMetricName::DuplicateSubmissionPrevented,
+                None,
+                RuntimeMetricResult::Prevented,
+            ),
+            1
+        );
+        assert!(
+            runtime_metric_count(
+                &fixture.observability,
+                RuntimeMetricName::Acquire,
+                Some(RuntimeMetricOperation::Process),
+                RuntimeMetricResult::Created,
+            ) >= 1
+        );
+        assert!(
+            runtime_metric_count(
+                &fixture.observability,
+                RuntimeMetricName::Acquire,
+                Some(RuntimeMetricOperation::Attachment),
+                RuntimeMetricResult::Created,
+            ) >= 1
+        );
+
+        drop(fixture.message_submission);
+        drop(fixture.runtime_selection);
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn switching_back_restores_historical_native_session_and_bridges_only_missing_window() {
+        use vibex_agent::{
+            MessageDispatchExecutor, RuntimeSwitchCoordinator, RuntimeSwitchCoordinatorConfig,
+            RuntimeSwitchRequest,
+        };
+        use vibex_core::{
+            AcpProviderProfileCreateRequest, MessageSubmissionId, RuntimeSwitchPolicy,
+            RuntimeSwitchStatus, SendAgentMessageRequest, SessionRuntimeSelectionStatus,
+        };
+        use vibex_db::ContextBridgeRepository;
+
+        let Some(fixture) = runtime_switch_fixture("historical-context-resume").await else {
+            return;
+        };
+        let service = fixture.fixture.service();
+        let profile_b = service
+            .create_acp_profile(AcpProviderProfileCreateRequest {
+                agent_id: Some(vibex_core::AgentId::parse(OPENCODE_AGENT_ID).unwrap()),
+                display_name: "Mock ACP B".to_string(),
+                account_alias: None,
+                preset_id: None,
+                config: Some(
+                    service
+                        .get_acp_profile_config(fixture.fixture.profile_id.clone())
+                        .unwrap(),
+                ),
+            })
+            .unwrap();
+        let mut selection_b = fixture.selection.clone();
+        selection_b.provider_profile_id = profile_b.id.clone();
+        let coordinator = RuntimeSwitchCoordinator::new(
+            &fixture.fixture.db_path,
+            fixture.bridge.clone(),
+            fixture.bridge.clone(),
+            RuntimeSwitchCoordinatorConfig::default(),
+        )
+        .unwrap();
+
+        MessageDispatchExecutor::dispatch_message(
+            fixture.manager.as_ref(),
+            MessageSubmissionId::new(),
+            SendAgentMessageRequest {
+                session_id: fixture.session.id.clone(),
+                message_idempotency_key: "historical-a-turn".to_string(),
+                desired_runtime: fixture.selection.clone(),
+                text: "context produced while A is current".to_string(),
+                attachments: Vec::new(),
+                reasoning_effort: fixture.selection.reasoning_effort.clone(),
+                correlation_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let binding_a = RuntimeBindingRepository::get(
+            &open_database(&fixture.fixture.db_path).unwrap(),
+            &fixture.source_binding.binding_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(binding_a.last_context_sequence > 0);
+        let native_a = binding_a.native_session_id.clone().unwrap();
+
+        let selection_revision_b = AgentSessionRuntimeRepository::set_desired_selection(
+            &open_database(&fixture.fixture.db_path).unwrap(),
+            &fixture.session.id,
+            fixture.source_selection_revision,
+            &selection_b,
+            SessionRuntimeSelectionStatus::Preparing,
+        )
+        .unwrap();
+        let switch_b = coordinator
+            .request_switch(RuntimeSwitchRequest {
+                session_id: fixture.session.id.clone(),
+                idempotency_key: "historical-a-to-b".to_string(),
+                expected_revision: fixture.source_revision,
+                expected_current_binding_id: Some(binding_a.binding_id.clone()),
+                desired_selection_revision: selection_revision_b,
+                target_adapter_id: binding_a.adapter_id.clone(),
+                target_selection: selection_b.clone(),
+                requested_policy: RuntimeSwitchPolicy::ForceFreshSession,
+                active_work_policy: Default::default(),
+                requested_session_config: Some(
+                    serde_json::to_value(SessionRuntimeConfigPatch {
+                        model_id: Some(selection_b.model_id.clone()),
+                        reasoning_effort: selection_b.reasoning_effort.clone(),
+                        mode_id: selection_b.mode_id.clone(),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                ),
+            })
+            .await
+            .unwrap();
+        assert_eq!(switch_b.status, RuntimeSwitchStatus::Committed);
+        let state_b = AgentSessionRuntimeRepository::get_runtime_state(
+            &open_database(&fixture.fixture.db_path).unwrap(),
+            &fixture.session.id,
+        )
+        .unwrap()
+        .unwrap();
+        let binding_b_id = state_b.current_binding_id.clone().unwrap();
+        assert_ne!(binding_b_id, binding_a.binding_id);
+
+        MessageDispatchExecutor::dispatch_message(
+            fixture.manager.as_ref(),
+            MessageSubmissionId::new(),
+            SendAgentMessageRequest {
+                session_id: fixture.session.id.clone(),
+                message_idempotency_key: "historical-b-turn".to_string(),
+                desired_runtime: selection_b.clone(),
+                text: "delta produced while B is current".to_string(),
+                attachments: Vec::new(),
+                reasoning_effort: selection_b.reasoning_effort.clone(),
+                correlation_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let selection_revision_a = AgentSessionRuntimeRepository::set_desired_selection(
+            &open_database(&fixture.fixture.db_path).unwrap(),
+            &fixture.session.id,
+            selection_revision_b,
+            &fixture.selection,
+            SessionRuntimeSelectionStatus::Preparing,
+        )
+        .unwrap();
+        let switch_a = coordinator
+            .request_switch(RuntimeSwitchRequest {
+                session_id: fixture.session.id.clone(),
+                idempotency_key: "historical-b-to-a".to_string(),
+                expected_revision: state_b.revision,
+                expected_current_binding_id: Some(binding_b_id),
+                desired_selection_revision: selection_revision_a,
+                target_adapter_id: binding_a.adapter_id.clone(),
+                target_selection: fixture.selection.clone(),
+                requested_policy: RuntimeSwitchPolicy::Automatic,
+                active_work_policy: Default::default(),
+                requested_session_config: Some(
+                    serde_json::to_value(SessionRuntimeConfigPatch {
+                        model_id: Some(fixture.selection.model_id.clone()),
+                        reasoning_effort: fixture.selection.reasoning_effort.clone(),
+                        mode_id: fixture.selection.mode_id.clone(),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                ),
+            })
+            .await
+            .unwrap();
+        assert_eq!(switch_a.status, RuntimeSwitchStatus::Committed);
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        let state_a = AgentSessionRuntimeRepository::get_runtime_state(&conn, &fixture.session.id)
+            .unwrap()
+            .unwrap();
+        let resumed_binding_id = state_a.current_binding_id.unwrap();
+        assert_ne!(resumed_binding_id, binding_a.binding_id);
+        let resumed_binding = RuntimeBindingRepository::get(&conn, &resumed_binding_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            resumed_binding.native_session_id.as_deref(),
+            Some(native_a.as_str())
+        );
+        assert_eq!(
+            resumed_binding.last_context_sequence,
+            binding_a.last_context_sequence
+        );
+        assert_eq!(
+            resumed_binding.last_summary_sequence,
+            binding_a.last_summary_sequence
+        );
+        assert_eq!(
+            resumed_binding.context_bridge_version,
+            binding_a.context_bridge_version
+        );
+        let pending = ContextBridgeRepository::get_pending_for_binding(&conn, &resumed_binding_id)
+            .unwrap()
+            .expect("historically resumed binding must bridge the missing B window");
+        assert_eq!(
+            pending.from_context_sequence,
+            binding_a.last_context_sequence
+        );
+        assert!(pending.prepare_sequence > pending.from_context_sequence);
+        drop(conn);
+
+        MessageDispatchExecutor::dispatch_message(
+            fixture.manager.as_ref(),
+            MessageSubmissionId::new(),
+            SendAgentMessageRequest {
+                session_id: fixture.session.id.clone(),
+                message_idempotency_key: "historical-a-resumed-turn".to_string(),
+                desired_runtime: fixture.selection.clone(),
+                text: "continue on restored A".to_string(),
+                attachments: Vec::new(),
+                reasoning_effort: fixture.selection.reasoning_effort.clone(),
+                correlation_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        assert!(
+            ContextBridgeRepository::get_pending_for_binding(&conn, &resumed_binding_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            RuntimeBindingRepository::get(&conn, &resumed_binding_id)
+                .unwrap()
+                .unwrap()
+                .last_context_sequence
+                > pending.prepare_sequence
+        );
+
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_first_target_turn_does_not_advance_context_bridge_cursors() {
+        use vibex_agent::MessageDispatchExecutor;
+        use vibex_core::{
+            FetchTimelineRequest, MessageSubmissionId, SendAgentMessageRequest, TimelinePayload,
+        };
+        use vibex_db::ContextBridgeRepository;
+
+        let Some(fixture) = runtime_switch_fixture("context-bridge-failed-turn").await else {
+            return;
+        };
+        let (target_binding_id, pending_before, binding_before) =
+            force_fresh_context_bridge_target(&fixture, "failed-target", "usage_limit").await;
+
+        let error = MessageDispatchExecutor::dispatch_message(
+            fixture.manager.as_ref(),
+            MessageSubmissionId::new(),
+            SendAgentMessageRequest {
+                session_id: fixture.session.id.clone(),
+                message_idempotency_key: "failed-target-turn".to_string(),
+                desired_runtime: fixture.selection.clone(),
+                text: "this target turn must fail".to_string(),
+                attachments: Vec::new(),
+                reasoning_effort: fixture.selection.reasoning_effort.clone(),
+                correlation_id: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, OPENCODE_MODEL_API_ERROR_CODE);
+        assert!(error.message.contains("Rate limit exceeded"));
+        assert_eq!(
+            fixture
+                .manager
+                .get_session(&fixture.session.id)
+                .await
+                .unwrap()
+                .state,
+            AgentSessionState::Error
+        );
+        let timeline = fixture
+            .manager
+            .fetch_timeline(FetchTimelineRequest {
+                session_id: fixture.session.id.clone(),
+                after_sequence: Some(0),
+                limit: 200,
+            })
+            .await
+            .unwrap();
+        assert!(timeline.items.iter().any(|item| {
+            matches!(
+                &item.payload,
+                TimelinePayload::Error(error)
+                    if error.code == OPENCODE_MODEL_API_ERROR_CODE
+                        && error.message.contains("Rate limit exceeded")
+            )
+        }));
+
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        let pending_after =
+            ContextBridgeRepository::get_pending_for_binding(&conn, &target_binding_id)
+                .unwrap()
+                .unwrap();
+        let binding_after = RuntimeBindingRepository::get(&conn, &target_binding_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending_after, pending_before);
+        assert_eq!(
+            (
+                binding_after.last_context_sequence,
+                binding_after.last_summary_sequence,
+                binding_after.context_bridge_version,
+            ),
+            (
+                binding_before.last_context_sequence,
+                binding_before.last_summary_sequence,
+                binding_before.context_bridge_version,
+            )
+        );
+
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unresolved_permission_turn_does_not_advance_context_bridge_cursors() {
+        use vibex_agent::MessageDispatchExecutor;
+        use vibex_core::{
+            AgentMessagePayload, MessageSubmissionId, SendAgentMessageRequest, TimelinePayload,
+        };
+        use vibex_db::ContextBridgeRepository;
+
+        let Some(fixture) = runtime_switch_fixture("context-bridge-incomplete-turn").await else {
+            return;
+        };
+        let (target_binding_id, pending_before, binding_before) =
+            force_fresh_context_bridge_target(
+                &fixture,
+                "incomplete-target",
+                "permission_unresolved",
+            )
+            .await;
+
+        let appended = MessageDispatchExecutor::dispatch_message(
+            fixture.manager.as_ref(),
+            MessageSubmissionId::new(),
+            SendAgentMessageRequest {
+                session_id: fixture.session.id.clone(),
+                message_idempotency_key: "incomplete-target-turn".to_string(),
+                desired_runtime: fixture.selection.clone(),
+                text: "request permission without completing this turn".to_string(),
+                attachments: Vec::new(),
+                reasoning_effort: fixture.selection.reasoning_effort.clone(),
+                correlation_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!appended.iter().any(|item| {
+            matches!(
+                item.payload,
+                TimelinePayload::AgentMessage(AgentMessagePayload { is_final: true, .. })
+            )
+        }));
+
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        let pending_after =
+            ContextBridgeRepository::get_pending_for_binding(&conn, &target_binding_id)
+                .unwrap()
+                .unwrap();
+        let binding_after = RuntimeBindingRepository::get(&conn, &target_binding_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending_after, pending_before);
+        assert_eq!(
+            (
+                binding_after.last_context_sequence,
+                binding_after.last_summary_sequence,
+                binding_after.context_bridge_version,
+            ),
+            (
+                binding_before.last_context_sequence,
+                binding_before.last_summary_sequence,
+                binding_before.context_bridge_version,
+            )
+        );
+        drop(conn);
+        assert_eq!(
+            fixture
+                .manager
+                .get_session(&fixture.session.id)
+                .await
+                .unwrap()
+                .state,
+            AgentSessionState::NeedsInput
+        );
+
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    async fn prepare_and_send_turn(
+        client: &AcpRuntimeClient,
+        mut request: AcpSendTurnRequest,
+    ) -> VibexResult<AcpTurn> {
+        request.execution_identity = client.prepare_turn_execution(&request).await?;
+        client.send_turn(request).await
+    }
+
+    async fn start_mock_permission_turn(
+        client: Arc<AcpRuntimeClient>,
+        session_id: VibexSessionId,
+        binding: ProviderBinding,
+        workspace_root: String,
+    ) -> (
+        tokio::task::JoinHandle<VibexResult<AcpTurn>>,
+        tokio::sync::mpsc::UnboundedReceiver<AcpEvent>,
+        RequestId,
+    ) {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut turn_task = tokio::spawn(async move {
+            prepare_and_send_turn(
+                &client,
+                AcpSendTurnRequest {
+                    session_id,
+                    message_submission_id: None,
+                    required_runtime: None,
+                    text: "please ask permission".to_string(),
+                    attachments: Vec::new(),
+                    workspace_root,
+                    binding,
+                    runtime_resources: ProviderRuntimeResources::default(),
+                    execution_identity: None,
+                    event_sender: Some(event_tx),
+                },
+            )
+            .await
+        });
+
+        let permission_request_id;
+        loop {
+            tokio::select! {
+                event = event_rx.recv() => {
+                    match event {
+                        Some(AcpEvent::PermissionRequest { request_id, provider_request_id, details, .. }) => {
+                            assert!(provider_request_id.is_some());
+                            assert!(details.iter().any(|detail| detail.label == "tool"));
+                            permission_request_id = request_id;
+                            break;
+                        }
+                        Some(_) => {}
+                        None => panic!("event channel closed before the permission request"),
+                    }
+                }
+                result = &mut turn_task => {
+                    panic!("turn completed before permission resolution: {result:?}");
+                }
+            }
+        }
+
+        (
+            turn_task,
+            event_rx,
+            permission_request_id.expect("permission request id"),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mock_acp_agent_applies_selected_model_with_standard_request() {
+        let Some(fixture) = MockAcpFixture::create("selected-model") else {
+            return;
+        };
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: Some("mock/model-2".to_string()),
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session
+                .session_config_state
+                .as_ref()
+                .and_then(|state| state.current_model.as_ref())
+                .map(|model| model.value.as_str()),
+            Some("mock/model-2")
+        );
+        let log = fixture.request_log();
+        let new_session = find_logged_request(&log, "session/new");
+        assert!(new_session["params"].get("model").is_none());
+        let set_model = find_logged_request(&log, "session/set_model");
+        assert_eq!(set_model["params"]["modelId"], "mock/model-2");
+        let new_index = log
+            .iter()
+            .position(|entry| entry["method"] == "session/new")
+            .unwrap();
+        let set_index = log
+            .iter()
+            .position(|entry| entry["method"] == "session/set_model")
+            .unwrap();
+        assert!(new_index < set_index);
+
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn opencode_default_placeholder_does_not_request_model_switch() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "opencode-default-model",
+            Some(vibex_core::AgentId::parse(OPENCODE_AGENT_ID).unwrap()),
+        ) else {
+            return;
+        };
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: Some(OPENCODE_DEFAULT_MODEL.to_string()),
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+
+        let log = fixture.request_log();
+        assert_eq!(logged_request_count(&log, "session/set_model"), 0);
+        assert_eq!(logged_request_count(&log, "session/set_config_option"), 0);
+
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mock_acp_agent_falls_back_to_model_config_option() {
+        let Some(fixture) = MockAcpFixture::create("model-config-fallback") else {
+            return;
+        };
+        fixture.force_model_config_option_fallback();
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: Some("mock/model-2".to_string()),
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+
+        let log = fixture.request_log();
+        assert_eq!(logged_request_count(&log, "session/set_model"), 1);
+        let fallback = find_logged_request(&log, "session/set_config_option");
+        assert_eq!(fallback["params"]["configId"], "model");
+        assert_eq!(fallback["params"]["value"], "mock/model-2");
+        assert_eq!(
+            session
+                .session_config_state
+                .as_ref()
+                .and_then(|state| state.current_model.as_ref())
+                .map(|model| model.value.as_str()),
+            Some("mock/model-2")
+        );
+
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_runtime_config_applies_model_effort_mode_and_generic_in_order() {
+        let Some(fixture) = MockAcpFixture::create("runtime-config-chain") else {
+            return;
+        };
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let attachment = client.current_attachment(&session_id).unwrap();
+        let catalog = client.session_model_catalog(&session_id).unwrap();
+        assert!(!catalog.is_empty());
+        assert!(catalog.iter().all(|entry| {
+            entry.reasoning_efforts.is_empty() && entry.default_reasoning_effort.is_none()
+        }));
+        let state = attachment.payload().runtime_config_state();
+        let result = client
+            .update_session_runtime_config(SessionRuntimeConfigMutationRequest {
+                session_id: session_id.clone(),
+                expected_revision: state.state_revision,
+                expected_binding_id: attachment.binding_id().clone(),
+                expected_activation_generation: attachment.fence().activation_generation as i64,
+                patch: SessionRuntimeConfigPatch {
+                    model_id: Some("mock/model-2".to_string()),
+                    reasoning_effort: Some("high".to_string()),
+                    mode_id: Some("review".to_string()),
+                    config_values: BTreeMap::from([("autoapply".to_string(), "false".to_string())]),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.state.state_revision, 1, "{result:#?}");
+        assert_eq!(
+            result.state.effective_model.as_deref(),
+            Some("mock/model-2")
+        );
+        assert_eq!(
+            result.state.effective_reasoning_effort.as_deref(),
+            Some("high")
+        );
+        assert_eq!(result.state.effective_mode.as_deref(), Some("review"));
+        assert_eq!(
+            result
+                .state
+                .config_values
+                .get("autoapply")
+                .and_then(|value| value.effective.as_ref())
+                .map(|value| value.value.as_str()),
+            Some("false")
+        );
+        assert!(
+            result
+                .outcomes
+                .iter()
+                .all(|outcome| outcome.status == SessionRuntimeConfigApplyStatus::Applied)
+        );
+
+        let methods = fixture
+            .request_log()
+            .into_iter()
+            .filter_map(|entry| {
+                entry
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .filter(|method| {
+                matches!(
+                    method.as_str(),
+                    "session/set_model" | "session/set_mode" | "session/set_config_option"
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            vec![
+                "session/set_model",
+                "session/set_config_option",
+                "session/set_mode",
+                "session/set_config_option"
+            ]
+        );
+
+        let before = methods.len();
+        let no_op = client
+            .update_session_runtime_config(SessionRuntimeConfigMutationRequest {
+                session_id: session_id.clone(),
+                expected_revision: result.state.state_revision,
+                expected_binding_id: attachment.binding_id().clone(),
+                expected_activation_generation: attachment.fence().activation_generation as i64,
+                patch: SessionRuntimeConfigPatch {
+                    model_id: Some("mock/model-2".to_string()),
+                    reasoning_effort: Some("high".to_string()),
+                    mode_id: Some("review".to_string()),
+                    config_values: BTreeMap::from([("autoapply".to_string(), "false".to_string())]),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(no_op.state.state_revision, result.state.state_revision);
+        assert!(
+            no_op
+                .outcomes
+                .iter()
+                .all(|outcome| outcome.status == SessionRuntimeConfigApplyStatus::NoOp)
+        );
+        let after = fixture
+            .request_log()
+            .into_iter()
+            .filter(|entry| {
+                matches!(
+                    entry.get("method").and_then(Value::as_str),
+                    Some("session/set_model")
+                        | Some("session/set_mode")
+                        | Some("session/set_config_option")
+                )
+            })
+            .count();
+        assert_eq!(before, after);
+
+        let binding_id = attachment.binding_id().clone();
+        assert!(
+            client
+                .runtime_config_states
+                .lock()
+                .unwrap()
+                .contains_key(&binding_id)
+        );
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        client.close_session(&binding).await.unwrap();
+        assert!(
+            !client
+                .runtime_config_states
+                .lock()
+                .unwrap()
+                .contains_key(&binding_id)
+        );
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_runtime_config_replays_with_operation_evidence_without_discovery() {
+        let Some(fixture) = MockAcpFixture::create("runtime-config-no-discovery") else {
+            return;
+        };
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let attachment = client.current_attachment(&session_id).unwrap();
+        let binding_id = attachment.binding_id().clone();
+        let mut stored = attachment.payload().runtime_config_state();
+        stored.preferred_model = Some("mock/model-2".to_string());
+        stored.effective_model = None;
+        stored.applied_activation_generation = None;
+        stored.state_revision += 1;
+        client
+            .runtime_config_states
+            .lock()
+            .unwrap()
+            .insert(binding_id, stored.clone());
+        {
+            let payload = attachment.payload();
+            let mut state = payload.state.lock().unwrap();
+            state.model_ids.clear();
+            state.current_model_id = None;
+            state.current_mode_id = None;
+            state.session_config_state = None;
+            state.session_config_planner = None;
+            state.session_runtime_config_state = SessionRuntimeConfigState::default();
+        }
+
+        client
+            .configure_attachment_runtime_state(&attachment, AttachmentMutationMode::Current)
+            .unwrap();
+        assert!(attachment.payload().session_config_planner().is_some());
+        assert_eq!(
+            attachment
+                .payload()
+                .runtime_config_state()
+                .preferred_model
+                .as_deref(),
+            Some("mock/model-2")
+        );
+        let replay = client
+            .replay_attachment_preferred_state(&attachment, AttachmentMutationMode::Current)
+            .await
+            .unwrap();
+        assert_eq!(
+            attachment
+                .payload()
+                .runtime_config_state()
+                .effective_model
+                .as_deref(),
+            Some("mock/model-2"),
+            "{replay:#?}"
+        );
+
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_runtime_config_busy_gate_has_zero_wire_side_effect() {
+        let Some(fixture) = MockAcpFixture::create("runtime-config-busy") else {
+            return;
+        };
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let attachment = client.current_attachment(&session_id).unwrap();
+        attachment
+            .payload()
+            .begin_turn(TurnSink::Buffer(Vec::new()))
+            .unwrap();
+        let state = attachment.payload().runtime_config_state();
+        let before = fixture.request_log().len();
+        let result = client
+            .update_session_runtime_config(SessionRuntimeConfigMutationRequest {
+                session_id: session_id.clone(),
+                expected_revision: state.state_revision,
+                expected_binding_id: attachment.binding_id().clone(),
+                expected_activation_generation: attachment.fence().activation_generation as i64,
+                patch: SessionRuntimeConfigPatch {
+                    model_id: Some("mock/model-2".to_string()),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            result.outcomes[0].status,
+            SessionRuntimeConfigApplyStatus::Busy
+        );
+        assert_eq!(fixture.request_log().len(), before);
+        assert_eq!(result.state.state_revision, state.state_revision);
+        attachment.payload().finish_turn(false).unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_runtime_config_stale_request_is_structured_and_side_effect_free() {
+        let Some(fixture) = MockAcpFixture::create("runtime-config-stale") else {
+            return;
+        };
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let attachment = client.current_attachment(&session_id).unwrap();
+        let state = attachment.payload().runtime_config_state();
+        let before = fixture.request_log().len();
+        let result = client
+            .update_session_runtime_config(SessionRuntimeConfigMutationRequest {
+                session_id: session_id.clone(),
+                expected_revision: state.state_revision + 1,
+                expected_binding_id: attachment.binding_id().clone(),
+                expected_activation_generation: attachment.fence().activation_generation as i64,
+                patch: SessionRuntimeConfigPatch {
+                    model_id: Some("mock/model-2".to_string()),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            result.outcomes[0].status,
+            SessionRuntimeConfigApplyStatus::StaleConfirmation
+        );
+        assert_eq!(result.state.state_revision, state.state_revision);
+        assert_eq!(fixture.request_log().len(), before);
+
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_runtime_config_does_not_fallback_on_permission_failure() {
+        let Some(fixture) = MockAcpFixture::create("runtime-config-auth") else {
+            return;
+        };
+        fixture.set_model_failure_mode("auth");
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let attachment = client.current_attachment(&session_id).unwrap();
+        let state = attachment.payload().runtime_config_state();
+        let result = client
+            .update_session_runtime_config(SessionRuntimeConfigMutationRequest {
+                session_id: session_id.clone(),
+                expected_revision: state.state_revision,
+                expected_binding_id: attachment.binding_id().clone(),
+                expected_activation_generation: attachment.fence().activation_generation as i64,
+                patch: SessionRuntimeConfigPatch {
+                    model_id: Some("mock/model-2".to_string()),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            result.outcomes[0].status,
+            SessionRuntimeConfigApplyStatus::Failed
+        );
+        assert_eq!(
+            logged_request_count(&fixture.request_log(), "session/set_model"),
+            1
+        );
+        assert_eq!(
+            logged_request_count(&fixture.request_log(), "session/set_config_option"),
+            0
+        );
+        assert_eq!(
+            result.state.effective_model.as_deref(),
+            Some("mock/model-1")
+        );
+        assert_eq!(
+            result.state.preferred_model.as_deref(),
+            Some("mock/model-2")
+        );
+
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mock_acp_agent_reconciles_hot_switched_model_before_prompt() {
+        let Some(fixture) = MockAcpFixture::create("hot-model-switch") else {
+            return;
+        };
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let mut binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        binding
+            .native
+            .redacted_metadata
+            .push(ProviderBindingMetadata {
+                key: PROVIDER_SELECTED_MODEL_METADATA_KEY.to_string(),
+                value: "mock/model-2".to_string(),
+            });
+
+        let turn = prepare_and_send_turn(
+            &client,
+            AcpSendTurnRequest {
+                session_id: session_id.clone(),
+                message_submission_id: None,
+                required_runtime: None,
+                text: "after switch".to_string(),
+                attachments: Vec::new(),
+                workspace_root: fixture.workspace.display().to_string(),
+                binding: binding.clone(),
+                runtime_resources: ProviderRuntimeResources::default(),
+                execution_identity: None,
+                event_sender: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(turn.completed);
+
+        let log = fixture.request_log();
+        assert_eq!(logged_request_count(&log, "session/set_model"), 1);
+        let set_index = log
+            .iter()
+            .position(|entry| entry["method"] == "session/set_model")
+            .unwrap();
+        let prompt_index = log
+            .iter()
+            .position(|entry| entry["method"] == "session/prompt")
+            .unwrap();
+        assert!(set_index < prompt_index);
+        assert_eq!(
+            turn.binding_update
+                .as_ref()
+                .and_then(|session| session.session_config_state.as_ref())
+                .and_then(|state| state.current_model.as_ref())
+                .map(|model| model.value.as_str()),
+            Some("mock/model-2")
+        );
+
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn model_switch_failure_after_load_does_not_create_a_new_session() {
+        let Some(fixture) = MockAcpFixture::create("loaded-model-unsupported") else {
+            return;
+        };
+        fixture.force_model_config_option_fallback();
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let binding = ProviderBinding {
+            session_id: session_id.clone(),
+            provider_kind: ProviderKind::Acp,
+            provider_profile_id: fixture.profile_id.clone(),
+            native: vibex_core::ProviderNativeBinding {
+                native_session_id: Some("mock-import-session".to_string()),
+                native_thread_id: None,
+                native_resume_token: None,
+                session_config_state: None,
+                redacted_metadata: vec![ProviderBindingMetadata {
+                    key: PROVIDER_SELECTED_MODEL_METADATA_KEY.to_string(),
+                    value: "mock/model-1".to_string(),
+                }],
+            },
+            created_at_ms: unix_timestamp_ms(),
+            updated_at_ms: unix_timestamp_ms(),
+        };
+
+        let error = prepare_and_send_turn(
+            &client,
+            AcpSendTurnRequest {
+                session_id,
+                message_submission_id: None,
+                required_runtime: None,
+                text: "must not create a replacement session".to_string(),
+                attachments: Vec::new(),
+                workspace_root: fixture.workspace.display().to_string(),
+                binding,
+                runtime_resources: ProviderRuntimeResources::default(),
+                execution_identity: None,
+                event_sender: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code, "acp_model_switch_unsupported");
+        let log = fixture.request_log();
+        assert_eq!(logged_request_count(&log, "session/load"), 1);
+        assert_eq!(logged_request_count(&log, "session/set_model"), 1);
+        assert_eq!(logged_request_count(&log, "session/new"), 0);
+        assert_eq!(logged_request_count(&log, "session/prompt"), 0);
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_uses_negotiated_resume_then_operation_local_load_fallback() {
+        for (label, mode, expected_load) in [
+            ("restore-resume", "success", 0),
+            ("restore-resume-load", "resume_unsupported", 1),
+        ] {
+            let Some(fixture) = MockAcpFixture::create(label) else {
+                return;
+            };
+            fixture.set_restore_mode(mode, true);
+            let client = fixture.client();
+            let session_id = VibexSessionId::new();
+            let binding =
+                test_restore_binding(&session_id, &fixture.profile_id, "mock-import-session");
+            let turn = prepare_and_send_turn(
+                &client,
+                AcpSendTurnRequest {
+                    session_id: session_id.clone(),
+                    message_submission_id: None,
+                    required_runtime: None,
+                    text: "restore".to_string(),
+                    attachments: Vec::new(),
+                    workspace_root: fixture.workspace.display().to_string(),
+                    binding: binding.clone(),
+                    runtime_resources: ProviderRuntimeResources::default(),
+                    execution_identity: None,
+                    event_sender: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(turn.completed);
+            let log = fixture.request_log();
+            assert_eq!(logged_request_count(&log, "session/resume"), 1);
+            assert_eq!(logged_request_count(&log, "session/load"), expected_load);
+            assert_eq!(logged_request_count(&log, "session/new"), 0);
+            let restore_result = client.last_restore_result(&session_id).unwrap();
+            assert_eq!(
+                restore_result.outcome,
+                if expected_load == 0 {
+                    AgentSessionRestoreOutcome::Resumed
+                } else {
+                    AgentSessionRestoreOutcome::Loaded
+                }
+            );
+            assert_eq!(
+                restore_result.attempts.len(),
+                if expected_load == 0 { 1 } else { 2 }
+            );
+            client.close_session(&binding).await.unwrap();
+            fixture.cleanup();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_only_creates_fresh_for_not_found_or_unsupported() {
+        for (label, mode, advertise_resume, expected_resume) in [
+            ("restore-not-found", "not_found", false, 0),
+            ("restore-unsupported", "load_unsupported", false, 0),
+            (
+                "restore-codex-rollout-missing",
+                "codex_rollout_missing",
+                true,
+                1,
+            ),
+        ] {
+            let Some(fixture) = MockAcpFixture::create(label) else {
+                return;
+            };
+            fixture.set_restore_mode(mode, advertise_resume);
+            let client = fixture.client();
+            let session_id = VibexSessionId::new();
+            let binding =
+                test_restore_binding(&session_id, &fixture.profile_id, "mock-missing-session");
+            let turn = prepare_and_send_turn(
+                &client,
+                AcpSendTurnRequest {
+                    session_id: session_id.clone(),
+                    message_submission_id: None,
+                    required_runtime: None,
+                    text: "fresh after classified miss".to_string(),
+                    attachments: Vec::new(),
+                    workspace_root: fixture.workspace.display().to_string(),
+                    binding: binding.clone(),
+                    runtime_resources: ProviderRuntimeResources::default(),
+                    execution_identity: None,
+                    event_sender: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(turn.completed);
+            let log = fixture.request_log();
+            assert_eq!(
+                logged_request_count(&log, "session/resume"),
+                expected_resume
+            );
+            assert_eq!(logged_request_count(&log, "session/load"), 1);
+            assert_eq!(logged_request_count(&log, "session/new"), 1);
+            client.close_session(&binding).await.unwrap();
+            fixture.cleanup();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_auth_provider_and_invalid_response_never_fall_back_to_fresh() {
+        for (label, mode, expected_code, expected_outcome, restore_timeout) in [
+            (
+                "restore-auth",
+                "auth",
+                "acp_restore_authentication_required",
+                AgentSessionRestoreOutcome::AuthenticationRequired,
+                None,
+            ),
+            (
+                "restore-provider",
+                "provider_failure",
+                "acp_restore_fatal_failure",
+                AgentSessionRestoreOutcome::FatalFailure,
+                None,
+            ),
+            (
+                "restore-invalid",
+                "invalid",
+                "acp_restore_fatal_failure",
+                AgentSessionRestoreOutcome::FatalFailure,
+                None,
+            ),
+            (
+                "restore-native-mismatch",
+                "native_mismatch",
+                "acp_restore_fatal_failure",
+                AgentSessionRestoreOutcome::FatalFailure,
+                None,
+            ),
+            (
+                "restore-timeout",
+                "timeout",
+                "acp_restore_transient_failure",
+                AgentSessionRestoreOutcome::TransientFailure,
+                Some(Duration::from_millis(50)),
+            ),
+        ] {
+            let Some(fixture) = MockAcpFixture::create(label) else {
+                return;
+            };
+            fixture.set_restore_mode(mode, false);
+            let observability = Arc::new(RuntimeObservability::new());
+            let mut client =
+                AcpRuntimeClient::new_with_observability(fixture.service(), observability.clone());
+            if let Some(restore_timeout) = restore_timeout {
+                client.restore_timeout = restore_timeout;
+            }
+            let session_id = VibexSessionId::new();
+            let binding =
+                test_restore_binding(&session_id, &fixture.profile_id, "mock-import-session");
+            let error = prepare_and_send_turn(
+                &client,
+                AcpSendTurnRequest {
+                    session_id: session_id.clone(),
+                    message_submission_id: None,
+                    required_runtime: None,
+                    text: "must stop".to_string(),
+                    attachments: Vec::new(),
+                    workspace_root: fixture.workspace.display().to_string(),
+                    binding,
+                    runtime_resources: ProviderRuntimeResources::default(),
+                    execution_identity: None,
+                    event_sender: None,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, expected_code);
+            assert_eq!(
+                client.last_restore_result(&session_id).unwrap().outcome,
+                expected_outcome
+            );
+            let log = fixture.request_log();
+            assert_eq!(logged_request_count(&log, "session/load"), 1);
+            assert_eq!(logged_request_count(&log, "session/new"), 0);
+            assert_eq!(logged_request_count(&log, "session/prompt"), 0);
+            assert_eq!(
+                runtime_metric_count(
+                    &observability,
+                    RuntimeMetricName::Restore,
+                    None,
+                    restore_metric_result(expected_outcome),
+                ),
+                1
+            );
+            assert_eq!(
+                runtime_metric_count(
+                    &observability,
+                    RuntimeMetricName::FreshBridge,
+                    None,
+                    RuntimeMetricResult::Fresh,
+                ),
+                0
+            );
+            fixture.cleanup();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_restore_for_the_same_attachment_loads_once() {
+        let Some(fixture) = MockAcpFixture::create("restore-concurrent") else {
+            return;
+        };
+        fixture.set_restore_mode("delayed_success", false);
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let binding = test_restore_binding(&session_id, &fixture.profile_id, "mock-import-session");
+        let workspace_root = fixture.workspace.display().to_string();
+        let runtime_resources = ProviderRuntimeResources::default();
+
+        let (first, second) = tokio::join!(
+            client.ensure_attachment(&binding, &workspace_root, &runtime_resources),
+            client.ensure_attachment(&binding, &workspace_root, &runtime_resources),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.fence(), second.fence());
+        let log = fixture.request_log();
+        assert_eq!(logged_request_count(&log, "session/load"), 1);
+        assert_eq!(logged_request_count(&log, "session/new"), 0);
+
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn opencode_stream_errors_fail_the_prompt_and_cancel_retries() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "opencode-stream-error",
+            Some(vibex_core::AgentId::parse(OPENCODE_AGENT_ID).unwrap()),
+        ) else {
+            return;
+        };
+        fixture.set_prompt_mode("stream_error");
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            prepare_and_send_turn(
+                &client,
+                AcpSendTurnRequest {
+                    session_id: session_id.clone(),
+                    message_submission_id: None,
+                    required_runtime: None,
+                    text: "trigger upstream failure".to_string(),
+                    attachments: Vec::new(),
+                    workspace_root: fixture.workspace.display().to_string(),
+                    binding: binding.clone(),
+                    runtime_resources: ProviderRuntimeResources::default(),
+                    execution_identity: None,
+                    event_sender: None,
+                },
+            ),
+        )
+        .await
+        .expect("OpenCode stream errors must not leave the ACP prompt hanging")
+        .unwrap_err();
+
+        assert_eq!(error.code, OPENCODE_MODEL_API_ERROR_CODE);
+        assert!(error.message.contains("Internal server error"));
+        for _ in 0..50 {
+            if logged_request_count(&fixture.request_log(), "session/cancel") == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            logged_request_count(&fixture.request_log(), "session/cancel"),
+            1
+        );
+
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn opencode_transient_error_stays_bounded_after_one_recovery_update() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "opencode-stream-error-once",
+            Some(vibex_core::AgentId::parse(OPENCODE_AGENT_ID).unwrap()),
+        ) else {
+            return;
+        };
+        fixture.set_prompt_mode("stream_error_once");
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            prepare_and_send_turn(
+                &client,
+                AcpSendTurnRequest {
+                    session_id: session_id.clone(),
+                    message_submission_id: None,
+                    required_runtime: None,
+                    text: "wait for one transient retry".to_string(),
+                    attachments: Vec::new(),
+                    workspace_root: fixture.workspace.display().to_string(),
+                    binding: binding.clone(),
+                    runtime_resources: ProviderRuntimeResources::default(),
+                    execution_identity: None,
+                    event_sender: Some(event_tx),
+                },
+            ),
+        )
+        .await
+        .expect("OpenCode retry recovery deadline must end a silent prompt")
+        .unwrap_err();
+
+        assert_eq!(error.code, OPENCODE_MODEL_API_ERROR_CODE);
+        assert!(error.message.contains("Service Unavailable"));
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AcpEvent::Error {
+                    code,
+                    message,
+                    recoverable: true,
+                    provider_correlation_id: Some(_),
+                } if code == OPENCODE_MODEL_API_RETRYING_CODE
+                    && message.contains("Service Unavailable")
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(event, AcpEvent::Reasoning { text, .. } if text == "one recovery update")
+        }));
+        assert_eq!(
+            logged_request_count(&fixture.request_log(), "session/cancel"),
+            1
+        );
+
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn opencode_terminal_rpc_error_preserves_the_stream_failure() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "opencode-stream-error-rpc-failure",
+            Some(vibex_core::AgentId::parse(OPENCODE_AGENT_ID).unwrap()),
+        ) else {
+            return;
+        };
+        fixture.set_prompt_mode("stream_error_rpc_failure");
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+
+        let error = prepare_and_send_turn(
+            &client,
+            AcpSendTurnRequest {
+                session_id: session_id.clone(),
+                message_submission_id: None,
+                required_runtime: None,
+                text: "fail before the first model token".to_string(),
+                attachments: Vec::new(),
+                workspace_root: fixture.workspace.display().to_string(),
+                binding: binding.clone(),
+                runtime_resources: ProviderRuntimeResources::default(),
+                execution_identity: None,
+                event_sender: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code, OPENCODE_MODEL_API_ERROR_CODE);
+        assert!(error.message.contains("No provider available"));
+        assert_eq!(
+            logged_request_count(&fixture.request_log(), "session/cancel"),
+            0
+        );
+
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn opencode_stream_progress_resets_consecutive_error_budget() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "opencode-stream-error-recovery",
+            Some(vibex_core::AgentId::parse(OPENCODE_AGENT_ID).unwrap()),
+        ) else {
+            return;
+        };
+        fixture.set_prompt_mode("stream_error_recovery");
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+
+        let turn = tokio::time::timeout(
+            Duration::from_secs(5),
+            prepare_and_send_turn(
+                &client,
+                AcpSendTurnRequest {
+                    session_id: session_id.clone(),
+                    message_submission_id: None,
+                    required_runtime: None,
+                    text: "recover between transient failures".to_string(),
+                    attachments: Vec::new(),
+                    workspace_root: fixture.workspace.display().to_string(),
+                    binding: binding.clone(),
+                    runtime_resources: ProviderRuntimeResources::default(),
+                    execution_identity: None,
+                    event_sender: None,
+                },
+            ),
+        )
+        .await
+        .expect("OpenCode progress should preserve the pending prompt")
+        .unwrap();
+
+        assert!(turn.completed);
+        assert!(turn.events.iter().any(|event| {
+            matches!(
+                event,
+                AcpEvent::Reasoning { text, .. } if text == "model stream recovered"
+            )
+        }));
+        assert_eq!(
+            logged_request_count(&fixture.request_log(), "session/cancel"),
+            0
+        );
+
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn opencode_title_stream_error_does_not_fail_the_main_prompt() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "opencode-title-error",
+            Some(vibex_core::AgentId::parse(OPENCODE_AGENT_ID).unwrap()),
+        ) else {
+            return;
+        };
+        fixture.set_prompt_mode("title_error");
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+
+        let turn = prepare_and_send_turn(
+            &client,
+            AcpSendTurnRequest {
+                session_id: session_id.clone(),
+                message_submission_id: None,
+                required_runtime: None,
+                text: "main prompt still succeeds".to_string(),
+                attachments: Vec::new(),
+                workspace_root: fixture.workspace.display().to_string(),
+                binding: binding.clone(),
+                runtime_resources: ProviderRuntimeResources::default(),
+                execution_identity: None,
+                event_sender: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(turn.completed);
+        assert_eq!(
+            logged_request_count(&fixture.request_log(), "session/cancel"),
+            0
+        );
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mock_acp_agent_streams_turn_and_bridges_permissions() {
+        let Some(fixture) = MockAcpFixture::create("full-loop") else {
+            return;
+        };
+        let client = Arc::new(fixture.client());
+        let session_id = VibexSessionId::new();
+
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: fixture_mcp_resources(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(session.native_session_id.as_deref(), Some("mock-session-1"));
+        let log = fixture.request_log();
+        let initialize = find_logged_request(&log, "initialize");
+        assert_eq!(
+            initialize["params"]["clientCapabilities"]["mcpServers"],
+            json!(true)
+        );
+        let new_session = find_logged_request(&log, "session/new");
+        assert_eq!(
+            new_session["params"]["mcpServers"],
+            json!([
+                {
+                    "id": "filesystem",
+                    "name": "Filesystem",
+                    "transport": "stdio",
+                    "command": "mcp-server-filesystem",
+                    "args": ["--root", "/tmp/workspace"]
+                },
+                {
+                    "id": "remote",
+                    "name": "Remote",
+                    "transport": "http",
+                    "url": "https://example.invalid/mcp"
+                }
+            ])
+        );
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+
+        // Turn 1: plain streamed turn.
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let turn = prepare_and_send_turn(
+            &client,
+            AcpSendTurnRequest {
+                session_id: session_id.clone(),
+                message_submission_id: None,
+                required_runtime: None,
+                text: "hello".to_string(),
+                attachments: Vec::new(),
+                workspace_root: fixture.workspace.display().to_string(),
+                binding: binding.clone(),
+                runtime_resources: ProviderRuntimeResources::default(),
+                execution_identity: None,
+                event_sender: Some(event_tx),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(turn.completed);
+        let mut saw_reasoning = false;
+        let mut streamed_text = String::new();
+        let mut final_text = None;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                AcpEvent::Reasoning { text, .. } => {
+                    saw_reasoning = true;
+                    assert_eq!(text, "thinking");
+                }
+                AcpEvent::AssistantDelta { text_delta, .. } => streamed_text.push_str(&text_delta),
+                AcpEvent::AssistantMessage { text, is_final } => {
+                    assert!(is_final);
+                    final_text = Some(text);
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_reasoning);
+        assert_eq!(streamed_text, "mock-session-1:hello");
+        assert_eq!(final_text.as_deref(), Some(streamed_text.as_str()));
+
+        let attachment = client.current_attachment(&session_id).unwrap();
+        let payload = attachment.payload();
+        payload.begin_turn(TurnSink::Buffer(Vec::new())).unwrap();
+        payload.handle_session_update(&json!({
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "intro" }
+            }
+        }));
+        payload.handle_session_update(&json!({
+            "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "segment-tool",
+                "title": "Inspect files",
+                "kind": "read",
+                "status": "pending"
+            }
+        }));
+        payload.handle_session_update(&json!({
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "segment-tool",
+                "status": "completed"
+            }
+        }));
+        payload.handle_session_update(&json!({
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "conclusion" }
+            }
+        }));
+        let segment_events = payload.finish_turn(true).unwrap();
+        assert!(segment_events.iter().any(|event| {
+            matches!(
+                event,
+                AcpEvent::AssistantMessage { text, is_final: true } if text == "conclusion"
+            )
+        }));
+
+        // Session commands announced through available_commands_update.
+        let commands = client.list_session_commands(&session_id).await.unwrap();
+        assert!(commands.iter().any(|command| command.name == "compact"));
+
+        // Turn 2: the agent requests permission mid-turn; approve it and the
+        // blocked prompt completes.
+        let (turn_task, mut event_rx, request_id) = start_mock_permission_turn(
+            Arc::clone(&client),
+            session_id.clone(),
+            binding.clone(),
+            fixture.workspace.display().to_string(),
+        )
+        .await;
+
+        client
+            .resolve_permission(AcpPermissionResolution {
+                binding: binding.clone(),
+                resolution: vibex_core::PermissionResolution {
+                    request_id: request_id.clone(),
+                    session_id: session_id.clone(),
+                    response: PermissionResponseKind::Approve,
+                    responder_device_id: None,
+                    provider_resolution_id: None,
+                    note: None,
+                    resolved_at_ms: vibex_core::unix_timestamp_ms(),
+                },
+            })
+            .await
+            .unwrap();
+        client
+            .resolve_permission(AcpPermissionResolution {
+                binding: binding.clone(),
+                resolution: vibex_core::PermissionResolution {
+                    request_id,
+                    session_id: session_id.clone(),
+                    response: PermissionResponseKind::Approve,
+                    responder_device_id: None,
+                    provider_resolution_id: None,
+                    note: None,
+                    resolved_at_ms: vibex_core::unix_timestamp_ms(),
+                },
+            })
+            .await
+            .unwrap();
+
+        let turn = tokio::time::timeout(Duration::from_secs(10), turn_task)
+            .await
+            .expect("prompt must complete after permission approval")
+            .expect("permission turn task must not panic")
+            .unwrap();
+        assert!(turn.completed);
+        let mut followup_text = String::new();
+        let mut final_text = None;
+        let mut tool_completed = false;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                AcpEvent::AssistantDelta { text_delta, .. } => followup_text.push_str(&text_delta),
+                AcpEvent::AssistantMessage { text, is_final } => {
+                    assert!(is_final);
+                    final_text = Some(text);
+                }
+                AcpEvent::Canonical(crate::NormalizedAgentEvent {
+                    event: crate::CanonicalAgentEvent::ToolCall(tool),
+                    provider_correlation_id,
+                }) => {
+                    tool_completed |= tool.status == ToolCallStatus::Completed;
+                    assert!(!provider_correlation_id.contains("tc-1"));
+                }
+                _ => {}
+            }
+        }
+        assert!(followup_text.contains("permission approved"));
+        assert_eq!(final_text.as_deref(), Some(followup_text.as_str()));
+        assert!(tool_completed);
+
+        client.close_session(&binding).await.unwrap();
+        assert!(client.live_process(&session_id).is_none());
+
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mock_acp_agent_rejects_permission_and_finishes_turn() {
+        let Some(fixture) = MockAcpFixture::create("reject-loop") else {
+            return;
+        };
+        let client = Arc::new(AcpRuntimeClient::new(ProviderConfigService::new(
+            fixture.db_path.clone(),
+        )));
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        let (turn_task, mut event_rx, request_id) = start_mock_permission_turn(
+            Arc::clone(&client),
+            session_id.clone(),
+            binding.clone(),
+            fixture.workspace.display().to_string(),
+        )
+        .await;
+
+        client
+            .resolve_permission(AcpPermissionResolution {
+                binding: binding.clone(),
+                resolution: vibex_core::PermissionResolution {
+                    request_id,
+                    session_id: session_id.clone(),
+                    response: PermissionResponseKind::Deny,
+                    responder_device_id: None,
+                    provider_resolution_id: None,
+                    note: None,
+                    resolved_at_ms: vibex_core::unix_timestamp_ms(),
+                },
+            })
+            .await
+            .unwrap();
+
+        let turn = tokio::time::timeout(Duration::from_secs(10), turn_task)
+            .await
+            .expect("prompt must complete after permission rejection")
+            .expect("permission turn task must not panic")
+            .unwrap();
+        assert!(turn.completed);
+        let mut followup_text = String::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let AcpEvent::AssistantDelta { text_delta, .. } = event {
+                followup_text.push_str(&text_delta);
+            }
+        }
+        assert!(followup_text.contains("permission rejected"));
+
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mock_acp_agent_interrupt_cancels_pending_permission() {
+        let Some(fixture) = MockAcpFixture::create("cancel-loop") else {
+            return;
+        };
+        let client = Arc::new(AcpRuntimeClient::new(ProviderConfigService::new(
+            fixture.db_path.clone(),
+        )));
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        let (turn_task, mut event_rx, _request_id) = start_mock_permission_turn(
+            Arc::clone(&client),
+            session_id.clone(),
+            binding.clone(),
+            fixture.workspace.display().to_string(),
+        )
+        .await;
+
+        client.interrupt(&binding).await.unwrap();
+
+        let turn = tokio::time::timeout(Duration::from_secs(10), turn_task)
+            .await
+            .expect("prompt must complete after permission cancellation")
+            .expect("permission turn task must not panic")
+            .unwrap();
+        assert!(turn.completed);
+        let mut followup_text = String::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let AcpEvent::AssistantDelta { text_delta, .. } = event {
+                followup_text.push_str(&text_delta);
+            }
+        }
+        assert!(followup_text.contains("permission cancelled"));
+
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_prompt_future_releases_attachment_and_transport_gates() {
+        let Some(fixture) = MockAcpFixture::create("cancelled-prompt-future") else {
+            return;
+        };
+        let client = Arc::new(fixture.client());
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        let (turn_task, _event_rx, _request_id) = start_mock_permission_turn(
+            Arc::clone(&client),
+            session_id.clone(),
+            binding.clone(),
+            fixture.workspace.display().to_string(),
+        )
+        .await;
+
+        turn_task.abort();
+        assert!(turn_task.await.unwrap_err().is_cancelled());
+        let attachment = client.current_attachment(&session_id).unwrap();
+        let payload = attachment.payload();
+        {
+            let state = payload.state.lock().unwrap();
+            assert!(state.active_turn.is_none());
+            assert!(state.pending_permissions.is_empty());
+            assert!(state.pending_terminal_creates.is_empty());
+        }
+        let process = payload.process();
+        assert!(process.pending_requests.lock().unwrap().is_empty());
+        assert!(process.pending_prompt_requests.lock().unwrap().is_empty());
+        let prompt_guard = client
+            .attachment_router
+            .registry
+            .acquire_prompt(attachment.fence())
+            .await
+            .unwrap();
+        drop(prompt_guard);
+        assert!(
+            process
+                .debug_log
+                .lock()
+                .unwrap()
+                .messages()
+                .iter()
+                .any(|message| message.direction == AcpDebugDirection::Outgoing
+                    && message
+                        .message
+                        .contains(AcpOperation::SessionCancel.method()))
+        );
+
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn process_acquire_key_includes_forwarded_mcp_shape_without_exposing_it() {
+        let Some(fixture) = MockAcpFixture::create("process-key-mcp") else {
+            return;
+        };
+        let client = fixture.client();
+        let config = client.profile_config(&fixture.profile_id).unwrap();
+        let cwd =
+            AcpRuntimeClient::resolve_workspace_cwd(&config, &fixture.workspace.to_string_lossy())
+                .unwrap();
+        let without_mcp = client
+            .process_acquire_key(
+                &fixture.profile_id,
+                &config,
+                &cwd,
+                &ProviderRuntimeResources::default(),
+            )
+            .unwrap();
+        let resources = fixture_mcp_resources();
+        let with_mcp = client
+            .process_acquire_key(&fixture.profile_id, &config, &cwd, &resources)
+            .unwrap();
+
+        assert_ne!(without_mcp, with_mcp);
+        let rendered = format!("{with_mcp:?}");
+        assert!(!rendered.contains("mcp-server-filesystem"));
+        assert!(!rendered.contains("example.invalid"));
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn process_snapshot_excludes_session_config_and_tracks_secret_references() {
+        let Some(fixture) = MockAcpFixture::create("process-snapshot-fields") else {
+            return;
+        };
+        let client = fixture.client();
+        let config = client.profile_config(&fixture.profile_id).unwrap();
+        let cwd =
+            AcpRuntimeClient::resolve_workspace_cwd(&config, &fixture.workspace.to_string_lossy())
+                .unwrap();
+        let baseline = client
+            .process_spawn_config_snapshot(
+                &fixture.profile_id,
+                &config,
+                &cwd,
+                &ProviderRuntimeResources::default(),
+            )
+            .unwrap();
+
+        let mut session_only = config.clone();
+        session_only
+            .modes
+            .push("interactive-session-mode".to_string());
+        session_only
+            .disabled_tools
+            .push("session-only-tool".to_string());
+        let session_changed = client
+            .process_spawn_config_snapshot(
+                &fixture.profile_id,
+                &session_only,
+                &cwd,
+                &ProviderRuntimeResources::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            baseline.process_spawn_fingerprint(),
+            session_changed.process_spawn_fingerprint()
+        );
+
+        let mut profile = client
+            .config_service
+            .get_profile(&fixture.profile_id)
+            .unwrap()
+            .unwrap();
+        profile.secrets = vec![vibex_core::ProviderSecretReference {
+            id: RequestId::new(),
+            provider_profile_id: profile.id.clone(),
+            secret_kind: vibex_core::ProviderSecretKind::ApiKey,
+            backend: ProviderSecretBackend::OsKeychain,
+            setup_state: vibex_core::ProviderSecretSetupState::Available,
+            lookup_key: "fixture-api-key-reference".to_string(),
+            display_label: "API key".to_string(),
+            redacted_hint: "stored".to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }];
+        let with_secret = client
+            .process_spawn_config_snapshot_from_profile(
+                &fixture.profile_id,
+                &profile,
+                &config,
+                &cwd,
+                &ProviderRuntimeResources::default(),
+                None,
+            )
+            .unwrap();
+        assert_ne!(
+            baseline.process_spawn_fingerprint(),
+            with_secret.process_spawn_fingerprint()
+        );
+        let rendered = format!("{with_secret:?}");
+        assert!(!rendered.contains("fixture-api-key-reference"));
+        assert!(!rendered.contains("secret-value"));
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn profile_save_marks_existing_process_stale_without_killing_it() {
+        let Some(fixture) = MockAcpFixture::create("profile-save-stale") else {
+            return;
+        };
+        let runtime = Arc::new(AcpRuntimeClient::new(ProviderConfigService::new(
+            fixture.db_path.clone(),
+        )));
+        let service = ProviderConfigService::new(fixture.db_path.clone())
+            .with_profile_change_listener(runtime.clone());
+        let session_id = VibexSessionId::new();
+        let session = runtime
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        let mut status_events = runtime.subscribe_process_config_status();
+        service
+            .update_profile(vibex_core::ProviderProfileUpdateRequest {
+                provider_profile_id: fixture.profile_id.clone(),
+                display_name: None,
+                status: None,
+                account_alias: None,
+                base_url: Some("https://stale.example.test".to_string()),
+                default_model: None,
+                small_model: None,
+                large_model: None,
+                configured_models: None,
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: None,
+            })
+            .unwrap();
+        let event = status_events.try_recv().unwrap();
+        assert_eq!(event.status, ProcessConfigStatus::StaleRestartRequired);
+        let attachment = runtime.current_attachment(&session_id).unwrap();
+        assert!(!attachment.payload().process().is_closed());
+        service
+            .update_profile(vibex_core::ProviderProfileUpdateRequest {
+                provider_profile_id: fixture.profile_id.clone(),
+                display_name: None,
+                status: None,
+                account_alias: None,
+                base_url: Some(String::new()),
+                default_model: None,
+                small_model: None,
+                large_model: None,
+                configured_models: None,
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: None,
+            })
+            .unwrap();
+        assert_eq!(
+            status_events.try_recv().unwrap().status,
+            ProcessConfigStatus::Current
+        );
+        runtime.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn credential_reference_revision_stales_old_process_and_prevents_reuse() {
+        use vibex_db::ProviderSecretReferenceRepository;
+
+        const LOOKUP_SENTINEL: &str = "credential-lookup-must-not-leak";
+        const VALUE_SENTINEL: &str = "sk-credential-value-must-not-leak";
+
+        let Some(fixture) = MockAcpFixture::create("credential-reference-stale") else {
+            return;
+        };
+        let secret = vibex_core::ProviderSecretReference {
+            id: RequestId::new(),
+            provider_profile_id: fixture.profile_id.clone(),
+            secret_kind: vibex_core::ProviderSecretKind::ApiKey,
+            backend: ProviderSecretBackend::Placeholder,
+            setup_state: vibex_core::ProviderSecretSetupState::Missing,
+            lookup_key: LOOKUP_SENTINEL.to_string(),
+            display_label: "API key".to_string(),
+            redacted_hint: "not configured".to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        ProviderSecretReferenceRepository::replace_for_profile(
+            &open_database(&fixture.db_path).unwrap(),
+            &fixture.profile_id,
+            std::slice::from_ref(&secret),
+        )
+        .unwrap();
+
+        let observability = Arc::new(RuntimeObservability::new());
+        let runtime = Arc::new(AcpRuntimeClient::new_with_observability(
+            fixture.service(),
+            observability.clone(),
+        ));
+        let service = fixture
+            .service()
+            .with_profile_change_listener(runtime.clone());
+        let session_id = VibexSessionId::new();
+        let session = runtime
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        let old_attachment = runtime.current_attachment(&session_id).unwrap();
+        let old_lease = old_attachment.payload().lease.clone();
+        let old_fingerprint = old_lease.key().process_spawn_fingerprint.clone();
+        let mut status_events = runtime.subscribe_process_config_status();
+
+        let mut next_secret = secret;
+        next_secret.updated_at_ms = 2;
+        ProviderSecretReferenceRepository::replace_for_profile(
+            &open_database(&fixture.db_path).unwrap(),
+            &fixture.profile_id,
+            std::slice::from_ref(&next_secret),
+        )
+        .unwrap();
+        service
+            .update_profile(vibex_core::ProviderProfileUpdateRequest {
+                provider_profile_id: fixture.profile_id.clone(),
+                display_name: Some("Mock ACP".to_string()),
+                status: None,
+                account_alias: None,
+                base_url: None,
+                default_model: None,
+                small_model: None,
+                large_model: None,
+                configured_models: None,
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: None,
+            })
+            .unwrap();
+
+        let event = status_events.try_recv().unwrap();
+        assert_eq!(event.status, ProcessConfigStatus::StaleRestartRequired);
+        assert_eq!(
+            old_lease.attach().unwrap_err().code,
+            "acp_process_config_stale"
+        );
+        assert!(!old_attachment.payload().process().is_closed());
+        assert_eq!(
+            runtime_metric_count(
+                &observability,
+                RuntimeMetricName::ConfigStale,
+                None,
+                RuntimeMetricResult::Stale,
+            ),
+            1
+        );
+
+        let config = runtime.profile_config(&fixture.profile_id).unwrap();
+        let cwd = AcpRuntimeClient::resolve_workspace_cwd(
+            &config,
+            fixture.workspace.to_string_lossy().as_ref(),
+        )
+        .unwrap();
+        let resources = ProviderRuntimeResources::default();
+        let replacement = runtime
+            .acquire_initialized_process(AcpProcessLaunch {
+                profile_id: &fixture.profile_id,
+                config: &config,
+                cwd: &cwd,
+                runtime_resources: &resources,
+                purpose: AcpProcessPurpose::Session,
+                process_strategy_effective: AcpProcessStrategy::PerSession,
+                pool_fallback_reason: None,
+            })
+            .await
+            .unwrap();
+        assert_ne!(replacement.key().process_spawn_fingerprint, old_fingerprint);
+        assert_ne!(
+            replacement.process_instance_id(),
+            old_lease.process_instance_id()
+        );
+
+        let rendered = format!(
+            "{:?}{:?}{:?}{:?}",
+            event,
+            old_lease.snapshot().unwrap(),
+            replacement.snapshot().unwrap(),
+            observability.snapshot()
+        );
+        assert!(!rendered.contains(LOOKUP_SENTINEL));
+        assert!(!rendered.contains(VALUE_SENTINEL));
+
+        runtime.release_process_reservation(&replacement).await;
+        runtime.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_create_initializes_once_and_releases_lock_before_session_new() {
+        let Some(fixture) = MockAcpFixture::create("pool-concurrent-create") else {
+            return;
+        };
+        fixture.enable_per_profile_pool(true);
+        fixture.set_session_new_delay("1.0");
+        let client = Arc::new(fixture.client());
+        let session_a_id = VibexSessionId::new();
+        let session_b_id = VibexSessionId::new();
+        let first = {
+            let client = Arc::clone(&client);
+            let profile_id = fixture.profile_id.clone();
+            let workspace_root = fixture.workspace.display().to_string();
+            let session_id = session_a_id.clone();
+            tokio::spawn(async move {
+                client
+                    .create_session(AcpCreateSessionRequest {
+                        session_id,
+                        provider_profile_id: profile_id,
+                        model: None,
+                        workspace_root,
+                        runtime_resources: ProviderRuntimeResources::default(),
+                    })
+                    .await
+            })
+        };
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if logged_request_count(&fixture.request_log(), "session/new") == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first session/new must reach the delayed mock agent");
+
+        let config = client.profile_config(&fixture.profile_id).unwrap();
+        let cwd =
+            AcpRuntimeClient::resolve_workspace_cwd(&config, &fixture.workspace.to_string_lossy())
+                .unwrap();
+        let resources = ProviderRuntimeResources::default();
+        let ready_lease = tokio::time::timeout(
+            Duration::from_millis(400),
+            client.acquire_initialized_process(AcpProcessLaunch {
+                profile_id: &fixture.profile_id,
+                config: &config,
+                cwd: &cwd,
+                runtime_resources: &resources,
+                purpose: AcpProcessPurpose::Session,
+                process_strategy_effective: AcpProcessStrategy::PerProfilePool,
+                pool_fallback_reason: None,
+            }),
+        )
+        .await
+        .expect("session/new must not retain the process acquire lock")
+        .unwrap();
+
+        let second = {
+            let client = Arc::clone(&client);
+            let profile_id = fixture.profile_id.clone();
+            let workspace_root = fixture.workspace.display().to_string();
+            let session_id = session_b_id.clone();
+            tokio::spawn(async move {
+                client
+                    .create_session(AcpCreateSessionRequest {
+                        session_id,
+                        provider_profile_id: profile_id,
+                        model: None,
+                        workspace_root,
+                        runtime_resources: ProviderRuntimeResources::default(),
+                    })
+                    .await
+            })
+        };
+        let (session_a, session_b) = tokio::time::timeout(Duration::from_secs(5), async {
+            let (session_a, session_b) = tokio::join!(first, second);
+            (session_a.unwrap().unwrap(), session_b.unwrap().unwrap())
+        })
+        .await
+        .expect("both concurrent session creates must finish");
+
+        let process_instance_id = ready_lease.process_instance_id().as_str();
+        for session in [&session_a, &session_b] {
+            assert!(session.redacted_metadata.iter().any(|entry| {
+                entry.key == "processInstanceId" && entry.value == process_instance_id
+            }));
+        }
+        let log = fixture.request_log();
+        assert_eq!(logged_request_count(&log, "initialize"), 1);
+        assert_eq!(logged_request_count(&log, "session/new"), 2);
+        client.release_process_reservation(&ready_lease).await;
+
+        client
+            .close_session(&test_binding_for(
+                &session_a_id,
+                &fixture.profile_id,
+                &session_a,
+            ))
+            .await
+            .unwrap();
+        client
+            .close_session(&test_binding_for(
+                &session_b_id,
+                &fixture.profile_id,
+                &session_b,
+            ))
+            .await
+            .unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_concurrent_session_new_does_not_shutdown_shared_process() {
+        let Some(fixture) = MockAcpFixture::create("pool-concurrent-session-failure") else {
+            return;
+        };
+        fixture.enable_per_profile_pool(true);
+        fixture.set_session_new_delay("1.0");
+        fixture.fail_first_session_new();
+        let client = Arc::new(fixture.client());
+        let session_a_id = VibexSessionId::new();
+        let session_b_id = VibexSessionId::new();
+        let first = {
+            let client = Arc::clone(&client);
+            let profile_id = fixture.profile_id.clone();
+            let workspace_root = fixture.workspace.display().to_string();
+            let session_id = session_a_id.clone();
+            tokio::spawn(async move {
+                client
+                    .create_session(AcpCreateSessionRequest {
+                        session_id,
+                        provider_profile_id: profile_id,
+                        model: None,
+                        workspace_root,
+                        runtime_resources: ProviderRuntimeResources::default(),
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if logged_request_count(&fixture.request_log(), "session/new") == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first delayed session/new must start");
+
+        let second = {
+            let client = Arc::clone(&client);
+            let profile_id = fixture.profile_id.clone();
+            let workspace_root = fixture.workspace.display().to_string();
+            let session_id = session_b_id.clone();
+            tokio::spawn(async move {
+                client
+                    .create_session(AcpCreateSessionRequest {
+                        session_id,
+                        provider_profile_id: profile_id,
+                        model: None,
+                        workspace_root,
+                        runtime_resources: ProviderRuntimeResources::default(),
+                    })
+                    .await
+            })
+        };
+        let (first_result, session_b) = tokio::time::timeout(Duration::from_secs(5), async {
+            let (first, second) = tokio::join!(first, second);
+            (first.unwrap(), second.unwrap().unwrap())
+        })
+        .await
+        .expect("the surviving concurrent session/new must finish");
+
+        assert_eq!(first_result.unwrap_err().code, "acp_rpc_error");
+        assert_eq!(
+            session_b.native_session_id.as_deref(),
+            Some("mock-session-2")
+        );
+        let log = fixture.request_log();
+        assert_eq!(logged_request_count(&log, "initialize"), 1);
+        assert_eq!(logged_request_count(&log, "session/new"), 2);
+        assert!(client.live_process(&session_b_id).is_some());
+
+        client
+            .close_session(&test_binding_for(
+                &session_b_id,
+                &fixture.profile_id,
+                &session_b,
+            ))
+            .await
+            .unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn standard_usage_update_refreshes_snapshot_and_publishes_runtime_event() {
+        let Some(fixture) = MockAcpFixture::create("usage-update-runtime-event") else {
+            return;
+        };
+        let client = Arc::new(fixture.client());
+        let manager = Arc::new(AgentManager::new(&fixture.db_path).unwrap());
+        let bridge = Arc::new(
+            AcpRuntimeSwitchBridge::new(&fixture.db_path, client.clone(), manager).unwrap(),
+        );
+        let lifecycle = RuntimeLifecycleService::new(
+            Arc::new(AcpRuntimeLifecycleBackend::new(bridge.clone())),
+            vibex_agent::RuntimeLifecycleConfig::default(),
+        )
+        .unwrap();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        let attachment = client.current_attachment(&session_id).unwrap();
+        let payload = attachment.payload();
+        let mut runtime_events = lifecycle.subscribe();
+
+        payload.process().handle_session_update(&json!({
+            "sessionId": payload.native_session_id,
+            "update": {
+                "sessionUpdate": "usage_update",
+                "used": 47_500,
+                "size": 200_000
+            }
+        }));
+
+        let event = tokio::time::timeout(Duration::from_secs(1), runtime_events.recv())
+            .await
+            .expect("usage update should publish a runtime event")
+            .unwrap();
+        assert_eq!(event.session_id, session_id);
+        assert_eq!(event.kind, vibex_core::RuntimeEventKind::AttachmentUpdated);
+        let snapshot = payload
+            .runtime_attachment_snapshot(&session_id, RuntimeAttachmentStatus::Ready)
+            .unwrap();
+        let usage = snapshot.usage.unwrap();
+        assert_eq!(usage.context_window_used_tokens, Some(47_500));
+        assert_eq!(usage.context_window_size_tokens, Some(200_000));
+
+        client.close_session(&binding).await.unwrap();
+        drop(lifecycle);
+        drop(bridge);
+        drop(client);
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mock_acp_agent_per_profile_pool_reuses_process_and_routes_updates() {
+        let Some(fixture) = MockAcpFixture::create("pool-reuse") else {
+            return;
+        };
+        fixture.enable_per_profile_pool(true);
+        let client = Arc::new(fixture.client());
+        let session_a_id = VibexSessionId::new();
+        let session_b_id = VibexSessionId::new();
+
+        let session_a = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_a_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let session_b = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_b_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: Some("mock/model-2".to_string()),
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session_a.native_session_id.as_deref(),
+            Some("mock-session-1")
+        );
+        assert_eq!(
+            session_b.native_session_id.as_deref(),
+            Some("mock-session-2")
+        );
+        let log = fixture.request_log();
+        assert_eq!(logged_request_count(&log, "initialize"), 1);
+        assert_eq!(logged_request_count(&log, "session/new"), 2);
+
+        let binding_a = test_binding_for(&session_a_id, &fixture.profile_id, &session_a);
+        let binding_b = test_binding_for(&session_b_id, &fixture.profile_id, &session_b);
+        let resumed_a = client.resume_session(binding_a.clone()).await.unwrap();
+        let resumed_b = client.resume_session(binding_b.clone()).await.unwrap();
+        assert_eq!(
+            resumed_a
+                .session_config_state
+                .as_ref()
+                .and_then(|state| state.current_model.as_ref())
+                .map(|model| model.value.as_str()),
+            Some("mock/model-1")
+        );
+        assert_eq!(
+            resumed_b
+                .session_config_state
+                .as_ref()
+                .and_then(|state| state.current_model.as_ref())
+                .map(|model| model.value.as_str()),
+            Some("mock/model-2")
+        );
+        let (tx_a, mut rx_a) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_b, mut rx_b) = tokio::sync::mpsc::unbounded_channel();
+
+        prepare_and_send_turn(
+            &client,
+            AcpSendTurnRequest {
+                session_id: session_a_id.clone(),
+                message_submission_id: None,
+                required_runtime: None,
+                text: "alpha".to_string(),
+                attachments: Vec::new(),
+                workspace_root: fixture.workspace.display().to_string(),
+                binding: binding_a.clone(),
+                runtime_resources: ProviderRuntimeResources::default(),
+                execution_identity: None,
+                event_sender: Some(tx_a),
+            },
+        )
+        .await
+        .unwrap();
+        prepare_and_send_turn(
+            &client,
+            AcpSendTurnRequest {
+                session_id: session_b_id.clone(),
+                message_submission_id: None,
+                required_runtime: None,
+                text: "bravo".to_string(),
+                attachments: Vec::new(),
+                workspace_root: fixture.workspace.display().to_string(),
+                binding: binding_b.clone(),
+                runtime_resources: ProviderRuntimeResources::default(),
+                execution_identity: None,
+                event_sender: Some(tx_b),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(collect_text_events(&mut rx_a), "mock-session-1:alpha");
+        assert_eq!(collect_text_events(&mut rx_b), "mock-session-2:bravo");
+        let pooled_process_id = client
+            .current_attachment(&session_a_id)
+            .unwrap()
+            .fence()
+            .process_instance_id
+            .clone();
+
+        client.close_session(&binding_a).await.unwrap();
+        assert!(client.live_process(&session_b_id).is_some());
+        client.close_session(&binding_b).await.unwrap();
+        assert!(client.live_process(&session_b_id).is_none());
+        let warm = client
+            .process_registry
+            .snapshot(&pooled_process_id)
+            .unwrap();
+        assert_eq!(warm.status, AcpProcessStatus::Ready);
+        assert_eq!(warm.attached_session_count, 0);
+        assert!(warm.reusable);
+        client
+            .process_registry
+            .shutdown(&pooled_process_id)
+            .await
+            .unwrap();
+        client.process_registry.remove(&pooled_process_id).unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pooled_permissions_and_interrupt_are_attachment_local() {
+        let Some(fixture) = MockAcpFixture::create("pool-permission-isolation") else {
+            return;
+        };
+        fixture.enable_per_profile_pool(true);
+        let client = fixture.client();
+        let session_a_id = VibexSessionId::new();
+        let session_b_id = VibexSessionId::new();
+        let session_a = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_a_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let session_b = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_b_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding_a = test_binding_for(&session_a_id, &fixture.profile_id, &session_a);
+        let binding_b = test_binding_for(&session_b_id, &fixture.profile_id, &session_b);
+        let attachment_a = client.current_attachment(&session_a_id).unwrap();
+        let attachment_b = client.current_attachment(&session_b_id).unwrap();
+        let payload_a = attachment_a.payload();
+        let payload_b = attachment_b.payload();
+        let process = payload_a.process();
+        let process_instance_id = payload_a.process_instance_id().clone();
+        assert!(Arc::ptr_eq(&process, &payload_b.process()));
+        let (tx_a, mut rx_a) = mpsc::unbounded_channel();
+        let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+        payload_a.begin_turn(TurnSink::Channel(tx_a)).unwrap();
+        payload_b.begin_turn(TurnSink::Channel(tx_b)).unwrap();
+
+        for (rpc_id, native_session_id) in [
+            (701, payload_a.native_session_id.as_str()),
+            (702, payload_b.native_session_id.as_str()),
+        ] {
+            process.handle_permission_request(
+                json!(rpc_id),
+                &json!({
+                    "sessionId": native_session_id,
+                    "toolCall": { "kind": "execute", "toolCallId": format!("tool-{rpc_id}") },
+                    "options": [
+                        { "optionId": "allow", "kind": "allow_once" },
+                        { "optionId": "deny", "kind": "reject_once" }
+                    ]
+                }),
+            );
+        }
+        let request_a = match rx_a.recv().await.unwrap() {
+            AcpEvent::PermissionRequest {
+                request_id: Some(request_id),
+                ..
+            } => request_id,
+            other => panic!("unexpected session A event: {other:?}"),
+        };
+        let _request_b = match rx_b.recv().await.unwrap() {
+            AcpEvent::PermissionRequest {
+                request_id: Some(request_id),
+                ..
+            } => request_id,
+            other => panic!("unexpected session B event: {other:?}"),
+        };
+        assert_eq!(payload_a.state.lock().unwrap().pending_permissions.len(), 1);
+        assert_eq!(payload_b.state.lock().unwrap().pending_permissions.len(), 1);
+
+        client
+            .resolve_permission(AcpPermissionResolution {
+                binding: binding_a.clone(),
+                resolution: vibex_core::PermissionResolution {
+                    request_id: request_a,
+                    session_id: session_a_id.clone(),
+                    response: PermissionResponseKind::Approve,
+                    responder_device_id: None,
+                    provider_resolution_id: None,
+                    note: None,
+                    resolved_at_ms: unix_timestamp_ms(),
+                },
+            })
+            .await
+            .unwrap();
+        assert!(
+            payload_a
+                .state
+                .lock()
+                .unwrap()
+                .pending_permissions
+                .is_empty()
+        );
+        assert_eq!(payload_b.state.lock().unwrap().pending_permissions.len(), 1);
+        client.interrupt(&binding_b).await.unwrap();
+        assert!(
+            payload_b
+                .state
+                .lock()
+                .unwrap()
+                .pending_permissions
+                .is_empty()
+        );
+        for (native_session_id, title, mode) in [
+            (payload_a.native_session_id.as_str(), "tool-a", "mode-a"),
+            (payload_b.native_session_id.as_str(), "tool-b", "mode-b"),
+        ] {
+            process.handle_session_update(&json!({
+                "sessionId": native_session_id,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "shared-tool-id",
+                    "title": title,
+                    "kind": "execute",
+                    "status": "pending"
+                }
+            }));
+            process.handle_session_update(&json!({
+                "sessionId": native_session_id,
+                "update": {
+                    "sessionUpdate": "current_mode_update",
+                    "currentModeId": mode
+                }
+            }));
+        }
+        {
+            let state_a = payload_a.state.lock().unwrap();
+            let state_b = payload_b.state.lock().unwrap();
+            assert_eq!(
+                state_a.tool_calls["shared-tool-id"].title.as_str(),
+                "tool-a"
+            );
+            assert_eq!(
+                state_b.tool_calls["shared-tool-id"].title.as_str(),
+                "tool-b"
+            );
+            assert_eq!(state_a.current_mode_id.as_deref(), Some("mode-a"));
+            assert_eq!(state_b.current_mode_id.as_deref(), Some("mode-b"));
+        }
+        payload_a.finish_turn(false).unwrap();
+        payload_b.finish_turn(false).unwrap();
+        client.close_session(&binding_a).await.unwrap();
+        assert_eq!(
+            client
+                .process_registry
+                .snapshot(&process_instance_id)
+                .unwrap()
+                .attached_session_count,
+            1
+        );
+        client.close_session(&binding_b).await.unwrap();
+        let warm = client
+            .process_registry
+            .snapshot(&process_instance_id)
+            .unwrap();
+        assert_eq!(warm.status, AcpProcessStatus::Ready);
+        assert_eq!(warm.attached_session_count, 0);
+        assert!(warm.reusable);
+        client
+            .process_registry
+            .shutdown(&process_instance_id)
+            .await
+            .unwrap();
+        client
+            .process_registry
+            .remove(&process_instance_id)
+            .unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn crashed_attachment_rebuild_rejects_stale_turn_and_late_old_process_events() {
+        let Some(fixture) = MockAcpFixture::create("crash-rebuild-fence") else {
+            return;
+        };
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        let old = client.current_attachment(&session_id).unwrap();
+        let old_fence = old.fence().clone();
+        let old_process = old.payload().process();
+        let mut stale_request = AcpSendTurnRequest {
+            session_id: session_id.clone(),
+            message_submission_id: None,
+            required_runtime: None,
+            text: "stale prepared turn".to_string(),
+            attachments: Vec::new(),
+            workspace_root: fixture.workspace.display().to_string(),
+            binding: binding.clone(),
+            runtime_resources: ProviderRuntimeResources::default(),
+            execution_identity: None,
+            event_sender: None,
+        };
+        stale_request.execution_identity =
+            client.prepare_turn_execution(&stale_request).await.unwrap();
+        assert_eq!(
+            stale_request
+                .execution_identity
+                .as_ref()
+                .unwrap()
+                .activation_generation,
+            old_fence.activation_generation as i64
+        );
+        Arc::clone(&old_process).handle_process_exit().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while old.state().unwrap() != crate::SessionAttachmentState::Crashed {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        prepare_and_send_turn(
+            &client,
+            AcpSendTurnRequest {
+                session_id: session_id.clone(),
+                message_submission_id: None,
+                required_runtime: None,
+                text: "rebuilt".to_string(),
+                attachments: Vec::new(),
+                workspace_root: fixture.workspace.display().to_string(),
+                binding: binding.clone(),
+                runtime_resources: ProviderRuntimeResources::default(),
+                execution_identity: None,
+                event_sender: None,
+            },
+        )
+        .await
+        .unwrap();
+        let rebuilt = client.current_attachment(&session_id).unwrap();
+        assert_eq!(rebuilt.binding_id(), old.binding_id());
+        assert!(rebuilt.fence().activation_generation > old_fence.activation_generation);
+        assert_ne!(
+            rebuilt.fence().process_instance_id,
+            old_fence.process_instance_id
+        );
+        assert!(
+            client
+                .process_registry
+                .snapshot(&old_fence.process_instance_id)
+                .is_err()
+        );
+
+        let prompt_count = logged_request_count(&fixture.request_log(), "session/prompt");
+        let stale_error = client.send_turn(stale_request).await.unwrap_err();
+        assert_eq!(stale_error.code, "turn_execution_identity_mismatch");
+        assert_eq!(
+            logged_request_count(&fixture.request_log(), "session/prompt"),
+            prompt_count
+        );
+        let payload = rebuilt.payload();
+        {
+            let state = payload.state.lock().unwrap();
+            assert!(state.active_turn.is_none());
+            assert!(state.pending_permissions.is_empty());
+        }
+
+        let (events, mut event_rx) = mpsc::unbounded_channel();
+        payload.begin_turn(TurnSink::Channel(events)).unwrap();
+        old_process.handle_session_update(&json!({
+            "sessionId": old_fence.native_session_id,
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "late-old" }
+            }
+        }));
+        assert!(event_rx.try_recv().is_err());
+        payload.process().handle_session_update(&json!({
+            "sessionId": payload.native_session_id,
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "current" }
+            }
+        }));
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(AcpEvent::AssistantDelta { text_delta, .. }) if text_delta == "current"
+        ));
+        client.attachment_router.handle_crash(&old_fence);
+        assert_eq!(
+            rebuilt.state().unwrap(),
+            crate::SessionAttachmentState::Committed
+        );
+        payload.finish_turn(false).unwrap();
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pooled_process_crash_fans_out_once_through_attachment_fences() {
+        let Some(fixture) = MockAcpFixture::create("pool-crash-fanout") else {
+            return;
+        };
+        fixture.enable_per_profile_pool(true);
+        let client = fixture.client();
+        let session_a_id = VibexSessionId::new();
+        let session_b_id = VibexSessionId::new();
+        let session_a = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_a_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let session_b = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_b_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding_a = test_binding_for(&session_a_id, &fixture.profile_id, &session_a);
+        let binding_b = test_binding_for(&session_b_id, &fixture.profile_id, &session_b);
+        let attachment_a = client.current_attachment(&session_a_id).unwrap();
+        let attachment_b = client.current_attachment(&session_b_id).unwrap();
+        let payload_a = attachment_a.payload();
+        let payload_b = attachment_b.payload();
+        let process = payload_a.process();
+        assert!(Arc::ptr_eq(&process, &payload_b.process()));
+        let (tx_a, mut rx_a) = mpsc::unbounded_channel();
+        let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+        payload_a.begin_turn(TurnSink::Channel(tx_a)).unwrap();
+        payload_b.begin_turn(TurnSink::Channel(tx_b)).unwrap();
+
+        Arc::clone(&process).handle_process_exit().await;
+        for receiver in [&mut rx_a, &mut rx_b] {
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                    .await
+                    .unwrap(),
+                Some(AcpEvent::Error { code, recoverable: true, .. })
+                    if code == "acp_process_exited"
+            ));
+        }
+        assert_eq!(
+            attachment_a.state().unwrap(),
+            crate::SessionAttachmentState::Crashed
+        );
+        assert_eq!(
+            attachment_b.state().unwrap(),
+            crate::SessionAttachmentState::Crashed
+        );
+        Arc::clone(&process).handle_process_exit().await;
+        assert!(rx_a.try_recv().is_err());
+        assert!(rx_b.try_recv().is_err());
+        assert!(client.current_attachment(&session_a_id).is_none());
+        assert!(client.current_attachment(&session_b_id).is_none());
+
+        client.close_session(&binding_a).await.unwrap();
+        client.close_session(&binding_b).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_terminal_projection_tracks_create_kill_release_wait_and_cleanup() {
+        let Some(fixture) = MockAcpFixture::create("terminal-active-projection") else {
+            return;
+        };
+        let service = fixture.service();
+        let mut config = service
+            .get_acp_profile_config(fixture.profile_id.clone())
+            .unwrap();
+        config.terminal_tools = true;
+        service
+            .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                provider_profile_id: fixture.profile_id.clone(),
+                config,
+            })
+            .unwrap();
+        let terminal_host = Arc::new(MockTerminalHost::default());
+        let client = AcpRuntimeClient::with_terminal_host(service, terminal_host.clone());
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        let attachment = client.current_attachment(&session_id).unwrap();
+        let payload = attachment.payload();
+        let process = payload.process();
+        assert!(!payload.active_work_snapshot().active_terminal);
+
+        for (index, operation) in ["kill", "release", "wait"].into_iter().enumerate() {
+            resolve_terminal_create_permission(
+                process.clone(),
+                Some(payload.clone()),
+                PendingTerminalCreate {
+                    rpc_id: json!(700 + index),
+                    request: AcpTerminalCreateRequest {
+                        session_id: Some(payload.native_session_id.clone()),
+                        command: "echo".to_string(),
+                        args: vec![operation.to_string()],
+                        cwd: None,
+                        env: Vec::new(),
+                        title: None,
+                    },
+                },
+                PermissionResponseKind::Approve,
+            )
+            .await
+            .unwrap();
+            let terminal_id = terminal_host.created_ids.lock().unwrap()[index].clone();
+            assert!(payload.active_work_snapshot().active_terminal);
+            let params = json!({ "terminalId": terminal_id.as_str() });
+            match operation {
+                "kill" => process.handle_terminal_kill(json!(710 + index), &params),
+                "release" => process.handle_terminal_release(json!(710 + index), &params),
+                "wait" => process.handle_terminal_wait_for_exit(json!(710 + index), &params),
+                _ => unreachable!(),
+            }
+            timeout(Duration::from_secs(1), async {
+                while payload.active_work_snapshot().active_terminal {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        assert_eq!(terminal_host.killed.lock().unwrap().len(), 1);
+        assert_eq!(terminal_host.released.lock().unwrap().len(), 1);
+        assert_eq!(terminal_host.waited.lock().unwrap().len(), 1);
+
+        resolve_terminal_create_permission(
+            process.clone(),
+            Some(payload.clone()),
+            PendingTerminalCreate {
+                rpc_id: json!(720),
+                request: AcpTerminalCreateRequest {
+                    session_id: Some(payload.native_session_id.clone()),
+                    command: "echo".to_string(),
+                    args: vec!["cleanup".to_string()],
+                    cwd: None,
+                    env: Vec::new(),
+                    title: None,
+                },
+            },
+            PermissionResponseKind::Approve,
+        )
+        .await
+        .unwrap();
+        assert!(payload.active_work_snapshot().active_terminal);
+        client.close_session(&binding).await.unwrap();
+        assert!(!payload.active_work_snapshot().active_terminal);
+        assert!(process.active_terminal_owners.lock().unwrap().is_empty());
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_and_unknown_native_ids_never_fallback_to_dedicated_attachment() {
+        let Some(fixture) = MockAcpFixture::create("strict-native-route") else {
+            return;
+        };
+        let service = fixture.service();
+        let mut config = service
+            .get_acp_profile_config(fixture.profile_id.clone())
+            .unwrap();
+        config.terminal_tools = true;
+        service
+            .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                provider_profile_id: fixture.profile_id.clone(),
+                config,
+            })
+            .unwrap();
+        let terminal_host = Arc::new(MockTerminalHost::default());
+        let client = AcpRuntimeClient::with_terminal_host(service, terminal_host.clone());
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        let attachment = client.current_attachment(&session_id).unwrap();
+        let payload = attachment.payload();
+        let process = payload.process();
+        let (events, mut event_rx) = mpsc::unbounded_channel();
+        payload.begin_turn(TurnSink::Channel(events)).unwrap();
+
+        for params in [
+            json!({
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "missing" }
+                }
+            }),
+            json!({
+                "sessionId": "unknown-native-session",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "unknown" }
+                }
+            }),
+        ] {
+            process.handle_session_update(&params);
+        }
+        assert!(event_rx.try_recv().is_err());
+
+        process.handle_permission_request(
+            json!(901),
+            &json!({ "toolCall": { "kind": "execute" }, "options": [] }),
+        );
+        process.handle_permission_request(
+            json!(902),
+            &json!({
+                "sessionId": "unknown-native-session",
+                "toolCall": { "kind": "execute" },
+                "options": []
+            }),
+        );
+        process
+            .handle_terminal_create(json!(903), &json!({ "command": "echo", "args": ["hello"] }));
+        {
+            let state = payload.state.lock().unwrap();
+            assert!(state.pending_permissions.is_empty());
+            assert!(state.pending_terminal_creates.is_empty());
+        }
+        assert!(terminal_host.created.lock().unwrap().is_empty());
+        let debug = { process.debug_log.lock().unwrap().messages() };
+        for rpc_id in [901, 902, 903] {
+            assert!(debug.iter().any(|message| {
+                message.direction == AcpDebugDirection::Outgoing
+                    && message.message.contains(&format!("\"id\":{rpc_id}"))
+            }));
+        }
+
+        payload.finish_turn(false).unwrap();
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mock_acp_agent_per_profile_pool_separates_workspaces() {
+        let Some(fixture) = MockAcpFixture::create("pool-workspace") else {
+            return;
+        };
+        fixture.enable_per_profile_pool(true);
+        let client = fixture.client();
+        let session_a_id = VibexSessionId::new();
+        let session_b_id = VibexSessionId::new();
+        let other_workspace = fixture.alternate_workspace("workspace-b");
+
+        let session_a = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_a_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let session_b = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_b_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: other_workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session_a.native_session_id.as_deref(),
+            Some("mock-session-1")
+        );
+        assert_eq!(
+            session_b.native_session_id.as_deref(),
+            Some("mock-session-1")
+        );
+        assert_eq!(
+            logged_request_count(&fixture.request_log(), "initialize"),
+            2
+        );
+
+        client
+            .close_session(&test_binding_for(
+                &session_a_id,
+                &fixture.profile_id,
+                &session_a,
+            ))
+            .await
+            .unwrap();
+        client
+            .close_session(&test_binding_for(
+                &session_b_id,
+                &fixture.profile_id,
+                &session_b,
+            ))
+            .await
+            .unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mock_acp_agent_unsafe_pool_request_falls_back_to_per_session() {
+        let Some(fixture) = MockAcpFixture::create("pool-fallback") else {
+            return;
+        };
+        fixture.enable_per_profile_pool(false);
+        let client = fixture.client();
+        let session_a_id = VibexSessionId::new();
+        let session_b_id = VibexSessionId::new();
+
+        let session_a = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_a_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let session_b = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_b_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session_a.native_session_id.as_deref(),
+            Some("mock-session-1")
+        );
+        assert_eq!(
+            session_b.native_session_id.as_deref(),
+            Some("mock-session-1")
+        );
+        assert_eq!(
+            logged_request_count(&fixture.request_log(), "initialize"),
+            2
+        );
+        assert!(session_a.redacted_metadata.iter().any(|entry| {
+            entry.key == "processStrategyEffective" && entry.value == "per_session"
+        }));
+        assert!(session_a.redacted_metadata.iter().any(|entry| {
+            entry.key == "processPoolFallback"
+                && entry.value == "acp_multi_session_capability_missing"
+        }));
+
+        client
+            .close_session(&test_binding_for(
+                &session_a_id,
+                &fixture.profile_id,
+                &session_a,
+            ))
+            .await
+            .unwrap();
+        client
+            .close_session(&test_binding_for(
+                &session_b_id,
+                &fixture.profile_id,
+                &session_b,
+            ))
+            .await
+            .unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mock_acp_agent_probe_lists_models() {
+        let Some(fixture) = MockAcpFixture::create("probe") else {
+            return;
+        };
+        let client = AcpRuntimeClient::new(ProviderConfigService::new(fixture.db_path.clone()));
+
+        let probed = client
+            .probe_runtime_session_config(&fixture.profile_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            probed.models,
+            vec!["mock/model-1".to_string(), "mock/model-2".to_string()]
+        );
+        assert_eq!(
+            probed
+                .modes
+                .iter()
+                .map(|mode| (mode.value.as_str(), mode.label.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![("build", Some("Build")), ("review", Some("Review"))]
+        );
+        assert_eq!(
+            probed
+                .reasoning_efforts
+                .iter()
+                .map(|effort| effort.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high"]
+        );
+
+        let models = client
+            .list_runtime_models(&fixture.profile_id)
+            .await
+            .unwrap();
+        assert_eq!(models, probed.models);
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn codex_stateless_model_probe_lists_per_model_reasoning() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "codex-model-capabilities",
+            Some(AgentId::parse("codex").unwrap()),
+        ) else {
+            return;
+        };
+        let client = AcpRuntimeClient::new(ProviderConfigService::new(fixture.db_path.clone()));
+
+        let capabilities = client
+            .list_runtime_model_capabilities(&fixture.profile_id)
+            .await
+            .unwrap();
+
+        assert_eq!(capabilities.len(), 2);
+        assert_eq!(capabilities[0].model, "mock/model-1");
+        assert_eq!(
+            capabilities[0].default_reasoning_effort.as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            capabilities[0]
+                .reasoning_efforts
+                .iter()
+                .map(|effort| effort.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high"]
+        );
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn codex_provider_model_list_merges_stateless_reasoning_evidence() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "codex-provider-model-capabilities",
+            Some(AgentId::parse("codex").unwrap()),
+        ) else {
+            return;
+        };
+        let service = ProviderConfigService::new(fixture.db_path.clone());
+        let mut config = service
+            .get_acp_profile_config(fixture.profile_id.clone())
+            .unwrap();
+        config.models = vec!["mock/model-1".to_string(), "configured-only".to_string()];
+        service
+            .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                provider_profile_id: fixture.profile_id.clone(),
+                config,
+            })
+            .unwrap();
+        let provider = crate::AcpAgentProvider::with_config_service(
+            Arc::new(AcpRuntimeClient::new(service.clone())),
+            service,
+        );
+
+        let response = provider
+            .list_models(Some(&fixture.profile_id))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.models,
+            vec!["mock/model-1".to_string(), "configured-only".to_string()]
+        );
+        assert_eq!(response.model_capabilities.len(), 1);
+        assert_eq!(response.model_capabilities[0].model, "mock/model-1");
+        assert_eq!(
+            response.model_capabilities[0]
+                .reasoning_efforts
+                .iter()
+                .map(|effort| effort.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high"]
+        );
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.key == "modelCapabilities" && diagnostic.value == "codex_app_server"
+        }));
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mock_acp_agent_lists_and_imports_native_session() {
+        let Some(fixture) = MockAcpFixture::create("list-import") else {
+            return;
+        };
+        let client = fixture.client();
+
+        let candidates = client
+            .list_sessions(
+                &fixture.profile_id,
+                Some(fixture.workspace.to_string_lossy().as_ref()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].native_session_id.as_deref(),
+            Some("mock-import-session")
+        );
+        assert_eq!(
+            candidates[0].continuation_status,
+            ExternalSessionContinuationStatus::Resumable
+        );
+        assert_eq!(candidates[0].updated_at_ms, Some(123));
+
+        let session_id = VibexSessionId::new();
+        let session = client
+            .import_session(AcpImportSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                native_session_id: Some("mock-import-session".to_string()),
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: fixture_mcp_resources(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session.native_session_id.as_deref(),
+            Some("mock-import-session")
+        );
+        let load_session = find_logged_request(&fixture.request_log(), "session/load");
+        assert_eq!(
+            load_session["params"]["mcpServers"][0]["id"],
+            json!("filesystem")
+        );
+        let config = session
+            .session_config_state
+            .as_ref()
+            .expect("load config state");
+        assert_eq!(config.current_model.as_ref().unwrap().value, "mock/model-2");
+        assert_eq!(config.current_mode.as_ref().unwrap().value, "review");
+        assert!(
+            config
+                .options
+                .iter()
+                .any(|option| option.id == "reviewDepth")
+        );
+        client
+            .close_session(&test_binding_for(
+                &session_id,
+                &fixture.profile_id,
+                &session,
+            ))
+            .await
+            .unwrap();
+        fixture.cleanup();
+    }
+
+    /// Live verification against a locally installed `opencode` CLI. Ignored
+    /// by default; run with `cargo test -p vibex-agent-acp -- --ignored` on a
+    /// machine with an authenticated opencode install.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires a local authenticated opencode CLI"]
+    async fn real_opencode_acp_handshake_and_prompt() {
+        let opencode = which_binary("opencode").expect("opencode CLI must be on PATH");
+        let unique = RequestId::new();
+        let root = std::env::temp_dir().join(format!("vibex-acp-real-{}", unique.as_str()));
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let db_path = root.join("vibex.db");
+        let service = ProviderConfigService::new(db_path.clone());
+        let profile = service
+            .create_acp_profile(vibex_core::AcpProviderProfileCreateRequest {
+                agent_id: None,
+                display_name: "OpenCode ACP live".to_string(),
+                account_alias: None,
+                preset_id: None,
+                config: Some(AcpProviderConfig {
+                    command: opencode,
+                    args: vec!["acp".to_string()],
+                    env: Vec::new(),
+                    cwd_template: Some("{workspaceRoot}".to_string()),
+                    process_strategy: vibex_core::AcpProcessStrategy::default(),
+                    terminal_tools: false,
+                    terminal_auth: false,
+                    models: Vec::new(),
+                    modes: Vec::new(),
+                    features: vec![
+                        "streaming".to_string(),
+                        "tool_calls".to_string(),
+                        "permission_requests".to_string(),
+                        "reasoning".to_string(),
+                        "interrupt".to_string(),
+                    ],
+                    disabled_tools: Vec::new(),
+                }),
+            })
+            .unwrap();
+
+        let client = AcpRuntimeClient::new(ProviderConfigService::new(db_path.clone()));
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: profile.id.clone(),
+                model: None,
+                workspace_root: workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        assert!(session.native_session_id.is_some());
+        eprintln!(
+            "live opencode session metadata: {:?}",
+            session.redacted_metadata
+        );
+
+        let binding = test_binding_for(&session_id, &profile.id, &session);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let turn = tokio::time::timeout(
+            Duration::from_secs(120),
+            prepare_and_send_turn(
+                &client,
+                AcpSendTurnRequest {
+                    session_id: session_id.clone(),
+                    message_submission_id: None,
+                    required_runtime: None,
+                    text:
+                        "Reply with exactly: vibex-acp-runtime-ok. Do not run tools or edit files."
+                            .to_string(),
+                    attachments: Vec::new(),
+                    workspace_root: workspace.display().to_string(),
+                    binding: binding.clone(),
+                    runtime_resources: ProviderRuntimeResources::default(),
+                    execution_identity: None,
+                    event_sender: Some(event_tx),
+                },
+            ),
+        )
+        .await
+        .expect("live opencode prompt timed out")
+        .unwrap();
+
+        let mut streamed_text = String::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let AcpEvent::AssistantDelta { text_delta, .. } = event {
+                streamed_text.push_str(&text_delta);
+            }
+        }
+        eprintln!("live opencode streamed text: {streamed_text:?}");
+        assert!(turn.completed);
+        assert!(!streamed_text.trim().is_empty());
+
+        client.close_session(&binding).await.unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn which_binary(name: &str) -> Option<String> {
+        let path = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate.display().to_string());
+            }
+        }
+        None
+    }
+
+    /// Full unified-layer loop: AgentManager -> AcpAgentProvider ->
+    /// AcpRuntimeClient -> mock ACP CLI, including a mid-turn permission that
+    /// is resolved through the manager while the provider turn stays blocked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_manager_runs_permission_loop_against_mock_acp_agent() {
+        use vibex_agent::{
+            AgentManager, MessageSubmissionCoordinator, MessageSubmissionCoordinatorConfig,
+            RuntimeSelectionService, RuntimeSelectionServiceConfig, RuntimeSwitchCoordinator,
+            RuntimeSwitchCoordinatorConfig, manager_message_dispatcher,
+        };
+        use vibex_core::{
+            AgentSessionState, CreateAgentSessionRequest, FetchTimelineRequest,
+            PermissionRequestStatus, ResolvePermissionRequest, SendAgentMessageRequest,
+            TimelinePayload, WorkspaceMode,
+        };
+
+        let Some(fixture) = MockAcpFixture::create("manager-loop") else {
+            return;
+        };
+
+        // The builtin ACP agent ships disabled; enable it like the config
+        // center would before creating sessions.
+        ProviderConfigService::new(fixture.db_path.clone())
+            .update_agent_config(vibex_core::AgentUpdateConfigRequest {
+                agent_id: vibex_core::AgentId::parse("opencode").unwrap(),
+                added: Some(true),
+                enabled: Some(true),
+                label_override: None,
+                description_override: None,
+                order_index: None,
+                command: None,
+                env: None,
+                params: None,
+            })
+            .unwrap();
+
+        let service = ProviderConfigService::new(fixture.db_path.clone());
+        let mut config = service
+            .get_acp_profile_config(fixture.profile_id.clone())
+            .unwrap();
+        config.models = vec!["mock/model-1".to_string()];
+        config.modes = vec!["build".to_string()];
+        service
+            .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                provider_profile_id: fixture.profile_id.clone(),
+                config,
+            })
+            .unwrap();
+        let client = Arc::new(AcpRuntimeClient::new(service.clone()));
+        let provider_client: Arc<dyn AcpClient> = client.clone();
+        let provider = crate::AcpAgentProvider::with_config_service(provider_client, service);
+        let agent_id = vibex_core::AgentId::parse(OPENCODE_AGENT_ID).unwrap();
+        let mut manager = AgentManager::new(&fixture.db_path).unwrap();
+        manager
+            .register_runtime(client.route_key_for_agent(&agent_id), Arc::new(provider))
+            .unwrap();
+        let manager = Arc::new(manager);
+        let bridge = Arc::new(
+            AcpRuntimeSwitchBridge::new(&fixture.db_path, client, manager.clone()).unwrap(),
+        );
+        let coordinator = RuntimeSwitchCoordinator::new(
+            &fixture.db_path,
+            bridge.clone(),
+            bridge.clone(),
+            RuntimeSwitchCoordinatorConfig::default(),
+        )
+        .unwrap();
+        let runtime_selection = Arc::new(
+            RuntimeSelectionService::new(
+                coordinator,
+                bridge,
+                RuntimeSelectionServiceConfig::default(),
+            )
+            .unwrap(),
+        );
+        manager
+            .install_runtime_selection_service(&runtime_selection)
+            .unwrap();
+        let message_submission = Arc::new(
+            MessageSubmissionCoordinator::new(
+                &fixture.db_path,
+                runtime_selection,
+                manager_message_dispatcher(&manager),
+                MessageSubmissionCoordinatorConfig::default(),
+            )
+            .unwrap(),
+        );
+        manager
+            .install_message_submission_coordinator(&message_submission)
+            .unwrap();
+
+        let selection = SessionRuntimeSelection {
+            agent_id,
+            provider_profile_id: fixture.profile_id.clone(),
+            model_id: "mock/model-1".to_string(),
+            reasoning_effort: None,
+            mode_id: Some("build".to_string()),
+            config_values: Default::default(),
+        };
+        let session = manager
+            .create_session(CreateAgentSessionRequest {
+                runtime: selection.clone(),
+                workspace_root: fixture.workspace.display().to_string(),
+                workspace_mode: WorkspaceMode::CurrentCheckout,
+                title: Some("mock acp".to_string()),
+                safety: None,
+            })
+            .await
+            .unwrap();
+        let conn = open_database(&fixture.db_path).unwrap();
+        let runtime_state = AgentSessionRuntimeRepository::get_runtime_state(&conn, &session.id)
+            .unwrap()
+            .unwrap();
+        let current_binding = RuntimeBindingRepository::get(
+            &conn,
+            runtime_state.current_binding_id.as_ref().unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            current_binding.native_session_id.as_deref(),
+            Some("mock-session-1")
+        );
+        drop(conn);
+
+        let send_manager = Arc::clone(&manager);
+        let send_session_id = session.id.clone();
+        let send_runtime = selection;
+        let send_task = tokio::spawn(async move {
+            send_manager
+                .send_message(SendAgentMessageRequest {
+                    session_id: send_session_id,
+                    message_idempotency_key: "acp-runtime-permission".to_string(),
+                    desired_runtime: send_runtime,
+                    text: "please ask permission".to_string(),
+                    attachments: Vec::new(),
+                    reasoning_effort: None,
+                    correlation_id: None,
+                })
+                .await
+        });
+
+        // Poll the persisted timeline until the streamed permission request
+        // lands, then resolve it through the manager mid-turn.
+        let mut permission = None;
+        for _ in 0..100 {
+            let page = manager
+                .fetch_timeline(FetchTimelineRequest {
+                    session_id: session.id.clone(),
+                    after_sequence: Some(0),
+                    limit: 200,
+                })
+                .await
+                .unwrap();
+            permission = page.items.iter().find_map(|item| match &item.payload {
+                TimelinePayload::PermissionRequest(request)
+                    if request.status == PermissionRequestStatus::Pending =>
+                {
+                    Some(request.clone())
+                }
+                _ => None,
+            });
+            if permission.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let permission = permission.expect("streamed permission request must persist");
+
+        manager
+            .resolve_permission(ResolvePermissionRequest {
+                session_id: session.id.clone(),
+                request_id: permission.id.clone(),
+                resolution: vibex_core::PermissionResolution {
+                    request_id: permission.id.clone(),
+                    session_id: session.id.clone(),
+                    response: PermissionResponseKind::Approve,
+                    responder_device_id: None,
+                    provider_resolution_id: None,
+                    note: None,
+                    resolved_at_ms: vibex_core::unix_timestamp_ms(),
+                },
+            })
+            .await
+            .unwrap();
+
+        let appended = tokio::time::timeout(Duration::from_secs(15), send_task)
+            .await
+            .expect("turn must finish after approval")
+            .unwrap()
+            .unwrap();
+        assert!(appended.iter().any(|item| {
+            matches!(
+                &item.payload,
+                TimelinePayload::AgentMessageDelta(delta)
+                    if delta.text_delta.contains("permission approved")
+            ) || matches!(
+                &item.payload,
+                TimelinePayload::AgentMessage(message)
+                    if message.text.contains("permission approved")
+            )
+        }));
+
+        // The permission was resolved during the turn, so the session must
+        // settle in Idle rather than NeedsInput.
+        let session = manager.get_session(&session.id).await.unwrap();
+        assert_eq!(session.state, AgentSessionState::Idle);
+
+        manager.delete_session(&session.id).await.unwrap();
+        fixture.cleanup();
+    }
+}

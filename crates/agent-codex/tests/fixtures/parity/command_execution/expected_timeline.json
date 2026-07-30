@@ -1,0 +1,32 @@
+{
+  "events": [
+    {
+      "payload": {
+        "data": {
+          "command": "cargo test -p demo",
+          "cwd": null,
+          "exitCode": 0,
+          "outputSummary": "running 12 tests\ntest result: ok. 12 passed",
+          "status": "completed"
+        },
+        "type": "command"
+      },
+      "providerCorrelationId": null,
+      "source": "agent"
+    },
+    {
+      "payload": {
+        "data": {
+          "command": "cargo build --broken-flag",
+          "cwd": null,
+          "exitCode": 2,
+          "outputSummary": "error: unexpected argument",
+          "status": "failed"
+        },
+        "type": "command"
+      },
+      "providerCorrelationId": null,
+      "source": "agent"
+    }
+  ]
+}

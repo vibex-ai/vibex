@@ -1,0 +1,308 @@
+{
+  "schemaVersion": "vibex-workflow-e2e.v1",
+  "updatedAt": "2026-07-27T05:42:29.751Z",
+  "candidate": {
+    "source": {
+      "sourceCommit": "31d6472872a62ec928943c2f898844a9b9823d2e",
+      "sourceTreeSha256": "14f6574fe0b3e76209ac8674eebe294e1a0d6a16134c590330ed92e24d0b49ea",
+      "workflowSourceTreeSha256": "99e0e6a3c341573b0ae790adf00e75694657593e4ee64f2cbb91bb240474b86a",
+      "mobileShellTreeSha256": "a7810c32de3980a4bce1c79e9e4b316c499cef8ae7d6d053092fbdcf9416b3da",
+      "cargoLockSha256": "0108279ede3db5dc4edd67bc344af6cec5f6fc2d80e669830cb2dafbdef4147b",
+      "pnpmLockSha256": "df26c51e92664204660cb635da559d120aaa86f3a9f2c1ed2e94e8512967bb69",
+      "zedRevision": "c9e8e611dbc279afa0914d28c4d37ad07f38c03b",
+      "gpuiComponentRevision": "031555662e99a1b5a549990b47f246d475b8288a"
+    },
+    "webBuild": {
+      "buildId": "58440410f73e9ca75972c579",
+      "profile": "release",
+      "wasmBytes": 23794647,
+      "wasmSha256": "3379c60d3d28a595baa111e2d130e487ebb6ded883acd94d5a2e6ad1152b65ab",
+      "glueSha256": "b7efcf349dde598d2e0c8db6c4d7c409bf2bbd858d75fc1b906516135edc22e4",
+      "staticSha256": "554ab5db0323f8f9c5f1750adbbe9f203b46b9d61094572b0c32c96bf065934b",
+      "buildJsonSha256": "e501dd4f6ed562899f5460bb87e46191af876ef8fd11c09e8b86a838415f055d",
+      "hostJsSha256": "75cb95b39ab7efb7dafa8f1aae78748a3b29e42f4d0e8baf79e3e23543b67f35"
+    },
+    "androidApk": {
+      "path": "apps/mobile/artifacts/vibex-gate-debug.apk",
+      "bytes": 17791167,
+      "sha256": "445590ff481757326e0d3f60d5d476d0b622dda31f4f2ba6b35ce0efac0ff35a",
+      "applicationId": "dev.vibex.remote"
+    },
+    "candidateDigest": "675fd4fca6ecdcdaf65feb61c69016af2dac5f27c717c39e9902712b05a6c19c"
+  },
+  "targets": {
+    "web_browser": {
+      "direct": {
+        "target": "web_browser",
+        "transport": "direct",
+        "status": "passed",
+        "capturedAt": "2026-07-27T04:11:19.515Z",
+        "candidateDigest": "675fd4fca6ecdcdaf65feb61c69016af2dac5f27c717c39e9902712b05a6c19c",
+        "environment": {
+          "kind": "browser",
+          "browserName": "chromium",
+          "browserVersion": "149.0.7827.55",
+          "platformSha256": "4bf1a9639120f17570c8149517f79a799f067b685f1c9a844e6cef611257c881"
+        },
+        "topology": {
+          "kind": "lan_or_private_network",
+          "endpointSha256": "7a4da15c3acefd63503d8021ed372936ec4b7c2633f58052f381b72ce03d9bba",
+          "selfHosted": true,
+          "e2ee": false,
+          "officialService": false
+        },
+        "workflows": {
+          "agent": {
+            "status": "passed",
+            "permission": "passed",
+            "businessResult": "passed",
+            "liveEvent": "passed",
+            "reconnectRecovery": "passed",
+            "errorCode": null
+          },
+          "files": {
+            "status": "passed",
+            "permission": "passed",
+            "businessResult": "passed",
+            "liveEvent": "passed",
+            "reconnectRecovery": "passed",
+            "errorCode": null
+          },
+          "git": {
+            "status": "passed",
+            "permission": "passed",
+            "businessResult": "passed",
+            "liveEvent": "passed",
+            "reconnectRecovery": "passed",
+            "errorCode": null
+          },
+          "terminal": {
+            "status": "passed",
+            "permission": "passed",
+            "businessResult": "passed",
+            "liveEvent": "passed",
+            "reconnectRecovery": "passed",
+            "errorCode": null
+          },
+          "management": {
+            "status": "passed",
+            "permission": "passed",
+            "businessResult": "passed",
+            "liveEvent": "passed",
+            "reconnectRecovery": "passed",
+            "errorCode": null
+          }
+        },
+        "permissionContractSha256": "c37a1c7b6ffad4ee0a86d33e1af1d218bc72b0800d7e60ae7da6e37363e7a0a2",
+        "redactionScan": "passed"
+      },
+      "relay": {
+        "target": "web_browser",
+        "transport": "relay",
+        "status": "passed",
+        "capturedAt": "2026-07-27T04:13:13.906Z",
+        "candidateDigest": "675fd4fca6ecdcdaf65feb61c69016af2dac5f27c717c39e9902712b05a6c19c",
+        "environment": {
+          "kind": "browser",
+          "browserName": "chromium",
+          "browserVersion": "149.0.7827.55",
+          "platformSha256": "4bf1a9639120f17570c8149517f79a799f067b685f1c9a844e6cef611257c881"
+        },
+        "topology": {
+          "kind": "self_hosted_relay",
+          "endpointSha256": "237b0d3a26d27147d1feb3da5174ee1a805d8080be1f313009f2769e33db0b39",
+          "selfHosted": true,
+          "e2ee": true,
+          "officialService": false
+        },
+        "workflows": {
+          "agent": {
+            "status": "passed",
+            "permission": "passed",
+            "businessResult": "passed",
+            "liveEvent": "passed",
+            "reconnectRecovery": "passed",
+            "errorCode": null
+          },
+          "files": {
+            "status": "passed",
+            "permission": "passed",
+            "businessResult": "passed",
+            "liveEvent": "passed",
+            "reconnectRecovery": "passed",
+            "errorCode": null
+          },
+          "git": {
+            "status": "passed",
+            "permission": "passed",
+            "businessResult": "passed",
+            "liveEvent": "passed",
+            "reconnectRecovery": "passed",
+            "errorCode": null
+          },
+          "terminal": {
+            "status": "passed",
+            "permission": "passed",
+            "businessResult": "passed",
+            "liveEvent": "passed",
+            "reconnectRecovery": "passed",
+            "errorCode": null
+          },
+          "management": {
+            "status": "passed",
+            "permission": "passed",
+            "businessResult": "passed",
+            "liveEvent": "passed",
+            "reconnectRecovery": "passed",
+            "errorCode": null
+          }
+        },
+        "permissionContractSha256": "c37a1c7b6ffad4ee0a86d33e1af1d218bc72b0800d7e60ae7da6e37363e7a0a2",
+        "redactionScan": "passed"
+      }
+    },
+    "android_physical": {
+      "direct": {
+        "target": "android_physical",
+        "transport": "direct",
+        "status": "passed",
+        "capturedAt": "2026-07-27T05:40:54.049Z",
+        "candidateDigest": "675fd4fca6ecdcdaf65feb61c69016af2dac5f27c717c39e9902712b05a6c19c",
+        "environment": {
+          "kind": "android",
+          "physical": true,
+          "deviceIdentitySha256": "d470dea9980a4e944d60558546590d4680bbea960b2023e685c4af9876deb379",
+          "model": "PJD110",
+          "osVersion": "16",
+          "webViewVersion": "149.0.7827.163",
+          "apkSha256": "445590ff481757326e0d3f60d5d476d0b622dda31f4f2ba6b35ce0efac0ff35a"
+        },
+        "topology": {
+          "kind": "lan_or_private_network",
+          "endpointSha256": "7a4da15c3acefd63503d8021ed372936ec4b7c2633f58052f381b72ce03d9bba",
+          "selfHosted": true,
+          "e2ee": false,
+          "officialService": false
+        },
+        "workflows": {
+          "agent": {
+            "status": "passed",
+            "permission": "passed",
+            "businessResult": "passed",
+            "liveEvent": "passed",
+            "reconnectRecovery": "passed",
+            "errorCode": null
+          },
+          "files": {
+            "status": "passed",
+            "permission": "passed",
+            "businessResult": "passed",
+            "liveEvent": "passed",
+            "reconnectRecovery": "passed",
+            "errorCode": null
+          },
+          "git": {
+            "status": "passed",
+            "permission": "passed",
+            "businessResult": "passed",
+            "liveEvent": "passed",
+            "reconnectRecovery": "passed",
+            "errorCode": null
+          },
+          "terminal": {
+            "status": "passed",
+            "permission": "passed",
+            "businessResult": "passed",
+            "liveEvent": "passed",
+            "reconnectRecovery": "passed",
+            "errorCode": null
+          },
+          "management": {
+            "status": "passed",
+            "permission": "passed",
+            "businessResult": "passed",
+            "liveEvent": "passed",
+            "reconnectRecovery": "passed",
+            "errorCode": null
+          }
+        },
+        "permissionContractSha256": "c37a1c7b6ffad4ee0a86d33e1af1d218bc72b0800d7e60ae7da6e37363e7a0a2",
+        "redactionScan": "passed"
+      },
+      "relay": {
+        "target": "android_physical",
+        "transport": "relay",
+        "status": "passed",
+        "capturedAt": "2026-07-27T05:42:29.751Z",
+        "candidateDigest": "675fd4fca6ecdcdaf65feb61c69016af2dac5f27c717c39e9902712b05a6c19c",
+        "environment": {
+          "kind": "android",
+          "physical": true,
+          "deviceIdentitySha256": "d470dea9980a4e944d60558546590d4680bbea960b2023e685c4af9876deb379",
+          "model": "PJD110",
+          "osVersion": "16",
+          "webViewVersion": "149.0.7827.163",
+          "apkSha256": "445590ff481757326e0d3f60d5d476d0b622dda31f4f2ba6b35ce0efac0ff35a"
+        },
+        "topology": {
+          "kind": "self_hosted_relay",
+          "endpointSha256": "237b0d3a26d27147d1feb3da5174ee1a805d8080be1f313009f2769e33db0b39",
+          "selfHosted": true,
+          "e2ee": true,
+          "officialService": false
+        },
+        "workflows": {
+          "agent": {
+            "status": "passed",
+            "permission": "passed",
+            "businessResult": "passed",
+            "liveEvent": "passed",
+            "reconnectRecovery": "passed",
+            "errorCode": null
+          },
+          "files": {
+            "status": "passed",
+            "permission": "passed",
+            "businessResult": "passed",
+            "liveEvent": "passed",
+            "reconnectRecovery": "passed",
+            "errorCode": null
+          },
+          "git": {
+            "status": "passed",
+            "permission": "passed",
+            "businessResult": "passed",
+            "liveEvent": "passed",
+            "reconnectRecovery": "passed",
+            "errorCode": null
+          },
+          "terminal": {
+            "status": "passed",
+            "permission": "passed",
+            "businessResult": "passed",
+            "liveEvent": "passed",
+            "reconnectRecovery": "passed",
+            "errorCode": null
+          },
+          "management": {
+            "status": "passed",
+            "permission": "passed",
+            "businessResult": "passed",
+            "liveEvent": "passed",
+            "reconnectRecovery": "passed",
+            "errorCode": null
+          }
+        },
+        "permissionContractSha256": "c37a1c7b6ffad4ee0a86d33e1af1d218bc72b0800d7e60ae7da6e37363e7a0a2",
+        "redactionScan": "passed"
+      }
+    }
+  },
+  "redaction": {
+    "bounded": true,
+    "containsSecrets": false,
+    "containsUserContent": false,
+    "containsRawLogs": false,
+    "containsPairingMaterial": false
+  }
+}

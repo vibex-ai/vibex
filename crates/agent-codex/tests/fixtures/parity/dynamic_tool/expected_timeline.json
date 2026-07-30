@@ -1,0 +1,19 @@
+{
+  "events": [
+    {
+      "payload": {
+        "data": {
+          "inputSummary": "{\"style\":\"compact\"}",
+          "outputSummary": "status=completed",
+          "status": "completed",
+          "summary": "Codex tool call",
+          "toolCallId": "item_dyn_1",
+          "toolName": "custom_formatter"
+        },
+        "type": "tool_call"
+      },
+      "providerCorrelationId": null,
+      "source": "agent"
+    }
+  ]
+}

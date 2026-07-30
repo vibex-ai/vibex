@@ -1,0 +1,18 @@
+[package]
+name = "vibex-db"
+version = "0.1.0-rc.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dirs = "6"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde.workspace = true
+serde_json.workspace = true
+vibex-core = { path = "../core" }
+
+[[bin]]
+name = "vibex-db-smoke"
+path = "src/bin/vibex-db-smoke.rs"

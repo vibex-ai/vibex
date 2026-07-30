@@ -1,0 +1,47 @@
+{
+  "schemaVersion": "native-frame-evidence.v1",
+  "status": "blocked",
+  "capturedAt": "2026-07-18T11:23:03.735Z",
+  "source": {
+    "vibexBaselineCommit": "f1c624f115401d6160a771545fa1ec73128394b1",
+    "zedRevision": "819fe337999551ce8177b14c8db1127645617ae4",
+    "gpuiComponentRevision": "3c270ed244d06fb211b47f156761c1d833eac535",
+    "lockfileSha256": "6bafd6ea8d8aa706f6a51a01d7884c6f00209247b716f5cb6ba4e4b8a3aa80a4",
+    "gpuiShellTreeSha256": "86dcd7138fc80a5b421f9b4c35b350f18ff5115498c7987591eea72ec82c8aab"
+  },
+  "runner": {
+    "platform": "linux",
+    "architecture": "x64",
+    "displayBackend": "x11-xvfb",
+    "displaySize": "1200x780x24",
+    "scaleFactor": 1,
+    "syntheticDisplay": true
+  },
+  "window": {
+    "identity": "dev.vibex.desktop.preview",
+    "discovered": true,
+    "borderlessRequested": true
+  },
+  "capture": {
+    "screenshotPath": "docs/parity/screenshots/current/spikes/linux-x11-xvfb-black.png",
+    "screenshotSha256": "ecc1118f88607fa1b0e09ba95537d54d99bfcef19a0a7d033f9d351065816919",
+    "width": 1200,
+    "height": 780,
+    "uniqueColors": 1,
+    "entropy": 0,
+    "mean": 0,
+    "standardDeviation": 0
+  },
+  "nativePixelsVerified": false,
+  "blocker": {
+    "code": "xvfb-frame-is-uniform",
+    "summary": "The GPUI X11 window exists, but its captured client area is one uniform color.",
+    "dri3MentionedByProcess": true,
+    "disposition": "Keep Linux X11 native pixels blocked until a DRI3/Vulkan-capable native runner captures non-uniform application pixels."
+  },
+  "limitations": [
+    "Xvfb is a synthetic X11 display and cannot prove physical-display DPI behavior.",
+    "This capture does not prove pointer, keyboard, clipboard, focus, accessibility, or IME behavior.",
+    "A discovered native window is not equivalent to rendered application pixels."
+  ]
+}

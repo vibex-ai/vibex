@@ -1,0 +1,64 @@
+name: vibex-relay
+
+services:
+  relay-server:
+    build:
+      context: ../..
+      dockerfile: deploy/relay/Dockerfile
+    image: vibex-relay-server:local
+    container_name: vibex-relay-server
+    restart: unless-stopped
+    environment:
+      VIBEX_RELAY_BIND_ADDR: 0.0.0.0:9700
+      VIBEX_RELAY_WEB_STATIC_DIR: /app/web
+      VIBEX_RELAY_ROOM_TTL_MS: "${VIBEX_RELAY_ROOM_TTL_MS:-3600000}"
+      VIBEX_RELAY_BRIDGE_TIMEOUT_MS: "${VIBEX_RELAY_BRIDGE_TIMEOUT_MS:-30000}"
+      VIBEX_RELAY_HEARTBEAT_TIMEOUT_MS: "${VIBEX_RELAY_HEARTBEAT_TIMEOUT_MS:-45000}"
+      VIBEX_RELAY_MAX_ROOMS: "${VIBEX_RELAY_MAX_ROOMS:-1024}"
+      VIBEX_RELAY_MAX_TOTAL_CONNECTIONS: "${VIBEX_RELAY_MAX_TOTAL_CONNECTIONS:-4096}"
+      VIBEX_RELAY_MAX_PENDING_PER_ROOM: "${VIBEX_RELAY_MAX_PENDING_PER_ROOM:-64}"
+      VIBEX_RELAY_MAX_CONNECTIONS_PER_ROOM: "${VIBEX_RELAY_MAX_CONNECTIONS_PER_ROOM:-1}"
+      VIBEX_RELAY_MAX_DEVICES_PER_ROOM: "${VIBEX_RELAY_MAX_DEVICES_PER_ROOM:-8}"
+      VIBEX_RELAY_MAX_BODY_BYTES: "${VIBEX_RELAY_MAX_BODY_BYTES:-1048576}"
+      VIBEX_RELAY_RATE_LIMIT_WINDOW_MS: "${VIBEX_RELAY_RATE_LIMIT_WINDOW_MS:-1000}"
+      VIBEX_RELAY_MAX_REQUESTS_PER_WINDOW_PER_ROOM: "${VIBEX_RELAY_MAX_REQUESTS_PER_WINDOW_PER_ROOM:-120}"
+      VIBEX_RELAY_MAX_QUEUE_BYTES_PER_CONNECTION: "${VIBEX_RELAY_MAX_QUEUE_BYTES_PER_CONNECTION:-4194304}"
+      VIBEX_RELAY_MAX_BANDWIDTH_BYTES_PER_WINDOW: "${VIBEX_RELAY_MAX_BANDWIDTH_BYTES_PER_WINDOW:-16777216}"
+      VIBEX_RELAY_MAX_PUSH_INSTALLATIONS: "${VIBEX_RELAY_MAX_PUSH_INSTALLATIONS:-256}"
+      VIBEX_RELAY_MAX_PUSH_DEDUP_ENTRIES: "${VIBEX_RELAY_MAX_PUSH_DEDUP_ENTRIES:-4096}"
+      VIBEX_RELAY_PUSH_ADAPTER_TIMEOUT_MS: "${VIBEX_RELAY_PUSH_ADAPTER_TIMEOUT_MS:-10000}"
+      VIBEX_RELAY_PUSH_PROVIDER: "${VIBEX_RELAY_PUSH_PROVIDER:-}"
+      VIBEX_RELAY_PUSH_AUTH_TOKEN: "${VIBEX_RELAY_PUSH_AUTH_TOKEN:-}"
+      VIBEX_RELAY_PUSH_ADAPTER_URL: "${VIBEX_RELAY_PUSH_ADAPTER_URL:-}"
+      VIBEX_RELAY_PUSH_ADAPTER_AUTH_TOKEN: "${VIBEX_RELAY_PUSH_ADAPTER_AUTH_TOKEN:-}"
+    ports:
+      - "${VIBEX_RELAY_HOST_BIND:-127.0.0.1}:9700:9700"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9700/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: vibex-relay-caddy
+    restart: unless-stopped
+    profiles:
+      - caddy
+    environment:
+      VIBEX_RELAY_SITE_ADDRESS: ${VIBEX_RELAY_SITE_ADDRESS:-relay.example.com}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      relay-server:
+        condition: service_healthy
+
+volumes:
+  caddy-data:
+  caddy-config:

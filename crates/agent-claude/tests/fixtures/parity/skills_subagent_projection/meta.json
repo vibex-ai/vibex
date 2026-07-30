@@ -1,0 +1,9 @@
+{
+  "capability": "skills_subagent_projection",
+  "mode": "meta_only",
+  "source": "observation snapshot 2026-07-11",
+  "sdk": "offline compatibility metadata",
+  "recorded_at": "2026-07-11",
+  "known_defects": [],
+  "notes": "Retained as sanitized historical Skills projection evidence. Online Skills injection is owned by the managed Claude ACP runtime."
+}

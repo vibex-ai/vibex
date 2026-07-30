@@ -1,0 +1,20 @@
+[package]
+name = "vibex-terminal"
+version = "0.1.0-rc.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+alacritty_terminal.workspace = true
+vibex-terminal-ui = { path = "../vibex-terminal-ui" }
+portable-pty = "0.9"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+vibex-core = { path = "../core" }
+
+[[bin]]
+name = "vibex-pty-smoke"
+path = "src/bin/vibex-pty-smoke.rs"

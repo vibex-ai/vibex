@@ -1,0 +1,9 @@
+{
+  "capability": "mcp_injection",
+  "mode": "meta_only",
+  "source": "observation snapshot 2026-07-11",
+  "sdk": "offline compatibility metadata",
+  "recorded_at": "2026-07-11",
+  "known_defects": [],
+  "notes": "Retained as sanitized MCP projection evidence. Online MCP injection is owned by the managed Claude ACP runtime and typed profile projection."
+}

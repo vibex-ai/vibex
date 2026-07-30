@@ -1,0 +1,336 @@
+{
+  "events": [
+    {
+      "kind": "tool_call",
+      "payload": {
+        "data": {
+          "inputSummary": "{\"query\":\"serde tagged enums\"}",
+          "outputSummary": "2 matches",
+          "rawExtension": {
+            "contentBlocks": [],
+            "locations": [],
+            "meta": {
+              "status": "completed"
+            },
+            "rawInput": "{\"query\":\"serde tagged enums\"}",
+            "rawOutput": {
+              "mode": "snapshot",
+              "text": "2 matches"
+            },
+            "schemaVersion": 1,
+            "truncated": false
+          },
+          "status": "completed",
+          "summary": "Lookup docs",
+          "toolCallId": "acp_event_a5fab0278803f713130882c8f69d139c",
+          "toolName": "lookup_docs"
+        },
+        "type": "tool_call"
+      },
+      "providerCorrelationId": "acp_event_4e74946339ae01e8ff89f4a001fb8cc2",
+      "redactionState": "contains_redactions",
+      "source": "agent"
+    },
+    {
+      "kind": "command",
+      "payload": {
+        "data": {
+          "command": "cargo test -p demo",
+          "cwd": "workspace",
+          "exitCode": 0,
+          "outputSummary": "running 2 tests",
+          "rawExtension": {
+            "contentBlocks": [],
+            "locations": [],
+            "meta": {
+              "exit_code": "0"
+            },
+            "rawInput": "{\"command\":\"cargo test -p demo\",\"cwd\":\"workspace\"}",
+            "rawOutput": {
+              "mode": "snapshot",
+              "text": "running 2 tests"
+            },
+            "schemaVersion": 1,
+            "truncated": false
+          },
+          "status": "started"
+        },
+        "type": "command"
+      },
+      "providerCorrelationId": "acp_event_39d33493188569ff3c0f395eef2901b7",
+      "redactionState": "contains_redactions",
+      "source": "agent"
+    },
+    {
+      "kind": "command",
+      "payload": {
+        "data": {
+          "command": "cargo test -p demo",
+          "cwd": "workspace",
+          "exitCode": 0,
+          "outputSummary": "running 2 tests\ntest result: ok",
+          "rawExtension": {
+            "contentBlocks": [],
+            "locations": [],
+            "meta": {
+              "exit_code": "0"
+            },
+            "rawInput": "{\"command\":\"cargo test -p demo\",\"cwd\":\"workspace\"}",
+            "rawOutput": {
+              "mode": "append",
+              "text": "\ntest result: ok"
+            },
+            "schemaVersion": 1,
+            "truncated": false
+          },
+          "status": "completed"
+        },
+        "type": "command"
+      },
+      "providerCorrelationId": "acp_event_39d33493188569ff3c0f395eef2901b7",
+      "redactionState": "contains_redactions",
+      "source": "agent"
+    },
+    {
+      "kind": "file_operation",
+      "payload": {
+        "data": {
+          "operation": "write",
+          "path": "src/new.rs",
+          "rawExtension": {
+            "contentBlocks": [
+              {
+                "blockType": "diff",
+                "summary": "diff src/lib.rs"
+              }
+            ],
+            "locations": [
+              {
+                "column": 3,
+                "line": 7,
+                "uri": "src/lib.rs"
+              }
+            ],
+            "meta": {},
+            "rawInput": "{\"changes\":[{\"kind\":\"add\",\"path\":\"src/new.rs\"},{\"kind\":\"update\",\"path\":\"src/lib.rs\"},{\"kind\":\"delete\",\"path\":\"src/old.rs\"}]}",
+            "rawOutput": null,
+            "schemaVersion": 1,
+            "truncated": false
+          },
+          "summary": "Wrote src/new.rs"
+        },
+        "type": "file_operation"
+      },
+      "providerCorrelationId": "acp_event_da2e95a2f6f690b4ab14075b1d59363a",
+      "redactionState": "contains_redactions",
+      "source": "agent"
+    },
+    {
+      "kind": "file_operation",
+      "payload": {
+        "data": {
+          "operation": "edit",
+          "path": "src/lib.rs",
+          "rawExtension": {
+            "contentBlocks": [
+              {
+                "blockType": "diff",
+                "summary": "diff src/lib.rs"
+              }
+            ],
+            "locations": [
+              {
+                "column": 3,
+                "line": 7,
+                "uri": "src/lib.rs"
+              }
+            ],
+            "meta": {},
+            "rawInput": "{\"changes\":[{\"kind\":\"add\",\"path\":\"src/new.rs\"},{\"kind\":\"update\",\"path\":\"src/lib.rs\"},{\"kind\":\"delete\",\"path\":\"src/old.rs\"}]}",
+            "rawOutput": null,
+            "schemaVersion": 1,
+            "truncated": false
+          },
+          "summary": "Edited src/lib.rs"
+        },
+        "type": "file_operation"
+      },
+      "providerCorrelationId": "acp_event_b1cd6adf4a3b7939025fc8b2f32ede23",
+      "redactionState": "contains_redactions",
+      "source": "agent"
+    },
+    {
+      "kind": "file_operation",
+      "payload": {
+        "data": {
+          "operation": "delete",
+          "path": "src/old.rs",
+          "rawExtension": {
+            "contentBlocks": [
+              {
+                "blockType": "diff",
+                "summary": "diff src/lib.rs"
+              }
+            ],
+            "locations": [
+              {
+                "column": 3,
+                "line": 7,
+                "uri": "src/lib.rs"
+              }
+            ],
+            "meta": {},
+            "rawInput": "{\"changes\":[{\"kind\":\"add\",\"path\":\"src/new.rs\"},{\"kind\":\"update\",\"path\":\"src/lib.rs\"},{\"kind\":\"delete\",\"path\":\"src/old.rs\"}]}",
+            "rawOutput": null,
+            "schemaVersion": 1,
+            "truncated": false
+          },
+          "summary": "Deleted src/old.rs"
+        },
+        "type": "file_operation"
+      },
+      "providerCorrelationId": "acp_event_9268c21f762f6c30502fe03e2ec42365",
+      "redactionState": "contains_redactions",
+      "source": "agent"
+    },
+    {
+      "kind": "web_search",
+      "payload": {
+        "data": {
+          "query": "Rust structural JSON diff",
+          "rawExtension": {
+            "contentBlocks": [],
+            "locations": [],
+            "meta": {},
+            "rawInput": "{\"query\":\"Rust structural JSON diff\"}",
+            "rawOutput": {
+              "mode": "snapshot",
+              "text": "Found official docs"
+            },
+            "schemaVersion": 1,
+            "truncated": false
+          },
+          "resultSummary": "Found official docs",
+          "status": "completed"
+        },
+        "type": "web_search"
+      },
+      "providerCorrelationId": "acp_event_e15c5bfbc8a4d6c2f07ae1b7418d6210",
+      "redactionState": "contains_redactions",
+      "source": "agent"
+    },
+    {
+      "kind": "todo_update",
+      "payload": {
+        "data": {
+          "items": [
+            {
+              "status": "completed",
+              "title": "Write normalizer"
+            },
+            {
+              "status": "running",
+              "title": "Run fixtures"
+            }
+          ],
+          "rawExtension": {
+            "contentBlocks": [],
+            "locations": [],
+            "meta": {},
+            "rawInput": "{\"items\":[{\"completed\":true,\"text\":\"Write normalizer\"},{\"status\":\"running\",\"text\":\"Run fixtures\"}]}",
+            "rawOutput": null,
+            "schemaVersion": 1,
+            "truncated": false
+          },
+          "title": "Implementation tasks"
+        },
+        "type": "todo_update"
+      },
+      "providerCorrelationId": "acp_event_f4e634cf1d63f4ad9faf8b5ab7a142ce",
+      "redactionState": "contains_redactions",
+      "source": "agent"
+    },
+    {
+      "kind": "collaboration",
+      "payload": {
+        "data": {
+          "action": "spawn_agent",
+          "agentLabel": "reviewer",
+          "rawExtension": {
+            "contentBlocks": [],
+            "locations": [],
+            "meta": {},
+            "rawInput": "[redacted]",
+            "rawOutput": {
+              "mode": "snapshot",
+              "text": "Review complete"
+            },
+            "schemaVersion": 1,
+            "truncated": true
+          },
+          "status": "completed",
+          "summary": "Review the event contract"
+        },
+        "type": "collaboration"
+      },
+      "providerCorrelationId": "acp_event_beb6f8fb61b1e0437de259f6b2b15f90",
+      "redactionState": "contains_redactions",
+      "source": "agent"
+    },
+    {
+      "kind": "image_generation",
+      "payload": {
+        "data": {
+          "imageReference": "asset:image-1",
+          "mimeType": "image/png",
+          "rawExtension": {
+            "contentBlocks": [
+              {
+                "blockType": "image",
+                "summary": "image/png"
+              }
+            ],
+            "locations": [],
+            "meta": {},
+            "rawInput": "{\"imageReference\":\"asset:image-1\",\"mimeType\":\"image/png\"}",
+            "rawOutput": null,
+            "schemaVersion": 1,
+            "truncated": false
+          },
+          "status": "completed",
+          "summary": "Generate architecture diagram"
+        },
+        "type": "image_generation"
+      },
+      "providerCorrelationId": "acp_event_df0f38dc850a41eec234b0a09d3360c1",
+      "redactionState": "contains_redactions",
+      "source": "agent"
+    },
+    {
+      "kind": "tool_call",
+      "payload": {
+        "data": {
+          "inputSummary": "{\"description\":\"No structured command field\"}",
+          "outputSummary": null,
+          "rawExtension": {
+            "contentBlocks": [],
+            "locations": [],
+            "meta": {},
+            "rawInput": "{\"description\":\"No structured command field\"}",
+            "rawOutput": null,
+            "schemaVersion": 1,
+            "truncated": false
+          },
+          "status": "completed",
+          "summary": "Ambiguous command marker",
+          "toolCallId": "acp_event_2d8d84e3569b7140e90c947daab73cd7",
+          "toolName": "command_execution"
+        },
+        "type": "tool_call"
+      },
+      "providerCorrelationId": "acp_event_8e91ca8b552c8e93e229265e298e158e",
+      "redactionState": "contains_redactions",
+      "source": "agent"
+    }
+  ]
+}

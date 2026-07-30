@@ -1,0 +1,11 @@
+{
+  "capability": "slash_commands",
+  "mode": "meta_only",
+  "source": "observation snapshot 2026-07-11",
+  "sdk": "offline compatibility metadata",
+  "recorded_at": "2026-07-11",
+  "known_defects": [
+    "This historical metadata snapshot did not include live ACP command discovery."
+  ],
+  "notes": "Online commands are discovered and executed through the durable managed ACP runtime; this fixture is offline evidence only."
+}

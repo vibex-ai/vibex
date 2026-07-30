@@ -1,0 +1,11 @@
+{
+  "capability": "fork_rollback_capability",
+  "mode": "meta_only",
+  "source": "observation snapshot 2026-07-11",
+  "sdk": "offline compatibility metadata",
+  "recorded_at": "2026-07-11",
+  "known_defects": [
+    "This historical metadata snapshot declared fork and rollback without executable evidence."
+  ],
+  "notes": "Online fork and rollback availability is published only from exact managed ACP compatibility evidence."
+}

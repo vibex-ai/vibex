@@ -1,0 +1,173 @@
+{
+  "schemaVersion": "terminal-linux-evidence.v1",
+  "status": "partial",
+  "capturedAt": "2026-07-18T11:23:55.396Z",
+  "source": {
+    "vibexBaselineCommit": "f1c624f115401d6160a771545fa1ec73128394b1",
+    "captureParentCommit": "65efcb3ee74e711bb9d25ca0f55af7b36dc3b0c8",
+    "rustToolchain": "rustc 1.97.0 (2d8144b78 2026-07-07) (Arch Linux rust 1:1.97.0-1)",
+    "lockfileSha256": "6bafd6ea8d8aa706f6a51a01d7884c6f00209247b716f5cb6ba4e4b8a3aa80a4",
+    "sourceInputRoots": [
+      "Cargo.lock",
+      "Cargo.toml",
+      "rust-toolchain.toml",
+      "apps/desktop/Cargo.toml",
+      "apps/desktop/src",
+      "crates/terminal/Cargo.toml",
+      "crates/terminal/src",
+      "scripts/capture-terminal.mjs"
+    ],
+    "sourceInputTreeSha256": "518a7b9885c9d0c3a177762e7cd317489f2e3d97d02f2dbbfb9e2d00d79a9932"
+  },
+  "runner": {
+    "platform": "linux",
+    "architecture": "x64",
+    "kernelRelease": "7.1.3-arch1-3",
+    "syntheticPty": false,
+    "fixtureProvider": "python-stdlib"
+  },
+  "reference": {
+    "repository": "https://github.com/lassejlv/termy.git",
+    "revision": "03df18575fdda54619b86e277e7389d30972c302",
+    "licenseExpression": "MIT",
+    "engine": "alacritty_terminal 0.26.0",
+    "gpuiRevision": "c8656ac96d2344fc288b551943cc12fcb6ef56ad",
+    "vibexGpuiRevision": "819fe337999551ce817b14c8db1127645617ae4",
+    "directImportSelected": false,
+    "sourceCodeCopied": false,
+    "coupling": [
+      "termy_config_core",
+      "termy_search",
+      "termy_themes",
+      "termy_gpui_revision"
+    ]
+  },
+  "dependency": {
+    "name": "alacritty_terminal",
+    "version": "0.26.0",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "licenseExpression": "Apache-2.0",
+    "directFromVibexTerminal": true,
+    "linkedFromDesktop": true
+  },
+  "run": {
+    "schemaVersion": "vibex-terminal-feasibility-run.v1",
+    "status": "passed",
+    "platform": "linux",
+    "architecture": "x86_64",
+    "engine": {
+      "name": "alacritty_terminal",
+      "version": "0.26.0",
+      "integration": "termy-compatible-bounded-core-fallback"
+    },
+    "pty": {
+      "backend": "portable-pty-openpty",
+      "windowsConptyExercised": false,
+      "rawBytesObserved": true,
+      "invalidUtf8Observed": true,
+      "cjkObserved": true,
+      "resizeRequested": {
+        "rows": 42,
+        "columns": 132
+      },
+      "resizeObserved": true,
+      "inputBytesWritten": 289,
+      "processExited": true,
+      "rawDroppedChunks": 0
+    },
+    "emulator": {
+      "cjkCellsObserved": true,
+      "selectionCopyObserved": true,
+      "alternateScreenEntered": true,
+      "primaryScreenRestored": true,
+      "resizeObserved": true,
+      "ingestedBytes": 39
+    },
+    "throughput": {
+      "fixtureBytes": 10485760,
+      "fixtureSha256": "e5b844cc57f57094ea4585e235f36c78c1cd222262bb89d53c94dcb4d6b3e55d",
+      "elapsedMs": 551,
+      "mebibytesPerSecond": 18.12954316040422,
+      "dataLossObserved": false
+    },
+    "rawTextStored": false
+  },
+  "claims": [
+    {
+      "id": "termy_reference_boundary",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "alacritty_core_fallback",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "vibex_pty_raw_bytes",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "cjk_round_trip",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "selection_copy_model",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "resize_round_trip",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "alternate_screen",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "linux_10mb_no_loss",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "windows_conpty",
+      "status": "blocked",
+      "decisionBearing": true,
+      "blocker": {
+        "code": "hosted-conpty-not-run",
+        "summary": "Windows ConPTY must execute on the pinned windows-2022 hosted runner.",
+        "action": "Run the hosted native gate and merge its terminal probe evidence."
+      }
+    }
+  ],
+  "summary": {
+    "passedClaims": 8,
+    "blockedClaims": 1,
+    "terminalGateSatisfied": false
+  },
+  "recommendation": {
+    "route": "alacritty-core-adapter",
+    "termyDisposition": "reference-only",
+    "rationale": "Termy confirms the mature engine choice, but its core and renderer are coupled to Termy configuration/search/themes and a different GPUI revision.",
+    "productionEstimateEngineerWeeks": {
+      "min": 2,
+      "max": 4
+    }
+  },
+  "remainingRisks": [
+    "Windows ConPTY execution remains pending on the hosted runner.",
+    "The spike proves the emulator model and GPUI binary linkage, not a production terminal grid renderer or native clipboard UI."
+  ]
+}

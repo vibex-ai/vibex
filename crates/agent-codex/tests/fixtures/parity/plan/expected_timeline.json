@@ -1,0 +1,20 @@
+{
+  "events": [
+    {
+      "payload": {
+        "data": {
+          "steps": [
+            {
+              "status": "running",
+              "title": "1. Inspect the failing test\n2. Patch the parser\n3. Re-run the suite"
+            }
+          ],
+          "title": "Codex plan"
+        },
+        "type": "plan"
+      },
+      "providerCorrelationId": null,
+      "source": "agent"
+    }
+  ]
+}

@@ -1,0 +1,3 @@
+{"type":"user","uuid":"item-user-1","parentUuid":null,"cwd":"/tmp/vibex-claude-fixture","timestamp":"2026-06-25T00:00:00Z","message":{"role":"user","content":"Synthetic Claude user import prompt"}}
+this is not json
+{"type":"queue-operation","timestamp":"2026-06-25T00:00:01Z","content":"unsupported secret text TOKEN=secret must not appear in diagnostics"}

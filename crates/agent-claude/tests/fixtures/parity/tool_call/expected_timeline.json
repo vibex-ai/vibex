@@ -1,0 +1,19 @@
+{
+  "events": [
+    {
+      "payload": {
+        "data": {
+          "inputSummary": "{}",
+          "outputSummary": null,
+          "status": "started",
+          "summary": "Claude tool call",
+          "toolCallId": "toolu_parity_01",
+          "toolName": "Bash"
+        },
+        "type": "tool_call"
+      },
+      "providerCorrelationId": null,
+      "source": "agent"
+    }
+  ]
+}

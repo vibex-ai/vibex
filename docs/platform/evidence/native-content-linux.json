@@ -1,0 +1,196 @@
+{
+  "schemaVersion": "native-content-linux-evidence.v1",
+  "status": "partial",
+  "capturedAt": "2026-07-20T09:18:16.332Z",
+  "source": {
+    "captureParentCommit": "75fa162d00004e139b15f0987cb79c5be2071c84",
+    "dependencySourcePolicy": "upstream_git_root_cargo_lock",
+    "zedRevision": "c9e8e611dbc279afa0914d28c4d37ad07f38c03b",
+    "gpuiComponentRevision": "031555662e99a1b5a549990b47f246d475b8288a",
+    "rustToolchain": "rustc 1.97.1 (8bab26f4f 2026-07-14) (Arch Linux rust 1:1.97.1-1)",
+    "lockfileSha256": "2a460e5cd42aa18f99a362401994793283f1f78f9de5dfdd5739e43e87610a41",
+    "sourceInputRoots": [
+      "Cargo.lock",
+      "Cargo.toml",
+      "apps/desktop/Cargo.toml",
+      "apps/desktop/src/main.rs",
+      "apps/desktop/src/document_interaction.rs",
+      "apps/desktop/src/native_content.rs",
+      "apps/desktop/src/office_surface.rs",
+      "apps/desktop/src/pdf_surface.rs",
+      "apps/desktop/src/pdf_worker.rs",
+      "apps/desktop/src/terminal_surface.rs",
+      "crates/content/Cargo.toml",
+      "crates/content/src",
+      "crates/terminal/Cargo.toml",
+      "crates/terminal/src",
+      "docs/platform/fixtures/office-interaction.docx",
+      "scripts/capture-document-interaction-linux.mjs",
+      "scripts/capture-native-content-linux.mjs",
+      "scripts/generate-office-fixtures.mjs"
+    ],
+    "sourceInputTreeSha256": "2dde022e9adb29a56b22edfdf46be5aef2670a2d4e583c97fd8de51e40e422ba"
+  },
+  "runner": {
+    "platform": "linux",
+    "architecture": "x64",
+    "kernelRelease": "7.1.4-arch1-1",
+    "displayBackend": "wayland-hyprland",
+    "compositor": "Hyprland",
+    "syntheticDisplay": false,
+    "activeMonitorObserved": true,
+    "inputInjection": {
+      "name": "wtype",
+      "version": "0.4",
+      "sourceRevision": "d71be3a7b3f93b534a2823fd68cabd7ac2a02359",
+      "licenseExpression": "MIT",
+      "repository": "https://github.com/atx/wtype",
+      "binarySha256": "a7a4988f0e73844a689e1d22ca8991679ca19b9d066cd6cfd4c9bce84b0b9f13",
+      "packagedWithApplication": false
+    }
+  },
+  "window": {
+    "identity": "dev.vibex.desktop.preview",
+    "discovered": true,
+    "xwayland": false,
+    "monitorId": 1,
+    "width": 1200,
+    "height": 900
+  },
+  "capture": {
+    "screenshotPath": "docs/parity/screenshots/current/native-content/linux-wayland-terminal.png",
+    "screenshotSha256": "4c2d4732d9a56bcf6494e751131745f6795a3f42af90143b3d038a4092e44464",
+    "width": 1200,
+    "height": 900,
+    "uniqueColors": 8294,
+    "entropy": 0.249609,
+    "mean": 0.595068,
+    "standardDeviation": 0.442963
+  },
+  "process": {
+    "processExited": true,
+    "appExitCode": 0,
+    "panicMentioned": false
+  },
+  "run": {
+    "schemaVersion": "native-content-run.v1",
+    "status": "passed",
+    "terminal": {
+      "ptyCreated": true,
+      "rawByteSnapshots": true,
+      "imeCapableInput": true,
+      "commandSubmitted": true,
+      "commandMarkerObserved": true,
+      "frameRows": 20,
+      "frameColumns": 100,
+      "ingestedBytes": 96,
+      "nonBlankCells": 66,
+      "styledCells": 0,
+      "cursorPresent": true,
+      "fullRepaints": 1,
+      "partialRepaints": 1,
+      "terminalOutputStored": false
+    },
+    "web": {
+      "typedUnsupportedState": true,
+      "ordinaryNativeSurfaceAllocated": false,
+      "rightRailNativeSurfaceAllocated": false,
+      "profileOrCacheAllocated": false,
+      "networkTaskAllocated": false
+    },
+    "privacy": {
+      "terminalOutputStored": false,
+      "urlStored": false,
+      "pdfContentStored": false,
+      "officeContentStored": false
+    },
+    "limitations": [
+      "This physical slice proves a native Wayland frame and one live PTY command round trip.",
+      "PDF page/zoom and bounded Office rendering use a separate physical interaction protocol.",
+      "X11 and the five-minute Terminal stress/soak use separate evidence protocols."
+    ]
+  },
+  "externalEvidence": {
+    "terminalStress": {
+      "path": "docs/platform/evidence/terminal-stress-linux.json",
+      "sha256": "57ea16e489143b5e5137884a1442ddf71bafde87aa803fe4d5708baabd163d85",
+      "status": "passed"
+    },
+    "x11": {
+      "path": "docs/platform/evidence/native-content-x11-linux.json",
+      "sha256": "c32577a227bd6becabc9f479a4de76a947e6f2ec421ed47813d230c381ab83ce",
+      "status": "blocked"
+    }
+  },
+  "claims": [
+    {
+      "id": "native_wayland_window",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "live_pty_command_round_trip",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "raw_snapshot_frame",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "web_zero_allocation",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "diagnostics_redacted",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "clean_close_cleanup",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "x11_native_matrix",
+      "status": "blocked",
+      "decisionBearing": true,
+      "blocker": {
+        "code": "x11-native-matrix",
+        "owner": "desktop-native-content",
+        "action": "Run the protocol from an authorized, active physical Xorg session; XWayland and synthetic X servers are rejected."
+      }
+    },
+    {
+      "id": "terminal_stress_and_soak",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    },
+    {
+      "id": "pdf_office_interaction",
+      "status": "passed",
+      "decisionBearing": true,
+      "blocker": null
+    }
+  ],
+  "summary": {
+    "passedClaims": 8,
+    "blockedClaims": 1,
+    "nativeContentGateSatisfied": false
+  },
+  "limitations": [
+    "This capture proves one physical native Wayland frame and one live PTY command round trip.",
+    "The evidence stores no terminal output, URL, PDF content, or Office content.",
+    "wtype is an MIT capture-only prerequisite and is not linked or packaged with Vibex.",
+    "The five-minute Terminal stress matrix passed; independent physical Xorg remains a decision-bearing blocker."
+  ]
+}

@@ -1,0 +1,60 @@
+[package]
+name = "vibex-markdown"
+version = "0.1.0-rc.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["gpui", "artifact-engines"]
+gpui = ["dep:gpui", "dep:gpui-component", "dep:image", "dep:ropey"]
+artifact-engines = [
+  "dep:mathjax-svg-rs",
+  "dep:mermaid-rs-renderer",
+]
+
+[dependencies]
+base64.workspace = true
+gpui = { workspace = true, optional = true }
+gpui-component = { workspace = true, optional = true, features = [
+  "tree-sitter-bash",
+  "tree-sitter-c",
+  "tree-sitter-cpp",
+  "tree-sitter-csharp",
+  "tree-sitter-css",
+  "tree-sitter-diff",
+  "tree-sitter-go",
+  "tree-sitter-html",
+  "tree-sitter-java",
+  "tree-sitter-javascript",
+  "tree-sitter-kotlin",
+  "tree-sitter-lua",
+  "tree-sitter-markdown",
+  "tree-sitter-php",
+  "tree-sitter-python",
+  "tree-sitter-ruby",
+  "tree-sitter-rust",
+  "tree-sitter-sql",
+  "tree-sitter-swift",
+  "tree-sitter-toml",
+  "tree-sitter-tsx",
+  "tree-sitter-typescript",
+  "tree-sitter-yaml",
+  "tree-sitter-zig",
+] }
+html5ever.workspace = true
+image = { workspace = true, optional = true, features = ["gif", "jpeg", "png", "webp"] }
+markup5ever_rcdom.workspace = true
+mathjax-svg-rs = { workspace = true, optional = true }
+mermaid-rs-renderer = { workspace = true, optional = true }
+pulldown-cmark.workspace = true
+quick-xml.workspace = true
+ropey = { workspace = true, optional = true }
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

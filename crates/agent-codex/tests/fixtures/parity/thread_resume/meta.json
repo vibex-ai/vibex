@@ -1,0 +1,9 @@
+{
+  "capability": "thread_resume",
+  "mode": "transcript",
+  "source": "synthetic-offline (single stable session_meta id across the rollout)",
+  "sdk": "offline Codex transcript import parser",
+  "recorded_at": "2026-07-11",
+  "known_defects": [],
+  "notes": "A rollout with exactly one session_meta id yields continuation_status=resumable for offline import metadata. Online resume is owned exclusively by the managed ACP attachment and compatibility descriptor."
+}

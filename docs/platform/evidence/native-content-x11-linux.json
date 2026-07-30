@@ -1,0 +1,65 @@
+{
+  "schemaVersion": "native-content-x11-linux-evidence.v1",
+  "status": "blocked",
+  "capturedAt": "2026-07-19T07:43:24.340Z",
+  "source": {
+    "captureParentCommit": "1f51f0dbd31c7bdb990b87b1143fd7630f864031",
+    "rustToolchain": "rustc 1.97.0 (2d8144b78 2026-07-07) (Arch Linux rust 1:1.97.0-1)",
+    "lockfileSha256": "7a5488b1882681707399417335bf61343f78b9afaa9fbe054a41c3c98c5db959",
+    "sourceInputRoots": [
+      "Cargo.lock",
+      "Cargo.toml",
+      "apps/desktop/Cargo.toml",
+      "apps/desktop/src/main.rs",
+      "apps/desktop/src/native_content.rs",
+      "apps/desktop/src/terminal_surface.rs",
+      "crates/content/Cargo.toml",
+      "crates/content/src/terminal.rs",
+      "crates/terminal/Cargo.toml",
+      "crates/terminal/src",
+      "scripts/capture-native-content-x11-linux.mjs",
+      "scripts/x11-x-test-input.py"
+    ],
+    "sourceInputTreeSha256": "f7795d84b9fb19626b91f4cda1c1426b0a5f15cda66ece457ab041ad6ad119ef"
+  },
+  "runner": {
+    "platform": "linux",
+    "architecture": "x64",
+    "kernelRelease": "7.1.3-arch1-3",
+    "displayBackend": "xwayland-rejected",
+    "serverKind": "xwayland",
+    "syntheticDisplay": false,
+    "physicalXorgProcessObserved": true,
+    "independentXorgAuthorized": false,
+    "xwaylandDetected": true,
+    "physicalConnector": null,
+    "dri3Observed": false,
+    "xtestObserved": false,
+    "probedDisplayCount": 2
+  },
+  "capture": null,
+  "process": null,
+  "run": null,
+  "claims": [
+    {
+      "id": "x11_native_matrix",
+      "status": "blocked",
+      "decisionBearing": true,
+      "blocker": {
+        "code": "physical-xorg-authorization-unavailable",
+        "owner": "desktop-native-content",
+        "action": "Run the protocol from an authorized, active physical Xorg session; XWayland and synthetic X servers are rejected."
+      }
+    }
+  ],
+  "summary": {
+    "passedClaims": 0,
+    "blockedClaims": 1,
+    "x11NativeGateSatisfied": false
+  },
+  "limitations": [
+    "The active desktop is Wayland and its DISPLAY endpoint is XWayland, which is not reported as independent Xorg evidence.",
+    "A separate physical Xorg server process may exist, but this user session cannot authenticate to or prove an active output on it.",
+    "No window, pixels, keyboard input, or terminal behavior is claimed for X11."
+  ]
+}

@@ -1,0 +1,17 @@
+[package]
+name = "vibex-git"
+version = "0.1.0-rc.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fs2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+vibex-core = { path = "../core" }
+
+[[bin]]
+name = "vibex-git-smoke"
+path = "src/bin/vibex-git-smoke.rs"

@@ -1,0 +1,19 @@
+# Vibex Relay reverse proxy.
+# Set VIBEX_RELAY_SITE_ADDRESS to your public Relay host, for example:
+#   VIBEX_RELAY_SITE_ADDRESS=relay.example.com
+#
+# Caddy preserves WebSocket upgrades for /ws through reverse_proxy. PC and
+# device peers use this full-duplex path. Keep /api on the same origin for
+# health/info, push, the versioned HTTP pair/command compatibility bridge, and
+# the source-bound GPUI WebUI. URL fragments are browser-local and never enter
+# Caddy or Relay request logs.
+
+{$VIBEX_RELAY_SITE_ADDRESS:relay.example.com} {
+	encode zstd gzip
+
+	@websocket path /ws
+	reverse_proxy @websocket relay-server:9700
+
+	# Relay enforces request, queue, rate, bandwidth, and connection limits.
+	reverse_proxy relay-server:9700
+}

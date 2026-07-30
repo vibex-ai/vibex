@@ -1,0 +1,9 @@
+{
+  "capability": "session_resume",
+  "mode": "transcript",
+  "source": "synthetic-offline (single stable sessionId across records)",
+  "sdk": "offline Claude transcript import parser",
+  "recorded_at": "2026-07-11",
+  "known_defects": [],
+  "notes": "A transcript with exactly one sessionId yields continuation_status=resumable for offline import metadata. Online resume is owned exclusively by the managed ACP attachment and compatibility descriptor."
+}

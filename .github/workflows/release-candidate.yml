@@ -1,0 +1,69 @@
+name: Release Candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Isolated package channel
+        required: true
+        default: rc
+        type: choice
+        options:
+          - preview
+          - rc
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-candidate-${{ github.ref }}-${{ inputs.channel }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PACKAGER_VERSION: "0.11.8"
+  VIBEX_CHANNEL: ${{ inputs.channel }}
+
+jobs:
+  candidate:
+    name: Linux candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: pnpm/action-setup@7088e561eb65bb68695d245aa206f005ef30921d
+        with:
+          version: 11.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83
+        with:
+          components: rustfmt, clippy
+      - name: Install Linux native dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig1-dev libvulkan1 libxkbcommon-x11-dev patchelf
+      - name: Install dependencies and packager
+        run: |
+          pnpm install --frozen-lockfile
+          cargo install cargo-packager --version "${{ env.CARGO_PACKAGER_VERSION }}" --locked
+      - name: Verify candidate contracts
+        run: |
+          pnpm check:release
+          cargo test -p vibex-desktop-model -p vibex-desktop-runtime --locked
+      - name: Build exact release binary
+        run: |
+          node scripts/prepare-pdfium-runtime.mjs
+          node scripts/build-channel.mjs "${{ inputs.channel }}"
+      - name: Package isolated channel
+        run: NO_STRIP=1 cargo packager --config "apps/desktop/Packager.${{ inputs.channel }}.toml" --formats deb,appimage
+      - name: Upload exact Linux candidate for native lifecycle gates
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: vibex-${{ inputs.channel }}-linux-${{ github.sha }}
+          path: target/release-packages/${{ inputs.channel }}/**
+          if-no-files-found: error
+          retention-days: 14

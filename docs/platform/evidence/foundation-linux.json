@@ -1,0 +1,233 @@
+{
+  "schemaVersion": "foundation-linux.v1",
+  "capturedAt": "2026-07-18T11:23:16.507Z",
+  "source": {
+    "parentCommit": "65efcb3ee74e711bb9d25ca0f55af7b36dc3b0c8",
+    "cargoLockSha256": "6bafd6ea8d8aa706f6a51a01d7884c6f00209247b716f5cb6ba4e4b8a3aa80a4",
+    "foundationTreeSha256": "860f9a1b91143126bb2392a5e4bcecd182a8e630c1456fc5f29469fa74fecb68"
+  },
+  "runner": {
+    "platform": "linux",
+    "architecture": "x64",
+    "compositor": "Hyprland",
+    "displayBackend": "wayland",
+    "syntheticDisplay": false,
+    "monitor": {
+      "width": 2560,
+      "height": 1440,
+      "scale": 1
+    }
+  },
+  "requiredViewports": [
+    {
+      "width": 1600,
+      "height": 1000
+    },
+    {
+      "width": 1200,
+      "height": 780
+    },
+    {
+      "width": 900,
+      "height": 720
+    },
+    {
+      "width": 760,
+      "height": 1000
+    },
+    {
+      "width": 360,
+      "height": 800
+    },
+    {
+      "width": 360,
+      "height": 620
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "default-light-en",
+      "theme": "light",
+      "locale": "en",
+      "systemLocale": "en_US.UTF-8",
+      "settingsOpen": false,
+      "settingsSheetObserved": false,
+      "runtimeReady": true,
+      "captures": [
+        {
+          "viewport": {
+            "width": 1600,
+            "height": 1000
+          },
+          "window": {
+            "appId": "dev.vibex.desktop.preview",
+            "xwayland": false,
+            "floating": true,
+            "scale": 1
+          },
+          "screenshotPath": "docs/parity/screenshots/current/foundation/default-light-en-1600x1000.png",
+          "screenshotSha256": "cb413b9136d5dbdd28123028393557176d0d6780fbf7142d285f22edd653551a",
+          "metrics": {
+            "width": 1600,
+            "height": 1000,
+            "uniqueColors": 859,
+            "entropy": 0.132462,
+            "mean": 0.972586,
+            "standardDeviation": 0.0688274
+          }
+        },
+        {
+          "viewport": {
+            "width": 1200,
+            "height": 780
+          },
+          "window": {
+            "appId": "dev.vibex.desktop.preview",
+            "xwayland": false,
+            "floating": true,
+            "scale": 1
+          },
+          "screenshotPath": "docs/parity/screenshots/current/foundation/default-light-en-1200x780.png",
+          "screenshotSha256": "c5773e0c501d70814c298291cb7ca7b12d4bda0af87875177cd6e29e355e9a40",
+          "metrics": {
+            "width": 1200,
+            "height": 780,
+            "uniqueColors": 597,
+            "entropy": 0.141688,
+            "mean": 0.974985,
+            "standardDeviation": 0.0471237
+          }
+        },
+        {
+          "viewport": {
+            "width": 900,
+            "height": 720
+          },
+          "window": {
+            "appId": "dev.vibex.desktop.preview",
+            "xwayland": false,
+            "floating": true,
+            "scale": 1
+          },
+          "screenshotPath": "docs/parity/screenshots/current/foundation/default-light-en-900x720.png",
+          "screenshotSha256": "bf52920cb578d1b4333bccebb93452ae44b2e290d191be4d9f89e14506a96cf4",
+          "metrics": {
+            "width": 900,
+            "height": 720,
+            "uniqueColors": 593,
+            "entropy": 0.156337,
+            "mean": 0.973526,
+            "standardDeviation": 0.0495329
+          }
+        },
+        {
+          "viewport": {
+            "width": 760,
+            "height": 1000
+          },
+          "window": {
+            "appId": "dev.vibex.desktop.preview",
+            "xwayland": false,
+            "floating": true,
+            "scale": 1
+          },
+          "screenshotPath": "docs/parity/screenshots/current/foundation/default-light-en-760x1000.png",
+          "screenshotSha256": "72201180d0b6603f04a9422090a94f697945c7f1079f5dfac674bf938798a1cb",
+          "metrics": {
+            "width": 760,
+            "height": 1000,
+            "uniqueColors": 430,
+            "entropy": 0.0402195,
+            "mean": 0.980848,
+            "standardDeviation": 0.0369891
+          }
+        },
+        {
+          "viewport": {
+            "width": 360,
+            "height": 800
+          },
+          "window": {
+            "appId": "dev.vibex.desktop.preview",
+            "xwayland": false,
+            "floating": true,
+            "scale": 1
+          },
+          "screenshotPath": "docs/parity/screenshots/current/foundation/default-light-en-360x800.png",
+          "screenshotSha256": "f49fcf1a3c55d935d433176a2848ee4cb6b3a7083e6155feb17ca3a594f0594d",
+          "metrics": {
+            "width": 360,
+            "height": 800,
+            "uniqueColors": 383,
+            "entropy": 0.0524728,
+            "mean": 0.977351,
+            "standardDeviation": 0.0583435
+          }
+        },
+        {
+          "viewport": {
+            "width": 360,
+            "height": 620
+          },
+          "window": {
+            "appId": "dev.vibex.desktop.preview",
+            "xwayland": false,
+            "floating": true,
+            "scale": 1
+          },
+          "screenshotPath": "docs/parity/screenshots/current/foundation/default-light-en-360x620.png",
+          "screenshotSha256": "2391a051532266d12ec709fc180687ad5fda5c10c24d01d9333472070f68ee79",
+          "metrics": {
+            "width": 360,
+            "height": 620,
+            "uniqueColors": 364,
+            "entropy": 0.0609624,
+            "mean": 0.977482,
+            "standardDeviation": 0.0555266
+          }
+        }
+      ]
+    },
+    {
+      "id": "settings-dark-zh-tw",
+      "theme": "dark",
+      "locale": "zh_tw",
+      "systemLocale": "zh_TW.UTF-8",
+      "settingsOpen": true,
+      "settingsSheetObserved": true,
+      "runtimeReady": true,
+      "captures": [
+        {
+          "viewport": {
+            "width": 760,
+            "height": 1000
+          },
+          "window": {
+            "appId": "dev.vibex.desktop.preview",
+            "xwayland": false,
+            "floating": true,
+            "scale": 1
+          },
+          "screenshotPath": "docs/parity/screenshots/current/foundation/settings-dark-zh-tw-760x1000.png",
+          "screenshotSha256": "6b7def2322a7b36ce847c2ee729e40a7e3be0474a2654feb39b2c32039b44824",
+          "metrics": {
+            "width": 760,
+            "height": 1000,
+            "uniqueColors": 645,
+            "entropy": 0.245134,
+            "mean": 0.0516343,
+            "standardDeviation": 0.068765
+          }
+        }
+      ]
+    }
+  ],
+  "lifecycle": {
+    "closeDispatch": "hyprctl dispatch closewindow",
+    "processExitCode": 0,
+    "uiStateExitFlush": true,
+    "runtimeShutdownAwaited": true,
+    "homeLockedWhileRunning": true,
+    "homeLockReleasedAfterExit": true
+  }
+}

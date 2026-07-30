@@ -1,0 +1,11 @@
+{
+  "capability": "transcript_import",
+  "mode": "transcript",
+  "source": "synthetic-offline (native Codex rollout JSONL record shape accepted by preview_codex_external_sessions)",
+  "sdk": "vibex-agent-codex import parser",
+  "recorded_at": "2026-07-11",
+  "known_defects": [
+    "Only session_meta and response_item records of type message/reasoning are imported; other rollout records surface as codex_import_unsupported_record diagnostics."
+  ],
+  "notes": "Covers session_meta thread id + cwd capture, user/assistant messages and reasoning summaries."
+}

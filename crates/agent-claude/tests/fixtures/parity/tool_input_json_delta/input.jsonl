@@ -1,0 +1,3 @@
+{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_parity_02","name":"Write","input":{}}}
+{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"/home/user/demo.txt\""}}
+{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":",\"content\":\"hello\"}"}}

@@ -1,0 +1,853 @@
+{
+  "schemaVersion": "code-workbench-evidence.v1",
+  "status": "model_passed_visual_pending",
+  "capturedAt": "2026-07-30T13:55:27.813Z",
+  "sourceInputs": [
+    {
+      "path": "Cargo.lock",
+      "bytes": 294072,
+      "sha256": "9f369bb4fef16ff737c1ac6951740e4f37b56e75bcbbb1b195e41221762e043a"
+    },
+    {
+      "path": "Cargo.toml",
+      "bytes": 3229,
+      "sha256": "623a547e961cdc4244a7cce1fe6fee2f31cc0461fa95c62b0753cb9116fb8465"
+    },
+    {
+      "path": "package.json",
+      "bytes": 8894,
+      "sha256": "329e7f442662014caf34eca3cb0d219587276b49339078595f544459a4b20058"
+    },
+    {
+      "path": "apps/desktop/Cargo.toml",
+      "bytes": 2028,
+      "sha256": "0f8f1125905c7c1667298d7a0edb7c599667f554601e89721ec351987b0b7281"
+    },
+    {
+      "path": "apps/desktop/src/actions.rs",
+      "bytes": 828,
+      "sha256": "d43713f0a4cc09b9bb70ccd9457b034457fa9f07c9de7e27646bed8ec55acb8b"
+    },
+    {
+      "path": "apps/desktop/src/app.rs",
+      "bytes": 1137787,
+      "sha256": "ec961b61849ab5b4db28340162c807111f8a9cd61e1711b5f10037bc6d21eaab"
+    },
+    {
+      "path": "apps/desktop/src/code_workbench.rs",
+      "bytes": 424033,
+      "sha256": "94093dde8830f905bb11bc4b4147a3fa5272712a5fb95f3fc8aebf24f584fd0b"
+    },
+    {
+      "path": "apps/desktop/src/lib.rs",
+      "bytes": 4914,
+      "sha256": "0c9c25ecc3ae18f9dceb518ea95b12e042d62c2dd3132864ee74904ad456aad3"
+    },
+    {
+      "path": "apps/desktop/src/main.rs",
+      "bytes": 16336,
+      "sha256": "7115185a420e3c92e08e86096a8925770fb332fa5ef0476c4d313a657f29f2e4"
+    },
+    {
+      "path": "apps/desktop/src/platform/mod.rs",
+      "bytes": 18223,
+      "sha256": "e5d913e9260c6f865ada3c001f59798d0694f39cdfe67c6c0167a9b859f9526a"
+    },
+    {
+      "path": "apps/desktop/src/terminal_surface.rs",
+      "bytes": 73928,
+      "sha256": "8c80ae7b81564402d39456e94297626f80943cc507ceefff8ea0eeeb5646a70d"
+    },
+    {
+      "path": "apps/desktop/src/testing.rs",
+      "bytes": 14085,
+      "sha256": "a7ce07ac73a98c0dce4be6e3f08c5684ab64f0908c4292c3d01d31e5c003bd8f"
+    },
+    {
+      "path": "apps/desktop/src/theme.rs",
+      "bytes": 6381,
+      "sha256": "8df6a4fb142dbb3eb17a18c185ceb1076116a240e5fb18a3e03f5aa577bbc299"
+    },
+    {
+      "path": "crates/vibex-ui/Cargo.toml",
+      "bytes": 556,
+      "sha256": "5e9b4bb8f36670e28042397639d82be29259d7b2cc80827b90ca41f45ce091c4"
+    },
+    {
+      "path": "crates/vibex-ui/src/generated_tokens.rs",
+      "bytes": 23072,
+      "sha256": "837adfa515d5a8e18d35ab279106829e3688e5373bdda4ccdb3cae60964fb9c5"
+    },
+    {
+      "path": "crates/vibex-ui/src/lib.rs",
+      "bytes": 2157,
+      "sha256": "6670714ebc28b5384db2653e37265c488e820f53bdecff92f196d180ce7c4795"
+    },
+    {
+      "path": "crates/vibex-ui/theme/tokens.json",
+      "bytes": 11758,
+      "sha256": "16902bd71162bff4d7ec39d4812096ef66ea7948f3dfdfe8c262d09201df5292"
+    },
+    {
+      "path": "scripts/generate-tokens.mjs",
+      "bytes": 16529,
+      "sha256": "201788e51bacfaf3b46373d4adc92625162d9dca683de0608250125361d9c6f7"
+    },
+    {
+      "path": "docs/parity/fixtures/desktop-behavioral-v1.json",
+      "bytes": 812,
+      "sha256": "8cf2f262c271ddefb0360a66814573c8257288ed71a6e5ccc98e6f8a42ed9b47"
+    },
+    {
+      "path": "crates/content/src/lifecycle.rs",
+      "bytes": 19869,
+      "sha256": "f22146f3ba6f308578baffc6f9d97d81f01e6b86b06e94d2ef577ceffd03f2b4"
+    },
+    {
+      "path": "crates/core/src/file.rs",
+      "bytes": 3518,
+      "sha256": "faec2f72de58c3de7d9f046ce0cae0dbf91dccfc87e31acbb3960118412d1964"
+    },
+    {
+      "path": "crates/core/src/lib.rs",
+      "bytes": 21546,
+      "sha256": "f212967e391b48ad571657584e671f9c96f569b66a152063e44220c062340b1a"
+    },
+    {
+      "path": "crates/desktop-model/Cargo.toml",
+      "bytes": 578,
+      "sha256": "e3c4551eabebc977efc9a96d4bad259534b6e30fd162f98273c70c5429808c2b"
+    },
+    {
+      "path": "crates/desktop-model/src/agent_workbench.rs",
+      "bytes": 69033,
+      "sha256": "2cd11d6df3d00d9c186eb7da7520b51f20fb5d875af99542a2bd61cb1584b2d7"
+    },
+    {
+      "path": "crates/desktop-model/src/bin/vibex-code-workbench-probe.rs",
+      "bytes": 14759,
+      "sha256": "b427b413bbc6352029df5262ed3d4e96de839f2c6a7ebc6c0cc5d5ff3e640861"
+    },
+    {
+      "path": "crates/desktop-model/src/content_preview.rs",
+      "bytes": 13791,
+      "sha256": "b18fd4c5f64ef4758577740e06f0501e0c8118b8e370e79d6cf8a591cc7aa310"
+    },
+    {
+      "path": "crates/desktop-model/src/diff.rs",
+      "bytes": 23850,
+      "sha256": "06d77faa2a05b57e07dcc3b872f2d6dda1917d7155a463ceccf69dc41c570c7a"
+    },
+    {
+      "path": "crates/desktop-model/src/editor.rs",
+      "bytes": 20369,
+      "sha256": "91ed0d926c5dc23aed9d0dcf6436ed00448674a2f532537bb35edd3cc15c09ae"
+    },
+    {
+      "path": "crates/desktop-model/src/file_tree.rs",
+      "bytes": 59660,
+      "sha256": "8876265f8367a5f7b360bb5129142c294ea29cd51a645449e22da1a091e15ec0"
+    },
+    {
+      "path": "crates/desktop-model/src/git_workbench.rs",
+      "bytes": 65261,
+      "sha256": "525265b02c9b37176bbe926dabd2a39ebcc4607b0b328acc454f10b631d1d680"
+    },
+    {
+      "path": "crates/desktop-model/src/lib.rs",
+      "bytes": 816,
+      "sha256": "9dbf25af53221c2d14b88c2189b08c2c0b1217b3f27e196b885345ae37ab911a"
+    },
+    {
+      "path": "crates/desktop-model/src/preview.rs",
+      "bytes": 39760,
+      "sha256": "cdef4f11f74f5fd0fa596a7db9f16bef292be97c92b7ae37c658ee316c0e9fa7"
+    },
+    {
+      "path": "crates/desktop-model/src/ui_state.rs",
+      "bytes": 35274,
+      "sha256": "58e31f063982189bb256bced410e835f2d853425f4420dbfde38cc938d763f6e"
+    },
+    {
+      "path": "crates/vibex-markdown/Cargo.toml",
+      "bytes": 1596,
+      "sha256": "f928fb7d779723e0d1a52e7d8980c83faefc8527fde72b070e44f4f36be34de0"
+    },
+    {
+      "path": "crates/vibex-markdown/fixtures/advanced.md",
+      "bytes": 1741,
+      "sha256": "56bc8b694a2cb9a8d42851c0a1f4ea0d37125376921102ce98a6d60e54f4e080"
+    },
+    {
+      "path": "crates/vibex-markdown/fixtures/malformed.md",
+      "bytes": 357,
+      "sha256": "fdb722f66958cd53964d2dd5dd6c541fa36395dabf5df5b8fad90e93146785fa"
+    },
+    {
+      "path": "crates/vibex-markdown/src/artifact.rs",
+      "bytes": 20835,
+      "sha256": "2d7ee962ecfee6a7de9da5276f2df44473810dbe82d990ccf2fc303db47af7af"
+    },
+    {
+      "path": "crates/vibex-markdown/src/engines/mod.rs",
+      "bytes": 14466,
+      "sha256": "db3a2fd3e115448ac2d6689b343b3520921c015aae2624552419263ce2cdcc7f"
+    },
+    {
+      "path": "crates/vibex-markdown/src/gpui_view.rs",
+      "bytes": 115180,
+      "sha256": "9d859968bc58b398f804694a91be81f9336255b31f5acb0b996f88f11f324be0"
+    },
+    {
+      "path": "crates/vibex-markdown/src/html.rs",
+      "bytes": 24645,
+      "sha256": "49e5abb56c60c43f32c3b7530efc7a395b90da24f6a0a242fda3f134f6ea8b70"
+    },
+    {
+      "path": "crates/vibex-markdown/src/lib.rs",
+      "bytes": 442,
+      "sha256": "668df5768bfcb1e500a9135cd2782a86e960676980511c3e58bc55c050259bde"
+    },
+    {
+      "path": "crates/vibex-markdown/src/limits.rs",
+      "bytes": 2161,
+      "sha256": "e3ef91afd761d60f8a787a1ef09c2f468d9ae12f3ec2f493470ee6f97da2e24d"
+    },
+    {
+      "path": "crates/vibex-markdown/src/model.rs",
+      "bytes": 14869,
+      "sha256": "8afc97511d9831ac3d02726838ba77cb2920036c8e50497b78bb966e114a2a77"
+    },
+    {
+      "path": "crates/vibex-markdown/src/parser.rs",
+      "bytes": 51773,
+      "sha256": "dfcf9c3a922c2c73746d46b91eb9d4560c3252d5497ee8565793f7e81b8f7ef4"
+    },
+    {
+      "path": "crates/vibex-markdown/src/resource.rs",
+      "bytes": 8340,
+      "sha256": "0e495afe2596875557c3403169f1d60eded4d3aad27f718a92df51f1057b8f0b"
+    },
+    {
+      "path": "crates/vibex-markdown/src/svg.rs",
+      "bytes": 27647,
+      "sha256": "c02384b88cfb04b71935eb75550d6ddfa7663ac82314b178eaa076ce2f39e3ae"
+    },
+    {
+      "path": "crates/desktop-runtime/src/lib.rs",
+      "bytes": 54070,
+      "sha256": "2ffc7d85ad9647cafd64a3b5d9328bb274ee2d251ec3f25c7d1cca3aa3ce6780"
+    },
+    {
+      "path": "crates/desktop-runtime/src/workbench.rs",
+      "bytes": 26628,
+      "sha256": "bf67d8a70e28ab9677deddb182ed0092487d77bb463c2851a6a05e610d62460e"
+    },
+    {
+      "path": "crates/vibex-backend/Cargo.toml",
+      "bytes": 566,
+      "sha256": "1fcb0f13bf7c39f277ab4636c2fac9687add7d81b4226fccc9f5e7c095321e1e"
+    },
+    {
+      "path": "crates/vibex-backend/src/agent.rs",
+      "bytes": 4214,
+      "sha256": "7e67dfc0f45fad9768a39b58405dc0ba1658c0c9b6c2fa7d464dc91e9e3f6d0f"
+    },
+    {
+      "path": "crates/vibex-backend/src/capability.rs",
+      "bytes": 5788,
+      "sha256": "34622139a32dab39b5e07847911181c5294e3d05fe5b56e386f01a5c962292a2"
+    },
+    {
+      "path": "crates/vibex-backend/src/device.rs",
+      "bytes": 1290,
+      "sha256": "fdf500f24103334c66729cce2f5d0c49f22219173977d0d9e83f0486c36ba98a"
+    },
+    {
+      "path": "crates/vibex-backend/src/error.rs",
+      "bytes": 4083,
+      "sha256": "203c2ee80035f7d79474befe6233614cbf4f4de899445ad8d71b68bb365e97e8"
+    },
+    {
+      "path": "crates/vibex-backend/src/facade.rs",
+      "bytes": 2852,
+      "sha256": "78f7681d85ea365e9eb060de6c759c24e28ebf5010b66a96fd92d481c0c84a62"
+    },
+    {
+      "path": "crates/vibex-backend/src/file.rs",
+      "bytes": 1195,
+      "sha256": "c8a3f589712e2bcaefefb731199e554f42bc961b7de6e76a0d0549e9d3389c0a"
+    },
+    {
+      "path": "crates/vibex-backend/src/git.rs",
+      "bytes": 809,
+      "sha256": "8091e25bae1f14467ec8475deeaf738d99190f3a95638f91e1cd91289d720eb0"
+    },
+    {
+      "path": "crates/vibex-backend/src/lib.rs",
+      "bytes": 1536,
+      "sha256": "cc68b6d9857f11a38dbec113e766d28b3cc9313ce5ad7c0d8a959b893f07936f"
+    },
+    {
+      "path": "crates/vibex-backend/src/management.rs",
+      "bytes": 1867,
+      "sha256": "77769be28cb5a3057a7d48f23b1e096eede909e74022775dd7e35c48910d0c06"
+    },
+    {
+      "path": "crates/vibex-backend/src/mutation.rs",
+      "bytes": 2585,
+      "sha256": "84dc74a296cb206e4933a96f144ed3876e07bb632994bb2f5e66563b9b91dd56"
+    },
+    {
+      "path": "crates/vibex-backend/src/native.rs",
+      "bytes": 33240,
+      "sha256": "51ca4d335d8cd79cf89b9c63659cbb609021ca5917db556146eff00d026eb5c7"
+    },
+    {
+      "path": "crates/vibex-backend/src/terminal.rs",
+      "bytes": 3576,
+      "sha256": "dd4222e8e88837095ac38d5e95cfba80a465bfe06492ac7bd39aff609921448a"
+    },
+    {
+      "path": "crates/vibex-backend/src/workspace.rs",
+      "bytes": 843,
+      "sha256": "6cfc8a21485069a0b2172eee35ebc1fd524cee79a5cf2bf5974ba01c097e4d9e"
+    },
+    {
+      "path": "crates/vibex-terminal-ui/Cargo.toml",
+      "bytes": 335,
+      "sha256": "54815413dda741b882b25bb32c607b5544ea08ea26af6d6f1043f797534e7f0f"
+    },
+    {
+      "path": "crates/vibex-terminal-ui/src/emulator.rs",
+      "bytes": 19144,
+      "sha256": "cf4144d6febd471f79386e4df9f7fc136daaf45bc0445cccf02daf6807f847c3"
+    },
+    {
+      "path": "crates/vibex-terminal-ui/src/emulator_wasm.rs",
+      "bytes": 12274,
+      "sha256": "5d9aba5233042f0009bcdb6342aca4629beedeea77fa21fd5b168e238332b63b"
+    },
+    {
+      "path": "crates/vibex-terminal-ui/src/lib.rs",
+      "bytes": 474,
+      "sha256": "5660f711f354d9c5e0835a885688d16136405508bc99798e4036eb6144a2607e"
+    },
+    {
+      "path": "crates/vibex-ui/src/shell.rs",
+      "bytes": 15146,
+      "sha256": "234c92fbc1d958755e4b9c3fe087769b92d285adcfea35d37724691124288f81"
+    },
+    {
+      "path": "crates/fs/Cargo.toml",
+      "bytes": 508,
+      "sha256": "c2d92f4b40914ff911ea29a734fe52d753d256274c754b91518ba72c7c95f9d0"
+    },
+    {
+      "path": "crates/fs/src/lib.rs",
+      "bytes": 68505,
+      "sha256": "d5454f0ac7a2bd4963500b31f12b446092a445a4802d02ce1efe693efb9d96b7"
+    },
+    {
+      "path": "crates/git/Cargo.toml",
+      "bytes": 352,
+      "sha256": "7785abe384bca00633542cdc508bbbf85b38f97c1f34a306cff74e73d31a2aa2"
+    },
+    {
+      "path": "crates/git/src/lib.rs",
+      "bytes": 72024,
+      "sha256": "ff9924c880b7f384e5c880dbd7d86956acb40af2b3352d75a34ca0c1eebda1ef"
+    },
+    {
+      "path": "crates/remote/src/lib.rs",
+      "bytes": 155908,
+      "sha256": "e82bf8f698bb1975ec506227b17558f582fcbe58b842893a8cc9c51d97103dac"
+    },
+    {
+      "path": "docs/parity/fixtures/code-workbench-lgtm-dual-run.rs",
+      "bytes": 7027,
+      "sha256": "45c8a16b6e1dffb4fe90756aad6e2835b6f9aa2bf7591ae96e9ef2f12b085a37"
+    },
+    {
+      "path": "docs/parity/code-workbench.md",
+      "bytes": 1893,
+      "sha256": "560a90ed62e41af72ba5db3aa3de8f302f24277c1431bbfa6df63e56c322ccee"
+    },
+    {
+      "path": "scripts/capture-code-workbench.mjs",
+      "bytes": 38212,
+      "sha256": "cfe87f9d55a8ee37f7e681213666f8cb0d1621fdcb88fb2486ba9e0c04d50901"
+    }
+  ],
+  "probe": {
+    "schemaVersion": "code-workbench-probe.v1",
+    "status": "passed",
+    "tree": {
+      "inputEntries": 100000,
+      "depth": 8,
+      "compactChainSegments": 8,
+      "expandedVisibleRows": 99994,
+      "deepWindowStart": 99794,
+      "deepWindowRows": 168,
+      "searchVisibleRows": 3,
+      "searchLeafFound": true,
+      "staleLoadRejected": true,
+      "applyMicros": 110600,
+      "expandMicros": 141553,
+      "searchMicros": 32627,
+      "operationLimitMicros": 15000000
+    },
+    "diff": {
+      "inputRows": 20000,
+      "projectedRows": 20000,
+      "initialWindowRows": 500,
+      "deepWindowStart": 19500,
+      "deepWindowRows": 120,
+      "deepFirstRowId": "diff:0:19500",
+      "cachedWordRows": 2000,
+      "cacheLimitRows": 2000,
+      "constructMicros": 2223,
+      "initialWindowMicros": 383,
+      "deepWindowMicros": 128,
+      "operationLimitMicros": 5000000
+    },
+    "caches": {
+      "gitInsertions": 40,
+      "gitResidentItems": 32,
+      "gitItemLimit": 32,
+      "oldestGitItemEvicted": true,
+      "newestGitItemResident": true,
+      "imageInsertions": 32,
+      "imageResidentItems": 8,
+      "imageResidentBytes": 800,
+      "imageEvictions": 24
+    },
+    "generations": {
+      "workspaceSwitches": 128,
+      "staleWorkspaceResultsRejected": 128,
+      "revisionSwitches": 128,
+      "staleRevisionResultsRejected": 128,
+      "finalDiffCacheItems": 0
+    }
+  },
+  "uiContract": {
+    "schemaVersion": "code-workbench-contract.v1",
+    "previewTargetKinds": 5,
+    "fileTreeFixtureRows": 100000,
+    "diffFixtureRows": 20000,
+    "maxEagerRenderedRows": 5000,
+    "maxInitialDiffRows": 500,
+    "fileTreeVirtualized": true,
+    "gitChangesVirtualized": true,
+    "gitHistoryVirtualized": true,
+    "diffVirtualized": true,
+    "inlineFileMutations": true,
+    "blankAreaContextMenu": true,
+    "dirtyCloseGuarded": true,
+    "saveShortcut": true,
+    "lifecycleBoundsAndClose": true,
+    "agentFilePreviewActions": true,
+    "narrowLayoutSupported": true
+  },
+  "sourceContract": {
+    "uniformListCount": 3,
+    "boundedUniformListCallCount": 3,
+    "fullSizeTrackedListCount": 3,
+    "variablePatchListCount": 1,
+    "variablePatchListStatePresent": true,
+    "variablePatchListFullSize": true,
+    "wrappingDiffRowsPresent": true,
+    "fileListIdPresent": true,
+    "gitChangesListIdPresent": true,
+    "gitHistoryListIdPresent": true,
+    "diffListIdPresent": true,
+    "commitPatchListIdPresent": true,
+    "inlineFileRowsPresent": true,
+    "blankAreaContextMenuPresent": true,
+    "splitDirectionModelPreserved": true,
+    "lifecycleBoundsCanvasPresent": true,
+    "lifecycleClosePresent": true,
+    "previewPaneNewButtonDoesNotOverrideHover": true,
+    "saveShortcutPresent": true,
+    "agentPreviewProjectionPresent": true,
+    "fixtureModesPresent": true
+  },
+  "lgtmDecision": {
+    "disposition": "rejected",
+    "sourceAdopted": false,
+    "performanceGatePassed": true,
+    "licenseGatePassed": true,
+    "semanticGatePassed": false,
+    "reasons": [
+      "quoted_octal_utf8_path_not_decoded",
+      "no_newline_marker_discarded",
+      "copy_metadata_not_represented"
+    ],
+    "dualRun": {
+      "fixtures": [
+        {
+          "boundedWithoutPanic": true,
+          "lgtm": {
+            "files": [
+              {
+                "additions": 1,
+                "binary": false,
+                "contexts": 1,
+                "copied": false,
+                "deletions": 1,
+                "hunks": 1,
+                "newPath": "src/lib.rs",
+                "newlineMarkers": 0,
+                "oldPath": "src/lib.rs",
+                "renamed": false
+              }
+            ]
+          },
+          "name": "hunk_word",
+          "semanticMatch": true,
+          "vibex": {
+            "files": [
+              {
+                "additions": 1,
+                "binary": false,
+                "contexts": 1,
+                "copied": false,
+                "deletions": 1,
+                "hunks": 1,
+                "newPath": "src/lib.rs",
+                "newlineMarkers": 0,
+                "oldPath": "src/lib.rs",
+                "renamed": false
+              }
+            ]
+          },
+          "wordSignals": {
+            "bothProduceBoundedWordSignals": true,
+            "lgtmChangedRows": 2,
+            "vibexChangedRows": 2
+          }
+        },
+        {
+          "boundedWithoutPanic": true,
+          "lgtm": {
+            "files": [
+              {
+                "additions": 1,
+                "binary": false,
+                "contexts": 0,
+                "copied": false,
+                "deletions": 1,
+                "hunks": 1,
+                "newPath": "new.rs",
+                "newlineMarkers": 0,
+                "oldPath": "old.rs",
+                "renamed": true
+              }
+            ]
+          },
+          "name": "rename",
+          "semanticMatch": true,
+          "vibex": {
+            "files": [
+              {
+                "additions": 1,
+                "binary": false,
+                "contexts": 0,
+                "copied": false,
+                "deletions": 1,
+                "hunks": 1,
+                "newPath": "new.rs",
+                "newlineMarkers": 0,
+                "oldPath": "old.rs",
+                "renamed": true
+              }
+            ]
+          },
+          "wordSignals": null
+        },
+        {
+          "boundedWithoutPanic": true,
+          "lgtm": {
+            "files": [
+              {
+                "additions": 0,
+                "binary": true,
+                "contexts": 0,
+                "copied": false,
+                "deletions": 0,
+                "hunks": 0,
+                "newPath": "logo.png",
+                "newlineMarkers": 0,
+                "oldPath": "logo.png",
+                "renamed": false
+              }
+            ]
+          },
+          "name": "binary",
+          "semanticMatch": true,
+          "vibex": {
+            "files": [
+              {
+                "additions": 0,
+                "binary": true,
+                "contexts": 0,
+                "copied": false,
+                "deletions": 0,
+                "hunks": 0,
+                "newPath": "logo.png",
+                "newlineMarkers": 0,
+                "oldPath": "logo.png",
+                "renamed": false
+              }
+            ]
+          },
+          "wordSignals": null
+        },
+        {
+          "boundedWithoutPanic": true,
+          "lgtm": {
+            "files": [
+              {
+                "additions": 1,
+                "binary": false,
+                "contexts": 0,
+                "copied": false,
+                "deletions": 1,
+                "hunks": 1,
+                "newPath": "crlf.txt",
+                "newlineMarkers": 0,
+                "oldPath": "crlf.txt",
+                "renamed": false
+              }
+            ]
+          },
+          "name": "crlf",
+          "semanticMatch": true,
+          "vibex": {
+            "files": [
+              {
+                "additions": 1,
+                "binary": false,
+                "contexts": 0,
+                "copied": false,
+                "deletions": 1,
+                "hunks": 1,
+                "newPath": "crlf.txt",
+                "newlineMarkers": 0,
+                "oldPath": "crlf.txt",
+                "renamed": false
+              }
+            ]
+          },
+          "wordSignals": null
+        },
+        {
+          "boundedWithoutPanic": true,
+          "lgtm": {
+            "files": [
+              {
+                "additions": 1,
+                "binary": false,
+                "contexts": 0,
+                "copied": false,
+                "deletions": 1,
+                "hunks": 1,
+                "newPath": "\\346\\226\\207.md",
+                "newlineMarkers": 0,
+                "oldPath": "\\346\\226\\207.md",
+                "renamed": false
+              }
+            ]
+          },
+          "name": "quoted_octal_utf8",
+          "semanticMatch": false,
+          "vibex": {
+            "files": [
+              {
+                "additions": 1,
+                "binary": false,
+                "contexts": 0,
+                "copied": false,
+                "deletions": 1,
+                "hunks": 1,
+                "newPath": "文.md",
+                "newlineMarkers": 0,
+                "oldPath": "文.md",
+                "renamed": false
+              }
+            ]
+          },
+          "wordSignals": null
+        },
+        {
+          "boundedWithoutPanic": true,
+          "lgtm": {
+            "files": [
+              {
+                "additions": 1,
+                "binary": false,
+                "contexts": 0,
+                "copied": false,
+                "deletions": 1,
+                "hunks": 1,
+                "newPath": "no-newline.txt",
+                "newlineMarkers": 0,
+                "oldPath": "no-newline.txt",
+                "renamed": false
+              }
+            ]
+          },
+          "name": "no_newline_marker",
+          "semanticMatch": false,
+          "vibex": {
+            "files": [
+              {
+                "additions": 1,
+                "binary": false,
+                "contexts": 0,
+                "copied": false,
+                "deletions": 1,
+                "hunks": 1,
+                "newPath": "no-newline.txt",
+                "newlineMarkers": 2,
+                "oldPath": "no-newline.txt",
+                "renamed": false
+              }
+            ]
+          },
+          "wordSignals": null
+        },
+        {
+          "boundedWithoutPanic": true,
+          "lgtm": {
+            "files": [
+              {
+                "additions": 0,
+                "binary": false,
+                "contexts": 0,
+                "copied": false,
+                "deletions": 0,
+                "hunks": 0,
+                "newPath": "copied.rs",
+                "newlineMarkers": 0,
+                "oldPath": "source.rs",
+                "renamed": false
+              }
+            ]
+          },
+          "name": "copy",
+          "semanticMatch": false,
+          "vibex": {
+            "files": [
+              {
+                "additions": 0,
+                "binary": false,
+                "contexts": 0,
+                "copied": true,
+                "deletions": 0,
+                "hunks": 0,
+                "newPath": "copied.rs",
+                "newlineMarkers": 0,
+                "oldPath": "source.rs",
+                "renamed": false
+              }
+            ]
+          },
+          "wordSignals": null
+        },
+        {
+          "boundedWithoutPanic": true,
+          "lgtm": {
+            "files": [
+              {
+                "additions": 0,
+                "binary": false,
+                "contexts": 0,
+                "copied": false,
+                "deletions": 0,
+                "hunks": 0,
+                "newPath": "bad.txt",
+                "newlineMarkers": 0,
+                "oldPath": "bad.txt",
+                "renamed": false
+              }
+            ]
+          },
+          "name": "malformed_hunk",
+          "semanticMatch": true,
+          "vibex": {
+            "files": [
+              {
+                "additions": 0,
+                "binary": false,
+                "contexts": 0,
+                "copied": false,
+                "deletions": 0,
+                "hunks": 0,
+                "newPath": "bad.txt",
+                "newlineMarkers": 0,
+                "oldPath": "bad.txt",
+                "renamed": false
+              }
+            ]
+          },
+          "wordSignals": null
+        }
+      ],
+      "performance": {
+        "inputLines": 20004,
+        "iterations": 9,
+        "lgtmMedianMicros": 606,
+        "vibexMedianMicros": 719
+      },
+      "schemaVersion": "vibex-lgtm-dual-run.v1"
+    }
+  },
+  "referenceBoundaries": {
+    "lgtm": {
+      "repository": "https://github.com/ellie/lgtm.git",
+      "commit": "3b0327b8ef4936d46d038512f97209dff41bef10",
+      "license": "MIT",
+      "licenseSha256": "7942c4864b895103fad0806f47b9bf2c6471a89763ec3e25a3b80eae528f7662",
+      "diffCoreManifestSha256": "eeafa131989d5fc501fc0144c88be171bd24c007a36ff6fcab73fa26f9ca198c",
+      "diffCoreSourceSha256": "0bfcaea9be8e162d8870022bcc84e3f57623fbab786c727d400d62195067c7d2",
+      "diffCoreDependencies": [
+        {
+          "name": "imara-diff",
+          "version": "0.1.8",
+          "license": "Apache-2.0",
+          "checksum": "17d34b7d42178945f775e84bc4c36dde7c1c6cdfea656d3354d009056f2bb3d2"
+        }
+      ],
+      "disposition": "rejected_no_source_adopted"
+    },
+    "fulgur": {
+      "repository": "https://github.com/fulgur-app/Fulgur.git",
+      "commit": "9f941b0c4e6e6f75080a47c97ba5697c5eaa19cf",
+      "license": "Apache-2.0",
+      "licenseSha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "manifestSha256": "11535048657eb4dc42f7b83b44f32e0d3f005d90c438876f4f71e93e06ae1213",
+      "disposition": "behavior_research_only_no_file_or_dependency_adopted"
+    },
+    "gitComet": {
+      "repository": "https://github.com/Auto-Explore/GitComet.git",
+      "commit": "7bf4b89ea3cff7fafb663d6a6e0e0fe070db7e44",
+      "license": "AGPL-3.0-only",
+      "licenseSha256": "0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0",
+      "manifestSha256": "30eb6f28a3f30958f33c52fd31b0c855ab51d62b6dbe29ae829e27ebf0cd3568",
+      "forbiddenGpuiFork": "https://github.com/Havunen/gpui-ce.git",
+      "disposition": "clean_room_ideas_only_no_code_asset_fixture_dependency_or_fork_adopted",
+      "workingTreePolicy": "read_only_preexisting_changes_preserved"
+    }
+  },
+  "visual": {
+    "status": "pending",
+    "reason": "Physical Linux Wayland capture is required for this source."
+  },
+  "privacy": {
+    "workspacePathStored": false,
+    "fileContentStored": false,
+    "gitPatchStoredOutsideSanitizedFixture": false,
+    "providerPayloadStored": false
+  }
+}

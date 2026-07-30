@@ -1,0 +1,16 @@
+{
+  "events": [
+    {
+      "payload": {
+        "data": {
+          "query": "rust structural json diff",
+          "resultSummary": null,
+          "status": "completed"
+        },
+        "type": "web_search"
+      },
+      "providerCorrelationId": null,
+      "source": "agent"
+    }
+  ]
+}

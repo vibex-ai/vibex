@@ -1,0 +1,82 @@
+{
+  "schemaVersion": "native-content-switch-evidence.v1",
+  "status": "passed",
+  "capturedAt": "2026-07-25T10:46:08.469Z",
+  "sourceInputs": [
+    {
+      "path": "Cargo.lock",
+      "bytes": 299235,
+      "sha256": "4d7403b1d03a19381c6c30f7527bbbca9883518b8d562ac559c1582d33da367c"
+    },
+    {
+      "path": "Cargo.toml",
+      "bytes": 2928,
+      "sha256": "c250765f302b52767f12383e7d035181175602c53cc58c3066d884108a3051bf"
+    },
+    {
+      "path": "apps/desktop/Cargo.toml",
+      "bytes": 1776,
+      "sha256": "1ae05510cdabe3573d8633db6488236ce1ef160ac4226d7610c1f2d8e6b2568c"
+    },
+    {
+      "path": "apps/desktop/src/main.rs",
+      "bytes": 15218,
+      "sha256": "87a7fab7d4803a904f374efe548f28c816fdd2e713bdbeaf6661eaa32765489b"
+    },
+    {
+      "path": "apps/desktop/src/native_content.rs",
+      "bytes": 31599,
+      "sha256": "d5c9efee278b4a72f042056c39b8b3d5d8f1a157565af62799a512ca6fa196dd"
+    },
+    {
+      "path": "crates/content/Cargo.toml",
+      "bytes": 429,
+      "sha256": "5d246edd732923e093c6903f1da7d3c1adf02d4c6af5cf5208b91db2fb111081"
+    },
+    {
+      "path": "crates/content/src/lifecycle.rs",
+      "bytes": 19869,
+      "sha256": "f22146f3ba6f308578baffc6f9d97d81f01e6b86b06e94d2ef577ceffd03f2b4"
+    },
+    {
+      "path": "crates/content/src/web.rs",
+      "bytes": 23640,
+      "sha256": "0b5df06aaad87a0ea2ae547767e4fe8563a9ae73d2b12efa61a09f5cce236c00"
+    },
+    {
+      "path": "scripts/capture-native-content-switch.mjs",
+      "bytes": 6146,
+      "sha256": "ed54b99859475c6058942001a63bcd5f7fbb8886c2221ba3325f0ba547dac3cf"
+    }
+  ],
+  "run": {
+    "schemaVersion": "native-content-switch-contract.v1",
+    "status": "passed",
+    "targetsActivated": 5,
+    "rapidSwitches": 100,
+    "staleCallbacksIgnored": 3,
+    "closeCallbacksIgnored": 3,
+    "overlayHidden": true,
+    "focusReturnPendingObserved": true,
+    "focusRestored": true,
+    "latestBoundsPreserved": true,
+    "closedSurfaceRemainedClosed": true,
+    "crashRecoveryPassed": true,
+    "visibleSurfaceCount": 1,
+    "focusedSurfaceCount": 1,
+    "finalActiveKind": "office",
+    "webZeroAllocation": true,
+    "rightRailWebZeroAllocation": true,
+    "privacy": {
+      "targetIdentityStored": false,
+      "terminalOutputStored": false,
+      "urlStored": false,
+      "pdfContentStored": false,
+      "officeContentStored": false
+    },
+    "limitations": [
+      "This contract proves shared content lifecycle orchestration, not physical focus or pixels.",
+      "File, editor, Git, split, and fullscreen reducer hookup remains owned by the code-workbench task."
+    ]
+  }
+}

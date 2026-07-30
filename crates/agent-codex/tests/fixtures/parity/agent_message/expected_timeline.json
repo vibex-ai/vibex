@@ -1,0 +1,26 @@
+{
+  "events": [
+    {
+      "payload": {
+        "data": {
+          "isFinal": false,
+          "text": "Interim commentary while working."
+        },
+        "type": "agent_message"
+      },
+      "providerCorrelationId": null,
+      "source": "agent"
+    },
+    {
+      "payload": {
+        "data": {
+          "isFinal": true,
+          "text": "The fix is applied and tests pass."
+        },
+        "type": "agent_message"
+      },
+      "providerCorrelationId": null,
+      "source": "agent"
+    }
+  ]
+}

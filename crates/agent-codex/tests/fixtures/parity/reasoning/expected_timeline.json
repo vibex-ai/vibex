@@ -1,0 +1,15 @@
+{
+  "events": [
+    {
+      "payload": {
+        "data": {
+          "isFinal": true,
+          "text": "Weigh both implementation options.\nPick the smaller diff because it is easier to review."
+        },
+        "type": "reasoning"
+      },
+      "providerCorrelationId": null,
+      "source": "agent"
+    }
+  ]
+}

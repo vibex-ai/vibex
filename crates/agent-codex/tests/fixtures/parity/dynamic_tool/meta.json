@@ -1,0 +1,9 @@
+{
+  "capability": "dynamic_tool",
+  "mode": "thread_items",
+  "source": "synthetic-offline (sanitized Codex thread item wire shape)",
+  "sdk": "offline Serde wire mirror",
+  "recorded_at": "2026-07-11",
+  "known_defects": [],
+  "notes": "Replayed offline through parity::map_wire_item into canonical timeline payloads."
+}

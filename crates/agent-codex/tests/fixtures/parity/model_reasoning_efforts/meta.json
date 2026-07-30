@@ -1,0 +1,9 @@
+{
+  "capability": "model_reasoning_efforts",
+  "mode": "meta_only",
+  "source": "observation snapshot 2026-07-11",
+  "sdk": "offline compatibility metadata",
+  "recorded_at": "2026-07-11",
+  "known_defects": [],
+  "notes": "Historical per-model effort observation. Online selectors publish only managed ACP catalog or negotiated effort evidence and do not synthesize static values."
+}

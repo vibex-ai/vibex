@@ -1,0 +1,73 @@
+{
+  "candidateStatus": "importable",
+  "continuationReason": null,
+  "continuationStatus": "resumable",
+  "diagnosticCodes": [],
+  "items": [
+    {
+      "payload": {
+        "data": {
+          "attachments": [],
+          "text": "Summarize the repository layout"
+        },
+        "type": "user_message"
+      },
+      "providerCorrelationId": "item-user-1",
+      "source": "user"
+    },
+    {
+      "payload": {
+        "data": {
+          "isFinal": true,
+          "text": "Look at the crate layout before answering."
+        },
+        "type": "reasoning"
+      },
+      "providerCorrelationId": "item-assistant-1:block-0",
+      "source": "agent"
+    },
+    {
+      "payload": {
+        "data": {
+          "inputSummary": "Claude tool input omitted from import",
+          "outputSummary": null,
+          "status": "started",
+          "summary": "Imported Claude tool use",
+          "toolCallId": "toolu_parity_10",
+          "toolName": "Bash"
+        },
+        "type": "tool_call"
+      },
+      "providerCorrelationId": "item-assistant-1:block-1",
+      "source": "agent"
+    },
+    {
+      "payload": {
+        "data": {
+          "inputSummary": null,
+          "outputSummary": "Claude tool output omitted from import",
+          "status": "completed",
+          "summary": "Imported Claude tool result",
+          "toolCallId": "toolu_parity_10",
+          "toolName": "tool_result"
+        },
+        "type": "tool_call"
+      },
+      "providerCorrelationId": "item-assistant-1:block-2",
+      "source": "agent"
+    },
+    {
+      "payload": {
+        "data": {
+          "isFinal": true,
+          "text": "The workspace contains agent crates plus a shared core crate."
+        },
+        "type": "agent_message"
+      },
+      "providerCorrelationId": "item-assistant-1:block-3",
+      "source": "agent"
+    }
+  ],
+  "nativeSessionId": "claude-session-parity-1",
+  "workspaceRoot": "/home/user/workspace/demo"
+}

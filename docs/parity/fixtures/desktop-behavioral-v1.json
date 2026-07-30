@@ -1,0 +1,30 @@
+{
+  "schemaVersion": "desktop-behavioral-fixtures.v1",
+  "deterministic": true,
+  "providerFree": true,
+  "sanitized": true,
+  "clock": {
+    "epochMs": 1700000000000,
+    "tickMs": 17
+  },
+  "fixtures": {
+    "workbench.files": {
+      "area": "files",
+      "description": "Open a file in the current GPUI workbench.",
+      "initialView": {
+        "selectedWorkspaceId": "workspace_mock",
+        "selectedSessionId": "session_mock",
+        "selectedFilePath": "README.md"
+      }
+    },
+    "workbench.git_changes": {
+      "area": "git",
+      "description": "Open an unstaged diff in the current GPUI workbench.",
+      "initialView": {
+        "selectedWorkspaceId": "workspace_mock",
+        "selectedSessionId": "session_mock",
+        "selectedGitPath": "apps/desktop/src/app.rs"
+      }
+    }
+  }
+}

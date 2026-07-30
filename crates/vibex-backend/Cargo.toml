@@ -1,0 +1,23 @@
+[package]
+name = "vibex-backend"
+version = "0.1.0-rc.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+native = ["dep:tokio", "dep:vibex-desktop-runtime"]
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+vibex-core = { path = "../core" }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { workspace = true, optional = true }
+vibex-desktop-runtime = { path = "../desktop-runtime", optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true
