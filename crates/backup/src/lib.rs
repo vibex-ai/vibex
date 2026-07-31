@@ -729,7 +729,17 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use vibex_db::DbConnection;
+    use vibex_core::{
+        AcpAdapterId, AgentId, AgentSession, AgentSessionSafety, AgentSessionState,
+        AgentUsageCounterOrigin, AgentUsageExecutionContext, AgentUsageObservation,
+        AgentUsageObservationSource, AgentUsageStreamAttribution, AgentUsageTokenValues,
+        BindingState, NativeStateHomeId, ProviderProfileId, RuntimeBinding, RuntimeBindingId,
+        SessionRuntimeConfigState, TransportKind, UsageExecutionId, VibexSessionId, WorkspaceMode,
+    };
+    use vibex_db::{
+        AgentUsageRepository, DbConnection, RuntimeBindingRepository, SessionRepository,
+        WorkspaceRepository,
+    };
 
     static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -839,6 +849,7 @@ mod tests {
         let backup = root.join("backup");
         let target = root.join("target.db");
         let source_smoke = run_smoke(&source).unwrap();
+        let (usage_execution_id, expected_total_tokens) = seed_usage_fact(&source, &root);
 
         create_backup(BackupCreateRequest {
             source_db_path: source,
@@ -861,6 +872,139 @@ mod tests {
             read_foundation_marker(&target).unwrap(),
             source_smoke.marker
         );
+        let restored_connection = open_database(&target).unwrap();
+        let restored_fact =
+            AgentUsageRepository::get_fact(&restored_connection, &usage_execution_id)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            restored_fact.delta.total_tokens,
+            Some(expected_total_tokens)
+        );
+        let checkpoint_count: i64 = restored_connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_usage_checkpoints WHERE last_usage_execution_id = ?1",
+                [usage_execution_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(checkpoint_count, 1);
+    }
+
+    fn seed_usage_fact(source: &Path, root: &Path) -> (UsageExecutionId, u64) {
+        let connection = open_database(source).unwrap();
+        let workspace_root = root.join("usage-workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let (project, workspace) = WorkspaceRepository::ensure(
+            &connection,
+            &workspace_root,
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "Backup usage".to_string(),
+            project_id: project.id.clone(),
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path,
+            workspace_mode: workspace.mode,
+            agent_id: AgentId::parse("opencode").unwrap(),
+            state: AgentSessionState::Idle,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        SessionRepository::insert(&connection, &session).unwrap();
+        let migration_applied_at_ms = connection
+            .query_row(
+                "SELECT applied_at_ms FROM schema_migrations WHERE version = 31",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        let binding_created_at_ms = migration_applied_at_ms.saturating_add(1);
+        let binding_id = RuntimeBindingId::new();
+        let provider_profile_id = ProviderProfileId::new();
+        RuntimeBindingRepository::insert(
+            &connection,
+            &RuntimeBinding {
+                binding_id: binding_id.clone(),
+                session_id: session.id.clone(),
+                agent_id: session.agent_id.clone(),
+                transport_kind: TransportKind::Acp,
+                provider_profile_id: provider_profile_id.clone(),
+                adapter_id: AcpAdapterId::parse("usage-test-adapter").unwrap(),
+                adapter_version: "1.0.0".to_string(),
+                adapter_compatibility_identity: "usage-test-compatibility".to_string(),
+                native_session_id: None,
+                native_state_home_id: NativeStateHomeId::new(),
+                provider_resume_identity: None,
+                process_spawn_fingerprint: "usage-test-fingerprint".to_string(),
+                session_runtime_config_state: SessionRuntimeConfigState::default(),
+                capability_snapshot: None,
+                restore_compatibility_key: None,
+                profile_revision: 1,
+                last_context_sequence: 0,
+                last_summary_sequence: 0,
+                context_bridge_version: 0,
+                activation_generation: 1,
+                binding_state: BindingState::Current,
+                created_by_switch_id: None,
+                created_at_ms: binding_created_at_ms,
+                updated_at_ms: binding_created_at_ms,
+            },
+        )
+        .unwrap();
+
+        let usage_execution_id = UsageExecutionId::new();
+        RuntimeBindingRepository::claim_usage_zero_baseline(
+            &connection,
+            &binding_id,
+            1,
+            &usage_execution_id,
+        )
+        .unwrap();
+        let execution = AgentUsageExecutionContext {
+            usage_execution_id: usage_execution_id.clone(),
+            message_submission_id: None,
+            project_id: project.id,
+            workspace_id: workspace.id,
+            stream: AgentUsageStreamAttribution {
+                session_id: session.id,
+                binding_id,
+                activation_generation: 1,
+                agent_id: session.agent_id,
+                provider_profile_id,
+                model_id: "backup-test-model".to_string(),
+            },
+        }
+        .dispatched_at(binding_created_at_ms.saturating_add(1));
+        let expected_total_tokens = 1_234;
+        let mut mutable_connection = connection;
+        AgentUsageRepository::apply_observation(
+            &mut mutable_connection,
+            &AgentUsageObservation {
+                stream: execution.stream.clone(),
+                execution: Some(execution),
+                counter_origin: AgentUsageCounterOrigin::KnownZero,
+                observation_sequence: 1,
+                cumulative: AgentUsageTokenValues {
+                    input_tokens: Some(800),
+                    output_tokens: Some(434),
+                    cached_read_tokens: Some(200),
+                    total_tokens: Some(expected_total_tokens),
+                    ..AgentUsageTokenValues::default()
+                },
+                context_window_used_tokens: Some(1_100),
+                context_window_size_tokens: Some(200_000),
+                source: AgentUsageObservationSource::PromptResponse,
+                observed_at_ms: binding_created_at_ms.saturating_add(2),
+            },
+        )
+        .unwrap();
+        (usage_execution_id, expected_total_tokens)
     }
 
     fn seeded_backup(root: &Path) -> BackupCreateResult {

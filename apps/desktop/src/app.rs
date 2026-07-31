@@ -111,6 +111,7 @@ use crate::platform::ui_state_path;
 use crate::remote_access_pairing::open_remote_access_pairing;
 use crate::responsive::WorkbenchVisibility;
 use crate::terminal_surface::{TerminalSurface, available_shells};
+use crate::usage::UsageView;
 use crate::{DEFAULT_HEIGHT, DEFAULT_WIDTH, MIN_HEIGHT, MIN_WIDTH, theme};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1858,6 +1859,8 @@ pub struct VibexWorkbench {
     code_workbench: Entity<CodeWorkbench>,
     code_right_rail: Entity<CodeRightRail>,
     management_view: Entity<ManagementCenter>,
+    usage_view: Entity<UsageView>,
+    usage_session_filter: Option<VibexSessionId>,
     session_search: Entity<InputState>,
     session_search_open: bool,
     session_search_selected_index: usize,
@@ -2227,6 +2230,7 @@ impl VibexWorkbench {
         });
         let code_right_rail = cx.new(|cx| CodeRightRail::new(code_workbench.clone(), window, cx));
         let management_view = cx.new(|cx| ManagementCenter::new(window, cx));
+        let usage_view = cx.new(|_| UsageView::new());
         agent_subscriptions.push(cx.observe(&code_workbench, |_, _, cx| cx.notify()));
         agent_subscriptions.push(cx.subscribe(
             &management_view,
@@ -2288,6 +2292,8 @@ impl VibexWorkbench {
             code_workbench,
             code_right_rail,
             management_view,
+            usage_view,
+            usage_session_filter: None,
             session_search,
             session_search_open: false,
             session_search_selected_index: 0,
@@ -2488,6 +2494,8 @@ impl VibexWorkbench {
         self.shared_management = None;
         self.management_view
             .update(cx, |management, cx| management.clear_runtime(cx));
+        self.usage_view
+            .update(cx, |usage, cx| usage.clear_backend(cx));
         self.runtime_status = RuntimeStatus::Starting;
         self.runtime_note = None;
         self.event_task = None;
@@ -2549,6 +2557,8 @@ impl VibexWorkbench {
                                     &facade.capabilities(),
                                 ),
                             ));
+                            this.usage_view
+                                .update(cx, |usage, cx| usage.set_backend(facade.clone(), cx));
                             this.backend = Some(facade);
                             this.management_view.update(cx, |management, cx| {
                                 management.set_runtime(runtime.clone(), cx)
@@ -3793,6 +3803,7 @@ impl VibexWorkbench {
         let primary_tab_changed = self.ui_state.workbench.active_tab != "agent";
         if primary_tab_changed {
             self.sync_current_navigation_entry();
+            self.usage_session_filter = None;
             self.ui_state.workbench.active_tab = "agent".to_string();
             self.queue_ui_state();
         }
@@ -4372,6 +4383,12 @@ impl VibexWorkbench {
                     false
                 }
             }
+            DesktopEvent::UsageInvalidated => {
+                let visible = self.ui_state.workbench.active_tab == "usage";
+                self.usage_view
+                    .update(cx, |usage, cx| usage.invalidate(visible, cx));
+                visible
+            }
             DesktopEvent::Lagged {
                 stream,
                 skipped,
@@ -4393,6 +4410,11 @@ impl VibexWorkbench {
                     if let Some(session_id) = self.selected_session_id.clone() {
                         self.select_session_with_history(session_id, false, cx);
                     }
+                }
+                if refetch.usage {
+                    let visible = self.ui_state.workbench.active_tab == "usage";
+                    self.usage_view
+                        .update(cx, |usage, cx| usage.invalidate(visible, cx));
                 }
                 true
             }
@@ -7745,6 +7767,7 @@ impl VibexWorkbench {
         let primary_tab_changed = self.ui_state.workbench.active_tab != "agent";
         if primary_tab_changed {
             self.sync_current_navigation_entry();
+            self.usage_session_filter = None;
             self.ui_state.workbench.active_tab = "agent".to_string();
             self.queue_ui_state();
         }
@@ -9299,7 +9322,12 @@ impl VibexWorkbench {
     }
 
     fn current_workbench_route(&self) -> WorkbenchRoute {
-        workbench_route(&self.ui_state, self.selected_session_id.as_ref())
+        let mut route = workbench_route(&self.ui_state, self.selected_session_id.as_ref());
+        route.usage_session_id = self
+            .usage_session_filter
+            .as_ref()
+            .map(|id| id.as_str().to_string());
+        route
     }
 
     fn sync_current_navigation_entry(&mut self) {
@@ -9322,14 +9350,18 @@ impl VibexWorkbench {
         let selected_file_path = route.selected_file_path.clone();
         let selected_git_path = route.selected_git_path.clone();
         let selected_terminal_id = route.selected_terminal_id.clone();
-        self.ui_state.workbench.active_tab = if route.primary_tab == "management" {
-            "management".to_string()
-        } else {
-            "agent".to_string()
+        self.ui_state.workbench.active_tab = match route.primary_tab.as_str() {
+            "management" => "management".to_string(),
+            "usage" => "usage".to_string(),
+            _ => "agent".to_string(),
         };
-        if self.ui_state.workbench.active_tab == "management" {
+        if self.ui_state.workbench.active_tab != "agent" {
             self.clear_suggestions();
         }
+        self.usage_session_filter = route
+            .usage_session_id
+            .as_deref()
+            .and_then(|id| VibexSessionId::parse(id.to_string()).ok());
         self.ui_state.workbench.selected_workspace_id = route.workspace_id;
         self.ui_state.workbench.selected_file_path = selected_file_path.clone();
         self.ui_state.workbench.selected_git_path = selected_git_path.clone();
@@ -9373,6 +9405,10 @@ impl VibexWorkbench {
                 });
             }
             self.sync_management_pairing_context(cx);
+        } else if self.ui_state.workbench.active_tab == "usage" {
+            let session_filter = self.usage_session_filter.clone();
+            self.usage_view
+                .update(cx, |usage, cx| usage.activate(session_filter, cx));
         } else {
             self.load_right_rail_plugins(cx);
         }
@@ -9453,6 +9489,7 @@ impl VibexWorkbench {
             !new_session_open && self.code_workbench.read(cx).fullscreen_active();
         let agent_workbench_active = self.ui_state.workbench.active_tab == "agent";
         let management_open = self.ui_state.workbench.active_tab == "management";
+        let usage_open = self.ui_state.workbench.active_tab == "usage";
         let preview_side_open = agent_workbench_active
             && visibility.preview_docked
             && self.ui_state.workbench.preview_visible
@@ -9463,7 +9500,7 @@ impl VibexWorkbench {
             && self.ui_state.workbench.right_rail_visible
             && !preview_fullscreen
             && !new_session_open;
-        let sidebar_open = (agent_workbench_active || management_open)
+        let sidebar_open = (agent_workbench_active || management_open || usage_open)
             && visibility.sidebar_docked
             && self.ui_state.workbench.sidebar_visible;
 
@@ -10343,6 +10380,7 @@ impl VibexWorkbench {
             return;
         }
         self.sync_current_navigation_entry();
+        self.usage_session_filter = None;
         self.ui_state.workbench.active_tab = "management".to_string();
         self.queue_ui_state();
         if let Some(runtime) = self.runtime.clone() {
@@ -10351,6 +10389,30 @@ impl VibexWorkbench {
             });
         }
         self.sync_management_pairing_context(cx);
+        self.push_current_navigation_entry();
+        cx.notify();
+    }
+
+    fn open_usage(&mut self, session_filter: Option<VibexSessionId>, cx: &mut Context<Self>) {
+        let sidebar_was_open = self.sidebar_overlay_open || self.sidebar_hover_preview_open;
+        self.dismiss_sidebar_for_navigation();
+        self.new_session_open = false;
+        self.new_session_error = None;
+        self.clear_suggestions();
+        if self.ui_state.workbench.active_tab == "usage"
+            && self.usage_session_filter == session_filter
+        {
+            if sidebar_was_open {
+                cx.notify();
+            }
+            return;
+        }
+        self.sync_current_navigation_entry();
+        self.ui_state.workbench.active_tab = "usage".to_string();
+        self.usage_session_filter = session_filter.clone();
+        self.queue_ui_state();
+        self.usage_view
+            .update(cx, |usage, cx| usage.activate(session_filter, cx));
         self.push_current_navigation_entry();
         cx.notify();
     }
@@ -11028,6 +11090,8 @@ impl VibexWorkbench {
         } else {
             strings.sidebar_collapse_all
         };
+        let management_selected = self.ui_state.workbench.active_tab == "management";
+        let usage_selected = self.ui_state.workbench.active_tab == "usage";
 
         v_flex()
             .id("agent-sidebar")
@@ -11069,10 +11133,30 @@ impl VibexWorkbench {
                             .h(px(32.0))
                             .justify_start()
                             .rounded(gpui_component::button::ButtonRounded::Size(px(8.0)))
+                            .selected(management_selected)
                             .icon(Icon::new(IconName::Settings).mr_2())
                             .label(strings.sidebar_providers)
                             .child(div().flex_1())
                             .on_click(cx.listener(|this, _, _, cx| this.open_management(cx))),
+                    )
+                    .child(
+                        Button::new("sidebar-usage-statistics")
+                            .small()
+                            .ghost()
+                            .w_full()
+                            .h(px(32.0))
+                            .justify_start()
+                            .rounded(gpui_component::button::ButtonRounded::Size(px(8.0)))
+                            .selected(usage_selected)
+                            .icon(
+                                Icon::default()
+                                    .path("icons/vibex/activity.svg")
+                                    .size(px(16.0))
+                                    .mr_2(),
+                            )
+                            .label(locale::text("Usage Statistics", "用量统计", "用量統計"))
+                            .child(div().flex_1())
+                            .on_click(cx.listener(|this, _, _, cx| this.open_usage(None, cx))),
                     ),
             )
             .child(
@@ -18463,9 +18547,25 @@ impl VibexWorkbench {
                                             .flex_none()
                                             .items_center()
                                             .gap_1()
-                                            .child(render_cache_token_ring(
-                                                self.token_usage.as_ref(),
-                                                cx,
+                                            .child(button_with_aria_label(
+                                                Button::new("open-session-usage")
+                                                    .ghost()
+                                                    .compact()
+                                                    .size(px(32.0))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        let session_filter =
+                                                            this.selected_session_id.clone();
+                                                        this.open_usage(session_filter, cx);
+                                                    }))
+                                                    .child(render_cache_token_ring(
+                                                        self.token_usage.as_ref(),
+                                                        cx,
+                                                    )),
+                                                locale::text(
+                                                    "Open usage statistics",
+                                                    "打开用量统计",
+                                                    "開啟用量統計",
+                                                ),
                                             ))
                                             .child(self.render_composer_terminal_menu(cx))
                                             .child(primary_action),
@@ -19292,19 +19392,20 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let management_open = self.ui_state.workbench.active_tab == "management";
+        let usage_open = self.ui_state.workbench.active_tab == "usage";
+        let agent_open = self.ui_state.workbench.active_tab == "agent";
         let sidebar_docked = visibility.sidebar_docked && self.ui_state.workbench.sidebar_visible;
         let new_session_open = self.new_session_open;
-        let preview_fullscreen = !management_open
-            && !new_session_open
-            && self.code_workbench.read(cx).fullscreen_active();
+        let preview_fullscreen =
+            agent_open && !new_session_open && self.code_workbench.read(cx).fullscreen_active();
         let preview_docked = visibility.preview_docked
             && self.ui_state.workbench.preview_visible
-            && !management_open
+            && agent_open
             && !preview_fullscreen
             && !new_session_open;
         let right_rail_docked = visibility.right_rail_docked
             && self.ui_state.workbench.right_rail_visible
-            && !management_open
+            && agent_open
             && !preview_fullscreen
             && !new_session_open;
         let sidebar_width = self.sidebar_panel_width(visibility);
@@ -19342,6 +19443,14 @@ impl VibexWorkbench {
                         .min_w_0()
                         .min_h_0()
                         .child(self.management_view.clone())
+                        .into_any_element()
+                } else if usage_open {
+                    div()
+                        .id("usage-shell")
+                        .size_full()
+                        .min_w_0()
+                        .min_h_0()
+                        .child(self.usage_view.clone())
                         .into_any_element()
                 } else if new_session_open {
                     self.render_new_session_panel(strings, window, cx)
@@ -19388,10 +19497,10 @@ impl VibexWorkbench {
                     .child(resize_handle),
             );
         }
-        if !management_open && !new_session_open && !preview_fullscreen {
+        if agent_open && !new_session_open && !preview_fullscreen {
             shell = shell.child(self.render_right_rail_activity_bar(cx));
         }
-        let floating_right_rail = (!management_open
+        let floating_right_rail = (agent_open
             && !new_session_open
             && !visibility.right_rail_docked
             && self.right_rail_overlay_open
@@ -19421,7 +19530,7 @@ impl VibexWorkbench {
             });
         shell
             .when(
-                !management_open
+                agent_open
                     && !new_session_open
                     && !visibility.preview_docked
                     && self.preview_overlay_open
@@ -19878,6 +19987,7 @@ fn workbench_route(
     WorkbenchRoute {
         workspace_id: ui_state.workbench.selected_workspace_id.clone(),
         session_id: selected_session_id.map(|session_id| session_id.as_str().to_string()),
+        usage_session_id: None,
         primary_tab: ui_state.workbench.active_tab.clone(),
         right_rail: if ui_state.workbench.right_rail_visible {
             ui_state
@@ -25360,6 +25470,42 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn usage_navigation_is_independent_and_sits_above_projects() {
+        let source = include_str!("app.rs");
+        let sidebar = source
+            .split_once("    fn render_agent_sidebar(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_project("))
+            .map(|(body, _)| body)
+            .expect("sidebar renderer should remain inspectable");
+        let config = sidebar
+            .find("Button::new(\"sidebar-config-center\")")
+            .expect("Config Center entry should exist");
+        let usage = sidebar
+            .find("Button::new(\"sidebar-usage-statistics\")")
+            .expect("Usage Statistics entry should exist");
+        let projects = sidebar
+            .find("strings.sidebar_projects")
+            .expect("Projects section should exist");
+        assert!(config < usage);
+        assert!(usage < projects);
+        assert!(sidebar.contains(".selected(usage_selected)"));
+
+        let route = source
+            .split_once("    fn apply_workbench_route(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn navigate_back("))
+            .map(|(body, _)| body)
+            .expect("route application should remain inspectable");
+        assert!(route.contains("\"usage\" => \"usage\".to_string()"));
+        assert!(route.contains("usage.activate(session_filter, cx)"));
+
+        let composer = source
+            .split_once("Button::new(\"open-session-usage\")")
+            .expect("the live usage indicator should open Usage")
+            .1;
+        assert!(composer.contains("this.open_usage(session_filter, cx);"));
     }
 
     #[test]

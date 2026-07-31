@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 pub struct WorkbenchRoute {
     pub workspace_id: Option<String>,
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub usage_session_id: Option<String>,
     pub primary_tab: String,
     pub right_rail: String,
     pub selected_file_path: Option<String>,
@@ -237,6 +239,21 @@ mod tests {
             primary_tab: name.into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn usage_session_filter_round_trips_with_navigation_history() {
+        let mut usage = route("usage");
+        usage.usage_session_id = Some("session_usage_filter".to_string());
+        let encoded = serde_json::to_string(&usage).unwrap();
+        let decoded: WorkbenchRoute = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, usage);
+
+        let legacy: WorkbenchRoute = serde_json::from_str(
+            r#"{"workspaceId":null,"sessionId":null,"primaryTab":"usage","rightRail":"","selectedFilePath":null,"selectedGitPath":null,"selectedTerminalId":null}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.usage_session_id, None);
     }
 
     #[test]

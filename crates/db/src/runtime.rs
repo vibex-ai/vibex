@@ -18,7 +18,7 @@ use vibex_core::{
     RuntimeSwitchId, RuntimeSwitchOperationId, RuntimeSwitchPolicy, RuntimeSwitchStatus,
     SendAgentMessageRequest, SessionRuntimeConfigState, SessionRuntimeSelection,
     SessionRuntimeSelectionStatus, SwitchOperationStatus, TimelineItemId, TimelineItemKind,
-    TransportKind, VibexError, VibexResult, VibexSessionId, unix_timestamp_ms,
+    TransportKind, UsageExecutionId, VibexError, VibexResult, VibexSessionId, unix_timestamp_ms,
 };
 
 use crate::{enum_from_db, enum_to_db, json_from_db, json_to_db, parse_id, storage_err};
@@ -48,10 +48,12 @@ impl RuntimeBindingRepository {
                 session_runtime_config_state_json, capability_snapshot_json,
                 restore_compatibility_key_json, last_context_sequence,
                 last_summary_sequence, context_bridge_version, activation_generation,
-                binding_state, created_by_switch_id, created_at_ms, updated_at_ms
+                binding_state, created_by_switch_id, created_at_ms, updated_at_ms,
+                usage_zero_baseline_state, usage_zero_baseline_execution_id,
+                usage_zero_baseline_activation_generation
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
+                ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, 'available', NULL, NULL
             )
             ",
             params![
@@ -94,6 +96,92 @@ impl RuntimeBindingRepository {
             "failed to insert runtime binding",
         ))?;
         Ok(())
+    }
+
+    /// Claims the one execution that may subtract a binding's cumulative
+    /// counter from a proven zero origin. Existing bindings upgraded from an
+    /// older schema start unavailable, while newly inserted bindings start
+    /// available and can be claimed exactly once.
+    pub fn claim_usage_zero_baseline(
+        conn: &Connection,
+        binding_id: &RuntimeBindingId,
+        activation_generation: i64,
+        usage_execution_id: &UsageExecutionId,
+    ) -> VibexResult<bool> {
+        if activation_generation < 0 {
+            return Err(VibexError::validation(
+                "agent_usage_zero_baseline_generation_invalid",
+                "Agent usage zero-baseline activation generation is invalid",
+            ));
+        }
+        let changed = conn
+            .execute(
+                "
+                UPDATE session_runtime_bindings
+                SET usage_zero_baseline_state = 'claimed',
+                    usage_zero_baseline_execution_id = ?2,
+                    usage_zero_baseline_activation_generation = ?3,
+                    updated_at_ms = ?4
+                WHERE binding_id = ?1
+                  AND activation_generation = ?3
+                  AND usage_zero_baseline_state = 'available'
+                  AND usage_zero_baseline_execution_id IS NULL
+                  AND usage_zero_baseline_activation_generation IS NULL
+                ",
+                params![
+                    binding_id.as_str(),
+                    usage_execution_id.as_str(),
+                    activation_generation,
+                    unix_timestamp_ms(),
+                ],
+            )
+            .map_err(storage_err(
+                "agent_usage_zero_baseline_claim_failed",
+                "failed to claim the Agent usage zero baseline",
+            ))?;
+        if changed == 1 {
+            return Ok(true);
+        }
+
+        let current = conn
+            .query_row(
+                "
+                SELECT activation_generation, usage_zero_baseline_state,
+                       usage_zero_baseline_execution_id,
+                       usage_zero_baseline_activation_generation
+                FROM session_runtime_bindings
+                WHERE binding_id = ?1
+                ",
+                params![binding_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_err(
+                "agent_usage_zero_baseline_lookup_failed",
+                "failed to inspect the Agent usage zero baseline",
+            ))?
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "agent_usage_zero_baseline_binding_missing",
+                    "Agent usage zero-baseline binding was not found",
+                )
+            })?;
+        if current.0 != activation_generation {
+            return Err(VibexError::conflict(
+                "agent_usage_zero_baseline_fence_stale",
+                "Agent usage zero-baseline activation fence is stale",
+            ));
+        }
+        Ok(current.1 == "claimed"
+            && current.2.as_deref() == Some(usage_execution_id.as_str())
+            && current.3 == Some(activation_generation))
     }
 
     pub fn get(
@@ -6274,6 +6362,58 @@ mod tests {
                 .activation_generation,
             1
         );
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn usage_zero_baseline_claim_is_exact_idempotent_and_one_shot() {
+        let temp = temp_db_path("usage-zero-baseline-claim");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let session_id = seeded_session(&conn, "usage-zero-baseline-claim");
+        let binding = sample_binding(&session_id, BindingState::Current);
+        RuntimeBindingRepository::insert(&conn, &binding).unwrap();
+        let first = UsageExecutionId::new();
+        let second = UsageExecutionId::new();
+
+        assert!(
+            RuntimeBindingRepository::claim_usage_zero_baseline(
+                &conn,
+                &binding.binding_id,
+                binding.activation_generation,
+                &first,
+            )
+            .unwrap()
+        );
+        assert!(
+            RuntimeBindingRepository::claim_usage_zero_baseline(
+                &conn,
+                &binding.binding_id,
+                binding.activation_generation,
+                &first,
+            )
+            .unwrap()
+        );
+        assert!(
+            !RuntimeBindingRepository::claim_usage_zero_baseline(
+                &conn,
+                &binding.binding_id,
+                binding.activation_generation,
+                &second,
+            )
+            .unwrap()
+        );
+
+        let stored: (String, String, i64) = conn
+            .query_row(
+                "SELECT usage_zero_baseline_state, usage_zero_baseline_execution_id,
+                        usage_zero_baseline_activation_generation
+                 FROM session_runtime_bindings WHERE binding_id = ?1",
+                params![binding.binding_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, ("claimed".to_string(), first.to_string(), 0));
         cleanup_db(temp);
     }
 

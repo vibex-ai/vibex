@@ -3,18 +3,19 @@ use std::time::Duration;
 
 use vibex_core::{
     AgentListRequest, AgentListResponse, AgentSession, AgentSessionRuntimeSelectionState,
-    CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
-    FetchTimelineRequest, FileMutationRequest, FileReadRequest, FileReadResponse,
-    FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest,
-    GitCommitRequest, GitCommitResult, GitDiffRequest, GitDiffResponse, GitStageRequest,
-    GitStatusSummary, OpenWorkspaceRequest, ProjectId, ProviderHealthSummary,
-    ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, RemoteAuditListRequest,
-    RemoteAuditRecord, RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
-    RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeviceDetail,
-    RemoteRevokeDeviceRequest, RenameAgentSessionRequest, ResolvePermissionRequest,
-    SendAgentMessageRequest, SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest,
-    TerminalCreateRequest, TerminalId, TerminalResizeRequest, TerminalSession, TerminalSnapshot,
-    TerminalStatus, TerminalWriteRequest, TimelineItem, TimelinePage, VibexSessionId, WorkspaceId,
+    AgentUsageStatistics, AgentUsageStatisticsRequest, CancelAgentSessionRuntimeSwitchRequest,
+    ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest, FileMutationRequest,
+    FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
+    FileTreeRequest, FileWriteRequest, GitCommitRequest, GitCommitResult, GitDiffRequest,
+    GitDiffResponse, GitStageRequest, GitStatusSummary, OpenWorkspaceRequest, ProjectId,
+    ProviderHealthSummary, ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult,
+    RemoteAuditListRequest, RemoteAuditRecord, RemoteCreatePairingCodeRequest,
+    RemoteCreatePairingCodeResponse, RemoteCreatePairingOfferRequest,
+    RemoteCreatePairingOfferResponse, RemoteDeviceDetail, RemoteRevokeDeviceRequest,
+    RenameAgentSessionRequest, ResolvePermissionRequest, SendAgentMessageRequest,
+    SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
+    TerminalId, TerminalResizeRequest, TerminalSession, TerminalSnapshot, TerminalStatus,
+    TerminalWriteRequest, TimelineItem, TimelinePage, VibexSessionId, WorkspaceId,
 };
 use vibex_desktop_runtime::{
     AuthoritativeRefetch, DesktopEvent, DesktopEventReceiver, DesktopEventStream, DesktopRuntime,
@@ -23,8 +24,8 @@ use vibex_desktop_runtime::{
 
 use crate::{
     AgentBackend, BackendCapabilitySnapshot, BackendError, BackendEvent, BackendEventStream,
-    BackendEventSubscription, BackendFacade, BackendFuture, BackendOperation, BackendRefetch,
-    BackendResult, DeviceBackend, FileBackend, GitBackend, ManagementBackend,
+    BackendEventSubscription, BackendFacade, BackendFuture, BackendOperation, BackendProjection,
+    BackendRefetch, BackendResult, DeviceBackend, FileBackend, GitBackend, ManagementBackend,
     ManagementProfileSelectionRequest, MutationRequest, RelayConnectionState, RelayStatusSummary,
     TerminalBackend, TerminalFrame, TerminalFrameBatch, TerminalFrameSubscription,
     WorkspaceBackend, WorkspaceSummary,
@@ -95,6 +96,9 @@ fn map_desktop_event(event: DesktopEvent) -> BackendEvent {
         DesktopEvent::Timeline(event) => BackendEvent::Timeline(event),
         DesktopEvent::Runtime(event) => BackendEvent::Runtime(event),
         DesktopEvent::RuntimeSelection(event) => BackendEvent::RuntimeSelection(event),
+        DesktopEvent::UsageInvalidated => {
+            BackendEvent::ProjectionInvalidated(BackendProjection::Usage)
+        }
         DesktopEvent::Lagged {
             stream,
             skipped,
@@ -114,6 +118,7 @@ fn map_event_stream(stream: DesktopEventStream) -> BackendEventStream {
         DesktopEventStream::Timeline => BackendEventStream::Timeline,
         DesktopEventStream::Runtime => BackendEventStream::Runtime,
         DesktopEventStream::RuntimeSelection => BackendEventStream::RuntimeSelection,
+        DesktopEventStream::Usage => BackendEventStream::Usage,
         DesktopEventStream::Fanout => BackendEventStream::Fanout,
     }
 }
@@ -124,7 +129,7 @@ fn map_refetch(refetch: AuthoritativeRefetch) -> BackendRefetch {
         timeline: refetch.timeline,
         runtime: refetch.runtime,
         runtime_selection: refetch.runtime_selection,
-        projection: None,
+        projection: refetch.usage.then_some(BackendProjection::Usage),
     }
 }
 
@@ -185,6 +190,26 @@ impl AgentBackend for NativeBackend {
                 .agent()
                 .fetch_timeline(request)
                 .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn usage_statistics(
+        &self,
+        request: AgentUsageStatisticsRequest,
+    ) -> BackendFuture<'_, AgentUsageStatistics> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            let service = runtime.usage();
+            tokio::task::spawn_blocking(move || service.query_statistics(request))
+                .await
+                .map_err(|_| {
+                    BackendError::failed(
+                        "agent_usage_query_task_failed",
+                        "Agent usage query task did not complete",
+                    )
+                })?
                 .map_err(Into::into)
         })
     }

@@ -1035,6 +1035,9 @@ impl WorkflowWorkbenchView {
                     self.refresh_management_from_event(recovery, cx);
                 }
             }
+            BackendProjection::Usage => {
+                cx.notify();
+            }
         }
     }
 

@@ -3864,13 +3864,13 @@ mod tests {
     #[tokio::test]
     async fn lease_heartbeat_prevents_takeover_during_slow_external_operation() {
         let env = TestEnvironment::new("lease-heartbeat");
-        env.executor.set_delay_on(OP_SPAWN_PROCESS, 180);
+        env.executor.set_delay_on(OP_SPAWN_PROCESS, 900);
         let coordinator = RuntimeSwitchCoordinator::new(
             &env.db_path,
             Arc::new(env.executor.clone()),
             Arc::new(env.gate.clone()),
             RuntimeSwitchCoordinatorConfig {
-                lease_duration_ms: 60,
+                lease_duration_ms: 300,
                 idle_poll_interval: Duration::from_millis(2),
             },
         )
@@ -3878,7 +3878,26 @@ mod tests {
         let request = env.request("lease-heartbeat");
         let task = tokio::spawn(async move { coordinator.request_switch(request).await });
         wait_for_executor_call(&env.executor, OP_SPAWN_PROCESS).await;
-        sleep(Duration::from_millis(120)).await;
+        let initial_deadline_ms = env
+            .switch_by_key("lease-heartbeat")
+            .worker_lease_deadline_ms
+            .expect("worker lease should exist before the external operation");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let now_ms = unix_timestamp_ms();
+                let deadline_ms = env
+                    .switch_by_key("lease-heartbeat")
+                    .worker_lease_deadline_ms;
+                if now_ms > initial_deadline_ms
+                    && deadline_ms.is_some_and(|deadline_ms| deadline_ms > now_ms + 100)
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("heartbeat should renew the lease beyond its original deadline");
         let record = env.switch_by_key("lease-heartbeat");
         assert!(
             !RuntimeSwitchRepository::try_acquire_worker_lease(

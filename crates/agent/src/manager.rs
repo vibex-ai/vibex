@@ -9,8 +9,9 @@ use vibex_core::{
     AgentCommandExecuteRequest, AgentCommandExecuteResult, AgentCommandExecuteStatus,
     AgentCommandExecutionBehavior, AgentCommandSelectionBehavior, AgentCommandSourceKind,
     AgentCommandTrigger, AgentConfig, AgentId, AgentModelListRequest, AgentModelListResponse,
-    AgentModelListSource, AgentSession, AgentSessionConfigProbe, AgentSessionSafety,
-    AgentSessionState, BindingState, ContinueAgentTurnRequest, CreateAgentSessionRequest,
+    AgentModelListSource, AgentSession, AgentSessionConfigProbe, AgentSessionRestoreMethod,
+    AgentSessionSafety, AgentSessionState, AgentUsageCounterOrigin, AgentUsageExecutionContext,
+    AgentUsageStreamAttribution, BindingState, ContinueAgentTurnRequest, CreateAgentSessionRequest,
     ExternalSessionContinuationStatus, ExternalSessionImportCandidate,
     ExternalSessionImportCandidateStatus, ExternalSessionImportDiagnostic,
     ExternalSessionImportPreview, ExternalSessionImportPreviewRequest,
@@ -24,7 +25,7 @@ use vibex_core::{
     SessionRuntimeSelection, SessionRuntimeSelectionStatus, SystemNoticeLevel, SystemNoticePayload,
     TimelineErrorPayload, TimelineItem, TimelineLiveEvent, TimelinePage, TimelinePayload,
     TimelineRedactionState, TimelineSource, TransportKind, TurnExecutionAttribution,
-    UserMessagePayload, VibexError, VibexResult, VibexSessionId, WorkspaceId,
+    UsageExecutionId, UserMessagePayload, VibexError, VibexResult, VibexSessionId, WorkspaceId,
     agent_id_for_provider_kind, builtin_agent_definitions, unix_timestamp_ms,
 };
 use vibex_db::{
@@ -36,9 +37,10 @@ use vibex_db::{
 };
 
 use crate::adapter::{
-    AgentProvider, ProviderEvent, ProviderPermissionResolution, ProviderRuntimeMcpServer,
-    ProviderRuntimeMcpTransport, ProviderRuntimeResources, ProviderRuntimeSkill,
-    ProviderSessionHandle, ProviderTurnExecutionIdentity, ProviderTurnRequest, ProviderTurnResult,
+    AgentProvider, AgentUsageTelemetryEvent, ProviderEvent, ProviderPermissionResolution,
+    ProviderRuntimeMcpServer, ProviderRuntimeMcpTransport, ProviderRuntimeResources,
+    ProviderRuntimeSkill, ProviderSessionHandle, ProviderTurnExecutionIdentity,
+    ProviderTurnRequest, ProviderTurnResult,
 };
 use crate::context_bridge::{ContextBridgeService, PreparedContextBridge};
 use crate::message_submission::MessageSubmissionCoordinator;
@@ -57,6 +59,7 @@ pub struct AgentManager {
     live_events: broadcast::Sender<TimelineLiveEvent>,
     runtime_selection: OnceLock<Weak<RuntimeSelectionService>>,
     message_submission: OnceLock<Weak<MessageSubmissionCoordinator>>,
+    usage_telemetry: OnceLock<mpsc::UnboundedSender<AgentUsageTelemetryEvent>>,
     context_bridge: ContextBridgeService,
 }
 
@@ -124,6 +127,7 @@ impl AgentManager {
             live_events,
             runtime_selection: OnceLock::new(),
             message_submission: OnceLock::new(),
+            usage_telemetry: OnceLock::new(),
             context_bridge,
         };
         manager.recover_interrupted_sessions(&mut conn)?;
@@ -202,6 +206,18 @@ impl AgentManager {
                     "runtime selection service is already installed",
                 )
             })
+    }
+
+    pub fn install_usage_telemetry_sender(
+        &self,
+        sender: mpsc::UnboundedSender<AgentUsageTelemetryEvent>,
+    ) -> VibexResult<()> {
+        self.usage_telemetry.set(sender).map_err(|_| {
+            VibexError::conflict(
+                "agent_usage_telemetry_already_installed",
+                "Agent usage telemetry sender is already installed",
+            )
+        })
     }
 
     pub fn database_path(&self) -> &Path {
@@ -1188,6 +1204,11 @@ impl AgentManager {
                 "durable message submission has no committed runtime binding",
             )
         })?;
+        let usage_execution_id = message_submission_id
+            .as_ref()
+            .map(UsageExecutionId::from_message_submission)
+            .unwrap_or_default();
+        let usage_counter_origin = self.usage_counter_origin(&conn, current_binding_id)?;
         let (binding, expected_execution_identity, route_key) = self
             .durable_provider_turn_binding(
                 &conn,
@@ -1262,6 +1283,8 @@ impl AgentManager {
                 provider_turn_text,
                 &request.attachments,
                 message_submission_id.clone(),
+                usage_execution_id,
+                usage_counter_origin,
                 Some(required_runtime.clone()),
                 Some(expected_execution_identity.clone()),
                 coalesce_after_sequence,
@@ -1419,6 +1442,8 @@ impl AgentManager {
         provider_turn_text: String,
         attachments: &[MessageAttachment],
         message_submission_id: Option<MessageSubmissionId>,
+        usage_execution_id: UsageExecutionId,
+        usage_counter_origin: AgentUsageCounterOrigin,
         required_runtime: Option<SessionRuntimeSelection>,
         expected_execution_identity: Option<ProviderTurnExecutionIdentity>,
         coalesce_after_sequence: i64,
@@ -1465,6 +1490,9 @@ impl AgentManager {
             execution_identity: expected_execution_identity.clone(),
             event_sender: Some(event_sender),
             binding_update_sender: None,
+            usage_execution_context: None,
+            usage_counter_origin,
+            usage_event_sender: self.usage_telemetry.get().cloned(),
         };
         let execution_identity = match provider
             .prepare_turn_execution(&handle, &turn_request)
@@ -1493,6 +1521,23 @@ impl AgentManager {
                 execution_attribution: None,
             });
         }
+        let usage_execution_context =
+            execution_identity
+                .as_ref()
+                .map(|identity| AgentUsageExecutionContext {
+                    usage_execution_id,
+                    message_submission_id: turn_request.message_submission_id.clone(),
+                    project_id: session.project_id.clone(),
+                    workspace_id: session.workspace_id.clone(),
+                    stream: AgentUsageStreamAttribution {
+                        session_id: session.id.clone(),
+                        binding_id: identity.binding_id.clone(),
+                        activation_generation: identity.activation_generation,
+                        agent_id: session.agent_id.clone(),
+                        provider_profile_id: binding.provider_profile_id.clone(),
+                        model_id: identity.model_id.clone(),
+                    },
+                });
         let execution_attribution = match execution_identity.as_ref() {
             Some(identity) => match self.turn_execution_attribution(&binding, identity) {
                 Ok(attribution) => Some(attribution),
@@ -1508,6 +1553,8 @@ impl AgentManager {
             None => None,
         };
         turn_request.execution_identity = execution_identity;
+        turn_request.usage_execution_context = usage_execution_context;
+        turn_request.usage_counter_origin = usage_counter_origin;
         let turn = runner(provider.clone(), handle, turn_request);
         tokio::pin!(turn);
 
@@ -2133,6 +2180,27 @@ impl AgentManager {
             })
     }
 
+    fn usage_counter_origin(
+        &self,
+        conn: &DbConnection,
+        binding_id: &vibex_core::RuntimeBindingId,
+    ) -> VibexResult<AgentUsageCounterOrigin> {
+        let Some(binding) = RuntimeBindingRepository::get(conn, binding_id)? else {
+            return Ok(AgentUsageCounterOrigin::Unknown);
+        };
+        let Some(switch_id) = binding.created_by_switch_id.as_ref() else {
+            return Ok(AgentUsageCounterOrigin::Unknown);
+        };
+        let Some(record) = RuntimeSwitchRepository::get(conn, switch_id)? else {
+            return Ok(AgentUsageCounterOrigin::Unknown);
+        };
+        Ok(usage_counter_origin_for_switch_method(
+            record
+                .restore_compatibility_result
+                .and_then(|result| result.method),
+        ))
+    }
+
     pub(crate) fn open_migrated(&self) -> VibexResult<DbConnection> {
         let mut conn = open_database(&self.db_path)?;
         apply_migrations(&mut conn)?;
@@ -2621,6 +2689,17 @@ impl AgentManager {
     }
 }
 
+fn usage_counter_origin_for_switch_method(
+    method: Option<AgentSessionRestoreMethod>,
+) -> AgentUsageCounterOrigin {
+    match method {
+        Some(AgentSessionRestoreMethod::Resume | AgentSessionRestoreMethod::Load) => {
+            AgentUsageCounterOrigin::Resumed
+        }
+        Some(AgentSessionRestoreMethod::New) | None => AgentUsageCounterOrigin::KnownZero,
+    }
+}
+
 fn push_or_replace_timeline_item(items: &mut Vec<TimelineItem>, item: TimelineItem) {
     if let Some(existing) = items
         .iter_mut()
@@ -3036,12 +3115,13 @@ fn imported_session_notice(candidate: &ExternalSessionImportCandidate) -> String
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use vibex_core::{
-        AcpAdapterId, AgentRuntimeRouteKey, AgentSessionSafety, RuntimeBindingId,
-        RuntimeSwitchActiveWorkPolicy, RuntimeSwitchId, RuntimeSwitchPolicy, WorkspaceMode,
+        AcpAdapterId, AgentRuntimeRouteKey, AgentSessionSafety, NativeStateHomeId, RuntimeBinding,
+        RuntimeBindingId, RuntimeSwitchActiveWorkPolicy, RuntimeSwitchId, RuntimeSwitchPolicy,
+        SessionRuntimeConfigState, WorkspaceMode,
     };
     use vibex_db::{DesiredRuntimeSwitchEnqueueRequest, WorkspaceRepository};
 
@@ -3053,6 +3133,10 @@ mod tests {
 
     struct TestProvider {
         kind: ProviderKind,
+    }
+
+    struct UsageOriginProvider {
+        identity: ProviderTurnExecutionIdentity,
     }
 
     #[async_trait]
@@ -3088,6 +3172,50 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl AgentProvider for UsageOriginProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Acp
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::conservative(ProviderKind::Acp, "usage-origin-test")
+        }
+
+        async fn create_session(
+            &self,
+            _request: ProviderCreateRequest,
+        ) -> VibexResult<ProviderSessionHandle> {
+            unreachable!("usage-origin test resumes its seeded binding")
+        }
+
+        async fn resume_session(
+            &self,
+            binding: ProviderBinding,
+        ) -> VibexResult<ProviderSessionHandle> {
+            Ok(ProviderSessionHandle {
+                binding,
+                capabilities: self.capabilities(),
+            })
+        }
+
+        async fn prepare_turn_execution(
+            &self,
+            _handle: &ProviderSessionHandle,
+            _request: &ProviderTurnRequest,
+        ) -> VibexResult<Option<ProviderTurnExecutionIdentity>> {
+            Ok(Some(self.identity.clone()))
+        }
+
+        async fn send_turn(
+            &self,
+            _handle: ProviderSessionHandle,
+            _request: ProviderTurnRequest,
+        ) -> VibexResult<ProviderTurnResult> {
+            unreachable!("usage-origin test injects a runner")
+        }
+    }
+
     #[test]
     fn reasoning_effort_validation_is_forward_compatible_but_bounded() {
         assert_eq!(
@@ -3100,6 +3228,174 @@ mod tests {
         );
         let error = normalize_reasoning_effort(Some("high=value")).unwrap_err();
         assert_eq!(error.code, "reasoning_effort_invalid");
+    }
+
+    #[test]
+    fn switch_usage_origin_treats_only_successful_restore_as_resumed() {
+        assert_eq!(
+            usage_counter_origin_for_switch_method(None),
+            AgentUsageCounterOrigin::KnownZero
+        );
+        assert_eq!(
+            usage_counter_origin_for_switch_method(Some(AgentSessionRestoreMethod::New)),
+            AgentUsageCounterOrigin::KnownZero
+        );
+        for method in [
+            AgentSessionRestoreMethod::Resume,
+            AgentSessionRestoreMethod::Load,
+        ] {
+            assert_eq!(
+                usage_counter_origin_for_switch_method(Some(method)),
+                AgentUsageCounterOrigin::Resumed
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_baseline_origin_is_forwarded_without_claiming_before_dispatch() {
+        let db_path = temp_db_path("usage-zero-baseline-request");
+        let manager = AgentManager::new(&db_path).unwrap();
+        let conn = manager.open_migrated().unwrap();
+        ProviderProfileRepository::ensure_local_defaults(&conn).unwrap();
+        let workspace_root = temp_workspace_path("usage-zero-baseline-request");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let agent_id = AgentId::parse("opencode").unwrap();
+        let session = insert_session(
+            &conn,
+            "usage zero baseline request",
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            agent_id.clone(),
+            AgentSessionState::Idle,
+        );
+        let provider_profile_id =
+            ProviderProfileId::parse(ProviderKind::Acp.local_default_profile_id().to_string())
+                .unwrap();
+        let binding_id = RuntimeBindingId::new();
+        let now = unix_timestamp_ms();
+        RuntimeBindingRepository::insert(
+            &conn,
+            &RuntimeBinding {
+                binding_id: binding_id.clone(),
+                session_id: session.id.clone(),
+                agent_id,
+                transport_kind: TransportKind::Acp,
+                provider_profile_id: provider_profile_id.clone(),
+                adapter_id: AcpAdapterId::parse("opencode-acp").unwrap(),
+                adapter_version: "1.0.0".to_string(),
+                adapter_compatibility_identity: "opencode-acp@1".to_string(),
+                native_session_id: Some("native-usage-origin-test".to_string()),
+                native_state_home_id: NativeStateHomeId::new(),
+                provider_resume_identity: None,
+                process_spawn_fingerprint: "usage-origin-test".to_string(),
+                session_runtime_config_state: SessionRuntimeConfigState::default(),
+                capability_snapshot: None,
+                restore_compatibility_key: None,
+                profile_revision: 1,
+                last_context_sequence: 0,
+                last_summary_sequence: 0,
+                context_bridge_version: 0,
+                activation_generation: 3,
+                binding_state: BindingState::Current,
+                created_by_switch_id: None,
+                created_at_ms: now,
+                updated_at_ms: now,
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        let identity = ProviderTurnExecutionIdentity {
+            binding_id,
+            activation_generation: 3,
+            model_id: "usage-test-model".to_string(),
+        };
+        let provider_binding = ProviderBinding {
+            session_id: session.id.clone(),
+            provider_kind: ProviderKind::Acp,
+            provider_profile_id,
+            native: ProviderNativeBinding {
+                native_session_id: Some("native-usage-origin-test".to_string()),
+                ..ProviderNativeBinding::empty()
+            },
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        let provider = Arc::new(UsageOriginProvider {
+            identity: identity.clone(),
+        });
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let runner = {
+            let captured = Arc::clone(&captured);
+            move |_provider: Arc<dyn AgentProvider>,
+                  _handle: ProviderSessionHandle,
+                  request: ProviderTurnRequest| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    let execution_id = request
+                        .usage_execution_context
+                        .expect("prepared turn must carry usage execution context")
+                        .usage_execution_id;
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push((request.usage_counter_origin, execution_id));
+                    Ok(ProviderTurnResult {
+                        events: Vec::new(),
+                        binding_update: None,
+                        completed: true,
+                    })
+                }
+            }
+        };
+        let first_execution_id = UsageExecutionId::new();
+        let second_execution_id = UsageExecutionId::new();
+        for usage_execution_id in [&first_execution_id, &second_execution_id] {
+            let outcome = manager
+                .run_provider_turn_attempt(
+                    &session,
+                    provider.clone(),
+                    provider_binding.clone(),
+                    "test usage origin".to_string(),
+                    &[],
+                    None,
+                    usage_execution_id.clone(),
+                    AgentUsageCounterOrigin::KnownZero,
+                    None,
+                    Some(identity.clone()),
+                    0,
+                    &runner,
+                )
+                .await;
+            assert!(matches!(outcome, ProviderTurnAttemptOutcome::Success(_)));
+        }
+        assert_eq!(
+            *captured.lock().unwrap(),
+            vec![
+                (AgentUsageCounterOrigin::KnownZero, first_execution_id),
+                (AgentUsageCounterOrigin::KnownZero, second_execution_id),
+            ]
+        );
+        let claim_probe = UsageExecutionId::new();
+        let conn = manager.open_migrated().unwrap();
+        assert!(
+            RuntimeBindingRepository::claim_usage_zero_baseline(
+                &conn,
+                &identity.binding_id,
+                identity.activation_generation,
+                &claim_probe,
+            )
+            .unwrap(),
+            "pre-dispatch turn preparation must leave the one-shot claim available"
+        );
+        drop(conn);
+
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
     }
 
     #[test]

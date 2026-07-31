@@ -123,6 +123,17 @@ vibex_id!(RuntimeLeaseId, "runtime_lease");
 vibex_id!(RuntimeProcessId, "runtime_process");
 vibex_id!(NativeStateHomeId, "statehome");
 vibex_id!(MessageSubmissionId, "submission");
+vibex_id!(UsageExecutionId, "usage_execution");
+
+impl UsageExecutionId {
+    pub fn from_message_submission(submission_id: &MessageSubmissionId) -> Self {
+        let suffix = submission_id
+            .as_str()
+            .strip_prefix("submission_")
+            .unwrap_or(submission_id.as_str());
+        Self(format!("{}_{}", Self::PREFIX, suffix))
+    }
+}
 
 impl RuntimeProcessId {
     /// Accepts an existing provider-runtime process identity while the ACP

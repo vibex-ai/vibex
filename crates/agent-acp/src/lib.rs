@@ -20,9 +20,9 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 use vibex_agent::{
-    AgentProvider, ProviderCreateRequest, ProviderEvent, ProviderPermissionResolution,
-    ProviderRuntimeResources, ProviderSessionHandle, ProviderTurnAttachment,
-    ProviderTurnExecutionIdentity, ProviderTurnRequest, ProviderTurnResult,
+    AgentProvider, AgentUsageTelemetryEvent, ProviderCreateRequest, ProviderEvent,
+    ProviderPermissionResolution, ProviderRuntimeResources, ProviderSessionHandle,
+    ProviderTurnAttachment, ProviderTurnExecutionIdentity, ProviderTurnRequest, ProviderTurnResult,
     materialize_provider_attachments, reject_forbidden_agent_smoke_workspace,
     resolve_agent_smoke_workspace,
 };
@@ -33,13 +33,13 @@ use vibex_core::{
     AgentCommandExecuteRequest, AgentCommandExecutionBehavior, AgentCommandSelectionBehavior,
     AgentCommandSourceKind, AgentCommandTrigger, AgentEventRawExtension, AgentMessageDeltaPayload,
     AgentMessagePayload, AgentModelCapabilities, AgentModelListResponse, AgentModelListSource,
-    AgentReasoningEffort, AgentSessionConfigProbe, AgentSessionSafety,
-    ExternalSessionImportCandidate, MessageSubmissionId, PermissionActionDetail, PermissionRequest,
-    PermissionRequestStatus, PermissionResponseKind, PermissionRiskCategory, PlanPayload,
-    PlanStepPayload, ProviderBinding, ProviderBindingMetadata, ProviderCapabilities,
-    ProviderCapabilitySummary, ProviderKind, ProviderNativeBinding, ProviderProfileId,
-    ProviderRunCapabilityProbesRequest, ProviderSessionConfigOption, ProviderSessionConfigValue,
-    ReasoningPayload, RequestId, SessionRuntimeConfigMutationRequest,
+    AgentReasoningEffort, AgentSessionConfigProbe, AgentSessionSafety, AgentUsageCounterOrigin,
+    AgentUsageExecutionContext, ExternalSessionImportCandidate, MessageSubmissionId,
+    PermissionActionDetail, PermissionRequest, PermissionRequestStatus, PermissionResponseKind,
+    PermissionRiskCategory, PlanPayload, PlanStepPayload, ProviderBinding, ProviderBindingMetadata,
+    ProviderCapabilities, ProviderCapabilitySummary, ProviderKind, ProviderNativeBinding,
+    ProviderProfileId, ProviderRunCapabilityProbesRequest, ProviderSessionConfigOption,
+    ProviderSessionConfigValue, ReasoningPayload, RequestId, SessionRuntimeConfigMutationRequest,
     SessionRuntimeConfigMutationResult, SessionRuntimeSelection, SystemNoticeLevel,
     SystemNoticePayload, TimelineErrorPayload, TimelinePayload, TimelineRedactionState,
     ToolCallPayload, ToolCallStatus, VibexError, VibexResult, VibexSessionId, unix_timestamp_ms,
@@ -1752,6 +1752,9 @@ pub struct AcpSendTurnRequest {
     /// Streams translated ACP events while the turn is still running. When
     /// absent, adapters buffer events into the returned [`AcpTurn`].
     pub event_sender: Option<tokio::sync::mpsc::UnboundedSender<AcpEvent>>,
+    pub usage_execution_context: Option<AgentUsageExecutionContext>,
+    pub usage_counter_origin: AgentUsageCounterOrigin,
+    pub usage_event_sender: Option<tokio::sync::mpsc::UnboundedSender<AgentUsageTelemetryEvent>>,
 }
 
 impl fmt::Debug for AcpSendTurnRequest {
@@ -1775,6 +1778,12 @@ impl fmt::Debug for AcpSendTurnRequest {
             .field("skill_count", &self.runtime_resources.skills.len())
             .field("has_execution_identity", &self.execution_identity.is_some())
             .field("has_event_sender", &self.event_sender.is_some())
+            .field(
+                "has_usage_execution_context",
+                &self.usage_execution_context.is_some(),
+            )
+            .field("usage_counter_origin", &self.usage_counter_origin)
+            .field("has_usage_event_sender", &self.usage_event_sender.is_some())
             .finish()
     }
 }
@@ -2057,6 +2066,9 @@ impl AgentProvider for AcpAgentProvider {
                 runtime_resources: request.runtime_resources.clone(),
                 execution_identity: request.execution_identity.clone(),
                 event_sender: None,
+                usage_execution_context: request.usage_execution_context.clone(),
+                usage_counter_origin: request.usage_counter_origin,
+                usage_event_sender: request.usage_event_sender.clone(),
             })
             .await
     }
@@ -2139,6 +2151,9 @@ impl AgentProvider for AcpAgentProvider {
                 runtime_resources: request.runtime_resources,
                 execution_identity: request.execution_identity,
                 event_sender: acp_event_sender,
+                usage_execution_context: request.usage_execution_context,
+                usage_counter_origin: request.usage_counter_origin,
+                usage_event_sender: request.usage_event_sender,
             })
             .await;
         if let Some(forwarder) = forwarder {
@@ -2680,6 +2695,9 @@ async fn attempt_acp_turn_boundary(
         execution_identity: None,
         event_sender: None,
         binding_update_sender: None,
+        usage_execution_context: None,
+        usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+        usage_event_sender: None,
     };
     let result = match provider.prepare_turn_execution(&handle, &request).await {
         Ok(execution_identity) => {
@@ -3042,6 +3060,9 @@ mod tests {
                 model_id: "model-secret-id".to_string(),
             }),
             event_sender: None,
+            usage_execution_context: None,
+            usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+            usage_event_sender: None,
         };
 
         let debug = format!("{request:?}");
@@ -3718,6 +3739,9 @@ mod tests {
                     execution_identity: None,
                     event_sender: None,
                     binding_update_sender: None,
+                    usage_execution_context: None,
+                    usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                    usage_event_sender: None,
                 },
             )
             .await

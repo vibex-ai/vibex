@@ -380,6 +380,9 @@ async fn run_session_exercise(
         execution_identity: None,
         event_sender: Some(event_tx),
         binding_update_sender: None,
+        usage_execution_context: None,
+        usage_counter_origin: vibex_core::AgentUsageCounterOrigin::Unknown,
+        usage_event_sender: None,
     };
     request.execution_identity = provider.prepare_turn_execution(&handle, &request).await?;
     let turn = tokio::time::timeout(Duration::from_secs(90), provider.send_turn(handle, request))

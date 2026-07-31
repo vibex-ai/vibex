@@ -7,6 +7,7 @@ mod home_lock;
 mod management;
 mod relay;
 mod remote_connectivity;
+mod usage;
 mod workbench;
 
 use std::collections::BTreeMap;
@@ -15,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use vibex_agent::{
     AgentManager, MessageSubmissionCoordinator, MessageSubmissionCoordinatorConfig,
@@ -76,6 +77,7 @@ pub use remote_connectivity::{
     TokioProcessRunner, WebAssetResolver, WebBuildDescriptor, normalize_https_origin,
     parse_tailscale_inspection,
 };
+pub use usage::AgentUsageService;
 
 pub const STABLE_DESKTOP_APP_ID: &str = "dev.vibex.desktop";
 pub const PREVIEW_APP_ID: &str = "dev.vibex.desktop.preview";
@@ -603,6 +605,7 @@ pub struct DesktopRuntime {
     backup: BackupHandle,
     remote: RemoteHandle,
     relay: RelayClientRuntime,
+    usage: AgentUsageService,
     polling: DesktopPollingPolicy,
     events: broadcast::Sender<DesktopEvent>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -633,6 +636,9 @@ impl DesktopRuntime {
             build_agent_manager(&config, observability.clone()).await?;
         let manager = Arc::new(manager);
         let db_path = manager.database_path().to_path_buf();
+        let usage = AgentUsageService::new(db_path.clone())?;
+        let (usage_sender, usage_receiver) = mpsc::unbounded_channel();
+        manager.install_usage_telemetry_sender(usage_sender)?;
         let runtime_switch_bridge = Arc::new(AcpRuntimeSwitchBridge::new(
             &db_path,
             acp_runtime,
@@ -772,12 +778,14 @@ impl DesktopRuntime {
             },
             remote,
             relay,
+            usage,
             polling: DesktopPollingPolicy::default(),
             events,
             tasks: Mutex::new(Vec::new()),
             home_lock: Mutex::new(home_lock),
             shutting_down: AtomicBool::new(false),
         });
+        runtime.spawn_usage_consumer(usage_receiver)?;
         runtime.activate().await?;
         Ok(runtime)
     }
@@ -894,6 +902,38 @@ impl DesktopRuntime {
         Ok(())
     }
 
+    fn spawn_usage_consumer(
+        &self,
+        mut receiver: mpsc::UnboundedReceiver<vibex_agent::AgentUsageTelemetryEvent>,
+    ) -> VibexResult<()> {
+        let mut tasks = self.tasks.lock().map_err(|_| {
+            VibexError::process(
+                "desktop_runtime_task_lock_failed",
+                "desktop runtime task ownership is unavailable",
+            )
+        })?;
+        let service = self.usage.clone();
+        let events = self.events.clone();
+        tasks.push(tokio::spawn(async move {
+            while let Some(event) = receiver.recv().await {
+                match service.apply_telemetry_event(event) {
+                    Ok(true) => {
+                        let _ = events.send(DesktopEvent::UsageInvalidated);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "vibex_desktop",
+                            error_code = %error.code,
+                            "Agent usage telemetry persistence failed"
+                        );
+                    }
+                }
+            }
+        }));
+        Ok(())
+    }
+
     pub fn config(&self) -> &DesktopRuntimeConfig {
         &self.config
     }
@@ -908,6 +948,10 @@ impl DesktopRuntime {
 
     pub fn providers(&self) -> ProviderHandle {
         self.providers.clone()
+    }
+
+    pub fn usage(&self) -> AgentUsageService {
+        self.usage.clone()
     }
 
     pub fn workspace(&self) -> WorkspaceHandle {

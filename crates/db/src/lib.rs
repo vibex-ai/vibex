@@ -48,6 +48,8 @@ use vibex_core::{
 
 mod remote_v2;
 pub use remote_v2::*;
+mod usage;
+pub use usage::*;
 
 pub type DbConnection = Connection;
 
@@ -62,7 +64,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 30;
+pub const CURRENT_SCHEMA_VERSION: i64 = 32;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -1315,6 +1317,112 @@ const MIGRATIONS: &[Migration] = &[
             );
             CREATE INDEX IF NOT EXISTS idx_provider_runtime_option_snapshots_agent
                 ON provider_runtime_option_snapshots(agent_id, last_attempt_at_ms);
+        ",
+    },
+    Migration {
+        version: 31,
+        name: "agent_usage_statistics",
+        sql: "
+            CREATE TABLE IF NOT EXISTS agent_usage_checkpoints (
+                usage_stream_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL
+                    REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+                binding_id TEXT NOT NULL,
+                last_activation_generation INTEGER NOT NULL
+                    CHECK(last_activation_generation >= 0),
+                agent_id TEXT NOT NULL,
+                provider_profile_id TEXT NOT NULL,
+                last_model_id TEXT NOT NULL,
+                reset_epoch INTEGER NOT NULL CHECK(reset_epoch >= 0),
+                counter_origin TEXT NOT NULL,
+                cumulative_input_tokens INTEGER NULL CHECK(cumulative_input_tokens >= 0),
+                cumulative_output_tokens INTEGER NULL CHECK(cumulative_output_tokens >= 0),
+                cumulative_thought_tokens INTEGER NULL CHECK(cumulative_thought_tokens >= 0),
+                cumulative_cached_read_tokens INTEGER NULL
+                    CHECK(cumulative_cached_read_tokens >= 0),
+                cumulative_cached_write_tokens INTEGER NULL
+                    CHECK(cumulative_cached_write_tokens >= 0),
+                cumulative_total_tokens INTEGER NULL CHECK(cumulative_total_tokens >= 0),
+                last_usage_execution_id TEXT NULL,
+                last_observation_sequence INTEGER NOT NULL
+                    CHECK(last_observation_sequence >= 0),
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                UNIQUE(session_id, binding_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_usage_checkpoints_session
+                ON agent_usage_checkpoints(session_id, updated_at_ms);
+
+            CREATE TABLE IF NOT EXISTS agent_turn_usage_facts (
+                usage_execution_id TEXT PRIMARY KEY,
+                message_submission_id TEXT NULL,
+                session_id TEXT NOT NULL
+                    REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+                project_id TEXT NOT NULL
+                    REFERENCES projects(project_id) ON DELETE CASCADE,
+                workspace_id TEXT NOT NULL
+                    REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+                binding_id TEXT NOT NULL,
+                activation_generation INTEGER NOT NULL CHECK(activation_generation >= 0),
+                reset_epoch INTEGER NOT NULL CHECK(reset_epoch >= 0),
+                agent_id TEXT NOT NULL,
+                provider_profile_id TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                execution_status TEXT NOT NULL,
+                input_delta INTEGER NULL CHECK(input_delta >= 0),
+                output_delta INTEGER NULL CHECK(output_delta >= 0),
+                thought_delta INTEGER NULL CHECK(thought_delta >= 0),
+                cached_read_delta INTEGER NULL CHECK(cached_read_delta >= 0),
+                cached_write_delta INTEGER NULL CHECK(cached_write_delta >= 0),
+                total_delta INTEGER NULL CHECK(total_delta >= 0),
+                cumulative_input_after INTEGER NULL CHECK(cumulative_input_after >= 0),
+                cumulative_output_after INTEGER NULL CHECK(cumulative_output_after >= 0),
+                cumulative_thought_after INTEGER NULL CHECK(cumulative_thought_after >= 0),
+                cumulative_cached_read_after INTEGER NULL
+                    CHECK(cumulative_cached_read_after >= 0),
+                cumulative_cached_write_after INTEGER NULL
+                    CHECK(cumulative_cached_write_after >= 0),
+                cumulative_total_after INTEGER NULL CHECK(cumulative_total_after >= 0),
+                context_window_used_tokens INTEGER NULL
+                    CHECK(context_window_used_tokens >= 0),
+                context_window_size_tokens INTEGER NULL
+                    CHECK(context_window_size_tokens > 0),
+                reported_fields INTEGER NOT NULL CHECK(reported_fields >= 0),
+                coverage TEXT NOT NULL,
+                last_source TEXT NULL,
+                reset_reason TEXT NULL,
+                dispatched_at_ms INTEGER NOT NULL,
+                completed_at_ms INTEGER NULL,
+                last_observed_at_ms INTEGER NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_turn_usage_facts_dispatch
+                ON agent_turn_usage_facts(dispatched_at_ms, usage_execution_id);
+            CREATE INDEX IF NOT EXISTS idx_agent_turn_usage_facts_session
+                ON agent_turn_usage_facts(session_id, dispatched_at_ms);
+            CREATE INDEX IF NOT EXISTS idx_agent_turn_usage_facts_project
+                ON agent_turn_usage_facts(project_id, dispatched_at_ms);
+            CREATE INDEX IF NOT EXISTS idx_agent_turn_usage_facts_agent
+                ON agent_turn_usage_facts(agent_id, dispatched_at_ms);
+            CREATE INDEX IF NOT EXISTS idx_agent_turn_usage_facts_profile
+                ON agent_turn_usage_facts(provider_profile_id, dispatched_at_ms);
+            CREATE INDEX IF NOT EXISTS idx_agent_turn_usage_facts_model
+                ON agent_turn_usage_facts(model_id, dispatched_at_ms);
+        ",
+    },
+    Migration {
+        version: 32,
+        name: "agent_usage_zero_baseline_fence",
+        sql: "
+            ALTER TABLE session_runtime_bindings
+                ADD COLUMN usage_zero_baseline_state TEXT NOT NULL DEFAULT 'unavailable'
+                    CHECK(usage_zero_baseline_state IN ('available', 'claimed', 'unavailable'));
+            ALTER TABLE session_runtime_bindings
+                ADD COLUMN usage_zero_baseline_execution_id TEXT NULL;
+            ALTER TABLE session_runtime_bindings
+                ADD COLUMN usage_zero_baseline_activation_generation INTEGER NULL
+                    CHECK(usage_zero_baseline_activation_generation >= 0);
         ",
     },
 ];
@@ -9935,6 +10043,93 @@ mod tests {
     }
 
     #[test]
+    fn schema_v32_marks_existing_runtime_bindings_zero_baseline_unavailable() {
+        let temp = temp_db_path("schema-v32-zero-baseline-upgrade");
+        let mut conn = open_database(&temp).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at_ms INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 31)
+        {
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(migration.sql).unwrap();
+            tx.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at_ms)
+                 VALUES (?1, ?2, ?3)",
+                params![migration.version, migration.name, unix_timestamp_ms()],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(current_schema_version(&conn).unwrap(), 31);
+
+        let workspace_root = std::env::temp_dir().join(format!(
+            "vibex-schema-v32-upgrade-{}",
+            RequestId::new().as_str()
+        ));
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let now = unix_timestamp_ms();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "Pre-v32 ACP session".to_string(),
+            project_id: project.id,
+            workspace_id: workspace.id,
+            workspace_root: workspace.root_path,
+            workspace_mode: workspace.mode,
+            agent_id: AgentId::parse("opencode").unwrap(),
+            state: AgentSessionState::Idle,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        SessionRepository::insert(&conn, &session).unwrap();
+        conn.execute(
+            "INSERT INTO session_runtime_bindings (
+                binding_id, session_id, agent_id, transport_kind, adapter_id, adapter_version,
+                adapter_compatibility_identity, provider_profile_id, native_state_home_id,
+                process_spawn_fingerprint, session_runtime_config_state_json, binding_state,
+                activation_generation, created_at_ms, updated_at_ms
+             ) VALUES (
+                'binding_pre_v32', ?1, 'opencode', 'acp', 'opencode-acp', '1.0.0',
+                'opencode-acp@1', 'provider_acp_local', 'home_pre_v32',
+                'fingerprint_pre_v32', '{}', 'current', 4, ?2, ?2
+             )",
+            params![session.id.as_str(), now],
+        )
+        .unwrap();
+
+        assert_eq!(
+            apply_migrations(&mut conn).unwrap(),
+            vec!["32:agent_usage_zero_baseline_fence"]
+        );
+        let stored: (String, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT usage_zero_baseline_state, usage_zero_baseline_execution_id,
+                        usage_zero_baseline_activation_generation
+                 FROM session_runtime_bindings WHERE binding_id = 'binding_pre_v32'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, ("unavailable".to_string(), None, None));
+
+        drop(conn);
+        cleanup_db(temp);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
     fn schema_v28_clears_legacy_sessions_and_accepts_new_durable_acp_rows() {
         let temp = temp_db_path("schema-v28-cutover");
         let mut conn = open_database(&temp).unwrap();
@@ -10048,9 +10243,43 @@ mod tests {
             vec![
                 "28:acp_only_runtime_cutover",
                 "29:remote_protocol_v2_pairing_offers",
-                "30:provider_runtime_option_snapshots"
+                "30:provider_runtime_option_snapshots",
+                "31:agent_usage_statistics",
+                "32:agent_usage_zero_baseline_fence"
             ]
         );
+        assert_eq!(
+            current_schema_version(&conn).unwrap(),
+            CURRENT_SCHEMA_VERSION
+        );
+        for table in ["agent_usage_checkpoints", "agent_turn_usage_facts"] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "v31 must create usage table {table}");
+        }
+        for index in [
+            "idx_agent_usage_checkpoints_session",
+            "idx_agent_turn_usage_facts_dispatch",
+            "idx_agent_turn_usage_facts_session",
+            "idx_agent_turn_usage_facts_project",
+            "idx_agent_turn_usage_facts_agent",
+            "idx_agent_turn_usage_facts_profile",
+            "idx_agent_turn_usage_facts_model",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    params![index],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "v31 must create usage index {index}");
+        }
         for table in [
             "agent_sessions",
             "session_runtime_bindings",
@@ -10086,6 +10315,23 @@ mod tests {
                 matches!(column.as_str(), "provider_kind" | "provider_profile_id")
             })
         );
+        let binding_columns = conn
+            .prepare("SELECT name FROM pragma_table_info('session_runtime_bindings')")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for column in [
+            "usage_zero_baseline_state",
+            "usage_zero_baseline_execution_id",
+            "usage_zero_baseline_activation_generation",
+        ] {
+            assert!(
+                binding_columns.iter().any(|candidate| candidate == column),
+                "v32 must add runtime binding column {column}"
+            );
+        }
 
         let workspace_root = std::env::temp_dir().join(format!(
             "vibex-schema-v28-new-{}",
@@ -10145,7 +10391,7 @@ mod tests {
         RuntimeBindingRepository::insert(
             &conn,
             &RuntimeBinding {
-                binding_id: target_binding_id,
+                binding_id: target_binding_id.clone(),
                 session_id: session.id.clone(),
                 agent_id: session.agent_id.clone(),
                 transport_kind: TransportKind::Acp,
@@ -10172,6 +10418,16 @@ mod tests {
             },
         )
         .unwrap();
+        let zero_baseline: (String, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT usage_zero_baseline_state, usage_zero_baseline_execution_id,
+                        usage_zero_baseline_activation_generation
+                 FROM session_runtime_bindings WHERE binding_id = ?1",
+                params![target_binding_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(zero_baseline, ("available".to_string(), None, None));
         let submission = MessageSubmissionRepository::enqueue(
             &mut conn,
             MessageSubmissionId::new(),

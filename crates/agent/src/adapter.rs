@@ -10,10 +10,12 @@ use tokio::sync::mpsc;
 use vibex_core::{
     AgentCommandDiscoverRequest, AgentCommandDiscoverResponse, AgentCommandExecuteRequest,
     AgentModelListResponse, AgentModelListSource, AgentSessionConfigProbe, AgentSessionSafety,
-    ExternalSessionImportCandidate, MessageAttachment, MessageSubmissionId, PermissionResolution,
-    ProviderBinding, ProviderBindingMetadata, ProviderCapabilities, ProviderKind,
-    ProviderProfileId, RuntimeBindingId, SessionRuntimeSelection, TimelinePayload,
-    TimelineRedactionState, TimelineSource, VibexError, VibexResult, VibexSessionId,
+    AgentUsageCounterOrigin, AgentUsageExecution, AgentUsageExecutionContext,
+    AgentUsageExecutionStatusUpdate, AgentUsageObservation, ExternalSessionImportCandidate,
+    MessageAttachment, MessageSubmissionId, PermissionResolution, ProviderBinding,
+    ProviderBindingMetadata, ProviderCapabilities, ProviderKind, ProviderProfileId,
+    RuntimeBindingId, SessionRuntimeSelection, TimelinePayload, TimelineRedactionState,
+    TimelineSource, VibexError, VibexResult, VibexSessionId,
 };
 
 #[derive(Debug, Clone)]
@@ -88,6 +90,9 @@ pub struct ProviderTurnRequest {
     pub execution_identity: Option<ProviderTurnExecutionIdentity>,
     pub event_sender: Option<mpsc::UnboundedSender<ProviderEvent>>,
     pub binding_update_sender: Option<mpsc::UnboundedSender<ProviderBinding>>,
+    pub usage_execution_context: Option<AgentUsageExecutionContext>,
+    pub usage_counter_origin: AgentUsageCounterOrigin,
+    pub usage_event_sender: Option<mpsc::UnboundedSender<AgentUsageTelemetryEvent>>,
 }
 
 impl fmt::Debug for ProviderTurnRequest {
@@ -115,8 +120,24 @@ impl fmt::Debug for ProviderTurnRequest {
                 "has_binding_update_sender",
                 &self.binding_update_sender.is_some(),
             )
+            .field(
+                "has_usage_execution_context",
+                &self.usage_execution_context.is_some(),
+            )
+            .field("usage_counter_origin", &self.usage_counter_origin)
+            .field("has_usage_event_sender", &self.usage_event_sender.is_some())
             .finish()
     }
+}
+
+#[derive(Debug, Clone)]
+pub enum AgentUsageTelemetryEvent {
+    ExecutionDispatched {
+        execution: AgentUsageExecution,
+        counter_origin: AgentUsageCounterOrigin,
+    },
+    Observation(AgentUsageObservation),
+    ExecutionStatus(AgentUsageExecutionStatusUpdate),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -551,6 +572,9 @@ mod tests {
             execution_identity: None,
             event_sender: None,
             binding_update_sender: None,
+            usage_execution_context: None,
+            usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+            usage_event_sender: None,
         };
 
         let debug = format!("{request:?}");

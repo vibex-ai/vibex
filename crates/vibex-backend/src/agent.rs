@@ -1,10 +1,11 @@
 use vibex_core::{
     AgentSession, AgentSessionRuntimeSelectionEvent, AgentSessionRuntimeSelectionState,
-    CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
-    FetchTimelineRequest, RemoteDeepLinkResolution, RenameAgentSessionRequest,
-    ResolvePermissionRequest, RuntimeSessionEvent, SendAgentMessageRequest,
-    SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, TimelineItem,
-    TimelineLiveEvent, TimelinePage, VibexSessionId,
+    AgentUsageStatistics, AgentUsageStatisticsRequest, CancelAgentSessionRuntimeSwitchRequest,
+    ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest,
+    RemoteDeepLinkResolution, RenameAgentSessionRequest, ResolvePermissionRequest,
+    RuntimeSessionEvent, SendAgentMessageRequest, SessionRuntimeOptionCatalog,
+    SetDesiredAgentSessionRuntimeRequest, TimelineItem, TimelineLiveEvent, TimelinePage,
+    VibexSessionId,
 };
 
 use crate::{BackendBound, BackendFuture, BackendResult, MutationRequest};
@@ -14,6 +15,7 @@ pub enum BackendEventStream {
     Timeline,
     Runtime,
     RuntimeSelection,
+    Usage,
     Fanout,
 }
 
@@ -22,6 +24,7 @@ pub enum BackendProjection {
     Files,
     Git,
     Management,
+    Usage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +68,18 @@ pub trait AgentBackend: BackendBound {
     ) -> BackendFuture<'_, AgentSession>;
 
     fn fetch_timeline(&self, request: FetchTimelineRequest) -> BackendFuture<'_, TimelinePage>;
+
+    fn usage_statistics(
+        &self,
+        _request: AgentUsageStatisticsRequest,
+    ) -> BackendFuture<'_, AgentUsageStatistics> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_usage_statistics_unavailable",
+                "Agent usage statistics are unavailable on this backend",
+            ))
+        })
+    }
 
     /// Resolve a short-lived push/deep-link locator on the authoritative PC.
     /// Native backends that do not expose push routing keep the explicit

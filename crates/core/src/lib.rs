@@ -25,6 +25,7 @@ pub mod session_import;
 pub mod terminal;
 pub mod time;
 pub mod timeline;
+pub mod usage;
 pub mod workbench;
 pub mod workspace;
 
@@ -102,7 +103,7 @@ pub use ids::{
     RelayPeerId, RelayRoomId, RelaySessionId, RequestId, RightRailPluginId, RuntimeBindingId,
     RuntimeClientId, RuntimeLeaseId, RuntimeProcessId, RuntimeStreamId, RuntimeSwitchId,
     RuntimeSwitchOperationId, ScheduledTaskId, ScheduledTaskRunId, SkillId, TerminalId,
-    TimelineItemId, VibexSessionId, WorkspaceId,
+    TimelineItemId, UsageExecutionId, VibexSessionId, WorkspaceId,
 };
 pub use permission::{
     PermissionActionDetail, PermissionMode, PermissionRequest, PermissionRequestStatus,
@@ -307,6 +308,18 @@ pub use timeline::{
     TimelineItemKind, TimelineLiveEvent, TimelinePage, TimelinePayload, TimelineRedactionState,
     TimelineSource, TodoUpdatePayload, ToolCallPayload, ToolCallStatus, TurnExecutionAttribution,
     TurnExecutionAttributionView, UserMessagePayload, WebSearchPayload,
+};
+pub use usage::{
+    AgentTurnUsageFact, AgentUsageAggregate, AgentUsageCacheHitRate, AgentUsageCounterOrigin,
+    AgentUsageCoverage, AgentUsageCoverageSummary, AgentUsageDimension, AgentUsageDimensionRow,
+    AgentUsageEffectiveRange, AgentUsageExecution, AgentUsageExecutionContext,
+    AgentUsageExecutionStatus, AgentUsageExecutionStatusUpdate, AgentUsageFilterOption,
+    AgentUsageFilterOptions, AgentUsageMetricCoverage, AgentUsageMetricValue,
+    AgentUsageObservation, AgentUsageObservationSource, AgentUsageRange, AgentUsageReportedFields,
+    AgentUsageSortDirection, AgentUsageSortMetric, AgentUsageStatistics,
+    AgentUsageStatisticsRequest, AgentUsageStreamAttribution, AgentUsageTimeZone,
+    AgentUsageTokenValues, AgentUsageTrendBucket, AgentUsageTrendMetric,
+    MAX_AGENT_USAGE_TOKEN_VALUE,
 };
 pub use workbench::{WorkbenchPanel, WorkbenchTabKind};
 pub use workspace::{

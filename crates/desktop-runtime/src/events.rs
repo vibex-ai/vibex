@@ -10,6 +10,7 @@ pub enum DesktopEventStream {
     Timeline,
     Runtime,
     RuntimeSelection,
+    Usage,
     Fanout,
 }
 
@@ -20,6 +21,7 @@ pub struct AuthoritativeRefetch {
     pub timeline: bool,
     pub runtime: bool,
     pub runtime_selection: bool,
+    pub usage: bool,
 }
 
 impl AuthoritativeRefetch {
@@ -38,6 +40,10 @@ impl AuthoritativeRefetch {
                 stream,
                 DesktopEventStream::RuntimeSelection | DesktopEventStream::Fanout
             ),
+            usage: matches!(
+                stream,
+                DesktopEventStream::Usage | DesktopEventStream::Fanout
+            ),
         }
     }
 }
@@ -48,6 +54,7 @@ pub enum DesktopEvent {
     Timeline(TimelineLiveEvent),
     Runtime(RuntimeSessionEvent),
     RuntimeSelection(AgentSessionRuntimeSelectionEvent),
+    UsageInvalidated,
     Lagged {
         stream: DesktopEventStream,
         skipped: u64,

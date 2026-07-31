@@ -26,6 +26,7 @@ Read these files before frontend work:
 | --- | --- |
 | [Directory Structure](./directory-structure.md) | Creating app shells, feature folders, shared UI, or client protocol modules. |
 | [Component Guidelines](./component-guidelines.md) | Building layouts, timeline cards, panels, dialogs, and mobile screens. |
+| [GPUI Usage Statistics](./usage-statistics.md) | Touching the independent Usage route, current-session usage entry, statistics controls, or Usage states. |
 | [Controller / Historical Hook Guidelines](./hook-guidelines.md) | Adding shared GPUI controllers or interpreting retained pre-cutover React hook evidence. |
 | [State Management](./state-management.md) | Deciding local UI state, server state, streaming buffers, or persisted preferences. |
 | [Type Safety](./type-safety.md) | Adding protocol types, timeline events, provider capabilities, or form models. |

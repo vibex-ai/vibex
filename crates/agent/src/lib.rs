@@ -17,9 +17,9 @@ pub mod state_machine;
 pub(crate) mod test_support;
 
 pub use adapter::{
-    AgentProvider, ProviderCreateRequest, ProviderEvent, ProviderPermissionResolution,
-    ProviderRuntimeMcpServer, ProviderRuntimeMcpTransport, ProviderRuntimeResources,
-    ProviderRuntimeSkill, ProviderSessionHandle, ProviderTurnAttachment,
+    AgentProvider, AgentUsageTelemetryEvent, ProviderCreateRequest, ProviderEvent,
+    ProviderPermissionResolution, ProviderRuntimeMcpServer, ProviderRuntimeMcpTransport,
+    ProviderRuntimeResources, ProviderRuntimeSkill, ProviderSessionHandle, ProviderTurnAttachment,
     ProviderTurnExecutionIdentity, ProviderTurnRequest, ProviderTurnResult,
     legacy_provider_runtime_binding_id, materialize_provider_attachments,
     validate_legacy_provider_turn_execution_identity,

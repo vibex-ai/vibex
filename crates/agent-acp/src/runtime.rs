@@ -34,16 +34,17 @@ use vibex_agent::runtime_switch::{
     OP_RESOLVE_PENDING_PERMISSION, OP_RESTORE_SESSION,
 };
 use vibex_agent::{
-    ActiveWorkGate, ActiveWorkSnapshot, AgentManager, ContextBridgeService, JournaledOperation,
-    OperationReconcileOutcome, PROVIDER_SELECTED_MODEL_METADATA_KEY, PreparedAttachment,
-    PreparedProcess, ProviderRuntimeMcpServer, ProviderRuntimeMcpTransport,
-    ProviderRuntimeResources, ProviderTurnAttachment, ProviderTurnExecutionIdentity,
-    ResolvedInitialRuntimeSelection, ResolvedRuntimeSelection, RestoreAssessment,
-    RuntimeBackendSnapshot, RuntimeLeaseGuard, RuntimeLeaseTarget, RuntimeLifecycleBackend,
-    RuntimeLifecyclePublisher, RuntimeLifecycleService, RuntimeLogContext, RuntimeLogLevel,
-    RuntimeMetricName, RuntimeMetricOperation, RuntimeMetricResult, RuntimeObservability,
-    RuntimeSelectionResolver, RuntimeSweepReport, RuntimeSwitchStrategy, SwitchIntent,
-    SwitchTargetAssessment, SwitchTargetExecutor, default_adapter_for_agent,
+    ActiveWorkGate, ActiveWorkSnapshot, AgentManager, AgentUsageTelemetryEvent,
+    ContextBridgeService, JournaledOperation, OperationReconcileOutcome,
+    PROVIDER_SELECTED_MODEL_METADATA_KEY, PreparedAttachment, PreparedProcess,
+    ProviderRuntimeMcpServer, ProviderRuntimeMcpTransport, ProviderRuntimeResources,
+    ProviderTurnAttachment, ProviderTurnExecutionIdentity, ResolvedInitialRuntimeSelection,
+    ResolvedRuntimeSelection, RestoreAssessment, RuntimeBackendSnapshot, RuntimeLeaseGuard,
+    RuntimeLeaseTarget, RuntimeLifecycleBackend, RuntimeLifecyclePublisher,
+    RuntimeLifecycleService, RuntimeLogContext, RuntimeLogLevel, RuntimeMetricName,
+    RuntimeMetricOperation, RuntimeMetricResult, RuntimeObservability, RuntimeSelectionResolver,
+    RuntimeSweepReport, RuntimeSwitchStrategy, SwitchIntent, SwitchTargetAssessment,
+    SwitchTargetExecutor, default_adapter_for_agent,
 };
 use vibex_config_switch::{
     CODEX_MODEL_PROVIDER_ID_OPTION_KEY, CodexProviderRuntimeConfig, ProviderConfigService,
@@ -56,19 +57,22 @@ use vibex_core::{
     AgentModelListRequest, AgentModelListSource, AgentReasoningEffort, AgentRuntimeRouteKey,
     AgentSessionRestoreCompatibility, AgentSessionRestoreCompatibilityKey,
     AgentSessionRestoreMethod, AgentSessionRestoreOutcome, AgentSessionState, AgentTokenUsage,
-    BindingState, ExternalSessionContinuationStatus, ExternalSessionImportCandidate,
-    ExternalSessionImportCandidateStatus, ExternalSessionImportSource, NativeStateHomeId,
-    PermissionActionDetail, PermissionRequest, PermissionRequestStatus, PermissionResponseKind,
-    PermissionRiskCategory, PlanStepPayload, PlanStepStatus, ProviderBinding,
-    ProviderBindingMetadata, ProviderKind, ProviderModelWireApi, ProviderNativeBinding,
-    ProviderProfile, ProviderProfileId, ProviderProfileStatus, ProviderSecretBackend,
-    ProviderSessionConfigOption, ProviderSessionConfigOptionKind, ProviderSessionConfigState,
-    ProviderSessionConfigValue, RequestId, RuntimeAttachmentSnapshot, RuntimeAttachmentStatus,
-    RuntimeBinding, RuntimeBindingId, RuntimeLeaseRole, RuntimeLeaseRoleCounts,
-    RuntimeLiveMessageSnapshot, RuntimeLiveToolCallSnapshot, RuntimeMaterializationStatus,
-    RuntimeProcessConfigStatus, RuntimeProcessId, RuntimeProcessSnapshot,
-    RuntimeSwitchActiveWorkPolicy, RuntimeSwitchId, RuntimeSwitchPolicy, SessionConfigValue,
-    SessionRuntimeConfigApplyStatus, SessionRuntimeConfigFieldOutcome,
+    AgentUsageCounterOrigin, AgentUsageExecution, AgentUsageExecutionContext,
+    AgentUsageExecutionStatus, AgentUsageExecutionStatusUpdate, AgentUsageObservation,
+    AgentUsageObservationSource, AgentUsageTokenValues, BindingState,
+    ExternalSessionContinuationStatus, ExternalSessionImportCandidate,
+    ExternalSessionImportCandidateStatus, ExternalSessionImportSource, MAX_AGENT_USAGE_TOKEN_VALUE,
+    NativeStateHomeId, PermissionActionDetail, PermissionRequest, PermissionRequestStatus,
+    PermissionResponseKind, PermissionRiskCategory, PlanStepPayload, PlanStepStatus,
+    ProviderBinding, ProviderBindingMetadata, ProviderKind, ProviderModelWireApi,
+    ProviderNativeBinding, ProviderProfile, ProviderProfileId, ProviderProfileStatus,
+    ProviderSecretBackend, ProviderSessionConfigOption, ProviderSessionConfigOptionKind,
+    ProviderSessionConfigState, ProviderSessionConfigValue, RequestId, RuntimeAttachmentSnapshot,
+    RuntimeAttachmentStatus, RuntimeBinding, RuntimeBindingId, RuntimeLeaseRole,
+    RuntimeLeaseRoleCounts, RuntimeLiveMessageSnapshot, RuntimeLiveToolCallSnapshot,
+    RuntimeMaterializationStatus, RuntimeProcessConfigStatus, RuntimeProcessId,
+    RuntimeProcessSnapshot, RuntimeSwitchActiveWorkPolicy, RuntimeSwitchId, RuntimeSwitchPolicy,
+    SessionConfigValue, SessionRuntimeConfigApplyStatus, SessionRuntimeConfigFieldOutcome,
     SessionRuntimeConfigMutationRequest, SessionRuntimeConfigMutationResult,
     SessionRuntimeConfigPatch, SessionRuntimeConfigState, SessionRuntimeSelection,
     SystemNoticeLevel, TerminalAuthActionDescriptor, TerminalId, TimelineRedactionState,
@@ -823,6 +827,7 @@ enum TurnSink {
 
 struct ActiveTurn {
     sink: TurnSink,
+    usage: Option<ActiveUsageTurn>,
     chunk_index: u32,
     opencode_stream_error_count: u8,
     opencode_stream_error_epoch: u64,
@@ -832,6 +837,55 @@ struct ActiveTurn {
     assistant_text_truncated: bool,
     assistant_segment: String,
     assistant_segment_truncated: bool,
+}
+
+#[derive(Clone)]
+struct ActiveUsageTurn {
+    context: AgentUsageExecutionContext,
+    execution: Option<AgentUsageExecution>,
+    counter_origin: AgentUsageCounterOrigin,
+    event_sender: mpsc::UnboundedSender<AgentUsageTelemetryEvent>,
+}
+
+#[derive(Clone)]
+struct RecentUsageTurn {
+    execution: AgentUsageExecution,
+    counter_origin: AgentUsageCounterOrigin,
+    event_sender: mpsc::UnboundedSender<AgentUsageTelemetryEvent>,
+}
+
+struct DecodedAcpUsage {
+    cumulative: AgentUsageTokenValues,
+    context_window_used_tokens: Option<u64>,
+    context_window_size_tokens: Option<u64>,
+    source: AgentUsageObservationSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AcpUsageDecodeDiagnostic {
+    code: &'static str,
+    field: &'static str,
+}
+
+#[derive(Default)]
+struct AcpUsageDecode {
+    usage: Option<DecodedAcpUsage>,
+    diagnostics: Vec<AcpUsageDecodeDiagnostic>,
+}
+
+impl DecodedAcpUsage {
+    fn live_usage(&self) -> AgentTokenUsage {
+        AgentTokenUsage {
+            input_tokens: self.cumulative.input_tokens,
+            output_tokens: self.cumulative.output_tokens,
+            thought_tokens: self.cumulative.thought_tokens,
+            cached_read_tokens: self.cumulative.cached_read_tokens,
+            cached_write_tokens: self.cumulative.cached_write_tokens,
+            total_tokens: self.cumulative.total_tokens,
+            context_window_used_tokens: self.context_window_used_tokens,
+            context_window_size_tokens: self.context_window_size_tokens,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -911,6 +965,9 @@ struct ToolCallSnapshot {
 #[derive(Default)]
 struct AcpAttachmentShared {
     active_turn: Option<ActiveTurn>,
+    recent_usage_turn: Option<RecentUsageTurn>,
+    usage_prompt_dispatched: bool,
+    usage_observation_sequence: u64,
     pending_permissions: HashMap<String, PendingPermission>,
     pending_terminal_creates: HashMap<String, PendingTerminalCreate>,
     terminal_creates_in_flight: usize,
@@ -1308,7 +1365,18 @@ impl AcpSessionAttachment {
         }
     }
 
+    #[cfg(test)]
     fn begin_turn(&self, sink: TurnSink) -> VibexResult<()> {
+        self.begin_turn_with_usage(sink, None, AgentUsageCounterOrigin::Unknown, None)
+    }
+
+    fn begin_turn_with_usage(
+        &self,
+        sink: TurnSink,
+        usage_execution_context: Option<AgentUsageExecutionContext>,
+        usage_counter_origin: AgentUsageCounterOrigin,
+        usage_event_sender: Option<mpsc::UnboundedSender<AgentUsageTelemetryEvent>>,
+    ) -> VibexResult<()> {
         let mut state = self
             .state
             .lock()
@@ -1319,8 +1387,24 @@ impl AcpSessionAttachment {
                 "ACP session already has an active turn",
             ));
         }
+        state.recent_usage_turn = None;
+        let usage_counter_origin = if usage_counter_origin == AgentUsageCounterOrigin::KnownZero
+            && state.usage_prompt_dispatched
+        {
+            AgentUsageCounterOrigin::RestoredCheckpoint
+        } else {
+            usage_counter_origin
+        };
         state.active_turn = Some(ActiveTurn {
             sink,
+            usage: usage_execution_context.zip(usage_event_sender).map(
+                |(context, event_sender)| ActiveUsageTurn {
+                    context,
+                    execution: None,
+                    counter_origin: usage_counter_origin,
+                    event_sender,
+                },
+            ),
             chunk_index: 0,
             opencode_stream_error_count: 0,
             opencode_stream_error_epoch: 0,
@@ -1334,13 +1418,82 @@ impl AcpSessionAttachment {
         Ok(())
     }
 
+    fn mark_turn_dispatched(&self, dispatched_at_ms: i64) -> VibexResult<()> {
+        let event = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| lock_poisoned_error("attachmentState"))?;
+            let event = match state
+                .active_turn
+                .as_mut()
+                .and_then(|turn| turn.usage.as_mut())
+            {
+                Some(usage) => {
+                    if usage.execution.is_some() {
+                        return Err(VibexError::conflict(
+                            "agent_usage_execution_already_dispatched",
+                            "Agent usage execution was already marked as dispatched",
+                        ));
+                    }
+                    let execution = usage.context.dispatched_at(dispatched_at_ms);
+                    usage.execution = Some(execution.clone());
+                    Some((
+                        usage.event_sender.clone(),
+                        AgentUsageTelemetryEvent::ExecutionDispatched {
+                            execution,
+                            counter_origin: usage.counter_origin,
+                        },
+                    ))
+                }
+                None => None,
+            };
+            state.usage_prompt_dispatched = true;
+            event
+        };
+        if let Some((sender, event)) = event {
+            let _ = sender.send(event);
+        }
+        Ok(())
+    }
+
+    fn emit_active_usage_status(&self, status: AgentUsageExecutionStatus) {
+        let event = self.state.lock().ok().and_then(|state| {
+            let usage = state.active_turn.as_ref()?.usage.as_ref()?;
+            let execution = usage.execution.as_ref()?;
+            Some((
+                usage.event_sender.clone(),
+                AgentUsageTelemetryEvent::ExecutionStatus(AgentUsageExecutionStatusUpdate {
+                    execution: execution.clone(),
+                    status,
+                    completed_at_ms: unix_timestamp_ms(),
+                }),
+            ))
+        });
+        if let Some((sender, event)) = event {
+            let _ = sender.send(event);
+        }
+    }
+
     fn finish_turn(&self, emit_final_message: bool) -> VibexResult<Vec<AcpEvent>> {
-        let active_turn = self
-            .state
-            .lock()
-            .map_err(|_| lock_poisoned_error("attachmentState"))?
-            .active_turn
-            .take();
+        let active_turn = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| lock_poisoned_error("attachmentState"))?;
+            let active_turn = state.active_turn.take();
+            state.recent_usage_turn = active_turn
+                .as_ref()
+                .and_then(|turn| turn.usage.as_ref())
+                .and_then(|usage| {
+                    usage.execution.clone().map(|execution| RecentUsageTurn {
+                        execution,
+                        counter_origin: usage.counter_origin,
+                        event_sender: usage.event_sender.clone(),
+                    })
+                });
+            active_turn
+        };
         Ok(match active_turn {
             Some(ActiveTurn {
                 sink,
@@ -1369,6 +1522,68 @@ impl AcpSessionAttachment {
             }
             None => Vec::new(),
         })
+    }
+
+    fn merge_and_publish_usage(&self, decoded: DecodedAcpUsage, allow_recent: bool) -> bool {
+        let observed_at_ms = unix_timestamp_ms();
+        let (changed, event) = {
+            let Ok(mut state) = self.state.lock() else {
+                return false;
+            };
+            let live_usage = decoded.live_usage();
+            let changed = match state.usage.as_mut() {
+                Some(current) => merge_agent_token_usage(current, live_usage),
+                None => {
+                    state.usage = Some(live_usage);
+                    true
+                }
+            };
+            let correlation = state
+                .active_turn
+                .as_ref()
+                .and_then(|turn| turn.usage.as_ref())
+                .and_then(|usage| {
+                    usage.execution.as_ref().map(|execution| {
+                        (
+                            execution.clone(),
+                            usage.counter_origin,
+                            usage.event_sender.clone(),
+                        )
+                    })
+                })
+                .or_else(|| {
+                    allow_recent
+                        .then(|| state.recent_usage_turn.clone())
+                        .flatten()
+                        .map(|recent| {
+                            (recent.execution, recent.counter_origin, recent.event_sender)
+                        })
+                });
+            let event = correlation.map(|(execution, counter_origin, sender)| {
+                let wall_sequence = u64::try_from(observed_at_ms).unwrap_or_default();
+                state.usage_observation_sequence = state
+                    .usage_observation_sequence
+                    .saturating_add(1)
+                    .max(wall_sequence);
+                let observation = AgentUsageObservation {
+                    stream: execution.stream.clone(),
+                    execution: Some(execution),
+                    counter_origin,
+                    observation_sequence: state.usage_observation_sequence,
+                    cumulative: decoded.cumulative,
+                    context_window_used_tokens: decoded.context_window_used_tokens,
+                    context_window_size_tokens: decoded.context_window_size_tokens,
+                    source: decoded.source,
+                    observed_at_ms,
+                };
+                (sender, AgentUsageTelemetryEvent::Observation(observation))
+            });
+            (changed, event)
+        };
+        if let Some((sender, event)) = event {
+            let _ = sender.send(event);
+        }
+        changed
     }
 
     fn emit_turn_event(&self, event: AcpEvent) -> bool {
@@ -1642,27 +1857,20 @@ impl AcpSessionAttachment {
             .unwrap_or_default()
     }
 
-    fn merge_token_usage(&self, incoming: AgentTokenUsage) -> bool {
-        let Ok(mut state) = self.state.lock() else {
-            return false;
-        };
-        match state.usage.as_mut() {
-            Some(current) => merge_agent_token_usage(current, incoming),
-            None => {
-                state.usage = Some(incoming);
-                true
-            }
-        }
-    }
-
     fn merge_context_window_usage(&self, update: &Value) -> bool {
-        agent_token_usage_from_context_update(update)
-            .is_some_and(|usage| self.merge_token_usage(usage))
+        let decoded = decode_context_window_usage(update);
+        emit_usage_decode_diagnostics(&decoded.diagnostics);
+        decoded
+            .usage
+            .is_some_and(|usage| self.merge_and_publish_usage(usage, true))
     }
 
     fn merge_prompt_response_usage(&self, response: &Value) -> bool {
-        agent_token_usage_from_prompt_response(response)
-            .is_some_and(|usage| self.merge_token_usage(usage))
+        let decoded = decode_prompt_response_usage(response);
+        emit_usage_decode_diagnostics(&decoded.diagnostics);
+        decoded
+            .usage
+            .is_some_and(|usage| self.merge_and_publish_usage(usage, false))
     }
 
     fn runtime_attachment_snapshot(
@@ -2291,19 +2499,26 @@ impl AcpAttachmentTurnGuard {
         }
     }
 
-    fn complete(mut self, emit_final_message: bool) -> VibexResult<Vec<AcpEvent>> {
+    fn complete(
+        mut self,
+        emit_final_message: bool,
+        usage_status: AgentUsageExecutionStatus,
+    ) -> VibexResult<Vec<AcpEvent>> {
         self.completed = true;
         self.prompt_guard.take();
+        self.attachment.emit_active_usage_status(usage_status);
         self.attachment.finish_turn(emit_final_message)
     }
 
-    fn abort(mut self, cancel_native_turn: bool) {
+    fn abort(mut self, cancel_native_turn: bool, usage_status: AgentUsageExecutionStatus) {
         self.completed = true;
         self.prompt_guard.take();
+        self.attachment.emit_active_usage_status(usage_status);
         self.process.cancel_started_request(self.request_id);
         if cancel_native_turn {
             self.cancel_native_turn();
         }
+        let _ = self.attachment.finish_turn(false);
         self.attachment.clear_turn_and_host_requests();
     }
 
@@ -2318,8 +2533,11 @@ impl AcpAttachmentTurnGuard {
 impl Drop for AcpAttachmentTurnGuard {
     fn drop(&mut self) {
         if !self.completed {
+            self.attachment
+                .emit_active_usage_status(AgentUsageExecutionStatus::Interrupted);
             self.process.cancel_started_request(self.request_id);
             self.cancel_native_turn();
+            let _ = self.attachment.finish_turn(false);
             self.attachment.clear_turn_and_host_requests();
         }
     }
@@ -11336,13 +11554,25 @@ impl AcpClient for AcpRuntimeClient {
         let started = self.attachment_router.registry.apply_current(
             attachment.fence(),
             |current| -> VibexResult<StartedAcpRequest> {
-                current.begin_turn(sink)?;
+                current.begin_turn_with_usage(
+                    sink,
+                    request.usage_execution_context.clone(),
+                    request.usage_counter_origin,
+                    request.usage_event_sender.clone(),
+                )?;
                 match process.start_request(
                     AcpOperation::SessionPrompt.method(),
                     protocol::build_session_prompt_params(&current.native_session_id, prompt),
                     false,
                 ) {
-                    Ok(request) => Ok(request),
+                    Ok(started) => {
+                        if let Err(error) = current.mark_turn_dispatched(unix_timestamp_ms()) {
+                            process.cancel_started_request(started.id);
+                            let _ = current.finish_turn(false);
+                            return Err(error);
+                        }
+                        Ok(started)
+                    }
                     Err(error) => {
                         let _ = current.finish_turn(false);
                         Err(error)
@@ -11398,22 +11628,26 @@ impl AcpClient for AcpRuntimeClient {
         let response = match result {
             Ok(response) => response,
             Err(err) => {
-                turn_guard.abort(err.code != OPENCODE_MODEL_API_ERROR_CODE);
+                let status = usage_status_for_error(&err);
+                turn_guard.abort(err.code != OPENCODE_MODEL_API_ERROR_CODE, status);
                 return Err(err);
             }
         };
         let usage_changed = payload.merge_prompt_response_usage(&response);
         let has_pending_permissions = payload.has_pending_permissions();
-        let buffered_events = turn_guard.complete(!has_pending_permissions)?;
-        if usage_changed {
-            process.publish_attachment_payload(&payload);
-        }
-
         let stop_reason = response
             .get("stopReason")
             .and_then(Value::as_str)
             .unwrap_or("end_turn")
             .to_string();
+        let usage_status = match stop_reason.as_str() {
+            "cancelled" | "canceled" | "interrupted" => AgentUsageExecutionStatus::Interrupted,
+            _ => AgentUsageExecutionStatus::Completed,
+        };
+        let buffered_events = turn_guard.complete(!has_pending_permissions, usage_status)?;
+        if usage_changed {
+            process.publish_attachment_payload(&payload);
+        }
         let mut events = buffered_events;
         if stop_reason != "end_turn" {
             events.push(AcpEvent::SystemNotice {
@@ -12047,41 +12281,125 @@ fn tool_call_content_summary(content: Option<&Value>) -> Option<String> {
     }
 }
 
-fn agent_token_usage_from_context_update(update: &Value) -> Option<AgentTokenUsage> {
-    let used = update.get("used").and_then(Value::as_u64)?;
-    let size = update.get("size").and_then(Value::as_u64)?;
-    if size == 0 {
-        return None;
+fn decode_context_window_usage(update: &Value) -> AcpUsageDecode {
+    let mut diagnostics = Vec::with_capacity(2);
+    let used = bounded_usage_token(update, "used", false, true, &mut diagnostics);
+    let size = bounded_usage_token(update, "size", true, true, &mut diagnostics);
+    AcpUsageDecode {
+        usage: used.zip(size).map(|(used, size)| DecodedAcpUsage {
+            cumulative: AgentUsageTokenValues::default(),
+            context_window_used_tokens: Some(used),
+            context_window_size_tokens: Some(size),
+            source: AgentUsageObservationSource::SessionUsageUpdate,
+        }),
+        diagnostics,
     }
-    Some(AgentTokenUsage {
-        context_window_used_tokens: Some(used),
-        context_window_size_tokens: Some(size),
-        ..AgentTokenUsage::default()
-    })
 }
 
-fn agent_token_usage_from_prompt_response(response: &Value) -> Option<AgentTokenUsage> {
-    let usage = response.get("usage")?;
-    let parsed = AgentTokenUsage {
-        input_tokens: usage.get("inputTokens").and_then(Value::as_u64),
-        output_tokens: usage.get("outputTokens").and_then(Value::as_u64),
-        thought_tokens: usage.get("thoughtTokens").and_then(Value::as_u64),
-        cached_read_tokens: usage.get("cachedReadTokens").and_then(Value::as_u64),
-        cached_write_tokens: usage.get("cachedWriteTokens").and_then(Value::as_u64),
-        total_tokens: usage.get("totalTokens").and_then(Value::as_u64),
-        ..AgentTokenUsage::default()
+fn decode_prompt_response_usage(response: &Value) -> AcpUsageDecode {
+    let Some(usage) = response.get("usage") else {
+        return AcpUsageDecode::default();
     };
-    [
-        parsed.input_tokens,
-        parsed.output_tokens,
-        parsed.thought_tokens,
-        parsed.cached_read_tokens,
-        parsed.cached_write_tokens,
-        parsed.total_tokens,
-    ]
-    .into_iter()
-    .any(|value| value.is_some())
-    .then_some(parsed)
+    if !usage.is_object() {
+        return AcpUsageDecode {
+            usage: None,
+            diagnostics: vec![AcpUsageDecodeDiagnostic {
+                code: "acp_usage_object_malformed",
+                field: "usage",
+            }],
+        };
+    }
+    let mut diagnostics = Vec::with_capacity(6);
+    let cumulative = AgentUsageTokenValues {
+        input_tokens: bounded_usage_token(usage, "inputTokens", false, false, &mut diagnostics),
+        output_tokens: bounded_usage_token(usage, "outputTokens", false, false, &mut diagnostics),
+        thought_tokens: bounded_usage_token(usage, "thoughtTokens", false, false, &mut diagnostics),
+        cached_read_tokens: bounded_usage_token(
+            usage,
+            "cachedReadTokens",
+            false,
+            false,
+            &mut diagnostics,
+        ),
+        cached_write_tokens: bounded_usage_token(
+            usage,
+            "cachedWriteTokens",
+            false,
+            false,
+            &mut diagnostics,
+        ),
+        total_tokens: bounded_usage_token(usage, "totalTokens", false, false, &mut diagnostics),
+    };
+    AcpUsageDecode {
+        usage: cumulative.any_reported().then_some(DecodedAcpUsage {
+            cumulative,
+            context_window_used_tokens: None,
+            context_window_size_tokens: None,
+            source: AgentUsageObservationSource::PromptResponse,
+        }),
+        diagnostics,
+    }
+}
+
+fn bounded_usage_token(
+    object: &Value,
+    field: &'static str,
+    nonzero: bool,
+    required: bool,
+    diagnostics: &mut Vec<AcpUsageDecodeDiagnostic>,
+) -> Option<u64> {
+    let Some(raw) = object.get(field) else {
+        if required {
+            diagnostics.push(AcpUsageDecodeDiagnostic {
+                code: "acp_usage_field_missing",
+                field,
+            });
+        }
+        return None;
+    };
+    let Some(value) = raw.as_u64() else {
+        diagnostics.push(AcpUsageDecodeDiagnostic {
+            code: "acp_usage_token_malformed",
+            field,
+        });
+        return None;
+    };
+    if value > MAX_AGENT_USAGE_TOKEN_VALUE {
+        diagnostics.push(AcpUsageDecodeDiagnostic {
+            code: "acp_usage_token_out_of_range",
+            field,
+        });
+        return None;
+    }
+    if nonzero && value == 0 {
+        diagnostics.push(AcpUsageDecodeDiagnostic {
+            code: "acp_usage_token_invalid_zero",
+            field,
+        });
+        return None;
+    }
+    Some(value)
+}
+
+fn emit_usage_decode_diagnostics(diagnostics: &[AcpUsageDecodeDiagnostic]) {
+    for diagnostic in diagnostics.iter().take(6) {
+        tracing::warn!(
+            target: "vibex_agent_acp",
+            event_code = "acp_usage_field_ignored",
+            error_code = diagnostic.code,
+            field = diagnostic.field,
+            "ACP usage field ignored"
+        );
+    }
+}
+
+fn usage_status_for_error(error: &VibexError) -> AgentUsageExecutionStatus {
+    let code = error.code.to_ascii_lowercase();
+    if code.contains("cancel") || code.contains("interrupt") || code.contains("aborted") {
+        AgentUsageExecutionStatus::Interrupted
+    } else {
+        AgentUsageExecutionStatus::Failed
+    }
 }
 
 fn merge_agent_token_usage(current: &mut AgentTokenUsage, incoming: AgentTokenUsage) -> bool {
@@ -12734,10 +13052,10 @@ mod tests {
 
     #[test]
     fn standard_context_and_prompt_usage_are_merged_without_losing_fields() {
-        let mut usage =
-            agent_token_usage_from_context_update(&json!({ "used": 12_500, "size": 200_000 }))
-                .unwrap();
-        let prompt = agent_token_usage_from_prompt_response(&json!({
+        let context = decode_context_window_usage(&json!({ "used": 12_500, "size": 200_000 }));
+        assert!(context.diagnostics.is_empty());
+        let mut usage = context.usage.unwrap().live_usage();
+        let prompt = decode_prompt_response_usage(&json!({
             "stopReason": "end_turn",
             "usage": {
                 "inputTokens": 600,
@@ -12747,8 +13065,9 @@ mod tests {
                 "cachedWriteTokens": 250,
                 "totalTokens": 2_370
             }
-        }))
-        .unwrap();
+        }));
+        assert!(prompt.diagnostics.is_empty());
+        let prompt = prompt.usage.unwrap().live_usage();
 
         assert!(merge_agent_token_usage(&mut usage, prompt));
         assert_eq!(usage.context_window_used_tokens, Some(12_500));
@@ -12761,21 +13080,41 @@ mod tests {
 
     #[test]
     fn malformed_usage_values_do_not_replace_valid_usage() {
-        assert!(
-            agent_token_usage_from_context_update(&json!({ "used": -1, "size": 200_000 }))
-                .is_none()
+        let malformed_context =
+            decode_context_window_usage(&json!({ "used": -1, "size": 200_000 }));
+        assert!(malformed_context.usage.is_none());
+        assert_eq!(
+            malformed_context.diagnostics,
+            [AcpUsageDecodeDiagnostic {
+                code: "acp_usage_token_malformed",
+                field: "used",
+            }]
         );
-        assert!(agent_token_usage_from_context_update(&json!({ "used": 1, "size": 0 })).is_none());
-        assert!(
-            agent_token_usage_from_prompt_response(&json!({
-                "usage": {
-                    "inputTokens": -1,
-                    "cachedReadTokens": 1.5,
-                    "totalTokens": "unknown"
-                }
-            }))
-            .is_none()
+        let zero_size = decode_context_window_usage(&json!({ "used": 1, "size": 0 }));
+        assert!(zero_size.usage.is_none());
+        assert_eq!(
+            zero_size.diagnostics,
+            [AcpUsageDecodeDiagnostic {
+                code: "acp_usage_token_invalid_zero",
+                field: "size",
+            }]
         );
+        let malformed_prompt = decode_prompt_response_usage(&json!({
+            "usage": {
+                "inputTokens": -1,
+                "cachedReadTokens": 1.5,
+                "totalTokens": "unknown"
+            }
+        }));
+        assert!(malformed_prompt.usage.is_none());
+        assert_eq!(malformed_prompt.diagnostics.len(), 3);
+        assert!(malformed_prompt.diagnostics.iter().all(|diagnostic| {
+            diagnostic.code == "acp_usage_token_malformed"
+                && matches!(
+                    diagnostic.field,
+                    "inputTokens" | "cachedReadTokens" | "totalTokens"
+                )
+        }));
 
         let mut current = AgentTokenUsage {
             input_tokens: Some(10),
@@ -12784,9 +13123,22 @@ mod tests {
             context_window_size_tokens: Some(40),
             ..AgentTokenUsage::default()
         };
-        let partial =
-            agent_token_usage_from_prompt_response(&json!({ "usage": { "outputTokens": 5 } }))
-                .unwrap();
+        let partial = decode_prompt_response_usage(&json!({
+            "usage": {
+                "outputTokens": 5,
+                "inputTokens": "sensitive-sentinel"
+            }
+        }));
+        assert_eq!(
+            partial.diagnostics,
+            [AcpUsageDecodeDiagnostic {
+                code: "acp_usage_token_malformed",
+                field: "inputTokens",
+            }]
+        );
+        let diagnostic_debug = format!("{:?}", partial.diagnostics);
+        assert!(!diagnostic_debug.contains("sensitive-sentinel"));
+        let partial = partial.usage.unwrap().live_usage();
         assert!(merge_agent_token_usage(&mut current, partial));
         assert_eq!(current.input_tokens, Some(10));
         assert_eq!(current.cached_read_tokens, Some(20));
@@ -18161,6 +18513,9 @@ for line in sys.stdin:
                     runtime_resources: ProviderRuntimeResources::default(),
                     execution_identity: None,
                     event_sender: Some(event_tx),
+                    usage_execution_context: None,
+                    usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                    usage_event_sender: None,
                 },
             )
             .await
@@ -18724,6 +19079,9 @@ for line in sys.stdin:
                 runtime_resources: ProviderRuntimeResources::default(),
                 execution_identity: None,
                 event_sender: None,
+                usage_execution_context: None,
+                usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                usage_event_sender: None,
             },
         )
         .await
@@ -18793,6 +19151,9 @@ for line in sys.stdin:
                 runtime_resources: ProviderRuntimeResources::default(),
                 execution_identity: None,
                 event_sender: None,
+                usage_execution_context: None,
+                usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                usage_event_sender: None,
             },
         )
         .await
@@ -18834,6 +19195,9 @@ for line in sys.stdin:
                     runtime_resources: ProviderRuntimeResources::default(),
                     execution_identity: None,
                     event_sender: None,
+                    usage_execution_context: None,
+                    usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                    usage_event_sender: None,
                 },
             )
             .await
@@ -18894,6 +19258,9 @@ for line in sys.stdin:
                     runtime_resources: ProviderRuntimeResources::default(),
                     execution_identity: None,
                     event_sender: None,
+                    usage_execution_context: None,
+                    usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                    usage_event_sender: None,
                 },
             )
             .await
@@ -18976,6 +19343,9 @@ for line in sys.stdin:
                     runtime_resources: ProviderRuntimeResources::default(),
                     execution_identity: None,
                     event_sender: None,
+                    usage_execution_context: None,
+                    usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                    usage_event_sender: None,
                 },
             )
             .await
@@ -19076,6 +19446,9 @@ for line in sys.stdin:
                     runtime_resources: ProviderRuntimeResources::default(),
                     execution_identity: None,
                     event_sender: None,
+                    usage_execution_context: None,
+                    usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                    usage_event_sender: None,
                 },
             ),
         )
@@ -19139,6 +19512,9 @@ for line in sys.stdin:
                     runtime_resources: ProviderRuntimeResources::default(),
                     execution_identity: None,
                     event_sender: Some(event_tx),
+                    usage_execution_context: None,
+                    usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                    usage_event_sender: None,
                 },
             ),
         )
@@ -19209,6 +19585,9 @@ for line in sys.stdin:
                 runtime_resources: ProviderRuntimeResources::default(),
                 execution_identity: None,
                 event_sender: None,
+                usage_execution_context: None,
+                usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                usage_event_sender: None,
             },
         )
         .await
@@ -19263,6 +19642,9 @@ for line in sys.stdin:
                     runtime_resources: ProviderRuntimeResources::default(),
                     execution_identity: None,
                     event_sender: None,
+                    usage_execution_context: None,
+                    usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                    usage_event_sender: None,
                 },
             ),
         )
@@ -19322,6 +19704,9 @@ for line in sys.stdin:
                 runtime_resources: ProviderRuntimeResources::default(),
                 execution_identity: None,
                 event_sender: None,
+                usage_execution_context: None,
+                usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                usage_event_sender: None,
             },
         )
         .await
@@ -19397,6 +19782,9 @@ for line in sys.stdin:
                 runtime_resources: ProviderRuntimeResources::default(),
                 execution_identity: None,
                 event_sender: Some(event_tx),
+                usage_execution_context: None,
+                usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                usage_event_sender: None,
             },
         )
         .await
@@ -20290,6 +20678,180 @@ for line in sys.stdin:
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_telemetry_preserves_execution_fence_and_separates_context_gauge() {
+        let Some(fixture) = MockAcpFixture::create("usage-telemetry-fence") else {
+            return;
+        };
+        let client = Arc::new(fixture.client());
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        let attachment = client.current_attachment(&session_id).unwrap();
+        let payload = attachment.payload();
+        let (usage_tx, mut usage_rx) = mpsc::unbounded_channel();
+        let execution_id = vibex_core::UsageExecutionId::new();
+        let execution_context = AgentUsageExecutionContext {
+            usage_execution_id: execution_id.clone(),
+            message_submission_id: None,
+            project_id: vibex_core::ProjectId::new(),
+            workspace_id: vibex_core::WorkspaceId::new(),
+            stream: vibex_core::AgentUsageStreamAttribution {
+                session_id: session_id.clone(),
+                binding_id: attachment.binding_id().clone(),
+                activation_generation: attachment.fence().activation_generation as i64,
+                agent_id: AgentId::parse(OPENCODE_AGENT_ID).unwrap(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model_id: "mock/model-1".to_string(),
+            },
+        };
+        let mut undispatched_context = execution_context.clone();
+        undispatched_context.usage_execution_id = vibex_core::UsageExecutionId::new();
+        let (undispatched_tx, mut undispatched_rx) = mpsc::unbounded_channel();
+        payload
+            .begin_turn_with_usage(
+                TurnSink::Buffer(Vec::new()),
+                Some(undispatched_context),
+                AgentUsageCounterOrigin::KnownZero,
+                Some(undispatched_tx),
+            )
+            .unwrap();
+        payload.finish_turn(false).unwrap();
+        assert!(undispatched_rx.try_recv().is_err());
+
+        payload
+            .begin_turn_with_usage(
+                TurnSink::Buffer(Vec::new()),
+                Some(execution_context),
+                AgentUsageCounterOrigin::KnownZero,
+                Some(usage_tx),
+            )
+            .unwrap();
+        payload.mark_turn_dispatched(unix_timestamp_ms()).unwrap();
+
+        payload.process().handle_session_update(&json!({
+            "sessionId": payload.native_session_id,
+            "update": {
+                "sessionUpdate": "usage_update",
+                "used": 12_000,
+                "size": 200_000
+            }
+        }));
+        assert!(payload.merge_prompt_response_usage(&json!({
+            "usage": {
+                "inputTokens": 600,
+                "outputTokens": 400,
+                "cachedReadTokens": 300,
+                "totalTokens": 1_000,
+                "cost": 99_999
+            }
+        })));
+        payload.emit_active_usage_status(AgentUsageExecutionStatus::Completed);
+        payload.finish_turn(false).unwrap();
+
+        let dispatched = usage_rx.recv().await.unwrap();
+        let context = usage_rx.recv().await.unwrap();
+        let cumulative = usage_rx.recv().await.unwrap();
+        let completed = usage_rx.recv().await.unwrap();
+        assert!(matches!(
+            dispatched,
+            AgentUsageTelemetryEvent::ExecutionDispatched {
+                ref execution,
+                counter_origin: AgentUsageCounterOrigin::KnownZero,
+            }
+                if execution.usage_execution_id == execution_id
+        ));
+        let AgentUsageTelemetryEvent::Observation(context) = context else {
+            panic!("expected context usage observation");
+        };
+        assert_eq!(
+            context.source,
+            AgentUsageObservationSource::SessionUsageUpdate
+        );
+        assert!(!context.cumulative.any_reported());
+        assert_eq!(context.context_window_used_tokens, Some(12_000));
+        let AgentUsageTelemetryEvent::Observation(cumulative) = cumulative else {
+            panic!("expected cumulative usage observation");
+        };
+        assert_eq!(
+            cumulative.source,
+            AgentUsageObservationSource::PromptResponse
+        );
+        assert_eq!(cumulative.cumulative.total_tokens, Some(1_000));
+        assert_eq!(
+            cumulative.execution.unwrap().usage_execution_id,
+            execution_id
+        );
+        assert!(cumulative.observation_sequence > context.observation_sequence);
+        assert!(matches!(
+            completed,
+            AgentUsageTelemetryEvent::ExecutionStatus(ref update)
+                if update.execution.usage_execution_id == execution_id
+                    && update.status == AgentUsageExecutionStatus::Completed
+        ));
+
+        let (next_usage_tx, mut next_usage_rx) = mpsc::unbounded_channel();
+        let next_execution_id = vibex_core::UsageExecutionId::new();
+        let next_execution_context = AgentUsageExecutionContext {
+            usage_execution_id: next_execution_id.clone(),
+            message_submission_id: None,
+            project_id: vibex_core::ProjectId::new(),
+            workspace_id: vibex_core::WorkspaceId::new(),
+            stream: vibex_core::AgentUsageStreamAttribution {
+                session_id: session_id.clone(),
+                binding_id: attachment.binding_id().clone(),
+                activation_generation: attachment.fence().activation_generation as i64,
+                agent_id: AgentId::parse(OPENCODE_AGENT_ID).unwrap(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model_id: "mock/model-1".to_string(),
+            },
+        };
+        payload
+            .begin_turn_with_usage(
+                TurnSink::Buffer(Vec::new()),
+                Some(next_execution_context),
+                AgentUsageCounterOrigin::KnownZero,
+                Some(next_usage_tx),
+            )
+            .unwrap();
+        payload.mark_turn_dispatched(unix_timestamp_ms()).unwrap();
+        assert!(payload.merge_prompt_response_usage(&json!({
+            "usage": { "totalTokens": 1_200 }
+        })));
+        payload.finish_turn(false).unwrap();
+
+        assert!(matches!(
+            next_usage_rx.recv().await.unwrap(),
+            AgentUsageTelemetryEvent::ExecutionDispatched {
+                ref execution,
+                counter_origin: AgentUsageCounterOrigin::RestoredCheckpoint,
+            }
+                if execution.usage_execution_id == next_execution_id
+        ));
+        let AgentUsageTelemetryEvent::Observation(next_observation) =
+            next_usage_rx.recv().await.unwrap()
+        else {
+            panic!("expected second cumulative usage observation");
+        };
+        assert_eq!(
+            next_observation.counter_origin,
+            AgentUsageCounterOrigin::RestoredCheckpoint
+        );
+
+        client.close_session(&binding).await.unwrap();
+        drop(client);
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mock_acp_agent_per_profile_pool_reuses_process_and_routes_updates() {
         let Some(fixture) = MockAcpFixture::create("pool-reuse") else {
             return;
@@ -20368,6 +20930,9 @@ for line in sys.stdin:
                 runtime_resources: ProviderRuntimeResources::default(),
                 execution_identity: None,
                 event_sender: Some(tx_a),
+                usage_execution_context: None,
+                usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                usage_event_sender: None,
             },
         )
         .await
@@ -20385,6 +20950,9 @@ for line in sys.stdin:
                 runtime_resources: ProviderRuntimeResources::default(),
                 execution_identity: None,
                 event_sender: Some(tx_b),
+                usage_execution_context: None,
+                usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                usage_event_sender: None,
             },
         )
         .await
@@ -20627,6 +21195,9 @@ for line in sys.stdin:
             runtime_resources: ProviderRuntimeResources::default(),
             execution_identity: None,
             event_sender: None,
+            usage_execution_context: None,
+            usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+            usage_event_sender: None,
         };
         stale_request.execution_identity =
             client.prepare_turn_execution(&stale_request).await.unwrap();
@@ -20660,6 +21231,9 @@ for line in sys.stdin:
                 runtime_resources: ProviderRuntimeResources::default(),
                 execution_identity: None,
                 event_sender: None,
+                usage_execution_context: None,
+                usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                usage_event_sender: None,
             },
         )
         .await
@@ -21385,6 +21959,9 @@ for line in sys.stdin:
                     runtime_resources: ProviderRuntimeResources::default(),
                     execution_identity: None,
                     event_sender: Some(event_tx),
+                    usage_execution_context: None,
+                    usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                    usage_event_sender: None,
                 },
             ),
         )
