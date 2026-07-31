@@ -96,6 +96,9 @@ fn map_desktop_event(event: DesktopEvent) -> BackendEvent {
         DesktopEvent::Timeline(event) => BackendEvent::Timeline(event),
         DesktopEvent::Runtime(event) => BackendEvent::Runtime(event),
         DesktopEvent::RuntimeSelection(event) => BackendEvent::RuntimeSelection(event),
+        DesktopEvent::ProviderConfigChanged(_) => {
+            BackendEvent::ProjectionInvalidated(BackendProjection::Management)
+        }
         DesktopEvent::UsageInvalidated => {
             BackendEvent::ProjectionInvalidated(BackendProjection::Usage)
         }

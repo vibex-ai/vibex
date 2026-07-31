@@ -1792,16 +1792,7 @@ impl ManagementCenter {
                     format!("已複製供應商配置 {}", created.display_name)
                 }
             };
-            let refresh = runtime
-                .agent()
-                .runtime_catalog()
-                .refresh_agent(&agent_id)
-                .await;
-            Ok(management_append_runtime_option_refresh(
-                message,
-                refresh,
-                active_locale,
-            ))
+            Ok(message)
         });
     }
 
@@ -1964,15 +1955,6 @@ impl ManagementCenter {
                 )
                 .to_string()
             };
-            let message = management_append_runtime_option_refresh(
-                message,
-                runtime
-                    .agent()
-                    .runtime_catalog()
-                    .refresh_agent(&agent_id)
-                    .await,
-                active_locale,
-            );
             Ok::<_, VibexError>((message, saved_profile_id))
         });
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
@@ -2005,10 +1987,6 @@ impl ManagementCenter {
                         cx.notify();
                     }
                 }
-                // The profile may have been written even on a late failure
-                // (e.g. the follow-up secret update erroring); always let the
-                // workbench rebuild its runtime option catalog.
-                cx.emit(ManagementEvent::AgentRegistryChanged);
             });
         }));
     }
@@ -2968,18 +2946,9 @@ impl ManagementCenter {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
                 this.mutation = None;
-                // Provider profile and ACP config mutations change what the
-                // runtime option catalog can offer; the workbench listens for
-                // this event to rebuild the new-session selectors without a
-                // restart.
                 let agent_registry_changed = matches!(
                     &completed_mutation,
-                    ManagementMutation::AgentToggle(_)
-                        | ManagementMutation::AgentDiscovery
-                        | ManagementMutation::ProfileCreate
-                        | ManagementMutation::ProfileUpdate(_)
-                        | ManagementMutation::ProfileDelete(_)
-                        | ManagementMutation::AcpConfig(_)
+                    ManagementMutation::AgentToggle(_) | ManagementMutation::AgentDiscovery
                 ) || matches!(
                     &completed_mutation,
                     ManagementMutation::ProviderProbe(action) if action == "runtime-options"
@@ -7571,16 +7540,7 @@ impl ManagementCenter {
                     format!("已更新 ACP 配置 {}", profile.display_name)
                 }
             };
-            let refresh = runtime
-                .agent()
-                .runtime_catalog()
-                .refresh_agent(&profile.agent_id)
-                .await;
-            Ok(management_append_runtime_option_refresh(
-                message,
-                refresh,
-                active_locale,
-            ))
+            Ok(message)
         });
     }
 
@@ -12799,6 +12759,30 @@ mod tests {
         assert_eq!(updated.process_strategy, original.process_strategy);
         assert_eq!(updated.terminal_tools, original.terminal_tools);
         assert_eq!(updated.terminal_auth, original.terminal_auth);
+    }
+
+    #[test]
+    fn provider_profile_saves_do_not_wait_for_runtime_catalog_probes() {
+        let source = include_str!("management.rs");
+        let duplicate = source
+            .split_once("    fn duplicate_provider_profile(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn save_profile("))
+            .map(|(body, _)| body)
+            .expect("duplicate profile handler should remain inspectable");
+        let save = source
+            .split_once("    fn save_profile(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn run_provider_health_probe("))
+            .map(|(body, _)| body)
+            .expect("profile save handler should remain inspectable");
+        let acp = source
+            .split_once("    fn save_acp_config(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_acp_config_card("))
+            .map(|(body, _)| body)
+            .expect("ACP config save handler should remain inspectable");
+
+        assert!(!duplicate.contains(".refresh_agent("));
+        assert!(!save.contains(".refresh_agent("));
+        assert!(!acp.contains(".refresh_agent("));
     }
 
     #[test]

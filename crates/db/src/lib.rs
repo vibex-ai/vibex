@@ -3598,6 +3598,18 @@ impl ProviderRuntimeOptionSnapshotRepository {
         Ok(())
     }
 
+    pub fn delete(conn: &Connection, provider_profile_id: &ProviderProfileId) -> VibexResult<()> {
+        conn.execute(
+            "DELETE FROM provider_runtime_option_snapshots WHERE provider_profile_id = ?1",
+            params![provider_profile_id.as_str()],
+        )
+        .map_err(storage_err(
+            "runtime_option_snapshot_delete_failed",
+            "failed to delete runtime option snapshot",
+        ))?;
+        Ok(())
+    }
+
     pub fn list(conn: &Connection) -> VibexResult<Vec<ProviderRuntimeOptionSnapshotRecord>> {
         let mut stmt = conn
             .prepare(
@@ -12520,6 +12532,14 @@ mod tests {
         assert_eq!(
             first_failure.last_error_code.as_deref(),
             Some("agent_not_installed")
+        );
+
+        ProviderRuntimeOptionSnapshotRepository::delete(&conn, &failed_profile.id).unwrap();
+        assert!(
+            ProviderRuntimeOptionSnapshotRepository::list(&conn)
+                .unwrap()
+                .iter()
+                .all(|snapshot| snapshot.provider_profile_id != failed_profile.id)
         );
 
         ProviderProfileRepository::soft_delete(&mut conn, &successful_profile.id).unwrap();

@@ -2281,15 +2281,37 @@ fn sanitize_request_id_suffix(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, fs};
+    use std::{
+        collections::HashSet,
+        fs,
+        sync::{Arc, Mutex},
+    };
 
     use tempfile::tempdir;
     use vibex_core::{
         ProviderNativeImportCreateRequest, ProviderNativeImportPreviewRequest,
-        ProviderNativeImportSource,
+        ProviderNativeImportSource, ProviderProfileId,
     };
 
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingImportProfileListener {
+        saved_profile_ids: Mutex<Vec<ProviderProfileId>>,
+    }
+
+    impl crate::ProviderProfileChangeListener for RecordingImportProfileListener {
+        fn on_provider_profile_saved(
+            &self,
+            provider_profile_id: &ProviderProfileId,
+            _profile_updated_at_ms: i64,
+        ) {
+            self.saved_profile_ids
+                .lock()
+                .unwrap()
+                .push(provider_profile_id.clone());
+        }
+    }
 
     #[test]
     fn native_import_codex_preview_redacts_auth_and_maps_config() {
@@ -2864,7 +2886,9 @@ wire_api = "responses"
         );
 
         let vibex_dir = tempdir().unwrap();
-        let service = ProviderConfigService::new(vibex_dir.path().join("vibex.db"));
+        let listener = Arc::new(RecordingImportProfileListener::default());
+        let service = ProviderConfigService::new(vibex_dir.path().join("vibex.db"))
+            .with_profile_change_listener(listener.clone());
         let result = service
             .create_profile_from_import_with_roots(
                 ProviderNativeImportCreateRequest {
@@ -2881,6 +2905,9 @@ wire_api = "responses"
         assert_eq!(profile.kind, ProviderKind::Acp);
         assert_eq!(profile.agent_id.as_str(), "opencode");
         assert_eq!(profile.default_model.as_deref(), Some("opencode-fast"));
+        let saved_profile_ids = listener.saved_profile_ids.lock().unwrap();
+        assert_eq!(saved_profile_ids.len(), 1);
+        assert_eq!(saved_profile_ids[0], profile.id);
         assert!(
             profile
                 .provider_options

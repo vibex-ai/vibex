@@ -88,15 +88,17 @@ pub struct CodexProviderRuntimeConfig {
     pub api_key: Option<String>,
 }
 
-/// Runtime listener invoked after a Provider Profile write and readback have
-/// both succeeded. Implementations must be non-blocking and must not attempt to
-/// participate in the completed persistence transaction.
+/// Runtime listener invoked after a Provider Profile create/update readback or
+/// delete commit succeeds. Implementations must be non-blocking and must not
+/// attempt to participate in the completed persistence operation.
 pub trait ProviderProfileChangeListener: Send + Sync {
     fn on_provider_profile_saved(
         &self,
         provider_profile_id: &ProviderProfileId,
         profile_updated_at_ms: i64,
     );
+
+    fn on_provider_profile_deleted(&self, _provider_profile_id: &ProviderProfileId) {}
 }
 
 #[derive(Clone)]
@@ -141,6 +143,12 @@ impl ProviderConfigService {
     fn notify_profile_saved(&self, profile: &ProviderProfile) {
         for listener in &self.profile_change_listeners {
             listener.on_provider_profile_saved(&profile.id, profile.updated_at_ms);
+        }
+    }
+
+    fn notify_profile_deleted(&self, provider_profile_id: &ProviderProfileId) {
+        for listener in &self.profile_change_listeners {
+            listener.on_provider_profile_deleted(provider_profile_id);
         }
     }
 
@@ -497,12 +505,14 @@ impl ProviderConfigService {
                 secret_references: request.secret_references,
             });
         ProviderProfileRepository::insert(&conn, &profile)?;
-        ProviderProfileRepository::get(&conn, &profile.id)?.ok_or_else(|| {
+        let created = ProviderProfileRepository::get(&conn, &profile.id)?.ok_or_else(|| {
             VibexError::storage(
                 "agent_model_provider_profile_create_readback_failed",
                 "failed to read agent model provider profile after create",
             )
-        })
+        })?;
+        self.notify_profile_saved(&created);
+        Ok(created)
     }
 
     pub fn update_agent_model_provider_profile(
@@ -869,12 +879,14 @@ impl ProviderConfigService {
         let conn = self.open_connection()?;
         let profile = ProviderProfileRepository::from_create_request(request);
         ProviderProfileRepository::insert(&conn, &profile)?;
-        ProviderProfileRepository::get(&conn, &profile.id)?.ok_or_else(|| {
+        let created = ProviderProfileRepository::get(&conn, &profile.id)?.ok_or_else(|| {
             VibexError::storage(
                 "provider_profile_create_readback_failed",
                 "failed to read provider profile after create",
             )
-        })
+        })?;
+        self.notify_profile_saved(&created);
+        Ok(created)
     }
 
     pub fn update_profile(
@@ -1135,12 +1147,14 @@ impl ProviderConfigService {
             })
             .collect();
         ProviderProfileRepository::insert(&conn, &duplicate)?;
-        ProviderProfileRepository::get(&conn, &duplicate.id)?.ok_or_else(|| {
+        let created = ProviderProfileRepository::get(&conn, &duplicate.id)?.ok_or_else(|| {
             VibexError::storage(
                 "provider_profile_duplicate_readback_failed",
                 "failed to read provider profile after duplicate",
             )
-        })
+        })?;
+        self.notify_profile_saved(&created);
+        Ok(created)
     }
 
     pub fn delete_profile(&self, request: ProviderProfileDeleteRequest) -> VibexResult<()> {
@@ -1152,7 +1166,10 @@ impl ProviderConfigService {
             .with_diagnostic("providerProfileId", request.provider_profile_id.as_str()));
         }
         let mut conn = self.open_connection()?;
-        ProviderProfileRepository::soft_delete(&mut conn, &request.provider_profile_id)
+        ProviderProfileRepository::soft_delete(&mut conn, &request.provider_profile_id)?;
+        drop(conn);
+        self.notify_profile_deleted(&request.provider_profile_id);
+        Ok(())
     }
 
     pub fn get_default(
@@ -6763,6 +6780,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingProfileListener {
         calls: Mutex<Vec<(String, i64)>>,
+        deleted_calls: Mutex<Vec<String>>,
     }
 
     impl ProviderProfileChangeListener for RecordingProfileListener {
@@ -6776,10 +6794,17 @@ mod tests {
                 profile_updated_at_ms,
             ));
         }
+
+        fn on_provider_profile_deleted(&self, provider_profile_id: &ProviderProfileId) {
+            self.deleted_calls
+                .lock()
+                .unwrap()
+                .push(provider_profile_id.as_str().to_string());
+        }
     }
 
     #[test]
-    fn profile_listener_runs_after_successful_profile_readback() {
+    fn profile_listener_runs_after_successful_profile_mutations() {
         let dir = tempdir().unwrap();
         let listener = Arc::new(RecordingProfileListener::default());
         let second_listener = Arc::new(RecordingProfileListener::default());
@@ -6807,8 +6832,8 @@ mod tests {
                 }),
             })
             .unwrap();
-        assert!(listener.calls.lock().unwrap().is_empty());
-        assert!(second_listener.calls.lock().unwrap().is_empty());
+        assert_eq!(listener.calls.lock().unwrap().len(), 1);
+        assert_eq!(second_listener.calls.lock().unwrap().len(), 1);
 
         let invalid = service.update_profile(ProviderProfileUpdateRequest {
             provider_profile_id: profile.id.clone(),
@@ -6827,8 +6852,8 @@ mod tests {
             provider_options: None,
         });
         assert!(invalid.is_err());
-        assert!(listener.calls.lock().unwrap().is_empty());
-        assert!(second_listener.calls.lock().unwrap().is_empty());
+        assert_eq!(listener.calls.lock().unwrap().len(), 1);
+        assert_eq!(second_listener.calls.lock().unwrap().len(), 1);
 
         let updated = service
             .update_profile(ProviderProfileUpdateRequest {
@@ -6849,12 +6874,28 @@ mod tests {
             })
             .unwrap();
         let calls = listener.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, updated.id.as_str());
-        assert_eq!(calls[0].1, updated.updated_at_ms);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].0, updated.id.as_str());
+        assert_eq!(calls[1].1, updated.updated_at_ms);
         let second_calls = second_listener.calls.lock().unwrap();
-        assert_eq!(second_calls.len(), 1);
-        assert_eq!(second_calls[0].0, updated.id.as_str());
+        assert_eq!(second_calls.len(), 2);
+        assert_eq!(second_calls[1].0, updated.id.as_str());
+        drop(calls);
+        drop(second_calls);
+
+        service
+            .delete_profile(ProviderProfileDeleteRequest {
+                provider_profile_id: profile.id.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            listener.deleted_calls.lock().unwrap().as_slice(),
+            [profile.id.as_str()]
+        );
+        assert_eq!(
+            second_listener.deleted_calls.lock().unwrap().as_slice(),
+            [profile.id.as_str()]
+        );
     }
 
     struct EnvVarGuard {
@@ -7534,7 +7575,7 @@ mod tests {
         assert_eq!(updated.value.as_deref(), Some("sk-visible-local"));
         assert_eq!(updated.setup_state, ProviderSecretSetupState::Available);
         assert_eq!(updated.backend, ProviderSecretBackend::OsKeychain);
-        assert_eq!(listener.calls.lock().unwrap().len(), 1);
+        assert_eq!(listener.calls.lock().unwrap().len(), 2);
 
         let test_result = service
             .test_agent_model_provider_profile(AgentModelProviderProfileTestRequest {
@@ -7564,7 +7605,7 @@ mod tests {
             .unwrap();
         assert_eq!(cleared.value, None);
         assert_eq!(cleared.setup_state, ProviderSecretSetupState::Missing);
-        assert_eq!(listener.calls.lock().unwrap().len(), 2);
+        assert_eq!(listener.calls.lock().unwrap().len(), 3);
     }
 
     fn spawn_http_probe_server(expected_path: &'static str, response_body: &'static str) -> String {

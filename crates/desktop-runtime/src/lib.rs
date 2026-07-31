@@ -10,7 +10,7 @@ mod remote_connectivity;
 mod usage;
 mod workbench;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,12 +28,12 @@ use vibex_agent_acp::{
     AcpAgentProvider, AcpCompatibilityRegistry, AcpRuntimeClient, AcpRuntimeLifecycleBackend,
     AcpRuntimeSwitchBridge, ManagedAcpAdapterStore,
 };
-use vibex_config_switch::ProviderConfigService;
+use vibex_config_switch::{ProviderConfigService, ProviderProfileChangeListener};
 use vibex_core::{
     AgentCommandConfig, AgentRefreshSnapshotRequest, AgentRuntimeKind, AgentSession,
-    FetchTimelineRequest, OpenWorkspaceRequest, ProjectId, ProjectRecord, TerminalCreateRequest,
-    TerminalId, TerminalSession, TerminalSwitchShellRequest, TimelinePage, VibexError, VibexResult,
-    WorkspaceId, WorkspaceMode, WorkspaceRecord,
+    FetchTimelineRequest, OpenWorkspaceRequest, ProjectId, ProjectRecord, ProviderProfileId,
+    TerminalCreateRequest, TerminalId, TerminalSession, TerminalSwitchShellRequest, TimelinePage,
+    VibexError, VibexResult, WorkspaceId, WorkspaceMode, WorkspaceRecord,
 };
 use vibex_db::{
     TerminalSessionRepository, WorkspaceRepository, apply_migrations, default_database_path,
@@ -52,7 +52,7 @@ pub use catalog::{
 };
 pub use events::{
     AuthoritativeRefetch, DesktopEvent, DesktopEventReceiver, DesktopEventReceiverClosed,
-    DesktopEventStream,
+    DesktopEventStream, ProviderConfigChangePhase, ProviderConfigChangedEvent,
 };
 pub use fixture::FixtureDesktopRuntime;
 pub use home_lock::{DESKTOP_RUNTIME_LOCK_FILE, DesktopHomeLock};
@@ -88,6 +88,34 @@ pub const RELEASE_STABLE_HOME_DIRECTORY: &str = "desktop-stable";
 pub const NATIVE_TERMINAL_RING_CAPACITY: usize = 2_000;
 pub const NATIVE_TERMINAL_RAW_CAPACITY_BYTES: usize = 10 * 1024 * 1024;
 pub const DESKTOP_UI_STATE_FILE: &str = "desktop-ui-state.json";
+
+#[derive(Debug, Clone)]
+enum ProviderProfileMutationEvent {
+    Saved(ProviderProfileId),
+    Deleted(ProviderProfileId),
+}
+
+struct DesktopProviderProfileChangeListener {
+    sender: mpsc::UnboundedSender<ProviderProfileMutationEvent>,
+}
+
+impl ProviderProfileChangeListener for DesktopProviderProfileChangeListener {
+    fn on_provider_profile_saved(
+        &self,
+        provider_profile_id: &ProviderProfileId,
+        _profile_updated_at_ms: i64,
+    ) {
+        let _ = self.sender.send(ProviderProfileMutationEvent::Saved(
+            provider_profile_id.clone(),
+        ));
+    }
+
+    fn on_provider_profile_deleted(&self, provider_profile_id: &ProviderProfileId) {
+        let _ = self.sender.send(ProviderProfileMutationEvent::Deleted(
+            provider_profile_id.clone(),
+        ));
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesktopRuntimeMode {
@@ -632,8 +660,12 @@ impl DesktopRuntime {
             None
         };
         let observability = Arc::new(RuntimeObservability::new());
+        let (provider_change_sender, provider_change_receiver) = mpsc::unbounded_channel();
+        let provider_change_listener = Arc::new(DesktopProviderProfileChangeListener {
+            sender: provider_change_sender,
+        });
         let (manager, provider_config_service, acp_runtime) =
-            build_agent_manager(&config, observability.clone()).await?;
+            build_agent_manager(&config, observability.clone(), provider_change_listener).await?;
         let manager = Arc::new(manager);
         let db_path = manager.database_path().to_path_buf();
         let usage = AgentUsageService::new(db_path.clone())?;
@@ -786,6 +818,7 @@ impl DesktopRuntime {
             shutting_down: AtomicBool::new(false),
         });
         runtime.spawn_usage_consumer(usage_receiver)?;
+        runtime.spawn_provider_config_consumer(provider_change_receiver)?;
         runtime.activate().await?;
         Ok(runtime)
     }
@@ -928,6 +961,117 @@ impl DesktopRuntime {
                             "Agent usage telemetry persistence failed"
                         );
                     }
+                }
+            }
+        }));
+        Ok(())
+    }
+
+    fn spawn_provider_config_consumer(
+        &self,
+        mut receiver: mpsc::UnboundedReceiver<ProviderProfileMutationEvent>,
+    ) -> VibexResult<()> {
+        let mut tasks = self.tasks.lock().map_err(|_| {
+            VibexError::process(
+                "desktop_runtime_task_lock_failed",
+                "desktop runtime task ownership is unavailable",
+            )
+        })?;
+        let (refresh_sender, mut refresh_receiver) = mpsc::unbounded_channel();
+        let catalog = self.agent.runtime_catalog.clone();
+        let profile_events = self.events.clone();
+        let profile_gateway = self.remote.gateway.clone();
+        tasks.push(tokio::spawn(async move {
+            while let Some(first) = receiver.recv().await {
+                let mut changes = vec![first];
+                while let Ok(change) = receiver.try_recv() {
+                    changes.push(change);
+                }
+                let mut changed_profile_ids = BTreeSet::new();
+                let mut refresh_profile_ids = BTreeSet::new();
+                for change in changes {
+                    match change {
+                        ProviderProfileMutationEvent::Saved(provider_profile_id) => {
+                            refresh_profile_ids.insert(provider_profile_id.clone());
+                            changed_profile_ids.insert(provider_profile_id);
+                        }
+                        ProviderProfileMutationEvent::Deleted(provider_profile_id) => {
+                            refresh_profile_ids.remove(&provider_profile_id);
+                            changed_profile_ids.insert(provider_profile_id);
+                        }
+                    }
+                }
+                for provider_profile_id in &changed_profile_ids {
+                    if let Err(error) = catalog.invalidate_profile_snapshot(provider_profile_id) {
+                        tracing::warn!(
+                            target: "vibex_desktop",
+                            provider_profile_id = %provider_profile_id,
+                            error_code = %error.code,
+                            "Provider runtime option snapshot invalidation failed"
+                        );
+                    }
+                }
+                if !changed_profile_ids.is_empty() {
+                    let provider_profile_ids = changed_profile_ids.into_iter().collect();
+                    let _ = profile_events.send(DesktopEvent::ProviderConfigChanged(
+                        ProviderConfigChangedEvent {
+                            provider_profile_ids,
+                            phase: ProviderConfigChangePhase::ProfilesChanged,
+                        },
+                    ));
+                    if let Err(error) = profile_gateway.publish_provider_invalidation() {
+                        tracing::warn!(
+                            target: "vibex_desktop",
+                            error_code = %error.code,
+                            "Remote Provider projection invalidation failed"
+                        );
+                    }
+                }
+                for provider_profile_id in refresh_profile_ids {
+                    let _ = refresh_sender.send(provider_profile_id);
+                }
+            }
+        }));
+
+        let catalog = self.agent.runtime_catalog.clone();
+        let runtime_option_events = self.events.clone();
+        let runtime_option_gateway = self.remote.gateway.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut pending = BTreeSet::new();
+            loop {
+                if pending.is_empty() {
+                    let Some(provider_profile_id) = refresh_receiver.recv().await else {
+                        break;
+                    };
+                    pending.insert(provider_profile_id);
+                }
+                tokio::task::yield_now().await;
+                while let Ok(provider_profile_id) = refresh_receiver.try_recv() {
+                    pending.insert(provider_profile_id);
+                }
+                let Some(provider_profile_id) = pending.pop_first() else {
+                    continue;
+                };
+                if let Err(error) = catalog.refresh_profile(&provider_profile_id).await {
+                    tracing::warn!(
+                        target: "vibex_desktop",
+                        provider_profile_id = %provider_profile_id,
+                        error_code = %error.code,
+                        "Provider runtime option background refresh failed"
+                    );
+                }
+                let _ = runtime_option_events.send(DesktopEvent::ProviderConfigChanged(
+                    ProviderConfigChangedEvent {
+                        provider_profile_ids: vec![provider_profile_id],
+                        phase: ProviderConfigChangePhase::RuntimeOptionsChanged,
+                    },
+                ));
+                if let Err(error) = runtime_option_gateway.publish_provider_invalidation() {
+                    tracing::warn!(
+                        target: "vibex_desktop",
+                        error_code = %error.code,
+                        "Remote Provider runtime option invalidation failed"
+                    );
                 }
             }
         }));
@@ -1270,6 +1414,7 @@ impl Drop for DesktopRuntime {
 async fn build_agent_manager(
     config: &DesktopRuntimeConfig,
     observability: Arc<RuntimeObservability>,
+    profile_change_listener: Arc<dyn ProviderProfileChangeListener>,
 ) -> VibexResult<(AgentManager, ProviderConfigService, Arc<AcpRuntimeClient>)> {
     let db_path = config.database_path.clone();
     let bootstrap_config_service = ProviderConfigService::new(&db_path);
@@ -1282,7 +1427,8 @@ async fn build_agent_manager(
         observability,
     ));
     let acp_config_service = ProviderConfigService::new(db_path.clone())
-        .with_profile_change_listener(acp_runtime.clone());
+        .with_profile_change_listener(acp_runtime.clone())
+        .with_profile_change_listener(profile_change_listener);
     let acp_provider = Arc::new(AcpAgentProvider::with_config_service(
         acp_runtime.clone(),
         acp_config_service.clone(),
@@ -1357,7 +1503,10 @@ async fn prepare_managed_acp_adapters(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vibex_core::{TerminalStatus, WorkspaceMode};
+    use vibex_core::{
+        ProviderKind, ProviderOptions, ProviderProfileCreateRequest, ProviderProfileDeleteRequest,
+        TerminalStatus, WorkspaceMode,
+    };
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn isolated_runtime_uses_one_home_lock_and_releases_it_on_shutdown() {
@@ -1373,6 +1522,92 @@ mod tests {
         runtime.shutdown().await.unwrap();
         let replacement = DesktopRuntime::start(config).await.unwrap();
         replacement.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provider_mutations_publish_static_then_runtime_option_invalidations() {
+        let home = tempfile::tempdir().unwrap();
+        let runtime = DesktopRuntime::start(DesktopRuntimeConfig::isolated_test(home.path()))
+            .await
+            .unwrap();
+        let mut events = runtime.subscribe();
+        let profile = runtime
+            .management()
+            .providers()
+            .management()
+            .create_profile(ProviderProfileCreateRequest {
+                agent_id: Some(vibex_core::AgentId::parse("codex").unwrap()),
+                kind: ProviderKind::Codex,
+                display_name: "Evented provider".to_string(),
+                account_alias: None,
+                base_url: None,
+                default_model: None,
+                small_model: None,
+                large_model: None,
+                configured_models: Vec::new(),
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: Some(ProviderOptions::empty()),
+                secret_references: Vec::new(),
+            })
+            .unwrap();
+
+        let profiles_changed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let DesktopEvent::ProviderConfigChanged(event) = events.recv().await.unwrap()
+                    && event.phase == ProviderConfigChangePhase::ProfilesChanged
+                {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            profiles_changed.provider_profile_ids,
+            vec![profile.id.clone()]
+        );
+
+        let runtime_options_changed =
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if let DesktopEvent::ProviderConfigChanged(event) = events.recv().await.unwrap()
+                        && event.phase == ProviderConfigChangePhase::RuntimeOptionsChanged
+                    {
+                        break event;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime_options_changed.provider_profile_ids,
+            vec![profile.id.clone()]
+        );
+
+        runtime
+            .management()
+            .providers()
+            .management()
+            .delete_profile(ProviderProfileDeleteRequest {
+                provider_profile_id: profile.id.clone(),
+            })
+            .unwrap();
+        let deleted = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let DesktopEvent::ProviderConfigChanged(event) = events.recv().await.unwrap()
+                    && event.phase == ProviderConfigChangePhase::ProfilesChanged
+                {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(deleted.provider_profile_ids, vec![profile.id]);
+        runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

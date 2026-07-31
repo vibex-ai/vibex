@@ -14,8 +14,8 @@ use vibex_core::{
     ProviderProfileStatus, ProviderSessionConfigValue, SessionRuntimeOptionCatalog, VibexError,
 };
 use vibex_db::{
-    ProviderRuntimeOptionSnapshotRecord, ProviderRuntimeOptionSnapshotRepository, apply_migrations,
-    open_database,
+    ProviderProfileRepository, ProviderRuntimeOptionSnapshotRecord,
+    ProviderRuntimeOptionSnapshotRepository, apply_migrations, open_database,
 };
 use vibex_remote::RemoteRuntimeOptionCatalogSource;
 
@@ -177,7 +177,33 @@ impl RuntimeOptionCatalogService {
             })
             .map(|profile| profile.id.clone())
             .collect::<Vec<_>>();
-        self.refresh_profile_ids(&profiles, profile_ids).await
+        self.refresh_profile_ids(profile_ids).await
+    }
+
+    /// Refreshes one changed Profile without probing every configuration owned
+    /// by the same Agent.
+    pub async fn refresh_profile(
+        &self,
+        provider_profile_id: &ProviderProfileId,
+    ) -> Result<RuntimeOptionRefreshResult, VibexError> {
+        let Some(profile) = self.provider_config.get_profile(provider_profile_id)? else {
+            return Ok(RuntimeOptionRefreshResult::default());
+        };
+        if profile.kind != ProviderKind::Acp || profile.status != ProviderProfileStatus::Enabled {
+            return Ok(RuntimeOptionRefreshResult::default());
+        }
+        let agents = self.provider_config.list_agents(AgentListRequest {
+            include_disabled: false,
+        })?;
+        if !agents
+            .agents
+            .iter()
+            .any(|agent| agent.id == profile.agent_id && agent.added && agent.enabled)
+        {
+            return Ok(RuntimeOptionRefreshResult::default());
+        }
+        self.refresh_profile_ids(vec![provider_profile_id.clone()])
+            .await
     }
 
     /// Performs the one-time bootstrap for enabled ACP Profiles that have no
@@ -202,7 +228,16 @@ impl RuntimeOptionCatalogService {
             })
             .map(|profile| profile.id.clone())
             .collect::<Vec<_>>();
-        self.refresh_profile_ids(&profiles, profile_ids).await
+        self.refresh_profile_ids(profile_ids).await
+    }
+
+    pub fn invalidate_profile_snapshot(
+        &self,
+        provider_profile_id: &ProviderProfileId,
+    ) -> Result<(), VibexError> {
+        let mut connection = open_database(self.provider_config.database_path())?;
+        apply_migrations(&mut connection)?;
+        ProviderRuntimeOptionSnapshotRepository::delete(&connection, provider_profile_id)
     }
 
     pub fn snapshot_summaries(&self) -> Result<Vec<RuntimeOptionSnapshotSummary>, VibexError> {
@@ -221,15 +256,18 @@ impl RuntimeOptionCatalogService {
 
     async fn refresh_profile_ids(
         &self,
-        profiles: &[ProviderProfile],
         profile_ids: Vec<ProviderProfileId>,
     ) -> Result<RuntimeOptionRefreshResult, VibexError> {
         let _refresh_guard = self.refresh_lock.lock().await;
         let mut result = RuntimeOptionRefreshResult::default();
         for profile_id in profile_ids {
-            let Some(profile) = profiles.iter().find(|profile| profile.id == profile_id) else {
+            let Some(profile) = self.provider_config.get_profile(&profile_id)? else {
                 continue;
             };
+            if profile.kind != ProviderKind::Acp || profile.status != ProviderProfileStatus::Enabled
+            {
+                continue;
+            }
             let attempted_at_ms = vibex_core::unix_timestamp_ms();
             let session_probe = self
                 .manager
@@ -237,7 +275,7 @@ impl RuntimeOptionCatalogService {
                 .await;
             let (model_response, session_config) = match session_probe {
                 Ok(probe) => {
-                    let has_configured_models = !configured_model_ids(profile).is_empty();
+                    let has_configured_models = !configured_model_ids(&profile).is_empty();
                     let response = if has_configured_models {
                         self.manager
                             .list_models(vibex_core::AgentModelListRequest {
@@ -246,15 +284,20 @@ impl RuntimeOptionCatalogService {
                                 session_id: None,
                             })
                             .await
-                            .unwrap_or_else(|_| configured_model_response(profile))
+                            .unwrap_or_else(|_| configured_model_response(&profile))
                     } else {
-                        probed_model_response(profile, &probe)
+                        probed_model_response(&profile, &probe)
                     };
                     (response, probe)
                 }
                 Err(error) => {
-                    self.record_snapshot_failure(profile, attempted_at_ms, &error.code)?;
-                    result.failed_profile_ids.push(profile.id.clone());
+                    if self.record_snapshot_failure_if_current(
+                        &profile,
+                        attempted_at_ms,
+                        &error.code,
+                    )? {
+                        result.failed_profile_ids.push(profile.id.clone());
+                    }
                     continue;
                 }
             };
@@ -267,8 +310,9 @@ impl RuntimeOptionCatalogService {
                 last_attempt_at_ms: attempted_at_ms,
                 last_error_code: None,
             };
-            self.persist_snapshot_success(&record)?;
-            result.refreshed_profile_ids.push(profile.id.clone());
+            if self.persist_snapshot_success_if_current(&profile, &record)? {
+                result.refreshed_profile_ids.push(profile.id.clone());
+            }
         }
         Ok(result)
     }
@@ -289,6 +333,7 @@ impl RuntimeOptionCatalogService {
             .collect())
     }
 
+    #[cfg(test)]
     fn persist_snapshot_success(
         &self,
         record: &ProviderRuntimeOptionSnapshotRecord,
@@ -298,21 +343,67 @@ impl RuntimeOptionCatalogService {
         ProviderRuntimeOptionSnapshotRepository::upsert_success(&connection, record)
     }
 
-    fn record_snapshot_failure(
+    fn persist_snapshot_success_if_current(
         &self,
-        profile: &ProviderProfile,
-        attempted_at_ms: i64,
-        error_code: &str,
-    ) -> Result<(), VibexError> {
+        expected: &ProviderProfile,
+        record: &ProviderRuntimeOptionSnapshotRecord,
+    ) -> Result<bool, VibexError> {
         let mut connection = open_database(self.provider_config.database_path())?;
         apply_migrations(&mut connection)?;
+        let transaction = connection.transaction().map_err(|error| {
+            VibexError::storage(
+                "runtime_option_snapshot_transaction_failed",
+                "failed to begin runtime option snapshot transaction",
+            )
+            .with_diagnostic("error", error.to_string())
+        })?;
+        if ProviderProfileRepository::get(&transaction, &expected.id)?.as_ref() != Some(expected) {
+            return Ok(false);
+        }
+        ProviderRuntimeOptionSnapshotRepository::upsert_success(&transaction, record)?;
+        transaction.commit().map_err(|error| {
+            VibexError::storage(
+                "runtime_option_snapshot_commit_failed",
+                "failed to commit runtime option snapshot",
+            )
+            .with_diagnostic("error", error.to_string())
+        })?;
+        Ok(true)
+    }
+
+    fn record_snapshot_failure_if_current(
+        &self,
+        expected: &ProviderProfile,
+        attempted_at_ms: i64,
+        error_code: &str,
+    ) -> Result<bool, VibexError> {
+        let mut connection = open_database(self.provider_config.database_path())?;
+        apply_migrations(&mut connection)?;
+        let transaction = connection.transaction().map_err(|error| {
+            VibexError::storage(
+                "runtime_option_snapshot_transaction_failed",
+                "failed to begin runtime option snapshot transaction",
+            )
+            .with_diagnostic("error", error.to_string())
+        })?;
+        if ProviderProfileRepository::get(&transaction, &expected.id)?.as_ref() != Some(expected) {
+            return Ok(false);
+        }
         ProviderRuntimeOptionSnapshotRepository::record_failure(
-            &connection,
-            &profile.id,
-            &profile.agent_id,
+            &transaction,
+            &expected.id,
+            &expected.agent_id,
             attempted_at_ms,
             error_code,
-        )
+        )?;
+        transaction.commit().map_err(|error| {
+            VibexError::storage(
+                "runtime_option_snapshot_commit_failed",
+                "failed to commit runtime option snapshot",
+            )
+            .with_diagnostic("error", error.to_string())
+        })?;
+        Ok(true)
     }
 }
 
@@ -649,6 +740,48 @@ mod tests {
                 .any(|effort| effort.value == "high")
         );
         assert!(configured.features.is_empty());
+    }
+
+    #[tokio::test]
+    async fn targeted_refresh_only_probes_and_invalidates_requested_profile() {
+        let (_directory, catalog, provider_config, agent_id) = catalog_fixture();
+        let first = create_profile(&provider_config, &agent_id, "First", Vec::new());
+        let second = create_profile(&provider_config, &agent_id, "Second", Vec::new());
+
+        let result = catalog.refresh_profile(&first.id).await.unwrap();
+
+        assert!(
+            result
+                .failed_profile_ids
+                .iter()
+                .any(|provider_profile_id| provider_profile_id == &first.id)
+        );
+        assert!(
+            result
+                .failed_profile_ids
+                .iter()
+                .all(|provider_profile_id| provider_profile_id != &second.id)
+        );
+        let summaries = catalog.snapshot_summaries().unwrap();
+        assert!(
+            summaries
+                .iter()
+                .any(|summary| summary.provider_profile_id == first.id)
+        );
+        assert!(
+            summaries
+                .iter()
+                .all(|summary| summary.provider_profile_id != second.id)
+        );
+
+        catalog.invalidate_profile_snapshot(&first.id).unwrap();
+        assert!(
+            catalog
+                .snapshot_summaries()
+                .unwrap()
+                .iter()
+                .all(|summary| summary.provider_profile_id != first.id)
+        );
     }
 
     #[tokio::test]

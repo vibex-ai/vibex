@@ -85,7 +85,7 @@ use vibex_desktop_model::{
 };
 use vibex_desktop_runtime::{
     DesktopEvent, DesktopRuntime, DesktopRuntimeConfig, DesktopRuntimeFacade, PREVIEW_APP_ID,
-    RC_APP_ID, STABLE_DESKTOP_APP_ID, validate_external_open_url,
+    ProviderConfigChangePhase, RC_APP_ID, STABLE_DESKTOP_APP_ID, validate_external_open_url,
 };
 use vibex_markdown::{
     MarkdownInput, MarkdownPresentation, MarkdownSurface, MarkdownView, ResolvedResource,
@@ -2698,6 +2698,72 @@ impl VibexWorkbench {
         ));
     }
 
+    fn load_agent_configured_catalog(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        self.agent_catalog_generation = self.agent_catalog_generation.wrapping_add(1);
+        let generation = self.agent_catalog_generation;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let agents = backend
+                .management()
+                .list_agents(AgentListRequest {
+                    include_disabled: false,
+                })
+                .await?
+                .agents;
+            let profiles = backend.management().list_profiles().await?;
+            Ok::<_, vibex_backend::BackendError>((agents, profiles))
+        });
+        self.agent_catalog_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    if this.agent_catalog_generation != generation {
+                        return;
+                    }
+                    match outcome {
+                        Ok(Ok((agents, profiles))) => {
+                            let preferred_new_session_agent =
+                                this.new_session_agent_id.clone().or_else(|| {
+                                    this.runtime_selection
+                                        .as_ref()
+                                        .map(|state| state.desired.agent_id.clone())
+                                });
+                            this.new_session_agent_id = default_new_session_agent_id(
+                                &agents,
+                                preferred_new_session_agent.as_ref(),
+                            );
+                            this.runtime_catalog = Some(build_runtime_option_catalog(
+                                &agents,
+                                &profiles,
+                                &BTreeMap::new(),
+                            ));
+                            this.runtime_provider_profiles = profiles;
+                            this.agent_snapshots = agents;
+                            if this.reconcile_new_session_runtime_selection()
+                                && this.new_session_open
+                            {
+                                this.refresh_active_suggestions(ComposerTarget::NewSession, cx);
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            this.runtime_note = Some(format!(
+                                "Configured runtime catalog unavailable ({}: {})",
+                                error.code, error.message
+                            ));
+                        }
+                        Err(error) => {
+                            this.runtime_note =
+                                Some(format!("configured runtime catalog task failed: {error}"));
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
     fn load_agent_overview(&mut self, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
             return;
@@ -2708,6 +2774,7 @@ impl VibexWorkbench {
             self.optimistic_session_deletion_reconciliation_pending;
         // A provider mutation makes every in-flight enriched catalog stale.
         self.agent_catalog_generation = self.agent_catalog_generation.wrapping_add(1);
+        let catalog_generation = self.agent_catalog_generation;
         let shared_agent = self
             .shared_workflow
             .as_ref()
@@ -2779,11 +2846,13 @@ impl VibexWorkbench {
                                 &agents,
                                 preferred_new_session_agent.as_ref(),
                             );
-                            this.runtime_catalog = Some(build_runtime_option_catalog(
-                                &agents,
-                                &profiles,
-                                &BTreeMap::new(),
-                            ));
+                            if this.agent_catalog_generation == catalog_generation {
+                                this.runtime_catalog = Some(build_runtime_option_catalog(
+                                    &agents,
+                                    &profiles,
+                                    &BTreeMap::new(),
+                                ));
+                            }
                             this.runtime_provider_profiles = profiles;
                             this.agent_snapshots = agents;
                             this.sessions = sessions;
@@ -2808,7 +2877,9 @@ impl VibexWorkbench {
                                 this.agent_loading = false;
                                 this.finish_startup_loading();
                             }
-                            this.load_agent_runtime_catalog(cx);
+                            if this.agent_catalog_generation == catalog_generation {
+                                this.load_agent_runtime_catalog(cx);
+                            }
                         }
                         Ok(Err(error)) => {
                             if this.sessions.is_empty() && this.timeline.session_id.is_none() {
@@ -4382,6 +4453,19 @@ impl VibexWorkbench {
                 } else {
                     false
                 }
+            }
+            DesktopEvent::ProviderConfigChanged(event) => {
+                self.management_view
+                    .update(cx, |management, cx| management.refresh(cx));
+                match event.phase {
+                    ProviderConfigChangePhase::ProfilesChanged => {
+                        self.load_agent_configured_catalog(cx)
+                    }
+                    ProviderConfigChangePhase::RuntimeOptionsChanged => {
+                        self.load_agent_runtime_catalog(cx)
+                    }
+                }
+                false
             }
             DesktopEvent::UsageInvalidated => {
                 let visible = self.ui_state.workbench.active_tab == "usage";
@@ -26990,6 +27074,33 @@ mod tests {
             1
         );
         assert!(overview.contains("self.agent_catalog_generation = self.agent_catalog_generation"));
+        assert!(overview.contains("catalog_generation"));
+    }
+
+    #[test]
+    fn provider_config_events_split_static_and_enriched_catalog_reload() {
+        let source = include_str!("app.rs");
+        let configured_catalog = source
+            .split_once("    fn load_agent_configured_catalog(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn load_agent_overview("))
+            .map(|(body, _)| body)
+            .expect("configured catalog loader should remain inspectable");
+        let handler = source
+            .split_once("    fn apply_desktop_event(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn rebuild_timeline_sizes("))
+            .map(|(body, _)| body)
+            .expect("desktop event handler should remain inspectable");
+
+        assert!(configured_catalog.contains(".list_agents(AgentListRequest"));
+        assert!(configured_catalog.contains(".list_profiles().await?"));
+        assert!(configured_catalog.contains("build_runtime_option_catalog("));
+        assert!(!configured_catalog.contains("list_sessions("));
+        assert!(!configured_catalog.contains("list_workspaces("));
+        assert!(handler.contains("DesktopEvent::ProviderConfigChanged(event)"));
+        assert!(handler.contains("ProviderConfigChangePhase::ProfilesChanged"));
+        assert!(handler.contains("self.load_agent_configured_catalog(cx)"));
+        assert!(handler.contains("ProviderConfigChangePhase::RuntimeOptionsChanged"));
+        assert!(handler.contains("self.load_agent_runtime_catalog(cx)"));
     }
 
     #[test]

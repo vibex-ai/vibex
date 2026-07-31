@@ -1,8 +1,23 @@
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use vibex_core::{
-    AgentSessionRuntimeSelectionEvent, RuntimeSessionEvent, TimelineLiveEvent, VibexSessionId,
+    AgentSessionRuntimeSelectionEvent, ProviderProfileId, RuntimeSessionEvent, TimelineLiveEvent,
+    VibexSessionId,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderConfigChangePhase {
+    ProfilesChanged,
+    RuntimeOptionsChanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderConfigChangedEvent {
+    pub provider_profile_ids: Vec<ProviderProfileId>,
+    pub phase: ProviderConfigChangePhase,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -54,6 +69,7 @@ pub enum DesktopEvent {
     Timeline(TimelineLiveEvent),
     Runtime(RuntimeSessionEvent),
     RuntimeSelection(AgentSessionRuntimeSelectionEvent),
+    ProviderConfigChanged(ProviderConfigChangedEvent),
     UsageInvalidated,
     Lagged {
         stream: DesktopEventStream,

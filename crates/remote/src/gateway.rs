@@ -439,6 +439,14 @@ impl RemoteGateway {
             .clone()
     }
 
+    pub fn publish_provider_invalidation(&self) -> VibexResult<()> {
+        self.inner.domain_events.publish(
+            "provider",
+            self.inner.session_epoch.load(Ordering::Acquire),
+            None,
+        )
+    }
+
     /// Replace the validated Gateway configuration while the listener is
     /// stopped.  A running epoch owns an immutable router snapshot; callers
     /// must stop/restart explicitly when they need a new listener config.
