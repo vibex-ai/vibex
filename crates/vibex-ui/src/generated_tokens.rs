@@ -33,7 +33,7 @@ pub const TOKEN_SCHEMA_VERSION: &str = "vibex-design-tokens.v1";
 pub const TOKEN_PRODUCT_VISUAL_SOURCE: &str = "apps/desktop";
 pub const TOKEN_SOURCE_PATH: &str = "crates/vibex-ui/theme/tokens.json";
 pub const TOKEN_SOURCE_SHA256: &str =
-    "16902bd71162bff4d7ec39d4812096ef66ea7948f3dfdfe8c262d09201df5292";
+    "14ec0caacf494a73e270d0b3dfc83126769bc85a7c9d41fd9b49b93b176d767f";
 pub const GPUI_REVISION: &str = "c9e8e611dbc279afa0914d28c4d37ad07f38c03b";
 pub const GPUI_COMPONENT_REVISION: &str = "031555662e99a1b5a549990b47f246d475b8288a";
 
@@ -244,6 +244,76 @@ pub const LIGHT_TOKENS: &[GpuiColorToken] = &[
         oklch: "0.448 0.119 151.328",
         hex: "#016630",
         rgb: 0x016630,
+        alpha: 1.0,
+    },
+    GpuiColorToken {
+        name: "chart-category-1",
+        oklch: "0.62 0.205 255",
+        hex: "#0083fd",
+        rgb: 0x0083fd,
+        alpha: 1.0,
+    },
+    GpuiColorToken {
+        name: "chart-category-2",
+        oklch: "0.68 0.17 215",
+        hex: "#00b0d9",
+        rgb: 0x00b0d9,
+        alpha: 1.0,
+    },
+    GpuiColorToken {
+        name: "chart-category-3",
+        oklch: "0.67 0.18 160",
+        hex: "#00b56d",
+        rgb: 0x00b56d,
+        alpha: 1.0,
+    },
+    GpuiColorToken {
+        name: "chart-category-4",
+        oklch: "0.78 0.17 88",
+        hex: "#e4af00",
+        rgb: 0xe4af00,
+        alpha: 1.0,
+    },
+    GpuiColorToken {
+        name: "chart-category-5",
+        oklch: "0.72 0.19 58",
+        hex: "#f97f00",
+        rgb: 0xf97f00,
+        alpha: 1.0,
+    },
+    GpuiColorToken {
+        name: "chart-category-6",
+        oklch: "0.65 0.22 28",
+        hex: "#f94239",
+        rgb: 0xf94239,
+        alpha: 1.0,
+    },
+    GpuiColorToken {
+        name: "chart-category-7",
+        oklch: "0.69 0.19 350",
+        hex: "#ed60ac",
+        rgb: 0xed60ac,
+        alpha: 1.0,
+    },
+    GpuiColorToken {
+        name: "chart-category-8",
+        oklch: "0.64 0.2 320",
+        hex: "#bf5ad6",
+        rgb: 0xbf5ad6,
+        alpha: 1.0,
+    },
+    GpuiColorToken {
+        name: "chart-category-9",
+        oklch: "0.62 0.19 285",
+        hex: "#7e6ef2",
+        rgb: 0x7e6ef2,
+        alpha: 1.0,
+    },
+    GpuiColorToken {
+        name: "chart-category-10",
+        oklch: "0.59 0.08 240",
+        hex: "#4e84a8",
+        rgb: 0x4e84a8,
         alpha: 1.0,
     },
     GpuiColorToken {
@@ -632,6 +702,76 @@ pub const DARK_TOKENS: &[GpuiColorToken] = &[
         oklch: "0.448 0.119 151.328",
         hex: "#016630",
         rgb: 0x016630,
+        alpha: 1.0,
+    },
+    GpuiColorToken {
+        name: "chart-category-1",
+        oklch: "0.72 0.18 255",
+        hex: "#4ca5ff",
+        rgb: 0x4ca5ff,
+        alpha: 1.0,
+    },
+    GpuiColorToken {
+        name: "chart-category-2",
+        oklch: "0.76 0.15 215",
+        hex: "#00c8ec",
+        rgb: 0x00c8ec,
+        alpha: 1.0,
+    },
+    GpuiColorToken {
+        name: "chart-category-3",
+        oklch: "0.75 0.17 160",
+        hex: "#00ce88",
+        rgb: 0x00ce88,
+        alpha: 1.0,
+    },
+    GpuiColorToken {
+        name: "chart-category-4",
+        oklch: "0.82 0.16 88",
+        hex: "#efbd24",
+        rgb: 0xefbd24,
+        alpha: 1.0,
+    },
+    GpuiColorToken {
+        name: "chart-category-5",
+        oklch: "0.78 0.18 58",
+        hex: "#ff951c",
+        rgb: 0xff951c,
+        alpha: 1.0,
+    },
+    GpuiColorToken {
+        name: "chart-category-6",
+        oklch: "0.73 0.2 28",
+        hex: "#ff6a5c",
+        rgb: 0xff6a5c,
+        alpha: 1.0,
+    },
+    GpuiColorToken {
+        name: "chart-category-7",
+        oklch: "0.76 0.18 350",
+        hex: "#ff7bc1",
+        rgb: 0xff7bc1,
+        alpha: 1.0,
+    },
+    GpuiColorToken {
+        name: "chart-category-8",
+        oklch: "0.72 0.18 320",
+        hex: "#d57ae9",
+        rgb: 0xd57ae9,
+        alpha: 1.0,
+    },
+    GpuiColorToken {
+        name: "chart-category-9",
+        oklch: "0.71 0.17 285",
+        hex: "#998fff",
+        rgb: 0x998fff,
+        alpha: 1.0,
+    },
+    GpuiColorToken {
+        name: "chart-category-10",
+        oklch: "0.7 0.08 240",
+        hex: "#6fa5cb",
+        rgb: 0x6fa5cb,
         alpha: 1.0,
     },
     GpuiColorToken {

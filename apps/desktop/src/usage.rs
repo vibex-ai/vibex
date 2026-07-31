@@ -1,11 +1,15 @@
+use std::collections::{BTreeMap, BTreeSet};
+
+use chrono::{Datelike as _, NaiveDate};
 use gpui::{
-    AnyElement, Context, InteractiveElement as _, IntoElement, Render, SharedString, Styled as _,
-    Task, Window, div, prelude::*, px,
+    AnyElement, BorderStyle, Bounds, Context, Edges, Hsla, InteractiveElement as _, IntoElement,
+    Render, ScrollHandle, ScrollWheelEvent, SharedString, Styled as _, Task, Window, canvas, div,
+    point, prelude::*, px, quad, transparent_black,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
     StyledExt as _,
-    button::{Button, ButtonVariants as _},
+    button::{Button, ButtonGroup, ButtonVariants as _},
     h_flex,
     menu::{DropdownMenu as _, PopupMenuItem},
     scroll::ScrollableElement as _,
@@ -14,18 +18,25 @@ use gpui_component::{
 };
 use vibex_backend::BackendFacade;
 use vibex_core::{
-    AgentId, AgentUsageAggregate, AgentUsageDimension, AgentUsageDimensionRow,
-    AgentUsageFilterOption, AgentUsageMetricCoverage, AgentUsageMetricValue, AgentUsageRange,
-    AgentUsageSortDirection, AgentUsageSortMetric, AgentUsageStatistics,
-    AgentUsageStatisticsRequest, AgentUsageTrendMetric, ProjectId, ProviderProfileId,
-    VibexSessionId,
+    AgentId, AgentUsageAggregate, AgentUsageAnnualProjection, AgentUsageDailyModelUsage,
+    AgentUsageDimension, AgentUsageDimensionRow, AgentUsageFilterOption, AgentUsageMetricCoverage,
+    AgentUsageMetricValue, AgentUsageRange, AgentUsageSortDirection, AgentUsageSortMetric,
+    AgentUsageStatistics, AgentUsageStatisticsRequest, AgentUsageTrendMetric, ProjectId,
+    ProviderProfileId, VibexSessionId,
 };
 
-use crate::locale;
+use crate::{gpui_ext::button_with_aria_label, locale, theme};
 
 const USAGE_HEADER_HEIGHT: f32 = 48.0;
 const USAGE_CHART_HEIGHT: f32 = 176.0;
+const USAGE_CHART_AXIS_WIDTH: f32 = 48.0;
+const USAGE_HEATMAP_CELL_SIZE: f32 = 12.0;
+const USAGE_HEATMAP_GAP: f32 = 3.0;
+const USAGE_HEATMAP_MIN_WIDTH: f32 = 840.0;
+const USAGE_MODEL_CHART_MIN_WIDTH: f32 = 720.0;
 const USAGE_TABLE_MIN_WIDTH: f32 = 1040.0;
+const USAGE_MODEL_LIMIT: usize = 10;
+const USAGE_OTHER_MODEL_ID: &str = "__vibex_other_models__";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UsageFilterKind {
@@ -44,6 +55,32 @@ enum UsageContentState {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsageTrendView {
+    Bars,
+    Heatmap,
+    Models,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsageModelMetric {
+    Requests,
+    TotalTokens,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UsageTrendSeries {
+    metric: AgentUsageTrendMetric,
+    label: &'static str,
+    color: Hsla,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UsageHeatmapEntry {
+    label: String,
+    value: Option<u64>,
+}
+
 pub struct UsageView {
     backend: Option<BackendFacade>,
     request: AgentUsageStatisticsRequest,
@@ -51,6 +88,10 @@ pub struct UsageView {
     loading: bool,
     stale: bool,
     error: Option<(String, String)>,
+    trend_view: UsageTrendView,
+    enabled_trend_metrics: Vec<AgentUsageTrendMetric>,
+    model_metric: UsageModelMetric,
+    table_scroll: ScrollHandle,
     generation: u64,
     refresh_task: Option<Task<()>>,
 }
@@ -70,6 +111,14 @@ impl UsageView {
             loading: false,
             stale: false,
             error: None,
+            trend_view: UsageTrendView::Bars,
+            enabled_trend_metrics: vec![
+                AgentUsageTrendMetric::InputTokens,
+                AgentUsageTrendMetric::OutputTokens,
+                AgentUsageTrendMetric::CachedTokens,
+            ],
+            model_metric: UsageModelMetric::TotalTokens,
+            table_scroll: ScrollHandle::new(),
             generation: 0,
             refresh_task: None,
         }
@@ -172,10 +221,33 @@ impl UsageView {
         }
     }
 
-    fn choose_trend(&mut self, metric: AgentUsageTrendMetric, cx: &mut Context<Self>) {
-        if self.request.trend_metric != metric {
-            self.request.trend_metric = metric;
-            self.refresh(cx);
+    fn choose_trend_view(&mut self, view: UsageTrendView, cx: &mut Context<Self>) {
+        if self.trend_view != view {
+            self.trend_view = view;
+            cx.notify();
+        }
+    }
+
+    fn toggle_trend_metric(&mut self, metric: AgentUsageTrendMetric, cx: &mut Context<Self>) {
+        if metric == AgentUsageTrendMetric::TotalTokens {
+            if self.enabled_trend_metrics.contains(&metric) {
+                self.enabled_trend_metrics.clear();
+            } else {
+                self.enabled_trend_metrics.clear();
+                self.enabled_trend_metrics.push(metric);
+            }
+        } else {
+            self.enabled_trend_metrics
+                .retain(|current| *current != AgentUsageTrendMetric::TotalTokens);
+            toggle_typed(&mut self.enabled_trend_metrics, metric);
+        }
+        cx.notify();
+    }
+
+    fn choose_model_metric(&mut self, metric: UsageModelMetric, cx: &mut Context<Self>) {
+        if self.model_metric != metric {
+            self.model_metric = metric;
+            cx.notify();
         }
     }
 
@@ -342,19 +414,6 @@ impl UsageView {
             )
             .child(
                 self.render_filter_button(
-                    UsageFilterKind::Project,
-                    locale::text("Project", "项目", "專案"),
-                    options.projects,
-                    self.request
-                        .project_ids
-                        .iter()
-                        .map(|id| id.as_str().to_string())
-                        .collect(),
-                    cx,
-                ),
-            )
-            .child(
-                self.render_filter_button(
                     UsageFilterKind::ProviderProfile,
                     locale::text("Model provider", "模型供应商", "模型供應商"),
                     options.provider_profiles,
@@ -373,6 +432,19 @@ impl UsageView {
                 self.request.model_ids.clone(),
                 cx,
             ))
+            .child(
+                self.render_filter_button(
+                    UsageFilterKind::Project,
+                    locale::text("Project", "项目", "專案"),
+                    options.projects,
+                    self.request
+                        .project_ids
+                        .iter()
+                        .map(|id| id.as_str().to_string())
+                        .collect(),
+                    cx,
+                ),
+            )
             .child(
                 self.render_filter_button(
                     UsageFilterKind::Session,
@@ -460,54 +532,49 @@ impl UsageView {
             .grid()
             .grid_cols(columns)
             .w_full()
-            .border_1()
-            .border_color(cx.theme().border)
-            .rounded(px(6.0))
-            .overflow_hidden()
+            .gap_2()
             .children([
-                summary_metric(
-                    "requests",
-                    locale::text("Requests", "请求数", "請求數"),
-                    format_compact_number(aggregate.requests),
-                    format_full_number(aggregate.requests),
-                    locale::text(
-                        "Dispatched prompt executions",
-                        "实际发送的 prompt 执行数",
-                        "實際傳送的 prompt 執行數",
-                    ),
-                    false,
-                    cx,
-                ),
                 summary_metric_value(
                     "total",
                     locale::text("Total tokens", "总 Token", "總 Token"),
+                    IconName::Cpu,
                     &aggregate.total_tokens,
+                    cx,
+                ),
+                summary_metric(
+                    "requests",
+                    locale::text("Requests", "请求数", "請求數"),
+                    IconName::Inbox,
+                    format_compact_number(aggregate.requests),
+                    false,
                     cx,
                 ),
                 summary_metric_value(
                     "input",
                     locale::text("Input", "输入", "輸入"),
+                    IconName::ArrowDown,
                     &aggregate.input_tokens,
                     cx,
                 ),
                 summary_metric_value(
                     "output",
                     locale::text("Output", "输出", "輸出"),
+                    IconName::ArrowUp,
                     &aggregate.output_tokens,
                     cx,
                 ),
                 summary_metric_value(
                     "cached",
                     locale::text("Cached read", "缓存读取", "快取讀取"),
+                    IconName::HardDrive,
                     &aggregate.cached_tokens,
                     cx,
                 ),
                 summary_metric(
                     "cache-hit",
                     locale::text("Cache hit rate", "缓存命中率", "快取命中率"),
+                    IconName::ChartPie,
                     format_basis_points(aggregate.cache_hit_rate.basis_points),
-                    format_basis_points(aggregate.cache_hit_rate.basis_points),
-                    cache_hit_detail(&aggregate.cache_hit_rate),
                     aggregate.cache_hit_rate.basis_points.is_none(),
                     cx,
                 ),
@@ -520,89 +587,21 @@ impl UsageView {
         statistics: &AgentUsageStatistics,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let metrics = [
-            (
-                AgentUsageTrendMetric::Requests,
-                locale::text("Requests", "请求", "請求"),
-            ),
-            (
-                AgentUsageTrendMetric::TotalTokens,
-                locale::text("Total", "总量", "總量"),
-            ),
-            (
-                AgentUsageTrendMetric::InputTokens,
-                locale::text("Input", "输入", "輸入"),
-            ),
-            (
-                AgentUsageTrendMetric::OutputTokens,
-                locale::text("Output", "输出", "輸出"),
-            ),
-            (
-                AgentUsageTrendMetric::CachedTokens,
-                locale::text("Cache", "缓存", "快取"),
-            ),
-        ];
-        let selected = self.request.trend_metric;
-        let mut controls = h_flex().flex_wrap().gap_1();
-        for (metric, label) in metrics {
-            controls = controls.child(
-                Button::new(SharedString::from(format!("usage-trend-{metric:?}")))
-                    .xsmall()
-                    .ghost()
-                    .h(px(28.0))
-                    .selected(metric == selected)
-                    .label(label)
-                    .on_click(cx.listener(move |this, _, _, cx| this.choose_trend(metric, cx))),
-            );
-        }
-        let values = statistics
-            .trend_buckets
-            .iter()
-            .map(|bucket| trend_value(&bucket.aggregate, selected))
-            .collect::<Vec<_>>();
-        let maximum = values.iter().flatten().copied().max().unwrap_or(0);
-        let has_values = values.iter().flatten().any(|value| *value > 0);
-        let bucket_count = statistics.trend_buckets.len();
-        let mut bars = h_flex()
-            .h(px(USAGE_CHART_HEIGHT - 34.0))
-            .w_full()
-            .items_end()
-            .gap(px(if bucket_count > 20 { 3.0 } else { 8.0 }));
-        for (index, bucket) in statistics.trend_buckets.iter().enumerate() {
-            let value = values[index];
-            let height = match (value, maximum) {
-                (Some(value), maximum) if maximum > 0 => {
-                    5.0 + (value as f64 / maximum as f64 * 104.0) as f32
-                }
-                (Some(_), _) => 3.0,
-                (None, _) => 0.0,
-            };
-            let tooltip = format!(
-                "{}: {}",
-                bucket.label,
-                value
-                    .map(format_full_number)
-                    .unwrap_or_else(|| { locale::text("Unknown", "未知", "未知").to_string() })
-            );
-            bars =
-                bars.child(
-                    div()
-                        .id(SharedString::from(format!("usage-trend-bar-{index}")))
-                        .h_full()
-                        .min_w(px(2.0))
-                        .flex_1()
-                        .flex()
-                        .items_end()
-                        .child(div().w_full().h(px(height)).rounded_t(px(2.0)).bg(
-                            if value.is_some() {
-                                cx.theme().primary.opacity(0.72)
-                            } else {
-                                cx.theme().muted.opacity(0.35)
-                            },
-                        ))
-                        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx)),
-                );
-        }
+        let trend_view = self.trend_view;
+        let chart = match trend_view {
+            UsageTrendView::Bars => {
+                render_stacked_trend(statistics, self.enabled_trend_metrics.as_slice(), cx)
+            }
+            UsageTrendView::Heatmap => render_usage_heatmap(statistics.annual.as_ref(), cx),
+            UsageTrendView::Models => {
+                render_model_usage(statistics.annual.as_ref(), self.model_metric, cx)
+            }
+        };
+        let trailing_control = match trend_view {
+            UsageTrendView::Bars => Some(self.render_trend_legend(cx)),
+            UsageTrendView::Models => Some(self.render_model_metric_control(cx)),
+            UsageTrendView::Heatmap => None,
+        };
         v_flex()
             .w_full()
             .gap_3()
@@ -617,40 +616,104 @@ impl UsageView {
                     .items_center()
                     .justify_between()
                     .gap_2()
-                    .child(div().text_sm().font_semibold().child(locale::text(
-                        "Usage trend",
-                        "用量趋势",
-                        "用量趨勢",
-                    )))
-                    .child(controls),
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(div().text_sm().font_semibold().child(locale::text(
+                                "Usage trend",
+                                "用量趋势",
+                                "用量趨勢",
+                            )))
+                            .child(
+                                ButtonGroup::new("usage-trend-view-toggle")
+                                    .xsmall()
+                                    .outline()
+                                    .compact()
+                                    .child(
+                                        Button::new("usage-trend-view-bars")
+                                            .icon(IconName::ChartPie)
+                                            .label(locale::text("Trend", "趋势", "趨勢"))
+                                            .selected(trend_view == UsageTrendView::Bars),
+                                    )
+                                    .child(
+                                        Button::new("usage-trend-view-heatmap")
+                                            .icon(IconName::LayoutDashboard)
+                                            .label(locale::text("Heatmap", "热力", "熱力"))
+                                            .selected(trend_view == UsageTrendView::Heatmap),
+                                    )
+                                    .child(
+                                        Button::new("usage-trend-view-models")
+                                            .icon(IconName::ChartPie)
+                                            .label(locale::text("Models", "模型", "模型"))
+                                            .selected(trend_view == UsageTrendView::Models),
+                                    )
+                                    .on_click(cx.listener(|this, selected: &Vec<usize>, _, cx| {
+                                        if selected.contains(&0) {
+                                            this.choose_trend_view(UsageTrendView::Bars, cx);
+                                        } else if selected.contains(&1) {
+                                            this.choose_trend_view(UsageTrendView::Heatmap, cx);
+                                        } else if selected.contains(&2) {
+                                            this.choose_trend_view(UsageTrendView::Models, cx);
+                                        }
+                                    })),
+                            ),
+                    )
+                    .children(trailing_control),
+            )
+            .child(chart)
+            .into_any_element()
+    }
+
+    fn render_trend_legend(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let mut legend = h_flex().flex_wrap().items_center().justify_end().gap_1();
+        for series in usage_trend_series(cx) {
+            let active = self.enabled_trend_metrics.contains(&series.metric);
+            let metric = series.metric;
+            let label = series.label;
+            let button = Button::new(SharedString::from(format!(
+                "usage-trend-series-{:?}",
+                series.metric
+            )))
+            .xsmall()
+            .ghost()
+            .compact()
+            .selected(active)
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .child(div().size(px(7.0)).rounded_full().bg(series.color))
+                    .child(label),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_trend_metric(metric, cx)));
+            legend = legend.child(button_with_aria_label(button, label));
+        }
+        legend.into_any_element()
+    }
+
+    fn render_model_metric_control(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        ButtonGroup::new("usage-model-metric")
+            .xsmall()
+            .outline()
+            .compact()
+            .child(
+                Button::new("usage-model-metric-requests")
+                    .label(locale::text("Requests", "请求数", "請求數"))
+                    .selected(self.model_metric == UsageModelMetric::Requests),
             )
             .child(
-                div()
-                    .relative()
-                    .h(px(USAGE_CHART_HEIGHT))
-                    .w_full()
-                    .border_b_1()
-                    .border_color(cx.theme().border.opacity(0.55))
-                    .child(bars)
-                    .when(!has_values, |this| {
-                        this.child(
-                            div()
-                                .absolute()
-                                .inset_0()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(locale::text(
-                                    "No reported values in this range",
-                                    "此范围内没有已上报数值",
-                                    "此範圍內沒有已回報數值",
-                                )),
-                        )
-                    }),
+                Button::new("usage-model-metric-tokens")
+                    .label(locale::text("Total tokens", "总 Token", "總 Token"))
+                    .selected(self.model_metric == UsageModelMetric::TotalTokens),
             )
-            .child(render_trend_labels(statistics, cx))
+            .on_click(cx.listener(|this, selected: &Vec<usize>, _, cx| {
+                if selected.contains(&0) {
+                    this.choose_model_metric(UsageModelMetric::Requests, cx);
+                } else if selected.contains(&1) {
+                    this.choose_model_metric(UsageModelMetric::TotalTokens, cx);
+                }
+            }))
             .into_any_element()
     }
 
@@ -790,12 +853,29 @@ impl UsageView {
                 body = body.child(render_table_row(index, row, cx));
             }
         }
+        let wheel_scroll = self.table_scroll.clone();
         div()
             .id("usage-table-scroll")
             .w_full()
-            .max_h(px(420.0))
             .overflow_x_scroll()
-            .overflow_y_scrollbar()
+            .track_scroll(&self.table_scroll)
+            .on_scroll_wheel(cx.listener(move |_, event: &ScrollWheelEvent, window, cx| {
+                let max_x = wheel_scroll.max_offset().x;
+                if max_x <= px(0.0) {
+                    return;
+                }
+                let delta = event.delta.pixel_delta(window.line_height());
+                if delta.y.abs() > delta.x.abs() {
+                    let offset = wheel_scroll.offset();
+                    // GPUI applies delta.x before bubble listeners run.
+                    let next_x = (offset.x - delta.x + delta.y).clamp(-max_x, px(0.0));
+                    if next_x != offset.x {
+                        wheel_scroll.set_offset(point(next_x, offset.y));
+                        cx.notify();
+                    }
+                }
+                cx.stop_propagation();
+            }))
             .border_1()
             .border_color(cx.theme().border)
             .rounded(px(6.0))
@@ -881,39 +961,9 @@ impl UsageView {
                     .into_any_element(),
             );
         }
-        let statistics = self.statistics.as_ref()?;
-        let coverage = &statistics.totals.coverage;
-        let incomplete = coverage
-            .partial_requests
-            .saturating_add(coverage.baseline_only_requests)
-            .saturating_add(coverage.unreported_requests)
-            .saturating_add(coverage.unsupported_requests);
-        if incomplete == 0 && !self.stale {
+        if !self.stale || self.statistics.is_none() {
             return None;
         }
-        let text = if self.stale {
-            locale::text(
-                "Refreshing after new usage was committed",
-                "新用量已提交，正在刷新",
-                "新用量已提交，正在重新整理",
-            )
-            .to_string()
-        } else {
-            match locale::current_locale() {
-                locale::ResolvedLocale::En => format!(
-                    "Partial reporting for {incomplete} of {} requests",
-                    coverage.total_requests
-                ),
-                locale::ResolvedLocale::ZhCn => format!(
-                    "{} 个请求中有 {incomplete} 个上报不完整",
-                    coverage.total_requests
-                ),
-                locale::ResolvedLocale::ZhTw => format!(
-                    "{} 個請求中有 {incomplete} 個回報不完整",
-                    coverage.total_requests
-                ),
-            }
-        };
         Some(
             h_flex()
                 .w_full()
@@ -925,7 +975,11 @@ impl UsageView {
                 .px_3()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
-                .child(text)
+                .child(locale::text(
+                    "Refreshing after new usage was committed",
+                    "新用量已提交，正在刷新",
+                    "新用量已提交，正在重新整理",
+                ))
                 .into_any_element(),
         )
     }
@@ -1037,6 +1091,7 @@ fn toggle_typed<T: PartialEq>(values: &mut Vec<T>, value: T) {
 fn summary_metric_value(
     id: &'static str,
     label: &'static str,
+    icon: IconName,
     metric: &AgentUsageMetricValue,
     cx: &mut Context<UsageView>,
 ) -> AnyElement {
@@ -1044,48 +1099,41 @@ fn summary_metric_value(
         .value
         .map(format_compact_number)
         .unwrap_or_else(|| locale::text("Unknown", "未知", "未知").to_string());
-    let full_value = metric
-        .value
-        .map(format_full_number)
-        .unwrap_or_else(|| locale::text("Unknown", "未知", "未知").to_string());
-    summary_metric(
-        id,
-        label,
-        display_value,
-        full_value,
-        metric_detail(metric),
-        metric.value.is_none(),
-        cx,
-    )
+    summary_metric(id, label, icon, display_value, metric.value.is_none(), cx)
 }
 
 fn summary_metric(
     id: &'static str,
     label: &'static str,
+    icon: IconName,
     value: String,
-    full_value: String,
-    detail: impl Into<String>,
     unknown: bool,
     cx: &mut Context<UsageView>,
 ) -> AnyElement {
-    let detail = detail.into();
-    let tooltip = format!("{label}: {full_value}. {detail}");
     v_flex()
         .id(SharedString::from(format!("usage-summary-{id}")))
         .min_w_0()
-        .h(px(84.0))
+        .h(px(72.0))
         .justify_center()
         .gap_1()
-        .border_r_1()
-        .border_b_1()
-        .border_color(cx.theme().border.opacity(0.65))
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(cx.theme().border.opacity(0.78))
+        .bg(theme::semantic_color("card", cx.theme().is_dark()))
         .px_3()
         .child(
-            div()
-                .truncate()
+            h_flex()
+                .min_w_0()
+                .items_center()
+                .gap_1()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
-                .child(label),
+                .child(
+                    Icon::new(icon)
+                        .size(px(13.0))
+                        .text_color(cx.theme().primary.opacity(0.82)),
+                )
+                .child(div().min_w_0().truncate().child(label)),
         )
         .child(
             div()
@@ -1095,14 +1143,6 @@ fn summary_metric(
                 .when(unknown, |this| this.text_color(cx.theme().muted_foreground))
                 .child(value),
         )
-        .child(
-            div()
-                .truncate()
-                .text_size(px(11.0))
-                .text_color(cx.theme().muted_foreground.opacity(0.82))
-                .child(detail),
-        )
-        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
         .into_any_element()
 }
 
@@ -1122,11 +1162,339 @@ fn metric_coverage_label(coverage: AgentUsageMetricCoverage) -> &'static str {
 fn trend_value(aggregate: &AgentUsageAggregate, metric: AgentUsageTrendMetric) -> Option<u64> {
     match metric {
         AgentUsageTrendMetric::Requests => Some(aggregate.requests),
-        AgentUsageTrendMetric::TotalTokens => aggregate.total_tokens.value,
-        AgentUsageTrendMetric::InputTokens => aggregate.input_tokens.value,
-        AgentUsageTrendMetric::OutputTokens => aggregate.output_tokens.value,
-        AgentUsageTrendMetric::CachedTokens => aggregate.cached_tokens.value,
+        AgentUsageTrendMetric::TotalTokens => {
+            token_trend_value(aggregate.requests, aggregate.total_tokens.value)
+        }
+        AgentUsageTrendMetric::InputTokens => {
+            token_trend_value(aggregate.requests, aggregate.input_tokens.value)
+        }
+        AgentUsageTrendMetric::OutputTokens => {
+            token_trend_value(aggregate.requests, aggregate.output_tokens.value)
+        }
+        AgentUsageTrendMetric::CachedTokens => {
+            token_trend_value(aggregate.requests, aggregate.cached_tokens.value)
+        }
     }
+}
+
+fn token_trend_value(requests: u64, value: Option<u64>) -> Option<u64> {
+    if requests == 0 { Some(0) } else { value }
+}
+
+fn usage_trend_series(cx: &Context<UsageView>) -> [UsageTrendSeries; 4] {
+    let is_dark = cx.theme().is_dark();
+    [
+        UsageTrendSeries {
+            metric: AgentUsageTrendMetric::TotalTokens,
+            label: locale::text("Total", "总量", "總量"),
+            color: theme::semantic_color("chart-2", is_dark),
+        },
+        UsageTrendSeries {
+            metric: AgentUsageTrendMetric::InputTokens,
+            label: locale::text("Input", "输入", "輸入"),
+            color: theme::semantic_color("chart-3", is_dark),
+        },
+        UsageTrendSeries {
+            metric: AgentUsageTrendMetric::OutputTokens,
+            label: locale::text("Output", "输出", "輸出"),
+            color: theme::semantic_color("chart-4", is_dark),
+        },
+        UsageTrendSeries {
+            metric: AgentUsageTrendMetric::CachedTokens,
+            label: locale::text("Cache", "缓存", "快取"),
+            color: theme::semantic_color("chart-5", is_dark),
+        },
+    ]
+}
+
+fn nice_axis_upper(value: u64, minimum: u64) -> u64 {
+    if value == 0 {
+        return minimum;
+    }
+    let raw_step = value as f64 / 4.0;
+    let magnitude = 10_f64.powf(raw_step.log10().floor());
+    let normalized = raw_step / magnitude;
+    let nice = if normalized <= 1.0 {
+        1.0
+    } else if normalized <= 2.0 {
+        2.0
+    } else if normalized <= 2.5 {
+        2.5
+    } else if normalized <= 5.0 {
+        5.0
+    } else {
+        10.0
+    };
+    ((nice * magnitude * 4.0).ceil() as u64).max(minimum)
+}
+
+fn axis_ticks(maximum: u64) -> [u64; 5] {
+    let step = maximum / 4;
+    [
+        maximum,
+        step.saturating_mul(3),
+        step.saturating_mul(2),
+        step,
+        0,
+    ]
+}
+
+fn format_token_axis_k(value: u64) -> String {
+    if value.is_multiple_of(1_000) {
+        format!("{}K", value / 1_000)
+    } else {
+        let formatted = format!("{:.2}", value as f64 / 1_000.0);
+        format!("{}K", formatted.trim_end_matches('0').trim_end_matches('.'))
+    }
+}
+
+fn render_trend_axis(maximum: u64, width: f32, cx: &mut Context<UsageView>) -> AnyElement {
+    let mut axis = v_flex()
+        .h(px(USAGE_CHART_HEIGHT))
+        .w(px(width))
+        .flex_none()
+        .justify_between()
+        .text_size(px(10.0))
+        .text_color(cx.theme().muted_foreground);
+    for tick in axis_ticks(maximum) {
+        axis = axis.child(
+            div()
+                .w_full()
+                .pr_2()
+                .text_right()
+                .child(format_token_axis_k(tick)),
+        );
+    }
+    axis.into_any_element()
+}
+
+fn stacked_bucket_total(aggregate: &AgentUsageAggregate, metrics: &[AgentUsageTrendMetric]) -> u64 {
+    metrics.iter().fold(0_u64, |total, metric| {
+        total.saturating_add(trend_value(aggregate, *metric).unwrap_or(0))
+    })
+}
+
+fn paint_chart_rect(
+    window: &mut Window,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    color: Hsla,
+) {
+    window.paint_quad(quad(
+        Bounds::from_corners(point(px(left), px(top)), point(px(right), px(bottom))),
+        px(1.0),
+        color,
+        Edges::default(),
+        transparent_black(),
+        BorderStyle::default(),
+    ));
+}
+
+fn render_stacked_trend(
+    statistics: &AgentUsageStatistics,
+    enabled_metrics: &[AgentUsageTrendMetric],
+    cx: &mut Context<UsageView>,
+) -> AnyElement {
+    let bar_data = usage_trend_series(cx)
+        .into_iter()
+        .filter(|series| enabled_metrics.contains(&series.metric))
+        .map(|series| {
+            (
+                series.color,
+                statistics
+                    .trend_buckets
+                    .iter()
+                    .map(|bucket| trend_value(&bucket.aggregate, series.metric))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let stack_maximum = statistics
+        .trend_buckets
+        .iter()
+        .map(|bucket| stacked_bucket_total(&bucket.aggregate, enabled_metrics))
+        .max()
+        .unwrap_or(0);
+    let token_axis_maximum = nice_axis_upper(stack_maximum, 1_000);
+    let has_values = bar_data
+        .iter()
+        .flat_map(|(_, values)| values.iter().flatten())
+        .any(|value| *value > 0);
+    let has_metrics = !bar_data.is_empty();
+    let bucket_count = statistics.trend_buckets.len();
+
+    let mut grid = v_flex().absolute().inset_0().justify_between();
+    for _ in 0..5 {
+        grid = grid.child(
+            div()
+                .w_full()
+                .border_t_1()
+                .border_color(cx.theme().border.opacity(0.42)),
+        );
+    }
+    let mut hitboxes = h_flex().absolute().inset_0();
+    for (index, bucket) in statistics.trend_buckets.iter().enumerate() {
+        let tooltip_title = bucket.label.clone();
+        let tooltip_rows = trend_bucket_tooltip_rows(&bucket.aggregate, enabled_metrics);
+        hitboxes = hitboxes.child(
+            div()
+                .id(SharedString::from(format!("usage-trend-bucket-{index}")))
+                .h_full()
+                .min_w(px(2.0))
+                .flex_1()
+                .tooltip(move |window, cx| {
+                    let title = tooltip_title.clone();
+                    let rows = tooltip_rows.clone();
+                    Tooltip::element(move |_, cx| {
+                        let mut content = v_flex()
+                            .min_w(px(190.0))
+                            .gap_1()
+                            .text_xs()
+                            .child(div().font_medium().child(title.clone()));
+                        for (label, value) in rows.iter() {
+                            content = content.child(
+                                h_flex()
+                                    .w_full()
+                                    .justify_between()
+                                    .gap_4()
+                                    .child(
+                                        div()
+                                            .text_color(cx.theme().popover_foreground.opacity(0.72))
+                                            .child(*label),
+                                    )
+                                    .child(div().font_medium().child(value.clone())),
+                            );
+                        }
+                        content
+                    })
+                    .build(window, cx)
+                }),
+        );
+    }
+    let plot = div()
+        .relative()
+        .h(px(USAGE_CHART_HEIGHT))
+        .min_w_0()
+        .flex_1()
+        .overflow_hidden()
+        .border_b_1()
+        .border_color(cx.theme().border.opacity(0.55))
+        .child(grid)
+        .child(
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, window, _| {
+                    let width = f32::from(bounds.size.width).max(1.0);
+                    let height = f32::from(bounds.size.height).max(1.0);
+                    let bucket_count = bucket_count.max(1);
+                    let bucket_width = width / bucket_count as f32;
+                    let bar_width = (bucket_width * 0.64).clamp(2.0, 32.0);
+                    let origin_x = f32::from(bounds.origin.x);
+                    let origin_y = f32::from(bounds.origin.y);
+                    for index in 0..bucket_count {
+                        let center = origin_x + bucket_width * (index as f32 + 0.5);
+                        let mut bottom = origin_y + height - 2.0;
+                        for (color, values) in &bar_data {
+                            let Some(value) = values.get(index).copied().flatten() else {
+                                continue;
+                            };
+                            if value == 0 {
+                                continue;
+                            }
+                            let segment_height = (value.min(token_axis_maximum) as f64
+                                / token_axis_maximum.max(1) as f64
+                                * f64::from((height - 4.0).max(1.0)))
+                                as f32;
+                            let top = bottom - segment_height;
+                            paint_chart_rect(
+                                window,
+                                center - bar_width / 2.0,
+                                top,
+                                center + bar_width / 2.0,
+                                bottom,
+                                *color,
+                            );
+                            bottom = top;
+                        }
+                    }
+                },
+            )
+            .absolute()
+            .inset_0(),
+        )
+        .child(hitboxes)
+        .when(!has_values, |this| {
+            this.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if has_metrics {
+                        locale::text(
+                            "No reported values in this range",
+                            "此范围内没有已上报数值",
+                            "此範圍內沒有已回報數值",
+                        )
+                    } else {
+                        locale::text(
+                            "Select a metric to display",
+                            "请选择要展示的维度",
+                            "請選擇要顯示的維度",
+                        )
+                    }),
+            )
+        });
+
+    v_flex()
+        .w_full()
+        .gap_2()
+        .child(
+            h_flex()
+                .w_full()
+                .child(render_trend_axis(
+                    token_axis_maximum,
+                    USAGE_CHART_AXIS_WIDTH,
+                    cx,
+                ))
+                .child(plot),
+        )
+        .child(
+            h_flex()
+                .w_full()
+                .child(div().w(px(USAGE_CHART_AXIS_WIDTH)).flex_none())
+                .child(render_trend_labels(statistics, cx)),
+        )
+        .into_any_element()
+}
+
+fn trend_bucket_tooltip_rows(
+    aggregate: &AgentUsageAggregate,
+    enabled_metrics: &[AgentUsageTrendMetric],
+) -> Vec<(&'static str, String)> {
+    let display = |value: Option<u64>| {
+        value
+            .map(format_full_number)
+            .unwrap_or_else(|| locale::text("Unknown", "未知", "未知").to_string())
+    };
+    enabled_metrics
+        .iter()
+        .map(|metric| {
+            let label = match metric {
+                AgentUsageTrendMetric::Requests => locale::text("Requests", "请求", "請求"),
+                AgentUsageTrendMetric::TotalTokens => locale::text("Total", "总量", "總量"),
+                AgentUsageTrendMetric::InputTokens => locale::text("Input", "输入", "輸入"),
+                AgentUsageTrendMetric::OutputTokens => locale::text("Output", "输出", "輸出"),
+                AgentUsageTrendMetric::CachedTokens => locale::text("Cache", "缓存", "快取"),
+            };
+            (label, display(trend_value(aggregate, *metric)))
+        })
+        .collect()
 }
 
 fn render_trend_labels(
@@ -1134,9 +1502,7 @@ fn render_trend_labels(
     cx: &mut Context<UsageView>,
 ) -> AnyElement {
     let count = statistics.trend_buckets.len();
-    let mut labels = h_flex()
-        .w_full()
-        .gap(px(if count > 20 { 3.0 } else { 8.0 }));
+    let mut labels = h_flex().w_full();
     for (index, bucket) in statistics.trend_buckets.iter().enumerate() {
         let visible = count <= 8 || index == 0 || index + 1 == count || index % 6 == 0;
         labels = labels.child(
@@ -1154,6 +1520,623 @@ fn render_trend_labels(
         );
     }
     labels.into_any_element()
+}
+
+fn usage_heatmap_entries(annual: &AgentUsageAnnualProjection) -> Vec<UsageHeatmapEntry> {
+    annual
+        .days
+        .iter()
+        .map(|day| UsageHeatmapEntry {
+            label: day.label.clone(),
+            value: token_trend_value(day.requests, day.total_tokens.value),
+        })
+        .collect()
+}
+
+fn heatmap_start_row(entries: &[UsageHeatmapEntry]) -> usize {
+    entries
+        .first()
+        .and_then(|entry| NaiveDate::parse_from_str(&entry.label, "%Y-%m-%d").ok())
+        .map(|date| date.weekday().num_days_from_monday() as usize)
+        .unwrap_or(0)
+}
+
+fn heatmap_level(value: Option<u64>, maximum: u64) -> Option<u8> {
+    value.map(|value| {
+        if value == 0 || maximum == 0 {
+            0
+        } else {
+            ((value as f64 / maximum as f64 * 4.0).ceil() as u8).clamp(1, 4)
+        }
+    })
+}
+
+fn heatmap_color(level: Option<u8>, cx: &Context<UsageView>) -> Hsla {
+    let is_dark = cx.theme().is_dark();
+    match level {
+        None => theme::semantic_color("card", is_dark),
+        Some(0) => cx.theme().muted.opacity(0.28),
+        Some(1) => theme::semantic_color("chart-5", is_dark),
+        Some(2) => theme::semantic_color("chart-4", is_dark),
+        Some(3) => theme::semantic_color("chart-3", is_dark),
+        Some(_) => theme::semantic_color("chart-1", is_dark),
+    }
+}
+
+fn heatmap_weekday_label(row: usize) -> &'static str {
+    match row {
+        0 => locale::text("Mon", "一", "一"),
+        2 => locale::text("Wed", "三", "三"),
+        4 => locale::text("Fri", "五", "五"),
+        _ => "",
+    }
+}
+
+fn month_label(month: u32) -> String {
+    const ENGLISH: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    match locale::current_locale() {
+        locale::ResolvedLocale::En => ENGLISH
+            .get(month.saturating_sub(1) as usize)
+            .copied()
+            .unwrap_or_default()
+            .to_string(),
+        locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => format!("{month}月"),
+    }
+}
+
+fn render_heatmap_legend(cx: &mut Context<UsageView>) -> AnyElement {
+    let mut levels = h_flex().items_center().gap(px(3.0));
+    for level in 0..=4 {
+        levels = levels.child(
+            div()
+                .size(px(11.0))
+                .rounded(px(2.0))
+                .bg(heatmap_color(Some(level), cx)),
+        );
+    }
+    h_flex()
+        .w_full()
+        .justify_end()
+        .items_center()
+        .gap_2()
+        .text_size(px(10.0))
+        .text_color(cx.theme().muted_foreground)
+        .child(locale::text("Less", "少", "少"))
+        .child(levels)
+        .child(locale::text("More", "多", "多"))
+        .into_any_element()
+}
+
+fn render_usage_heatmap(
+    annual: Option<&AgentUsageAnnualProjection>,
+    cx: &mut Context<UsageView>,
+) -> AnyElement {
+    let Some(annual) = annual else {
+        return centered_message(
+            locale::text(
+                "Daily heatmap is unavailable",
+                "每日热力图暂不可用",
+                "每日熱力圖暫不可用",
+            ),
+            cx,
+        );
+    };
+    let entries = usage_heatmap_entries(annual);
+    if entries.is_empty() {
+        return centered_message(
+            locale::text(
+                "No reported values in this range",
+                "此范围内没有已上报数值",
+                "此範圍內沒有已回報數值",
+            ),
+            cx,
+        );
+    }
+    let maximum = entries
+        .iter()
+        .filter_map(|entry| entry.value)
+        .max()
+        .unwrap_or(0);
+    let row_count = 7;
+    let start_row = heatmap_start_row(&entries);
+    let columns = (start_row + entries.len()).div_ceil(row_count).max(1);
+    let mut weekday_labels = v_flex().flex_none().gap(px(USAGE_HEATMAP_GAP));
+    for row in 0..7 {
+        weekday_labels = weekday_labels.child(
+            div()
+                .h(px(USAGE_HEATMAP_CELL_SIZE))
+                .w(px(28.0))
+                .flex()
+                .items_center()
+                .text_size(px(10.0))
+                .text_color(cx.theme().muted_foreground)
+                .child(heatmap_weekday_label(row)),
+        );
+    }
+    let mut month_labels = h_flex().items_start().gap(px(USAGE_HEATMAP_GAP));
+    let mut previous_month = None;
+    for column in 0..columns {
+        let entry_index = column
+            .checked_mul(row_count)
+            .and_then(|slot| slot.checked_sub(start_row));
+        let month = entry_index
+            .and_then(|index| entries.get(index))
+            .and_then(|entry| NaiveDate::parse_from_str(&entry.label, "%Y-%m-%d").ok())
+            .map(|date| date.month());
+        let label = if month.is_some() && month != previous_month {
+            previous_month = month;
+            month.map(month_label).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        month_labels = month_labels.child(
+            div()
+                .w(px(USAGE_HEATMAP_CELL_SIZE))
+                .h(px(14.0))
+                .flex_none()
+                .text_size(px(10.0))
+                .text_color(cx.theme().muted_foreground)
+                .child(label),
+        );
+    }
+    let mut matrix = h_flex().items_start().gap(px(USAGE_HEATMAP_GAP));
+    for column in 0..columns {
+        let mut week = v_flex().gap(px(USAGE_HEATMAP_GAP));
+        for row in 0..row_count {
+            let slot = column * row_count + row;
+            let entry_index = slot.checked_sub(start_row);
+            if let Some(entry) = entry_index.and_then(|index| entries.get(index)) {
+                let level = heatmap_level(entry.value, maximum);
+                let tooltip = format!(
+                    "{} · {} Token",
+                    entry.label,
+                    entry
+                        .value
+                        .map(format_full_number)
+                        .unwrap_or_else(|| locale::text("Unknown", "未知", "未知").to_string())
+                );
+                week = week.child(
+                    div()
+                        .id(SharedString::from(format!("usage-heatmap-cell-{slot}")))
+                        .size(px(USAGE_HEATMAP_CELL_SIZE))
+                        .rounded(px(2.0))
+                        .bg(heatmap_color(level, cx))
+                        .when(level.is_none(), |this| {
+                            this.border_1().border_color(cx.theme().border)
+                        })
+                        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx)),
+                );
+            } else {
+                week = week.child(div().size(px(USAGE_HEATMAP_CELL_SIZE)));
+            }
+        }
+        matrix = matrix.child(week);
+    }
+    let calendar = h_flex()
+        .w_full()
+        .min_w_0()
+        .items_start()
+        .gap_2()
+        .child(weekday_labels)
+        .child(matrix);
+    v_flex()
+        .w_full()
+        .min_h(px(USAGE_CHART_HEIGHT))
+        .justify_center()
+        .gap_3()
+        .child(
+            div()
+                .id("usage-heatmap-scroll")
+                .w_full()
+                .overflow_x_scroll()
+                .child(
+                    v_flex()
+                        .min_w(px(USAGE_HEATMAP_MIN_WIDTH))
+                        .gap(px(2.0))
+                        .child(
+                            h_flex()
+                                .items_start()
+                                .gap_2()
+                                .child(div().w(px(28.0)).flex_none())
+                                .child(month_labels),
+                        )
+                        .child(calendar),
+                ),
+        )
+        .child(render_heatmap_legend(cx))
+        .into_any_element()
+}
+
+#[derive(Debug, Clone)]
+struct UsageModelCategory {
+    id: String,
+    label: String,
+    color: Hsla,
+    other: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UsageModelIdentity {
+    id: String,
+    label: String,
+    other: bool,
+}
+
+fn model_metric_value(model: &AgentUsageDailyModelUsage, metric: UsageModelMetric) -> Option<u64> {
+    match metric {
+        UsageModelMetric::Requests => Some(model.requests),
+        UsageModelMetric::TotalTokens => model.total_tokens.value,
+    }
+}
+
+fn model_metric_label(metric: UsageModelMetric) -> &'static str {
+    match metric {
+        UsageModelMetric::Requests => locale::text("Requests", "请求数", "請求數"),
+        UsageModelMetric::TotalTokens => locale::text("Total tokens", "总 Token", "總 Token"),
+    }
+}
+
+fn model_category_color(index: usize, cx: &Context<UsageView>) -> Hsla {
+    const TOKENS: [&str; USAGE_MODEL_LIMIT] = [
+        "chart-category-1",
+        "chart-category-2",
+        "chart-category-3",
+        "chart-category-4",
+        "chart-category-5",
+        "chart-category-6",
+        "chart-category-7",
+        "chart-category-8",
+        "chart-category-9",
+        "chart-category-10",
+    ];
+    theme::semantic_color(TOKENS[index.min(TOKENS.len() - 1)], cx.theme().is_dark())
+}
+
+fn ranked_model_identities(annual: &AgentUsageAnnualProjection) -> Vec<UsageModelIdentity> {
+    let mut totals = BTreeMap::<String, (String, u64, Option<u64>)>::new();
+    for day in &annual.days {
+        for model in &day.models {
+            let entry = totals
+                .entry(model.model_id.clone())
+                .or_insert_with(|| (model.label.clone(), 0, None));
+            entry.1 = entry.1.saturating_add(model.requests);
+            if let Some(value) = model.total_tokens.value {
+                entry.2 = Some(entry.2.unwrap_or(0).saturating_add(value));
+            }
+        }
+    }
+    let mut ranked = totals.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(
+        |(left_id, (left_label, left_requests, left_tokens)),
+         (right_id, (right_label, right_requests, right_tokens))| {
+            right_tokens
+                .is_some()
+                .cmp(&left_tokens.is_some())
+                .then_with(|| right_tokens.cmp(left_tokens))
+                .then_with(|| right_requests.cmp(left_requests))
+                .then_with(|| left_label.to_lowercase().cmp(&right_label.to_lowercase()))
+                .then_with(|| left_id.cmp(right_id))
+        },
+    );
+    let needs_other = ranked.len() > USAGE_MODEL_LIMIT;
+    let visible_count = if needs_other {
+        USAGE_MODEL_LIMIT - 1
+    } else {
+        ranked.len()
+    };
+    let mut categories = ranked
+        .into_iter()
+        .take(visible_count)
+        .map(|(id, (label, _, _))| UsageModelIdentity {
+            id,
+            label,
+            other: false,
+        })
+        .collect::<Vec<_>>();
+    if needs_other {
+        categories.push(UsageModelIdentity {
+            id: USAGE_OTHER_MODEL_ID.to_string(),
+            label: locale::text("Other", "其他", "其他").to_string(),
+            other: true,
+        });
+    }
+    categories
+}
+
+fn model_categories(
+    annual: &AgentUsageAnnualProjection,
+    cx: &Context<UsageView>,
+) -> Vec<UsageModelCategory> {
+    ranked_model_identities(annual)
+        .into_iter()
+        .enumerate()
+        .map(|(index, identity)| UsageModelCategory {
+            id: identity.id,
+            label: identity.label,
+            color: model_category_color(index, cx),
+            other: identity.other,
+        })
+        .collect()
+}
+
+fn model_day_value(
+    day: &vibex_core::AgentUsageAnnualDay,
+    category: &UsageModelCategory,
+    metric: UsageModelMetric,
+    visible_model_ids: &BTreeSet<String>,
+) -> Option<u64> {
+    let mut found = false;
+    let mut known = false;
+    let mut sum = 0_u64;
+    for model in &day.models {
+        let included = if category.other {
+            !visible_model_ids.contains(&model.model_id)
+        } else {
+            model.model_id == category.id
+        };
+        if !included {
+            continue;
+        }
+        found = true;
+        if let Some(value) = model_metric_value(model, metric) {
+            known = true;
+            sum = sum.saturating_add(value);
+        }
+    }
+    if !found {
+        Some(0)
+    } else if known {
+        Some(sum)
+    } else {
+        None
+    }
+}
+
+fn render_percentage_axis(cx: &mut Context<UsageView>) -> AnyElement {
+    v_flex()
+        .h(px(USAGE_CHART_HEIGHT))
+        .w(px(38.0))
+        .flex_none()
+        .justify_between()
+        .text_size(px(10.0))
+        .text_color(cx.theme().muted_foreground)
+        .children(
+            ["100%", "50%", "0%"].map(|label| div().w_full().text_right().pr_2().child(label)),
+        )
+        .into_any_element()
+}
+
+fn render_model_usage(
+    annual: Option<&AgentUsageAnnualProjection>,
+    metric: UsageModelMetric,
+    cx: &mut Context<UsageView>,
+) -> AnyElement {
+    let Some(annual) = annual else {
+        return centered_message(
+            locale::text(
+                "Model usage is unavailable",
+                "模型用量暂不可用",
+                "模型用量暫不可用",
+            ),
+            cx,
+        );
+    };
+    let categories = model_categories(annual, cx);
+    let visible_model_ids = categories
+        .iter()
+        .filter(|category| !category.other)
+        .map(|category| category.id.clone())
+        .collect::<BTreeSet<_>>();
+    let day_values = annual
+        .days
+        .iter()
+        .map(|day| {
+            let values = categories
+                .iter()
+                .map(|category| model_day_value(day, category, metric, &visible_model_ids))
+                .collect::<Vec<_>>();
+            (day.label.clone(), values)
+        })
+        .collect::<Vec<_>>();
+    let mut grid = v_flex().absolute().inset_0().justify_between();
+    for _ in 0..3 {
+        grid = grid.child(
+            div()
+                .w_full()
+                .border_t_1()
+                .border_color(cx.theme().border.opacity(0.42)),
+        );
+    }
+    let mut hitboxes = h_flex().absolute().inset_0();
+    for (index, (label, values)) in day_values.iter().enumerate() {
+        let title = label.clone();
+        let denominator = values
+            .iter()
+            .flatten()
+            .fold(0_u64, |sum, value| sum.saturating_add(*value));
+        let rows = categories
+            .iter()
+            .zip(values.iter())
+            .map(|(category, value)| {
+                (
+                    category.label.clone(),
+                    value.map_or_else(
+                        || locale::text("Unknown", "未知", "未知").to_string(),
+                        |value| {
+                            let percentage = if denominator == 0 {
+                                0.0
+                            } else {
+                                value as f64 / denominator as f64 * 100.0
+                            };
+                            format!("{} · {percentage:.1}%", format_full_number(value))
+                        },
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        hitboxes = hitboxes.child(
+            div()
+                .id(SharedString::from(format!("usage-model-day-{index}")))
+                .h_full()
+                .min_w(px(1.0))
+                .flex_1()
+                .tooltip(move |window, cx| {
+                    let title = title.clone();
+                    let rows = rows.clone();
+                    Tooltip::element(move |_, cx| {
+                        let mut content = v_flex()
+                            .min_w(px(190.0))
+                            .gap_1()
+                            .text_xs()
+                            .child(div().font_medium().child(title.clone()));
+                        for (label, value) in &rows {
+                            content = content.child(
+                                h_flex()
+                                    .w_full()
+                                    .justify_between()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .text_color(cx.theme().popover_foreground.opacity(0.72))
+                                            .child(label.clone()),
+                                    )
+                                    .child(div().font_medium().child(value.clone())),
+                            );
+                        }
+                        content.child(
+                            div()
+                                .text_color(cx.theme().popover_foreground.opacity(0.62))
+                                .child(model_metric_label(metric)),
+                        )
+                    })
+                    .build(window, cx)
+                }),
+        );
+    }
+    let chart_data = day_values
+        .iter()
+        .map(|(_, values)| values.clone())
+        .collect::<Vec<_>>();
+    let colors = categories
+        .iter()
+        .map(|category| category.color)
+        .collect::<Vec<_>>();
+    let plot = div()
+        .relative()
+        .h(px(USAGE_CHART_HEIGHT))
+        .min_w_0()
+        .flex_1()
+        .overflow_hidden()
+        .child(grid)
+        .child(
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, window, _| {
+                    let width = f32::from(bounds.size.width).max(1.0);
+                    let height = f32::from(bounds.size.height).max(1.0);
+                    let count = chart_data.len().max(1);
+                    let day_width = width / count as f32;
+                    let bar_width = (day_width * 0.82).clamp(1.0, 8.0);
+                    let origin_x = f32::from(bounds.origin.x);
+                    let origin_y = f32::from(bounds.origin.y);
+                    for (index, values) in chart_data.iter().enumerate() {
+                        let total = values
+                            .iter()
+                            .flatten()
+                            .fold(0_u64, |sum, value| sum.saturating_add(*value));
+                        if total == 0 {
+                            continue;
+                        }
+                        let center = origin_x + day_width * (index as f32 + 0.5);
+                        let mut bottom = origin_y + height;
+                        for (value, color) in values.iter().zip(colors.iter()) {
+                            let Some(value) = value else { continue };
+                            if *value == 0 {
+                                continue;
+                            }
+                            let segment_height =
+                                (*value as f64 / total as f64 * height as f64) as f32;
+                            let top = bottom - segment_height;
+                            paint_chart_rect(
+                                window,
+                                center - bar_width / 2.0,
+                                top,
+                                center + bar_width / 2.0,
+                                bottom,
+                                *color,
+                            );
+                            bottom = top;
+                        }
+                    }
+                },
+            )
+            .absolute()
+            .inset_0(),
+        )
+        .child(hitboxes);
+    let mut month_labels = h_flex().w_full().gap_0();
+    let mut previous_month = None;
+    for (label, _) in &day_values {
+        let month = NaiveDate::parse_from_str(label, "%Y-%m-%d")
+            .ok()
+            .map(|date| date.month());
+        let visible = month.is_some() && month != previous_month;
+        if visible {
+            previous_month = month;
+        }
+        month_labels = month_labels.child(
+            div()
+                .min_w(px(1.0))
+                .flex_1()
+                .text_size(px(10.0))
+                .text_color(cx.theme().muted_foreground)
+                .child(if visible {
+                    month.map(month_label).unwrap_or_default()
+                } else {
+                    String::new()
+                }),
+        );
+    }
+    let mut legend = h_flex().w_full().flex_wrap().items_center().gap_2();
+    for category in &categories {
+        legend = legend.child(
+            h_flex()
+                .items_center()
+                .gap_1()
+                .child(div().size(px(8.0)).rounded(px(2.0)).bg(category.color))
+                .child(div().text_xs().child(category.label.clone())),
+        );
+    }
+    v_flex()
+        .w_full()
+        .gap_2()
+        .child(
+            div()
+                .id("usage-model-chart-scroll")
+                .w_full()
+                .overflow_x_scroll()
+                .child(
+                    v_flex()
+                        .min_w(px(USAGE_MODEL_CHART_MIN_WIDTH))
+                        .gap_2()
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .child(render_percentage_axis(cx))
+                                .child(plot),
+                        )
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .child(div().w(px(38.0)).flex_none())
+                                .child(month_labels),
+                        ),
+                ),
+        )
+        .child(legend)
+        .into_any_element()
 }
 
 fn dimension_label(dimension: AgentUsageDimension) -> &'static str {
@@ -1383,7 +2366,6 @@ fn table_coverage(
 
 fn usage_content_state(requests: Option<u64>, loading: bool, has_error: bool) -> UsageContentState {
     match requests {
-        Some(0) => UsageContentState::Empty,
         Some(_) => UsageContentState::Ready,
         None if loading => UsageContentState::Loading,
         None if has_error => UsageContentState::Unavailable,
@@ -1616,10 +2598,10 @@ mod tests {
     }
 
     #[test]
-    fn successful_zero_request_query_uses_enablement_empty_state() {
+    fn successful_query_keeps_fixed_year_views_visible_when_range_is_empty() {
         assert_eq!(
             usage_content_state(Some(0), false, false),
-            UsageContentState::Empty
+            UsageContentState::Ready
         );
         assert_eq!(
             usage_content_state(Some(2), true, false),
@@ -1653,5 +2635,75 @@ mod tests {
         assert!(detail.contains('2'));
         assert!(detail.contains('3'));
         assert!(detail.contains("input + output"));
+    }
+
+    #[test]
+    fn trend_axis_uses_a_stable_token_scale() {
+        assert_eq!(nice_axis_upper(0, 1_000), 1_000);
+        assert_eq!(nice_axis_upper(86_700, 1_000), 100_000);
+        assert_eq!(axis_ticks(100_000), [100_000, 75_000, 50_000, 25_000, 0]);
+        assert_eq!(format_token_axis_k(25_000), "25K");
+        assert_eq!(format_token_axis_k(1_500), "1.5K");
+        assert_eq!(format_token_axis_k(750), "0.75K");
+        assert_eq!(format_token_axis_k(250), "0.25K");
+    }
+
+    #[test]
+    fn heatmap_levels_preserve_unknown_zero_and_daily_alignment() {
+        assert_eq!(token_trend_value(0, None), Some(0));
+        assert_eq!(token_trend_value(1, None), None);
+        assert_eq!(token_trend_value(1, Some(0)), Some(0));
+        assert_eq!(heatmap_level(None, 100), None);
+        assert_eq!(heatmap_level(Some(0), 100), Some(0));
+        assert_eq!(heatmap_level(Some(25), 100), Some(1));
+        assert_eq!(heatmap_level(Some(26), 100), Some(2));
+        assert_eq!(heatmap_level(Some(75), 100), Some(3));
+        assert_eq!(heatmap_level(Some(100), 100), Some(4));
+
+        let entries = vec![UsageHeatmapEntry {
+            label: "2024-01-03".to_string(),
+            value: Some(1),
+        }];
+        assert_eq!(heatmap_start_row(&entries), 2);
+    }
+
+    #[test]
+    fn model_view_keeps_nine_ranked_models_plus_other_in_a_stable_order() {
+        let metric = |value| AgentUsageMetricValue {
+            value: Some(value),
+            coverage: AgentUsageMetricCoverage::Complete,
+            known_requests: 1,
+            derived_requests: 0,
+            total_requests: 1,
+        };
+        let models = (0..11)
+            .map(|index| AgentUsageDailyModelUsage {
+                model_id: format!("model-{index:02}"),
+                label: format!("Model {index:02}"),
+                requests: index + 1,
+                total_tokens: metric((11 - index) * 100),
+            })
+            .collect();
+        let annual = AgentUsageAnnualProjection {
+            effective_range: vibex_core::AgentUsageEffectiveRange {
+                start_at_ms: 0,
+                end_at_ms: 1,
+                bucket_kind: "day".to_string(),
+            },
+            days: vec![vibex_core::AgentUsageAnnualDay {
+                id: "0".to_string(),
+                label: "2026-07-31".to_string(),
+                start_at_ms: 0,
+                end_at_ms: 1,
+                requests: 66,
+                total_tokens: metric(6_600),
+                models,
+            }],
+        };
+
+        let categories = ranked_model_identities(&annual);
+        assert_eq!(categories.len(), USAGE_MODEL_LIMIT);
+        assert_eq!(categories[0].id, "model-00");
+        assert!(categories.last().unwrap().other);
     }
 }

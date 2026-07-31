@@ -310,8 +310,9 @@ pub use timeline::{
     TurnExecutionAttributionView, UserMessagePayload, WebSearchPayload,
 };
 pub use usage::{
-    AgentTurnUsageFact, AgentUsageAggregate, AgentUsageCacheHitRate, AgentUsageCounterOrigin,
-    AgentUsageCoverage, AgentUsageCoverageSummary, AgentUsageDimension, AgentUsageDimensionRow,
+    AgentTurnUsageFact, AgentUsageAggregate, AgentUsageAnnualDay, AgentUsageAnnualProjection,
+    AgentUsageCacheHitRate, AgentUsageCounterOrigin, AgentUsageCoverage, AgentUsageCoverageSummary,
+    AgentUsageDailyModelUsage, AgentUsageDimension, AgentUsageDimensionRow,
     AgentUsageEffectiveRange, AgentUsageExecution, AgentUsageExecutionContext,
     AgentUsageExecutionStatus, AgentUsageExecutionStatusUpdate, AgentUsageFilterOption,
     AgentUsageFilterOptions, AgentUsageMetricCoverage, AgentUsageMetricValue,

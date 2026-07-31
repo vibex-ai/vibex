@@ -7,8 +7,9 @@ use chrono::{
 };
 use vibex_agent::AgentUsageTelemetryEvent;
 use vibex_core::{
-    AgentTurnUsageFact, AgentUsageAggregate, AgentUsageCacheHitRate, AgentUsageCounterOrigin,
-    AgentUsageCoverage, AgentUsageCoverageSummary, AgentUsageDimension, AgentUsageDimensionRow,
+    AgentTurnUsageFact, AgentUsageAggregate, AgentUsageAnnualDay, AgentUsageAnnualProjection,
+    AgentUsageCacheHitRate, AgentUsageCounterOrigin, AgentUsageCoverage, AgentUsageCoverageSummary,
+    AgentUsageDailyModelUsage, AgentUsageDimension, AgentUsageDimensionRow,
     AgentUsageEffectiveRange, AgentUsageFilterOption, AgentUsageFilterOptions,
     AgentUsageMetricCoverage, AgentUsageMetricValue, AgentUsageRange, AgentUsageSortDirection,
     AgentUsageSortMetric, AgentUsageStatistics, AgentUsageStatisticsRequest, AgentUsageTimeZone,
@@ -85,11 +86,16 @@ impl AgentUsageService {
         validate_request(&request)?;
         let time_zone = ResolvedUsageTimeZone::resolve(&request.time_zone)?;
         let bounds = query_bounds(request.range, &time_zone, generated_at_ms)?;
+        let annual_buckets = build_annual_time_buckets(&time_zone, generated_at_ms)?;
+        let annual_start_at_ms = annual_buckets
+            .first()
+            .map(|bucket| bucket.start_at_ms)
+            .unwrap_or(bounds.start_at_ms);
         let mut connection = open_database(&self.db_path)?;
         apply_migrations(&mut connection)?;
         let all_facts = AgentUsageRepository::list_facts_in_range(
             &connection,
-            bounds.start_at_ms,
+            bounds.start_at_ms.min(annual_start_at_ms),
             bounds.end_at_ms,
             MAX_AGENT_USAGE_QUERY_ROWS.saturating_add(1),
         )?;
@@ -102,6 +108,15 @@ impl AgentUsageService {
         let filter_options = build_filter_options(&all_facts);
         let facts = all_facts
             .iter()
+            .filter(|projection| fact_is_in_bounds(projection, &bounds))
+            .filter(|projection| matches_filters(projection, &request))
+            .collect::<Vec<_>>();
+        let annual_facts = all_facts
+            .iter()
+            .filter(|projection| {
+                projection.fact.dispatched_at_ms >= annual_start_at_ms
+                    && projection.fact.dispatched_at_ms < bounds.end_at_ms
+            })
             .filter(|projection| matches_filters(projection, &request))
             .collect::<Vec<_>>();
         let buckets =
@@ -136,6 +151,8 @@ impl AgentUsageService {
             request.sort_metric,
             request.sort_direction,
         );
+        let annual =
+            build_annual_projection(annual_buckets, annual_facts.as_slice(), bounds.end_at_ms)?;
 
         Ok(AgentUsageStatistics {
             generated_at_ms,
@@ -148,6 +165,7 @@ impl AgentUsageService {
             trend_buckets,
             dimension_rows,
             filter_options,
+            annual: Some(annual),
         })
     }
 }
@@ -260,6 +278,11 @@ struct QueryBounds {
     start_at_ms: i64,
     end_at_ms: i64,
     bucket_kind: &'static str,
+}
+
+fn fact_is_in_bounds(projection: &AgentUsageFactProjection, bounds: &QueryBounds) -> bool {
+    projection.fact.dispatched_at_ms >= bounds.start_at_ms
+        && projection.fact.dispatched_at_ms < bounds.end_at_ms
 }
 
 fn query_bounds(
@@ -381,6 +404,90 @@ fn build_time_buckets(
             Ok(buckets)
         }
     }
+}
+
+fn build_annual_time_buckets(
+    time_zone: &ResolvedUsageTimeZone,
+    now_ms: i64,
+) -> VibexResult<Vec<TimeBucket>> {
+    let today = time_zone.local_datetime(now_ms)?.date();
+    let first = today - Duration::days(364);
+    (0..365)
+        .map(|index| {
+            let date = first + Duration::days(index);
+            Ok(TimeBucket {
+                label: date.format("%Y-%m-%d").to_string(),
+                start_at_ms: local_midnight(*time_zone, date)?,
+                end_at_ms: local_midnight(*time_zone, next_date(date)?)?,
+            })
+        })
+        .collect()
+}
+
+fn build_annual_projection(
+    buckets: Vec<TimeBucket>,
+    facts: &[&AgentUsageFactProjection],
+    query_end_at_ms: i64,
+) -> VibexResult<AgentUsageAnnualProjection> {
+    let start_at_ms = buckets
+        .first()
+        .map(|bucket| bucket.start_at_ms)
+        .unwrap_or(query_end_at_ms);
+    let mut facts_by_day = vec![Vec::new(); buckets.len()];
+    for projection in facts {
+        let timestamp = projection.fact.dispatched_at_ms;
+        let index = buckets.partition_point(|bucket| bucket.end_at_ms <= timestamp);
+        if let Some(bucket) = buckets.get(index)
+            && timestamp >= bucket.start_at_ms
+            && timestamp < bucket.end_at_ms
+        {
+            facts_by_day[index].push(*projection);
+        }
+    }
+
+    let days = buckets
+        .into_iter()
+        .zip(facts_by_day)
+        .map(|(bucket, day_facts)| {
+            let mut model_groups: BTreeMap<String, Vec<&AgentUsageFactProjection>> =
+                BTreeMap::new();
+            for projection in &day_facts {
+                model_groups
+                    .entry(projection.fact.model_id.clone())
+                    .or_default()
+                    .push(*projection);
+            }
+            let models = model_groups
+                .into_iter()
+                .map(|(model_id, model_facts)| {
+                    Ok(AgentUsageDailyModelUsage {
+                        label: model_id.clone(),
+                        model_id,
+                        requests: model_facts.len() as u64,
+                        total_tokens: total_metric(model_facts.as_slice())?,
+                    })
+                })
+                .collect::<VibexResult<Vec<_>>>()?;
+            Ok(AgentUsageAnnualDay {
+                id: bucket.start_at_ms.to_string(),
+                label: bucket.label,
+                start_at_ms: bucket.start_at_ms,
+                end_at_ms: bucket.end_at_ms,
+                requests: day_facts.len() as u64,
+                total_tokens: total_metric(day_facts.as_slice())?,
+                models,
+            })
+        })
+        .collect::<VibexResult<Vec<_>>>()?;
+
+    Ok(AgentUsageAnnualProjection {
+        effective_range: AgentUsageEffectiveRange {
+            start_at_ms,
+            end_at_ms: query_end_at_ms,
+            bucket_kind: "day".to_string(),
+        },
+        days,
+    })
 }
 
 fn local_midnight(time_zone: ResolvedUsageTimeZone, date: NaiveDate) -> VibexResult<i64> {
@@ -1133,6 +1240,23 @@ mod tests {
             AgentUsageMetricCoverage::Unknown
         );
         assert_eq!(statistics.totals.coverage.unreported_requests, 1);
+        let annual = statistics.annual.expect("annual projection");
+        let today = annual
+            .days
+            .iter()
+            .find(|day| day.label == "2026-07-31")
+            .expect("today annual bucket");
+        assert_eq!(today.requests, 1);
+        assert_eq!(today.total_tokens.value, None);
+        assert_eq!(today.models.len(), 1);
+        assert_eq!(today.models[0].total_tokens.value, None);
+        let empty = annual
+            .days
+            .iter()
+            .find(|day| day.label == "2026-07-30")
+            .expect("empty annual bucket");
+        assert_eq!(empty.requests, 0);
+        assert_eq!(empty.total_tokens.value, None);
     }
 
     #[test]
@@ -1183,6 +1307,54 @@ mod tests {
                 requests,
                 "range {range:?}"
             );
+        }
+    }
+
+    #[test]
+    fn annual_projection_is_fixed_to_365_days_independent_of_selected_range() {
+        let (_directory, service, session) = seeded_service();
+        let stream = stream(
+            &service,
+            &session,
+            session.agent_id.as_str(),
+            ProviderProfileId::new(),
+            "annual-model",
+        );
+        let execution = execution_at(&service, &session, &stream, timestamp(2025, 8, 15, 9, 0));
+        service
+            .apply_telemetry_event(dispatched_event(execution.clone()))
+            .unwrap();
+        service
+            .apply_telemetry_event(AgentUsageTelemetryEvent::Observation(observation(
+                execution, 1, 60, 40, 20, 100,
+            )))
+            .unwrap();
+
+        let now = dispatched_at(12);
+        for (range, selected_requests) in [
+            (AgentUsageRange::Today, 0),
+            (AgentUsageRange::Last7Days, 0),
+            (AgentUsageRange::AllTime, 1),
+        ] {
+            let statistics = service
+                .query_statistics_at(fixed_request(range), now)
+                .unwrap();
+            assert_eq!(statistics.totals.requests, selected_requests);
+            assert_eq!(statistics.filter_options.models[0].id, "annual-model");
+            let annual = statistics.annual.expect("annual projection");
+            assert_eq!(annual.effective_range.bucket_kind, "day");
+            assert_eq!(annual.days.len(), 365);
+            assert_eq!(annual.days.first().unwrap().label, "2025-08-01");
+            assert_eq!(annual.days.last().unwrap().label, "2026-07-31");
+            assert_eq!(annual.days.iter().map(|day| day.requests).sum::<u64>(), 1);
+            let used_day = annual
+                .days
+                .iter()
+                .find(|day| day.label == "2025-08-15")
+                .unwrap();
+            assert_eq!(used_day.total_tokens.value, Some(100));
+            assert_eq!(used_day.models[0].model_id, "annual-model");
+            assert_eq!(used_day.models[0].requests, 1);
         }
     }
 
@@ -1271,6 +1443,17 @@ mod tests {
             .unwrap();
         assert_eq!(filtered.totals.requests, 1);
         assert_eq!(filtered.totals.total_tokens.value, Some(100));
+        assert_eq!(
+            filtered
+                .annual
+                .as_ref()
+                .unwrap()
+                .days
+                .iter()
+                .map(|day| day.requests)
+                .sum::<u64>(),
+            1
+        );
         assert_eq!(filtered.filter_options.agents.len(), 2);
         assert_eq!(filtered.filter_options.projects.len(), 2);
         assert_eq!(filtered.filter_options.provider_profiles.len(), 2);

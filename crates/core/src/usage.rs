@@ -442,6 +442,34 @@ pub struct AgentUsageTrendBucket {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AgentUsageDailyModelUsage {
+    pub model_id: String,
+    pub label: String,
+    pub requests: u64,
+    pub total_tokens: AgentUsageMetricValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentUsageAnnualDay {
+    pub id: String,
+    pub label: String,
+    pub start_at_ms: i64,
+    pub end_at_ms: i64,
+    pub requests: u64,
+    pub total_tokens: AgentUsageMetricValue,
+    pub models: Vec<AgentUsageDailyModelUsage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentUsageAnnualProjection {
+    pub effective_range: AgentUsageEffectiveRange,
+    pub days: Vec<AgentUsageAnnualDay>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentUsageDimensionRow {
     pub id: String,
     pub label: String,
@@ -474,6 +502,8 @@ pub struct AgentUsageStatistics {
     pub trend_buckets: Vec<AgentUsageTrendBucket>,
     pub dimension_rows: Vec<AgentUsageDimensionRow>,
     pub filter_options: AgentUsageFilterOptions,
+    #[serde(default)]
+    pub annual: Option<AgentUsageAnnualProjection>,
 }
 
 #[cfg(test)]
@@ -523,5 +553,45 @@ mod tests {
         for forbidden in ["cost", "price", "currency", "amount"] {
             assert!(!serialized.to_ascii_lowercase().contains(forbidden));
         }
+    }
+
+    #[test]
+    fn statistics_without_annual_projection_remain_readable() {
+        let metric = AgentUsageMetricValue::unknown(0);
+        let statistics = AgentUsageStatistics {
+            generated_at_ms: 1,
+            effective_range: AgentUsageEffectiveRange {
+                start_at_ms: 0,
+                end_at_ms: 1,
+                bucket_kind: "day".to_string(),
+            },
+            totals: AgentUsageAggregate {
+                requests: 0,
+                total_tokens: metric.clone(),
+                input_tokens: metric.clone(),
+                output_tokens: metric.clone(),
+                cached_tokens: metric.clone(),
+                thought_tokens: metric.clone(),
+                cached_write_tokens: metric,
+                cache_hit_rate: AgentUsageCacheHitRate {
+                    basis_points: None,
+                    cached_read_tokens: 0,
+                    denominator_tokens: 0,
+                    eligible_requests: 0,
+                    total_requests: 0,
+                    coverage: AgentUsageMetricCoverage::Unknown,
+                },
+                coverage: AgentUsageCoverageSummary::default(),
+                last_activity_at_ms: None,
+            },
+            trend_buckets: Vec::new(),
+            dimension_rows: Vec::new(),
+            filter_options: AgentUsageFilterOptions::default(),
+            annual: None,
+        };
+        let mut serialized = serde_json::to_value(statistics).unwrap();
+        serialized.as_object_mut().unwrap().remove("annual");
+        let decoded: AgentUsageStatistics = serde_json::from_value(serialized).unwrap();
+        assert!(decoded.annual.is_none());
     }
 }

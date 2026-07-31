@@ -74,7 +74,13 @@ AgentUsageStatisticsRequest {
 
 AgentUsageStatistics {
   generated_at_ms, effective_range, totals,
-  trend_buckets[], dimension_rows[], filter_options
+  trend_buckets[], dimension_rows[], filter_options,
+  annual?: { effective_range, days[] }
+}
+
+AgentUsageAnnualDay {
+  id, label, start_at_ms, end_at_ms, requests, total_tokens,
+  models[]: { model_id, label, requests, total_tokens }
 }
 ```
 
@@ -170,12 +176,19 @@ session_runtime_bindings(
 
 #### Aggregation And Privacy
 
-- Queries are capped at `MAX_AGENT_USAGE_QUERY_ROWS` (100,000 facts). The same
-  range and cross-filters apply to totals, trend buckets, and dimension rows.
+- Queries are capped at `MAX_AGENT_USAGE_QUERY_ROWS` (100,000 facts). The selected
+  range and all cross-filters apply to totals, trend buckets, and dimension rows.
 - Today uses local-hour buckets, 7/30 days use local-day buckets, and all time
   uses local-month buckets. Materialize empty buckets. Calendar boundaries are
   computed from the requested system/fixed-offset time zone, not implicit
   SQLite date behavior.
+- Every successful query also projects the latest 365 local calendar days for
+  annual charts. This projection ignores only the selected range: it applies the
+  same Agent, Model Provider, Model, Project, and Session filters. Materialize all
+  365 days, use local-midnight boundaries so DST stays correct, and include daily
+  model Requests and Total Token without changing their nullable coverage rules.
+  The field is optional on the wire so older serialized responses remain readable;
+  a current backend returns `Some` even when every annual day is empty.
 - The five dimensions are Time, Agent, Project, Model Provider, and Model.
   Stable Vibex ids are group keys; current labels are projections with the id as
   fallback. Sort by the selected metric/direction, then case-folded label, then id.
@@ -244,7 +257,8 @@ session_runtime_bindings(
   older observation cannot change fact deltas, checkpoint, or reset epoch.
 - Query tests cover all ranges/time zones, empty buckets, every cross-filter and
   dimension, deterministic sorting, partial/derived coverage, cache-hit
-  eligibility, empty data, row caps, and overflow handling.
+  eligibility, empty data, row caps, overflow handling, the fixed 365-day annual
+  window, range independence, and daily model projections.
 - One integration test runs fake ACP cumulative events through adapter,
   `DesktopRuntime`, SQLite, the typed query service, and the GPUI view model.
 
