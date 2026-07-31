@@ -159,27 +159,44 @@ where
             RuntimeConfigDimension::Mode => &option.modes,
         };
         for candidate in candidates {
-            values.entry(candidate.value.clone()).or_insert_with(|| {
-                candidate
+            let label = match dimension {
+                RuntimeConfigDimension::ReasoningEffort => reasoning_effort_label(&candidate.value),
+                RuntimeConfigDimension::Mode => candidate
                     .label
                     .clone()
-                    .unwrap_or_else(|| candidate.value.clone())
-            });
+                    .unwrap_or_else(|| candidate.value.clone()),
+            };
+            values.entry(candidate.value.clone()).or_insert(label);
         }
     }
     if values.is_empty() {
         return Vec::new();
     }
-    let mut default_selection = desired.clone();
-    match dimension {
-        RuntimeConfigDimension::ReasoningEffort => default_selection.reasoning_effort = None,
-        RuntimeConfigDimension::Mode => default_selection.mode_id = None,
+
+    if matches!(dimension, RuntimeConfigDimension::ReasoningEffort) {
+        values.retain(|value, _| !value.eq_ignore_ascii_case("default"));
     }
-    let mut choices = vec![RuntimeCascadeChoice {
-        value: "default".into(),
-        label: "Default".into(),
-        selection: default_selection,
-    }];
+    let mut values = values.into_iter().collect::<Vec<_>>();
+    if matches!(dimension, RuntimeConfigDimension::ReasoningEffort) {
+        values.sort_by(|(left, _), (right, _)| {
+            reasoning_effort_rank(left)
+                .cmp(&reasoning_effort_rank(right))
+                .then_with(|| left.cmp(right))
+        });
+    }
+
+    let mut choices = Vec::with_capacity(
+        values.len() + usize::from(matches!(dimension, RuntimeConfigDimension::Mode)),
+    );
+    if matches!(dimension, RuntimeConfigDimension::Mode) {
+        let mut default_selection = desired.clone();
+        default_selection.mode_id = None;
+        choices.push(RuntimeCascadeChoice {
+            value: "default".into(),
+            label: "Default".into(),
+            selection: default_selection,
+        });
+    }
     choices.extend(values.into_iter().map(|(value, label)| {
         let mut selection = desired.clone();
         match dimension {
@@ -195,6 +212,58 @@ where
         }
     }));
     choices
+}
+
+fn reasoning_effort_rank(value: &str) -> (u8, String) {
+    let normalized = value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    let rank = match normalized.as_str() {
+        "none" => 0,
+        "minimal" => 1,
+        "low" => 2,
+        "medium" => 3,
+        "high" => 4,
+        "xhigh" | "extrahigh" => 5,
+        "max" | "maximum" => 6,
+        "ultra" => 7,
+        _ => u8::MAX,
+    };
+    (rank, normalized)
+}
+
+fn reasoning_effort_label(value: &str) -> String {
+    let normalized = value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    if normalized == "xhigh" {
+        return "XHigh".to_string();
+    }
+
+    let label = value
+        .split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut characters = part.chars();
+            let Some(first) = characters.next() else {
+                return String::new();
+            };
+            first
+                .to_uppercase()
+                .chain(characters.flat_map(char::to_lowercase))
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if label.is_empty() {
+        value.to_string()
+    } else {
+        label
+    }
 }
 
 #[cfg(test)]
@@ -263,10 +332,64 @@ mod tests {
         assert_eq!(projection.agents.len(), 2);
         assert_eq!(projection.profiles.len(), 1);
         assert_eq!(projection.models.len(), 2);
-        assert_eq!(projection.reasoning_efforts[0].label, "Default");
-        assert_eq!(projection.reasoning_efforts[1].label, "HIGH");
+        assert_eq!(
+            projection
+                .reasoning_efforts
+                .iter()
+                .map(|choice| (choice.value.as_str(), choice.label.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("low", "Low"), ("high", "High")]
+        );
         assert_eq!(projection.modes.len(), 2);
         assert_eq!(projection.modes[1].value, "build");
+    }
+
+    #[test]
+    fn reasoning_efforts_use_names_without_default_and_sort_by_depth() {
+        let mut runtime = option(
+            "codex",
+            "provider_codex",
+            "gpt-5",
+            &[
+                "ultra", "medium", "xhigh", "default", "custom", "low", "max", "high", "minimal",
+            ],
+            &[],
+        );
+        for effort in &mut runtime.reasoning_efforts {
+            effort.label = Some(format!("Description for {}", effort.value));
+        }
+        let desired = runtime.selection.clone();
+        let projection = RuntimeCascadeProjection::from_catalog(
+            &SessionRuntimeOptionCatalog {
+                revision: 2,
+                options: vec![runtime],
+            },
+            &desired,
+        );
+
+        assert_eq!(
+            projection
+                .reasoning_efforts
+                .iter()
+                .map(|choice| (choice.value.as_str(), choice.label.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("minimal", "Minimal"),
+                ("low", "Low"),
+                ("medium", "Medium"),
+                ("high", "High"),
+                ("xhigh", "XHigh"),
+                ("max", "Max"),
+                ("ultra", "Ultra"),
+                ("custom", "Custom"),
+            ]
+        );
+        assert!(
+            projection
+                .reasoning_efforts
+                .iter()
+                .all(|choice| choice.value != "default")
+        );
     }
 
     #[test]

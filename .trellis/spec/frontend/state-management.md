@@ -524,6 +524,12 @@ DesktopPollingPolicy {
 }
 
 MessageSubmissionCoordinator::submit(SendAgentMessageRequest)
+
+RuntimeCascadeProjection::from_catalog(catalog, desired)
+  -> RuntimeCascadeProjection
+
+ComposerUiState.runtime_selections_by_agent:
+  BTreeMap<AgentId, SessionRuntimeSelection>
 ```
 
 ### 3. Contracts
@@ -608,6 +614,26 @@ MessageSubmissionCoordinator::submit(SendAgentMessageRequest)
   back to a complete `SessionRuntimeSelection`; unavailable catalog entries are
   excluded from cascade choices, and the selected request still goes through the
   durable runtime-selection service.
+- Reasoning Effort selector names derive from the catalog value (`low` -> `Low`,
+  `medium` -> `Medium`, `xhigh` -> `XHigh`), never from the explanatory
+  description. Known levels render from lower to higher depth
+  (`none/minimal/low/medium/high/xhigh/max/ultra`), followed by unknown values in
+  deterministic order. Do not insert or retain a synthetic `Default` effort;
+  `reasoning_effort = null` continues to mean the Adapter's converged default.
+- `DesktopUiStateV1.composer.runtime_selections_by_agent` persists at most one
+  complete, bounded product selection per Agent. Explicit new-session choices and
+  successful in-session runtime changes update it. Switching Agent A -> B -> A
+  restores A's last valid Profile/Model/Effort/Mode/feature selection; every
+  restore is revalidated against the current catalog before it reaches a
+  selector or mutation. Persist only catalog-backed Toggle/Select feature values;
+  freeform String feature values may contain user content and remain view-local.
+- Async in-session preference writes carry a per-Agent intent epoch. A completion
+  persists only while its epoch is still current, so an older switch cannot
+  overwrite a newer choice; activity for another Agent does not invalidate it.
+- Above the compact breakpoint, the runtime trigger visibly renders
+  `Provider Profile / Model`; compact icon-only triggers keep the same complete
+  value in their tooltip. Rendering only the Model name is ambiguous when two
+  Profiles expose similarly named Models.
 - Composer terminal controls own only a filtered terminal-id list and selected
   id. Create goes through the typed desktop runtime terminal facade and persists
   metadata; switch changes the Composer selection without auto-selecting a
@@ -647,6 +673,8 @@ MessageSubmissionCoordinator::submit(SendAgentMessageRequest)
   mutations; a global list refresh may still reconcile durable changes.
 - Session switches while send/runtime/permission/interrupt is pending -> the
   new view is usable and the old completion cannot clear or overwrite it.
+- Runtime switches for the same Agent complete out of order -> only the newest
+  intent may update the remembered Composer selection.
 - Cached session selected -> render the cached Turn projection immediately,
   keep `agent_loading=false`, and refresh authoritatively in the background.
 - Cached refresh fails -> retain cached content and surface the bounded error;
@@ -666,6 +694,19 @@ MessageSubmissionCoordinator::submit(SendAgentMessageRequest)
   target and do not persist a new order.
 - Relative reorder is missing either id or already adjacent in that direction ->
   return `false`; do not schedule a persistence write.
+- Remembered runtime selection is missing from the current catalog, unavailable,
+  or contains a removed Effort/Mode/feature value -> ignore it for that catalog
+  snapshot and show the first available option for the Agent. Do not overwrite
+  the remembered value from automatic reconciliation: startup first publishes a
+  provisional configured-model catalog, and later capability enrichment may make
+  the preference valid again. Only an explicit user choice or a confirmed
+  in-session switch replaces it.
+- Persisted runtime preference key does not match `selection.agent_id`, has an
+  empty Model, or exceeds bounded key/value/count limits -> drop that preference
+  during `DesktopUiStateV1::normalize`; do not fail session creation or treat the
+  preference as runtime authority.
+- Catalog exposes no Reasoning Effort values, or only a `default` sentinel ->
+  render no Effort choice; do not fabricate a level or a `Default` menu item.
 
 ### 5. Good/Base/Bad Cases
 
@@ -678,11 +719,19 @@ MessageSubmissionCoordinator::submit(SendAgentMessageRequest)
   including when the idle turn has only streamed deltas and no final message.
 - Good: switch from session A to B while A's runtime switch is pending; B loads
   its own selection and remains enabled when A finishes.
+- Good: choose `high` for Codex and `low` for Claude, switch between their
+  new-session chips, restart the desktop, and restore each choice only while its
+  exact Profile/Model and advertised values remain valid.
 - Base: a clean preview home has no sessions; the workbench renders its empty
   state while the shared runtime lifecycle remains healthy.
+- Base: a remembered Model was disabled since the last run; the selector falls
+  back to the first available option for that Agent while retaining the bounded
+  preference until an explicit replacement is chosen.
 - Bad: store raw `TimelineItem` merge logic in the GPUI render method, clear the
   draft before `submit` accepts, replace the active runtime from a stale task,
-  or remove polling because live events appeared healthy in one run.
+  label Effort choices with long descriptions, sort them alphabetically, show a
+  synthetic `Default`, or remove polling because live events appeared healthy in
+  one run.
 
 ### 6. Tests Required
 
@@ -698,6 +747,14 @@ MessageSubmissionCoordinator::submit(SendAgentMessageRequest)
   keeps runtime catalog/Owner attach calls outside the timeline loading task.
 - GPUI unit tests cover LRU recency/eviction and complete-prefix pagination; a
   cached session switch must not clear its Timeline or enter a loading state.
+- `desktop-model` runtime tests feed descriptions and shuffled Effort values,
+  then assert value-derived names, semantic low-to-high ordering, deterministic
+  unknown ordering, and no `Default` effort.
+- UI-state tests cover per-Agent preference normalization and atomic round-trip.
+  GPUI tests assert Agent A -> B -> A preference isolation, provisional ->
+  enriched catalog restoration, freeform feature exclusion, stale catalog
+  fallback, out-of-order completion fencing, and visible
+  `Provider Profile / Model` labels.
 - GPUI contract probe asserts virtualization, authoritative/live merge,
   generation fencing, row drag reorder, durable submission, Owner heartbeat,
   native IME input, attachment drop, and permission actions.
@@ -746,6 +803,27 @@ attach Owner -> wait for provider restore -> fetch persisted timeline
 adjacent compatible deltas -> one stable row -> adjacent final replaces body
 switch opened session -> restore bounded cache -> refresh authoritative prefix
 fetch persisted timeline -> end loading; attach Owner in the background
+```
+
+#### Wrong
+
+```rust
+let label = effort.description.clone().unwrap_or(effort.value.clone());
+let mut choices = vec![default_choice];
+choices.extend(BTreeMap::from_iter(efforts)); // alphabetic, not depth order
+```
+
+#### Correct
+
+```rust
+let mut choices = reasoning_efforts
+    .filter(|effort| effort.value != "default")
+    .map(|effort| (reasoning_effort_rank(&effort.value), reasoning_effort_label(&effort.value)))
+    .collect::<Vec<_>>();
+choices.sort_by_key(|(rank, _)| rank.clone());
+let preferred = persisted_by_agent
+    .get(&agent_id)
+    .filter(|selection| catalog_has_runtime_selection(catalog, selection));
 ```
 
 ## Scenario: Workspace-Less New Session Creation

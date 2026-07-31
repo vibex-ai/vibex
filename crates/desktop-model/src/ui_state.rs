@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use vibex_core::{AgentId, SessionRuntimeSelection};
 
 pub const DESKTOP_UI_STATE_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_UI_STATE_WRITE_DELAY_MS: u64 = 200;
@@ -214,6 +215,8 @@ pub enum SessionContentWidthMode {
 #[serde(rename_all = "camelCase")]
 pub struct ComposerUiState {
     pub terminal_ids: Vec<String>,
+    #[serde(default)]
+    pub runtime_selections_by_agent: BTreeMap<AgentId, SessionRuntimeSelection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -330,6 +333,19 @@ impl DesktopUiStateV1 {
         self.right_rail.selected_activity_id =
             bounded_optional(self.right_rail.selected_activity_id.take(), 256);
         normalize_ids(&mut self.composer.terminal_ids, 64);
+        self.composer.runtime_selections_by_agent =
+            std::mem::take(&mut self.composer.runtime_selections_by_agent)
+                .into_iter()
+                .filter_map(|(agent_id, mut selection)| {
+                    if selection.agent_id != agent_id
+                        || !normalize_runtime_selection(&mut selection)
+                    {
+                        return None;
+                    }
+                    Some((agent_id, selection))
+                })
+                .take(64)
+                .collect();
         normalize_ids(&mut self.agent_tab_order, 256);
         self.terminal_tab_titles = std::mem::take(&mut self.terminal_tab_titles)
             .into_iter()
@@ -758,6 +774,53 @@ fn normalize_set(ids: &mut BTreeSet<String>, limit: usize) {
     *ids = values.into_iter().collect();
 }
 
+fn normalize_runtime_selection(selection: &mut SessionRuntimeSelection) -> bool {
+    let Some(model_id) = bounded_runtime_value(&selection.model_id, 512) else {
+        return false;
+    };
+    selection.model_id = model_id;
+    selection.reasoning_effort = match selection.reasoning_effort.take() {
+        Some(value) => {
+            let Some(value) = bounded_runtime_value(&value, 128) else {
+                return false;
+            };
+            Some(value)
+        }
+        None => None,
+    };
+    selection.mode_id = match selection.mode_id.take() {
+        Some(value) => {
+            let Some(value) = bounded_runtime_value(&value, 128) else {
+                return false;
+            };
+            Some(value)
+        }
+        None => None,
+    };
+    if selection.config_values.len() > 64 {
+        return false;
+    }
+    let Some(config_values) = std::mem::take(&mut selection.config_values)
+        .into_iter()
+        .map(|(key, value)| {
+            Some((
+                bounded_runtime_value(&key, 160)?,
+                bounded_runtime_value(&value, 256)?,
+            ))
+        })
+        .collect::<Option<BTreeMap<_, _>>>()
+    else {
+        return false;
+    };
+    selection.config_values = config_values;
+    true
+}
+
+fn bounded_runtime_value(value: &str, max_chars: usize) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty() && value.chars().count() <= max_chars).then(|| value.to_string())
+}
+
 fn normalize_split_sizes(sizes: Vec<f32>) -> Vec<f32> {
     let mut sizes = sizes
         .into_iter()
@@ -861,6 +924,109 @@ mod tests {
         assert_eq!(state.workbench.sidebar_width, 320.0);
         assert_eq!(state.sidebar.session_order, vec!["session_a"]);
         assert_eq!(state.preview.split_sizes, vec![0.5, 0.5]);
+    }
+
+    #[test]
+    fn state_normalizes_bounded_runtime_selections_by_agent() {
+        let codex = AgentId::parse("codex").unwrap();
+        let claude = AgentId::parse("claude").unwrap();
+        let mut state = DesktopUiStateV1::default();
+        state.composer.runtime_selections_by_agent.insert(
+            codex.clone(),
+            SessionRuntimeSelection {
+                agent_id: codex.clone(),
+                provider_profile_id: vibex_core::ProviderProfileId::new(),
+                model_id: "  gpt-5  ".into(),
+                reasoning_effort: Some(" high ".into()),
+                mode_id: Some(" agent ".into()),
+                config_values: BTreeMap::from([(" web_search ".into(), " true ".into())]),
+            },
+        );
+        state.composer.runtime_selections_by_agent.insert(
+            claude,
+            SessionRuntimeSelection {
+                agent_id: AgentId::parse("codex").unwrap(),
+                provider_profile_id: vibex_core::ProviderProfileId::new(),
+                model_id: "stale".into(),
+                reasoning_effort: None,
+                mode_id: None,
+                config_values: BTreeMap::new(),
+            },
+        );
+        state.composer.runtime_selections_by_agent.insert(
+            AgentId::parse("opencode").unwrap(),
+            SessionRuntimeSelection {
+                agent_id: AgentId::parse("opencode").unwrap(),
+                provider_profile_id: vibex_core::ProviderProfileId::new(),
+                model_id: "x".repeat(513),
+                reasoning_effort: None,
+                mode_id: None,
+                config_values: BTreeMap::new(),
+            },
+        );
+
+        state.normalize().unwrap();
+
+        let selection = state
+            .composer
+            .runtime_selections_by_agent
+            .get(&codex)
+            .unwrap();
+        assert_eq!(selection.model_id, "gpt-5");
+        assert_eq!(selection.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(selection.mode_id.as_deref(), Some("agent"));
+        assert_eq!(
+            selection.config_values,
+            BTreeMap::from([("web_search".into(), "true".into())])
+        );
+        assert_eq!(state.composer.runtime_selections_by_agent.len(), 1);
+    }
+
+    #[test]
+    fn runtime_selection_preferences_round_trip_in_ui_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("desktop-ui-state.json");
+        let store = UiStateStore::new(&path);
+        let codex = AgentId::parse("codex").unwrap();
+        let mut state = DesktopUiStateV1::default();
+        let selection = SessionRuntimeSelection {
+            agent_id: codex.clone(),
+            provider_profile_id: vibex_core::ProviderProfileId::new(),
+            model_id: "gpt-5".into(),
+            reasoning_effort: Some("medium".into()),
+            mode_id: Some("agent".into()),
+            config_values: BTreeMap::from([("web_search".into(), "true".into())]),
+        };
+        state
+            .composer
+            .runtime_selections_by_agent
+            .insert(codex.clone(), selection.clone());
+
+        store.save(&state).unwrap();
+        let loaded = store.load_or_default(1).unwrap();
+
+        assert_eq!(
+            loaded
+                .state
+                .composer
+                .runtime_selections_by_agent
+                .get(&codex),
+            Some(&selection)
+        );
+    }
+
+    #[test]
+    fn current_v1_without_runtime_preferences_defaults_to_an_empty_map() {
+        let mut value = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
+        value
+            .get_mut("composer")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .remove("runtimeSelectionsByAgent");
+
+        let decoded = decode_and_migrate(&serde_json::to_vec(&value).unwrap()).unwrap();
+
+        assert!(decoded.composer.runtime_selections_by_agent.is_empty());
     }
 
     #[test]

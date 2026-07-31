@@ -69,10 +69,10 @@ use vibex_core::{
     RightRailPluginReorderRequest, RightRailPluginStatus, RightRailPluginUpdateRequest,
     RightRailSystemPluginKey, RightRailWebPluginUaMode, RuntimeClientId, RuntimeLeaseRole,
     RuntimeSelectionInteraction, SendAgentMessageRequest, SessionRuntimeFeature,
-    SessionRuntimeFeatureKind, SessionRuntimeOptionCatalog, SessionRuntimeSelection,
-    SessionRuntimeSelectionStatus, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
-    TerminalId, TerminalSession, TerminalStatus, TerminalSwitchShellRequest, TimelineItem,
-    TimelineLiveEvent, TimelinePage, TimelinePayload, VibexSessionId, WorkspaceMode,
+    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
+    SessionRuntimeSelection, SessionRuntimeSelectionStatus, SetDesiredAgentSessionRuntimeRequest,
+    TerminalCreateRequest, TerminalId, TerminalSession, TerminalStatus, TerminalSwitchShellRequest,
+    TimelineItem, TimelineLiveEvent, TimelinePage, TimelinePayload, VibexSessionId, WorkspaceMode,
     WorkspaceRecord, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
@@ -347,6 +347,23 @@ enum ComposerRuntimeMenuView {
 enum RuntimeFeatureTarget {
     NewSession,
     ActiveSession,
+}
+
+#[derive(Debug, Default)]
+struct RuntimePreferenceWriteFence {
+    epochs: BTreeMap<AgentId, u64>,
+}
+
+impl RuntimePreferenceWriteFence {
+    fn begin(&mut self, agent_id: &AgentId) -> u64 {
+        let epoch = self.epochs.entry(agent_id.clone()).or_default();
+        *epoch = epoch.saturating_add(1);
+        *epoch
+    }
+
+    fn is_current(&self, agent_id: &AgentId, epoch: u64) -> bool {
+        self.epochs.get(agent_id).copied().unwrap_or_default() == epoch
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1928,6 +1945,7 @@ pub struct VibexWorkbench {
     runtime_catalog: Option<SessionRuntimeOptionCatalog>,
     runtime_provider_profiles: Vec<ProviderProfileSummary>,
     runtime_selection: Option<AgentSessionRuntimeSelectionState>,
+    runtime_preference_write_fence: RuntimePreferenceWriteFence,
     token_usage: Option<AgentTokenUsage>,
     composer_runtime_menu_open: bool,
     composer_runtime_menu_view: ComposerRuntimeMenuView,
@@ -2361,6 +2379,7 @@ impl VibexWorkbench {
             runtime_catalog: None,
             runtime_provider_profiles: Vec::new(),
             runtime_selection: None,
+            runtime_preference_write_fence: RuntimePreferenceWriteFence::default(),
             token_usage: None,
             composer_runtime_menu_open: false,
             composer_runtime_menu_view: ComposerRuntimeMenuView::Agent,
@@ -2956,19 +2975,66 @@ impl VibexWorkbench {
         let Some(catalog) = self.runtime_catalog.as_ref() else {
             return false;
         };
-        let preferred = self.new_session_runtime_selection.clone().or_else(|| {
-            self.runtime_selection
-                .as_ref()
-                .map(|state| state.desired.clone())
-        });
+        let preferred = self
+            .new_session_agent_id
+            .as_ref()
+            .and_then(|agent_id| self.preferred_new_session_runtime_for_agent(agent_id));
         let selection = new_session_runtime_selection_for_agent(
             catalog,
             self.new_session_agent_id.as_ref(),
             preferred.as_ref(),
         );
+        self.set_new_session_runtime_selection(selection)
+    }
+
+    fn preferred_new_session_runtime_for_agent(
+        &self,
+        agent_id: &AgentId,
+    ) -> Option<SessionRuntimeSelection> {
+        new_session_runtime_preference_for_agent(
+            agent_id,
+            self.new_session_runtime_selection.as_ref(),
+            &self.ui_state.composer.runtime_selections_by_agent,
+            self.runtime_selection.as_ref().map(|state| &state.desired),
+        )
+    }
+
+    fn set_new_session_runtime_selection(
+        &mut self,
+        selection: Option<SessionRuntimeSelection>,
+    ) -> bool {
         let changed = self.new_session_runtime_selection != selection;
         self.new_session_runtime_selection = selection;
         changed
+    }
+
+    fn remember_runtime_selection(&mut self, selection: &SessionRuntimeSelection) {
+        self.runtime_preference_write_fence
+            .begin(&selection.agent_id);
+        self.persist_runtime_selection(selection);
+    }
+
+    fn remember_runtime_selection_if_current(
+        &mut self,
+        selection: &SessionRuntimeSelection,
+        epoch: u64,
+    ) {
+        if self
+            .runtime_preference_write_fence
+            .is_current(&selection.agent_id, epoch)
+        {
+            self.persist_runtime_selection(selection);
+        }
+    }
+
+    fn persist_runtime_selection(&mut self, selection: &SessionRuntimeSelection) {
+        let selection = persisted_runtime_selection(self.runtime_catalog.as_ref(), selection);
+        let selections = &mut self.ui_state.composer.runtime_selections_by_agent;
+        if selections.get(&selection.agent_id) == Some(&selection) {
+            return;
+        }
+        selections.insert(selection.agent_id.clone(), selection);
+        self.queue_ui_state();
     }
 
     fn load_right_rail_plugins(&mut self, cx: &mut Context<Self>) {
@@ -7872,17 +7938,17 @@ impl VibexWorkbench {
         self.new_session_agent_id =
             default_new_session_agent_id(&self.agent_snapshots, preferred_agent.as_ref());
         let preferred_runtime = self
-            .runtime_selection
+            .new_session_agent_id
             .as_ref()
-            .map(|state| state.desired.clone())
-            .or_else(|| self.new_session_runtime_selection.clone());
-        self.new_session_runtime_selection = self.runtime_catalog.as_ref().and_then(|catalog| {
+            .and_then(|agent_id| self.preferred_new_session_runtime_for_agent(agent_id));
+        let selection = self.runtime_catalog.as_ref().and_then(|catalog| {
             new_session_runtime_selection_for_agent(
                 catalog,
                 self.new_session_agent_id.as_ref(),
                 preferred_runtime.as_ref(),
             )
         });
+        self.set_new_session_runtime_selection(selection);
         let workspace = workspace
             .or_else(|| {
                 self.selected_session()
@@ -7955,7 +8021,8 @@ impl VibexWorkbench {
         self.new_session_agent_id = Some(selection.agent_id.clone());
         self.new_session_runtime_menu_open = false;
         self.new_session_runtime_menu_profile_id = None;
-        self.new_session_runtime_selection = Some(selection);
+        self.set_new_session_runtime_selection(Some(selection.clone()));
+        self.remember_runtime_selection(&selection);
         self.new_session_error = None;
         self.refresh_active_suggestions(ComposerTarget::NewSession, cx);
         cx.notify();
@@ -7990,7 +8057,8 @@ impl VibexWorkbench {
         next.config_values.insert(feature.id.clone(), value);
         match target {
             RuntimeFeatureTarget::NewSession => {
-                self.new_session_runtime_selection = Some(next);
+                self.set_new_session_runtime_selection(Some(next.clone()));
+                self.remember_runtime_selection(&next);
                 self.new_session_error = None;
                 self.refresh_active_suggestions(ComposerTarget::NewSession, cx);
                 cx.notify();
@@ -8092,14 +8160,11 @@ impl VibexWorkbench {
         if self.agent_action_pending {
             return;
         }
-        let preferred = self
-            .new_session_runtime_selection
-            .as_ref()
-            .filter(|selection| selection.agent_id == agent_id)
-            .cloned();
-        self.new_session_runtime_selection = self.runtime_catalog.as_ref().and_then(|catalog| {
+        let preferred = self.preferred_new_session_runtime_for_agent(&agent_id);
+        let selection = self.runtime_catalog.as_ref().and_then(|catalog| {
             new_session_runtime_selection_for_agent(catalog, Some(&agent_id), preferred.as_ref())
         });
+        self.set_new_session_runtime_selection(selection);
         self.new_session_agent_id = Some(agent_id);
         self.new_session_runtime_menu_open = false;
         self.new_session_runtime_menu_view = ComposerRuntimeMenuView::Profile;
@@ -8488,8 +8553,10 @@ impl VibexWorkbench {
             return;
         };
         if !retry_same_desired && desired == state.desired {
+            self.remember_runtime_selection(&desired);
             return;
         }
+        let runtime_preference_epoch = self.runtime_preference_write_fence.begin(&desired.agent_id);
         self.agent_action_pending = true;
         let generation = self.session_generation;
         let requested_session_id = session_id.clone();
@@ -8516,16 +8583,26 @@ impl VibexWorkbench {
                     match outcome {
                         Ok(Ok(state)) if active => {
                             this.agent_action_pending = false;
+                            let desired = state.desired.clone();
                             this.runtime_selection = Some(state);
+                            this.remember_runtime_selection_if_current(
+                                &desired,
+                                runtime_preference_epoch,
+                            );
                             this.refresh_active_suggestions(ComposerTarget::Session, cx);
                         }
                         Ok(Ok(state)) => {
+                            let desired = state.desired.clone();
                             if let Some(entry) = this
                                 .agent_session_view_cache
                                 .get_mut(requested_session_id.as_str())
                             {
                                 entry.runtime_selection = Some(state);
                             }
+                            this.remember_runtime_selection_if_current(
+                                &desired,
+                                runtime_preference_epoch,
+                            );
                         }
                         Ok(Err(error)) if active => {
                             this.agent_action_pending = false;
@@ -12478,17 +12555,10 @@ impl VibexWorkbench {
                     && option.selection.model_id == selection.model_id
             })
         });
-        let selected_label = selected_option
-            .map(|option| option.model_label.clone())
-            .or_else(|| {
-                selection
-                    .as_ref()
-                    .map(|selection| selection.model_id.clone())
-            })
+        let selected_runtime_label = selection
+            .as_ref()
+            .map(|selection| runtime_provider_model_label(selected_option, selection))
             .unwrap_or_else(|| no_configuration.to_string());
-        let selected_runtime_label = selected_option
-            .map(|option| format!("{} / {}", option.provider_profile_label, option.model_label))
-            .unwrap_or_else(|| selected_label.clone());
         let tooltip = format!(
             "{}: {selected_runtime_label}",
             locale::text(
@@ -12526,7 +12596,13 @@ impl VibexWorkbench {
                 .min_w_0()
                 .gap(px(6.0))
                 .child(model_icon)
-                .child(div().min_w_0().flex_1().truncate().child(selected_label))
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .child(selected_runtime_label),
+                )
                 .child(
                     Icon::new(IconName::ChevronDown)
                         .size(px(13.0))
@@ -12547,14 +12623,20 @@ impl VibexWorkbench {
                     .as_ref()
                     .map(|selection| selection.provider_profile_id.clone())
             });
+        let preferred_model_selection = agent_id
+            .as_ref()
+            .and_then(|agent_id| self.preferred_new_session_runtime_for_agent(agent_id));
         let model_choices = match (
             catalog.as_ref(),
             agent_id.as_ref(),
             menu_profile_id.as_ref(),
         ) {
-            (Some(catalog), Some(agent_id), Some(profile_id)) => {
-                runtime_model_choices(catalog, agent_id, profile_id)
-            }
+            (Some(catalog), Some(agent_id), Some(profile_id)) => runtime_model_choices(
+                catalog,
+                agent_id,
+                profile_id,
+                preferred_model_selection.as_ref(),
+            ),
             _ => Vec::new(),
         };
         let menu_view = match self.new_session_runtime_menu_view {
@@ -14537,25 +14619,14 @@ impl VibexWorkbench {
                 && option.selection.provider_profile_id == desired.provider_profile_id
                 && option.selection.model_id == desired.model_id
         });
-        let selected_model_label = selected_option
-            .map(|option| option.model_label.clone())
-            .unwrap_or_else(|| desired.model_id.clone());
-        let selected_runtime_label = selected_option
-            .map(|option| {
-                format!(
-                    "{} / {} / {}",
-                    option.agent_label, option.provider_profile_label, option.model_label
-                )
-            })
-            .unwrap_or_else(|| {
-                format!(
-                    "{} / {} / {}",
-                    desired.agent_id, desired.provider_profile_id, desired.model_id
-                )
-            });
+        let selected_provider_model_label = runtime_provider_model_label(selected_option, &desired);
         let tooltip = format!(
-            "{}: {selected_runtime_label}",
-            locale::text("Model", "模型", "模型")
+            "{}: {selected_provider_model_label}",
+            locale::text(
+                "Model provider / Model",
+                "模型供应商 / 模型",
+                "模型供應商 / 模型",
+            )
         );
         let model_icon = model_brand_icon(
             &desired.model_id,
@@ -14587,7 +14658,7 @@ impl VibexWorkbench {
                         .min_w_0()
                         .flex_1()
                         .truncate()
-                        .child(selected_model_label),
+                        .child(selected_provider_model_label),
                 )
                 .child(
                     Icon::new(IconName::ChevronDown)
@@ -14617,7 +14688,20 @@ impl VibexWorkbench {
         let agent_choices = runtime_menu_agents(&self.agent_snapshots);
         let profile_choices =
             runtime_profiles_for_agent(&self.runtime_provider_profiles, &menu_agent_id);
-        let model_choices = runtime_model_choices(&catalog, &menu_agent_id, &menu_profile_id);
+        let preferred_model_selection = if desired.agent_id == menu_agent_id {
+            Some(&desired)
+        } else {
+            self.ui_state
+                .composer
+                .runtime_selections_by_agent
+                .get(&menu_agent_id)
+        };
+        let model_choices = runtime_model_choices(
+            &catalog,
+            &menu_agent_id,
+            &menu_profile_id,
+            preferred_model_selection,
+        );
         let menu_width = (self.last_visibility.layout.viewport_width as f32 - 32.0)
             .clamp(220.0, COMPOSER_RUNTIME_MENU_WIDTH);
         let menu_max_height = (self.last_visibility.layout.viewport_height as f32 - 128.0)
@@ -20347,6 +20431,57 @@ fn new_session_runtime_selection_for_agent(
     None
 }
 
+fn new_session_runtime_preference_for_agent(
+    agent_id: &AgentId,
+    draft: Option<&SessionRuntimeSelection>,
+    remembered: &BTreeMap<AgentId, SessionRuntimeSelection>,
+    active_session: Option<&SessionRuntimeSelection>,
+) -> Option<SessionRuntimeSelection> {
+    let draft = draft.filter(|selection| &selection.agent_id == agent_id);
+    let remembered = remembered.get(agent_id);
+    draft
+        .filter(|draft| {
+            remembered
+                .is_none_or(|remembered| draft_preserves_remembered_runtime(draft, remembered))
+        })
+        .or(remembered)
+        .or_else(|| active_session.filter(|selection| &selection.agent_id == agent_id))
+        .cloned()
+}
+
+fn draft_preserves_remembered_runtime(
+    draft: &SessionRuntimeSelection,
+    remembered: &SessionRuntimeSelection,
+) -> bool {
+    draft.agent_id == remembered.agent_id
+        && draft.provider_profile_id == remembered.provider_profile_id
+        && draft.model_id == remembered.model_id
+        && draft.reasoning_effort == remembered.reasoning_effort
+        && draft.mode_id == remembered.mode_id
+        && remembered
+            .config_values
+            .iter()
+            .all(|(key, value)| draft.config_values.get(key) == Some(value))
+}
+
+fn persisted_runtime_selection(
+    catalog: Option<&SessionRuntimeOptionCatalog>,
+    selection: &SessionRuntimeSelection,
+) -> SessionRuntimeSelection {
+    let mut persisted = selection.clone();
+    persisted.config_values.retain(|key, value| {
+        catalog
+            .and_then(|catalog| runtime_feature_for_selection(catalog, selection, key))
+            .is_some_and(|feature| {
+                matches!(
+                    feature.kind,
+                    SessionRuntimeFeatureKind::Toggle | SessionRuntimeFeatureKind::Select
+                ) && feature.accepts_value(value)
+            })
+    });
+    persisted
+}
+
 fn is_new_session_agent_available(agent: &AgentSnapshotEntry) -> bool {
     agent.added && agent.enabled && agent.installed && agent.deleted_at_ms.is_none()
 }
@@ -20952,6 +21087,7 @@ fn runtime_model_choices(
     catalog: &SessionRuntimeOptionCatalog,
     agent_id: &AgentId,
     provider_profile_id: &ProviderProfileId,
+    preferred: Option<&SessionRuntimeSelection>,
 ) -> Vec<RuntimeCascadeChoice> {
     let Some(seed) = catalog.options.iter().find(|option| {
         option.availability == vibex_core::RuntimeOptionAvailability::Available
@@ -20960,7 +21096,18 @@ fn runtime_model_choices(
     }) else {
         return Vec::new();
     };
-    RuntimeCascadeProjection::from_catalog(catalog, &seed.selection).models
+    let mut choices = RuntimeCascadeProjection::from_catalog(catalog, &seed.selection).models;
+    if let Some(preferred) = preferred.filter(|selection| {
+        &selection.agent_id == agent_id
+            && &selection.provider_profile_id == provider_profile_id
+            && catalog_has_runtime_selection(catalog, selection)
+    }) && let Some(choice) = choices
+        .iter_mut()
+        .find(|choice| choice.value == preferred.model_id)
+    {
+        choice.selection = preferred.clone();
+    }
+    choices
 }
 
 fn runtime_agent_label(agents: &[AgentSnapshotEntry], agent_id: &AgentId) -> String {
@@ -20980,6 +21127,15 @@ fn runtime_profile_label(
         .find(|profile| &profile.id == provider_profile_id)
         .map(|profile| profile.display_name.clone())
         .unwrap_or_else(|| provider_profile_id.to_string())
+}
+
+fn runtime_provider_model_label(
+    option: Option<&SessionRuntimeOption>,
+    selection: &SessionRuntimeSelection,
+) -> String {
+    option
+        .map(|option| format!("{} / {}", option.provider_profile_label, option.model_label))
+        .unwrap_or_else(|| format!("{} / {}", selection.provider_profile_id, selection.model_id))
 }
 
 fn runtime_menu_empty_state(cx: &App) -> AnyElement {
@@ -26043,6 +26199,202 @@ mod tests {
     }
 
     #[test]
+    fn new_session_runtime_preferences_are_remembered_per_agent() {
+        let codex = AgentId::parse("codex").unwrap();
+        let claude = AgentId::parse("claude").unwrap();
+        let mut codex_selection = new_session_runtime_option("codex", "Codex").selection;
+        codex_selection.reasoning_effort = Some("high".into());
+        let mut claude_selection = new_session_runtime_option("claude", "Claude Code").selection;
+        claude_selection.mode_id = Some("plan".into());
+        let remembered = BTreeMap::from([
+            (codex.clone(), codex_selection.clone()),
+            (claude.clone(), claude_selection.clone()),
+        ]);
+
+        assert_eq!(
+            new_session_runtime_preference_for_agent(
+                &codex,
+                Some(&claude_selection),
+                &remembered,
+                None,
+            ),
+            Some(codex_selection)
+        );
+        let provisional_codex = new_session_runtime_option("codex", "Codex").selection;
+        assert_eq!(
+            new_session_runtime_preference_for_agent(
+                &codex,
+                Some(&provisional_codex),
+                &remembered,
+                None,
+            )
+            .and_then(|selection| selection.reasoning_effort),
+            Some("high".into())
+        );
+        let mut view_local_codex = remembered.get(&codex).unwrap().clone();
+        view_local_codex
+            .config_values
+            .insert("instructions".into(), "keep while open".into());
+        assert_eq!(
+            new_session_runtime_preference_for_agent(
+                &codex,
+                Some(&view_local_codex),
+                &remembered,
+                None,
+            ),
+            Some(view_local_codex)
+        );
+        assert_eq!(
+            new_session_runtime_preference_for_agent(
+                &claude,
+                Some(&claude_selection),
+                &remembered,
+                None,
+            ),
+            Some(claude_selection)
+        );
+    }
+
+    #[test]
+    fn stale_runtime_switch_completion_cannot_replace_a_newer_preference() {
+        let codex = AgentId::parse("codex").unwrap();
+        let claude = AgentId::parse("claude").unwrap();
+        let mut fence = RuntimePreferenceWriteFence::default();
+
+        let first_codex = fence.begin(&codex);
+        let claude_epoch = fence.begin(&claude);
+        assert!(fence.is_current(&codex, first_codex));
+        assert!(fence.is_current(&claude, claude_epoch));
+
+        let newer_codex = fence.begin(&codex);
+        assert!(!fence.is_current(&codex, first_codex));
+        assert!(fence.is_current(&codex, newer_codex));
+        assert!(fence.is_current(&claude, claude_epoch));
+    }
+
+    #[test]
+    fn provisional_catalog_fallback_does_not_hide_an_enriched_preference() {
+        let enriched_option = new_session_runtime_option("codex", "Codex");
+        let agent_id = enriched_option.selection.agent_id.clone();
+        let mut remembered_selection = enriched_option.selection.clone();
+        remembered_selection.reasoning_effort = Some("high".into());
+        let remembered = BTreeMap::from([(agent_id.clone(), remembered_selection.clone())]);
+        let mut provisional_option = enriched_option.clone();
+        provisional_option.reasoning_efforts.clear();
+        let provisional_catalog = SessionRuntimeOptionCatalog {
+            revision: 1,
+            options: vec![provisional_option],
+        };
+
+        let provisional = new_session_runtime_selection_for_agent(
+            &provisional_catalog,
+            Some(&agent_id),
+            Some(&remembered_selection),
+        )
+        .unwrap();
+        assert_eq!(provisional.reasoning_effort, None);
+
+        let preferred = new_session_runtime_preference_for_agent(
+            &agent_id,
+            Some(&provisional),
+            &remembered,
+            None,
+        )
+        .unwrap();
+        let enriched_catalog = SessionRuntimeOptionCatalog {
+            revision: 2,
+            options: vec![enriched_option],
+        };
+        let restored = new_session_runtime_selection_for_agent(
+            &enriched_catalog,
+            Some(&agent_id),
+            Some(&preferred),
+        )
+        .unwrap();
+
+        assert_eq!(restored, remembered_selection);
+        assert_eq!(remembered.get(&agent_id), Some(&remembered_selection));
+    }
+
+    #[test]
+    fn runtime_model_choices_restore_only_a_valid_preferred_selection() {
+        let option = new_session_runtime_option("codex", "Codex");
+        let agent_id = option.selection.agent_id.clone();
+        let profile_id = option.selection.provider_profile_id.clone();
+        let mut preferred = option.selection.clone();
+        preferred.reasoning_effort = Some("high".into());
+        let catalog = SessionRuntimeOptionCatalog {
+            revision: 1,
+            options: vec![option.clone()],
+        };
+
+        let choices = runtime_model_choices(&catalog, &agent_id, &profile_id, Some(&preferred));
+        assert_eq!(choices[0].selection, preferred);
+
+        let mut stale = preferred.clone();
+        stale.reasoning_effort = Some("removed".into());
+        let choices = runtime_model_choices(&catalog, &agent_id, &profile_id, Some(&stale));
+        assert_eq!(choices[0].selection, option.selection);
+    }
+
+    #[test]
+    fn runtime_trigger_label_includes_provider_and_model() {
+        let option = new_session_runtime_option("codex", "Codex");
+
+        assert_eq!(
+            runtime_provider_model_label(Some(&option), &option.selection),
+            "Codex profile / Codex model"
+        );
+        assert_eq!(
+            runtime_provider_model_label(None, &option.selection),
+            "provider_codex / codex_model"
+        );
+    }
+
+    #[test]
+    fn persisted_runtime_preferences_exclude_freeform_feature_values() {
+        let mut option = new_session_runtime_option("codex", "Codex");
+        option.features = vec![
+            SessionRuntimeFeature {
+                id: "web_search".into(),
+                label: "Web search".into(),
+                description: None,
+                kind: SessionRuntimeFeatureKind::Toggle,
+                current_value: None,
+                default_value: None,
+                values: Vec::new(),
+            },
+            SessionRuntimeFeature {
+                id: "instructions".into(),
+                label: "Instructions".into(),
+                description: None,
+                kind: SessionRuntimeFeatureKind::String,
+                current_value: None,
+                default_value: None,
+                values: Vec::new(),
+            },
+        ];
+        let catalog = SessionRuntimeOptionCatalog {
+            revision: 1,
+            options: vec![option.clone()],
+        };
+        let mut selection = option.selection;
+        selection
+            .config_values
+            .insert("web_search".into(), "true".into());
+        selection
+            .config_values
+            .insert("instructions".into(), "do not persist this".into());
+
+        let persisted = persisted_runtime_selection(Some(&catalog), &selection);
+
+        assert_eq!(
+            persisted.config_values,
+            BTreeMap::from([("web_search".into(), "true".into())])
+        );
+    }
+
+    #[test]
     fn runtime_selection_validation_rejects_stale_feature_ids_and_values() {
         let mut option = new_session_runtime_option("codex", "Codex");
         option.features = vec![SessionRuntimeFeature {
@@ -27044,7 +27396,7 @@ mod tests {
 
         assert_eq!(profiles.len(), 1);
         assert_eq!(runtime_profile_model_count(&profiles[0]), 0);
-        assert!(runtime_model_choices(&catalog, &agent.id, &profile.id).is_empty());
+        assert!(runtime_model_choices(&catalog, &agent.id, &profile.id, None).is_empty());
     }
 
     #[test]

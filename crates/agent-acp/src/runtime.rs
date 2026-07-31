@@ -12537,8 +12537,8 @@ pub(crate) fn extract_model_ids(response: &Value) -> Vec<String> {
 /// Reasoning-effort choices advertised by a `session/new` response. Efforts
 /// travel as a select `configOptions` entry whose category or id matches the
 /// registry `reasoning_effort` alias family. The "default" sentinel is
-/// dropped: catalog cascades add their own Default choice that clears the
-/// override instead of pinning it.
+/// dropped because a missing override already leaves the Adapter's converged
+/// default authoritative; selectors must not expose it as a named effort.
 pub(crate) fn extract_probe_reasoning_efforts(response: &Value) -> Vec<AgentReasoningEffort> {
     const EFFORT_OPTION_KEYS: [&str; 4] = [
         "effort",
