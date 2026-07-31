@@ -4401,17 +4401,13 @@ impl VibexWorkbench {
                             }
                             let dirty = match signal {
                                 AgentPollSignal::Timeline(page) => {
-                                    let mut changed = 0;
-                                    for item in page.items {
-                                        let sequence = item.sequence;
-                                        if this.timeline.apply_live(TimelineLiveEvent {
+                                    let changed = this.timeline.apply_live_batch(
+                                        page.items.into_iter().map(|item| TimelineLiveEvent {
                                             session_id: page.session_id.clone(),
-                                            sequence,
+                                            sequence: item.sequence,
                                             item,
-                                        }) {
-                                            changed += 1;
-                                        }
-                                    }
+                                        }),
+                                    );
                                     if changed > 0 {
                                         this.timeline_follow.content_appended(changed);
                                         let content_extent_changed = this.rebuild_timeline_sizes();
@@ -4720,7 +4716,6 @@ impl VibexWorkbench {
                 cx.notify();
             });
         }));
-        cx.notify();
     }
 
     fn begin_timeline_scrollbar_interaction(
@@ -12983,20 +12978,15 @@ impl VibexWorkbench {
             cx,
         )];
         if !reasoning_efforts.is_empty() {
-            runtime_controls.push(
-                self.render_new_session_runtime_choice(
-                    "effort".into(),
-                    strings.reasoning_depth.into(),
-                    new_session_selector_icon("icons/vibex/brain.svg", chart_3),
-                    reasoning_efforts,
-                    selection
-                        .as_ref()
-                        .and_then(|selection| selection.reasoning_effort.clone())
-                        .unwrap_or_else(|| "default".into()),
-                    compact_runtime_controls,
-                    cx,
-                ),
-            );
+            runtime_controls.push(self.render_new_session_runtime_choice(
+                "effort".into(),
+                strings.reasoning_depth.into(),
+                new_session_selector_icon("icons/vibex/brain.svg", chart_3),
+                reasoning_efforts,
+                runtime_reasoning_effort_value(selection.as_ref()),
+                compact_runtime_controls,
+                cx,
+            ));
         }
         if !modes.is_empty() {
             runtime_controls.push(
@@ -16752,6 +16742,7 @@ impl VibexWorkbench {
             .surface(MarkdownSurface::Agent),
         )
         .presentation(MarkdownPresentation::Agent)
+        .streaming(row.streaming)
         .allow_http_images(true)
         .scroll_handle(self.timeline_scroll.base_handle().clone())
         .search_query(search_query)
@@ -16867,6 +16858,7 @@ impl VibexWorkbench {
             .surface(MarkdownSurface::Agent),
         )
         .presentation(MarkdownPresentation::Thought)
+        .streaming(row.streaming)
         .allow_http_images(true)
         .scroll_handle(self.timeline_scroll.base_handle().clone())
         .search_query(search_query)
@@ -18219,23 +18211,18 @@ impl VibexWorkbench {
                 cx,
             )];
             if !projection.reasoning_efforts.is_empty() {
-                controls.push(
-                    self.render_composer_runtime_choice(
-                        "effort".into(),
-                        locale::text("Thinking depth", "思考深度", "思考深度").into(),
-                        new_session_selector_icon(
-                            "icons/vibex/brain.svg",
-                            theme::semantic_color("chart-3", is_dark),
-                        ),
-                        projection.reasoning_efforts,
-                        desired
-                            .reasoning_effort
-                            .clone()
-                            .unwrap_or_else(|| "default".into()),
-                        compact_runtime_controls,
-                        cx,
+                controls.push(self.render_composer_runtime_choice(
+                    "effort".into(),
+                    locale::text("Thinking depth", "思考深度", "思考深度").into(),
+                    new_session_selector_icon(
+                        "icons/vibex/brain.svg",
+                        theme::semantic_color("chart-3", is_dark),
                     ),
-                );
+                    projection.reasoning_efforts,
+                    runtime_reasoning_effort_value(Some(&desired)),
+                    compact_runtime_controls,
+                    cx,
+                ));
             }
             if !projection.modes.is_empty() {
                 controls.push(self.render_composer_runtime_choice(
@@ -20305,6 +20292,12 @@ fn catalog_has_runtime_selection(
                     .is_some_and(|feature| feature.accepts_value(value))
             })
     })
+}
+
+fn runtime_reasoning_effort_value(selection: Option<&SessionRuntimeSelection>) -> String {
+    selection
+        .and_then(|selection| selection.reasoning_effort.clone())
+        .unwrap_or_default()
 }
 
 fn runtime_feature_for_selection<'a>(
@@ -26352,6 +26345,16 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_effort_control_never_invents_a_default_choice() {
+        let mut selection = new_session_runtime_option("codex", "Codex").selection;
+        assert_eq!(runtime_reasoning_effort_value(Some(&selection)), "");
+        assert_eq!(runtime_reasoning_effort_value(None), "");
+
+        selection.reasoning_effort = Some("medium".into());
+        assert_eq!(runtime_reasoning_effort_value(Some(&selection)), "medium");
+    }
+
+    #[test]
     fn persisted_runtime_preferences_exclude_freeform_feature_values() {
         let mut option = new_session_runtime_option("codex", "Codex");
         option.features = vec![
@@ -26655,6 +26658,19 @@ mod tests {
             AGENT_TIMELINE_NEAR_BOTTOM_THRESHOLD_PX / 2.0,
             false,
         ));
+    }
+
+    #[test]
+    fn timeline_scroll_wheel_repaints_follow_state_only_after_inertia_is_idle() {
+        let source = include_str!("app.rs");
+        let handler = source
+            .split_once("    fn handle_timeline_scroll_wheel(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn begin_timeline_scrollbar_interaction("))
+            .map(|(body, _)| body)
+            .expect("timeline wheel handler should remain inspectable");
+
+        assert!(handler.contains(".timer(AGENT_TIMELINE_SCROLL_IDLE_DELAY)"));
+        assert_eq!(handler.matches("cx.notify();").count(), 1);
     }
 
     #[test]

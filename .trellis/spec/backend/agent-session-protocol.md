@@ -992,6 +992,13 @@ carry `rawExtension?: AgentEventRawExtension`. Absence preserves legacy JSON.
   replacement emits a new `snapshot`. The merge state stores only cumulative
   byte length and a SHA-256 prefix fingerprint, never a growing output copy;
   terminal status, turn cleanup, detach, replacement, or crash clears it.
+- The Agent manager treats an event whose provider correlation, source,
+  redaction state, and canonical payload exactly match the latest streamed
+  snapshot for the current turn as a no-op before opening a Timeline write or
+  broadcasting a live update. A status transition or a non-empty output
+  snapshot/append remains a distinct event. Desktop projections of process
+  cards must omit lossless file snapshots and raw extensions that the card
+  renderer does not consume.
 - Permission requests remain on the typed permission path. Unknown extensions
   may become a bounded generic tool event or diagnostic but cannot bypass the
   permission gate or create provider-specific public Timeline variants.
@@ -1031,6 +1038,9 @@ carry `rawExtension?: AgentEventRawExtension`. Absence preserves legacy JSON.
 - Runtime tests cover route/fence ordering, attachment isolation, snapshot /
   append / duplicate / replacement behavior, and state cleanup on completion,
   failure, replacement, detach, and crash.
+- Manager tests cover exact streamed-snapshot suppression, preservation of
+  status/output transitions, and bounded desktop projection of lossless file
+  payloads.
 - Golden tests replay every live/transcript case twice, compare both against
   expected canonical Timeline JSON, verify P1 native baseline references, and
   scan fixtures and serialized/debug output for ids, secrets, and private paths.

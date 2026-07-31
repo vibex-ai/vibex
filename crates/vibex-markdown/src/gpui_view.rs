@@ -5,14 +5,14 @@ use std::time::Duration;
 
 use ::gpui::prelude::FluentBuilder as _;
 use ::gpui::{
-    AnyElement, App, AppContext as _, BorderStyle, Bounds, ClipboardItem, Context, Edges, Element,
-    ElementId, Entity, FocusHandle, FontStyle, FontWeight, GlobalElementId, HighlightStyle, Hitbox,
-    HitboxBehavior, Image, ImageFormat, ImageSource, InspectorElementId, InteractiveElement as _,
-    IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    ParentElement as _, Pixels, Point, Render, RenderImage, ScrollAnchor, ScrollHandle,
-    SharedString, StatefulInteractiveElement as _, StrikethroughStyle, StyleRefinement,
-    Styled as _, StyledImage as _, StyledText, Task, TextLayout, UnderlineStyle, WeakEntity,
-    Window, combine_highlights, div, img, point, px, quad, transparent_black,
+    AnyElement, App, AppContext as _, AvailableSpace, BorderStyle, Bounds, ClipboardItem, Context,
+    Edges, Element, ElementId, Entity, FocusHandle, FontStyle, FontWeight, GlobalElementId,
+    HighlightStyle, Hitbox, HitboxBehavior, Image, ImageFormat, ImageSource, InspectorElementId,
+    InteractiveElement as _, IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point, Render, RenderImage, ScrollAnchor,
+    ScrollHandle, SharedString, StatefulInteractiveElement as _, StrikethroughStyle,
+    StyleRefinement, Styled as _, StyledImage as _, StyledText, Task, TextLayout, UnderlineStyle,
+    WeakEntity, Window, combine_highlights, div, img, point, px, quad, size, transparent_black,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use gpui_component::{
@@ -43,7 +43,13 @@ use crate::parser::parse_markdown;
 use crate::resource::{ResolvedResource, ResourceKind};
 use crate::svg::{SvgArtifact, SvgPolicy};
 
-const SYNCHRONOUS_PARSE_BYTES: usize = 64 * 1024;
+const SYNCHRONOUS_PARSE_BYTES: usize = 16 * 1024;
+const AGENT_BLOCK_VIRTUALIZATION_MIN_BLOCKS: usize = 24;
+const AGENT_BLOCK_VIRTUALIZATION_MIN_SOURCE_BYTES: usize = 16 * 1024;
+const AGENT_BLOCK_VIRTUALIZATION_MIN_LARGE_BLOCKS: usize = 8;
+const AGENT_BLOCK_VIRTUALIZATION_OVERSCAN_PX: f32 = 640.0;
+const AGENT_BLOCK_GAP_PX: f32 = 12.0;
+const AGENT_BLOCK_ESTIMATE_WIDTH_PX: f32 = 720.0;
 const CODE_HIGHLIGHT_TIMEOUT: Duration = Duration::from_millis(20);
 const DATA_IMAGE_CACHE_ENTRIES: usize = 16;
 const DATA_IMAGE_CACHE_BYTES: usize = 16 * 1024 * 1024;
@@ -68,8 +74,22 @@ pub struct MarkdownViewOptions {
     pub search_query: Option<Arc<str>>,
     pub images: Arc<BTreeMap<String, Arc<Image>>>,
     pub allow_http_images: bool,
+    pub streaming: bool,
     pub scroll_handle: Option<ScrollHandle>,
     pub on_open_resource: Option<MarkdownResourceHandler>,
+}
+
+fn markdown_render_options_changed(
+    previous: &MarkdownViewOptions,
+    next: &MarkdownViewOptions,
+) -> bool {
+    previous.presentation != next.presentation
+        || previous.search_query != next.search_query
+        || previous.allow_http_images != next.allow_http_images
+        || previous.streaming != next.streaming
+        || previous.scroll_handle.is_some() != next.scroll_handle.is_some()
+        || (!(previous.images.is_empty() && next.images.is_empty())
+            && !Arc::ptr_eq(&previous.images, &next.images))
 }
 
 #[derive(Clone)]
@@ -125,6 +145,11 @@ impl MarkdownView {
 
     pub fn allow_http_images(mut self, allow: bool) -> Self {
         self.options.allow_http_images = allow;
+        self
+    }
+
+    pub fn streaming(mut self, streaming: bool) -> Self {
+        self.options.streaming = streaming;
         self
     }
 
@@ -268,6 +293,134 @@ impl Element for MarkdownView {
     }
 }
 
+struct MarkdownVirtualFlow {
+    state: Entity<MarkdownViewState>,
+    total_height: Pixels,
+}
+
+impl MarkdownVirtualFlow {
+    fn new(state: Entity<MarkdownViewState>, total_height: Pixels) -> Self {
+        Self {
+            state,
+            total_height,
+        }
+    }
+}
+
+impl IntoElement for MarkdownVirtualFlow {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+struct MarkdownVirtualFlowLayoutState {
+    spacer: AnyElement,
+    blocks: Vec<AnyElement>,
+}
+
+impl Element for MarkdownVirtualFlow {
+    type RequestLayoutState = MarkdownVirtualFlowLayoutState;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut spacer = div()
+            .w_full()
+            .min_w_0()
+            .h(self.total_height)
+            .flex_none()
+            .into_any_element();
+        let layout_id = spacer.request_layout(window, cx);
+        (
+            layout_id,
+            MarkdownVirtualFlowLayoutState {
+                spacer,
+                blocks: Vec::new(),
+            },
+        )
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        layout.spacer.prepaint(window, cx);
+        layout.blocks.clear();
+
+        let viewport = window.content_mask().bounds;
+        let width = bounds.size.width.max(px(1.0));
+        let (visible_blocks, origins, blocks) = self.state.update(cx, |state, cx| {
+            let layout_changed = state.prepare_virtual_layout(width);
+            let visible_blocks = state.visible_virtual_blocks(bounds, viewport);
+            state.prepare_virtual_selection(visible_blocks.clone());
+            let origins = state.virtual_block_origins.clone();
+            let blocks = visible_blocks
+                .clone()
+                .filter_map(|index| state.render_virtual_block(index, window, cx))
+                .collect::<Vec<_>>();
+            state.normalize_text_selection();
+            if layout_changed {
+                cx.notify();
+            }
+            (visible_blocks, origins, blocks)
+        });
+
+        let available_space = size(AvailableSpace::Definite(width), AvailableSpace::MinContent);
+        let mut measurements = Vec::with_capacity(blocks.len());
+        for (index, mut block) in visible_blocks.zip(blocks) {
+            let measured = block.layout_as_root(available_space, window, cx);
+            let origin = bounds.origin + point(px(0.0), origins[index]);
+            block.prepaint_at(origin, window, cx);
+            measurements.push((index, measured.height));
+            layout.blocks.push(block);
+        }
+
+        if !measurements.is_empty() {
+            self.state.update(cx, |state, cx| {
+                if state.record_virtual_block_heights(width, &measurements) {
+                    cx.notify();
+                }
+            });
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        layout: &mut Self::RequestLayoutState,
+        _: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        layout.spacer.paint(window, cx);
+        for block in &mut layout.blocks {
+            block.paint(window, cx);
+        }
+    }
+}
+
 struct ArtifactSpec {
     node_id: NodeId,
     kind: ArtifactKind,
@@ -402,6 +555,12 @@ pub struct MarkdownViewState {
     selection_text: String,
     selection_segments: BTreeMap<usize, SelectionSegment>,
     text_selection: MarkdownTextSelection,
+    virtual_block_sizes: Arc<Vec<Pixels>>,
+    virtual_block_origins: Arc<Vec<Pixels>>,
+    virtual_layout_width: Option<Pixels>,
+    virtual_visible_blocks: Option<Range<usize>>,
+    virtualized_selection: bool,
+    select_all_document: bool,
 }
 
 impl MarkdownViewState {
@@ -412,8 +571,8 @@ impl MarkdownViewState {
         options: MarkdownViewOptions,
         cx: &mut Context<Self>,
     ) -> Self {
-        let parse_in_background =
-            document.is_none() && input.source.len() > SYNCHRONOUS_PARSE_BYTES;
+        let parse_in_background = document.is_none()
+            && (options.streaming || input.source.len() > SYNCHRONOUS_PARSE_BYTES);
         let background_input = parse_in_background.then(|| input.clone());
         let document = document.unwrap_or_else(|| {
             if parse_in_background {
@@ -454,10 +613,16 @@ impl MarkdownViewState {
             selection_text: String::new(),
             selection_segments: BTreeMap::new(),
             text_selection: MarkdownTextSelection::default(),
+            virtual_block_sizes: Arc::new(Vec::new()),
+            virtual_block_origins: Arc::new(Vec::new()),
+            virtual_layout_width: None,
+            virtual_visible_blocks: None,
+            virtualized_selection: false,
+            select_all_document: false,
         };
         this.refresh_document_state();
         if let Some(input) = background_input {
-            this.start_background_parse(input, 1, cx);
+            this.queue_background_parse(input, 1, cx);
         }
         cx.notify();
         this
@@ -470,6 +635,7 @@ impl MarkdownViewState {
         options: MarkdownViewOptions,
         cx: &mut Context<Self>,
     ) {
+        let options_changed = markdown_render_options_changed(&self.options, &options);
         self.options = options;
         if let Some(document) = document {
             let changed = self.document.revision != document.revision
@@ -481,8 +647,9 @@ impl MarkdownViewState {
                 self.parse_task = None;
                 self.apply_document(document);
                 cx.notify();
-            } else {
+            } else if options_changed {
                 self.rebuild_anchors();
+                cx.notify();
             }
             return;
         }
@@ -490,40 +657,50 @@ impl MarkdownViewState {
             && self.input.source == input.source
             && self.input.base_path == input.base_path
         {
-            self.rebuild_anchors();
+            if options_changed {
+                self.rebuild_anchors();
+                cx.notify();
+            }
             return;
         }
         self.input = input.clone();
         self.parse_generation = self.parse_generation.saturating_add(1).max(1);
         let generation = self.parse_generation;
-        if input.source.len() <= SYNCHRONOUS_PARSE_BYTES {
+        if !self.options.streaming && input.source.len() <= SYNCHRONOUS_PARSE_BYTES {
             self.parse_task = None;
             self.apply_document(Arc::new(parse_markdown(input)));
             cx.notify();
             return;
         }
-        self.start_background_parse(input, generation, cx);
+        self.queue_background_parse(input, generation, cx);
     }
 
-    fn start_background_parse(
+    fn queue_background_parse(
         &mut self,
         input: MarkdownInput,
         generation: u64,
         cx: &mut Context<Self>,
     ) {
+        if self.parse_task.is_some() {
+            return;
+        }
         let parse = cx.background_spawn(async move { Arc::new(parse_markdown(input)) });
         self.parse_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let document = parse.await;
             let _ = entity.update(cx, |this, cx| {
-                if this.parse_generation != generation
-                    || this.input.revision != document.revision
-                    || this.input.base_path != document.base_path
-                {
-                    return;
-                }
-                this.apply_document(document);
                 this.parse_task = None;
-                cx.notify();
+                if this.parse_generation == generation
+                    && this.input.revision == document.revision
+                    && this.input.source == document.source
+                    && this.input.base_path == document.base_path
+                {
+                    this.apply_document(document);
+                    cx.notify();
+                } else {
+                    let latest = this.input.clone();
+                    let latest_generation = this.parse_generation;
+                    this.queue_background_parse(latest, latest_generation, cx);
+                }
             });
         }));
     }
@@ -535,8 +712,11 @@ impl MarkdownViewState {
 
     fn refresh_document_state(&mut self) {
         self.text_selection = MarkdownTextSelection::default();
+        self.select_all_document = false;
         self.selection_segments.clear();
         self.selection_text.clear();
+        self.virtual_visible_blocks = None;
+        self.virtual_layout_width = None;
         let mut live_nodes = BTreeSet::new();
         let mut artifact_specs = Vec::new();
         collect_document_state(
@@ -558,7 +738,153 @@ impl MarkdownViewState {
             .retain(|(node_id, _), _| self.live_nodes.contains(node_id));
         self.artifact_controller
             .prune(&self.view_id, self.document.revision, &self.live_nodes);
+        self.rebuild_virtual_layout(AGENT_BLOCK_ESTIMATE_WIDTH_PX);
         self.rebuild_anchors();
+    }
+
+    fn should_virtualize_blocks(&self) -> bool {
+        if self.options.presentation != MarkdownPresentation::Agent {
+            return false;
+        }
+        let block_count = self.document.blocks.len();
+        block_count >= AGENT_BLOCK_VIRTUALIZATION_MIN_BLOCKS
+            || (self.document.source.len() >= AGENT_BLOCK_VIRTUALIZATION_MIN_SOURCE_BYTES
+                && block_count >= AGENT_BLOCK_VIRTUALIZATION_MIN_LARGE_BLOCKS)
+    }
+
+    fn rebuild_virtual_layout(&mut self, width: f32) {
+        let width = width.max(1.0);
+        let chars_per_line = ((width / 7.0).floor() as usize).clamp(24, 120);
+        let block_count = self.document.blocks.len();
+        let mut sizes = Vec::with_capacity(block_count);
+        let mut origins = Vec::with_capacity(block_count);
+        let mut origin = px(0.0);
+        for (index, block) in self.document.blocks.iter().enumerate() {
+            origins.push(origin);
+            let gap = if index + 1 == block_count {
+                0.0
+            } else {
+                AGENT_BLOCK_GAP_PX
+            };
+            let height = estimated_markdown_block_height(
+                block,
+                self.document.source_for(block.range),
+                chars_per_line,
+            ) + gap;
+            let height = px(height.ceil().max(1.0));
+            sizes.push(height);
+            origin += height;
+        }
+        self.virtual_block_sizes = Arc::new(sizes);
+        self.virtual_block_origins = Arc::new(origins);
+    }
+
+    fn prepare_virtual_layout(&mut self, width: Pixels) -> bool {
+        if self
+            .virtual_layout_width
+            .is_some_and(|current| f32::from(current - width).abs() < 1.0)
+        {
+            return false;
+        }
+        self.virtual_layout_width = Some(width);
+        self.rebuild_virtual_layout(f32::from(width));
+        true
+    }
+
+    fn virtual_total_height(&self) -> Pixels {
+        self.virtual_block_origins
+            .last()
+            .zip(self.virtual_block_sizes.last())
+            .map(|(origin, size)| *origin + *size)
+            .unwrap_or_default()
+    }
+
+    fn visible_virtual_blocks(
+        &self,
+        flow_bounds: Bounds<Pixels>,
+        viewport: Bounds<Pixels>,
+    ) -> Range<usize> {
+        let block_count = self.virtual_block_sizes.len();
+        if block_count == 0 || flow_bounds.size.width <= px(0.0) {
+            return 0..0;
+        }
+        let visible_top = viewport.top() - px(AGENT_BLOCK_VIRTUALIZATION_OVERSCAN_PX);
+        let visible_bottom = viewport.bottom() + px(AGENT_BLOCK_VIRTUALIZATION_OVERSCAN_PX);
+        let first = self
+            .virtual_block_origins
+            .iter()
+            .zip(self.virtual_block_sizes.iter())
+            .position(|(origin, size)| flow_bounds.top() + *origin + *size > visible_top)
+            .unwrap_or(block_count);
+        let end = self.virtual_block_origins[first..]
+            .partition_point(|origin| flow_bounds.top() + *origin < visible_bottom)
+            .saturating_add(first)
+            .min(block_count);
+        first..end
+    }
+
+    fn prepare_virtual_selection(&mut self, visible_blocks: Range<usize>) {
+        if self.virtual_visible_blocks.as_ref() != Some(&visible_blocks) {
+            if !self.select_all_document {
+                self.text_selection = MarkdownTextSelection::default();
+            }
+            self.virtual_visible_blocks = Some(visible_blocks);
+        }
+    }
+
+    fn render_virtual_block(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let block = self.document.blocks.get(index)?.clone();
+        let is_last = index + 1 == self.document.blocks.len();
+        Some(
+            div()
+                .w_full()
+                .min_w_0()
+                .when(!is_last, |this| this.pb(px(AGENT_BLOCK_GAP_PX)))
+                .child(self.render_block(&block, window, cx))
+                .into_any_element(),
+        )
+    }
+
+    fn record_virtual_block_heights(
+        &mut self,
+        width: Pixels,
+        measurements: &[(usize, Pixels)],
+    ) -> bool {
+        if self
+            .virtual_layout_width
+            .is_none_or(|current| f32::from(current - width).abs() >= 1.0)
+        {
+            return false;
+        }
+        let mut sizes = self.virtual_block_sizes.as_ref().clone();
+        let mut changed = false;
+        for (index, measured) in measurements {
+            let measured = px(f32::from(*measured).ceil().max(1.0));
+            let Some(current) = sizes.get_mut(*index) else {
+                continue;
+            };
+            if f32::from(*current - measured).abs() >= 1.0 {
+                *current = measured;
+                changed = true;
+            }
+        }
+        if !changed {
+            return false;
+        }
+        let mut origins = Vec::with_capacity(sizes.len());
+        let mut origin = px(0.0);
+        for height in &sizes {
+            origins.push(origin);
+            origin += *height;
+        }
+        self.virtual_block_sizes = Arc::new(sizes);
+        self.virtual_block_origins = Arc::new(origins);
+        true
     }
 
     fn rebuild_anchors(&mut self) {
@@ -840,6 +1166,14 @@ impl MarkdownViewState {
             self.text_selection = MarkdownTextSelection::default();
             return;
         }
+        if self.select_all_document {
+            self.text_selection = MarkdownTextSelection {
+                anchor: 0,
+                head: self.selection_text.len(),
+                pending: false,
+            };
+            return;
+        }
         self.text_selection.anchor = text_boundary_at_or_before(
             &self.selection_text,
             self.text_selection.anchor.min(self.selection_text.len()),
@@ -898,6 +1232,7 @@ impl MarkdownViewState {
             self.clear_text_selection(cx);
             return;
         };
+        self.select_all_document = false;
         let range = match event.click_count {
             2 => selection_word_range(&self.selection_text, index),
             3 => selection_line_range(&self.selection_text, index),
@@ -954,14 +1289,18 @@ impl MarkdownViewState {
     }
 
     fn clear_text_selection(&mut self, cx: &mut Context<Self>) {
-        if self.text_selection == MarkdownTextSelection::default() {
+        if self.text_selection == MarkdownTextSelection::default() && !self.select_all_document {
             return;
         }
         self.text_selection = MarkdownTextSelection::default();
+        self.select_all_document = false;
         cx.notify();
     }
 
     fn selected_text(&self) -> String {
+        if self.select_all_document {
+            return self.document.plain_text();
+        }
         let range = self.text_selection.range();
         self.selection_text
             .get(range)
@@ -979,10 +1318,11 @@ impl MarkdownViewState {
     }
 
     fn select_all_text(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
-        if self.selection_text.is_empty() {
+        if self.selection_text.is_empty() && !self.virtualized_selection {
             cx.propagate();
             return;
         }
+        self.select_all_document = self.virtualized_selection;
         self.text_selection = MarkdownTextSelection {
             anchor: 0,
             head: self.selection_text.len(),
@@ -1252,11 +1592,45 @@ fn image_alt_text(alt: &str) -> String {
     }
 }
 
+fn estimated_markdown_block_height(block: &BlockNode, source: &str, chars_per_line: usize) -> f32 {
+    let wrapped_lines = source
+        .lines()
+        .map(|line| line.chars().count().max(1).div_ceil(chars_per_line.max(1)))
+        .sum::<usize>()
+        .max(1) as f32;
+    match &block.kind {
+        Block::Heading { level, .. } => match level {
+            1 => 32.0,
+            2 => 29.0,
+            3 => 26.0,
+            4 => 24.0,
+            _ => 22.0,
+        },
+        Block::Code { source, .. } | Block::Literal(source) => {
+            source.lines().count().max(1) as f32 * 20.0 + 42.0
+        }
+        Block::Diff { source } => source.lines().count().max(1) as f32 * 20.0 + 30.0,
+        Block::Math { .. } | Block::Diagram { .. } => 220.0,
+        Block::Table { header, rows, .. } => {
+            (rows.len() + usize::from(header.is_some())).max(1) as f32 * 36.0 + 2.0
+        }
+        Block::Image(_) => 220.0,
+        Block::ThematicBreak => 8.0,
+        Block::Progress { .. } => 28.0,
+        _ => wrapped_lines * 22.0,
+    }
+    .max(1.0)
+}
+
 impl Render for MarkdownViewState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_artifacts(window, cx);
         self.begin_selection_frame();
-        let blocks = self.document.blocks.clone();
+        let virtualized = self.should_virtualize_blocks();
+        self.virtualized_selection = virtualized;
+        if !virtualized {
+            self.virtual_visible_blocks = None;
+        }
         let focus_handle = self.focus_handle.clone();
         let mut root = v_flex()
             .id(format!("markdown-root:{}", self.view_id))
@@ -1266,7 +1640,7 @@ impl Render for MarkdownViewState {
             .on_action(cx.listener(Self::select_all_text))
             .w_full()
             .min_w_0()
-            .gap_3()
+            .when(!virtualized, |this| this.gap_3())
             .text_sm()
             .line_height(px(22.0))
             .text_color(match self.options.presentation {
@@ -1317,10 +1691,18 @@ impl Render for MarkdownViewState {
                 )
                 .when(outline_open, |this| this.child(self.render_toc(cx)));
         }
-        for block in blocks.iter() {
-            root = root.child(self.render_block(block, window, cx));
+        if virtualized {
+            root = root.child(MarkdownVirtualFlow::new(
+                cx.entity().clone(),
+                self.virtual_total_height(),
+            ));
+        } else {
+            let blocks = self.document.blocks.clone();
+            for block in blocks.iter() {
+                root = root.child(self.render_block(block, window, cx));
+            }
+            self.normalize_text_selection();
         }
-        self.normalize_text_selection();
         root
     }
 }
@@ -2688,10 +3070,14 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    use ::gpui::{Modifiers, MouseButton, TestAppContext, VisualTestContext};
+    use ::gpui::{
+        InteractiveElement as _, Modifiers, MouseButton, StatefulInteractiveElement as _,
+        TestAppContext, VisualTestContext,
+    };
     use gpui_component::{ElementExt as _, Theme, ThemeMode};
 
     use super::*;
+    use crate::MarkdownSurface;
 
     struct MarkdownLayoutProbe {
         input: MarkdownInput,
@@ -2703,6 +3089,12 @@ mod tests {
     struct MarkdownSelectionProbe {
         input: MarkdownInput,
         state: Entity<MarkdownViewState>,
+    }
+
+    struct MarkdownVirtualizationProbe {
+        input: MarkdownInput,
+        state: Entity<MarkdownViewState>,
+        scroll: ScrollHandle,
     }
 
     impl MarkdownSelectionProbe {
@@ -2720,11 +3112,52 @@ mod tests {
         }
     }
 
+    impl MarkdownVirtualizationProbe {
+        fn new(input: MarkdownInput, cx: &mut Context<Self>) -> Self {
+            let scroll = ScrollHandle::new();
+            let document = Arc::new(parse_markdown(input.clone()));
+            let state = cx.new(|cx| {
+                MarkdownViewState::new(
+                    "virtualization-probe".into(),
+                    input.clone(),
+                    Some(document),
+                    MarkdownViewOptions {
+                        presentation: MarkdownPresentation::Agent,
+                        scroll_handle: Some(scroll.clone()),
+                        ..MarkdownViewOptions::default()
+                    },
+                    cx,
+                )
+            });
+            Self {
+                input,
+                state,
+                scroll,
+            }
+        }
+    }
+
     impl Render for MarkdownSelectionProbe {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let mut markdown = MarkdownView::new("selection-probe", self.input.clone());
             markdown.state = Some(self.state.clone());
             div().w(px(560.0)).child(markdown)
+        }
+    }
+
+    impl Render for MarkdownVirtualizationProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let mut markdown = MarkdownView::new("virtualization-probe", self.input.clone())
+                .presentation(MarkdownPresentation::Agent)
+                .scroll_handle(self.scroll.clone());
+            markdown.state = Some(self.state.clone());
+            div()
+                .id("virtualization-probe-scroll")
+                .w(px(560.0))
+                .h(px(240.0))
+                .track_scroll(&self.scroll)
+                .overflow_y_scroll()
+                .child(markdown)
         }
     }
 
@@ -2773,6 +3206,57 @@ mod tests {
                 && style.underline.is_some()
                 && style.strikethrough.is_some()
         }));
+    }
+
+    #[::gpui::test]
+    fn long_agent_markdown_only_materializes_viewport_blocks(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let source = (0..120)
+            .map(|index| {
+                format!(
+                    "## Section {index}\n\nParagraph {index} contains enough text to wrap in the Agent message viewport and exercise block measurement."
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let input = MarkdownInput::new(source, "", 1).surface(MarkdownSurface::Agent);
+        let (probe, cx) = cx.add_window_view(|_, cx| MarkdownVirtualizationProbe::new(input, cx));
+
+        for _ in 0..4 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        }
+
+        let state = probe.read_with(cx, |probe, _| probe.state.clone());
+        let (block_count, first_range, total_height) = state.read_with(cx, |state, _| {
+            (
+                state.document.blocks.len(),
+                state.virtual_visible_blocks.clone().unwrap_or_default(),
+                state.virtual_total_height(),
+            )
+        });
+        assert!(block_count >= 200);
+        assert!(!first_range.is_empty());
+        assert!(first_range.len() < block_count / 4);
+        assert!(total_height > px(240.0));
+
+        let scroll = probe.read_with(cx, |probe, _| probe.scroll.clone());
+        scroll.set_offset(point(px(0.0), px(-4_000.0)));
+        for _ in 0..4 {
+            cx.update(|window, cx| {
+                window.refresh();
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        }
+
+        let second_range = state.read_with(cx, |state, _| {
+            state.virtual_visible_blocks.clone().unwrap_or_default()
+        });
+        assert!(second_range.start > first_range.start);
+        assert!(second_range.len() < block_count / 4);
     }
 
     #[::gpui::test]
@@ -3123,6 +3607,56 @@ mod tests {
                     .iter()
                     .all(|diagnostic| diagnostic.code != "markdown_parse_pending")
             );
+        });
+    }
+
+    #[::gpui::test]
+    fn streaming_markdown_uses_one_background_pipeline_and_catches_up_to_latest(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let options = MarkdownViewOptions {
+            streaming: true,
+            presentation: MarkdownPresentation::Agent,
+            ..MarkdownViewOptions::default()
+        };
+        let observed_pending = Rc::new(Cell::new(false));
+        let pending = observed_pending.clone();
+        let (state, cx) = cx.add_window_view(|_, cx| {
+            let state = MarkdownViewState::new(
+                "streaming-document".into(),
+                MarkdownInput::new("first", "", 1),
+                None,
+                options.clone(),
+                cx,
+            );
+            pending.set(
+                state
+                    .document
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "markdown_parse_pending"),
+            );
+            state
+        });
+        assert!(observed_pending.get());
+
+        state.update(cx, |state, cx| {
+            state.update(
+                MarkdownInput::new("second", "", 2),
+                None,
+                options.clone(),
+                cx,
+            );
+            state.update(MarkdownInput::new("latest", "", 3), None, options, cx);
+            assert!(state.parse_task.is_some());
+        });
+        cx.run_until_parked();
+
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.document.revision, 3);
+            assert_eq!(state.document.source.as_ref(), "latest");
+            assert!(state.parse_task.is_none());
         });
     }
 

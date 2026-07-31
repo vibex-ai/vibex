@@ -512,6 +512,12 @@ TimelineModel::replace_authoritative(session_id, items)
 TimelineModel::apply_live(TimelineLiveEvent) -> changed
 TimelineModel::mark_lagged()
 
+MarkdownViewState::should_virtualize_blocks() -> bool
+MarkdownVirtualFlow {
+  outer_scroll_content_mask, estimated_total_height,
+  measured_top_level_block_heights, overscanned_visible_range
+}
+
 AgentSessionViewCacheEntry {
   timeline, runtime_selection, timeline_follow, timeline_scroll,
   collapsed_timeline_rows, timeline_process_expansion
@@ -577,6 +583,15 @@ ComposerUiState.runtime_selections_by_agent:
   virtualizes Turns, keeps an active Turn's process open, defaults completed
   process history closed, and never repeats Agent/Streaming attribution per
   delta row.
+- Turn virtualization is not sufficient for one extremely tall Agent message.
+  Long `MarkdownPresentation::Agent` documents must additionally virtualize
+  top-level Markdown blocks against the outer timeline content mask, retain a
+  bounded overscan window, and converge estimated block heights to measured
+  heights. The virtual flow reserves the complete document height and continues
+  to use the timeline's one vertical scroll handle; it must not add an inner
+  height cap or nested vertical scrollbar. Short Agent messages and non-Agent
+  document surfaces keep the full-render path. Markdown above the synchronous
+  parse budget parses in the background and applies only the latest generation.
 - A GPUI User bubble uses one full-width `flex + justify_end` wrapper and an
   intrinsic-width, non-shrinking bubble with a bounded maximum width. Keep its
   text body as a plain intrinsic child: do not put `min_w_0` on it and do not
@@ -684,6 +699,10 @@ ComposerUiState.runtime_selections_by_agent:
   Composer controls may remain unavailable until their projection arrives.
 - A non-empty User message projects into a zero/invisible-width bubble -> reject
   the layout; keep the single right-aligned wrapper and intrinsic bubble width.
+- A long Agent Markdown view materializes every top-level block for each scroll
+  frame, reports only the viewport height, or creates a second vertical scroll
+  surface -> reject the layout. Keep the full estimated/measured extent while
+  materializing only the content-mask range plus bounded overscan.
 - Coordinator rejects or task join fails -> preserve Composer text and
   attachments and show the typed/bounded error.
 - Runtime event stream lags -> keep fallback polling active and refetch the
@@ -717,6 +736,11 @@ ComposerUiState.runtime_selections_by_agent:
   synchronously while an authoritative prefix refresh runs behind the cached view.
 - Base: a two-character User message remains a readable right-aligned bubble,
   including when the idle turn has only streamed deltas and no final message.
+- Good: a response with hundreds of Markdown blocks retains its full timeline
+  height while the first frame and a later scroll position each materialize only
+  a small viewport-relative block range.
+- Base: a short response uses the normal full Markdown renderer, including its
+  existing cross-block text selection and resource behavior.
 - Good: switch from session A to B while A's runtime switch is pending; B loads
   its own selection and remains enabled when A finishes.
 - Good: choose `high` for Codex and `low` for Claude, switch between their
@@ -745,6 +769,12 @@ ComposerUiState.runtime_selections_by_agent:
 - GPUI source-contract coverage keeps the User bubble non-shrinking and bounded,
   rejects `min_w_0` or `overflow_y_scrollbar` in its intrinsic body helper, and
   keeps runtime catalog/Owner attach calls outside the timeline loading task.
+- The `vibex-markdown` GPUI fixture must render a document with hundreds of
+  top-level blocks inside a fixed-height outer scroll surface, assert that the
+  visible range is a strict subset, change the outer offset, and assert that the
+  range advances while total height remains larger than the viewport. Desktop
+  coverage must continue proving that long Agent Markdown exceeds the old height
+  cap and does not gain an inner scrollbar.
 - GPUI unit tests cover LRU recency/eviction and complete-prefix pagination; a
   cached session switch must not clear its Timeline or enter a loading state.
 - `desktop-model` runtime tests feed descriptions and shuffled Effort values,
@@ -803,6 +833,20 @@ attach Owner -> wait for provider restore -> fetch persisted timeline
 adjacent compatible deltas -> one stable row -> adjacent final replaces body
 switch opened session -> restore bounded cache -> refresh authoritative prefix
 fetch persisted timeline -> end loading; attach Owner in the background
+```
+
+#### Wrong
+
+```text
+virtualize Turn -> render every block of its 100,000-character Agent message
+long Agent message -> max-height container -> nested vertical scrollbar
+```
+
+#### Correct
+
+```text
+virtualize Turn -> reserve full Markdown height -> render content-mask blocks + overscan
+large parse -> background generation fence -> latest document replaces prior render
 ```
 
 #### Wrong

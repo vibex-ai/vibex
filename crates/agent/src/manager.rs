@@ -1336,7 +1336,19 @@ impl AgentManager {
             }
         };
         let turn_completed = turn_result.completed;
+        let streamed_event_indices = appended
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                item.provider_correlation_id
+                    .as_ref()
+                    .map(|correlation| (correlation.clone(), index))
+            })
+            .collect::<HashMap<_, _>>();
         for event in turn_result.events {
+            if provider_event_was_streamed(&event, &appended, &streamed_event_indices) {
+                continue;
+            }
             if let TimelinePayload::PermissionRequest(permission) = &event.payload {
                 if let Err(err) = PermissionRepository::insert_request(&conn, permission) {
                     let _ = self.finish_turn_with_error_on_conn_with_attribution(
@@ -1562,11 +1574,19 @@ impl AgentManager {
         let mut needs_input = false;
         let mut provider_output_started = false;
         let mut event_receiver_open = true;
+        let mut streamed_event_indices = HashMap::<String, usize>::new();
         let turn_result = loop {
             if event_receiver_open {
                 tokio::select! {
                     event = event_receiver.recv(), if event_receiver_open => {
                         if let Some(event) = event {
+                            if provider_event_was_streamed(
+                                &event,
+                                &appended,
+                                &streamed_event_indices,
+                            ) {
+                                continue;
+                            }
                             let item = match self.handle_streamed_provider_event(
                                 &session.id,
                                 event,
@@ -1585,7 +1605,13 @@ impl AgentManager {
                                 }
                             };
                             provider_output_started = true;
-                            push_or_replace_timeline_item(&mut appended, item);
+                            let index = push_or_replace_timeline_item(&mut appended, item);
+                            if let Some(correlation) = appended[index]
+                                .provider_correlation_id
+                                .as_ref()
+                            {
+                                streamed_event_indices.insert(correlation.clone(), index);
+                            }
                         } else {
                             event_receiver_open = false;
                         }
@@ -1598,6 +1624,9 @@ impl AgentManager {
         };
 
         while let Ok(event) = event_receiver.try_recv() {
+            if provider_event_was_streamed(&event, &appended, &streamed_event_indices) {
+                continue;
+            }
             let item = match self.handle_streamed_provider_event(
                 &session.id,
                 event,
@@ -1616,7 +1645,10 @@ impl AgentManager {
                 }
             };
             provider_output_started = true;
-            push_or_replace_timeline_item(&mut appended, item);
+            let index = push_or_replace_timeline_item(&mut appended, item);
+            if let Some(correlation) = appended[index].provider_correlation_id.as_ref() {
+                streamed_event_indices.insert(correlation.clone(), index);
+            }
         }
         match turn_result {
             Ok(turn_result) => ProviderTurnAttemptOutcome::Success(ProviderTurnAttemptSuccess {
@@ -2700,15 +2732,41 @@ fn usage_counter_origin_for_switch_method(
     }
 }
 
-fn push_or_replace_timeline_item(items: &mut Vec<TimelineItem>, item: TimelineItem) {
-    if let Some(existing) = items
+fn push_or_replace_timeline_item(items: &mut Vec<TimelineItem>, item: TimelineItem) -> usize {
+    if let Some((index, existing)) = items
         .iter_mut()
-        .find(|existing| existing.id == item.id || existing.sequence == item.sequence)
+        .enumerate()
+        .find(|(_, existing)| existing.id == item.id || existing.sequence == item.sequence)
     {
         *existing = item;
-        return;
+        return index;
     }
+    let index = items.len();
     items.push(item);
+    index
+}
+
+fn provider_event_matches_timeline_item(event: &ProviderEvent, item: &TimelineItem) -> bool {
+    item.provider_correlation_id == event.provider_correlation_id
+        && item.source == event.source
+        && item.payload == event.payload
+        && item.redaction_state == event.redaction_state
+}
+
+fn provider_event_was_streamed(
+    event: &ProviderEvent,
+    streamed_items: &[TimelineItem],
+    streamed_event_indices: &HashMap<String, usize>,
+) -> bool {
+    event
+        .provider_correlation_id
+        .as_ref()
+        .is_some_and(|correlation| {
+            streamed_event_indices
+                .get(correlation)
+                .and_then(|index| streamed_items.get(*index))
+                .is_some_and(|item| provider_event_matches_timeline_item(event, item))
+        })
 }
 
 fn describe_runtime_route(route: &vibex_core::AgentRuntimeRouteKey) -> String {
@@ -3470,6 +3528,121 @@ mod tests {
         assert!(projected.iter().all(|item| item.correlation_id.is_none()
             && item.provider_correlation_id.is_none()
             && item.execution_attribution.is_none()));
+    }
+
+    #[test]
+    fn final_turn_result_skips_only_exact_streamed_provider_events() {
+        let session_id = VibexSessionId::new();
+        let correlation = "provider-file-change".to_string();
+        let payload = TimelinePayload::FileOperation(vibex_core::FileOperationPayload {
+            operation: vibex_core::FileOperationKind::Edit,
+            path: "apps/desktop/src/app.rs".into(),
+            summary: "Edited app.rs".into(),
+            old_text: Some("before".repeat(1024)),
+            new_text: Some("after".repeat(1024)),
+            raw_extension: None,
+        });
+        let streamed = TimelineItem {
+            id: vibex_core::TimelineItemId::new(),
+            session_id,
+            sequence: 1,
+            timestamp_ms: 1,
+            source: TimelineSource::Agent,
+            kind: payload.kind(),
+            correlation_id: None,
+            provider_correlation_id: Some(correlation.clone()),
+            redaction_state: TimelineRedactionState::None,
+            execution_attribution: None,
+            payload: payload.clone(),
+        };
+        let indices = HashMap::from([(correlation.clone(), 0)]);
+        let duplicate = ProviderEvent {
+            source: TimelineSource::Agent,
+            payload,
+            provider_correlation_id: Some(correlation.clone()),
+            redaction_state: TimelineRedactionState::None,
+        };
+        assert!(provider_event_was_streamed(
+            &duplicate,
+            std::slice::from_ref(&streamed),
+            &indices,
+        ));
+
+        let changed = ProviderEvent {
+            payload: TimelinePayload::FileOperation(vibex_core::FileOperationPayload {
+                operation: vibex_core::FileOperationKind::Edit,
+                path: "apps/desktop/src/app.rs".into(),
+                summary: "Edited app.rs again".into(),
+                old_text: None,
+                new_text: None,
+                raw_extension: None,
+            }),
+            ..duplicate
+        };
+        assert!(!provider_event_was_streamed(
+            &changed,
+            &[streamed],
+            &indices,
+        ));
+    }
+
+    #[test]
+    fn streamed_event_index_keeps_state_changes_but_drops_repeated_snapshots() {
+        let session_id = VibexSessionId::new();
+        let correlation = "provider-command".to_string();
+        let make_event = |status| ProviderEvent {
+            source: TimelineSource::Agent,
+            payload: TimelinePayload::Command(vibex_core::CommandPayload {
+                command: "cargo check".into(),
+                cwd: Some("/workspace".into()),
+                status,
+                exit_code: None,
+                output_summary: None,
+                raw_extension: None,
+            }),
+            provider_correlation_id: Some(correlation.clone()),
+            redaction_state: TimelineRedactionState::None,
+        };
+        let mut items = Vec::new();
+        let mut indices = HashMap::new();
+        let started = make_event(vibex_core::CommandStatus::Started);
+        assert!(!provider_event_was_streamed(&started, &items, &indices));
+        let started_item = TimelineItem {
+            id: vibex_core::TimelineItemId::new(),
+            session_id: session_id.clone(),
+            sequence: 1,
+            timestamp_ms: 1,
+            source: started.source,
+            kind: started.payload.kind(),
+            correlation_id: None,
+            provider_correlation_id: started.provider_correlation_id.clone(),
+            redaction_state: started.redaction_state,
+            execution_attribution: None,
+            payload: started.payload.clone(),
+        };
+        let index = push_or_replace_timeline_item(&mut items, started_item);
+        indices.insert(correlation.clone(), index);
+        assert!(provider_event_was_streamed(&started, &items, &indices));
+
+        let completed = make_event(vibex_core::CommandStatus::Completed);
+        assert!(!provider_event_was_streamed(&completed, &items, &indices));
+        let completed_item = TimelineItem {
+            id: vibex_core::TimelineItemId::new(),
+            session_id,
+            sequence: 2,
+            timestamp_ms: 2,
+            source: completed.source,
+            kind: completed.payload.kind(),
+            correlation_id: None,
+            provider_correlation_id: completed.provider_correlation_id.clone(),
+            redaction_state: completed.redaction_state,
+            execution_attribution: None,
+            payload: completed.payload.clone(),
+        };
+        let index = push_or_replace_timeline_item(&mut items, completed_item);
+        indices.insert(correlation, index);
+        assert!(provider_event_was_streamed(&completed, &items, &indices));
+        assert_eq!(items.len(), 2);
     }
 
     #[test]

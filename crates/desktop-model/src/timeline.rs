@@ -44,27 +44,56 @@ impl TimelineModel {
     }
 
     pub fn apply_live(&mut self, event: TimelineLiveEvent) -> bool {
-        if self.session_id.as_ref() != Some(&event.session_id)
-            || event.sequence != event.item.sequence
-            || event.item.session_id != event.session_id
-        {
-            return false;
+        self.apply_live_batch(std::iter::once(event)) > 0
+    }
+
+    pub fn apply_live_batch(
+        &mut self,
+        events: impl IntoIterator<Item = TimelineLiveEvent>,
+    ) -> usize {
+        let mut changed = 0;
+        for event in events {
+            if self.session_id.as_ref() != Some(&event.session_id)
+                || event.sequence != event.item.sequence
+                || event.item.session_id != event.session_id
+            {
+                continue;
+            }
+            if self
+                .authoritative_end_sequence
+                .is_some_and(|end| event.sequence > end.saturating_add(1))
+            {
+                self.needs_authoritative_refetch = true;
+            }
+
+            if self
+                .items
+                .last()
+                .is_none_or(|last| event.sequence > last.sequence)
+            {
+                self.items.push(event.item);
+                self.authoritative_end_sequence = Some(event.sequence);
+                changed += 1;
+                continue;
+            }
+
+            match self
+                .items
+                .binary_search_by_key(&event.sequence, |item| item.sequence)
+            {
+                Ok(index) if self.items[index] != event.item => {
+                    self.items[index] = event.item;
+                    changed += 1;
+                }
+                Ok(_) => {}
+                Err(index) => {
+                    self.items.insert(index, event.item);
+                    changed += 1;
+                }
+            }
+            self.authoritative_end_sequence = self.items.last().map(|item| item.sequence);
         }
-        if self
-            .authoritative_end_sequence
-            .is_some_and(|end| event.sequence > end.saturating_add(1))
-        {
-            self.needs_authoritative_refetch = true;
-        }
-        let mut by_sequence = std::mem::take(&mut self.items)
-            .into_iter()
-            .map(|item| (item.sequence, item))
-            .collect::<BTreeMap<_, _>>();
-        let changed = by_sequence.get(&event.sequence) != Some(&event.item);
-        by_sequence.insert(event.sequence, event.item);
-        self.items = by_sequence.into_values().collect();
-        self.authoritative_end_sequence = self.items.last().map(|item| item.sequence);
-        if changed {
+        if changed > 0 {
             self.revision = self.revision.wrapping_add(1);
         }
         changed
@@ -269,6 +298,59 @@ mod tests {
             model.turns()[0].conclusion_item_id.as_deref(),
             Some("timeline_2")
         );
+    }
+
+    #[test]
+    fn live_batch_keeps_order_and_bumps_revision_once() {
+        let session = VibexSessionId::parse("session_batch").unwrap();
+        let payload = |text: &str| {
+            TimelinePayload::AgentMessage(AgentMessagePayload {
+                text: text.into(),
+                is_final: false,
+            })
+        };
+        let mut model = TimelineModel::default();
+        model.replace_authoritative(session.clone(), [item(&session, 1, payload("one"))]);
+        let revision = model.revision;
+        let three = item(&session, 3, payload("three"));
+        let two = item(&session, 2, payload("two"));
+
+        assert_eq!(
+            model.apply_live_batch([
+                TimelineLiveEvent {
+                    session_id: session.clone(),
+                    sequence: three.sequence,
+                    item: three.clone(),
+                },
+                TimelineLiveEvent {
+                    session_id: session.clone(),
+                    sequence: two.sequence,
+                    item: two,
+                },
+            ]),
+            2
+        );
+        assert_eq!(model.revision, revision.wrapping_add(1));
+        assert_eq!(
+            model
+                .items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(model.needs_authoritative_refetch);
+
+        let revision = model.revision;
+        assert_eq!(
+            model.apply_live_batch([TimelineLiveEvent {
+                session_id: session.clone(),
+                sequence: three.sequence,
+                item: three,
+            }]),
+            0
+        );
+        assert_eq!(model.revision, revision);
     }
 
     #[test]

@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use vibex_core::{
-    AgentSession, AgentSessionState, PermissionRequestStatus, TimelineItem, TimelineItemKind,
-    TimelinePayload, VibexSessionId,
+    AgentSession, AgentSessionState, FileOperationPayload, PermissionRequestStatus, TimelineItem,
+    TimelineItemKind, TimelinePayload, VibexSessionId,
 };
 
 use crate::SidebarState;
@@ -234,7 +234,7 @@ pub fn timeline_conversation_turns(
     let visible_items = items
         .iter()
         .filter(|item| item.kind != TimelineItemKind::SystemNotice)
-        .cloned()
+        .map(timeline_presentation_item)
         .collect::<Vec<_>>();
     let mut rows_by_turn = BTreeMap::<String, Vec<TimelineRow>>::new();
     for row in timeline_rows(&visible_items) {
@@ -370,6 +370,39 @@ pub fn timeline_conversation_turns(
         });
     }
     turns
+}
+
+fn timeline_presentation_item(item: &TimelineItem) -> TimelineItem {
+    let payload = match &item.payload {
+        TimelinePayload::FileOperation(operation) => {
+            TimelinePayload::FileOperation(FileOperationPayload {
+                operation: operation.operation,
+                path: operation.path.clone(),
+                summary: operation.summary.clone(),
+                // Full before/after snapshots remain durable authority in the
+                // TimelineItem. The workbench row renders only path/summary, so
+                // carrying multi-megabyte file copies into every derived Turn
+                // would multiply memory and block the GPUI thread.
+                old_text: None,
+                new_text: None,
+                raw_extension: None,
+            })
+        }
+        payload => payload.clone(),
+    };
+    TimelineItem {
+        id: item.id.clone(),
+        session_id: item.session_id.clone(),
+        sequence: item.sequence,
+        timestamp_ms: item.timestamp_ms,
+        source: item.source,
+        kind: item.kind,
+        correlation_id: item.correlation_id.clone(),
+        provider_correlation_id: item.provider_correlation_id.clone(),
+        redaction_state: item.redaction_state,
+        execution_attribution: item.execution_attribution.clone(),
+        payload,
+    }
 }
 
 pub fn timeline_process_activity_groups(rows: &[TimelineRow]) -> Vec<TimelineProcessActivityGroup> {
@@ -1115,6 +1148,50 @@ mod tests {
             execution_attribution: None,
             payload,
         }
+    }
+
+    #[test]
+    fn timeline_presentation_does_not_copy_lossless_file_snapshots() {
+        let original = item(
+            1,
+            None,
+            TimelinePayload::FileOperation(FileOperationPayload {
+                operation: vibex_core::FileOperationKind::Edit,
+                path: "apps/desktop/src/app.rs".into(),
+                summary: "Edited app.rs".into(),
+                old_text: Some("a".repeat(1_000_000)),
+                new_text: Some("b".repeat(1_000_000)),
+                raw_extension: Some(vibex_core::AgentEventRawExtension::new(
+                    Vec::new(),
+                    Some("raw input that is not rendered".into()),
+                    None,
+                    Vec::new(),
+                    std::collections::BTreeMap::new(),
+                    false,
+                )),
+            }),
+        );
+
+        let projected = timeline_presentation_item(&original);
+        let TimelinePayload::FileOperation(original_file) = &original.payload else {
+            panic!("expected original file operation");
+        };
+        let TimelinePayload::FileOperation(projected_file) = projected.payload else {
+            panic!("expected projected file operation");
+        };
+        assert_eq!(
+            original_file.old_text.as_ref().map(String::len),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            original_file.new_text.as_ref().map(String::len),
+            Some(1_000_000)
+        );
+        assert_eq!(projected_file.path, original_file.path);
+        assert_eq!(projected_file.summary, original_file.summary);
+        assert!(projected_file.old_text.is_none());
+        assert!(projected_file.new_text.is_none());
+        assert!(projected_file.raw_extension.is_none());
     }
 
     #[test]
