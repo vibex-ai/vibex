@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,11 +9,12 @@ use ::gpui::{
     AnyElement, App, AppContext as _, AvailableSpace, BorderStyle, Bounds, ClipboardItem, Context,
     Edges, Element, ElementId, Entity, FocusHandle, FontStyle, FontWeight, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, Image, ImageFormat, ImageSource, InspectorElementId,
-    InteractiveElement as _, IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point, Render, RenderImage, ScrollAnchor,
-    ScrollHandle, SharedString, StatefulInteractiveElement as _, StrikethroughStyle,
-    StyleRefinement, Styled as _, StyledImage as _, StyledText, Task, TextLayout, UnderlineStyle,
-    WeakEntity, Window, combine_highlights, div, img, point, px, quad, size, transparent_black,
+    InteractiveElement as _, InteractiveText, IntoElement, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point, Render,
+    RenderImage, ScrollAnchor, ScrollHandle, SharedString, StatefulInteractiveElement as _,
+    StrikethroughStyle, StyleRefinement, Styled as _, StyledImage as _, StyledText, Task,
+    TextLayout, UnderlineStyle, WeakEntity, Window, combine_highlights, div, img, point, px, quad,
+    size, transparent_black,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use gpui_component::{
@@ -59,6 +61,7 @@ const DATA_IMAGE_MAX_RGBA_BYTES: u64 = 64 * 1024 * 1024;
 const ARTIFACT_MAX_RASTER_PIXELS: f32 = 16.0 * 1024.0 * 1024.0;
 
 pub type MarkdownResourceHandler = Arc<dyn Fn(ResolvedResource, &mut Window, &mut App) + 'static>;
+type MarkdownInlineClickHandler = Rc<dyn Fn(&mut Window, &mut App) + 'static>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MarkdownPresentation {
@@ -475,6 +478,21 @@ struct InlineSemanticStyle {
     underline: bool,
 }
 
+#[derive(Default)]
+struct InlineTextFlow {
+    text: String,
+    highlights: Vec<(Range<usize>, HighlightStyle)>,
+    mono_ranges: Vec<Range<usize>>,
+    actions: Vec<(Range<usize>, MarkdownInlineClickHandler)>,
+}
+
+struct MarkdownSelectableTextDecorations {
+    highlights: Vec<(Range<usize>, HighlightStyle)>,
+    mono_ranges: Vec<Range<usize>>,
+    actions: Vec<(Range<usize>, MarkdownInlineClickHandler)>,
+    mono_font_family: SharedString,
+}
+
 impl InlineSemanticStyle {
     fn strong(mut self) -> Self {
         self.strong = true;
@@ -523,6 +541,34 @@ fn combine_inline_highlights(
         return highlights;
     }
     combine_highlights([(0..text_len, semantic)], highlights).collect()
+}
+
+fn inline_supports_text_flow(inline: &InlineNode) -> bool {
+    match &inline.kind {
+        Inline::Image(_)
+        | Inline::Math(_)
+        | Inline::Superscript(_)
+        | Inline::Subscript(_)
+        | Inline::FootnoteReference(_) => false,
+        kind => kind
+            .children()
+            .is_none_or(|children| children.iter().all(inline_supports_text_flow)),
+    }
+}
+
+fn merge_inline_ranges(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    ranges.sort_by_key(|range| (range.start, range.end));
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges.into_iter().filter(|range| !range.is_empty()) {
+        if let Some(previous) = merged.last_mut()
+            && range.start <= previous.end
+        {
+            previous.end = previous.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    merged
 }
 
 impl MarkdownTextSelection {
@@ -1150,6 +1196,17 @@ impl MarkdownViewState {
         highlights: Vec<(Range<usize>, HighlightStyle)>,
         cx: &mut Context<Self>,
     ) -> MarkdownSelectableText {
+        self.selectable_interactive_text(text, highlights, Vec::new(), Vec::new(), cx)
+    }
+
+    fn selectable_interactive_text(
+        &mut self,
+        text: impl Into<SharedString>,
+        highlights: Vec<(Range<usize>, HighlightStyle)>,
+        mono_ranges: Vec<Range<usize>>,
+        actions: Vec<(Range<usize>, MarkdownInlineClickHandler)>,
+        cx: &mut Context<Self>,
+    ) -> MarkdownSelectableText {
         let text = text.into();
         let start = self.selection_text.len();
         self.selection_text.push_str(&text);
@@ -1157,12 +1214,18 @@ impl MarkdownViewState {
         let segment = self.selection_next_segment;
         self.selection_next_segment = self.selection_next_segment.saturating_add(1);
         MarkdownSelectableText::new(
+            format!("markdown-text:{}:{segment}", self.view_id),
             cx.entity().downgrade(),
             self.selection_frame,
             segment,
             text_range,
             text,
-            highlights,
+            MarkdownSelectableTextDecorations {
+                highlights,
+                mono_ranges,
+                actions,
+                mono_font_family: cx.theme().mono_font_family.clone(),
+            },
         )
     }
 
@@ -1360,35 +1423,72 @@ impl MarkdownViewState {
 }
 
 struct MarkdownSelectableText {
+    element_id: ElementId,
     owner: WeakEntity<MarkdownViewState>,
     frame: u64,
     segment: usize,
     text_range: Range<usize>,
-    styled_text: StyledText,
+    interactive_text: InteractiveText,
     layout: TextLayout,
 }
 
 impl MarkdownSelectableText {
     fn new(
+        element_id: impl Into<ElementId>,
         owner: WeakEntity<MarkdownViewState>,
         frame: u64,
         segment: usize,
         text_range: Range<usize>,
         text: SharedString,
-        highlights: Vec<(Range<usize>, HighlightStyle)>,
+        decorations: MarkdownSelectableTextDecorations,
     ) -> Self {
-        let styled_text = if highlights.is_empty() {
+        let element_id = element_id.into();
+        let MarkdownSelectableTextDecorations {
+            highlights,
+            mono_ranges,
+            actions,
+            mono_font_family,
+        } = decorations;
+        let mut styled_text = if highlights.is_empty() {
             StyledText::new(text)
         } else {
             StyledText::new(text).with_highlights(highlights)
         };
+        if !mono_ranges.is_empty() {
+            styled_text = styled_text.with_font_family_overrides(
+                mono_ranges
+                    .into_iter()
+                    .map(|range| (range, mono_font_family.clone())),
+            );
+        }
         let layout = styled_text.layout().clone();
+        let action_ranges = actions
+            .iter()
+            .map(|(range, _)| range.clone())
+            .collect::<Vec<_>>();
+        let handlers = actions
+            .into_iter()
+            .map(|(_, handler)| handler)
+            .collect::<Vec<_>>();
+        let interactive_text = if action_ranges.is_empty() {
+            InteractiveText::new(element_id.clone(), styled_text)
+        } else {
+            InteractiveText::new(element_id.clone(), styled_text).on_click(
+                action_ranges,
+                move |index, window, cx| {
+                    if let Some(handler) = handlers.get(index) {
+                        handler(window, cx);
+                    }
+                },
+            )
+        };
         Self {
+            element_id,
             owner,
             frame,
             segment,
             text_range,
-            styled_text,
+            interactive_text,
             layout,
         }
     }
@@ -1404,10 +1504,10 @@ impl IntoElement for MarkdownSelectableText {
 
 impl Element for MarkdownSelectableText {
     type RequestLayoutState = ();
-    type PrepaintState = ();
+    type PrepaintState = Hitbox;
 
     fn id(&self) -> Option<ElementId> {
-        None
+        Some(self.element_id.clone())
     }
 
     fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
@@ -1421,7 +1521,7 @@ impl Element for MarkdownSelectableText {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        self.styled_text
+        self.interactive_text
             .request_layout(id, inspector_id, window, cx)
     }
 
@@ -1434,8 +1534,9 @@ impl Element for MarkdownSelectableText {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        self.styled_text
-            .prepaint(id, inspector_id, bounds, request_layout, window, cx);
+        let hitbox =
+            self.interactive_text
+                .prepaint(id, inspector_id, bounds, request_layout, window, cx);
         let _ = self.owner.update(cx, |state, _| {
             state.register_selection_segment(
                 self.frame,
@@ -1445,6 +1546,7 @@ impl Element for MarkdownSelectableText {
                 self.layout.clone(),
             );
         });
+        hitbox
     }
 
     fn paint(
@@ -1470,7 +1572,7 @@ impl Element for MarkdownSelectableText {
         if let Some(selection) = local_selection {
             paint_text_selection(&selection, &self.layout, bounds, window, cx);
         }
-        self.styled_text.paint(
+        self.interactive_text.paint(
             id,
             inspector_id,
             bounds,
@@ -2046,6 +2148,31 @@ impl MarkdownViewState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if inlines.iter().all(inline_supports_text_flow) {
+            let mut flow = InlineTextFlow::default();
+            for inline in inlines {
+                self.append_inline_text_flow(inline, InlineSemanticStyle::default(), &mut flow, cx);
+            }
+            let highlights = combine_highlights(
+                std::iter::empty::<(Range<usize>, HighlightStyle)>(),
+                flow.highlights,
+            )
+            .collect::<Vec<_>>();
+            let text = self.selectable_interactive_text(
+                flow.text,
+                highlights,
+                merge_inline_ranges(flow.mono_ranges),
+                flow.actions,
+                cx,
+            );
+            return div()
+                .w_full()
+                .min_w_0()
+                .whitespace_normal()
+                .child(text)
+                .into_any_element();
+        }
+
         h_flex()
             .w_full()
             .min_w_0()
@@ -2058,6 +2185,195 @@ impl MarkdownViewState {
                     .map(|inline| self.render_inline(inline, window, cx)),
             )
             .into_any_element()
+    }
+
+    fn append_inline_text_flow(
+        &self,
+        inline: &InlineNode,
+        semantic: InlineSemanticStyle,
+        flow: &mut InlineTextFlow,
+        cx: &App,
+    ) {
+        match &inline.kind {
+            Inline::Text(text) | Inline::Literal(text) => {
+                self.push_inline_text(flow, text, semantic, None, false, cx)
+            }
+            Inline::Emphasis(children) => {
+                for child in children {
+                    self.append_inline_text_flow(child, semantic.emphasis(), flow, cx);
+                }
+            }
+            Inline::Strong(children) => {
+                for child in children {
+                    self.append_inline_text_flow(child, semantic.strong(), flow, cx);
+                }
+            }
+            Inline::Deletion(children) => {
+                for child in children {
+                    self.append_inline_text_flow(child, semantic.deletion(), flow, cx);
+                }
+            }
+            Inline::Underline(children) => {
+                for child in children {
+                    self.append_inline_text_flow(child, semantic.underline(), flow, cx);
+                }
+            }
+            Inline::Code(code) => self.push_inline_text(
+                flow,
+                code,
+                semantic,
+                Some(HighlightStyle {
+                    background_color: Some(cx.theme().muted),
+                    ..Default::default()
+                }),
+                true,
+                cx,
+            ),
+            Inline::Link {
+                destination,
+                children,
+                ..
+            } => {
+                let start = flow.text.len();
+                for child in children {
+                    self.append_inline_text_flow(child, semantic, flow, cx);
+                }
+                let range = start..flow.text.len();
+                if range.is_empty() {
+                    return;
+                }
+                let action = self.inline_text_link_action(destination);
+                flow.highlights.push((
+                    range.clone(),
+                    HighlightStyle {
+                        color: Some(if action.is_some() {
+                            cx.theme().primary
+                        } else {
+                            cx.theme().muted_foreground
+                        }),
+                        underline: Some(UnderlineStyle {
+                            thickness: px(1.0),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ));
+                if let Some(action) = action {
+                    flow.actions.push((range, action));
+                }
+            }
+            Inline::Keycap(children) => {
+                let start = flow.text.len();
+                for child in children {
+                    self.append_inline_text_flow(child, semantic, flow, cx);
+                }
+                let range = start..flow.text.len();
+                if !range.is_empty() {
+                    flow.highlights.push((
+                        range.clone(),
+                        HighlightStyle {
+                            background_color: Some(cx.theme().muted),
+                            ..Default::default()
+                        },
+                    ));
+                    flow.mono_ranges.push(range);
+                }
+            }
+            Inline::Mark(children) => {
+                let start = flow.text.len();
+                for child in children {
+                    self.append_inline_text_flow(child, semantic, flow, cx);
+                }
+                let range = start..flow.text.len();
+                if !range.is_empty() {
+                    flow.highlights.push((
+                        range,
+                        HighlightStyle {
+                            background_color: Some(
+                                cx.theme().warning.opacity(if cx.theme().is_dark() {
+                                    0.28
+                                } else {
+                                    0.22
+                                }),
+                            ),
+                            ..Default::default()
+                        },
+                    ));
+                }
+            }
+            Inline::Break => flow.text.push('\n'),
+            Inline::Image(_)
+            | Inline::Math(_)
+            | Inline::Superscript(_)
+            | Inline::Subscript(_)
+            | Inline::FootnoteReference(_) => {
+                unreachable!("element-flow-only inline nodes are filtered before collection")
+            }
+        }
+    }
+
+    fn push_inline_text(
+        &self,
+        flow: &mut InlineTextFlow,
+        text: &str,
+        semantic: InlineSemanticStyle,
+        extra: Option<HighlightStyle>,
+        mono: bool,
+        cx: &App,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        let start = flow.text.len();
+        flow.text.push_str(text);
+        let range = start..flow.text.len();
+        let mut highlights = combine_inline_highlights(
+            text.len(),
+            semantic,
+            search_highlights(text, self.options.search_query.as_deref(), cx),
+        );
+        if let Some(extra) = extra {
+            highlights = combine_highlights(highlights, [(0..text.len(), extra)]).collect();
+        }
+        flow.highlights.extend(
+            highlights
+                .into_iter()
+                .map(|(local, style)| (start + local.start..start + local.end, style)),
+        );
+        if mono {
+            flow.mono_ranges.push(range);
+        }
+    }
+
+    fn inline_text_link_action(
+        &self,
+        resource: &ResolvedResource,
+    ) -> Option<MarkdownInlineClickHandler> {
+        match resource.kind {
+            ResourceKind::Http | ResourceKind::Workspace => {
+                let handler = self.options.on_open_resource.clone()?;
+                let resource = resource.clone();
+                Some(Rc::new(move |window, cx| {
+                    handler(resource.clone(), window, cx)
+                }))
+            }
+            ResourceKind::Fragment => {
+                let anchor = resource
+                    .resolved
+                    .as_deref()
+                    .and_then(|fragment| fragment.strip_prefix('#'))
+                    .and_then(|slug| {
+                        self.document
+                            .outline
+                            .iter()
+                            .find(|entry| entry.slug == slug)
+                    })
+                    .and_then(|entry| self.anchors.get(&entry.node_id))
+                    .cloned()?;
+                Some(Rc::new(move |window, cx| anchor.scroll_to(window, cx)))
+            }
+            ResourceKind::Blocked | ResourceKind::DataImage => None,
+        }
     }
 
     fn render_inline(
@@ -3386,6 +3702,35 @@ mod tests {
     }
 
     #[::gpui::test]
+    fn inline_styles_share_one_wrapping_text_layout(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let input = MarkdownInput::new(
+            "Before **bold** and `code` plus [link](https://example.com) after.",
+            "",
+            1,
+        );
+        let (probe, cx) = cx.add_window_view(|_, cx| MarkdownSelectionProbe::new(input, cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let state = probe.read_with(cx, |probe, _| probe.state.clone());
+        state.read_with(cx, |state, _| {
+            let expected = "Before bold and code plus link after.";
+            let segments = state
+                .selection_segments
+                .values()
+                .filter(|segment| {
+                    state.selection_text.get(segment.text_range.clone()) == Some(expected)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(segments.len(), 1);
+            assert_eq!(segments[0].layout.wrapped_text(), expected);
+        });
+    }
+
+    #[::gpui::test]
     fn native_text_drag_selects_across_styles_and_paragraphs_and_copies(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
         let input = MarkdownInput::new(
@@ -3411,7 +3756,7 @@ mod tests {
                     })
                     .expect("fixture selection segment")
             };
-            let first = segment_for("First ");
+            let first = segment_for("First bold text.");
             let second = segment_for("Second paragraph.");
             let start = first.layout.position_for_index(0).unwrap()
                 + point(px(1.0), first.layout.line_height() / 2.0);

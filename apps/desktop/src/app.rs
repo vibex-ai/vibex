@@ -15,8 +15,8 @@ use gpui::{
     Bounds, ClipboardEntry, ClipboardItem, Context, Decorations, DragMoveEvent, ElementId, Empty,
     Entity, EntityInputHandler, ExternalPaths, FocusHandle, Focusable as _, FontWeight,
     HighlightStyle, Hsla, Image, IntoElement, KeyBinding, KeyDownEvent, MouseButton,
-    MouseDownEvent, ObjectFit, Orientation, ParentElement as _, PathBuilder, Pixels, Render, Rgba,
-    Role, ScrollDelta, ScrollStrategy, ScrollWheelEvent, SharedString, Size,
+    MouseDownEvent, MouseMoveEvent, ObjectFit, Orientation, ParentElement as _, PathBuilder,
+    Pixels, Render, Rgba, Role, ScrollDelta, ScrollStrategy, ScrollWheelEvent, SharedString, Size,
     StatefulInteractiveElement as _, Styled as _, StyledImage as _, StyledText, Subscription, Task,
     WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
     WindowDecorations, WindowOptions, canvas, div, img, linear_color_stop, linear_gradient, point,
@@ -207,6 +207,7 @@ const SESSION_SEARCH_DIALOG_VIEWPORT_WIDTH_RATIO: f32 = 0.88;
 const SESSION_SEARCH_DIALOG_VIEWPORT_HEIGHT_RATIO: f32 = 0.74;
 const SESSION_SEARCH_EXCERPT_MAX_CHARS: usize = 180;
 const COMPOSER_INLINE_ATTACHMENT_PREFIX: &str = " [attachment-";
+const COMPOSER_INLINE_ATTACHMENT_MARKER_RESERVE: &str = "..........";
 const COMPOSER_INLINE_ATTACHMENT_SUFFIX: &str = "] ";
 const COMPOSER_IMAGE_HOVER_PREVIEW_MAX_WIDTH: f32 = 384.0;
 const COMPOSER_IMAGE_HOVER_PREVIEW_MAX_HEIGHT: f32 = 288.0;
@@ -231,6 +232,8 @@ const COMPOSER_RUNTIME_AGENT_PROFILE_ROW_HEIGHT: f32 = 40.0;
 const COMPOSER_RUNTIME_MODEL_ROW_HEIGHT: f32 = 48.0;
 const IMAGE_PREVIEW_MIN_ZOOM: f32 = 0.25;
 const IMAGE_PREVIEW_MAX_ZOOM: f32 = 4.0;
+const IMAGE_PREVIEW_HORIZONTAL_PADDING: f32 = 24.0;
+const IMAGE_PREVIEW_VERTICAL_PADDING: f32 = 64.0;
 const SETTINGS_ROW_INLINE_MIN_WIDTH: f32 = 640.0;
 const SETTINGS_VERTICAL_TABS_MIN_WIDTH: f32 = 768.0;
 const SETTINGS_DIALOG_MAX_WIDTH: f32 = 672.0;
@@ -380,6 +383,43 @@ struct AttachmentImagePreviewState {
     image_source: Arc<std::path::Path>,
     intrinsic_size: Option<(u32, u32)>,
     zoom: f32,
+    pan_x: f32,
+    pan_y: f32,
+    drag: Option<AttachmentImagePreviewDragState>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AttachmentImagePreviewDragState {
+    start_pointer_x: f32,
+    start_pointer_y: f32,
+    start_pan_x: f32,
+    start_pan_y: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AttachmentImagePreviewLayout {
+    viewport_width: f32,
+    viewport_height: f32,
+    image_width: f32,
+    image_height: f32,
+}
+
+impl AttachmentImagePreviewLayout {
+    fn can_pan(self) -> bool {
+        self.image_width > self.viewport_width + 0.5
+            || self.image_height > self.viewport_height + 0.5
+    }
+
+    fn clamp_pan(self, pan_x: f32, pan_y: f32) -> (f32, f32) {
+        clamp_attachment_preview_pan(
+            pan_x,
+            pan_y,
+            self.image_width,
+            self.image_height,
+            self.viewport_width,
+            self.viewport_height,
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6376,9 +6416,7 @@ impl VibexWorkbench {
             .map(str::to_string);
         self.composer_attachment_serial = self.composer_attachment_serial.saturating_add(1);
         let serial = self.composer_attachment_serial;
-        let marker = format!(
-            "{COMPOSER_INLINE_ATTACHMENT_PREFIX}{serial}{COMPOSER_INLINE_ATTACHMENT_SUFFIX}"
-        );
+        let marker = inline_composer_attachment_marker(serial);
         let inline_attachment = InlineComposerAttachment {
             attachment: ComposerAttachment {
                 id: format!("attachment:{serial}"),
@@ -6626,6 +6664,9 @@ impl VibexWorkbench {
             ),
             intrinsic_size,
             zoom: 1.0,
+            pan_x: 0.0,
+            pan_y: 0.0,
+            drag: None,
         });
         self.composer_runtime_menu_open = false;
         cx.notify();
@@ -6637,10 +6678,20 @@ impl VibexWorkbench {
     }
 
     fn set_attachment_preview_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {
+        let viewport_width = self.last_visibility.layout.viewport_width as f32;
+        let viewport_height = self.last_visibility.layout.viewport_height as f32;
         let Some(preview) = self.attachment_image_preview.as_mut() else {
             return;
         };
         preview.zoom = clamp_attachment_preview_zoom(zoom);
+        let layout = attachment_image_preview_layout(
+            preview.intrinsic_size,
+            preview.zoom,
+            viewport_width,
+            viewport_height,
+        );
+        (preview.pan_x, preview.pan_y) = layout.clamp_pan(preview.pan_x, preview.pan_y);
+        preview.drag = None;
         cx.notify();
     }
 
@@ -6653,6 +6704,63 @@ impl VibexWorkbench {
             return;
         };
         self.set_attachment_preview_zoom(zoom + delta, cx);
+    }
+
+    fn begin_attachment_preview_drag(
+        &mut self,
+        pointer_x: f32,
+        pointer_y: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(preview) = self.attachment_image_preview.as_mut() else {
+            return;
+        };
+        preview.drag = Some(AttachmentImagePreviewDragState {
+            start_pointer_x: pointer_x,
+            start_pointer_y: pointer_y,
+            start_pan_x: preview.pan_x,
+            start_pan_y: preview.pan_y,
+        });
+        cx.notify();
+    }
+
+    fn update_attachment_preview_drag(
+        &mut self,
+        pointer_x: f32,
+        pointer_y: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let viewport_width = self.last_visibility.layout.viewport_width as f32;
+        let viewport_height = self.last_visibility.layout.viewport_height as f32;
+        let Some(preview) = self.attachment_image_preview.as_mut() else {
+            return;
+        };
+        let Some(drag) = preview.drag else {
+            return;
+        };
+        let layout = attachment_image_preview_layout(
+            preview.intrinsic_size,
+            preview.zoom,
+            viewport_width,
+            viewport_height,
+        );
+        let requested_x = drag.start_pan_x + pointer_x - drag.start_pointer_x;
+        let requested_y = drag.start_pan_y + pointer_y - drag.start_pointer_y;
+        let (pan_x, pan_y) = layout.clamp_pan(requested_x, requested_y);
+        if preview.pan_x != pan_x || preview.pan_y != pan_y {
+            preview.pan_x = pan_x;
+            preview.pan_y = pan_y;
+            cx.notify();
+        }
+    }
+
+    fn finish_attachment_preview_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(preview) = self.attachment_image_preview.as_mut() else {
+            return;
+        };
+        if preview.drag.take().is_some() {
+            cx.notify();
+        }
     }
 
     fn sync_terminal_sessions(&mut self, terminals: Vec<TerminalSession>, cx: &mut Context<Self>) {
@@ -15926,7 +16034,7 @@ impl VibexWorkbench {
                         .rounded(px(6.0))
                         .border_1()
                         .border_color(cx.theme().border)
-                        .bg(cx.theme().muted.opacity(0.88))
+                        .bg(cx.theme().muted)
                         .px(px(7.0))
                         .text_size(px(13.0))
                         .font_weight(FontWeight(600.0))
@@ -15996,15 +16104,17 @@ impl VibexWorkbench {
         let preview = self.attachment_image_preview.clone()?;
         let viewport_width = self.last_visibility.layout.viewport_width as f32;
         let viewport_height = self.last_visibility.layout.viewport_height as f32;
-        let max_image_width = (viewport_width - 48.0).max(80.0);
-        let max_image_height = (viewport_height - 128.0).max(80.0);
-        let (base_width, base_height) = fitted_attachment_preview_size(
+        let layout = attachment_image_preview_layout(
             preview.intrinsic_size,
-            max_image_width,
-            max_image_height,
+            preview.zoom,
+            viewport_width,
+            viewport_height,
         );
-        let image_width = base_width * preview.zoom;
-        let image_height = base_height * preview.zoom;
+        let image_width = layout.image_width;
+        let image_height = layout.image_height;
+        let (pan_x, pan_y) = layout.clamp_pan(preview.pan_x, preview.pan_y);
+        let can_pan = layout.can_pan();
+        let dragging = preview.drag.is_some();
         let zoom_label = format!("{}%", (preview.zoom * 100.0).round() as u32);
         let save_source = preview.attachment.path.clone().unwrap_or_default();
         let save_label = preview.attachment.label.clone();
@@ -16021,6 +16131,30 @@ impl VibexWorkbench {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| this.close_attachment_preview(cx)),
+                )
+                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                    if event.dragging()
+                        && this
+                            .attachment_image_preview
+                            .as_ref()
+                            .is_some_and(|preview| preview.drag.is_some())
+                    {
+                        this.update_attachment_preview_drag(
+                            f32::from(event.position.x),
+                            f32::from(event.position.y),
+                            cx,
+                        );
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    }
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.finish_attachment_preview_drag(cx)),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.finish_attachment_preview_drag(cx)),
                 )
                 .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
                     let y = match event.delta {
@@ -16040,15 +16174,33 @@ impl VibexWorkbench {
                         .items_center()
                         .justify_center()
                         .overflow_hidden()
-                        .px_6()
-                        .pt(px(64.0))
-                        .pb(px(64.0))
+                        .px(px(IMAGE_PREVIEW_HORIZONTAL_PADDING))
+                        .pt(px(IMAGE_PREVIEW_VERTICAL_PADDING))
+                        .pb(px(IMAGE_PREVIEW_VERTICAL_PADDING))
                         .child(
                             div()
                                 .flex_none()
                                 .w(px(image_width))
                                 .h(px(image_height))
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .relative()
+                                .left(px(pan_x))
+                                .top(px(pan_y))
+                                .when(can_pan && !dragging, |this| this.cursor_grab())
+                                .when(can_pan && dragging, |this| this.cursor_grabbing())
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                        if can_pan {
+                                            this.begin_attachment_preview_drag(
+                                                f32::from(event.position.x),
+                                                f32::from(event.position.y),
+                                                cx,
+                                            );
+                                        }
+                                        window.prevent_default();
+                                        cx.stop_propagation();
+                                    }),
+                                )
                                 .child(
                                     img(image_source).size_full().object_fit(ObjectFit::Contain),
                                 ),
@@ -16966,6 +17118,7 @@ impl VibexWorkbench {
             .group(hover_group.clone())
             .child(
                 v_flex()
+                    .min_w_0()
                     .when(editing, |this| this.w(relative(0.78)))
                     .when(!editing, |this| this.max_w(relative(0.78)))
                     .items_end()
@@ -17774,6 +17927,12 @@ impl VibexWorkbench {
         highlight_query: Option<&str>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let search_highlight = cx.theme().warning.opacity(0.42);
+        if attachments.is_empty() {
+            return render_user_message_text_segment(text, highlight_query, search_highlight)
+                .into_any_element();
+        }
+
         let (preview_width, preview_height) = composer_image_hover_preview_max_size(
             self.last_visibility.layout.viewport_width as f32,
             self.last_visibility.layout.viewport_height as f32,
@@ -17793,21 +17952,11 @@ impl VibexWorkbench {
             match segment {
                 UserMessageInlineSegment::Text(value) => {
                     if !value.is_empty() {
-                        let text = div().min_w_0().max_w_full().whitespace_normal();
-                        let text = if let Some(query) = highlight_query {
-                            text.child(session_search_highlighted_text(
-                                value,
-                                query,
-                                HighlightStyle {
-                                    background_color: Some(cx.theme().warning.opacity(0.42)),
-                                    font_weight: Some(FontWeight::BOLD),
-                                    ..Default::default()
-                                },
-                            ))
-                        } else {
-                            text.child(value)
-                        };
-                        content = content.child(text);
+                        content = content.child(render_user_message_text_segment(
+                            value,
+                            highlight_query,
+                            search_highlight,
+                        ));
                     }
                 }
                 UserMessageInlineSegment::Attachment(attachment) => {
@@ -17849,7 +17998,7 @@ impl VibexWorkbench {
                             .rounded(px(6.0))
                             .border_1()
                             .border_color(cx.theme().border)
-                            .bg(cx.theme().muted.opacity(0.88))
+                            .bg(cx.theme().muted)
                             .px(px(7.0))
                             .text_size(px(13.0))
                             .font_weight(FontWeight(600.0))
@@ -21102,6 +21251,12 @@ fn command_source_label(source_kind: AgentCommandSourceKind) -> &'static str {
     }
 }
 
+fn inline_composer_attachment_marker(serial: u64) -> String {
+    format!(
+        "{COMPOSER_INLINE_ATTACHMENT_PREFIX}{serial}{COMPOSER_INLINE_ATTACHMENT_MARKER_RESERVE}{COMPOSER_INLINE_ATTACHMENT_SUFFIX}"
+    )
+}
+
 fn composer_submission_payload(
     raw_text: &str,
     inline_attachments: &[InlineComposerAttachment],
@@ -21281,6 +21436,24 @@ fn fitted_attachment_preview_size(
     (width * scale, height * scale)
 }
 
+fn attachment_image_preview_layout(
+    intrinsic_size: Option<(u32, u32)>,
+    zoom: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+) -> AttachmentImagePreviewLayout {
+    let viewport_width = (viewport_width - IMAGE_PREVIEW_HORIZONTAL_PADDING * 2.0).max(80.0);
+    let viewport_height = (viewport_height - IMAGE_PREVIEW_VERTICAL_PADDING * 2.0).max(80.0);
+    let (base_width, base_height) =
+        fitted_attachment_preview_size(intrinsic_size, viewport_width, viewport_height);
+    AttachmentImagePreviewLayout {
+        viewport_width,
+        viewport_height,
+        image_width: base_width * zoom,
+        image_height: base_height * zoom,
+    }
+}
+
 fn composer_image_hover_preview_max_size(viewport_width: f32, viewport_height: f32) -> (f32, f32) {
     (
         (viewport_width - COMPOSER_IMAGE_HOVER_PREVIEW_MARGIN * 2.0)
@@ -21292,6 +21465,19 @@ fn composer_image_hover_preview_max_size(viewport_width: f32, viewport_height: f
 
 fn clamp_attachment_preview_zoom(zoom: f32) -> f32 {
     zoom.clamp(IMAGE_PREVIEW_MIN_ZOOM, IMAGE_PREVIEW_MAX_ZOOM)
+}
+
+fn clamp_attachment_preview_pan(
+    pan_x: f32,
+    pan_y: f32,
+    image_width: f32,
+    image_height: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+) -> (f32, f32) {
+    let max_x = ((image_width - viewport_width) / 2.0).max(0.0);
+    let max_y = ((image_height - viewport_height) / 2.0).max(0.0);
+    (pan_x.clamp(-max_x, max_x), pan_y.clamp(-max_y, max_y))
 }
 
 fn session_title_from_first_message(message: &str) -> Option<String> {
@@ -24723,8 +24909,8 @@ impl Render for VibexWorkbench {
                 )
             })
             .child(content)
-            .when_some(floating_sidebar, |this, sidebar| this.child(sidebar))
             .children(inline_composer_attachments)
+            .when_some(floating_sidebar, |this, sidebar| this.child(sidebar))
             .when_some(composer_suggestion_overlay, |this, overlay| {
                 this.child(overlay)
             })
@@ -25042,6 +25228,31 @@ fn agent_markdown_summary(source: &str) -> (String, Vec<String>) {
     (document.plain_text(), paths)
 }
 
+fn render_user_message_text_segment(
+    value: String,
+    highlight_query: Option<&str>,
+    highlight_background: Hsla,
+) -> gpui::Div {
+    let text = div()
+        .min_w_0()
+        .max_w_full()
+        .flex_shrink(1.0)
+        .whitespace_normal();
+    if let Some(query) = highlight_query {
+        text.child(session_search_highlighted_text(
+            value,
+            query,
+            HighlightStyle {
+                background_color: Some(highlight_background),
+                font_weight: Some(FontWeight::BOLD),
+                ..Default::default()
+            },
+        ))
+    } else {
+        text.child(value)
+    }
+}
+
 fn render_user_message_bubble(
     body: AnyElement,
     background: gpui::Hsla,
@@ -25049,7 +25260,9 @@ fn render_user_message_bubble(
 ) -> gpui::Div {
     // Codex-parity: compact rounded-xl pill.
     v_flex()
-        .flex_none()
+        .min_w_0()
+        .max_w_full()
+        .flex_shrink(1.0)
         .rounded(px(12.0))
         .bg(background)
         .px(px(14.0))
@@ -25377,6 +25590,40 @@ mod tests {
                             .presentation(MarkdownPresentation::Agent),
                         ),
                 )
+        }
+    }
+
+    struct UserMessageBubbleLayoutProbe {
+        measured_width: Rc<Cell<f32>>,
+        measured_height: Rc<Cell<f32>>,
+    }
+
+    impl Render for UserMessageBubbleLayoutProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let measured_width = self.measured_width.clone();
+            let measured_height = self.measured_height.clone();
+            let body = format!(
+                "first line\n\n  indented text\n{}",
+                "unbroken-content-".repeat(24)
+            );
+            h_flex().w(px(320.0)).justify_end().child(
+                v_flex().min_w_0().max_w(relative(0.78)).items_end().child(
+                    render_user_message_bubble(
+                        render_user_message_text_segment(
+                            body,
+                            None,
+                            theme::semantic_color("warning", true),
+                        )
+                        .into_any_element(),
+                        theme::semantic_color("muted", true),
+                        theme::semantic_color("foreground", true),
+                    )
+                    .on_prepaint(move |bounds, _, _| {
+                        measured_width.set(f32::from(bounds.size.width));
+                        measured_height.set(f32::from(bounds.size.height));
+                    }),
+                ),
+            )
         }
     }
 
@@ -25837,9 +26084,7 @@ mod tests {
                 path: Some(format!("/tmp/{label}.png")),
                 mime_type: Some("image/png".into()),
             },
-            marker: format!(
-                "{COMPOSER_INLINE_ATTACHMENT_PREFIX}{serial}{COMPOSER_INLINE_ATTACHMENT_SUFFIX}"
-            ),
+            marker: inline_composer_attachment_marker(serial),
         }
     }
 
@@ -27973,6 +28218,40 @@ mod tests {
     }
 
     #[test]
+    fn inline_composer_attachment_marker_reserves_the_full_token_label() {
+        let marker = inline_composer_attachment_marker(7);
+
+        assert!(marker.starts_with(" [attachment-7"));
+        assert!(marker.contains(COMPOSER_INLINE_ATTACHMENT_MARKER_RESERVE));
+        assert!(marker.ends_with(COMPOSER_INLINE_ATTACHMENT_SUFFIX));
+        assert!(COMPOSER_INLINE_ATTACHMENT_MARKER_RESERVE.len() >= 8);
+    }
+
+    #[test]
+    fn inline_composer_attachment_overlay_is_opaque_and_below_the_sidebar() {
+        let source = include_str!("app.rs");
+        let attachment_overlay = source
+            .split_once("    fn render_inline_composer_attachments(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_attachment_image_preview("))
+            .map(|(body, _)| body)
+            .expect("inline attachment overlay should remain inspectable");
+        assert!(attachment_overlay.contains(".bg(cx.theme().muted)"));
+        assert!(!attachment_overlay.contains(".bg(cx.theme().muted.opacity"));
+
+        let workbench_render = source
+            .split_once("impl Render for VibexWorkbench")
+            .map(|(_, body)| body)
+            .expect("workbench renderer should remain inspectable");
+        let attachments = workbench_render
+            .find(".children(inline_composer_attachments)")
+            .expect("inline attachment layer should be mounted");
+        let sidebar = workbench_render
+            .find(".when_some(floating_sidebar")
+            .expect("floating sidebar layer should be mounted");
+        assert!(attachments < sidebar);
+    }
+
+    #[test]
     fn inline_composer_attachments_follow_text_order_and_strip_markers() {
         let first = inline_composer_attachment(1, "first");
         let second = inline_composer_attachment(2, "second");
@@ -28041,6 +28320,16 @@ mod tests {
     }
 
     #[test]
+    fn user_message_segments_preserve_original_whitespace_without_attachments() {
+        let text = "first line\n\n  indented text  \nlast line";
+
+        assert_eq!(
+            user_message_inline_segments(text, &[]),
+            vec![UserMessageInlineSegment::Text(text.into())]
+        );
+    }
+
+    #[test]
     fn image_preview_fit_and_zoom_match_tauri_bounds() {
         assert_eq!(
             fitted_attachment_preview_size(Some((1_600, 800)), 800.0, 600.0),
@@ -28053,6 +28342,26 @@ mod tests {
         assert_eq!(clamp_attachment_preview_zoom(0.0), 0.25);
         assert_eq!(clamp_attachment_preview_zoom(1.0), 1.0);
         assert_eq!(clamp_attachment_preview_zoom(8.0), 4.0);
+        assert_eq!(
+            clamp_attachment_preview_pan(120.0, -80.0, 800.0, 400.0, 800.0, 600.0),
+            (0.0, 0.0)
+        );
+        assert_eq!(
+            clamp_attachment_preview_pan(900.0, -500.0, 1_600.0, 1_200.0, 800.0, 600.0),
+            (400.0, -300.0)
+        );
+
+        let zoomed = attachment_image_preview_layout(Some((1_600, 800)), 2.0, 848.0, 728.0);
+        assert_eq!(zoomed.viewport_width, 800.0);
+        assert_eq!(zoomed.viewport_height, 600.0);
+        assert_eq!(zoomed.image_width, 1_600.0);
+        assert_eq!(zoomed.image_height, 800.0);
+        assert!(zoomed.can_pan());
+        assert_eq!(zoomed.clamp_pan(900.0, -500.0), (400.0, -100.0));
+
+        let expanded = attachment_image_preview_layout(Some((1_600, 800)), 1.0, 2_048.0, 1_024.0);
+        assert!(!expanded.can_pan());
+        assert_eq!(expanded.clamp_pan(120.0, -80.0), (0.0, 0.0));
     }
 
     #[test]
@@ -28676,8 +28985,37 @@ mod tests {
         assert!(observed_height.get() > 288.0);
     }
 
+    #[gpui::test]
+    fn user_message_bubble_wraps_long_raw_text_inside_the_timeline(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let measured_width = Rc::new(Cell::new(0.0));
+        let measured_height = Rc::new(Cell::new(0.0));
+        let observed_width = measured_width.clone();
+        let observed_height = measured_height.clone();
+        let (_, cx) = cx.add_window_view(|_, _| UserMessageBubbleLayoutProbe {
+            measured_width,
+            measured_height,
+        });
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        assert!(
+            observed_width.get() <= 320.0 * 0.78 + 0.5,
+            "bubble width: {}",
+            observed_width.get()
+        );
+        assert!(
+            observed_height.get() > 72.0,
+            "bubble height: {}",
+            observed_height.get()
+        );
+    }
+
     #[test]
-    fn user_message_bubble_keeps_the_intrinsic_width_layout_contract() {
+    fn user_message_bubble_shrinks_inside_the_timeline_width_contract() {
         let source = include_str!("app.rs");
         let helper = source
             .split_once("fn render_user_message_bubble(")
@@ -28685,9 +29023,10 @@ mod tests {
             .map(|(body, _)| body)
             .expect("user-message bubble helper should remain inspectable");
 
-        assert!(helper.contains(".flex_none()"));
+        assert!(helper.contains(".flex_shrink(1.0)"));
+        assert!(helper.contains(".min_w_0()"));
+        assert!(helper.contains(".max_w_full()"));
         assert!(helper.contains(".rounded(px(12.0))"));
-        assert!(!helper.contains(".min_w_0()"));
         assert!(!helper.contains(".overflow_y_scrollbar()"));
     }
 
