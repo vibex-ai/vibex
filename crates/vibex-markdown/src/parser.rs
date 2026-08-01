@@ -72,6 +72,8 @@ enum FrameKind {
     Item {
         checked: Option<bool>,
         children: Vec<BlockNode>,
+        // pulldown-cmark omits Paragraph events for inline content in tight list items.
+        implicit_inlines: Vec<InlineNode>,
     },
     Footnote {
         label: String,
@@ -306,6 +308,7 @@ impl ParserState {
                 FrameKind::Item {
                     checked: None,
                     children: Vec::new(),
+                    implicit_inlines: Vec::new(),
                 },
             ),
             Tag::FootnoteDefinition(label) => (
@@ -501,7 +504,14 @@ impl ParserState {
                 let block = self.block(Block::List { start, items }, range);
                 self.push_block(block);
             }
-            FrameKind::Item { checked, children } => {
+            FrameKind::Item {
+                checked,
+                mut children,
+                implicit_inlines,
+            } => {
+                if let Some(paragraph) = self.implicit_paragraph(implicit_inlines) {
+                    children.push(paragraph);
+                }
                 let id = self.id("list_item", range, &source_text);
                 let item = ListItem {
                     id,
@@ -884,6 +894,12 @@ impl ParserState {
                     children.push(node);
                     return;
                 }
+                FrameKind::Item {
+                    implicit_inlines, ..
+                } => {
+                    implicit_inlines.push(node);
+                    return;
+                }
                 FrameKind::Code { .. }
                 | FrameKind::HtmlBlock(_)
                 | FrameKind::Metadata(_)
@@ -902,21 +918,48 @@ impl ParserState {
         }
     }
 
+    fn implicit_paragraph(&mut self, inlines: Vec<InlineNode>) -> Option<BlockNode> {
+        let range = SourceRange::new(inlines.first()?.range.start, inlines.last()?.range.end);
+        Some(self.block(Block::Paragraph(inlines), range))
+    }
+
     fn push_block(&mut self, block: BlockNode) {
-        for frame in self.stack.iter_mut().rev() {
-            match &mut frame.kind {
-                FrameKind::Quote { children, .. }
-                | FrameKind::Item { children, .. }
-                | FrameKind::Footnote { children, .. }
-                | FrameKind::Definition(children) => {
-                    children.push(block);
-                    return;
+        let mut target = None;
+        for (index, frame) in self.stack.iter().enumerate().rev() {
+            match &frame.kind {
+                FrameKind::Quote { .. }
+                | FrameKind::Item { .. }
+                | FrameKind::Footnote { .. }
+                | FrameKind::Definition(_) => {
+                    target = Some(index);
+                    break;
                 }
                 FrameKind::InlineHtml { .. } => return,
                 _ => {}
             }
         }
-        self.blocks.push(block);
+
+        let Some(target) = target else {
+            self.blocks.push(block);
+            return;
+        };
+        let implicit_inlines = match &mut self.stack[target].kind {
+            FrameKind::Item {
+                implicit_inlines, ..
+            } => std::mem::take(implicit_inlines),
+            _ => Vec::new(),
+        };
+        let implicit_paragraph = self.implicit_paragraph(implicit_inlines);
+        match &mut self.stack[target].kind {
+            FrameKind::Quote { children, .. }
+            | FrameKind::Item { children, .. }
+            | FrameKind::Footnote { children, .. }
+            | FrameKind::Definition(children) => {
+                children.extend(implicit_paragraph);
+                children.push(block);
+            }
+            _ => unreachable!("block target changed while flushing implicit paragraph"),
+        }
     }
 
     fn set_task_marker(&mut self, checked: bool) {
@@ -1339,6 +1382,65 @@ A -> B: hi
             inline,
             Inline::Code(_)
         )));
+    }
+
+    #[test]
+    fn tight_list_items_coalesce_consecutive_inlines_into_one_paragraph() {
+        let document = parse_markdown(input(
+            concat!(
+                "- Before `Idle`, see [manager.rs](../src/manager.rs).\n",
+                "- ACP returned `cancelled` or `interrupted`.\n",
+                "- Frontend `agent_error` is temporary.",
+            ),
+            4,
+        ));
+        let Block::List { items, .. } = &document.blocks[0].kind else {
+            panic!("fixture should parse as a list");
+        };
+
+        assert_eq!(items.len(), 3);
+        for item in items {
+            assert_eq!(item.children.len(), 1);
+            let Block::Paragraph(inlines) = &item.children[0].kind else {
+                panic!("tight list item should contain one implicit paragraph");
+            };
+            assert!(inlines.len() > 1);
+        }
+        let Block::Paragraph(first) = &items[0].children[0].kind else {
+            unreachable!();
+        };
+        assert!(
+            first
+                .iter()
+                .any(|inline| matches!(inline.kind, Inline::Code(_)))
+        );
+        assert!(
+            first
+                .iter()
+                .any(|inline| matches!(inline.kind, Inline::Link { .. }))
+        );
+        assert_eq!(plain_text(first), "Before Idle, see manager.rs.");
+    }
+
+    #[test]
+    fn tight_list_item_flushes_inline_content_before_a_nested_block() {
+        let document = parse_markdown(input(
+            concat!(
+                "- Parent `code`\n",
+                "  - Nested [link](../nested.md)\n",
+                "- Sibling",
+            ),
+            5,
+        ));
+        let Block::List { items, .. } = &document.blocks[0].kind else {
+            panic!("fixture should parse as a list");
+        };
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].children.len(), 2);
+        assert!(matches!(items[0].children[0].kind, Block::Paragraph(_)));
+        assert!(matches!(items[0].children[1].kind, Block::List { .. }));
+        assert_eq!(document.plain_text(), "Parent code\nNested link\nSibling");
     }
 
     #[test]

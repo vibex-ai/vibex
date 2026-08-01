@@ -534,8 +534,18 @@ MessageSubmissionCoordinator::submit(SendAgentMessageRequest)
 RuntimeCascadeProjection::from_catalog(catalog, desired)
   -> RuntimeCascadeProjection
 
-ComposerUiState.runtime_selections_by_agent:
-  BTreeMap<AgentId, SessionRuntimeSelection>
+ComposerUiState {
+  runtime_selections_by_agent:
+    BTreeMap<AgentId, SessionRuntimeSelection>,
+  runtime_selections_by_model:
+    Vec<SessionRuntimeSelection> // max 256, identity = Agent/Profile/Model
+}
+
+ComposerGeometry {
+  input_bounds, runtime_trigger_bounds
+}
+
+RuntimeMenuPlacement { anchor, height, trigger_offset }
 ```
 
 ### 3. Contracts
@@ -635,13 +645,23 @@ ComposerUiState.runtime_selections_by_agent:
   (`none/minimal/low/medium/high/xhigh/max/ultra`), followed by unknown values in
   deterministic order. Do not insert or retain a synthetic `Default` effort;
   `reasoning_effort = null` continues to mean the Adapter's converged default.
-- `DesktopUiStateV1.composer.runtime_selections_by_agent` persists at most one
-  complete, bounded product selection per Agent. Explicit new-session choices and
-  successful in-session runtime changes update it. Switching Agent A -> B -> A
-  restores A's last valid Profile/Model/Effort/Mode/feature selection; every
-  restore is revalidated against the current catalog before it reaches a
-  selector or mutation. Persist only catalog-backed Toggle/Select feature values;
-  freeform String feature values may contain user content and remain view-local.
+- Mode choices are exactly the values advertised by the runtime catalog. Do not
+  inject a null-selection `Default`; an Agent-advertised mode whose id is
+  `default` remains a normal real choice. ACP `SessionMode` exposes id, name,
+  description, and opaque `_meta`, but no risk level. Do not infer danger from
+  mode ids/names/descriptions or `_meta`, and do not apply warning colors until
+  a provider-neutral typed risk field exists.
+- `DesktopUiStateV1.composer.runtime_selections_by_agent` persists the most recent
+  complete selection per Agent so Agent A -> B -> A restores the last route.
+  `runtime_selections_by_model` additionally persists at most 256 selections by
+  exact Agent/Profile/Model identity, so choosing a Model restores its own valid
+  Effort/Mode/feature values even after selecting another Model. Explicit
+  new-session choices and successful in-session runtime changes update both
+  projections. Existing per-Agent values seed the per-Model collection during
+  normalization for backward compatibility. Every restore is revalidated against
+  the current catalog before it reaches a selector or mutation. Persist only
+  catalog-backed Toggle/Select feature values; freeform String feature values may
+  contain user content and remain view-local.
 - Async in-session preference writes carry a per-Agent intent epoch. A completion
   persists only while its epoch is still current, so an older switch cannot
   overwrite a newer choice; activity for another Agent does not invalidate it.
@@ -662,6 +682,24 @@ ComposerUiState.runtime_selections_by_agent:
   Native image chooser results, clipboard image entries, dropped paths, and
   bounded HTML `data:image/*;base64` payloads converge through the same typed
   attachment path; unrecognized clipboard text remains ordinary Composer text.
+- Inline attachment marker ranges contain only non-breaking word characters;
+  insertion padding stays outside the marker and is removed from the submitted
+  text. Root-level token overlays render only when the marker's buffer row is in
+  `InputState::visible_row_range` and its complete bounds remain inside the
+  tracked input viewport. Never trust `range_to_bounds` alone for an offset above
+  the visible prefix, and never let a marker range include a wrapping space. The
+  opaque token covers the complete horizontal marker bounds without an inset, so
+  raw marker glyphs cannot remain visible at either rounded edge.
+- New-session text, attachments, workspace, Agent, and runtime options are one
+  view-local draft. Navigating to an existing session hides but does not reset
+  that draft; reopening restores it. Clear it only on explicit Cancel or after
+  session creation is accepted. Prompt text and attachments remain excluded from
+  persisted UI state.
+- Runtime Popovers track their trigger. Choose the side with usable viewport
+  space, cap menu height to that space, and keep the menu attached to the trigger
+  with a fixed 4 px visual gap. Upward menus may overlay non-trigger Composer
+  content; offsetting them beyond the complete Composer surface leaves an
+  excessive gap from the control that opened them.
 - Native Composer cut and paste must use the history-recording InputState edit
   path. Calling a `*_silent` replacement from clipboard actions makes Ctrl+Z
   undo an older IME/text edit and prevents Ctrl+Y/Ctrl+Shift+Z from restoring
@@ -724,8 +762,17 @@ ComposerUiState.runtime_selections_by_agent:
   empty Model, or exceeds bounded key/value/count limits -> drop that preference
   during `DesktopUiStateV1::normalize`; do not fail session creation or treat the
   preference as runtime authority.
+- A per-Model preference has the same Agent/Profile/Model identity as an earlier
+  entry -> keep the latest normalized configuration in that slot. An invalid or
+  257th distinct entry is dropped/evicted without affecting runtime authority.
 - Catalog exposes no Reasoning Effort values, or only a `default` sentinel ->
   render no Effort choice; do not fabricate a level or a `Default` menu item.
+- Catalog exposes no Mode values -> render no Mode choice. Catalog exposes a real
+  `default` Mode -> render it once; never add a second synthetic choice.
+- Attachment row is above/below the input viewport, including a stale
+  `range_to_bounds` result mapped to the first visible line -> omit its overlay.
+- Runtime menu cannot fit at full height on either side -> use the larger side
+  and reduce its scroll viewport without crossing the trigger.
 
 ### 5. Good/Base/Bad Cases
 
@@ -746,6 +793,13 @@ ComposerUiState.runtime_selections_by_agent:
 - Good: choose `high` for Codex and `low` for Claude, switch between their
   new-session chips, restart the desktop, and restore each choice only while its
   exact Profile/Model and advertised values remain valid.
+- Good: choose Model A with high/Agent mode and Model B with low/Read-only mode;
+  switching A -> B -> A restores both exact configurations after catalog
+  validation.
+- Good: type a new-session prompt with an image, open an existing session, then
+  reopen New Session and recover the same prompt, attachment, and runtime options.
+- Base: ACP advertises a real `default` mode named `Manual`; it appears once with
+  the Agent-provided label and no inferred warning color.
 - Base: a clean preview home has no sessions; the workbench renders its empty
   state while the shared runtime lifecycle remains healthy.
 - Base: a remembered Model was disabled since the last run; the selector falls
@@ -754,8 +808,8 @@ ComposerUiState.runtime_selections_by_agent:
 - Bad: store raw `TimelineItem` merge logic in the GPUI render method, clear the
   draft before `submit` accepts, replace the active runtime from a stale task,
   label Effort choices with long descriptions, sort them alphabetically, show a
-  synthetic `Default`, or remove polling because live events appeared healthy in
-  one run.
+  synthetic `Default`, infer mode risk from a label, clear a hidden new-session
+  draft, or remove polling because live events appeared healthy in one run.
 
 ### 6. Tests Required
 
@@ -780,11 +834,17 @@ ComposerUiState.runtime_selections_by_agent:
 - `desktop-model` runtime tests feed descriptions and shuffled Effort values,
   then assert value-derived names, semantic low-to-high ordering, deterministic
   unknown ordering, and no `Default` effort.
-- UI-state tests cover per-Agent preference normalization and atomic round-trip.
-  GPUI tests assert Agent A -> B -> A preference isolation, provisional ->
-  enriched catalog restoration, freeform feature exclusion, stale catalog
-  fallback, out-of-order completion fencing, and visible
+- UI-state tests cover per-Agent and per-Model preference normalization, legacy
+  seeding, exact-identity deduplication, bounds, and atomic round-trip. GPUI tests
+  assert Agent A -> B -> A preference isolation, Model A -> B -> A configuration
+  restoration, provisional -> enriched catalog restoration, freeform feature
+  exclusion, stale catalog fallback, out-of-order completion fencing, and visible
   `Provider Profile / Model` labels.
+- GPUI tests assert Mode projection contains only catalog values, runtime menu
+  placement stays adjacent to its trigger in both directions, hidden new-session
+  navigation does not clear the draft, attachment markers do not own wrapping
+  spaces or show glyphs beyond the opaque token, and off-viewport attachment
+  bounds are rejected.
 - GPUI contract probe asserts virtualization, authoritative/live merge,
   generation fencing, row drag reorder, durable submission, Owner heartbeat,
   native IME input, attachment drop, and permission actions.
@@ -868,6 +928,30 @@ choices.sort_by_key(|(rank, _)| rank.clone());
 let preferred = persisted_by_agent
     .get(&agent_id)
     .filter(|selection| catalog_has_runtime_selection(catalog, selection));
+```
+
+#### Wrong
+
+```rust
+let mut modes = vec![RuntimeCascadeChoice::default_choice()];
+let bounds = input.range_to_bounds(&attachment_range)?;
+render_root_overlay(bounds); // may pin a scrolled-out marker to the first row
+```
+
+#### Correct
+
+```rust
+let modes = catalog_modes.map(RuntimeCascadeChoice::from_catalog).collect();
+let remembered = persisted_by_model
+    .iter()
+    .find(|selection| runtime_selection_identity_matches(selection, &choice.selection))
+    .filter(|selection| catalog_has_runtime_selection(catalog, selection));
+let bounds = input.range_to_bounds(&attachment_range)?;
+if visible_rows.contains(&buffer_row)
+    && composer_attachment_bounds_are_visible(bounds, input_bounds)
+{
+    render_root_overlay(bounds);
+}
 ```
 
 ## Scenario: Workspace-Less New Session Creation

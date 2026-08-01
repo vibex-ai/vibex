@@ -185,19 +185,7 @@ where
         });
     }
 
-    let mut choices = Vec::with_capacity(
-        values.len() + usize::from(matches!(dimension, RuntimeConfigDimension::Mode)),
-    );
-    if matches!(dimension, RuntimeConfigDimension::Mode) {
-        let mut default_selection = desired.clone();
-        default_selection.mode_id = None;
-        choices.push(RuntimeCascadeChoice {
-            value: "default".into(),
-            label: "Default".into(),
-            selection: default_selection,
-        });
-    }
-    choices.extend(values.into_iter().map(|(value, label)| {
+    let choices = values.into_iter().map(|(value, label)| {
         let mut selection = desired.clone();
         match dimension {
             RuntimeConfigDimension::ReasoningEffort => {
@@ -210,8 +198,8 @@ where
             label,
             selection,
         }
-    }));
-    choices
+    });
+    choices.collect()
 }
 
 fn reasoning_effort_rank(value: &str) -> (u8, String) {
@@ -340,8 +328,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("low", "Low"), ("high", "High")]
         );
-        assert_eq!(projection.modes.len(), 2);
-        assert_eq!(projection.modes[1].value, "build");
+        assert_eq!(projection.modes.len(), 1);
+        assert_eq!(projection.modes[0].value, "build");
+        assert_eq!(
+            projection.modes[0].selection.mode_id.as_deref(),
+            Some("build")
+        );
     }
 
     #[test]
@@ -390,6 +382,44 @@ mod tests {
                 .iter()
                 .all(|choice| choice.value != "default")
         );
+    }
+
+    #[test]
+    fn modes_preserve_an_advertised_default_without_injecting_one() {
+        let with_default = option(
+            "claude",
+            "provider_claude",
+            "sonnet",
+            &[],
+            &["default", "plan"],
+        );
+        let without_default = option("codex", "provider_codex", "gpt-5", &[], &["agent"]);
+
+        let with_default_projection = RuntimeCascadeProjection::from_catalog(
+            &SessionRuntimeOptionCatalog {
+                revision: 3,
+                options: vec![with_default.clone()],
+            },
+            &with_default.selection,
+        );
+        let without_default_projection = RuntimeCascadeProjection::from_catalog(
+            &SessionRuntimeOptionCatalog {
+                revision: 4,
+                options: vec![without_default.clone()],
+            },
+            &without_default.selection,
+        );
+
+        assert_eq!(
+            with_default_projection
+                .modes
+                .iter()
+                .map(|choice| choice.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["default", "plan"]
+        );
+        assert_eq!(without_default_projection.modes.len(), 1);
+        assert_eq!(without_default_projection.modes[0].value, "agent");
     }
 
     #[test]

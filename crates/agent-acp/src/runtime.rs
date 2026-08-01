@@ -151,6 +151,9 @@ const OPENCODE_INLINE_CONFIG_ENV: &str = "OPENCODE_CONFIG_CONTENT";
 const OPENCODE_PROVIDER_API_KEY_ENV: &str = "VIBEX_OPENCODE_PROVIDER_API_KEY";
 const OPENCODE_MODEL_API_ERROR_CODE: &str = "opencode_model_api_error";
 const OPENCODE_MODEL_API_RETRYING_CODE: &str = "opencode_model_api_retrying";
+const CODEX_STREAM_RECONNECTING_CODE: &str = "codex_stream_reconnecting";
+const CODEX_STREAM_RECONNECT_EXHAUSTED_CODE: &str = "codex_stream_reconnect_exhausted";
+const CODEX_RECONNECT_PROGRESS_PREFIX: &str = "Reconnecting... ";
 // OpenCode retries transient model failures with a 2/4/8/16/30-second backoff.
 // Eight consecutive failures preserve a roughly two-minute recovery window.
 const OPENCODE_STREAM_ERROR_LIMIT: u8 = 8;
@@ -829,6 +832,7 @@ struct ActiveTurn {
     sink: TurnSink,
     usage: Option<ActiveUsageTurn>,
     chunk_index: u32,
+    codex_reconnect: Option<CodexReconnectState>,
     opencode_stream_error_count: u8,
     opencode_stream_error_epoch: u64,
     latest_opencode_stream_error: Option<String>,
@@ -895,6 +899,18 @@ struct OpenCodeStreamErrorObservation {
     reached_limit: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CodexReconnectProgress {
+    attempt: u32,
+    total: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexReconnectState {
+    progress: CodexReconnectProgress,
+    terminal_message: Option<String>,
+}
+
 struct OpenCodeStreamErrorWatchdog {
     epoch: u64,
     deadline: Instant,
@@ -905,6 +921,15 @@ enum OpenCodeStreamErrorWatchdogState {
     Stale,
     Pending(Instant),
     Expired(String),
+}
+
+fn parse_codex_reconnect_progress(text: &str) -> Option<CodexReconnectProgress> {
+    let counter = text.trim().strip_prefix(CODEX_RECONNECT_PROGRESS_PREFIX)?;
+    let (attempt, total) = counter.split_once('/')?;
+    let attempt = attempt.parse::<u32>().ok()?;
+    let total = total.parse::<u32>().ok()?;
+    (attempt > 0 && total > 0 && attempt <= total)
+        .then_some(CodexReconnectProgress { attempt, total })
 }
 
 fn append_bounded_assistant_text(buffer: &mut String, truncated: &mut bool, text: &str) {
@@ -1406,6 +1431,7 @@ impl AcpSessionAttachment {
                 },
             ),
             chunk_index: 0,
+            codex_reconnect: None,
             opencode_stream_error_count: 0,
             opencode_stream_error_epoch: 0,
             latest_opencode_stream_error: None,
@@ -1631,6 +1657,67 @@ impl AcpSessionAttachment {
             &mut turn.assistant_segment_truncated,
             text,
         );
+    }
+
+    fn record_codex_reconnect_progress(&self, progress: CodexReconnectProgress) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let Some(turn) = state.active_turn.as_mut() else {
+            return;
+        };
+        turn.codex_reconnect = Some(CodexReconnectState {
+            progress,
+            terminal_message: None,
+        });
+    }
+
+    fn record_codex_reconnect_terminal_message(&self, message: &str) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let Some(reconnect) = state
+            .active_turn
+            .as_mut()
+            .and_then(|turn| turn.codex_reconnect.as_mut())
+            .filter(|reconnect| reconnect.progress.attempt == reconnect.progress.total)
+        else {
+            return false;
+        };
+        reconnect.terminal_message = Some(redact_summary(message));
+        true
+    }
+
+    fn clear_codex_reconnect(&self) {
+        if let Ok(mut state) = self.state.lock()
+            && let Some(turn) = state.active_turn.as_mut()
+        {
+            turn.codex_reconnect = None;
+        }
+    }
+
+    fn codex_reconnect_exhausted_error(&self) -> Option<VibexError> {
+        let state = self.state.lock().ok()?;
+        let reconnect = state.active_turn.as_ref()?.codex_reconnect.as_ref()?;
+        (reconnect.progress.attempt == reconnect.progress.total).then(|| {
+            let message = reconnect.terminal_message.as_deref().map_or_else(
+                || {
+                    format!(
+                        "Codex model stream failed after {} reconnect attempts",
+                        reconnect.progress.total
+                    )
+                },
+                |detail| {
+                    format!(
+                        "Codex model stream failed after {} reconnect attempts: {detail}",
+                        reconnect.progress.total
+                    )
+                },
+            );
+            VibexError::provider(CODEX_STREAM_RECONNECT_EXHAUSTED_CODE, message)
+                .with_recovery_hint("Continue the session to retry from the failed turn")
+                .with_diagnostic("reconnectAttempts", reconnect.progress.total.to_string())
+        })
     }
 
     fn record_opencode_stream_error(
@@ -2119,6 +2206,34 @@ impl AcpSessionAttachment {
             "agent_message_chunk" => {
                 let text = content_block_text(update.get("content"));
                 if !text.is_empty() {
+                    let process = self.process();
+                    let is_codex = process.event_enricher == AgentEventEnricherKind::Codex;
+                    let is_unattributed = update.get("messageId").and_then(Value::as_str).is_none();
+                    // codex-acp forwards most Codex errors as unattributed text and
+                    // still returns end_turn, so recover the retry boundary here.
+                    if is_codex && is_unattributed {
+                        if let Some(progress) = parse_codex_reconnect_progress(&text) {
+                            self.record_codex_reconnect_progress(progress);
+                            let provider_correlation_id = stable_event_correlation_id(
+                                &process.compatibility_identity,
+                                &self.native_session_id,
+                                CODEX_STREAM_RECONNECTING_CODE,
+                                0,
+                            );
+                            self.emit_turn_event(AcpEvent::Error {
+                                code: CODEX_STREAM_RECONNECTING_CODE.to_string(),
+                                message: redact_summary(&text),
+                                recoverable: true,
+                                provider_correlation_id: Some(provider_correlation_id),
+                            });
+                            return;
+                        }
+                        if self.record_codex_reconnect_terminal_message(&text) {
+                            return;
+                        }
+                    } else if is_codex {
+                        self.clear_codex_reconnect();
+                    }
                     self.record_opencode_stream_progress();
                     self.append_assistant_text(&text);
                     let chunk_index = self.next_chunk_index();
@@ -2131,6 +2246,9 @@ impl AcpSessionAttachment {
             "agent_thought_chunk" => {
                 let text = content_block_text(update.get("content"));
                 if !text.is_empty() {
+                    if self.process().event_enricher == AgentEventEnricherKind::Codex {
+                        self.clear_codex_reconnect();
+                    }
                     self.record_opencode_stream_progress();
                     self.emit_turn_event(AcpEvent::Reasoning {
                         text,
@@ -2140,6 +2258,9 @@ impl AcpSessionAttachment {
             }
             "tool_call" | "tool_call_update" => {
                 if kind == "tool_call" {
+                    if self.process().event_enricher == AgentEventEnricherKind::Codex {
+                        self.clear_codex_reconnect();
+                    }
                     self.record_opencode_stream_progress();
                 }
                 for event in self.merge_tool_call_update(kind, update) {
@@ -2149,6 +2270,9 @@ impl AcpSessionAttachment {
             "plan" => {
                 let steps = plan_steps(update.get("entries"));
                 if !steps.is_empty() {
+                    if self.process().event_enricher == AgentEventEnricherKind::Codex {
+                        self.clear_codex_reconnect();
+                    }
                     self.emit_turn_event(AcpEvent::Plan {
                         title: "Plan".to_string(),
                         steps,
@@ -11644,10 +11768,17 @@ impl AcpClient for AcpRuntimeClient {
             "cancelled" | "canceled" | "interrupted" => AgentUsageExecutionStatus::Interrupted,
             _ => AgentUsageExecutionStatus::Completed,
         };
-        let buffered_events = turn_guard.complete(!has_pending_permissions, usage_status)?;
         if usage_changed {
             process.publish_attachment_payload(&payload);
         }
+        if stop_reason == "end_turn"
+            && !has_pending_permissions
+            && let Some(error) = payload.codex_reconnect_exhausted_error()
+        {
+            turn_guard.abort(false, AgentUsageExecutionStatus::Failed);
+            return Err(error);
+        }
+        let buffered_events = turn_guard.complete(!has_pending_permissions, usage_status)?;
         let mut events = buffered_events;
         if stop_reason != "end_turn" {
             events.push(AcpEvent::SystemNotice {
@@ -13049,6 +13180,27 @@ fn image_content_block(attachment: &ProviderTurnAttachment) -> Option<Value> {
 mod tests {
     use super::*;
     use vibex_agent::AgentProvider;
+
+    #[test]
+    fn codex_reconnect_progress_requires_an_exact_bounded_counter() {
+        assert_eq!(
+            parse_codex_reconnect_progress("Reconnecting... 5/5\n\n"),
+            Some(CodexReconnectProgress {
+                attempt: 5,
+                total: 5,
+            })
+        );
+        for invalid in [
+            "Reconnecting... 0/5",
+            "Reconnecting... 6/5",
+            "Reconnecting... 1/0",
+            "Reconnecting... x/5",
+            "Warning: Reconnecting... 1/5",
+            "Reconnecting... 1/5 unexpected status",
+        ] {
+            assert_eq!(parse_codex_reconnect_progress(invalid), None, "{invalid}");
+        }
+    }
 
     #[test]
     fn standard_context_and_prompt_usage_are_merged_without_losing_fields() {
@@ -15655,6 +15807,55 @@ for line in sys.stdin:
                 },
             },
         })
+        if prompt_mode in ("codex_reconnect_exhausted", "codex_reconnect_recovered"):
+            for attempt in range(1, 6):
+                send({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {
+                                "type": "text",
+                                "text": "Reconnecting... " + str(attempt) + "/5\n\n",
+                            },
+                        },
+                    },
+                })
+            if prompt_mode == "codex_reconnect_exhausted":
+                send({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {
+                                "type": "text",
+                                "text": "unexpected status 404 Not Found\n\n",
+                            },
+                        },
+                    },
+                })
+            else:
+                send({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "messageId": "codex-recovered-message",
+                            "content": {
+                                "type": "text",
+                                "text": "model stream recovered",
+                            },
+                        },
+                    },
+                })
+            send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
+            continue
         if prompt_mode == "stream_error":
             send_stream_error(session_id, True, "AI_RetryError: title generation failed")
             for _ in range(8):
@@ -19403,6 +19604,162 @@ for line in sys.stdin:
         let log = fixture.request_log();
         assert_eq!(logged_request_count(&log, "session/load"), 1);
         assert_eq!(logged_request_count(&log, "session/new"), 0);
+
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn codex_reconnect_exhaustion_returns_a_terminal_provider_error() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "codex-reconnect-exhausted",
+            Some(AgentId::parse("codex").unwrap()),
+        ) else {
+            return;
+        };
+        fixture.set_prompt_mode("codex_reconnect_exhausted");
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let error = prepare_and_send_turn(
+            &client,
+            AcpSendTurnRequest {
+                session_id: session_id.clone(),
+                message_submission_id: None,
+                required_runtime: None,
+                text: "exhaust Codex reconnects".to_string(),
+                attachments: Vec::new(),
+                workspace_root: fixture.workspace.display().to_string(),
+                binding: binding.clone(),
+                runtime_resources: ProviderRuntimeResources::default(),
+                execution_identity: None,
+                event_sender: Some(event_tx),
+                usage_execution_context: None,
+                usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                usage_event_sender: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.category, vibex_core::ErrorCategory::Provider);
+        assert_eq!(error.code, CODEX_STREAM_RECONNECT_EXHAUSTED_CODE);
+        assert!(error.message.contains("unexpected status 404 Not Found"));
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        let reconnect_events = events
+            .iter()
+            .filter_map(|event| match event {
+                AcpEvent::Error {
+                    code,
+                    provider_correlation_id: Some(correlation),
+                    ..
+                } if code == CODEX_STREAM_RECONNECTING_CODE => Some(correlation.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reconnect_events.len(), 5);
+        assert!(
+            reconnect_events
+                .iter()
+                .all(|correlation| *correlation == reconnect_events[0])
+        );
+        assert!(!events.iter().any(|event| {
+            matches!(
+                event,
+                AcpEvent::AssistantDelta { text_delta, .. }
+                    if text_delta.contains(CODEX_RECONNECT_PROGRESS_PREFIX)
+                        || text_delta.contains("unexpected status")
+            )
+        }));
+        assert_eq!(
+            logged_request_count(&fixture.request_log(), "session/cancel"),
+            0
+        );
+
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn codex_real_progress_clears_an_exhausted_reconnect_candidate() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "codex-reconnect-recovered",
+            Some(AgentId::parse("codex").unwrap()),
+        ) else {
+            return;
+        };
+        fixture.set_prompt_mode("codex_reconnect_recovered");
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let turn = prepare_and_send_turn(
+            &client,
+            AcpSendTurnRequest {
+                session_id: session_id.clone(),
+                message_submission_id: None,
+                required_runtime: None,
+                text: "recover the Codex model stream".to_string(),
+                attachments: Vec::new(),
+                workspace_root: fixture.workspace.display().to_string(),
+                binding: binding.clone(),
+                runtime_resources: ProviderRuntimeResources::default(),
+                execution_identity: None,
+                event_sender: Some(event_tx),
+                usage_execution_context: None,
+                usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                usage_event_sender: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(turn.completed);
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AcpEvent::Error { code, .. } if code == CODEX_STREAM_RECONNECTING_CODE
+                ))
+                .count(),
+            5
+        );
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AcpEvent::AssistantDelta { text_delta, .. }
+                    if text_delta == "model stream recovered"
+            )
+        }));
+        assert_eq!(
+            logged_request_count(&fixture.request_log(), "session/cancel"),
+            0
+        );
 
         client.close_session(&binding).await.unwrap();
         fixture.cleanup();

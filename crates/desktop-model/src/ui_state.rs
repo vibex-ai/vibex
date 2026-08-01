@@ -13,6 +13,7 @@ pub const DEFAULT_UI_STATE_WRITE_DELAY_MS: u64 = 200;
 pub const MIN_UI_STATE_WRITE_DELAY_MS: u64 = 100;
 pub const MAX_UI_STATE_WRITE_DELAY_MS: u64 = 300;
 pub const DEFAULT_CORRUPT_BACKUP_LIMIT: usize = 3;
+pub const RUNTIME_SELECTION_PREFERENCE_LIMIT: usize = 256;
 
 #[derive(Debug, Error)]
 pub enum UiStateError {
@@ -217,6 +218,8 @@ pub struct ComposerUiState {
     pub terminal_ids: Vec<String>,
     #[serde(default)]
     pub runtime_selections_by_agent: BTreeMap<AgentId, SessionRuntimeSelection>,
+    #[serde(default)]
+    pub runtime_selections_by_model: Vec<SessionRuntimeSelection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -346,6 +349,28 @@ impl DesktopUiStateV1 {
                 })
                 .take(64)
                 .collect();
+        let legacy_runtime_selections = self
+            .composer
+            .runtime_selections_by_agent
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut runtime_selections_by_model = normalize_runtime_selection_preferences(
+            std::mem::take(&mut self.composer.runtime_selections_by_model),
+        );
+        for selection in legacy_runtime_selections {
+            if runtime_selections_by_model
+                .iter()
+                .any(|existing| runtime_selection_identity_matches(existing, &selection))
+            {
+                continue;
+            }
+            if runtime_selections_by_model.len() >= RUNTIME_SELECTION_PREFERENCE_LIMIT {
+                break;
+            }
+            runtime_selections_by_model.push(selection);
+        }
+        self.composer.runtime_selections_by_model = runtime_selections_by_model;
         normalize_ids(&mut self.agent_tab_order, 256);
         self.terminal_tab_titles = std::mem::take(&mut self.terminal_tab_titles)
             .into_iter()
@@ -816,6 +841,35 @@ fn normalize_runtime_selection(selection: &mut SessionRuntimeSelection) -> bool 
     true
 }
 
+fn normalize_runtime_selection_preferences(
+    selections: Vec<SessionRuntimeSelection>,
+) -> Vec<SessionRuntimeSelection> {
+    let mut normalized = Vec::<SessionRuntimeSelection>::new();
+    for mut selection in selections {
+        if !normalize_runtime_selection(&mut selection) {
+            continue;
+        }
+        if let Some(existing) = normalized
+            .iter_mut()
+            .find(|existing| runtime_selection_identity_matches(existing, &selection))
+        {
+            *existing = selection;
+        } else if normalized.len() < RUNTIME_SELECTION_PREFERENCE_LIMIT {
+            normalized.push(selection);
+        }
+    }
+    normalized
+}
+
+fn runtime_selection_identity_matches(
+    left: &SessionRuntimeSelection,
+    right: &SessionRuntimeSelection,
+) -> bool {
+    left.agent_id == right.agent_id
+        && left.provider_profile_id == right.provider_profile_id
+        && left.model_id == right.model_id
+}
+
 fn bounded_runtime_value(value: &str, max_chars: usize) -> Option<String> {
     let value = value.trim();
     (!value.is_empty() && value.chars().count() <= max_chars).then(|| value.to_string())
@@ -980,6 +1034,10 @@ mod tests {
             BTreeMap::from([("web_search".into(), "true".into())])
         );
         assert_eq!(state.composer.runtime_selections_by_agent.len(), 1);
+        assert_eq!(
+            state.composer.runtime_selections_by_model,
+            vec![selection.clone()]
+        );
     }
 
     #[test]
@@ -1001,6 +1059,13 @@ mod tests {
             .composer
             .runtime_selections_by_agent
             .insert(codex.clone(), selection.clone());
+        let mut alternate = selection.clone();
+        alternate.model_id = "gpt-5-mini".into();
+        alternate.reasoning_effort = Some("low".into());
+        state
+            .composer
+            .runtime_selections_by_model
+            .extend([selection.clone(), alternate.clone()]);
 
         store.save(&state).unwrap();
         let loaded = store.load_or_default(1).unwrap();
@@ -1013,20 +1078,64 @@ mod tests {
                 .get(&codex),
             Some(&selection)
         );
+        assert_eq!(
+            loaded.state.composer.runtime_selections_by_model,
+            vec![selection, alternate]
+        );
     }
 
     #[test]
-    fn current_v1_without_runtime_preferences_defaults_to_an_empty_map() {
+    fn current_v1_without_runtime_preferences_defaults_to_empty_collections() {
         let mut value = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
-        value
+        let composer = value
             .get_mut("composer")
             .and_then(serde_json::Value::as_object_mut)
-            .unwrap()
-            .remove("runtimeSelectionsByAgent");
+            .unwrap();
+        composer.remove("runtimeSelectionsByAgent");
+        composer.remove("runtimeSelectionsByModel");
 
         let decoded = decode_and_migrate(&serde_json::to_vec(&value).unwrap()).unwrap();
 
         assert!(decoded.composer.runtime_selections_by_agent.is_empty());
+        assert!(decoded.composer.runtime_selections_by_model.is_empty());
+    }
+
+    #[test]
+    fn runtime_preferences_keep_model_values_over_legacy_seeds_and_latest_duplicates() {
+        let agent_id = AgentId::parse("codex").unwrap();
+        let provider_profile_id = vibex_core::ProviderProfileId::new();
+        let selection = |model: &str, effort: &str| SessionRuntimeSelection {
+            agent_id: agent_id.clone(),
+            provider_profile_id: provider_profile_id.clone(),
+            model_id: model.into(),
+            reasoning_effort: Some(effort.into()),
+            mode_id: None,
+            config_values: BTreeMap::new(),
+        };
+        let mut state = DesktopUiStateV1::default();
+        state
+            .composer
+            .runtime_selections_by_agent
+            .insert(agent_id.clone(), selection("gpt-5", "low"));
+        state.composer.runtime_selections_by_model = vec![
+            selection("gpt-5", "low"),
+            selection("gpt-5-mini", "medium"),
+            selection("gpt-5", "high"),
+        ];
+
+        state.normalize().unwrap();
+
+        assert_eq!(state.composer.runtime_selections_by_model.len(), 2);
+        assert_eq!(
+            state.composer.runtime_selections_by_model[0]
+                .reasoning_effort
+                .as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            state.composer.runtime_selections_by_model[1].model_id,
+            "gpt-5-mini"
+        );
     }
 
     #[test]

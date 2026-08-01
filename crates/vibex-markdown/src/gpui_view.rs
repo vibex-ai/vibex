@@ -3432,6 +3432,7 @@ mod tests {
     struct MarkdownSelectionProbe {
         input: MarkdownInput,
         state: Entity<MarkdownViewState>,
+        width: f32,
     }
 
     struct MarkdownVirtualizationProbe {
@@ -3451,7 +3452,16 @@ mod tests {
                     cx,
                 )
             });
-            Self { input, state }
+            Self {
+                input,
+                state,
+                width: 560.0,
+            }
+        }
+
+        fn with_width(mut self, width: f32) -> Self {
+            self.width = width;
+            self
         }
     }
 
@@ -3484,7 +3494,7 @@ mod tests {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let mut markdown = MarkdownView::new("selection-probe", self.input.clone());
             markdown.state = Some(self.state.clone());
-            div().w(px(560.0)).child(markdown)
+            div().w(px(self.width)).child(markdown)
         }
     }
 
@@ -3727,6 +3737,79 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(segments.len(), 1);
             assert_eq!(segments[0].layout.wrapped_text(), expected);
+        });
+    }
+
+    #[::gpui::test]
+    fn chinese_list_items_keep_inline_code_and_links_in_the_same_line_layout(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let source = concat!(
+            "- 用户手动点“停止”，目前会话会被置为 `Idle`，见 ",
+            "[manager.rs](/workspace/crates/agent/src/manager.rs:1795)。\n",
+            "- ACP 返回 `cancelled`、`interrupted` 等停止原因。\n",
+            "- 普通执行结束、等待权限输入，或仅出现前端 `agent_error` 临时提示。",
+        );
+        let input = MarkdownInput::new(source, "/workspace", 1).surface(MarkdownSurface::Agent);
+        let document = parse_markdown(input.clone());
+        let list_items_support_text_flow = document.blocks.iter().all(|block| {
+            let Block::List { items, .. } = &block.kind else {
+                return false;
+            };
+            items.iter().all(|item| {
+                item.children.iter().all(|child| {
+                    matches!(
+                        &child.kind,
+                        Block::Paragraph(inlines)
+                            if inlines.iter().all(inline_supports_text_flow)
+                    )
+                })
+            })
+        });
+        assert!(
+            list_items_support_text_flow,
+            "fixture should use the combined inline text flow: {:#?}",
+            document.blocks,
+        );
+        let (probe, cx) =
+            cx.add_window_view(|_, cx| MarkdownSelectionProbe::new(input, cx).with_width(760.0));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let state = probe.read_with(cx, |probe, _| probe.state.clone());
+        state.read_with(cx, |state, _| {
+            for expected in [
+                "用户手动点“停止”，目前会话会被置为 Idle，见 manager.rs。",
+                "ACP 返回 cancelled、interrupted 等停止原因。",
+                "普通执行结束、等待权限输入，或仅出现前端 agent_error 临时提示。",
+            ] {
+                let segment = state
+                    .selection_segments
+                    .values()
+                    .find(|segment| {
+                        state.selection_text.get(segment.text_range.clone()) == Some(expected)
+                    })
+                    .unwrap_or_else(|| {
+                        let segments = state
+                            .selection_segments
+                            .values()
+                            .filter_map(|segment| {
+                                state
+                                    .selection_text
+                                    .get(segment.text_range.clone())
+                                    .map(|text| (text, segment.layout.wrapped_text()))
+                            })
+                            .collect::<Vec<_>>();
+                        panic!(
+                            "list item should use one selectable text segment; expected={expected:?}, selection={:?}, segments={segments:?}",
+                            state.selection_text,
+                        );
+                    });
+                assert_eq!(segment.layout.wrapped_text(), expected);
+            }
         });
     }
 

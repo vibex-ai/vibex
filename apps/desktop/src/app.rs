@@ -79,9 +79,9 @@ use vibex_core::{
 };
 use vibex_desktop_model::{
     AppearanceUiState, ComposerAttachment, ComposerSuggestionSelection, ComposerTrigger,
-    DesktopUiStateV1, LocaleMode, NavigationHistory, RuntimeCascadeChoice,
-    RuntimeCascadeProjection, SessionContentWidthMode, SessionUiState, SidebarState,
-    ThemeMode as ModelThemeMode, ThrottledUiStateWriter, TimelineConversationTurn,
+    DesktopUiStateV1, LocaleMode, NavigationHistory, RUNTIME_SELECTION_PREFERENCE_LIMIT,
+    RuntimeCascadeChoice, RuntimeCascadeProjection, SessionContentWidthMode, SessionUiState,
+    SidebarState, ThemeMode as ModelThemeMode, ThrottledUiStateWriter, TimelineConversationTurn,
     TimelineFollowState, TimelineModel, TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
     UiStateStore, WorkbenchRoute, composer_trigger_at, timeline_conversation_turns,
 };
@@ -206,9 +206,9 @@ const SESSION_SEARCH_DIALOG_MAX_HEIGHT: f32 = 620.0;
 const SESSION_SEARCH_DIALOG_VIEWPORT_WIDTH_RATIO: f32 = 0.88;
 const SESSION_SEARCH_DIALOG_VIEWPORT_HEIGHT_RATIO: f32 = 0.74;
 const SESSION_SEARCH_EXCERPT_MAX_CHARS: usize = 180;
-const COMPOSER_INLINE_ATTACHMENT_PREFIX: &str = " [attachment-";
+const COMPOSER_INLINE_ATTACHMENT_PREFIX: &str = "attachment_";
 const COMPOSER_INLINE_ATTACHMENT_MARKER_RESERVE: &str = "..........";
-const COMPOSER_INLINE_ATTACHMENT_SUFFIX: &str = "] ";
+const COMPOSER_INLINE_ATTACHMENT_SUFFIX: &str = "_vbx";
 const COMPOSER_IMAGE_HOVER_PREVIEW_MAX_WIDTH: f32 = 384.0;
 const COMPOSER_IMAGE_HOVER_PREVIEW_MAX_HEIGHT: f32 = 288.0;
 const COMPOSER_IMAGE_HOVER_PREVIEW_MARGIN: f32 = 12.0;
@@ -225,6 +225,8 @@ const COMPOSER_RUNTIME_MENU_MAX_HEIGHT: f32 = 448.0;
 const NEW_SESSION_RUNTIME_MENU_MAX_HEIGHT: f32 = 360.0;
 const NEW_SESSION_RUNTIME_MENU_MIN_HEIGHT: f32 = 104.0;
 const RUNTIME_MENU_VIEWPORT_MARGIN: f32 = 12.0;
+const RUNTIME_MENU_TRIGGER_GAP: f32 = 4.0;
+const COMPOSER_RUNTIME_CHOICE_ROW_HEIGHT: f32 = 36.0;
 const COMPOSER_RUNTIME_AGENT_MENU_CHROME_HEIGHT: f32 = 49.0;
 const COMPOSER_RUNTIME_PROFILE_MENU_CHROME_HEIGHT: f32 = 53.0;
 const COMPOSER_RUNTIME_MODEL_MENU_CHROME_HEIGHT: f32 = 55.0;
@@ -354,6 +356,25 @@ enum RuntimeFeatureTarget {
     ActiveSession,
 }
 
+#[derive(Debug, Clone)]
+enum RuntimeChoiceMenuAction {
+    NewSession(SessionRuntimeSelection),
+    ActiveSession(SessionRuntimeSelection),
+    Feature {
+        target: RuntimeFeatureTarget,
+        feature_id: String,
+        value: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeChoiceMenuItem {
+    id: String,
+    label: String,
+    selected: bool,
+    action: RuntimeChoiceMenuAction,
+}
+
 #[derive(Debug, Default)]
 struct RuntimePreferenceWriteFence {
     epochs: BTreeMap<AgentId, u64>,
@@ -375,6 +396,13 @@ impl RuntimePreferenceWriteFence {
 struct RuntimeMenuPlacement {
     anchor: Anchor,
     height: f32,
+    trigger_offset: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct ComposerGeometry {
+    input_bounds: Option<Bounds<Pixels>>,
+    runtime_trigger_bounds: Option<Bounds<Pixels>>,
 }
 
 #[derive(Debug, Clone)]
@@ -454,25 +482,26 @@ fn composer_runtime_menu_height(
     (chrome_height + row_height * row_count.max(1) as f32).min(max_height)
 }
 
-fn new_session_runtime_menu_placement(
+fn composer_runtime_menu_placement(
     trigger_bounds: Option<Bounds<Pixels>>,
     viewport_height: f32,
     desired_height: f32,
+    max_height: f32,
 ) -> RuntimeMenuPlacement {
-    let desired_height = desired_height.min(NEW_SESSION_RUNTIME_MENU_MAX_HEIGHT);
-    let fallback_height = (viewport_height - RUNTIME_MENU_VIEWPORT_MARGIN * 2.0).clamp(
-        NEW_SESSION_RUNTIME_MENU_MIN_HEIGHT,
-        NEW_SESSION_RUNTIME_MENU_MAX_HEIGHT,
-    );
+    let desired_height = desired_height.min(max_height);
+    let fallback_height = (viewport_height - RUNTIME_MENU_VIEWPORT_MARGIN * 2.0)
+        .clamp(NEW_SESSION_RUNTIME_MENU_MIN_HEIGHT, max_height);
     let Some(trigger_bounds) = trigger_bounds else {
         return RuntimeMenuPlacement {
             anchor: Anchor::TopLeft,
             height: desired_height.min(fallback_height),
+            trigger_offset: RUNTIME_MENU_TRIGGER_GAP,
         };
     };
 
     let trigger_top = f32::from(trigger_bounds.origin.y);
-    let trigger_bottom = f32::from(trigger_bounds.origin.y + trigger_bounds.size.height);
+    let trigger_height = f32::from(trigger_bounds.size.height);
+    let trigger_bottom = trigger_top + trigger_height;
     let available_above = (trigger_top - RUNTIME_MENU_VIEWPORT_MARGIN).max(0.0);
     let available_below =
         (viewport_height - trigger_bottom - RUNTIME_MENU_VIEWPORT_MARGIN).max(0.0);
@@ -483,18 +512,19 @@ fn new_session_runtime_menu_placement(
     } else {
         available_above
     };
-
     RuntimeMenuPlacement {
         anchor: if opens_below {
             Anchor::TopLeft
         } else {
             Anchor::BottomLeft
         },
-        height: desired_height.min(available.clamp(
-            NEW_SESSION_RUNTIME_MENU_MIN_HEIGHT,
-            NEW_SESSION_RUNTIME_MENU_MAX_HEIGHT,
-        )),
+        height: desired_height.min(available.max(1.0)),
+        trigger_offset: RUNTIME_MENU_TRIGGER_GAP,
     }
+}
+
+fn composer_runtime_choice_menu_height(row_count: usize, max_height: f32) -> f32 {
+    (12.0 + COMPOSER_RUNTIME_CHOICE_ROW_HEIGHT * row_count.max(1) as f32).min(max_height)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2039,6 +2069,7 @@ pub struct VibexWorkbench {
     collapsed_project_restore: Option<BTreeSet<String>>,
     selected_session_id: Option<VibexSessionId>,
     new_session_open: bool,
+    new_session_draft_initialized: bool,
     new_session_project_menu_open: bool,
     new_session_project_menu_mounted: bool,
     new_session_project_menu_close_task: Option<Task<()>>,
@@ -2049,7 +2080,7 @@ pub struct VibexWorkbench {
     new_session_runtime_menu_open: bool,
     new_session_runtime_menu_view: ComposerRuntimeMenuView,
     new_session_runtime_menu_profile_id: Option<ProviderProfileId>,
-    new_session_runtime_menu_trigger_bounds: Option<Bounds<Pixels>>,
+    new_session_composer_geometry: ComposerGeometry,
     new_session_workspace_mode: WorkspaceMode,
     new_session_attachments: Vec<InlineComposerAttachment>,
     new_session_error: Option<String>,
@@ -2086,6 +2117,8 @@ pub struct VibexWorkbench {
     composer_runtime_menu_view: ComposerRuntimeMenuView,
     composer_runtime_menu_agent_id: Option<AgentId>,
     composer_runtime_menu_profile_id: Option<ProviderProfileId>,
+    composer_geometry: ComposerGeometry,
+    runtime_choice_menu_open: Option<String>,
     suggestions: Vec<AgentCommandEntry>,
     suggestion_selection: ComposerSuggestionSelection,
     suggestion_context: Option<ComposerSuggestionContext>,
@@ -2479,6 +2512,7 @@ impl VibexWorkbench {
             collapsed_project_restore: None,
             selected_session_id,
             new_session_open: false,
+            new_session_draft_initialized: false,
             new_session_project_menu_open: false,
             new_session_project_menu_mounted: false,
             new_session_project_menu_close_task: None,
@@ -2489,7 +2523,7 @@ impl VibexWorkbench {
             new_session_runtime_menu_open: false,
             new_session_runtime_menu_view: ComposerRuntimeMenuView::Profile,
             new_session_runtime_menu_profile_id: None,
-            new_session_runtime_menu_trigger_bounds: None,
+            new_session_composer_geometry: ComposerGeometry::default(),
             new_session_workspace_mode: WorkspaceMode::CurrentCheckout,
             new_session_attachments: Vec::new(),
             new_session_error: None,
@@ -2526,6 +2560,8 @@ impl VibexWorkbench {
             composer_runtime_menu_view: ComposerRuntimeMenuView::Agent,
             composer_runtime_menu_agent_id: None,
             composer_runtime_menu_profile_id: None,
+            composer_geometry: ComposerGeometry::default(),
+            runtime_choice_menu_open: None,
             suggestions: Vec::new(),
             suggestion_selection: ComposerSuggestionSelection::default(),
             suggestion_context: None,
@@ -3026,6 +3062,7 @@ impl VibexWorkbench {
                             if !this.initial_new_session_panel_handled {
                                 this.initial_new_session_panel_handled = true;
                                 this.new_session_open = sessions_empty;
+                                this.new_session_draft_initialized = sessions_empty;
                             }
                             if let Some(session_id) = preferred {
                                 this.select_session_with_history(session_id, false, cx);
@@ -3172,12 +3209,31 @@ impl VibexWorkbench {
 
     fn persist_runtime_selection(&mut self, selection: &SessionRuntimeSelection) {
         let selection = persisted_runtime_selection(self.runtime_catalog.as_ref(), selection);
-        let selections = &mut self.ui_state.composer.runtime_selections_by_agent;
-        if selections.get(&selection.agent_id) == Some(&selection) {
-            return;
+        let mut changed = false;
+        let selections_by_agent = &mut self.ui_state.composer.runtime_selections_by_agent;
+        if selections_by_agent.get(&selection.agent_id) != Some(&selection) {
+            selections_by_agent.insert(selection.agent_id.clone(), selection.clone());
+            changed = true;
         }
-        selections.insert(selection.agent_id.clone(), selection);
-        self.queue_ui_state();
+        let selections_by_model = &mut self.ui_state.composer.runtime_selections_by_model;
+        if let Some(existing) = selections_by_model
+            .iter_mut()
+            .find(|existing| runtime_selection_identity_matches(existing, &selection))
+        {
+            if *existing != selection {
+                *existing = selection;
+                changed = true;
+            }
+        } else {
+            if selections_by_model.len() >= RUNTIME_SELECTION_PREFERENCE_LIMIT {
+                selections_by_model.remove(0);
+            }
+            selections_by_model.push(selection);
+            changed = true;
+        }
+        if changed {
+            self.queue_ui_state();
+        }
     }
 
     fn load_right_rail_plugins(&mut self, cx: &mut Context<Self>) {
@@ -5411,8 +5467,9 @@ impl VibexWorkbench {
         };
         let text = input.read(cx).value().to_string();
         if let Some(start) = text.find(&marker) {
+            let range = inline_composer_attachment_padded_range(&text, start..start + marker.len());
             input.update(cx, |input, cx| {
-                input.set_selected_range(start..start + marker.len(), cx);
+                input.set_selected_range(range, cx);
                 input.replace("", window, cx);
                 input.focus(window, cx);
             });
@@ -6434,7 +6491,7 @@ impl VibexWorkbench {
             self.composer_input.clone()
         };
         input.update(cx, |input, cx| {
-            input.replace(marker, window, cx);
+            input.replace(inline_composer_attachment_insertion(&marker), window, cx);
             input.focus(window, cx);
         });
         cx.notify();
@@ -8300,56 +8357,66 @@ impl VibexWorkbench {
             self.ui_state.workbench.active_tab = "agent".to_string();
             self.queue_ui_state();
         }
+        let initialize_draft = !self.new_session_draft_initialized;
         self.new_session_open = true;
         self.new_session_runtime_menu_open = false;
+        self.runtime_choice_menu_open = None;
         self.new_session_runtime_menu_view = ComposerRuntimeMenuView::Profile;
         self.new_session_runtime_menu_profile_id = None;
-        self.new_session_runtime_menu_trigger_bounds = None;
         self.new_session_error = None;
-        self.new_session_attachments.clear();
-        self.new_session_command_entry = None;
         self.clear_suggestions();
-        let preferred_agent = self
-            .runtime_selection
-            .as_ref()
-            .map(|state| state.desired.agent_id.clone())
-            .or_else(|| self.new_session_agent_id.clone());
-        self.new_session_agent_id =
-            default_new_session_agent_id(&self.agent_snapshots, preferred_agent.as_ref());
-        let preferred_runtime = self
-            .new_session_agent_id
-            .as_ref()
-            .and_then(|agent_id| self.preferred_new_session_runtime_for_agent(agent_id));
-        let selection = self.runtime_catalog.as_ref().and_then(|catalog| {
-            new_session_runtime_selection_for_agent(
-                catalog,
-                self.new_session_agent_id.as_ref(),
-                preferred_runtime.as_ref(),
-            )
-        });
-        self.set_new_session_runtime_selection(selection);
-        let workspace = workspace
-            .or_else(|| {
-                self.selected_session()
-                    .map(|session| (session.workspace_root.clone(), session.workspace_mode))
-            })
-            .or_else(|| {
-                let selected_workspace_id =
-                    self.ui_state.workbench.selected_workspace_id.as_deref()?;
-                self.workspaces
-                    .iter()
-                    .find(|(_, workspace)| workspace.id.as_str() == selected_workspace_id)
-                    .map(|(_, workspace)| (workspace.root_path.clone(), workspace.mode))
+        if initialize_draft {
+            self.new_session_attachments.clear();
+            self.new_session_command_entry = None;
+            let preferred_agent = self
+                .runtime_selection
+                .as_ref()
+                .map(|state| state.desired.agent_id.clone())
+                .or_else(|| self.new_session_agent_id.clone());
+            self.new_session_agent_id =
+                default_new_session_agent_id(&self.agent_snapshots, preferred_agent.as_ref());
+            let preferred_runtime = self
+                .new_session_agent_id
+                .as_ref()
+                .and_then(|agent_id| self.preferred_new_session_runtime_for_agent(agent_id));
+            let selection = self.runtime_catalog.as_ref().and_then(|catalog| {
+                new_session_runtime_selection_for_agent(
+                    catalog,
+                    self.new_session_agent_id.as_ref(),
+                    preferred_runtime.as_ref(),
+                )
             });
-        let (workspace_root, workspace_mode) =
-            workspace.unwrap_or_else(|| (String::new(), WorkspaceMode::CurrentCheckout));
-        self.new_session_workspace_mode = workspace_mode;
-        self.new_session_workspace_input
-            .update(cx, |input, cx| input.set_value(workspace_root, window, cx));
-        self.new_session_input
-            .update(cx, |input, cx| input.set_value("", window, cx));
+            self.set_new_session_runtime_selection(selection);
+            let workspace = workspace
+                .or_else(|| {
+                    self.selected_session()
+                        .map(|session| (session.workspace_root.clone(), session.workspace_mode))
+                })
+                .or_else(|| {
+                    let selected_workspace_id =
+                        self.ui_state.workbench.selected_workspace_id.as_deref()?;
+                    self.workspaces
+                        .iter()
+                        .find(|(_, workspace)| workspace.id.as_str() == selected_workspace_id)
+                        .map(|(_, workspace)| (workspace.root_path.clone(), workspace.mode))
+                });
+            let (workspace_root, workspace_mode) =
+                workspace.unwrap_or_else(|| (String::new(), WorkspaceMode::CurrentCheckout));
+            self.new_session_workspace_mode = workspace_mode;
+            self.new_session_workspace_input
+                .update(cx, |input, cx| input.set_value(workspace_root, window, cx));
+            self.new_session_input
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.new_session_draft_initialized = true;
+        } else if let Some((workspace_root, workspace_mode)) = workspace {
+            self.new_session_workspace_mode = workspace_mode;
+            self.new_session_workspace_input
+                .update(cx, |input, cx| input.set_value(workspace_root, window, cx));
+        }
         self.new_session_input
             .update(cx, |input, cx| input.focus(window, cx));
+        self.sync_composer_command_entry(ComposerTarget::NewSession, cx);
+        self.refresh_active_suggestions(ComposerTarget::NewSession, cx);
         if primary_tab_changed {
             self.push_current_navigation_entry();
         }
@@ -8362,7 +8429,9 @@ impl VibexWorkbench {
         }
         self.reset_new_session_project_menu(window, cx);
         self.new_session_open = false;
+        self.new_session_draft_initialized = false;
         self.new_session_runtime_menu_open = false;
+        self.runtime_choice_menu_open = None;
         self.new_session_runtime_menu_profile_id = None;
         self.new_session_error = None;
         self.new_session_attachments.clear();
@@ -8399,6 +8468,7 @@ impl VibexWorkbench {
     ) {
         self.new_session_agent_id = Some(selection.agent_id.clone());
         self.new_session_runtime_menu_open = false;
+        self.runtime_choice_menu_open = None;
         self.new_session_runtime_menu_profile_id = None;
         self.set_new_session_runtime_selection(Some(selection.clone()));
         self.remember_runtime_selection(&selection);
@@ -8432,6 +8502,7 @@ impl VibexWorkbench {
         if !feature.accepts_value(&value) {
             return;
         }
+        self.runtime_choice_menu_open = None;
         let mut next = selection.clone();
         next.config_values.insert(feature.id.clone(), value);
         match target {
@@ -8735,6 +8806,7 @@ impl VibexWorkbench {
                             let turn_generation =
                                 if this.session_generation == generation && this.new_session_open {
                                     this.new_session_attachments.clear();
+                                    this.new_session_draft_initialized = false;
                                     this.new_session_command_entry = None;
                                     new_session_input
                                         .update(cx, |input, cx| input.set_value("", window, cx));
@@ -8819,6 +8891,7 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) {
         self.composer_runtime_menu_open = false;
+        self.runtime_choice_menu_open = None;
         self.composer_runtime_menu_agent_id = None;
         self.composer_runtime_menu_profile_id = None;
         self.request_runtime_selection(selection, false, cx);
@@ -8828,6 +8901,7 @@ impl VibexWorkbench {
         let open = open && !self.agent_action_pending;
         self.composer_runtime_menu_open = open;
         if open {
+            self.runtime_choice_menu_open = None;
             let selection = self
                 .runtime_selection
                 .as_ref()
@@ -8867,6 +8941,7 @@ impl VibexWorkbench {
         let open = open && !self.agent_action_pending && self.new_session_agent_id.is_some();
         self.new_session_runtime_menu_open = open;
         if open {
+            self.runtime_choice_menu_open = None;
             self.new_session_runtime_menu_view =
                 if let Some(selection) = self.new_session_runtime_selection.as_ref() {
                     self.new_session_runtime_menu_profile_id =
@@ -8878,6 +8953,23 @@ impl VibexWorkbench {
                 };
         } else {
             self.new_session_runtime_menu_profile_id = None;
+        }
+        cx.notify();
+    }
+
+    fn set_runtime_choice_menu_open(
+        &mut self,
+        menu_id: String,
+        open: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let open = open && !self.agent_action_pending;
+        if open {
+            self.new_session_runtime_menu_open = false;
+            self.composer_runtime_menu_open = false;
+            self.runtime_choice_menu_open = Some(menu_id);
+        } else if self.runtime_choice_menu_open.as_deref() == Some(menu_id.as_str()) {
+            self.runtime_choice_menu_open = None;
         }
         cx.notify();
     }
@@ -12667,6 +12759,93 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
+    fn render_runtime_choice_popover(
+        &mut self,
+        menu_id: String,
+        trigger: Button,
+        items: Vec<RuntimeChoiceMenuItem>,
+        geometry: ComposerGeometry,
+        max_height: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let menu_open = self.runtime_choice_menu_open.as_deref() == Some(menu_id.as_str());
+        let menu_placement = composer_runtime_menu_placement(
+            geometry.runtime_trigger_bounds,
+            self.last_visibility.layout.viewport_height as f32,
+            composer_runtime_choice_menu_height(items.len(), max_height),
+            max_height,
+        );
+        let rows = items
+            .into_iter()
+            .map(|item| {
+                Button::new(format!("{menu_id}:{}", item.id))
+                    .small()
+                    .ghost()
+                    .w_full()
+                    .h(px(COMPOSER_RUNTIME_CHOICE_ROW_HEIGHT))
+                    .flex_none()
+                    .px_2()
+                    .justify_start()
+                    .selected(item.selected)
+                    .rounded(gpui_component::button::ButtonRounded::Size(px(6.0)))
+                    .child(
+                        h_flex()
+                            .size_full()
+                            .min_w_0()
+                            .gap_2()
+                            .child(div().min_w_0().flex_1().truncate().child(item.label))
+                            .when(item.selected, |this| {
+                                this.child(Icon::new(IconName::Check).size(px(14.0)))
+                            }),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| match &item.action {
+                        RuntimeChoiceMenuAction::NewSession(selection) => {
+                            this.choose_new_session_runtime(selection.clone(), window, cx)
+                        }
+                        RuntimeChoiceMenuAction::ActiveSession(selection) => {
+                            this.choose_runtime_selection(selection.clone(), cx)
+                        }
+                        RuntimeChoiceMenuAction::Feature {
+                            target,
+                            feature_id,
+                            value,
+                        } => this.set_runtime_feature_value(*target, feature_id, value.clone(), cx),
+                    }))
+            })
+            .collect::<Vec<_>>();
+        let menu_panel = v_flex()
+            .id(format!("{menu_id}-content"))
+            .role(Role::ListBox)
+            .w(px(208.0))
+            .h(px(menu_placement.height))
+            .min_h_0()
+            .overflow_y_scrollbar()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(cx.theme().border.opacity(0.70))
+            .bg(cx.theme().popover)
+            .p(px(6.0))
+            .shadow_lg()
+            .children(rows);
+        let open_menu_id = menu_id.clone();
+        Popover::new(format!("{menu_id}-popover"))
+            .anchor(menu_placement.anchor)
+            .appearance(false)
+            .open(menu_open)
+            .on_open_change(cx.listener(move |this, open, _, cx| {
+                this.set_runtime_choice_menu_open(open_menu_id.clone(), *open, cx)
+            }))
+            .trigger(trigger)
+            .child(menu_panel)
+            .map(|popover| match menu_placement.anchor {
+                Anchor::TopLeft | Anchor::TopCenter | Anchor::TopRight => {
+                    popover.top(px(menu_placement.trigger_offset))
+                }
+                _ => popover.bottom(px(menu_placement.trigger_offset)),
+            })
+            .into_any_element()
+    }
+
     fn render_new_session_runtime_choice(
         &mut self,
         id: String,
@@ -12705,8 +12884,9 @@ impl VibexWorkbench {
                 )
                 .into_any_element()
         };
-        let entity = cx.weak_entity();
-        Button::new(format!("new-session-{id}"))
+        let menu_id = format!("new-session-runtime-choice-{id}");
+        let choices_empty = choices.is_empty();
+        let trigger = Button::new(format!("new-session-{id}"))
             .xsmall()
             .ghost()
             .h(px(32.0))
@@ -12714,24 +12894,24 @@ impl VibexWorkbench {
             .when(!compact, |button| button.w(px(112.0)).px_2())
             .tooltip(tooltip)
             .child(content)
-            .disabled(choices.is_empty() || self.agent_action_pending)
-            .dropdown_menu(move |menu, _, _| {
-                let mut menu = menu;
-                for choice in choices.iter().cloned() {
-                    let checked = choice.value == selected_value;
-                    let selection = choice.selection;
-                    let entity = entity.clone();
-                    menu = menu.item(PopupMenuItem::new(choice.label).checked(checked).on_click(
-                        move |_, window, cx| {
-                            let _ = entity.update(cx, |this, cx| {
-                                this.choose_new_session_runtime(selection.clone(), window, cx)
-                            });
-                        },
-                    ));
-                }
-                menu
+            .disabled(choices_empty || self.agent_action_pending);
+        let items = choices
+            .into_iter()
+            .map(|choice| RuntimeChoiceMenuItem {
+                selected: choice.value == selected_value,
+                id: choice.value,
+                label: choice.label,
+                action: RuntimeChoiceMenuAction::NewSession(choice.selection),
             })
-            .into_any_element()
+            .collect::<Vec<_>>();
+        self.render_runtime_choice_popover(
+            menu_id,
+            trigger,
+            items,
+            self.new_session_composer_geometry,
+            NEW_SESSION_RUNTIME_MENU_MAX_HEIGHT,
+            cx,
+        )
     }
 
     fn render_runtime_feature(
@@ -12839,40 +13019,50 @@ impl VibexWorkbench {
                         .into_any_element()
                 };
                 let feature_id = feature.id.clone();
-                let entity = cx.weak_entity();
-                Button::new(SharedString::from(format!("{id_prefix}-{}", feature.id)))
-                    .xsmall()
-                    .ghost()
-                    .h(px(32.0))
-                    .when(compact, |button| button.compact().w(px(32.0)))
-                    .when(!compact, |button| button.w(px(112.0)).px_2())
-                    .tooltip(tooltip)
-                    .child(content)
-                    .disabled(values.is_empty() || self.agent_action_pending)
-                    .dropdown_menu(move |menu, _, _| {
-                        let mut menu = menu;
-                        for value in values.iter().cloned() {
-                            let checked = value.value == current_value;
-                            let label = value.label.clone().unwrap_or_else(|| value.value.clone());
-                            let selected_value = value.value;
-                            let feature_id = feature_id.clone();
-                            let entity = entity.clone();
-                            menu = menu.item(PopupMenuItem::new(label).checked(checked).on_click(
-                                move |_, _, cx| {
-                                    let _ = entity.update(cx, |this, cx| {
-                                        this.set_runtime_feature_value(
-                                            target,
-                                            &feature_id,
-                                            selected_value.clone(),
-                                            cx,
-                                        )
-                                    });
-                                },
-                            ));
-                        }
-                        menu
+                let menu_id = format!("{id_prefix}-{}-choice-menu", feature.id);
+                let geometry = match target {
+                    RuntimeFeatureTarget::NewSession => self.new_session_composer_geometry,
+                    RuntimeFeatureTarget::ActiveSession => self.composer_geometry,
+                };
+                let menu_max_height = match target {
+                    RuntimeFeatureTarget::NewSession => NEW_SESSION_RUNTIME_MENU_MAX_HEIGHT,
+                    RuntimeFeatureTarget::ActiveSession => {
+                        (self.last_visibility.layout.viewport_height as f32 - 128.0)
+                            .clamp(160.0, COMPOSER_RUNTIME_MENU_MAX_HEIGHT)
+                    }
+                };
+                let values_empty = values.is_empty();
+                let trigger =
+                    Button::new(SharedString::from(format!("{id_prefix}-{}", feature.id)))
+                        .xsmall()
+                        .ghost()
+                        .h(px(32.0))
+                        .when(compact, |button| button.compact().w(px(32.0)))
+                        .when(!compact, |button| button.w(px(112.0)).px_2())
+                        .tooltip(tooltip)
+                        .child(content)
+                        .disabled(values_empty || self.agent_action_pending);
+                let items = values
+                    .into_iter()
+                    .map(|value| RuntimeChoiceMenuItem {
+                        selected: value.value == current_value,
+                        id: value.value.clone(),
+                        label: value.label.unwrap_or_else(|| value.value.clone()),
+                        action: RuntimeChoiceMenuAction::Feature {
+                            target,
+                            feature_id: feature_id.clone(),
+                            value: value.value,
+                        },
                     })
-                    .into_any_element()
+                    .collect::<Vec<_>>();
+                self.render_runtime_choice_popover(
+                    menu_id,
+                    trigger,
+                    items,
+                    geometry,
+                    menu_max_height,
+                    cx,
+                )
             }
             SessionRuntimeFeatureKind::String => {
                 let selected_label = current
@@ -13015,6 +13205,7 @@ impl VibexWorkbench {
                 agent_id,
                 profile_id,
                 preferred_model_selection.as_ref(),
+                &self.ui_state.composer.runtime_selections_by_model,
             ),
             _ => Vec::new(),
         };
@@ -13034,18 +13225,19 @@ impl VibexWorkbench {
             menu_row_count,
             COMPOSER_RUNTIME_MENU_MAX_HEIGHT,
         );
-        let menu_placement = new_session_runtime_menu_placement(
-            self.new_session_runtime_menu_trigger_bounds,
+        let menu_placement = composer_runtime_menu_placement(
+            self.new_session_composer_geometry.runtime_trigger_bounds,
             viewport_height,
             desired_menu_height,
+            NEW_SESSION_RUNTIME_MENU_MAX_HEIGHT,
         );
         let trigger_bounds_entity = cx.weak_entity();
         let tracked_content = div()
             .size_full()
             .on_prepaint(move |bounds, _, cx| {
                 let _ = trigger_bounds_entity.update(cx, |this, cx| {
-                    if this.new_session_runtime_menu_trigger_bounds != Some(bounds) {
-                        this.new_session_runtime_menu_trigger_bounds = Some(bounds);
+                    if this.new_session_composer_geometry.runtime_trigger_bounds != Some(bounds) {
+                        this.new_session_composer_geometry.runtime_trigger_bounds = Some(bounds);
                         if this.new_session_runtime_menu_open {
                             cx.notify();
                         }
@@ -13302,6 +13494,12 @@ impl VibexWorkbench {
             )
             .trigger(trigger)
             .child(menu_panel)
+            .map(|popover| match menu_placement.anchor {
+                Anchor::TopLeft | Anchor::TopCenter | Anchor::TopRight => {
+                    popover.top(px(menu_placement.trigger_offset))
+                }
+                _ => popover.bottom(px(menu_placement.trigger_offset)),
+            })
             .into_any_element()
     }
 
@@ -13382,7 +13580,7 @@ impl VibexWorkbench {
                     selection
                         .as_ref()
                         .and_then(|selection| selection.mode_id.clone())
-                        .unwrap_or_else(|| "default".into()),
+                        .unwrap_or_default(),
                     compact_runtime_controls,
                     cx,
                 ),
@@ -13805,6 +14003,7 @@ impl VibexWorkbench {
             && has_agent_choices
             && self.new_session_runtime_selection.is_some()
             && !self.agent_action_pending;
+        let input_geometry_entity = cx.weak_entity();
         h_flex()
             .id("new-session-home")
             .size_full()
@@ -13904,6 +14103,20 @@ impl VibexWorkbench {
                                             .flex_1()
                                             .min_w_0()
                                             .h_full()
+                                            .on_prepaint(move |bounds, _, cx| {
+                                                let _ =
+                                                    input_geometry_entity.update(cx, |this, cx| {
+                                                        if this
+                                                            .new_session_composer_geometry
+                                                            .input_bounds
+                                                            != Some(bounds)
+                                                        {
+                                                            this.new_session_composer_geometry
+                                                                .input_bounds = Some(bounds);
+                                                            cx.notify();
+                                                        }
+                                                    });
+                                            })
                                             .on_key_up(cx.listener(|this, _, window, cx| {
                                                 this.refresh_suggestions(
                                                     ComposerTarget::NewSession,
@@ -14957,8 +15170,11 @@ impl VibexWorkbench {
                 )
                 .into_any_element()
         };
-        let entity = cx.weak_entity();
-        Button::new(format!("composer-runtime-{id}"))
+        let menu_id = format!("composer-runtime-choice-{id}");
+        let menu_max_height = (self.last_visibility.layout.viewport_height as f32 - 128.0)
+            .clamp(160.0, COMPOSER_RUNTIME_MENU_MAX_HEIGHT);
+        let choices_empty = choices.is_empty();
+        let trigger = Button::new(format!("composer-runtime-{id}"))
             .xsmall()
             .ghost()
             .h(px(32.0))
@@ -14966,24 +15182,24 @@ impl VibexWorkbench {
             .when(!compact, |button| button.w(px(112.0)).px_2())
             .tooltip(tooltip)
             .child(content)
-            .disabled(choices.is_empty() || self.agent_action_pending)
-            .dropdown_menu(move |menu, _, _| {
-                let mut menu = menu;
-                for choice in choices.iter().cloned() {
-                    let checked = choice.value == selected_value;
-                    let selection = choice.selection;
-                    let entity = entity.clone();
-                    menu = menu.item(PopupMenuItem::new(choice.label).checked(checked).on_click(
-                        move |_, _, cx| {
-                            let _ = entity.update(cx, |this, cx| {
-                                this.choose_runtime_selection(selection.clone(), cx)
-                            });
-                        },
-                    ));
-                }
-                menu
+            .disabled(choices_empty || self.agent_action_pending);
+        let items = choices
+            .into_iter()
+            .map(|choice| RuntimeChoiceMenuItem {
+                selected: choice.value == selected_value,
+                id: choice.value,
+                label: choice.label,
+                action: RuntimeChoiceMenuAction::ActiveSession(choice.selection),
             })
-            .into_any_element()
+            .collect::<Vec<_>>();
+        self.render_runtime_choice_popover(
+            menu_id,
+            trigger,
+            items,
+            self.composer_geometry,
+            menu_max_height,
+            cx,
+        )
     }
 
     fn render_composer_runtime_cascade(
@@ -15046,6 +15262,22 @@ impl VibexWorkbench {
                 )
                 .into_any_element()
         };
+        let trigger_bounds_entity = cx.weak_entity();
+        let tracked_content = div()
+            .size_full()
+            .on_prepaint(move |bounds, _, cx| {
+                let _ = trigger_bounds_entity.update(cx, |this, cx| {
+                    if this.composer_geometry.runtime_trigger_bounds != Some(bounds) {
+                        this.composer_geometry.runtime_trigger_bounds = Some(bounds);
+                        if this.composer_runtime_menu_open
+                            || this.runtime_choice_menu_open.is_some()
+                        {
+                            cx.notify();
+                        }
+                    }
+                });
+            })
+            .child(content);
         let trigger = Button::new("composer-runtime-model")
             .xsmall()
             .ghost()
@@ -15053,7 +15285,7 @@ impl VibexWorkbench {
             .when(compact, |button| button.compact().w(px(32.0)))
             .when(!compact, |button| button.w(px(224.0)).px_2())
             .tooltip(tooltip)
-            .child(content)
+            .child(tracked_content)
             .disabled(self.agent_action_pending);
 
         let menu_agent_id = self
@@ -15080,6 +15312,7 @@ impl VibexWorkbench {
             &menu_agent_id,
             &menu_profile_id,
             preferred_model_selection,
+            &self.ui_state.composer.runtime_selections_by_model,
         );
         let menu_width = (self.last_visibility.layout.viewport_width as f32 - 32.0)
             .clamp(220.0, COMPOSER_RUNTIME_MENU_WIDTH);
@@ -15092,6 +15325,12 @@ impl VibexWorkbench {
             ComposerRuntimeMenuView::Model => model_choices.len(),
         };
         let menu_height = composer_runtime_menu_height(menu_view, menu_row_count, menu_max_height);
+        let menu_placement = composer_runtime_menu_placement(
+            self.composer_geometry.runtime_trigger_bounds,
+            self.last_visibility.layout.viewport_height as f32,
+            menu_height,
+            menu_max_height,
+        );
         let separator = || {
             div()
                 .mx(px(2.0))
@@ -15431,7 +15670,7 @@ impl VibexWorkbench {
         let menu_panel = v_flex()
             .id("composer-runtime-cascade-content")
             .w(px(menu_width))
-            .h(px(menu_height))
+            .h(px(menu_placement.height))
             .min_h_0()
             .overflow_hidden()
             .rounded(px(8.0))
@@ -15444,7 +15683,7 @@ impl VibexWorkbench {
         let menu_open = self.composer_runtime_menu_open;
 
         Popover::new("composer-runtime-cascade")
-            .anchor(Anchor::BottomLeft)
+            .anchor(menu_placement.anchor)
             .appearance(false)
             .open(menu_open)
             .on_open_change(
@@ -15452,6 +15691,12 @@ impl VibexWorkbench {
             )
             .trigger(trigger)
             .child(menu_panel)
+            .map(|popover| match menu_placement.anchor {
+                Anchor::TopLeft | Anchor::TopCenter | Anchor::TopRight => {
+                    popover.top(px(menu_placement.trigger_offset))
+                }
+                _ => popover.bottom(px(menu_placement.trigger_offset)),
+            })
             .into_any_element()
     }
 
@@ -15975,10 +16220,11 @@ impl VibexWorkbench {
         ) {
             return Vec::new();
         }
-        let (input, attachments) = if self.new_session_open {
+        let (input, attachments, input_bounds) = if self.new_session_open {
             (
                 self.new_session_input.clone(),
                 self.new_session_attachments.clone(),
+                self.new_session_composer_geometry.input_bounds,
             )
         } else if self.ui_state.workbench.active_tab == "agent"
             && !self.composer_terminal_mode
@@ -15987,8 +16233,12 @@ impl VibexWorkbench {
             (
                 self.composer_input.clone(),
                 self.composer_attachments.clone(),
+                self.composer_geometry.input_bounds,
             )
         } else {
+            return Vec::new();
+        };
+        let Some(input_bounds) = input_bounds else {
             return Vec::new();
         };
         if attachments.is_empty() {
@@ -15996,6 +16246,7 @@ impl VibexWorkbench {
         }
 
         let text = input.read(cx).value().to_string();
+        let visible_rows = input.read(cx).visible_row_range();
         let (preview_width, preview_height) = composer_image_hover_preview_max_size(
             self.last_visibility.layout.viewport_width as f32,
             self.last_visibility.layout.viewport_height as f32,
@@ -16004,7 +16255,17 @@ impl VibexWorkbench {
             .into_iter()
             .filter_map(|inline_attachment| {
                 let range = inline_attachment.range_in(&text)?;
+                let row = composer_buffer_row_for_offset(&text, range.start);
+                if !visible_rows
+                    .as_ref()
+                    .is_some_and(|rows| rows.contains(&row))
+                {
+                    return None;
+                }
                 let bounds = input.read(cx).range_to_bounds(&range)?;
+                if !composer_attachment_bounds_are_visible(bounds, input_bounds) {
+                    return None;
+                }
                 let attachment = inline_attachment.attachment;
                 let attachment_id = attachment.id.clone();
                 let label = attachment.label.clone();
@@ -16013,7 +16274,7 @@ impl VibexWorkbench {
                 let preview_source = attachment.path.as_ref().filter(|_| is_image).map(|path| {
                     Arc::<std::path::Path>::from(std::path::PathBuf::from(path).into_boxed_path())
                 });
-                let token_width = (f32::from(bounds.size.width) - 4.0).max(24.0);
+                let token_width = f32::from(bounds.size.width).max(24.0);
                 let preview_label = format!(
                     "{}: {label}",
                     locale::text("Preview image", "预览图片", "預覽圖片")
@@ -16023,7 +16284,7 @@ impl VibexWorkbench {
                     h_flex()
                         .id(format!("inline-composer-attachment-{attachment_id}"))
                         .absolute()
-                        .left(bounds.origin.x + px(2.0))
+                        .left(bounds.origin.x)
                         .top(bounds.origin.y)
                         .w(px(token_width))
                         .h(bounds.size.height)
@@ -17119,8 +17380,7 @@ impl VibexWorkbench {
             .child(
                 v_flex()
                     .min_w_0()
-                    .when(editing, |this| this.w(relative(0.78)))
-                    .when(!editing, |this| this.max_w(relative(0.78)))
+                    .w(relative(0.78))
                     .items_end()
                     .gap_1()
                     .child(
@@ -18689,6 +18949,7 @@ impl VibexWorkbench {
         let composer_background = composer_surface_background(is_dark);
         let composer_queue = self.render_composer_queue(cx);
         let composer_queue_visible = composer_queue.is_some();
+        let input_geometry_entity = cx.weak_entity();
         let runtime_controls = if let Some((desired, catalog, projection)) = runtime_projection {
             let mut controls = vec![self.render_composer_runtime_cascade(
                 desired.clone(),
@@ -18719,7 +18980,7 @@ impl VibexWorkbench {
                         theme::semantic_color("chart-4", is_dark),
                     ),
                     projection.modes,
-                    desired.mode_id.clone().unwrap_or_else(|| "default".into()),
+                    desired.mode_id.clone().unwrap_or_default(),
                     compact_runtime_controls,
                     cx,
                 ));
@@ -18742,6 +19003,7 @@ impl VibexWorkbench {
                 .danger()
                 .compact()
                 .size(px(32.0))
+                .rounded(px(16.0))
                 .child(
                     div()
                         .size(px(10.0))
@@ -18761,6 +19023,7 @@ impl VibexWorkbench {
                 .primary()
                 .compact()
                 .size(px(32.0))
+                .rounded(px(16.0))
                 .icon(IconName::ArrowUp)
                 .tooltip(locale::text("Send message", "发送消息", "傳送訊息"))
                 .loading(self.agent_action_pending || self.agent_turn_pending)
@@ -18999,6 +19262,18 @@ impl VibexWorkbench {
                                             .min_w_0()
                                             .h_full()
                                             .flex_1()
+                                            .on_prepaint(move |bounds, _, cx| {
+                                                let _ =
+                                                    input_geometry_entity.update(cx, |this, cx| {
+                                                        if this.composer_geometry.input_bounds
+                                                            != Some(bounds)
+                                                        {
+                                                            this.composer_geometry.input_bounds =
+                                                                Some(bounds);
+                                                            cx.notify();
+                                                        }
+                                                    });
+                                            })
                                             .on_key_up(cx.listener(|this, _, window, cx| {
                                                 this.refresh_suggestions(
                                                     ComposerTarget::Session,
@@ -20780,6 +21055,15 @@ fn catalog_has_runtime_selection(
     })
 }
 
+fn runtime_selection_identity_matches(
+    left: &SessionRuntimeSelection,
+    right: &SessionRuntimeSelection,
+) -> bool {
+    left.agent_id == right.agent_id
+        && left.provider_profile_id == right.provider_profile_id
+        && left.model_id == right.model_id
+}
+
 fn runtime_reasoning_effort_value(selection: Option<&SessionRuntimeSelection>) -> String {
     selection
         .and_then(|selection| selection.reasoning_effort.clone())
@@ -21257,13 +21541,55 @@ fn inline_composer_attachment_marker(serial: u64) -> String {
     )
 }
 
+fn inline_composer_attachment_insertion(marker: &str) -> String {
+    format!(" {marker} ")
+}
+
+fn inline_composer_attachment_padded_range(text: &str, range: Range<usize>) -> Range<usize> {
+    let bytes = text.as_bytes();
+    let start = range
+        .start
+        .checked_sub(1)
+        .filter(|start| bytes.get(*start) == Some(&b' '))
+        .unwrap_or(range.start);
+    let end = if bytes.get(range.end) == Some(&b' ') {
+        range.end + 1
+    } else {
+        range.end
+    };
+    start..end
+}
+
+fn composer_buffer_row_for_offset(text: &str, offset: usize) -> usize {
+    text.as_bytes()[..offset.min(text.len())]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
+}
+
+fn composer_attachment_bounds_are_visible(
+    bounds: Bounds<Pixels>,
+    input_bounds: Bounds<Pixels>,
+) -> bool {
+    bounds.intersects(&input_bounds)
+        && bounds.top() >= input_bounds.top()
+        && bounds.bottom() <= input_bounds.bottom()
+}
+
 fn composer_submission_payload(
     raw_text: &str,
     inline_attachments: &[InlineComposerAttachment],
 ) -> (String, Vec<MessageAttachment>) {
     let mut positioned = inline_attachments
         .iter()
-        .filter_map(|item| item.range_in(raw_text).map(|range| (range, item)))
+        .filter_map(|item| {
+            item.range_in(raw_text).map(|range| {
+                (
+                    inline_composer_attachment_padded_range(raw_text, range),
+                    item,
+                )
+            })
+        })
         .collect::<Vec<_>>();
     positioned.sort_by_key(|(range, _)| range.start);
 
@@ -21286,7 +21612,13 @@ fn composer_submission_payload(
                 .map(|path| format!("file://{path}")),
             inline_text_offset: Some(inline_text_offset),
         });
-        text.push(' ');
+        let previous = text.chars().next_back();
+        let next = raw_text[range.end..].chars().next();
+        if previous.is_some_and(|character| !character.is_whitespace())
+            && next.is_some_and(|character| !character.is_whitespace())
+        {
+            text.push(' ');
+        }
         cursor = range.end;
     }
     text.push_str(&raw_text[cursor..]);
@@ -21604,6 +21936,7 @@ fn runtime_model_choices(
     agent_id: &AgentId,
     provider_profile_id: &ProviderProfileId,
     preferred: Option<&SessionRuntimeSelection>,
+    remembered: &[SessionRuntimeSelection],
 ) -> Vec<RuntimeCascadeChoice> {
     let Some(seed) = catalog.options.iter().find(|option| {
         option.availability == vibex_core::RuntimeOptionAvailability::Available
@@ -21613,15 +21946,21 @@ fn runtime_model_choices(
         return Vec::new();
     };
     let mut choices = RuntimeCascadeProjection::from_catalog(catalog, &seed.selection).models;
-    if let Some(preferred) = preferred.filter(|selection| {
-        &selection.agent_id == agent_id
-            && &selection.provider_profile_id == provider_profile_id
-            && catalog_has_runtime_selection(catalog, selection)
-    }) && let Some(choice) = choices
-        .iter_mut()
-        .find(|choice| choice.value == preferred.model_id)
-    {
-        choice.selection = preferred.clone();
+    for choice in &mut choices {
+        let restored = preferred
+            .filter(|selection| {
+                runtime_selection_identity_matches(selection, &choice.selection)
+                    && catalog_has_runtime_selection(catalog, selection)
+            })
+            .or_else(|| {
+                remembered.iter().rev().find(|selection| {
+                    runtime_selection_identity_matches(selection, &choice.selection)
+                        && catalog_has_runtime_selection(catalog, selection)
+                })
+            });
+        if let Some(restored) = restored {
+            choice.selection = restored.clone();
+        }
     }
     choices
 }
@@ -25594,6 +25933,8 @@ mod tests {
     }
 
     struct UserMessageBubbleLayoutProbe {
+        body: String,
+        timeline_width: f32,
         measured_width: Rc<Cell<f32>>,
         measured_height: Rc<Cell<f32>>,
     }
@@ -25602,27 +25943,29 @@ mod tests {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let measured_width = self.measured_width.clone();
             let measured_height = self.measured_height.clone();
-            let body = format!(
-                "first line\n\n  indented text\n{}",
-                "unbroken-content-".repeat(24)
-            );
-            h_flex().w(px(320.0)).justify_end().child(
-                v_flex().min_w_0().max_w(relative(0.78)).items_end().child(
-                    render_user_message_bubble(
-                        render_user_message_text_segment(
-                            body,
-                            None,
-                            theme::semantic_color("warning", true),
+            h_flex().w(px(self.timeline_width)).justify_end().child(
+                v_flex()
+                    .min_w_0()
+                    .w(relative(0.78))
+                    .items_end()
+                    .child(
+                        render_user_message_bubble(
+                            render_user_message_text_segment(
+                                self.body.clone(),
+                                None,
+                                theme::semantic_color("warning", true),
+                            )
+                            .into_any_element(),
+                            theme::semantic_color("muted", true),
+                            theme::semantic_color("foreground", true),
                         )
-                        .into_any_element(),
-                        theme::semantic_color("muted", true),
-                        theme::semantic_color("foreground", true),
+                        .on_prepaint(move |bounds, _, _| {
+                            measured_width.set(f32::from(bounds.size.width));
+                            measured_height.set(f32::from(bounds.size.height));
+                        }),
                     )
-                    .on_prepaint(move |bounds, _, _| {
-                        measured_width.set(f32::from(bounds.size.width));
-                        measured_height.set(f32::from(bounds.size.height));
-                    }),
-                ),
+                    // The hidden hover actions still participate in the row's intrinsic width.
+                    .child(div().w(px(132.0)).h(px(24.0))),
             )
         }
     }
@@ -25636,6 +25979,44 @@ mod tests {
         row_height: Rc<Cell<f32>>,
         queue_bottom: Rc<Cell<f32>>,
         composer_top: Rc<Cell<f32>>,
+    }
+
+    struct RuntimePopoverLayoutProbe {
+        placement: RuntimeMenuPlacement,
+        trigger_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+        menu_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    }
+
+    impl Render for RuntimePopoverLayoutProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let trigger_bounds = self.trigger_bounds.clone();
+            let menu_bounds = self.menu_bounds.clone();
+            let trigger = Button::new("runtime-popover-layout-trigger")
+                .w(px(112.0))
+                .h(px(32.0))
+                .child(div().size_full().on_prepaint(move |bounds, _, _| {
+                    trigger_bounds.set(Some(bounds));
+                }));
+            let menu = div()
+                .w(px(208.0))
+                .h(px(84.0))
+                .on_prepaint(move |bounds, _, _| menu_bounds.set(Some(bounds)));
+
+            div().size_full().pl(px(80.0)).pt(px(240.0)).child(
+                Popover::new("runtime-popover-layout-probe")
+                    .anchor(self.placement.anchor)
+                    .appearance(false)
+                    .open(true)
+                    .trigger(trigger)
+                    .child(menu)
+                    .map(|popover| match self.placement.anchor {
+                        Anchor::TopLeft | Anchor::TopCenter | Anchor::TopRight => {
+                            popover.top(px(self.placement.trigger_offset))
+                        }
+                        _ => popover.bottom(px(self.placement.trigger_offset)),
+                    }),
+            )
+        }
     }
 
     impl Render for ComposerLayoutProbe {
@@ -26996,13 +27377,54 @@ mod tests {
             options: vec![option.clone()],
         };
 
-        let choices = runtime_model_choices(&catalog, &agent_id, &profile_id, Some(&preferred));
+        let choices =
+            runtime_model_choices(&catalog, &agent_id, &profile_id, Some(&preferred), &[]);
         assert_eq!(choices[0].selection, preferred);
 
         let mut stale = preferred.clone();
         stale.reasoning_effort = Some("removed".into());
-        let choices = runtime_model_choices(&catalog, &agent_id, &profile_id, Some(&stale));
+        let choices = runtime_model_choices(&catalog, &agent_id, &profile_id, Some(&stale), &[]);
         assert_eq!(choices[0].selection, option.selection);
+    }
+
+    #[test]
+    fn runtime_model_choices_restore_configuration_for_each_agent_profile_model() {
+        let first = new_session_runtime_option("codex", "Codex");
+        let mut second = first.clone();
+        second.selection.model_id = "codex_model_mini".into();
+        second.model_label = "Codex mini".into();
+        let agent_id = first.selection.agent_id.clone();
+        let profile_id = first.selection.provider_profile_id.clone();
+        let mut first_preference = first.selection.clone();
+        first_preference.reasoning_effort = Some("high".into());
+        first_preference.mode_id = Some("default".into());
+        let mut second_preference = second.selection.clone();
+        second_preference.reasoning_effort = Some("high".into());
+        second_preference.mode_id = Some("default".into());
+        let catalog = SessionRuntimeOptionCatalog {
+            revision: 2,
+            options: vec![first, second],
+        };
+
+        let choices = runtime_model_choices(
+            &catalog,
+            &agent_id,
+            &profile_id,
+            None,
+            &[first_preference.clone(), second_preference.clone()],
+        );
+
+        assert_eq!(choices.len(), 2);
+        assert!(
+            choices
+                .iter()
+                .any(|choice| choice.selection == first_preference)
+        );
+        assert!(
+            choices
+                .iter()
+                .any(|choice| choice.selection == second_preference)
+        );
     }
 
     #[test]
@@ -27878,6 +28300,36 @@ mod tests {
     }
 
     #[test]
+    fn new_session_draft_is_not_cleared_by_existing_session_navigation() {
+        let source = include_str!("app.rs");
+        let open_new_session = source
+            .split_once("    fn open_new_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn close_new_session("))
+            .map(|(body, _)| body)
+            .expect("new-session navigation should remain inspectable");
+        let initialize = open_new_session
+            .find("if initialize_draft")
+            .expect("draft reset should be explicitly fenced");
+        let clear_attachments = open_new_session
+            .find("self.new_session_attachments.clear()")
+            .expect("a fresh draft should clear stale attachments");
+        let clear_text = open_new_session
+            .find("input.set_value(\"\", window, cx)")
+            .expect("a fresh draft should clear stale text");
+        assert!(initialize < clear_attachments);
+        assert!(initialize < clear_text);
+
+        let select_session = source
+            .split_once("    fn select_session_with_history(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn load_agent_session_timeline("))
+            .map(|(body, _)| body)
+            .expect("session selection should remain inspectable");
+        assert!(!select_session.contains("new_session_attachments.clear"));
+        assert!(!select_session.contains("new_session_input"));
+        assert!(source.contains("this.new_session_draft_initialized = sessions_empty;"));
+    }
+
+    #[test]
     fn composer_queue_reorders_only_within_a_session_and_steer_promotes_the_message() {
         let selection = SessionRuntimeSelection {
             agent_id: AgentId::parse("agent-queue").unwrap(),
@@ -28026,7 +28478,7 @@ mod tests {
     }
 
     #[test]
-    fn new_session_runtime_menu_prefers_below_and_caps_its_height() {
+    fn runtime_menu_opens_below_the_trigger_and_stays_attached() {
         let trigger_bounds = Bounds {
             origin: gpui::Point {
                 x: px(100.0),
@@ -28037,18 +28489,18 @@ mod tests {
                 height: px(32.0),
             },
         };
-
         assert_eq!(
-            new_session_runtime_menu_placement(Some(trigger_bounds), 947.0, 448.0),
+            composer_runtime_menu_placement(Some(trigger_bounds), 947.0, 448.0, 360.0),
             RuntimeMenuPlacement {
                 anchor: Anchor::TopLeft,
                 height: 360.0,
+                trigger_offset: 4.0,
             }
         );
     }
 
     #[test]
-    fn new_session_runtime_menu_uses_the_larger_available_side() {
+    fn runtime_menu_opens_above_the_trigger_and_uses_available_height() {
         let near_bottom = Bounds {
             origin: gpui::Point {
                 x: px(100.0),
@@ -28059,31 +28511,104 @@ mod tests {
                 height: px(32.0),
             },
         };
-        let cramped = Bounds {
+        let middle_trigger = Bounds {
             origin: gpui::Point {
                 x: px(100.0),
-                y: px(250.0),
+                y: px(320.0),
             },
             size: Size {
                 width: px(224.0),
                 height: px(32.0),
             },
         };
-
         assert_eq!(
-            new_session_runtime_menu_placement(Some(near_bottom), 900.0, 448.0),
+            composer_runtime_menu_placement(Some(near_bottom), 900.0, 448.0, 360.0),
             RuntimeMenuPlacement {
                 anchor: Anchor::BottomLeft,
                 height: 360.0,
+                trigger_offset: 4.0,
             }
         );
         assert_eq!(
-            new_session_runtime_menu_placement(Some(cramped), 500.0, 448.0),
+            composer_runtime_menu_placement(Some(middle_trigger), 500.0, 448.0, 360.0),
             RuntimeMenuPlacement {
                 anchor: Anchor::BottomLeft,
-                height: 238.0,
+                height: 308.0,
+                trigger_offset: 4.0,
             }
         );
+    }
+
+    #[gpui::test]
+    fn runtime_popover_render_keeps_upward_menu_four_pixels_from_trigger(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let placement = composer_runtime_menu_placement(
+            Some(Bounds {
+                origin: point(px(80.0), px(520.0)),
+                size: size(px(112.0), px(32.0)),
+            }),
+            600.0,
+            84.0,
+            360.0,
+        );
+        let trigger_bounds = Rc::new(Cell::new(None));
+        let menu_bounds = Rc::new(Cell::new(None));
+        let observed_trigger = trigger_bounds.clone();
+        let observed_menu = menu_bounds.clone();
+        let (_, cx) = cx.add_window_view(|_, _| RuntimePopoverLayoutProbe {
+            placement,
+            trigger_bounds,
+            menu_bounds,
+        });
+
+        for _ in 0..3 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        }
+
+        let trigger = observed_trigger.get().expect("trigger should be laid out");
+        let menu = observed_menu.get().expect("open menu should be laid out");
+        let gap = f32::from(trigger.top()) - f32::from(menu.bottom());
+        assert!((gap - RUNTIME_MENU_TRIGGER_GAP).abs() <= 1.5, "gap: {gap}");
+    }
+
+    #[gpui::test]
+    fn runtime_popover_render_keeps_downward_menu_four_pixels_from_trigger(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let placement = composer_runtime_menu_placement(
+            Some(Bounds {
+                origin: point(px(80.0), px(40.0)),
+                size: size(px(112.0), px(32.0)),
+            }),
+            600.0,
+            84.0,
+            360.0,
+        );
+        let trigger_bounds = Rc::new(Cell::new(None));
+        let menu_bounds = Rc::new(Cell::new(None));
+        let observed_trigger = trigger_bounds.clone();
+        let observed_menu = menu_bounds.clone();
+        let (_, cx) = cx.add_window_view(|_, _| RuntimePopoverLayoutProbe {
+            placement,
+            trigger_bounds,
+            menu_bounds,
+        });
+
+        for _ in 0..3 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        }
+
+        let trigger = observed_trigger.get().expect("trigger should be laid out");
+        let menu = observed_menu.get().expect("open menu should be laid out");
+        let gap = f32::from(menu.top()) - f32::from(trigger.bottom());
+        assert!((gap - RUNTIME_MENU_TRIGGER_GAP).abs() <= 1.5, "gap: {gap}");
     }
 
     #[test]
@@ -28125,7 +28650,7 @@ mod tests {
 
         assert_eq!(profiles.len(), 1);
         assert_eq!(runtime_profile_model_count(&profiles[0]), 0);
-        assert!(runtime_model_choices(&catalog, &agent.id, &profile.id, None).is_empty());
+        assert!(runtime_model_choices(&catalog, &agent.id, &profile.id, None, &[]).is_empty());
     }
 
     #[test]
@@ -28220,11 +28745,68 @@ mod tests {
     #[test]
     fn inline_composer_attachment_marker_reserves_the_full_token_label() {
         let marker = inline_composer_attachment_marker(7);
+        let insertion = inline_composer_attachment_insertion(&marker);
 
-        assert!(marker.starts_with(" [attachment-7"));
+        assert!(marker.starts_with("attachment_7"));
         assert!(marker.contains(COMPOSER_INLINE_ATTACHMENT_MARKER_RESERVE));
         assert!(marker.ends_with(COMPOSER_INLINE_ATTACHMENT_SUFFIX));
+        assert!(
+            marker.chars().all(
+                |character| character.is_ascii_alphanumeric() || matches!(character, '_' | '.')
+            )
+        );
+        assert_eq!(insertion, format!(" {marker} "));
+        assert_eq!(
+            inline_composer_attachment_padded_range(&insertion, 1..1 + marker.len()),
+            0..insertion.len()
+        );
         assert!(COMPOSER_INLINE_ATTACHMENT_MARKER_RESERVE.len() >= 8);
+    }
+
+    #[test]
+    fn inline_composer_attachment_overlay_requires_visible_row_and_input_bounds() {
+        let input_bounds = Bounds {
+            origin: point(px(20.0), px(40.0)),
+            size: Size {
+                width: px(400.0),
+                height: px(80.0),
+            },
+        };
+        let visible = Bounds {
+            origin: point(px(32.0), px(56.0)),
+            size: Size {
+                width: px(160.0),
+                height: px(20.0),
+            },
+        };
+        let above = Bounds {
+            origin: point(px(32.0), px(20.0)),
+            size: visible.size,
+        };
+
+        assert_eq!(
+            composer_buffer_row_for_offset("first\nsecond\nthird", 13),
+            2
+        );
+        assert!(composer_attachment_bounds_are_visible(
+            visible,
+            input_bounds
+        ));
+        assert!(!composer_attachment_bounds_are_visible(above, input_bounds));
+    }
+
+    #[test]
+    fn inline_composer_attachment_insertion_padding_is_not_submitted() {
+        let attachment = inline_composer_attachment(1, "padded");
+        let raw_text = format!(
+            "before{}after",
+            inline_composer_attachment_insertion(&attachment.marker)
+        );
+
+        let (text, attachments) = composer_submission_payload(&raw_text, &[attachment]);
+
+        assert_eq!(text, "before after");
+        assert_eq!(attachments[0].inline_text_offset, Some(6));
     }
 
     #[test]
@@ -28237,6 +28819,10 @@ mod tests {
             .expect("inline attachment overlay should remain inspectable");
         assert!(attachment_overlay.contains(".bg(cx.theme().muted)"));
         assert!(!attachment_overlay.contains(".bg(cx.theme().muted.opacity"));
+        assert!(attachment_overlay.contains(".left(bounds.origin.x)"));
+        assert!(attachment_overlay.contains("f32::from(bounds.size.width).max(24.0)"));
+        assert!(!attachment_overlay.contains("bounds.origin.x + px(2.0)"));
+        assert!(!attachment_overlay.contains("f32::from(bounds.size.width) - 4.0"));
 
         let workbench_render = source
             .split_once("impl Render for VibexWorkbench")
@@ -28993,6 +29579,11 @@ mod tests {
         let observed_width = measured_width.clone();
         let observed_height = measured_height.clone();
         let (_, cx) = cx.add_window_view(|_, _| UserMessageBubbleLayoutProbe {
+            body: format!(
+                "first line\n\n  indented text\n{}",
+                "unbroken-content-".repeat(24)
+            ),
+            timeline_width: 320.0,
             measured_width,
             measured_height,
         });
@@ -29014,15 +29605,61 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    fn user_message_bubble_preserves_a_single_input_line_when_width_is_available(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let measured_width = Rc::new(Cell::new(0.0));
+        let measured_height = Rc::new(Cell::new(0.0));
+        let observed_width = measured_width.clone();
+        let observed_height = measured_height.clone();
+        let timeline_width = 720.0;
+        let (_, cx) = cx.add_window_view(|_, _| UserMessageBubbleLayoutProbe {
+            body: "现在触发继续按钮栏的时机是什么？不用建任务，直接回答我".into(),
+            timeline_width,
+            measured_width,
+            measured_height,
+        });
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        assert!(
+            observed_width.get() <= timeline_width * 0.78 + 0.5,
+            "bubble width: {}",
+            observed_width.get()
+        );
+        assert!(
+            observed_width.get() >= 220.0,
+            "single-line bubble should expand to its content width: {}",
+            observed_width.get()
+        );
+        assert!(
+            observed_height.get() <= 44.5,
+            "single-line bubble height: {}",
+            observed_height.get()
+        );
+    }
+
     #[test]
     fn user_message_bubble_shrinks_inside_the_timeline_width_contract() {
         let source = include_str!("app.rs");
+        let row = source
+            .split_once("    fn render_user_message_row(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_agent_message_row("))
+            .map(|(body, _)| body)
+            .expect("user-message row should remain inspectable");
         let helper = source
             .split_once("fn render_user_message_bubble(")
             .and_then(|(_, tail)| tail.split_once("\n}\n\n#[cfg(test)]"))
             .map(|(body, _)| body)
             .expect("user-message bubble helper should remain inspectable");
 
+        assert!(row.contains(".w(relative(0.78))"));
+        assert!(!row.contains(".max_w(relative(0.78))"));
         assert!(helper.contains(".flex_shrink(1.0)"));
         assert!(helper.contains(".min_w_0()"));
         assert!(helper.contains(".max_w_full()"));
