@@ -1,6 +1,8 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     future::Future,
+    hash::{Hash as _, Hasher as _},
     ops::Range,
     rc::Rc,
     sync::Arc,
@@ -1204,6 +1206,89 @@ enum AgentPollSignal {
     Terminals(Vec<TerminalSession>),
 }
 
+/// Position lookup for `TimelineModel::items` keyed by item id.
+///
+/// Row/turn renderers resolve payloads from item ids on every frame; a linear
+/// scan over the whole timeline turns that into quadratic work once a session
+/// accumulates thousands of items, which is exactly when scrolling must stay
+/// smooth. The index is rebuilt lazily whenever the timeline identity changes.
+#[derive(Default)]
+struct TimelineItemIndex {
+    session_id: Option<VibexSessionId>,
+    revision: u64,
+    item_count: usize,
+    end_sequence: Option<i64>,
+    positions: HashMap<String, usize>,
+}
+
+impl TimelineItemIndex {
+    fn is_current_for(&self, timeline: &TimelineModel) -> bool {
+        self.session_id.as_ref() == timeline.session_id.as_ref()
+            && self.revision == timeline.revision
+            && self.item_count == timeline.items.len()
+            && self.end_sequence == timeline.authoritative_end_sequence
+    }
+
+    fn rebuild(&mut self, timeline: &TimelineModel) {
+        self.session_id = timeline.session_id.clone();
+        self.revision = timeline.revision;
+        self.item_count = timeline.items.len();
+        self.end_sequence = timeline.authoritative_end_sequence;
+        self.positions.clear();
+        self.positions.reserve(timeline.items.len());
+        // Items are ordered by sequence, so a later write always wins the id.
+        for (position, item) in timeline.items.iter().enumerate() {
+            self.positions.insert(item.id.to_string(), position);
+        }
+    }
+
+    fn sync(&mut self, timeline: &TimelineModel) {
+        if self.is_current_for(timeline) {
+            return;
+        }
+
+        let append_only = self.session_id.as_ref() == timeline.session_id.as_ref()
+            && self.item_count < timeline.items.len()
+            && (self.item_count == 0
+                || timeline.items.get(self.item_count - 1).is_some_and(|item| {
+                    Some(item.sequence) == self.end_sequence
+                        && self.positions.get(item.id.as_str()) == Some(&(self.item_count - 1))
+                }));
+        if !append_only {
+            self.rebuild(timeline);
+            return;
+        }
+
+        self.positions
+            .reserve(timeline.items.len().saturating_sub(self.item_count));
+        for (position, item) in timeline.items.iter().enumerate().skip(self.item_count) {
+            self.positions.insert(item.id.to_string(), position);
+        }
+        self.revision = timeline.revision;
+        self.item_count = timeline.items.len();
+        self.end_sequence = timeline.authoritative_end_sequence;
+    }
+
+    fn invalidate(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct ConversationTurnsSummary {
+    has_incomplete_turn: bool,
+    has_pending_permission: bool,
+}
+
+impl ConversationTurnsSummary {
+    fn from_turns(turns: &[TimelineConversationTurn]) -> Self {
+        Self {
+            has_incomplete_turn: turns.iter().any(|turn| !turn.complete),
+            has_pending_permission: turns.iter().any(|turn| turn.pending_permission),
+        }
+    }
+}
+
 struct AgentSessionViewCacheEntry {
     timeline: TimelineModel,
     runtime_selection: Option<AgentSessionRuntimeSelectionState>,
@@ -1212,8 +1297,12 @@ struct AgentSessionViewCacheEntry {
     timeline_scroll: VirtualListScrollHandle,
     timeline_row_sizes: Rc<Vec<Size<gpui::Pixels>>>,
     timeline_measured_turn_heights: BTreeMap<String, f32>,
+    timeline_estimated_turn_heights: BTreeMap<String, (u64, f32)>,
+    timeline_markdown_sources: BTreeMap<String, (i64, Arc<str>)>,
+    timeline_tool_card_projections: BTreeMap<String, (i64, Rc<ToolCardProjection>)>,
     conversation_turns_cache: Rc<Vec<TimelineConversationTurn>>,
     conversation_turns_cache_key: Option<ConversationTurnsCacheKey>,
+    conversation_turns_summary: ConversationTurnsSummary,
     content_width: SessionContentWidthMode,
     collapsed_timeline_rows: BTreeSet<String>,
     timeline_process_expansion: BTreeMap<String, bool>,
@@ -1928,6 +2017,7 @@ pub struct VibexWorkbench {
     runtime_client_id: RuntimeClientId,
     session_generation: u64,
     timeline: TimelineModel,
+    timeline_item_index: RefCell<TimelineItemIndex>,
     timeline_follow: TimelineFollowState,
     timeline_scroll: VirtualListScrollHandle,
     timeline_scroll_to_latest_pending: bool,
@@ -1936,8 +2026,13 @@ pub struct VibexWorkbench {
     timeline_scrollbar_interaction_active: bool,
     timeline_row_sizes: Rc<Vec<Size<gpui::Pixels>>>,
     timeline_measured_turn_heights: BTreeMap<String, f32>,
+    timeline_pending_turn_heights: BTreeMap<usize, (String, f32)>,
+    timeline_estimated_turn_heights: BTreeMap<String, (u64, f32)>,
+    timeline_markdown_sources: BTreeMap<String, (i64, Arc<str>)>,
+    timeline_tool_card_projections: BTreeMap<String, (i64, Rc<ToolCardProjection>)>,
     conversation_turns_cache: Rc<Vec<TimelineConversationTurn>>,
     conversation_turns_cache_key: Option<ConversationTurnsCacheKey>,
+    conversation_turns_summary: ConversationTurnsSummary,
     turn_preview_rail_visible: bool,
     turn_preview_active_index: Option<usize>,
     agent_session_view_cache: BTreeMap<String, AgentSessionViewCacheEntry>,
@@ -2362,6 +2457,7 @@ impl VibexWorkbench {
             runtime_client_id: RuntimeClientId::new(),
             session_generation: 0,
             timeline: TimelineModel::default(),
+            timeline_item_index: RefCell::new(TimelineItemIndex::default()),
             timeline_follow: TimelineFollowState::default(),
             timeline_scroll: VirtualListScrollHandle::new(),
             timeline_scroll_to_latest_pending: false,
@@ -2370,8 +2466,13 @@ impl VibexWorkbench {
             timeline_scrollbar_interaction_active: false,
             timeline_row_sizes: Rc::new(Vec::new()),
             timeline_measured_turn_heights: BTreeMap::new(),
+            timeline_pending_turn_heights: BTreeMap::new(),
+            timeline_estimated_turn_heights: BTreeMap::new(),
+            timeline_markdown_sources: BTreeMap::new(),
+            timeline_tool_card_projections: BTreeMap::new(),
             conversation_turns_cache: Rc::new(Vec::new()),
             conversation_turns_cache_key: None,
+            conversation_turns_summary: ConversationTurnsSummary::default(),
             turn_preview_rail_visible: false,
             turn_preview_active_index: None,
             agent_session_view_cache: BTreeMap::new(),
@@ -2891,6 +2992,8 @@ impl VibexWorkbench {
                             } else {
                                 this.selected_session_id = None;
                                 this.timeline = TimelineModel::default();
+                                this.timeline_row_sizes = Rc::new(Vec::new());
+                                this.invalidate_timeline_render_caches();
                                 this.runtime_selection = None;
                                 this.token_usage = None;
                                 this.agent_loading = false;
@@ -3790,6 +3893,7 @@ impl VibexWorkbench {
     }
 
     fn stash_current_agent_session_view(&mut self) {
+        self.apply_pending_timeline_row_heights();
         let Some(session_id) = self.selected_session_id.clone() else {
             return;
         };
@@ -3814,11 +3918,19 @@ impl VibexWorkbench {
             timeline_measured_turn_heights: std::mem::take(
                 &mut self.timeline_measured_turn_heights,
             ),
+            timeline_estimated_turn_heights: std::mem::take(
+                &mut self.timeline_estimated_turn_heights,
+            ),
+            timeline_markdown_sources: std::mem::take(&mut self.timeline_markdown_sources),
+            timeline_tool_card_projections: std::mem::take(
+                &mut self.timeline_tool_card_projections,
+            ),
             conversation_turns_cache: std::mem::replace(
                 &mut self.conversation_turns_cache,
                 Rc::new(Vec::new()),
             ),
             conversation_turns_cache_key: self.conversation_turns_cache_key.take(),
+            conversation_turns_summary: std::mem::take(&mut self.conversation_turns_summary),
             content_width: self.ui_state.session.content_width,
             collapsed_timeline_rows: std::mem::take(&mut self.collapsed_timeline_rows),
             timeline_process_expansion: std::mem::take(&mut self.timeline_process_expansion),
@@ -3849,14 +3961,19 @@ impl VibexWorkbench {
         };
         self.agent_session_view_lru.retain(|cached| cached != &key);
         self.timeline = entry.timeline;
+        self.timeline_item_index.get_mut().invalidate();
         self.runtime_selection = entry.runtime_selection;
         self.token_usage = entry.token_usage;
         self.timeline_follow = entry.timeline_follow;
         self.timeline_scroll = entry.timeline_scroll;
         self.timeline_row_sizes = entry.timeline_row_sizes;
         self.timeline_measured_turn_heights = entry.timeline_measured_turn_heights;
+        self.timeline_estimated_turn_heights = entry.timeline_estimated_turn_heights;
+        self.timeline_markdown_sources = entry.timeline_markdown_sources;
+        self.timeline_tool_card_projections = entry.timeline_tool_card_projections;
         self.conversation_turns_cache = entry.conversation_turns_cache;
         self.conversation_turns_cache_key = entry.conversation_turns_cache_key;
+        self.conversation_turns_summary = entry.conversation_turns_summary;
         self.collapsed_timeline_rows = entry.collapsed_timeline_rows;
         self.timeline_process_expansion = entry.timeline_process_expansion;
         self.timeline_command_expansion = entry.timeline_command_expansion;
@@ -3929,7 +4046,9 @@ impl VibexWorkbench {
     fn conversation_turns_cached(&mut self) -> Rc<Vec<TimelineConversationTurn>> {
         let key = self.current_conversation_turns_cache_key();
         if self.conversation_turns_cache_key.as_ref() != Some(&key) {
-            self.conversation_turns_cache = Rc::new(self.conversation_turns());
+            let turns = self.conversation_turns();
+            self.conversation_turns_summary = ConversationTurnsSummary::from_turns(&turns);
+            self.conversation_turns_cache = Rc::new(turns);
             self.conversation_turns_cache_key = Some(key);
         }
         self.conversation_turns_cache.clone()
@@ -4032,7 +4151,7 @@ impl VibexWorkbench {
             self.timeline_follow = TimelineFollowState::default();
             self.timeline_scroll = VirtualListScrollHandle::new();
             self.timeline_row_sizes = Rc::new(Vec::new());
-            self.timeline_measured_turn_heights.clear();
+            self.invalidate_timeline_render_caches();
             self.collapsed_timeline_rows.clear();
             self.timeline_process_expansion.clear();
             self.timeline_command_expansion.clear();
@@ -4123,6 +4242,12 @@ impl VibexWorkbench {
                     this.finish_startup_loading();
                     match outcome {
                         Ok(Ok(items)) => {
+                            let content_changed = this.timeline.session_id.as_ref()
+                                != Some(&session_id)
+                                || this.timeline.items != items;
+                            if content_changed {
+                                this.invalidate_timeline_render_caches();
+                            }
                             this.timeline
                                 .replace_authoritative(session_id.clone(), items);
                             this.rebuild_timeline_sizes();
@@ -4401,6 +4526,13 @@ impl VibexWorkbench {
                             }
                             let dirty = match signal {
                                 AgentPollSignal::Timeline(page) => {
+                                    let previous_item_count = this.timeline.items.len();
+                                    let updates_existing_item = this
+                                        .timeline
+                                        .authoritative_end_sequence
+                                        .is_some_and(|end| {
+                                            page.items.iter().any(|item| item.sequence <= end)
+                                        });
                                     let changed = this.timeline.apply_live_batch(
                                         page.items.into_iter().map(|item| TimelineLiveEvent {
                                             session_id: page.session_id.clone(),
@@ -4409,7 +4541,17 @@ impl VibexWorkbench {
                                         }),
                                     );
                                     if changed > 0 {
-                                        this.timeline_follow.content_appended(changed);
+                                        if updates_existing_item {
+                                            this.invalidate_timeline_render_caches();
+                                        }
+                                        let appended = this
+                                            .timeline
+                                            .items
+                                            .len()
+                                            .saturating_sub(previous_item_count);
+                                        if appended > 0 {
+                                            this.timeline_follow.content_appended(appended);
+                                        }
                                         let content_extent_changed = this.rebuild_timeline_sizes();
                                         if timeline_should_auto_follow_content(
                                             this.timeline_follow.following_bottom,
@@ -4470,9 +4612,24 @@ impl VibexWorkbench {
                 if self.selected_session_id.as_ref() != Some(&event.session_id) {
                     return false;
                 }
-                let appended = self.timeline.apply_live(event);
-                if appended {
-                    self.timeline_follow.content_appended(1);
+                let previous_item_count = self.timeline.items.len();
+                let updates_existing_item = self
+                    .timeline
+                    .authoritative_end_sequence
+                    .is_some_and(|end| event.sequence <= end);
+                let changed = self.timeline.apply_live(event);
+                if changed {
+                    if updates_existing_item {
+                        self.invalidate_timeline_render_caches();
+                    }
+                    let appended = self
+                        .timeline
+                        .items
+                        .len()
+                        .saturating_sub(previous_item_count);
+                    if appended > 0 {
+                        self.timeline_follow.content_appended(appended);
+                    }
                     let content_extent_changed = self.rebuild_timeline_sizes();
                     if timeline_should_auto_follow_content(
                         self.timeline_follow.following_bottom,
@@ -4487,7 +4644,7 @@ impl VibexWorkbench {
                 if needs_refetch && let Some(session_id) = self.selected_session_id.clone() {
                     self.select_session_with_history(session_id, false, cx);
                 }
-                appended || needs_refetch
+                changed || needs_refetch
             }
             DesktopEvent::Runtime(event) => {
                 self.selected_session_id
@@ -4569,6 +4726,7 @@ impl VibexWorkbench {
     }
 
     fn rebuild_timeline_sizes(&mut self) -> bool {
+        self.timeline_pending_turn_heights.clear();
         let turns = self.conversation_turns_cached();
         let active_turn_ids = turns
             .iter()
@@ -4576,23 +4734,20 @@ impl VibexWorkbench {
             .collect::<BTreeSet<_>>();
         self.timeline_measured_turn_heights
             .retain(|turn_id, _| active_turn_ids.contains(turn_id.as_str()));
+        self.timeline_estimated_turn_heights
+            .retain(|turn_id, _| active_turn_ids.contains(turn_id.as_str()));
         let content_width = session_content_max_width(self.ui_state.session.content_width)
             .unwrap_or(AGENT_CONTENT_STANDARD_MAX_WIDTH);
-        let row_sizes = turns
-            .iter()
-            .map(|turn| {
-                let estimated_height = self.estimated_timeline_turn_height_projected(
-                    turn,
-                    self.timeline_process_expansion.get(&turn.id).copied(),
-                );
-                let height = self
-                    .timeline_measured_turn_heights
-                    .get(&turn.id)
-                    .copied()
-                    .unwrap_or(estimated_height);
-                size(px(content_width), px(height))
-            })
-            .collect::<Vec<_>>();
+        let mut row_sizes = Vec::with_capacity(turns.len());
+        for turn in turns.iter() {
+            // Measured turns already know their real extent; re-estimating them
+            // would rescan every row body for nothing.
+            let height = match self.timeline_measured_turn_heights.get(&turn.id).copied() {
+                Some(measured) => measured,
+                None => self.estimated_timeline_turn_height_cached(turn),
+            };
+            row_sizes.push(size(px(content_width), px(height)));
+        }
         if self.timeline_row_sizes.as_ref() == &row_sizes {
             return false;
         }
@@ -4600,8 +4755,88 @@ impl VibexWorkbench {
         true
     }
 
+    fn invalidate_timeline_render_caches(&mut self) {
+        self.timeline_item_index.get_mut().invalidate();
+        self.timeline_measured_turn_heights.clear();
+        self.timeline_pending_turn_heights.clear();
+        self.timeline_estimated_turn_heights.clear();
+        self.timeline_markdown_sources.clear();
+        self.timeline_tool_card_projections.clear();
+        self.conversation_turns_cache = Rc::new(Vec::new());
+        self.conversation_turns_cache_key = None;
+        self.conversation_turns_summary = ConversationTurnsSummary::default();
+    }
+
+    fn invalidate_timeline_turn_measurement(&mut self, turn_id: &str) {
+        self.timeline_measured_turn_heights.remove(turn_id);
+        self.timeline_pending_turn_heights
+            .retain(|_, (pending_turn_id, _)| pending_turn_id != turn_id);
+    }
+
+    /// Height estimation walks every row body, so the result is memoized per
+    /// turn and only recomputed when the turn's content or expansion changes.
+    fn estimated_timeline_turn_height_cached(&mut self, turn: &TimelineConversationTurn) -> f32 {
+        let process_expansion = self.timeline_process_expansion.get(&turn.id).copied();
+        let signature = self.timeline_turn_estimate_signature(turn, process_expansion);
+        if let Some((cached_signature, height)) = self.timeline_estimated_turn_heights.get(&turn.id)
+            && *cached_signature == signature
+        {
+            return *height;
+        }
+        let height = self.estimated_timeline_turn_height_projected(turn, process_expansion);
+        self.timeline_estimated_turn_heights
+            .insert(turn.id.clone(), (signature, height));
+        height
+    }
+
+    /// Cheap fingerprint of every input the height estimate reads, computed in
+    /// row count rather than body length.
+    fn timeline_turn_estimate_signature(
+        &self,
+        turn: &TimelineConversationTurn,
+        process_expansion: Option<bool>,
+    ) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        turn.complete.hash(&mut hasher);
+        process_expansion.hash(&mut hasher);
+        for row in turn
+            .user_row
+            .iter()
+            .chain(turn.process_rows.iter())
+            .chain(turn.conclusion_row.iter())
+        {
+            row.id.hash(&mut hasher);
+            std::mem::discriminant(&row.kind).hash(&mut hasher);
+            row.last_sequence.hash(&mut hasher);
+            row.body.len().hash(&mut hasher);
+            row.title.len().hash(&mut hasher);
+            row.pending_permission.hash(&mut hasher);
+            row.failed.hash(&mut hasher);
+            row.file_path.is_some().hash(&mut hasher);
+            self.timeline_command_expansion
+                .get(&row.id)
+                .copied()
+                .hash(&mut hasher);
+            self.inline_user_message_edit
+                .as_ref()
+                .is_some_and(|edit| edit.matches(&row.id, self.selected_session_id.as_ref()))
+                .hash(&mut hasher);
+        }
+        for group in &turn.process_activity_groups {
+            group.id.hash(&mut hasher);
+            group.start_row.hash(&mut hasher);
+            group.end_row.hash(&mut hasher);
+            self.timeline_command_expansion
+                .get(&group.id)
+                .copied()
+                .hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
     fn record_timeline_turn_height(
         &mut self,
+        turn_index: usize,
         turn_id: String,
         measured_height: f32,
         cx: &mut Context<Self>,
@@ -4618,8 +4853,18 @@ impl VibexWorkbench {
             return;
         }
         self.timeline_measured_turn_heights
-            .insert(turn_id, measured_height);
-        let content_extent_changed = self.rebuild_timeline_sizes();
+            .insert(turn_id.clone(), measured_height);
+        let indexed_turn_matches = self
+            .conversation_turns_cache
+            .get(turn_index)
+            .is_some_and(|turn| turn.id == turn_id);
+        let content_extent_changed = !indexed_turn_matches
+            || self
+                .timeline_row_sizes
+                .get(turn_index)
+                .is_none_or(|row_size| row_size.height != px(measured_height));
+        self.timeline_pending_turn_heights
+            .insert(turn_index, (turn_id, measured_height));
         if timeline_should_auto_follow_content(
             self.timeline_follow.following_bottom,
             self.timeline_scroll_wheel_idle_task.is_some(),
@@ -4629,6 +4874,37 @@ impl VibexWorkbench {
             self.request_timeline_scroll_to_latest();
         }
         cx.notify();
+    }
+
+    /// Apply every height observed during the prior prepaint in one pass.
+    /// The active element tree holds the previous `Rc<Vec<_>>`; mutating once
+    /// on the next render avoids cloning the full size table per visible row.
+    fn apply_pending_timeline_row_heights(&mut self) -> bool {
+        if self.timeline_pending_turn_heights.is_empty() {
+            return false;
+        }
+        let pending = std::mem::take(&mut self.timeline_pending_turn_heights);
+        let valid = pending.iter().all(|(turn_index, (turn_id, _))| {
+            *turn_index < self.timeline_row_sizes.len()
+                && self
+                    .conversation_turns_cache
+                    .get(*turn_index)
+                    .is_some_and(|turn| turn.id == *turn_id)
+        });
+        if !valid {
+            return self.rebuild_timeline_sizes();
+        }
+
+        let row_sizes = Rc::make_mut(&mut self.timeline_row_sizes);
+        let mut changed = false;
+        for (turn_index, (_, height)) in pending {
+            let height = px(height);
+            if row_sizes[turn_index].height != height {
+                row_sizes[turn_index].height = height;
+                changed = true;
+            }
+        }
+        changed
     }
 
     fn timeline_distance_to_bottom(&self) -> f32 {
@@ -13861,7 +14137,15 @@ impl VibexWorkbench {
             locale::ResolvedLocale::ZhTw => "空訊息",
         };
 
-        let items = turns
+        // The rail only mounts its list while hovered, so building a preview card
+        // per turn on every frame would scale the frame cost with conversation
+        // length for something that is not on screen.
+        let rail_turns: &[TimelineConversationTurn] = if self.turn_preview_rail_visible {
+            turns
+        } else {
+            &[]
+        };
+        let items = rail_turns
             .iter()
             .enumerate()
             .map(|(preview_index, turn)| {
@@ -14119,22 +14403,18 @@ impl VibexWorkbench {
     }
 
     fn render_agent_workbench(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        self.apply_pending_timeline_row_heights();
         self.apply_pending_timeline_scroll();
         let selected = self.selected_session().cloned();
         let turns = self.conversation_turns_cached();
-        self.sync_timeline_duration_tick(turns.iter().any(|turn| !turn.complete), cx);
+        let turns_summary = self.conversation_turns_summary;
+        self.sync_timeline_duration_tick(turns_summary.has_incomplete_turn, cx);
         let rendered_turns = turns.clone();
         let row_sizes = self.timeline_row_sizes.clone();
         let rendered_row_sizes = row_sizes.clone();
         let strings = self.strings();
         let content_max_width = session_content_max_width(self.ui_state.session.content_width);
-        let pending_permission = turns.iter().any(|turn| {
-            turn.user_row
-                .iter()
-                .chain(turn.process_rows.iter())
-                .chain(turn.conclusion_row.iter())
-                .any(|row| row.pending_permission)
-        });
+        let pending_permission = turns_summary.has_pending_permission;
         let turn_preview_rail = (self.ui_state.session.turn_preview_rail && !turns.is_empty())
             .then(|| self.render_agent_turn_preview_rail(turns.as_slice(), cx));
         let timeline_surface = div()
@@ -14246,6 +14526,7 @@ impl VibexWorkbench {
                                                                 let _ = measured_height_entity
                                                                     .update(cx, |this, cx| {
                                                                         this.record_timeline_turn_height(
+                                                                            index,
                                                                             measured_turn_id.clone(),
                                                                             measured_height,
                                                                             cx,
@@ -15999,6 +16280,7 @@ impl VibexWorkbench {
                         move |window, cx| Tooltip::new(tooltip_text).build(window, cx)
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        this.invalidate_timeline_turn_measurement(&process_toggle_id);
                         this.timeline_process_expansion
                             .insert(process_toggle_id.clone(), !process_expanded);
                         this.rebuild_timeline_sizes();
@@ -16071,15 +16353,14 @@ impl VibexWorkbench {
         turn: &TimelineConversationTurn,
     ) -> Option<vibex_core::TurnExecutionAttributionView> {
         turn.runtime_attribution.as_ref()?;
+        self.sync_timeline_item_index();
         turn.process_rows
             .iter()
             .chain(turn.conclusion_row.iter())
             .flat_map(|row| row.item_ids.iter())
             .find_map(|item_id| {
-                self.timeline
-                    .items
-                    .iter()
-                    .find(|item| item.id.as_str() == item_id)
+                self.timeline_item_position(item_id)
+                    .and_then(|position| self.timeline.items.get(position))
                     .and_then(|item| item.execution_attribution.as_ref())
             })
             .cloned()
@@ -16269,11 +16550,65 @@ impl VibexWorkbench {
         )
     }
 
+    /// Tool/command card projection for a row, memoized per row revision.
+    ///
+    /// Building one clones the payload strings (command output, tool summaries),
+    /// and an expanded turn renders hundreds of these rows on every frame.
+    fn tool_card_projection_cached(&mut self, row: &TimelineRow) -> Rc<ToolCardProjection> {
+        if let Some((sequence, projection)) = self.timeline_tool_card_projections.get(&row.id)
+            && *sequence == row.last_sequence
+        {
+            return projection.clone();
+        }
+        let projection = {
+            let payload = self.timeline_row_latest_item(row).map(|item| &item.payload);
+            Rc::new(tool_card_projection(row, payload))
+        };
+        self.timeline_tool_card_projections
+            .insert(row.id.clone(), (row.last_sequence, projection.clone()));
+        projection
+    }
+
+    /// Shared body text for a markdown row.
+    ///
+    /// `MarkdownInput` takes an `Arc<str>`, so handing it `row.body.clone()`
+    /// copies the whole message twice per frame per visible row. Reusing one
+    /// allocation also lets the markdown view settle on a pointer comparison
+    /// instead of a full memcmp when nothing changed.
+    fn timeline_markdown_source(&mut self, row: &TimelineRow) -> Arc<str> {
+        if let Some((sequence, source)) = self.timeline_markdown_sources.get(&row.id)
+            && *sequence == row.last_sequence
+            && source.len() == row.body.len()
+        {
+            return source.clone();
+        }
+        let source: Arc<str> = Arc::from(row.body.as_str());
+        self.timeline_markdown_sources
+            .insert(row.id.clone(), (row.last_sequence, source.clone()));
+        source
+    }
+
+    /// Refresh the id → position lookup when the timeline identity moved on.
+    fn sync_timeline_item_index(&self) {
+        let mut index = self.timeline_item_index.borrow_mut();
+        index.sync(&self.timeline);
+    }
+
+    fn timeline_item_position(&self, item_id: &str) -> Option<usize> {
+        self.timeline_item_index
+            .borrow()
+            .positions
+            .get(item_id)
+            .copied()
+    }
+
     fn timeline_row_latest_item(&self, row: &TimelineRow) -> Option<&vibex_core::TimelineItem> {
-        self.timeline
-            .items
+        self.sync_timeline_item_index();
+        let index = self.timeline_item_index.borrow();
+        row.item_ids
             .iter()
-            .filter(|item| row.item_ids.iter().any(|id| id == item.id.as_str()))
+            .filter_map(|id| index.positions.get(id).copied())
+            .filter_map(|position| self.timeline.items.get(position))
             .max_by_key(|item| item.sequence)
     }
 
@@ -16573,22 +16908,21 @@ impl VibexWorkbench {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let attachments = row
-            .item_ids
-            .iter()
-            .find_map(|item_id| {
-                self.timeline
-                    .items
-                    .iter()
-                    .find(|item| item.id.as_str() == item_id)
-            })
-            .and_then(|item| match &item.payload {
-                vibex_core::TimelinePayload::UserMessage(message) => {
-                    Some(message.attachments.clone())
-                }
-                _ => None,
-            })
-            .unwrap_or_default();
+        self.sync_timeline_item_index();
+        let attachments = {
+            let timeline_item_index = self.timeline_item_index.borrow();
+            row.item_ids
+                .iter()
+                .filter_map(|item_id| timeline_item_index.positions.get(item_id).copied())
+                .filter_map(|position| self.timeline.items.get(position))
+                .find_map(|item| match &item.payload {
+                    vibex_core::TimelinePayload::UserMessage(message) => {
+                        Some(message.attachments.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default()
+        };
         let edit_attachments = attachments.clone();
         let timestamp = self.timeline_row_timestamp(row);
         let locale = self.resolved_locale();
@@ -16731,11 +17065,12 @@ impl VibexWorkbench {
         let search_query = self
             .session_search_highlight_query_for_rows(std::slice::from_ref(row))
             .map(str::to_string);
+        let markdown_source = self.timeline_markdown_source(row);
         let markdown_entity = cx.weak_entity();
         let markdown_view = MarkdownView::new(
             format!("markdown:{}", row.id),
             MarkdownInput::new(
-                row.body.clone(),
+                markdown_source.clone(),
                 "",
                 u64::try_from(row.last_sequence).unwrap_or_default(),
             )
@@ -16764,7 +17099,7 @@ impl VibexWorkbench {
             agent_answer_actions(timestamp.is_some())
                 .filter_map(|action| match action {
                     AgentAnswerAction::Copy => {
-                        let copy_text = row.body.clone();
+                        let copy_text = markdown_source.clone();
                         Some(
                             Button::new(format!("copy-conclusion:{}", row.id))
                                 .xsmall()
@@ -16775,7 +17110,7 @@ impl VibexWorkbench {
                                 .tooltip(locale::text("Copy", "复制", "複製"))
                                 .on_click(move |_, _, cx| {
                                     cx.write_to_clipboard(ClipboardItem::new_string(
-                                        copy_text.clone(),
+                                        copy_text.to_string(),
                                     ));
                                 })
                                 .into_any_element(),
@@ -16851,7 +17186,7 @@ impl VibexWorkbench {
         let markdown_view = MarkdownView::new(
             format!("thought:{}", row.id),
             MarkdownInput::new(
-                row.body.clone(),
+                self.timeline_markdown_source(row),
                 "",
                 u64::try_from(row.last_sequence).unwrap_or_default(),
             )
@@ -16887,10 +17222,7 @@ impl VibexWorkbench {
         let Some(latest_row) = rows.last() else {
             return div().id(group.id.clone()).into_any_element();
         };
-        let payload = self
-            .timeline_row_latest_item(latest_row)
-            .map(|item| item.payload.clone());
-        let projection = tool_card_projection(latest_row, payload.as_ref());
+        let projection = self.tool_card_projection_cached(latest_row);
         let expanded = self
             .timeline_command_expansion
             .get(&group.id)
@@ -16904,6 +17236,7 @@ impl VibexWorkbench {
             Vec::new()
         };
         let group_id = group.id.clone();
+        let measured_turn_id = latest_row.turn_id.clone();
         let line_color = if projection.failed {
             cx.theme().danger
         } else {
@@ -16945,6 +17278,9 @@ impl VibexWorkbench {
                     .hover(|style| style.text_color(cx.theme().foreground))
                     .tooltip(move |window, cx| Tooltip::new(tooltip_text).build(window, cx))
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(turn_id) = measured_turn_id.as_deref() {
+                            this.invalidate_timeline_turn_measurement(turn_id);
+                        }
                         this.timeline_command_expansion
                             .insert(group_id.clone(), !expanded);
                         this.rebuild_timeline_sizes();
@@ -16986,10 +17322,7 @@ impl VibexWorkbench {
     ) -> AnyElement {
         // Codex-parity: tool/command activity is a single muted line — icon plus a
         // compact summary. Clicking a line toggles its mono detail blocks.
-        let payload = self
-            .timeline_row_latest_item(row)
-            .map(|item| item.payload.clone());
-        let projection = tool_card_projection(row, payload.as_ref());
+        let projection = self.tool_card_projection_cached(row);
         let icon = process_activity_icon(row.kind);
         let has_details = !projection.details.is_empty();
         let expanded = has_details
@@ -16999,6 +17332,7 @@ impl VibexWorkbench {
                 .copied()
                 .unwrap_or(false);
         let toggle_id = row.id.clone();
+        let measured_turn_id = row.turn_id.clone();
         let line_color = if projection.failed {
             cx.theme().danger
         } else {
@@ -17021,6 +17355,9 @@ impl VibexWorkbench {
                         this.cursor_pointer()
                             .hover(|style| style.text_color(cx.theme().foreground))
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(turn_id) = measured_turn_id.as_deref() {
+                                    this.invalidate_timeline_turn_measurement(turn_id);
+                                }
                                 let expanded = this
                                     .timeline_command_expansion
                                     .get(&toggle_id)
@@ -24737,6 +25074,99 @@ mod tests {
         TimelineItemId, TimelineRedactionState, TimelineSource, UserMessagePayload, WorkspaceId,
     };
 
+    fn indexed_timeline_item(
+        session_id: &VibexSessionId,
+        sequence: i64,
+        text: &str,
+    ) -> TimelineItem {
+        let payload = TimelinePayload::AgentMessage(AgentMessagePayload {
+            text: text.into(),
+            is_final: true,
+        });
+        TimelineItem {
+            id: TimelineItemId::new(),
+            session_id: session_id.clone(),
+            sequence,
+            timestamp_ms: sequence,
+            source: TimelineSource::Agent,
+            kind: payload.kind(),
+            correlation_id: None,
+            provider_correlation_id: None,
+            redaction_state: TimelineRedactionState::None,
+            execution_attribution: None,
+            payload,
+        }
+    }
+
+    #[test]
+    fn timeline_item_index_tracks_append_replace_and_session_switch() {
+        let first_session = VibexSessionId::parse("session_index_first").unwrap();
+        let first = indexed_timeline_item(&first_session, 1, "first");
+        let second = indexed_timeline_item(&first_session, 2, "second");
+        let first_id = first.id.to_string();
+        let second_id = second.id.to_string();
+        let mut timeline = TimelineModel::default();
+        timeline.replace_authoritative(first_session.clone(), [first, second]);
+
+        let mut index = TimelineItemIndex::default();
+        index.sync(&timeline);
+        assert_eq!(index.positions.get(&first_id), Some(&0));
+        assert_eq!(index.positions.get(&second_id), Some(&1));
+
+        let appended = indexed_timeline_item(&first_session, 3, "appended");
+        let appended_id = appended.id.to_string();
+        assert!(timeline.apply_live(TimelineLiveEvent {
+            session_id: first_session.clone(),
+            sequence: appended.sequence,
+            item: appended,
+        }));
+        index.sync(&timeline);
+        assert_eq!(index.positions.get(&appended_id), Some(&2));
+
+        let replacement = indexed_timeline_item(&first_session, 2, "replacement");
+        let replacement_id = replacement.id.to_string();
+        assert!(timeline.apply_live(TimelineLiveEvent {
+            session_id: first_session,
+            sequence: replacement.sequence,
+            item: replacement,
+        }));
+        index.sync(&timeline);
+        assert!(!index.positions.contains_key(&second_id));
+        assert_eq!(index.positions.get(&replacement_id), Some(&1));
+
+        let next_session = VibexSessionId::parse("session_index_next").unwrap();
+        let next = indexed_timeline_item(&next_session, 1, "next");
+        let next_id = next.id.to_string();
+        timeline.replace_authoritative(next_session, [next]);
+        index.sync(&timeline);
+        assert_eq!(index.positions.len(), 1);
+        assert_eq!(index.positions.get(&next_id), Some(&0));
+    }
+
+    #[test]
+    fn conversation_turn_summary_uses_projected_turn_state() {
+        let turn = |id: &str, complete: bool, pending_permission: bool| TimelineConversationTurn {
+            id: id.into(),
+            user_row: None,
+            process_rows: Vec::new(),
+            process_activity_groups: Vec::new(),
+            conclusion_row: None,
+            runtime_attribution: None,
+            complete,
+            failed: false,
+            pending_permission,
+            item_count: 0,
+            started_at_ms: 0,
+            ended_at_ms: complete.then_some(1),
+        };
+        let turns = [turn("complete", true, false), turn("active", false, true)];
+
+        let summary = ConversationTurnsSummary::from_turns(&turns);
+
+        assert!(summary.has_incomplete_turn);
+        assert!(summary.has_pending_permission);
+    }
+
     #[test]
     fn session_search_normalizes_queries_and_centers_unicode_excerpts() {
         assert_eq!(
@@ -26713,9 +27143,12 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_controls("))
             .map(|(body, _)| body)
             .expect("agent workbench renderer should remain inspectable");
-        assert!(workbench.contains(
-            "self.sync_timeline_duration_tick(turns.iter().any(|turn| !turn.complete), cx);"
-        ));
+        assert!(workbench.contains("let turns_summary = self.conversation_turns_summary;"));
+        assert!(
+            workbench.contains(
+                "self.sync_timeline_duration_tick(turns_summary.has_incomplete_turn, cx);"
+            )
+        );
 
         let turn_renderer = source
             .split_once("    fn render_timeline_turn(")
@@ -26738,6 +27171,41 @@ mod tests {
 
         assert!(method.contains("self.timeline_scroll.base_handle().scroll_to_bottom();"));
         assert!(!method.contains("scroll_to_item"));
+    }
+
+    #[test]
+    fn timeline_height_measurements_are_batched_before_the_next_render() {
+        let source = include_str!("app.rs");
+        let recorder = source
+            .split_once("    fn record_timeline_turn_height(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Apply every height observed during the prior prepaint")
+            })
+            .map(|(body, _)| body)
+            .expect("timeline height recorder should remain inspectable");
+        assert!(recorder.contains("self.timeline_pending_turn_heights"));
+        assert!(!recorder.contains("Rc::make_mut"));
+        assert!(!recorder.contains("self.rebuild_timeline_sizes()"));
+
+        let batch = source
+            .split_once("    fn apply_pending_timeline_row_heights(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn timeline_distance_to_bottom("))
+            .map(|(body, _)| body)
+            .expect("timeline height batch should remain inspectable");
+        assert_eq!(batch.matches("Rc::make_mut").count(), 1);
+
+        let workbench = source
+            .split_once("    fn render_agent_workbench(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_controls("))
+            .map(|(body, _)| body)
+            .expect("agent workbench renderer should remain inspectable");
+        let apply = workbench
+            .find("self.apply_pending_timeline_row_heights();")
+            .expect("batched heights should be applied before rendering");
+        let scroll = workbench
+            .find("self.apply_pending_timeline_scroll();")
+            .expect("pending bottom scroll should remain applied");
+        assert!(apply < scroll);
     }
 
     #[test]
@@ -27844,6 +28312,8 @@ mod tests {
         assert!(renderer.contains("icons/vibex/file-code.svg"));
         assert!(renderer.contains("AGENT_TURN_PREVIEW_VISIBLE_FILE_COUNT"));
         assert!(renderer.contains("format!(\"+{remaining_file_count}\")"));
+        assert!(renderer.contains("if self.turn_preview_rail_visible"));
+        assert!(renderer.contains("let items = rail_turns"));
         assert!(!renderer.contains("format_timeline_hover_time(turn.started_at_ms"));
     }
 

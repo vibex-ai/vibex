@@ -79,6 +79,15 @@ pub struct MarkdownViewOptions {
     pub on_open_resource: Option<MarkdownResourceHandler>,
 }
 
+/// Compare two shared texts, taking the pointer shortcut first.
+///
+/// Callers hand the same `Arc<str>` back on every frame when nothing changed;
+/// without this the equality check degrades into a full memcmp of the whole
+/// message body once per frame per visible row.
+fn markdown_text_matches(previous: &Arc<str>, next: &Arc<str>) -> bool {
+    Arc::ptr_eq(previous, next) || previous == next
+}
+
 fn markdown_render_options_changed(
     previous: &MarkdownViewOptions,
     next: &MarkdownViewOptions,
@@ -394,6 +403,7 @@ impl Element for MarkdownVirtualFlow {
             measurements.push((index, measured.height));
             layout.blocks.push(block);
         }
+        drop(origins);
 
         if !measurements.is_empty() {
             self.state.update(cx, |state, cx| {
@@ -639,8 +649,8 @@ impl MarkdownViewState {
         self.options = options;
         if let Some(document) = document {
             let changed = self.document.revision != document.revision
-                || self.document.source != document.source
-                || self.document.base_path != document.base_path;
+                || !markdown_text_matches(&self.document.source, &document.source)
+                || !markdown_text_matches(&self.document.base_path, &document.base_path);
             self.input = input;
             if changed {
                 self.parse_generation = self.parse_generation.saturating_add(1).max(1);
@@ -654,8 +664,8 @@ impl MarkdownViewState {
             return;
         }
         if self.input.revision == input.revision
-            && self.input.source == input.source
-            && self.input.base_path == input.base_path
+            && markdown_text_matches(&self.input.source, &input.source)
+            && markdown_text_matches(&self.input.base_path, &input.base_path)
         {
             if options_changed {
                 self.rebuild_anchors();
@@ -810,12 +820,19 @@ impl MarkdownViewState {
         }
         let visible_top = viewport.top() - px(AGENT_BLOCK_VIRTUALIZATION_OVERSCAN_PX);
         let visible_bottom = viewport.bottom() + px(AGENT_BLOCK_VIRTUALIZATION_OVERSCAN_PX);
-        let first = self
-            .virtual_block_origins
-            .iter()
-            .zip(self.virtual_block_sizes.iter())
-            .position(|(origin, size)| flow_bounds.top() + *origin + *size > visible_top)
-            .unwrap_or(block_count);
+        let local_visible_top = visible_top - flow_bounds.top();
+        let first = if local_visible_top < px(0.0) {
+            0
+        } else if local_visible_top >= self.virtual_total_height() {
+            block_count
+        } else {
+            // Origins are cumulative. The block containing the top edge is the
+            // predecessor of the first origin beyond it, so lookup stays
+            // logarithmic even for documents with thousands of blocks.
+            self.virtual_block_origins
+                .partition_point(|origin| *origin <= local_visible_top)
+                .saturating_sub(1)
+        };
         let end = self.virtual_block_origins[first..]
             .partition_point(|origin| flow_bounds.top() + *origin < visible_bottom)
             .saturating_add(first)
@@ -861,8 +878,8 @@ impl MarkdownViewState {
         {
             return false;
         }
-        let mut sizes = self.virtual_block_sizes.as_ref().clone();
-        let mut changed = false;
+        let sizes = Arc::make_mut(&mut self.virtual_block_sizes);
+        let mut first_changed = None;
         for (index, measured) in measurements {
             let measured = px(f32::from(*measured).ceil().max(1.0));
             let Some(current) = sizes.get_mut(*index) else {
@@ -870,20 +887,30 @@ impl MarkdownViewState {
             };
             if f32::from(*current - measured).abs() >= 1.0 {
                 *current = measured;
-                changed = true;
+                first_changed =
+                    Some(first_changed.map_or(*index, |first: usize| first.min(*index)));
             }
         }
-        if !changed {
+        let Some(first_changed) = first_changed else {
             return false;
+        };
+
+        let sizes = self.virtual_block_sizes.clone();
+        let origins = Arc::make_mut(&mut self.virtual_block_origins);
+        let first_changed = if origins.len() == sizes.len() {
+            first_changed
+        } else {
+            0
+        };
+        origins.resize(sizes.len(), px(0.0));
+        let mut origin = first_changed
+            .checked_sub(1)
+            .map(|previous| origins[previous] + sizes[previous])
+            .unwrap_or_default();
+        for index in first_changed..sizes.len() {
+            origins[index] = origin;
+            origin += sizes[index];
         }
-        let mut origins = Vec::with_capacity(sizes.len());
-        let mut origin = px(0.0);
-        for height in &sizes {
-            origins.push(origin);
-            origin += *height;
-        }
-        self.virtual_block_sizes = Arc::new(sizes);
-        self.virtual_block_origins = Arc::new(origins);
         true
     }
 
@@ -3178,6 +3205,40 @@ mod tests {
                     )),
             )
         }
+    }
+
+    #[test]
+    fn shared_markdown_text_comparison_keeps_value_semantics() {
+        let source: Arc<str> = Arc::from("a long unchanged markdown source");
+        let same_allocation = source.clone();
+        let equal_value: Arc<str> = Arc::from("a long unchanged markdown source");
+        let changed: Arc<str> = Arc::from("changed markdown source");
+
+        assert!(Arc::ptr_eq(&source, &same_allocation));
+        assert!(markdown_text_matches(&source, &same_allocation));
+        assert!(!Arc::ptr_eq(&source, &equal_value));
+        assert!(markdown_text_matches(&source, &equal_value));
+        assert!(!markdown_text_matches(&source, &changed));
+    }
+
+    #[test]
+    fn virtual_markdown_block_lookup_and_measurement_stay_indexed() {
+        let source = include_str!("gpui_view.rs");
+        let lookup = source
+            .split_once("    fn visible_virtual_blocks(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn prepare_virtual_selection("))
+            .map(|(body, _)| body)
+            .expect("virtual block lookup should remain inspectable");
+        assert!(lookup.contains("partition_point"));
+        assert!(!lookup.contains(".position("));
+
+        let measurement = source
+            .split_once("    fn record_virtual_block_heights(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn rebuild_anchors("))
+            .map(|(body, _)| body)
+            .expect("virtual block measurement should remain inspectable");
+        assert_eq!(measurement.matches("Arc::make_mut").count(), 2);
+        assert!(!measurement.contains("virtual_block_sizes.as_ref().clone()"));
     }
 
     #[test]
