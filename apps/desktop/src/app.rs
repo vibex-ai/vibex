@@ -5121,8 +5121,8 @@ impl VibexWorkbench {
                     }
                 }
                 let needs_refetch = self.timeline.needs_authoritative_refetch;
-                if needs_refetch && let Some(session_id) = self.selected_session_id.clone() {
-                    self.select_session_with_history(session_id, false, cx);
+                if needs_refetch {
+                    self.refresh_selected_agent_timeline(cx);
                 }
                 changed || needs_refetch
             }
@@ -5145,9 +5145,7 @@ impl VibexWorkbench {
                     }
                 } else if event.event.is_none() {
                     self.timeline.mark_lagged();
-                    if let Some(session_id) = self.selected_session_id.clone() {
-                        self.select_session_with_history(session_id, false, cx);
-                    }
+                    self.refresh_selected_agent_timeline(cx);
                     true
                 } else {
                     false
@@ -5190,9 +5188,7 @@ impl VibexWorkbench {
                 }
                 if refetch.timeline || refetch.runtime_selection {
                     self.timeline.mark_lagged();
-                    if let Some(session_id) = self.selected_session_id.clone() {
-                        self.select_session_with_history(session_id, false, cx);
-                    }
+                    self.refresh_selected_agent_timeline(cx);
                 }
                 if refetch.usage {
                     let visible = self.ui_state.workbench.active_tab == "usage";
@@ -6593,7 +6589,7 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut completed_any = false;
+        let mut completed_session_ids = BTreeSet::new();
         let mut ambiguous_any = false;
         for state in &states {
             if matches!(
@@ -6606,7 +6602,9 @@ impl VibexWorkbench {
                         && locator.message_idempotency_key == state.message_idempotency_key)
                 });
             }
-            completed_any |= state.status == MessageSubmissionStatus::Completed;
+            if state.status == MessageSubmissionStatus::Completed {
+                completed_session_ids.insert(state.session_id.as_str().to_string());
+            }
             ambiguous_any |= state.status == MessageSubmissionStatus::AmbiguousPromptDispatch;
         }
         if ambiguous_any {
@@ -6633,11 +6631,17 @@ impl VibexWorkbench {
             self.composer_submission_states = visible;
             cx.notify();
         }
-        if completed_any {
+        let selected_session_completed = self
+            .selected_session_id
+            .as_ref()
+            .is_some_and(|session_id| completed_session_ids.contains(session_id.as_str()));
+        if selected_session_completed {
             self.timeline.mark_lagged();
-            if let Some(session_id) = self.selected_session_id.clone() {
-                self.select_session_with_history(session_id, false, cx);
+            if self.ui_state.workbench.active_tab == "agent" && !self.new_session_open {
+                self.refresh_selected_agent_timeline(cx);
             }
+        }
+        if !completed_session_ids.is_empty() {
             cx.notify();
         }
     }
@@ -8861,6 +8865,15 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    fn clear_submitted_new_session_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_session_attachments.clear();
+        self.new_session_draft_initialized = false;
+        self.new_session_command_entry = None;
+        self.new_session_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.new_session_workspace.reset_after_success();
+    }
+
     fn current_checkout_for_project(
         &self,
         project_id: &ProjectId,
@@ -9508,7 +9521,6 @@ impl VibexWorkbench {
                 refreshed_session,
             ))
         });
-        let new_session_input = self.new_session_input.clone();
         cx.spawn_in(window, async move |entity: WeakEntity<Self>, cx| {
             let mut created_session_id = None;
             let mut turn_generation = None;
@@ -9543,7 +9555,7 @@ impl VibexWorkbench {
                         workspaces,
                         has_initial_message,
                     ) => {
-                        let update = entity.update_in(cx, |this, _window, cx| {
+                        let update = entity.update_in(cx, |this, window, cx| {
                             if let Some(workspaces) = workspaces {
                                 this.workspaces = workspaces;
                             }
@@ -9573,6 +9585,7 @@ impl VibexWorkbench {
                                     this.agent_action_pending = false;
                                     None
                                 };
+                            this.clear_submitted_new_session_draft(window, cx);
                             this.refresh_workspace_contexts(cx);
                             cx.notify();
                             (created_session_id, turn_generation)
@@ -9624,11 +9637,6 @@ impl VibexWorkbench {
                                 this.composer_command_entry = draft_command_entry.clone();
                             }
                         }
-                        this.new_session_attachments.clear();
-                        this.new_session_draft_initialized = false;
-                        this.new_session_command_entry = None;
-                        new_session_input.update(cx, |input, cx| input.set_value("", window, cx));
-                        this.new_session_workspace.reset_after_success();
                         this.reconcile_sidebar_state();
                         this.refresh_workspace_contexts(cx);
                     }
@@ -28538,10 +28546,10 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn rebuild_timeline_sizes("))
             .map(|(body, _)| body)
             .expect("desktop event refreshes should remain inspectable");
-        assert!(!events.contains("self.select_session(session_id, cx);"));
+        assert!(!events.contains("select_session"));
         assert_eq!(
             events
-                .matches("self.select_session_with_history(session_id, false, cx);")
+                .matches("self.refresh_selected_agent_timeline(cx);")
                 .count(),
             3
         );
@@ -30083,6 +30091,60 @@ mod tests {
             submit.matches("input.set_value(\"\", window, cx)").count(),
             1
         );
+    }
+
+    #[test]
+    fn created_session_consumes_its_draft_before_the_initial_turn_completes() {
+        let source = include_str!("app.rs");
+        let submit = source
+            .split_once("    fn submit_new_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn choose_runtime_selection("))
+            .map(|(body, _)| body)
+            .expect("new-session submission should remain inspectable");
+        let session_ready = submit
+            .rfind("NewSessionCreateSignal::SessionReady(")
+            .expect("the authoritative session should be handled before its initial turn");
+        let clear = submit
+            .find("this.clear_submitted_new_session_draft(window, cx);")
+            .expect("the submitted new-session draft should be consumed");
+        let turn_completion = submit
+            .find("let outcome = runner.await;")
+            .expect("initial-turn completion should remain asynchronous");
+
+        assert!(session_ready < clear && clear < turn_completion);
+        assert!(!submit[turn_completion..].contains("clear_submitted_new_session_draft"));
+
+        let clear_draft = source
+            .split_once("    fn clear_submitted_new_session_draft(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn current_checkout_for_project("))
+            .map(|(body, _)| body)
+            .expect("submitted draft cleanup should remain inspectable");
+        assert!(clear_draft.contains("self.new_session_attachments.clear();"));
+        assert!(clear_draft.contains("self.new_session_draft_initialized = false;"));
+        assert!(clear_draft.contains("self.new_session_command_entry = None;"));
+        assert!(clear_draft.contains("input.set_value(\"\", window, cx)"));
+        assert!(clear_draft.contains("self.new_session_workspace.reset_after_success();"));
+    }
+
+    #[test]
+    fn completed_background_submission_never_navigates_to_a_session() {
+        let source = include_str!("app.rs");
+        let reconciliation = source
+            .split_once("    fn apply_submission_states(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn dismiss_submission_status("))
+            .map(|(body, _)| body)
+            .expect("submission reconciliation should remain inspectable");
+
+        assert!(reconciliation.contains("completed_session_ids"));
+        assert!(reconciliation.contains("completed_session_ids.contains(session_id.as_str())"));
+        assert!(reconciliation.contains("self.timeline.mark_lagged();"));
+        assert!(
+            reconciliation.contains(
+                "self.ui_state.workbench.active_tab == \"agent\" && !self.new_session_open"
+            )
+        );
+        assert!(reconciliation.contains("self.refresh_selected_agent_timeline(cx);"));
+        assert!(!reconciliation.contains("select_session"));
     }
 
     #[test]
