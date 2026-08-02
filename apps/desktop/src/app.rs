@@ -13942,7 +13942,7 @@ impl VibexWorkbench {
             .shadow_lg()
             .children(rows);
         let open_menu_id = menu_id.clone();
-        Popover::new(format!("{menu_id}-popover"))
+        let popover = Popover::new(format!("{menu_id}-popover"))
             .anchor(menu_placement.anchor)
             .appearance(false)
             .open(menu_open)
@@ -13956,8 +13956,8 @@ impl VibexWorkbench {
                     popover.top(px(menu_placement.trigger_offset))
                 }
                 _ => popover.bottom(px(menu_placement.trigger_offset)),
-            })
-            .into_any_element()
+            });
+        div().flex_none().child(popover).into_any_element()
     }
 
     fn render_new_session_runtime_choice(
@@ -13976,28 +13976,7 @@ impl VibexWorkbench {
             .map(|choice| choice.label.clone())
             .unwrap_or_else(|| label.to_string());
         let tooltip = format!("{label}: {selected_label}");
-        let content = if compact {
-            div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(icon)
-                .into_any_element()
-        } else {
-            h_flex()
-                .size_full()
-                .min_w_0()
-                .gap(px(6.0))
-                .child(icon)
-                .child(div().flex_1().min_w_0().truncate().child(selected_label))
-                .child(
-                    Icon::new(IconName::ChevronDown)
-                        .size(px(14.0))
-                        .text_color(cx.theme().muted_foreground),
-                )
-                .into_any_element()
-        };
+        let content = runtime_selector_dropdown_content(icon, selected_label, compact, cx);
         let menu_id = format!("new-session-runtime-choice-{id}");
         let choices_empty = choices.is_empty();
         let trigger = Button::new(format!("new-session-{id}"))
@@ -14005,7 +13984,7 @@ impl VibexWorkbench {
             .ghost()
             .h(px(32.0))
             .when(compact, |button| button.compact().w(px(32.0)))
-            .when(!compact, |button| button.w(px(112.0)).px_2())
+            .when(!compact, |button| button.px_2())
             .tooltip(tooltip)
             .child(content)
             .disabled(choices_empty || self.agent_action_pending);
@@ -14110,28 +14089,8 @@ impl VibexWorkbench {
                             .or_else(|| current.label.clone())
                     })
                     .unwrap_or_else(|| feature.label.clone());
-                let content = if compact {
-                    div()
-                        .size_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(feature_icon())
-                        .into_any_element()
-                } else {
-                    h_flex()
-                        .size_full()
-                        .min_w_0()
-                        .gap(px(6.0))
-                        .child(feature_icon())
-                        .child(div().min_w_0().flex_1().truncate().child(selected_label))
-                        .child(
-                            Icon::new(IconName::ChevronDown)
-                                .size(px(13.0))
-                                .text_color(cx.theme().muted_foreground),
-                        )
-                        .into_any_element()
-                };
+                let content =
+                    runtime_selector_dropdown_content(feature_icon(), selected_label, compact, cx);
                 let feature_id = feature.id.clone();
                 let menu_id = format!("{id_prefix}-{}-choice-menu", feature.id);
                 let geometry = match target {
@@ -14152,7 +14111,7 @@ impl VibexWorkbench {
                         .ghost()
                         .h(px(32.0))
                         .when(compact, |button| button.compact().w(px(32.0)))
-                        .when(!compact, |button| button.w(px(112.0)).px_2())
+                        .when(!compact, |button| button.px_2())
                         .tooltip(tooltip)
                         .child(content)
                         .disabled(values_empty || self.agent_action_pending);
@@ -14265,34 +14224,8 @@ impl VibexWorkbench {
                     theme::semantic_color("chart-2", cx.theme().is_dark()),
                 )
             });
-        let content = if compact {
-            div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(model_icon)
-                .into_any_element()
-        } else {
-            h_flex()
-                .size_full()
-                .min_w_0()
-                .gap(px(6.0))
-                .child(model_icon)
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .truncate()
-                        .child(selected_runtime_label),
-                )
-                .child(
-                    Icon::new(IconName::ChevronDown)
-                        .size(px(13.0))
-                        .text_color(cx.theme().muted_foreground),
-                )
-                .into_any_element()
-        };
+        let content =
+            runtime_selector_dropdown_content(model_icon, selected_runtime_label, compact, cx);
         let agent_id = self.new_session_agent_id.clone();
         let profile_choices = agent_id
             .as_ref()
@@ -14347,7 +14280,8 @@ impl VibexWorkbench {
         );
         let trigger_bounds_entity = cx.weak_entity();
         let tracked_content = div()
-            .size_full()
+            .when(compact, |this| this.size_full())
+            .when(!compact, |this| this.flex_none())
             .on_prepaint(move |bounds, _, cx| {
                 let _ = trigger_bounds_entity.update(cx, |this, cx| {
                     if this.new_session_composer_geometry.runtime_trigger_bounds != Some(bounds) {
@@ -14364,7 +14298,7 @@ impl VibexWorkbench {
             .ghost()
             .h(px(32.0))
             .when(compact, |button| button.compact().w(px(32.0)))
-            .when(!compact, |button| button.w(px(224.0)).px_2())
+            .when(!compact, |button| button.px_2())
             .tooltip(tooltip)
             .child(tracked_content)
             .disabled(self.agent_action_pending || self.new_session_agent_id.is_none());
@@ -14599,7 +14533,7 @@ impl VibexWorkbench {
             .shadow_lg()
             .child(menu_content);
 
-        Popover::new("new-session-runtime-cascade")
+        let popover = Popover::new("new-session-runtime-cascade")
             .anchor(menu_placement.anchor)
             .appearance(false)
             .open(self.new_session_runtime_menu_open)
@@ -14613,8 +14547,8 @@ impl VibexWorkbench {
                     popover.top(px(menu_placement.trigger_offset))
                 }
                 _ => popover.bottom(px(menu_placement.trigger_offset)),
-            })
-            .into_any_element()
+            });
+        div().flex_none().child(popover).into_any_element()
     }
 
     fn render_new_session_panel(
@@ -16618,28 +16552,7 @@ impl VibexWorkbench {
             .map(|choice| choice.label.clone())
             .unwrap_or_else(|| label.to_string());
         let tooltip = format!("{label}: {selected_label}");
-        let content = if compact {
-            div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(icon)
-                .into_any_element()
-        } else {
-            h_flex()
-                .size_full()
-                .min_w_0()
-                .gap(px(6.0))
-                .child(icon)
-                .child(div().min_w_0().flex_1().truncate().child(selected_label))
-                .child(
-                    Icon::new(IconName::ChevronDown)
-                        .size(px(13.0))
-                        .text_color(cx.theme().muted_foreground),
-                )
-                .into_any_element()
-        };
+        let content = runtime_selector_dropdown_content(icon, selected_label, compact, cx);
         let menu_id = format!("composer-runtime-choice-{id}");
         let menu_max_height = (self.last_visibility.layout.viewport_height as f32 - 128.0)
             .clamp(160.0, COMPOSER_RUNTIME_MENU_MAX_HEIGHT);
@@ -16649,7 +16562,7 @@ impl VibexWorkbench {
             .ghost()
             .h(px(32.0))
             .when(compact, |button| button.compact().w(px(32.0)))
-            .when(!compact, |button| button.w(px(112.0)).px_2())
+            .when(!compact, |button| button.px_2())
             .tooltip(tooltip)
             .child(content)
             .disabled(choices_empty || self.agent_action_pending);
@@ -16704,37 +16617,16 @@ impl VibexWorkbench {
                 theme::semantic_color("chart-2", cx.theme().is_dark()),
             )
         });
-        let content = if compact {
-            div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(model_icon)
-                .into_any_element()
-        } else {
-            h_flex()
-                .size_full()
-                .min_w_0()
-                .gap(px(6.0))
-                .child(model_icon)
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .truncate()
-                        .child(selected_provider_model_label),
-                )
-                .child(
-                    Icon::new(IconName::ChevronDown)
-                        .size(px(13.0))
-                        .text_color(cx.theme().muted_foreground),
-                )
-                .into_any_element()
-        };
+        let content = runtime_selector_dropdown_content(
+            model_icon,
+            selected_provider_model_label,
+            compact,
+            cx,
+        );
         let trigger_bounds_entity = cx.weak_entity();
         let tracked_content = div()
-            .size_full()
+            .when(compact, |this| this.size_full())
+            .when(!compact, |this| this.flex_none())
             .on_prepaint(move |bounds, _, cx| {
                 let _ = trigger_bounds_entity.update(cx, |this, cx| {
                     if this.composer_geometry.runtime_trigger_bounds != Some(bounds) {
@@ -16753,7 +16645,7 @@ impl VibexWorkbench {
             .ghost()
             .h(px(32.0))
             .when(compact, |button| button.compact().w(px(32.0)))
-            .when(!compact, |button| button.w(px(224.0)).px_2())
+            .when(!compact, |button| button.px_2())
             .tooltip(tooltip)
             .child(tracked_content)
             .disabled(self.agent_action_pending);
@@ -17152,7 +17044,7 @@ impl VibexWorkbench {
             .child(menu_content);
         let menu_open = self.composer_runtime_menu_open;
 
-        Popover::new("composer-runtime-cascade")
+        let popover = Popover::new("composer-runtime-cascade")
             .anchor(menu_placement.anchor)
             .appearance(false)
             .open(menu_open)
@@ -17166,8 +17058,8 @@ impl VibexWorkbench {
                     popover.top(px(menu_placement.trigger_offset))
                 }
                 _ => popover.bottom(px(menu_placement.trigger_offset)),
-            })
-            .into_any_element()
+            });
+        div().flex_none().child(popover).into_any_element()
     }
 
     fn render_composer_terminal_menu(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -23735,6 +23627,36 @@ fn new_session_selector_icon(path: &'static str, color: gpui::Hsla) -> AnyElemen
         .into_any_element()
 }
 
+fn runtime_selector_dropdown_content(
+    icon: AnyElement,
+    selected_label: String,
+    compact: bool,
+    cx: &App,
+) -> AnyElement {
+    if compact {
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(icon)
+            .into_any_element()
+    } else {
+        h_flex()
+            .flex_none()
+            .gap(px(6.0))
+            .child(div().flex_none().child(icon))
+            .child(div().flex_none().whitespace_nowrap().child(selected_label))
+            .child(
+                Icon::new(IconName::ChevronDown)
+                    .size(px(13.0))
+                    .flex_none()
+                    .text_color(cx.theme().muted_foreground),
+            )
+            .into_any_element()
+    }
+}
+
 fn runtime_profile_count_label(count: usize) -> String {
     match locale::current_locale() {
         locale::ResolvedLocale::En => format!("{count} profiles"),
@@ -27779,6 +27701,61 @@ mod tests {
         menu_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     }
 
+    struct RuntimeSelectorWidthProbe {
+        short_width: Rc<Cell<f32>>,
+        long_width: Rc<Cell<f32>>,
+    }
+
+    impl Render for RuntimeSelectorWidthProbe {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let short_width = self.short_width.clone();
+            let long_width = self.long_width.clone();
+            let short = Button::new("runtime-selector-width-short")
+                .xsmall()
+                .ghost()
+                .h(px(32.0))
+                .px_2()
+                .child(runtime_selector_dropdown_content(
+                    Icon::new(IconName::Bot).size(px(16.0)).into_any_element(),
+                    "Max".into(),
+                    false,
+                    cx,
+                ));
+            let long = Button::new("runtime-selector-width-long")
+                .xsmall()
+                .ghost()
+                .h(px(32.0))
+                .px_2()
+                .child(runtime_selector_dropdown_content(
+                    Icon::new(IconName::Bot).size(px(16.0)).into_any_element(),
+                    "Provider profile / model with a much longer name".into(),
+                    false,
+                    cx,
+                ));
+
+            v_flex()
+                .size_full()
+                .items_start()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_none()
+                        .on_prepaint(move |bounds, _, _| {
+                            short_width.set(f32::from(bounds.size.width));
+                        })
+                        .child(Popover::new("runtime-selector-width-short-popover").trigger(short)),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .on_prepaint(move |bounds, _, _| {
+                            long_width.set(f32::from(bounds.size.width));
+                        })
+                        .child(Popover::new("runtime-selector-width-long-popover").trigger(long)),
+                )
+        }
+    }
+
     impl Render for RuntimePopoverLayoutProbe {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let trigger_bounds = self.trigger_bounds.clone();
@@ -30397,6 +30374,34 @@ mod tests {
         let menu = observed_menu.get().expect("open menu should be laid out");
         let gap = f32::from(trigger.top()) - f32::from(menu.bottom());
         assert!((gap - RUNTIME_MENU_TRIGGER_GAP).abs() <= 1.5, "gap: {gap}");
+    }
+
+    #[gpui::test]
+    fn runtime_selector_width_tracks_the_selected_label(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let short_width = Rc::new(Cell::new(0.0));
+        let long_width = Rc::new(Cell::new(0.0));
+        let observed_short_width = short_width.clone();
+        let observed_long_width = long_width.clone();
+        let (_, cx) = cx.add_window_view(|_, _| RuntimeSelectorWidthProbe {
+            short_width,
+            long_width,
+        });
+
+        for _ in 0..3 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        }
+
+        let short_width = observed_short_width.get();
+        let long_width = observed_long_width.get();
+        assert!(short_width > 0.0, "short selector width: {short_width}");
+        assert!(
+            long_width > short_width + 100.0,
+            "short selector width: {short_width}, long selector width: {long_width}"
+        );
     }
 
     #[gpui::test]

@@ -151,6 +151,22 @@ use fixed `32px` icon-only triggers while keeping the selector name and current
 value in the tooltip. Use the Provider database, current model brand, reasoning
 brain, and conversation-mode shield icons in that order.
 
+Non-compact runtime-selector dropdown triggers size intrinsically to the current
+selected label. Do not assign per-selector widths or truncate the selected label;
+keep the icon, no-wrap label, and chevron non-shrinking. Wrap the `Popover` in a
+`flex_none` container so the composer row scrolls and the new-session row wraps
+before any trigger is compressed. Applying `flex_none` directly to `Popover`
+styles its overlay content rather than its rendered trigger wrapper.
+
+```rust
+// Wrong: short values waste space and long values are clipped.
+Button::new("runtime-selector").w(px(112.0)).child(truncated_label);
+
+// Correct: the selected label contributes its full intrinsic width.
+let trigger = Button::new("runtime-selector").px_2().child(intrinsic_content);
+div().flex_none().child(Popover::new("runtime-menu").trigger(trigger));
+```
+
 ## Timeline Cards
 
 Render Agent activity through provider-neutral cards:
