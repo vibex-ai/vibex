@@ -530,6 +530,11 @@ DesktopPollingPolicy {
 }
 
 MessageSubmissionCoordinator::submit(SendAgentMessageRequest)
+AgentManager::get_session(session_id) -> AgentSession
+
+Composer submission completion order:
+  submit result -> authoritative AgentSession snapshot
+                -> clear local pending -> recovery policy
 
 RuntimeCascadeProjection::from_catalog(catalog, desired)
   -> RuntimeCascadeProjection
@@ -714,6 +719,12 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   coordinator with the displayed desired runtime and an idempotency key. Clear
   the visible draft/attachments only after coordinator acceptance; validation,
   switch, dispatch, task, and recovery errors preserve them.
+- A submission completion, including a provider failure, reloads the
+  authoritative `AgentSession` before clearing the local turn-pending projection
+  and evaluating session recovery such as auto-continue. Timeline live events
+  update timeline content, not the sidebar/session-state snapshot; using the
+  pre-submit `Idle` or `Running` snapshot can hide the continue affordance and
+  skip recovery even though storage has already committed `Error`.
 - Claude/Codex JSONL support in this surface is offline import only. Adding the
   offline import crates must not introduce a Native online runtime route or
   provider-specific timeline rendering.
@@ -743,6 +754,10 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   materializing only the content-mask range plus bounded overscan.
 - Coordinator rejects or task join fails -> preserve Composer text and
   attachments and show the typed/bounded error.
+- Provider dispatch fails after the backend commits session `Error` -> merge the
+  latest `AgentSession`, clear local pending, then evaluate auto-continue once
+  against that error snapshot. A failed snapshot reload still surfaces the
+  submission error and must not infer `Error` from provider message text.
 - Runtime event stream lags -> keep fallback polling active and refetch the
   required authoritative projections.
 - No sessions exist -> keep the global new-session action reachable and render
@@ -790,6 +805,9 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   existing cross-block text selection and resource behavior.
 - Good: switch from session A to B while A's runtime switch is pending; B loads
   its own selection and remains enabled when A finishes.
+- Good: an enabled auto-continue session receives a provider 429 failure; the
+  completion reloads its durable `Error` snapshot, starts one countdown, and
+  continues without matching the human-readable error text in GPUI.
 - Good: choose `high` for Codex and `low` for Claude, switch between their
   new-session chips, restart the desktop, and restore each choice only while its
   exact Profile/Model and advertised values remain valid.
@@ -848,6 +866,10 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
 - GPUI contract probe asserts virtualization, authoritative/live merge,
   generation fencing, row drag reorder, durable submission, Owner heartbeat,
   native IME input, attachment drop, and permission actions.
+- GPUI regression coverage asserts a failed submission reconciles the latest
+  session snapshot before clearing per-session pending state and invoking the
+  auto-continue decision; session-row context-menu tests assert the captured row
+  id and checked state drive the same session-scoped toggle as the Composer.
 - `desktop-model` navigation tests assert before/after insertion plus missing-id
   and already-adjacent no-op behavior.
 - Run targeted GPUI/model tests, `cargo check --workspace --all-targets --locked`,

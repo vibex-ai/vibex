@@ -14590,6 +14590,7 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
         for message in [
             "AI_APICallError: Free usage exceeded, subscribe to Go",
             "AI_APICallError: Rate limit exceeded. Please try again later.",
+            "AI_APICallError: exceeded retry limit, last status: 429 Too Many Requests",
             "AI_APICallError: Insufficient account balance for the selected group",
         ] {
             let parsed = parse_opencode_stream_error(

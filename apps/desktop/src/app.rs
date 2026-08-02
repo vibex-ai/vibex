@@ -6187,21 +6187,19 @@ impl VibexWorkbench {
                     .await
                     .map(|_| ())
             };
-            outcome?;
-            Ok::<_, vibex_core::VibexError>(
-                runtime
-                    .agent()
-                    .manager()
-                    .get_session(&session_id)
-                    .await
-                    .ok(),
-            )
+            let session = runtime
+                .agent()
+                .manager()
+                .get_session(&session_id)
+                .await
+                .ok();
+            (outcome, session)
         });
         cx.spawn_in(window, async move |entity, cx| {
             let outcome = runner.await;
             let _ = entity.update_in(cx, |this, window, cx| {
-                let completed = matches!(&outcome, Ok(Ok(_)));
-                if let Ok(Ok(Some(session))) = &outcome {
+                let completed = matches!(&outcome, Ok((Ok(_), _)));
+                if let Ok((_, Some(session))) = &outcome {
                     this.upsert_session_snapshot(session.clone());
                     this.reconcile_sidebar_state();
                 }
@@ -6221,15 +6219,15 @@ impl VibexWorkbench {
                 );
                 if active {
                     match &outcome {
-                        Ok(Ok(_)) => this.refresh_selected_agent_timeline(cx),
-                        Ok(Err(error))
+                        Ok((Ok(_), _)) => this.refresh_selected_agent_timeline(cx),
+                        Ok((Err(error), _))
                             if !is_command
                                 && error.code == "message_submission_prompt_dispatch_ambiguous" =>
                         {
                             // The submission poll owns this presentation so the same
                             // delivery issue does not also become a persistent error row.
                         }
-                        Ok(Err(error)) => {
+                        Ok((Err(error), _)) => {
                             this.agent_error = Some(format!("{}: {}", error.code, error.message));
                         }
                         Err(error) => {
@@ -13526,10 +13524,13 @@ impl VibexWorkbench {
         let rename_session_id = session.id.clone();
         let delete_session_id = session.id.clone();
         let context_entity = cx.weak_entity();
+        let context_auto_continue_id = session.id.clone();
         let context_pin_id = session.id.clone();
         let context_rename_id = session.id.clone();
         let context_delete_id = session.id.clone();
         let mutation_pending = self.agent_action_pending;
+        let auto_continue_enabled = self.auto_continue_enabled(&session.id);
+        let auto_continue_label = locale::text("Auto continue", "自动继续", "自動繼續");
         let pin_label = if pinned {
             strings.sidebar_unpin
         } else {
@@ -13655,6 +13656,8 @@ impl VibexWorkbench {
                     .context_menu(move |menu, _, cx| {
                         let _ = context_entity
                             .update(cx, |this, _| this.retain_sidebar_hover_preview());
+                        let auto_continue_entity = context_entity.clone();
+                        let auto_continue_id = context_auto_continue_id.clone();
                         let pin_entity = context_entity.clone();
                         let pin_id = context_pin_id.clone();
                         let rename_entity = context_entity.clone();
@@ -13662,6 +13665,20 @@ impl VibexWorkbench {
                         let delete_entity = context_entity.clone();
                         let delete_id = context_delete_id.clone();
                         menu.item(
+                            PopupMenuItem::new(auto_continue_label)
+                                .checked(auto_continue_enabled)
+                                .on_click(move |_, _, cx| {
+                                    let _ = auto_continue_entity.update(cx, |this, cx| {
+                                        this.set_auto_continue_enabled(
+                                            auto_continue_id.clone(),
+                                            !auto_continue_enabled,
+                                            cx,
+                                        )
+                                    });
+                                }),
+                        )
+                        .separator()
+                        .item(
                             PopupMenuItem::new(pin_label)
                                 .icon(sidebar_icon("icons/vibex/pin.svg"))
                                 .on_click(move |_, _, cx| {
@@ -29804,6 +29821,45 @@ mod tests {
         assert!(composer.contains("auto_continue_countdown_label"));
         assert!(composer.contains("auto_continue_remaining.is_none()"));
         assert!(composer.contains("this.activate_continue_button(cx)"));
+
+        let sidebar = source
+            .split_once("    fn render_sidebar_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_choice_popover("))
+            .map(|(body, _)| body)
+            .expect("sidebar session renderer should remain inspectable");
+        assert!(sidebar.contains("let context_auto_continue_id = session.id.clone();"));
+        assert!(sidebar.contains("PopupMenuItem::new(auto_continue_label)"));
+        assert!(sidebar.contains(".checked(auto_continue_enabled)"));
+        assert!(sidebar.contains("this.set_auto_continue_enabled("));
+    }
+
+    #[test]
+    fn failed_composer_submission_reconciles_session_before_auto_continue() {
+        let source = include_str!("app.rs");
+        let dispatch = source
+            .split_once("    fn dispatch_composer_message(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn maybe_dispatch_next_composer_queue_message(")
+            })
+            .map(|(body, _)| body)
+            .expect("Composer dispatch should remain inspectable");
+
+        assert!(!dispatch.contains("outcome?;"));
+        assert!(dispatch.contains("let session = runtime"));
+        assert!(dispatch.contains("(outcome, session)"));
+        assert!(dispatch.contains("if let Ok((_, Some(session))) = &outcome"));
+        assert!(dispatch.contains("Ok((Err(error), _))"));
+
+        let reconcile = dispatch
+            .find("this.upsert_session_snapshot(session.clone());")
+            .expect("the authoritative session snapshot should be reconciled");
+        let clear_pending = dispatch
+            .find("this.set_session_turn_pending(&submitted_session_id, false);")
+            .expect("the local pending state should be cleared");
+        let auto_continue = dispatch
+            .find("this.sync_auto_continue_for_session(&submitted_session_id, cx);")
+            .expect("auto continue should observe the reconciled error state");
+        assert!(reconcile < clear_pending && clear_pending < auto_continue);
     }
 
     #[test]
