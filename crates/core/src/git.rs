@@ -566,10 +566,37 @@ pub struct GitWorktreeCreateRequest {
     pub branch_name: String,
     pub base_ref: Option<String>,
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
     #[serde(default)]
     pub target_workspace_id: Option<WorkspaceId>,
     #[serde(default)]
     pub target_branch: Option<String>,
+}
+
+pub fn managed_worktree_name_slug(value: &str) -> String {
+    let slug = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let slug = slug
+        .split('-')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+        .trim_matches(['-', '_'])
+        .to_string();
+    if slug.is_empty() {
+        "worktree".to_string()
+    } else {
+        slug
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -699,6 +726,35 @@ pub struct GitWorktreeReconcileReport {
 #[cfg(test)]
 mod worktree_contract_tests {
     use super::*;
+
+    #[test]
+    fn managed_worktree_slug_is_valid_for_a_git_branch_component() {
+        assert_eq!(
+            managed_worktree_name_slug("  feature..lock  "),
+            "feature-lock"
+        );
+        assert_eq!(managed_worktree_name_slug("___"), "worktree");
+        assert_eq!(managed_worktree_name_slug("中文 task"), "task");
+    }
+
+    #[test]
+    fn absent_custom_worktree_path_preserves_the_legacy_request_shape() {
+        let mut request = GitWorktreeCreateRequest {
+            workspace_id: WorkspaceId::new(),
+            branch_name: "feature/worktree".to_string(),
+            base_ref: Some("main".to_string()),
+            name: Some("worktree".to_string()),
+            worktree_path: None,
+            target_workspace_id: None,
+            target_branch: None,
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert!(encoded.get("worktreePath").is_none());
+
+        request.worktree_path = Some("/tmp/worktree".to_string());
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["worktreePath"], "/tmp/worktree");
+    }
 
     #[test]
     fn managed_identity_and_fixed_target_round_trip() {

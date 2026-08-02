@@ -396,6 +396,17 @@ pub fn validate_worktree_create(
 ) -> VibexResult<()> {
     let root = repo_root(repo_path.as_ref())?;
     validate_branch_name(&root, &request.branch_name)?;
+    if request.name.as_deref().is_some_and(|name| {
+        name.trim().is_empty() || name.len() > 128 || name.chars().any(char::is_control)
+    }) {
+        return Err(VibexError::validation(
+            "worktree_name_invalid",
+            "worktree name must be non-empty and bounded",
+        ));
+    }
+    if let Some(worktree_path) = request.worktree_path.as_deref() {
+        validate_requested_worktree_path(worktree_path)?;
+    }
     if let Some(base_ref) = request.base_ref.as_deref() {
         validate_existing_commitish(&root, base_ref)?;
     }
@@ -403,6 +414,25 @@ pub fn validate_worktree_create(
         return Err(VibexError::conflict(
             "worktree_branch_exists",
             "Git branch already exists",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_requested_worktree_path(worktree_path: &str) -> VibexResult<()> {
+    if worktree_path.trim().is_empty()
+        || worktree_path.len() > 4_096
+        || worktree_path.chars().any(char::is_control)
+    {
+        return Err(VibexError::validation(
+            "worktree_path_invalid",
+            "custom worktree path must be non-empty and bounded",
+        ));
+    }
+    if !Path::new(worktree_path).is_absolute() {
+        return Err(VibexError::validation(
+            "worktree_path_not_absolute",
+            "custom worktree path must be absolute",
         ));
     }
     Ok(())
@@ -2195,6 +2225,7 @@ mod tests {
             branch_name: "feature/worktree-test".to_string(),
             base_ref: Some("HEAD".to_string()),
             name: None,
+            worktree_path: None,
             target_workspace_id: None,
             target_branch: None,
         };
@@ -2226,6 +2257,38 @@ mod tests {
     }
 
     #[test]
+    fn worktree_create_rejects_invalid_custom_name_and_path() {
+        let root = temp_repo("worktree-validation-main");
+        std::fs::create_dir_all(&root).unwrap();
+        init_repo_with_commit(&root, "README.md", "hello\n", "initial");
+        let mut request = GitWorktreeCreateRequest {
+            workspace_id: WorkspaceId::new(),
+            branch_name: "feature/validation".to_string(),
+            base_ref: Some("HEAD".to_string()),
+            name: Some("valid".to_string()),
+            worktree_path: Some("relative/worktree".to_string()),
+            target_workspace_id: None,
+            target_branch: None,
+        };
+        assert_eq!(
+            validate_worktree_create(&root, &request).unwrap_err().code,
+            "worktree_path_not_absolute"
+        );
+
+        request.worktree_path = Some(
+            temp_repo("worktree-validation-target")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        request.name = Some("bad\nname".to_string());
+        assert_eq!(
+            validate_worktree_create(&root, &request).unwrap_err().code,
+            "worktree_name_invalid"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn worktree_merge_revalidates_source_and_target_under_mutation_lock() {
         let root = temp_repo("worktree-verified-merge-main");
         std::fs::create_dir_all(&root).unwrap();
@@ -2241,6 +2304,7 @@ mod tests {
                 branch_name: branch.to_string(),
                 base_ref: Some("HEAD".to_string()),
                 name: None,
+                worktree_path: None,
                 target_workspace_id: None,
                 target_branch: None,
             },

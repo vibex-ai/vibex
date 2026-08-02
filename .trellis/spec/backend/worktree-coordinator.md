@@ -35,7 +35,8 @@ GitBackend
     -> GitWorktreeCreateResult
 
 GitWorktreeCreateRequest {
-  workspaceId, branchName, baseRef?, name?, targetWorkspaceId?, targetBranch?
+  workspaceId, branchName, baseRef?, name?, worktreePath?,
+  targetWorkspaceId?, targetBranch?
 }
 
 GitWorktreeCreateResult { worktree, workspace, managed, operation }
@@ -112,9 +113,23 @@ but an unexpired `Running` lease returns busy.
 
 #### Coordination and create saga
 
+- `worktreePath = None` delegates path allocation to the runtime-managed root.
+  `worktreePath = Some(path)` is authoritative, but it must be bounded,
+  control-free, absolute, absent on disk, outside the repository and every
+  existing Workspace, and not already owned by a managed Worktree. Canonical
+  missing-tail identity is used for these checks; UI preview validation never
+  replaces them.
+- Worktree display/name input is bounded to 128 bytes. The shared
+  `managed_worktree_name_slug` produces a separator-normalized path/ref
+  component; UI and coordinator must not maintain divergent slug functions.
 - Reserve the durable intent before Git or filesystem side effects. The
   idempotency key is unique and bound to a request fingerprint; reuse with a
   different request returns `worktree_operation_idempotency_conflict`.
+- Request fingerprints are persisted across upgrades. An additive optional
+  request field must preserve the legacy serialized shape when absent (for
+  example, `worktreePath = None` uses `skip_serializing_if`); a present value
+  participates in the fingerprint. Do not turn a legacy retry into an
+  idempotency conflict by serializing a newly added `null` field.
 - Acquire all repository/path/workspace-index keys atomically after sorting by
   `(kind, key)`. Never hold a partial multi-key claim while waiting.
 - If a merge/discard intent is reserved but the in-process lifecycle lock is
@@ -173,6 +188,10 @@ IntentRecorded -> LocksAcquired -> GitAddStarted -> GitAdded
 | --- | --- |
 | Path is missing, not a directory, not a worktree, bare, or unborn | `GitProjectEligibility::Ineligible` with the corresponding stable reason. |
 | Eligibility revision changed before create | `worktree_eligibility_stale`. |
+| Worktree name is empty, unbounded, or contains controls | `worktree_name_invalid`; do not reserve or touch Git. |
+| Custom path is empty, unbounded, contains controls, or is relative | `worktree_path_invalid` / `worktree_path_not_absolute`; do not reserve or touch Git. |
+| Custom path already exists or has a managed owner | `worktree_path_exists` / `worktree_path_owned`; preserve the existing path. |
+| Custom path resolves inside the repository or any existing Workspace | `worktree_path_inside_repository` / `worktree_path_inside_workspace`; do not create directories or Git registrations. |
 | Base/target ref does not resolve to a commit | `git_ref_not_found` or the typed missing-target/base error; no intent-side effect beyond a safely retryable reservation. |
 | Idempotency key is reused for another fingerprint | `worktree_operation_idempotency_conflict`; do not insert a second operation. |
 | Lifecycle key or durable lease is held | `worktree_lifecycle_busy` or `worktree_operation_busy`; do not partially acquire keys, and do not leave a no-side-effect local-lock attempt active. |
@@ -199,6 +218,10 @@ values, file contents, or unbounded Git output.
   exact registration and finishes the Workspace/managed rows once.
 - Good: source and target heads match the preflight revision, so Merge Back uses
   the stored target Workspace and branch.
+- Good: the caller supplies an absent absolute path outside all known
+  Workspaces; the returned `WorkspaceRecord.rootPath` is that authoritative
+  location, its canonical identity owns the managed record, and retry returns
+  the same record.
 - Base: a normal `CurrentCheckout` Session remains unchanged and Worktree locks
   do not affect multiple Agent sessions sharing any Workspace.
 - Bad: compare raw path strings, infer repository identity from `.git` being a
@@ -211,7 +234,8 @@ values, file contents, or unbounded Git output.
 ### 6. Tests Required
 
 - Core serde tests assert fixed origin/base/target round trips, legacy operation
-  JSON defaults, and unknown enum values fail closed.
+  JSON defaults, absent additive fields preserve the legacy request shape, and
+  unknown enum values fail closed.
 - SQLite migration tests start at v32, apply v33 additively, and assert legacy
   rows, identity uniqueness, idempotent reservation, conditional lease claim,
   expired-lease takeover, archive identity retention, and Workspace FK detach
@@ -230,6 +254,9 @@ values, file contents, or unbounded Git output.
   rejection, and explicit force for dirty discard.
 - Reconciliation tests assert missing and unowned directories become diagnostics
   without deletion.
+- Create-path tests cover managed default allocation, an authoritative custom
+  path, relative/control/oversize input, existing paths, repository nesting,
+  nesting under another Project's Workspace, and managed identity conflicts.
 - Backend/remote tests assert native read/create, negotiated remote read only,
   stable request tags, auth redaction, and injected-authority HTTP routing.
 - Run focused crate tests, `cargo check -p vibex-remote-client
@@ -269,4 +296,11 @@ if recovery_is_uncertain {
     persist_needs_attention_diagnostic();
     // Preserve Git metadata, branch, and filesystem state for inspection.
 }
+
+let request = GitWorktreeCreateRequest {
+    worktree_path: custom_absolute_path,
+    ..request
+};
+let result = backend.git_worktree_create(MutationRequest::new(request)).await?;
+use_authoritative_workspace(result.workspace);
 ```

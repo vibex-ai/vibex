@@ -101,6 +101,7 @@ pub use git::{
     GitWorktreeOperationCheckpoint, GitWorktreeOperationDetail, GitWorktreeOperationKind,
     GitWorktreeOperationRecord, GitWorktreeOperationStatus, GitWorktreeReconcileReport,
     GitWorktreeReconciliationState, GitWorktreeRisk, GitWorktreeRiskKind, GitWorktreeSummary,
+    managed_worktree_name_slug,
 };
 pub use ids::{
     AutomationEdgeId, AutomationGraphId, AutomationNodeId, AutomationRunId, AutomationRunStepId,

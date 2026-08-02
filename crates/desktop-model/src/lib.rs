@@ -19,6 +19,7 @@ mod query;
 mod runtime;
 mod timeline;
 mod ui_state;
+mod worktree_session;
 
 pub use agent_workbench::*;
 pub use composer::*;
@@ -36,3 +37,4 @@ pub use query::*;
 pub use runtime::*;
 pub use timeline::*;
 pub use ui_state::*;
+pub use worktree_session::*;

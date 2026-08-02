@@ -649,9 +649,11 @@ impl WorktreeCoordinator {
                 )
             })?;
         let target_head = vibex_git::resolve_ref_head(&target_workspace.root_path, &target_branch)?;
-        let worktree_path = self.managed_worktree_path(
+        let worktree_path = self.resolve_create_worktree_path(
+            connection,
             &project.id,
-            request.name.as_deref().unwrap_or(&request.branch_name),
+            &repository_identity,
+            request,
             &operation_id,
         )?;
         let worktree_path_identity = vibex_git::canonical_path_identity(&worktree_path);
@@ -874,6 +876,7 @@ impl WorktreeCoordinator {
             branch_name: branch.clone(),
             base_ref: Some(base_head.clone()),
             name: None,
+            worktree_path: None,
             target_workspace_id: Some(target_workspace_id.clone()),
             target_branch: Some(target_branch.clone()),
         };
@@ -1363,7 +1366,59 @@ impl WorktreeCoordinator {
         Ok(root
             .join("worktrees")
             .join(project_id.as_str())
-            .join(format!("{}-{short_id}", safe_path_slug(name))))
+            .join(format!(
+                "{}-{short_id}",
+                vibex_core::managed_worktree_name_slug(name)
+            )))
+    }
+
+    fn resolve_create_worktree_path(
+        &self,
+        connection: &vibex_db::DbConnection,
+        project_id: &ProjectId,
+        repository_identity: &vibex_core::GitRepositoryIdentity,
+        request: &GitWorktreeCreateRequest,
+        operation_id: &RequestId,
+    ) -> VibexResult<PathBuf> {
+        let Some(requested_path) = request.worktree_path.as_deref() else {
+            return self.managed_worktree_path(
+                project_id,
+                request.name.as_deref().unwrap_or(&request.branch_name),
+                operation_id,
+            );
+        };
+        let path = PathBuf::from(requested_path);
+        let identity = vibex_git::canonical_path_identity(&path);
+        if path.exists() {
+            return Err(VibexError::conflict(
+                "worktree_path_exists",
+                "custom worktree path already exists",
+            ));
+        }
+        if path_identity_is_within(&identity, &repository_identity.repository_root) {
+            return Err(VibexError::validation(
+                "worktree_path_inside_repository",
+                "custom worktree path must be outside the repository checkout",
+            ));
+        }
+        if ManagedWorktreeRepository::get_by_identity_key(connection, &identity.comparison_key)?
+            .is_some()
+        {
+            return Err(VibexError::conflict(
+                "worktree_path_owned",
+                "custom worktree path is already owned by a managed worktree",
+            ));
+        }
+        for (_, workspace) in WorkspaceRepository::list(connection)? {
+            let workspace_identity = vibex_git::canonical_path_identity(&workspace.root_path);
+            if path_identity_is_within(&identity, &workspace_identity) {
+                return Err(VibexError::validation(
+                    "worktree_path_inside_workspace",
+                    "custom worktree path must be outside an existing project workspace",
+                ));
+            }
+        }
+        Ok(path)
     }
 
     #[cfg(test)]
@@ -2189,24 +2244,16 @@ fn read_directories(root: &Path) -> VibexResult<Vec<PathBuf>> {
     Ok(directories)
 }
 
-fn safe_path_slug(value: &str) -> String {
-    let slug = value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
-                character
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string();
-    if slug.is_empty() {
-        "worktree".to_string()
-    } else {
-        slug
-    }
+fn path_identity_is_within(candidate: &GitPathIdentity, root: &GitPathIdentity) -> bool {
+    let candidate = candidate
+        .canonical_path
+        .as_deref()
+        .unwrap_or(&candidate.normalized_path);
+    let root = root
+        .canonical_path
+        .as_deref()
+        .unwrap_or(&root.normalized_path);
+    Path::new(candidate).starts_with(root)
 }
 
 #[cfg(test)]
@@ -2316,6 +2363,7 @@ mod tests {
             ),
             base_ref: Some("main".to_string()),
             name: Some("parallel-create".to_string()),
+            worktree_path: None,
             target_workspace_id: Some(fixture.workspace.id.clone()),
             target_branch: Some("main".to_string()),
         };
@@ -2610,6 +2658,7 @@ mod tests {
                     ),
                     base_ref: Some("main".to_string()),
                     name: Some("parallel-merge".to_string()),
+                    worktree_path: None,
                     target_workspace_id: Some(fixture.workspace.id.clone()),
                     target_branch: Some("main".to_string()),
                 },
@@ -2842,6 +2891,99 @@ mod tests {
         assert!(orphan.is_dir());
     }
 
+    #[test]
+    fn custom_create_path_is_authoritative_and_registered_once() {
+        let fixture = Fixture::new();
+        let custom_path = fixture._temp.path().join("custom/worktree");
+        let mut request = fixture.request.clone();
+        request.worktree_path = Some(custom_path.to_string_lossy().into_owned());
+
+        let created = fixture
+            .coordinator
+            .create(&request, fixture.context.clone())
+            .unwrap();
+
+        assert!(vibex_git::same_path_identity(
+            &created.worktree.path,
+            &custom_path
+        ));
+        assert!(custom_path.is_dir());
+        fixture.assert_single_result();
+    }
+
+    #[test]
+    fn custom_create_path_cannot_be_nested_inside_an_existing_workspace() {
+        let fixture = Fixture::new();
+        let mut request = fixture.request.clone();
+        request.worktree_path = Some(
+            fixture
+                .repo
+                .join("nested-worktree")
+                .to_string_lossy()
+                .into_owned(),
+        );
+
+        let error = fixture
+            .coordinator
+            .create(&request, fixture.context.clone())
+            .unwrap_err();
+
+        assert_eq!(error.code, "worktree_path_inside_repository");
+    }
+
+    #[test]
+    fn custom_create_path_rejects_existing_paths_without_reserving_an_intent() {
+        let fixture = Fixture::new();
+        let custom_path = fixture._temp.path().join("existing-worktree");
+        fs::create_dir_all(&custom_path).unwrap();
+        let mut request = fixture.request.clone();
+        request.worktree_path = Some(custom_path.to_string_lossy().into_owned());
+
+        let error = fixture
+            .coordinator
+            .create(&request, fixture.context.clone())
+            .unwrap_err();
+
+        assert_eq!(error.code, "worktree_path_exists");
+        let connection = open_database(&fixture.coordinator.db_path).unwrap();
+        assert!(
+            WorktreeOperationRepository::list_for_project(
+                &connection,
+                &fixture.workspace.project_id,
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn custom_create_path_cannot_be_nested_inside_another_workspace() {
+        let fixture = Fixture::new();
+        let other_workspace = fixture._temp.path().join("other-project");
+        fs::create_dir_all(&other_workspace).unwrap();
+        let connection = open_database(&fixture.coordinator.db_path).unwrap();
+        WorkspaceRepository::ensure(
+            &connection,
+            &other_workspace,
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let mut request = fixture.request.clone();
+        request.worktree_path = Some(
+            other_workspace
+                .join("nested-worktree")
+                .to_string_lossy()
+                .into_owned(),
+        );
+
+        let error = fixture
+            .coordinator
+            .create(&request, fixture.context.clone())
+            .unwrap_err();
+
+        assert_eq!(error.code, "worktree_path_inside_workspace");
+    }
+
     struct Fixture {
         _temp: TempDir,
         repo: PathBuf,
@@ -2884,6 +3026,7 @@ mod tests {
                     ),
                     base_ref: Some("main".to_string()),
                     name: Some("fault-recovery".to_string()),
+                    worktree_path: None,
                     target_workspace_id: Some(workspace.id.clone()),
                     target_branch: Some("main".to_string()),
                 },

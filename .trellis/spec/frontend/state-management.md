@@ -1024,6 +1024,153 @@ CreateAgentSessionRequest.workspaceMode -> WorkspaceMode
 <SidebarQuickAction disabled={creatingSession} />
 ```
 
+## Scenario: Worktree-aware New Session And Sidebar Projection
+
+### 1. Scope / Trigger
+
+- Trigger: GPUI Desktop adds an optional managed Worktree to New Session, or
+  presents Project/Workspace/Session identity and concurrent Agent status.
+- `DesktopRuntime` remains authoritative for Git and Workspace creation.
+  `desktop-model` owns pure form/projection state; `apps/desktop` owns Backend
+  calls and GPUI composition. Web/mobile may consume read-only identity but do
+  not gain local Worktree mutation.
+
+### 2. Signatures
+
+```rust
+NewSessionWorkspaceState {
+    project_id, origin_workspace_id, fixed_workspace,
+    preference, location, eligibility, generation,
+    base_ref, worktree_name, worktree_path,
+    name_touched, path_touched, submission
+}
+
+NewSessionProjectTicket { generation, project_id, origin_workspace_id, project_root }
+NewSessionLocation::{CurrentCheckout, NewWorktree}
+SidebarHierarchyMode::{Compact, Detailed}
+sidebar_project_projections(workspaces, sessions, contexts, ...) -> Vec<SidebarProjectProjection>
+WorkspaceContextProjection {
+    project_id, project_name, workspace_id, workspace_mode,
+    workspace_root, branch, managed_worktree_id, git_dirty
+}
+```
+
+Persisted additive/defaulted UI fields:
+
+```text
+SidebarUiState.collapsedWorkspaceIds
+SidebarUiState.hierarchyMode = compact
+SidebarUiState.projectLocationPreferences
+```
+
+### 3. Contracts
+
+- The Project picker contains each Project once and never mixes branch or
+  Workspace rows into that list. Location, base ref, and Worktree settings are
+  independent controls that share one form model at every viewport width.
+- A missing Project preference means `CurrentCheckout`. An explicit preference
+  switch may persist `NewWorktree`, but the one-shot location control never
+  writes that preference. A detailed Workspace-row `+` fixes that exact
+  Workspace and ignores the Project preference.
+- Eligibility results apply only when the full
+  `{generation, projectId, originWorkspaceId, projectRoot}` ticket still
+  matches. Programmatic input synchronization also compares the incoming value
+  with the model value before setting `nameTouched/pathTouched`; delayed GPUI
+  Change events must not turn automatic previews into custom input.
+- Worktree submission uses the Backend capability and exact sequence:
+
+```text
+expected-revision/idempotent Worktree create
+  -> authoritative WorkspaceReady
+  -> Session create at returned root/mode
+  -> SessionReady/select
+  -> initial prompt
+```
+
+- If Worktree creation fails, the complete form draft remains. If Session
+  creation fails after `WorkspaceReady`, retry reuses the stored authoritative
+  Workspace and idempotency key instead of creating another Worktree. If the
+  initial prompt fails after the Session exists, move the original text,
+  attachments, and command selection to that Session composer; never create a
+  duplicate Session to retry a prompt.
+- Compact and Detailed sidebars are projections of the same stable IDs and
+  selection. Compact renders one Project plus flattened Sessions and adds
+  `Worktree · <branch>` identity only to Worktree Sessions. Detailed renders
+  one Project, Workspace rows, and their Sessions; Workspace rows expose
+  branch, mode, dirty state, Agent summary, and an explicit `+`.
+- Title/current context uses `WorkspaceContextProjection`, not a Project-root
+  guess. Agent, Terminal, Files, Git, Search, Diagnostics, and Preview continue
+  to route through the selected Session's authoritative Workspace ID/root.
+- Render Worktree mutation controls only when the Backend advertises
+  `GitWorktreeCreate`. Read-only clients may still render branch/mode identity.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required UI/model result |
+| --- | --- |
+| No preference or a new Project | Select `CurrentCheckout`; do not inspect active Agent count. |
+| Eligibility is pending or failed | Keep current checkout usable; disable Worktree with a short localized reason/retry. |
+| Project is non-Git, bare, unborn, or lacks a base ref | Disable Worktree from the typed reason; do not inspect `.git` in UI code. |
+| Late eligibility result targets an old ticket | Ignore it without changing location, base, name, or path. |
+| Automatic input emits a delayed Change event with the same value | Keep touched flags unchanged. |
+| Name/path is empty, unbounded, controlled, or custom path is relative | Disable submit and retain the draft; Backend validation remains authoritative. |
+| Worktree succeeds and Session create fails | Keep `created_workspace`, prompt, attachments, runtime, settings, and key; retry starts at Session create. |
+| Backend lacks `GitWorktreeCreate` | Hide mutation controls; keep read-only Workspace identity. |
+| Hierarchy mode changes | Persist the mode while retaining selected Session/Workspace and workbench state. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: rapidly select Project A then B; A's late Git result is ignored and B's
+  manually edited Worktree name/path remain unchanged.
+- Good: two running Sessions share one Worktree; both retain independent state,
+  while the detailed Workspace row aggregates two running Agents.
+- Good: Worktree creation succeeds, Session creation fails, and retry creates
+  exactly one Worktree, Workspace, and Session.
+- Base: a workspace-less first launch still creates a normal temporary-root
+  Session through the existing current-checkout flow.
+- Bad: put Worktrees in the Project picker, infer mode from path text, change
+  location based on active Agent count, or rebuild selection when hierarchy
+  mode changes.
+
+### 6. Tests Required
+
+- Pure model tests cover preference versus one-shot selection, stale ticket
+  rejection, touched fields, custom input bounds, retry Workspace reuse, one
+  Project for multiple Workspaces, and independent Agent aggregation.
+- UI-state tests decode older JSON without the new fields and normalize stale
+  Project/Workspace references and bounded preferences.
+- GPUI source/interaction tests assert separate Project/location/base/settings
+  controls, capability hiding, authoritative `WorkspaceReady` before Session
+  create, prompt-draft transfer, hierarchy persistence, Workspace `+`, Worktree
+  tooltip, and title context.
+- Runtime/Git tests use temporary repositories for custom/default paths,
+  eligibility revisions, idempotent create, nested/linked worktrees, and path
+  ownership boundaries.
+- Run `pnpm check:rust` with incompatible AppImage `PYTHONHOME/PYTHONPATH`
+  variables removed when ACP mock tests need the system Python installation.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+if active_agents > 0 { location = NewWorktree; }
+let workspace_id = WorkspaceId::new();
+create_session(project.root_path, WorkspaceMode::VibexWorktree).await?;
+```
+
+#### Correct
+
+```rust
+let ticket = form.select_project(&project, &checkout, saved_preference, ...);
+let eligibility = backend.git().git_worktree_eligibility(checkout.id).await?;
+if form.apply_eligibility(&ticket, eligibility) {
+    let created = backend.git().git_worktree_create(mutation).await?;
+    form.mark_workspace_ready(created.workspace.clone());
+    create_session(created.workspace.root_path, created.workspace.mode).await?;
+}
+```
+
 ## Scenario: GPUI Management Section Lifetime
 
 ### 1. Scope / Trigger

@@ -8,6 +8,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use vibex_core::{AgentId, SessionRuntimeSelection};
 
+use crate::{NewSessionLocation, SidebarHierarchyMode};
+
 pub const DESKTOP_UI_STATE_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_UI_STATE_WRITE_DELAY_MS: u64 = 200;
 pub const MIN_UI_STATE_WRITE_DELAY_MS: u64 = 100;
@@ -163,6 +165,12 @@ pub struct SidebarUiState {
     pub session_order: Vec<String>,
     pub pinned_session_ids: BTreeSet<String>,
     pub collapsed_project_ids: BTreeSet<String>,
+    #[serde(default)]
+    pub collapsed_workspace_ids: BTreeSet<String>,
+    #[serde(default)]
+    pub hierarchy_mode: SidebarHierarchyMode,
+    #[serde(default)]
+    pub project_location_preferences: BTreeMap<String, NewSessionLocation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -321,6 +329,15 @@ impl DesktopUiStateV1 {
         normalize_ids(&mut self.sidebar.session_order, 2_000);
         normalize_set(&mut self.sidebar.pinned_session_ids, 2_000);
         normalize_set(&mut self.sidebar.collapsed_project_ids, 1_000);
+        normalize_set(&mut self.sidebar.collapsed_workspace_ids, 2_000);
+        self.sidebar.project_location_preferences =
+            std::mem::take(&mut self.sidebar.project_location_preferences)
+                .into_iter()
+                .filter_map(|(project_id, preference)| {
+                    bounded_required(&project_id, 256).map(|project_id| (project_id, preference))
+                })
+                .take(1_000)
+                .collect();
         normalize_ids(&mut self.preview.pinned_tab_ids, 500);
         self.preview.focused_pane_id = bounded_optional(self.preview.focused_pane_id.take(), 256);
         self.preview.split_sizes =
@@ -395,6 +412,12 @@ impl DesktopUiStateV1 {
         self.sidebar
             .collapsed_project_ids
             .retain(|id| references.project_ids.contains(id));
+        self.sidebar
+            .project_location_preferences
+            .retain(|id, _| references.project_ids.contains(id));
+        self.sidebar
+            .collapsed_workspace_ids
+            .retain(|id| references.workspace_ids.contains(id));
         self.sidebar
             .session_order
             .retain(|id| references.session_ids.contains(id));
@@ -978,6 +1001,38 @@ mod tests {
         assert_eq!(state.workbench.sidebar_width, 320.0);
         assert_eq!(state.sidebar.session_order, vec!["session_a"]);
         assert_eq!(state.preview.split_sizes, vec![0.5, 0.5]);
+    }
+
+    #[test]
+    fn sidebar_worktree_preferences_are_bounded_and_backward_compatible() {
+        let mut state = DesktopUiStateV1::default();
+        state.sidebar.hierarchy_mode = SidebarHierarchyMode::Detailed;
+        state
+            .sidebar
+            .project_location_preferences
+            .insert(" project-1 ".into(), NewSessionLocation::NewWorktree);
+        state.normalize().unwrap();
+        assert_eq!(state.sidebar.hierarchy_mode, SidebarHierarchyMode::Detailed);
+        assert_eq!(
+            state.sidebar.project_location_preferences.get("project-1"),
+            Some(&NewSessionLocation::NewWorktree)
+        );
+
+        let mut value = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
+        let sidebar = value
+            .get_mut("sidebar")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        sidebar.remove("hierarchyMode");
+        sidebar.remove("projectLocationPreferences");
+        sidebar.remove("collapsedWorkspaceIds");
+        let decoded = decode_and_migrate(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(
+            decoded.sidebar.hierarchy_mode,
+            SidebarHierarchyMode::Compact
+        );
+        assert!(decoded.sidebar.project_location_preferences.is_empty());
+        assert!(decoded.sidebar.collapsed_workspace_ids.is_empty());
     }
 
     #[test]

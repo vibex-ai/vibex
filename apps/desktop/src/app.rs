@@ -52,7 +52,7 @@ use tokio::sync::mpsc;
 use vibex_agent_acp::build_runtime_option_catalog;
 use vibex_agent_claude::{ClaudeSessionImportPreviewRequest, preview_claude_external_sessions};
 use vibex_agent_codex::{CodexSessionImportPreviewRequest, preview_codex_external_sessions};
-use vibex_backend::{BackendFacade, NativeBackend};
+use vibex_backend::{BackendFacade, BackendOperation, MutationRequest, NativeBackend};
 use vibex_config_switch::skills::LocalSkillScanRequest;
 use vibex_core::{
     AgentCommandDiscoverRequest, AgentCommandDiscoverResponse, AgentCommandEntry,
@@ -62,28 +62,32 @@ use vibex_core::{
     AttachRuntimeRequest, CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest,
     CreateAgentSessionRequest, DetachRuntimeRequest, ExternalSessionImportCandidateStatus,
     ExternalSessionImportRequest, FetchTimelineRequest, FileEntryKind, FileTreeRequest,
-    ForkAgentSessionRequest, GetMessageSubmissionRequest, MessageAttachment,
-    MessageSubmissionState, MessageSubmissionStatus, PermissionResolution, PermissionResponseKind,
-    ProjectId, ProjectRecord, PromptId, ProviderBindingMetadata, ProviderKind, ProviderProfileId,
-    ProviderProfileStatus, ProviderProfileSummary, RenameAgentSessionRequest, RequestId,
-    ResolvePermissionRequest, RightRailPlugin, RightRailPluginCreateRequest,
-    RightRailPluginDeleteRequest, RightRailPluginId, RightRailPluginKind,
-    RightRailPluginReorderRequest, RightRailPluginStatus, RightRailPluginUpdateRequest,
-    RightRailSystemPluginKey, RightRailWebPluginUaMode, RuntimeClientId, RuntimeLeaseRole,
-    RuntimeSelectionInteraction, SendAgentMessageRequest, SessionRuntimeFeature,
-    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
-    SessionRuntimeSelection, SessionRuntimeSelectionStatus, SetDesiredAgentSessionRuntimeRequest,
-    TerminalCreateRequest, TerminalId, TerminalSession, TerminalStatus, TerminalSwitchShellRequest,
-    TimelineItem, TimelineLiveEvent, TimelinePage, TimelinePayload, VibexSessionId, WorkspaceMode,
-    WorkspaceRecord, unix_timestamp_ms,
+    ForkAgentSessionRequest, GetMessageSubmissionRequest, GitProjectEligibilityState,
+    GitProjectIneligibleReason, MessageAttachment, MessageSubmissionState, MessageSubmissionStatus,
+    OpenWorkspaceRequest, PermissionResolution, PermissionResponseKind, ProjectId, ProjectRecord,
+    PromptId, ProviderBindingMetadata, ProviderKind, ProviderProfileId, ProviderProfileStatus,
+    ProviderProfileSummary, RenameAgentSessionRequest, RequestId, ResolvePermissionRequest,
+    RightRailPlugin, RightRailPluginCreateRequest, RightRailPluginDeleteRequest, RightRailPluginId,
+    RightRailPluginKind, RightRailPluginReorderRequest, RightRailPluginStatus,
+    RightRailPluginUpdateRequest, RightRailSystemPluginKey, RightRailWebPluginUaMode,
+    RuntimeClientId, RuntimeLeaseRole, RuntimeSelectionInteraction, SendAgentMessageRequest,
+    SessionRuntimeFeature, SessionRuntimeFeatureKind, SessionRuntimeOption,
+    SessionRuntimeOptionCatalog, SessionRuntimeSelection, SessionRuntimeSelectionStatus,
+    SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest, TerminalId, TerminalSession,
+    TerminalStatus, TerminalSwitchShellRequest, TimelineItem, TimelineLiveEvent, TimelinePage,
+    TimelinePayload, VibexSessionId, WorkspaceMode, WorkspaceRecord, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     AppearanceUiState, ComposerAttachment, ComposerSuggestionSelection, ComposerTrigger,
-    DesktopUiStateV1, LocaleMode, NavigationHistory, RUNTIME_SELECTION_PREFERENCE_LIMIT,
+    DesktopUiStateV1, LocaleMode, NavigationHistory, NewSessionLocation, NewSessionProjectTicket,
+    NewSessionSubmissionStage, NewSessionWorkspaceState, RUNTIME_SELECTION_PREFERENCE_LIMIT,
     RuntimeCascadeChoice, RuntimeCascadeProjection, SessionContentWidthMode, SessionUiState,
-    SidebarState, ThemeMode as ModelThemeMode, ThrottledUiStateWriter, TimelineConversationTurn,
+    SidebarHierarchyMode, SidebarProjectProjection, SidebarState, SidebarWorkspaceProjection,
+    ThemeMode as ModelThemeMode, ThrottledUiStateWriter, TimelineConversationTurn,
     TimelineFollowState, TimelineModel, TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
-    UiStateStore, WorkbenchRoute, composer_trigger_at, timeline_conversation_turns,
+    UiStateStore, WorkbenchRoute, WorkspaceAgentSummary, WorkspaceContextProjection,
+    composer_trigger_at, custom_worktree_path_is_absolute, sidebar_project_projections,
+    timeline_conversation_turns,
 };
 use vibex_desktop_runtime::{
     DesktopEvent, DesktopRuntime, DesktopRuntimeConfig, DesktopRuntimeFacade, PREVIEW_APP_ID,
@@ -1796,7 +1800,7 @@ struct SidebarSessionDropTarget {
 
 #[derive(Clone)]
 struct SidebarProjectDrag {
-    workspace_id: String,
+    project_id: String,
     label: SharedString,
 }
 
@@ -1819,7 +1823,7 @@ impl Render for SidebarProjectDrag {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SidebarProjectDropTarget {
-    workspace_id: String,
+    project_id: String,
     after: bool,
 }
 
@@ -1942,11 +1946,19 @@ struct ComposerQueueDropTarget {
     after: bool,
 }
 
-#[derive(Clone)]
-struct SidebarWorkspaceGroup {
-    project: ProjectRecord,
-    workspace: WorkspaceRecord,
-    sessions: Vec<AgentSession>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NewSessionOpenTarget {
+    Project(ProjectId),
+    Workspace(vibex_core::WorkspaceId),
+}
+
+enum NewSessionCreateSignal {
+    WorkspaceReady(WorkspaceRecord),
+    SessionReady(
+        AgentSession,
+        Option<Vec<(ProjectRecord, WorkspaceRecord)>>,
+        bool,
+    ),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2052,7 +2064,8 @@ pub struct VibexWorkbench {
     composer_queue_edit_input: Entity<InputState>,
     composer_input: Entity<InputState>,
     new_session_input: Entity<InputState>,
-    new_session_workspace_input: Entity<InputState>,
+    new_session_worktree_name_input: Entity<InputState>,
+    new_session_worktree_path_input: Entity<InputState>,
     new_session_project_search: Entity<InputState>,
     new_session_project_menu_focus: FocusHandle,
     workspaces: Vec<(ProjectRecord, WorkspaceRecord)>,
@@ -2074,6 +2087,7 @@ pub struct VibexWorkbench {
     new_session_project_menu_mounted: bool,
     new_session_project_menu_close_task: Option<Task<()>>,
     initial_new_session_panel_handled: bool,
+    initial_new_session_setup_pending: bool,
     agent_snapshots: Vec<AgentSnapshotEntry>,
     new_session_agent_id: Option<AgentId>,
     new_session_runtime_selection: Option<SessionRuntimeSelection>,
@@ -2081,7 +2095,12 @@ pub struct VibexWorkbench {
     new_session_runtime_menu_view: ComposerRuntimeMenuView,
     new_session_runtime_menu_profile_id: Option<ProviderProfileId>,
     new_session_composer_geometry: ComposerGeometry,
-    new_session_workspace_mode: WorkspaceMode,
+    new_session_workspace: NewSessionWorkspaceState,
+    new_session_worktree_settings_open: bool,
+    new_session_worktree_input_syncing: bool,
+    new_session_eligibility_error: Option<String>,
+    workspace_contexts: BTreeMap<String, WorkspaceContextProjection>,
+    workspace_context_generation: u64,
     new_session_attachments: Vec<InlineComposerAttachment>,
     new_session_error: Option<String>,
     navigation_history: NavigationHistory,
@@ -2176,6 +2195,8 @@ pub struct VibexWorkbench {
     suggestion_task: Option<Task<()>>,
     session_search_index_task: Option<Task<()>>,
     sidebar_picker_task: Option<Task<()>>,
+    new_session_eligibility_task: Option<Task<()>>,
+    workspace_context_task: Option<Task<()>>,
     runtime_heartbeat_task: Option<Task<()>>,
     agent_poll_task: Option<Task<()>>,
     composer_attachment_task: Option<Task<()>>,
@@ -2271,8 +2292,19 @@ impl VibexWorkbench {
                 .submit_on_enter(true)
                 .placeholder(initial_strings.new_session_prompt_placeholder)
         });
-        let new_session_workspace_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(initial_strings.new_session_project_placeholder)
+        let new_session_worktree_name_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(locale::text(
+                "Worktree name",
+                "Worktree 名称",
+                "Worktree 名稱",
+            ))
+        });
+        let new_session_worktree_path_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(locale::text(
+                "Managed path",
+                "托管路径",
+                "受管路徑",
+            ))
         });
         let new_session_project_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(initial_strings.new_session_search_project)
@@ -2362,6 +2394,7 @@ impl VibexWorkbench {
                     InputEvent::Change => {
                         this.sync_inline_composer_attachments(true, cx);
                         this.sync_composer_command_entry(ComposerTarget::NewSession, cx);
+                        this.refresh_new_session_worktree_suggestions(window, cx);
                         this.refresh_suggestions(ComposerTarget::NewSession, window, cx);
                     }
                     InputEvent::Focus => {
@@ -2371,11 +2404,37 @@ impl VibexWorkbench {
                 },
             ),
             cx.subscribe(
-                &new_session_workspace_input,
+                &new_session_worktree_name_input,
                 |this, _, event: &InputEvent, cx| {
-                    if matches!(event, InputEvent::Change) {
-                        this.new_session_workspace_mode = WorkspaceMode::CurrentCheckout;
-                        this.refresh_active_suggestions(ComposerTarget::NewSession, cx);
+                    if matches!(event, InputEvent::Change)
+                        && !this.new_session_worktree_input_syncing
+                    {
+                        let value = this
+                            .new_session_worktree_name_input
+                            .read(cx)
+                            .value()
+                            .to_string();
+                        if value != this.new_session_workspace.worktree_name {
+                            this.new_session_workspace.set_worktree_name(value);
+                        }
+                    }
+                    cx.notify();
+                },
+            ),
+            cx.subscribe(
+                &new_session_worktree_path_input,
+                |this, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change)
+                        && !this.new_session_worktree_input_syncing
+                    {
+                        let value = this
+                            .new_session_worktree_path_input
+                            .read(cx)
+                            .value()
+                            .to_string();
+                        if value != this.new_session_workspace.worktree_path {
+                            this.new_session_workspace.set_worktree_path(value);
+                        }
                     }
                     cx.notify();
                 },
@@ -2439,6 +2498,14 @@ impl VibexWorkbench {
             workbench_route(&ui_state, selected_session_id.as_ref()),
             WORKBENCH_NAVIGATION_LIMIT,
         );
+        let mut new_session_workspace = NewSessionWorkspaceState::default();
+        new_session_workspace.clear(
+            RequestId::new().to_string(),
+            config
+                .as_ref()
+                .map(|config| config.home_dir.clone())
+                .unwrap_or_default(),
+        );
         let mut this = Self {
             focus_handle,
             config,
@@ -2495,7 +2562,8 @@ impl VibexWorkbench {
             composer_queue_edit_input,
             composer_input,
             new_session_input,
-            new_session_workspace_input,
+            new_session_worktree_name_input,
+            new_session_worktree_path_input,
             new_session_project_search,
             new_session_project_menu_focus,
             workspaces: Vec::new(),
@@ -2517,6 +2585,7 @@ impl VibexWorkbench {
             new_session_project_menu_mounted: false,
             new_session_project_menu_close_task: None,
             initial_new_session_panel_handled: false,
+            initial_new_session_setup_pending: false,
             agent_snapshots: Vec::new(),
             new_session_agent_id: None,
             new_session_runtime_selection: None,
@@ -2524,7 +2593,12 @@ impl VibexWorkbench {
             new_session_runtime_menu_view: ComposerRuntimeMenuView::Profile,
             new_session_runtime_menu_profile_id: None,
             new_session_composer_geometry: ComposerGeometry::default(),
-            new_session_workspace_mode: WorkspaceMode::CurrentCheckout,
+            new_session_workspace,
+            new_session_worktree_settings_open: false,
+            new_session_worktree_input_syncing: false,
+            new_session_eligibility_error: None,
+            workspace_contexts: BTreeMap::new(),
+            workspace_context_generation: 0,
             new_session_attachments: Vec::new(),
             new_session_error: None,
             navigation_history,
@@ -2619,6 +2693,8 @@ impl VibexWorkbench {
             suggestion_task: None,
             session_search_index_task: None,
             sidebar_picker_task: None,
+            new_session_eligibility_task: None,
+            workspace_context_task: None,
             runtime_heartbeat_task: None,
             agent_poll_task: None,
             composer_attachment_task: None,
@@ -3054,6 +3130,7 @@ impl VibexWorkbench {
                             this.sessions = sessions;
                             this.workspaces = workspaces;
                             this.reconcile_sidebar_state();
+                            this.refresh_workspace_contexts(cx);
                             if this.reconcile_new_session_runtime_selection()
                                 && this.new_session_open
                             {
@@ -3062,7 +3139,8 @@ impl VibexWorkbench {
                             if !this.initial_new_session_panel_handled {
                                 this.initial_new_session_panel_handled = true;
                                 this.new_session_open = sessions_empty;
-                                this.new_session_draft_initialized = sessions_empty;
+                                this.initial_new_session_setup_pending =
+                                    sessions_empty && !this.new_session_draft_initialized;
                             }
                             if let Some(session_id) = preferred {
                                 this.select_session_with_history(session_id, false, cx);
@@ -3093,6 +3171,92 @@ impl VibexWorkbench {
                             }
                             this.finish_startup_loading();
                             this.agent_error = Some(format!("agent overview task failed: {error}"));
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
+    fn refresh_workspace_contexts(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        self.workspace_context_generation = self.workspace_context_generation.wrapping_add(1);
+        let generation = self.workspace_context_generation;
+        let capabilities = backend.capabilities();
+        let can_read_worktrees = capabilities.git.supports(BackendOperation::GitWorktreeRead);
+        let can_read_status = capabilities.git.supports(BackendOperation::GitStatus);
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let summaries = backend.workspace().list_workspaces().await?;
+            let mut contexts = BTreeMap::new();
+            for summary in &summaries {
+                let eligibility = if can_read_worktrees {
+                    backend
+                        .git()
+                        .git_worktree_eligibility(summary.workspace.id.clone())
+                        .await
+                        .ok()
+                } else {
+                    None
+                };
+                let lifecycle = if can_read_worktrees {
+                    backend
+                        .git()
+                        .git_worktree_snapshot(summary.workspace.id.clone())
+                        .await
+                        .ok()
+                } else {
+                    None
+                };
+                let status = if can_read_status {
+                    backend
+                        .git()
+                        .git_status(summary.workspace.id.clone())
+                        .await
+                        .ok()
+                } else {
+                    None
+                };
+                let context = WorkspaceContextProjection::from_authoritative(
+                    &summary.project,
+                    &summary.workspace,
+                    eligibility.as_ref(),
+                    lifecycle.as_ref(),
+                    status.as_ref().and_then(|status| status.branch.as_deref()),
+                    status.as_ref().is_some_and(|status| status.dirty),
+                );
+                contexts.insert(summary.workspace.id.as_str().to_string(), context);
+            }
+            Ok::<_, vibex_backend::BackendError>((summaries, contexts))
+        });
+        self.workspace_context_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    if this.workspace_context_generation != generation {
+                        return;
+                    }
+                    this.workspace_context_task = None;
+                    match outcome {
+                        Ok(Ok((summaries, contexts))) => {
+                            this.workspaces = summaries
+                                .into_iter()
+                                .map(|summary| (summary.project, summary.workspace))
+                                .collect();
+                            this.workspace_contexts = contexts;
+                            this.reconcile_sidebar_state();
+                        }
+                        Ok(Err(error)) => {
+                            this.runtime_note = Some(format!(
+                                "Workspace context refresh failed: {}: {}",
+                                error.code, error.message
+                            ));
+                        }
+                        Err(error) => {
+                            this.runtime_note =
+                                Some(format!("Workspace context task failed: {error}"));
                         }
                     }
                     cx.notify();
@@ -3449,22 +3613,35 @@ impl VibexWorkbench {
             .as_ref()
             .is_some_and(|id| self.pending_agent_turn_session_ids.contains(id.as_str()));
 
-        let valid_workspace_ids = self
+        let valid_project_ids = self
             .workspaces
             .iter()
-            .map(|(_, workspace)| workspace.id.as_str().to_string())
+            .map(|(project, _)| project.id.as_str().to_string())
             .collect::<BTreeSet<_>>();
         let mut seen = BTreeSet::new();
         self.ui_state
             .sidebar
             .project_order
-            .retain(|id| valid_workspace_ids.contains(id) && seen.insert(id.clone()));
+            .retain(|id| valid_project_ids.contains(id) && seen.insert(id.clone()));
         self.sidebar_state
             .collapsed_ids
-            .retain(|id| valid_workspace_ids.contains(id));
+            .retain(|id| valid_project_ids.contains(id));
+        self.ui_state
+            .sidebar
+            .project_location_preferences
+            .retain(|id, _| valid_project_ids.contains(id));
         if let Some(snapshot) = self.collapsed_project_restore.as_mut() {
-            snapshot.retain(|id| valid_workspace_ids.contains(id));
+            snapshot.retain(|id| valid_project_ids.contains(id));
         }
+        let valid_workspace_ids = self
+            .workspaces
+            .iter()
+            .map(|(_, workspace)| workspace.id.as_str().to_string())
+            .collect::<BTreeSet<_>>();
+        self.ui_state
+            .sidebar
+            .collapsed_workspace_ids
+            .retain(|id| valid_workspace_ids.contains(id));
         if self
             .sidebar_renaming_session_id
             .as_ref()
@@ -3726,116 +3903,16 @@ impl VibexWorkbench {
         }
     }
 
-    fn sidebar_workspace_groups(&self, query: &str) -> Vec<SidebarWorkspaceGroup> {
-        let query = query.trim().to_lowercase();
-        let project_order = self
-            .ui_state
-            .sidebar
-            .project_order
-            .iter()
-            .enumerate()
-            .map(|(index, id)| (id.as_str(), index))
-            .collect::<BTreeMap<_, _>>();
-        let session_order = self
-            .sidebar_state
-            .row_order
-            .iter()
-            .enumerate()
-            .map(|(index, id)| (id.as_str(), index))
-            .collect::<BTreeMap<_, _>>();
-        let mut workspaces = self
-            .workspaces
-            .iter()
-            .cloned()
-            .enumerate()
-            .collect::<Vec<_>>();
-        workspaces.sort_by_key(|(index, (_, workspace))| {
-            (
-                project_order.get(workspace.id.as_str()).copied().is_none(),
-                project_order
-                    .get(workspace.id.as_str())
-                    .copied()
-                    .unwrap_or(usize::MAX),
-                *index,
-            )
-        });
-
-        workspaces
-            .into_iter()
-            .filter_map(|(_, (project, workspace))| {
-                let mut sessions = self
-                    .sessions
-                    .iter()
-                    .filter(|session| {
-                        session.deleted_at_ms.is_none() && session.workspace_id == workspace.id
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                sessions.sort_by(|left, right| {
-                    (!self.sidebar_state.pinned_ids.contains(left.id.as_str()))
-                        .cmp(&(!self.sidebar_state.pinned_ids.contains(right.id.as_str())))
-                        .then_with(|| right.updated_at_ms.cmp(&left.updated_at_ms))
-                        .then_with(|| left.id.as_str().cmp(right.id.as_str()))
-                });
-                let mut sessions = sessions.into_iter().enumerate().collect::<Vec<_>>();
-                sessions.sort_by_key(|(index, session)| {
-                    (
-                        session_order.get(session.id.as_str()).copied().is_none(),
-                        session_order
-                            .get(session.id.as_str())
-                            .copied()
-                            .unwrap_or(usize::MAX),
-                        *index,
-                    )
-                });
-                let sessions = sessions
-                    .into_iter()
-                    .map(|(_, session)| session)
-                    .collect::<Vec<_>>();
-                if query.is_empty() {
-                    return Some(SidebarWorkspaceGroup {
-                        project,
-                        workspace,
-                        sessions,
-                    });
-                }
-
-                let project_matches = [
-                    project.name.as_str(),
-                    project.root_path.as_str(),
-                    workspace.root_path.as_str(),
-                ]
-                .iter()
-                .any(|value| value.to_lowercase().contains(&query));
-                let filtered_sessions = sessions
-                    .iter()
-                    .filter(|session| {
-                        [
-                            session.title.as_str(),
-                            session.agent_id.as_str(),
-                            session.workspace_root.as_str(),
-                        ]
-                        .iter()
-                        .any(|value| value.to_lowercase().contains(&query))
-                            || format!("{:?}", session.state)
-                                .to_lowercase()
-                                .contains(&query)
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                (project_matches || !filtered_sessions.is_empty()).then_some(
-                    SidebarWorkspaceGroup {
-                        project,
-                        workspace,
-                        sessions: if project_matches {
-                            sessions
-                        } else {
-                            filtered_sessions
-                        },
-                    },
-                )
-            })
-            .collect()
+    fn sidebar_workspace_groups(&self, query: &str) -> Vec<SidebarProjectProjection> {
+        sidebar_project_projections(
+            &self.workspaces,
+            &self.sessions,
+            &self.workspace_contexts,
+            &self.ui_state.sidebar.project_order,
+            &self.sidebar_state.row_order,
+            &self.sidebar_state.pinned_ids,
+            query,
+        )
     }
 
     fn toggle_sidebar_batch_mode(&mut self, cx: &mut Context<Self>) {
@@ -3890,18 +3967,41 @@ impl VibexWorkbench {
         self.queue_ui_state();
     }
 
-    fn activate_and_toggle_workspace(
+    fn activate_and_toggle_project(
+        &mut self,
+        project_id: ProjectId,
+        workspace: WorkspaceRecord,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_workspace(workspace, cx);
+        let project_id = project_id.as_str().to_string();
+        if !self.sidebar_state.collapsed_ids.remove(&project_id) {
+            self.sidebar_state.collapsed_ids.insert(project_id);
+        }
+        self.collapsed_project_restore = None;
+        self.queue_agent_ui_state();
+        cx.notify();
+    }
+
+    fn activate_and_toggle_sidebar_workspace(
         &mut self,
         workspace: WorkspaceRecord,
         cx: &mut Context<Self>,
     ) {
         let workspace_id = workspace.id.as_str().to_string();
         self.activate_workspace(workspace, cx);
-        if !self.sidebar_state.collapsed_ids.remove(&workspace_id) {
-            self.sidebar_state.collapsed_ids.insert(workspace_id);
+        if !self
+            .ui_state
+            .sidebar
+            .collapsed_workspace_ids
+            .remove(&workspace_id)
+        {
+            self.ui_state
+                .sidebar
+                .collapsed_workspace_ids
+                .insert(workspace_id);
         }
-        self.collapsed_project_restore = None;
-        self.queue_agent_ui_state();
+        self.queue_ui_state();
         cx.notify();
     }
 
@@ -3915,7 +4015,7 @@ impl VibexWorkbench {
         let ids = self
             .sidebar_workspace_groups("")
             .into_iter()
-            .map(|group| group.workspace.id.as_str().to_string())
+            .map(|group| group.project.id.as_str().to_string())
             .collect::<Vec<_>>();
         complete_string_order(&mut self.ui_state.sidebar.project_order, ids);
         if move_string_relative(
@@ -3940,9 +4040,10 @@ impl VibexWorkbench {
         let ids = self
             .sidebar_workspace_groups("")
             .into_iter()
-            .find(|group| group.workspace.id.as_str() == workspace_id)
-            .map(|group| {
-                group
+            .flat_map(|group| group.workspaces)
+            .find(|workspace| workspace.workspace.id.as_str() == workspace_id)
+            .map(|workspace| {
+                workspace
                     .sessions
                     .into_iter()
                     .map(|session| session.id.as_str().to_string())
@@ -5256,17 +5357,11 @@ impl VibexWorkbench {
                 )
             }
             ComposerTarget::NewSession => {
-                let workspace_root = self
-                    .new_session_workspace_input
-                    .read(cx)
-                    .value()
-                    .trim()
-                    .to_string();
                 let workspace_id = self
-                    .workspaces
-                    .iter()
-                    .find(|(_, workspace)| workspace.root_path == workspace_root)
-                    .map(|(_, workspace)| workspace.id.clone());
+                    .new_session_workspace
+                    .selected_workspace()
+                    .map(|workspace| workspace.id.clone())
+                    .or_else(|| self.new_session_workspace.origin_workspace_id.clone());
                 (
                     self.new_session_runtime_selection
                         .as_ref()
@@ -7564,30 +7659,67 @@ impl VibexWorkbench {
         if self.sidebar_picker_task.is_some() || self.agent_action_pending {
             return;
         }
+        let Some(backend) = self.backend.clone() else {
+            self.new_session_error = Some("Local backend is not ready".into());
+            cx.notify();
+            return;
+        };
         if !self.new_session_open {
             self.open_new_session(None, window, cx);
         }
         self.set_new_session_project_menu_open(false, window, cx);
         let entity = cx.weak_entity();
         let picker = gpui_tokio::Tokio::spawn(cx, async move {
-            rfd::AsyncFileDialog::new()
+            let Some(folder) = rfd::AsyncFileDialog::new()
                 .set_title("Choose project directory")
                 .pick_folder()
                 .await
+            else {
+                return Ok::<_, vibex_backend::BackendError>(None);
+            };
+            let root_path = folder.path().to_string_lossy().into_owned();
+            backend
+                .workspace()
+                .open_workspace(
+                    MutationRequest::new(OpenWorkspaceRequest {
+                        root_path,
+                        mode: Some(WorkspaceMode::CurrentCheckout),
+                    })
+                    .with_idempotency_key(format!(
+                        "new-session-open-workspace:{}",
+                        RequestId::new()
+                    )),
+                )
+                .await
+                .map(Some)
         });
         self.sidebar_picker_task = Some(cx.spawn_in(window, async move |_, cx| {
-            let folder = picker.await.ok().flatten();
+            let outcome = picker.await;
             let _ = entity.update_in(cx, |this, window, cx| {
                 this.sidebar_picker_task = None;
-                if let Some(folder) = folder {
-                    this.set_new_session_workspace(
-                        folder.path().to_string_lossy().into_owned(),
-                        WorkspaceMode::CurrentCheckout,
-                        window,
-                        cx,
-                    );
-                    this.new_session_project_search
-                        .update(cx, |input, cx| input.set_value("", window, cx));
+                match outcome {
+                    Ok(Ok(Some(summary))) => {
+                        let project_id = summary.project.id.clone();
+                        this.workspaces
+                            .retain(|(_, workspace)| workspace.id != summary.workspace.id);
+                        this.workspaces.push((summary.project, summary.workspace));
+                        this.reconcile_sidebar_state();
+                        this.select_new_session_target(
+                            NewSessionOpenTarget::Project(project_id),
+                            window,
+                            cx,
+                        );
+                        this.new_session_project_search
+                            .update(cx, |input, cx| input.set_value("", window, cx));
+                        this.refresh_workspace_contexts(cx);
+                    }
+                    Ok(Ok(None)) => {}
+                    Ok(Err(error)) => {
+                        this.new_session_error = Some(format!("{}: {}", error.code, error.message));
+                    }
+                    Err(error) => {
+                        this.new_session_error = Some(format!("project selection failed: {error}"));
+                    }
                 }
                 this.new_session_input
                     .update(cx, |input, cx| input.focus(window, cx));
@@ -8340,7 +8472,7 @@ impl VibexWorkbench {
 
     fn open_new_session(
         &mut self,
-        workspace: Option<(String, WorkspaceMode)>,
+        target: Option<NewSessionOpenTarget>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -8365,6 +8497,7 @@ impl VibexWorkbench {
         self.new_session_runtime_menu_profile_id = None;
         self.new_session_error = None;
         self.clear_suggestions();
+        let explicit_target = target.is_some();
         if initialize_draft {
             self.new_session_attachments.clear();
             self.new_session_command_entry = None;
@@ -8387,31 +8520,23 @@ impl VibexWorkbench {
                 )
             });
             self.set_new_session_runtime_selection(selection);
-            let workspace = workspace
-                .or_else(|| {
-                    self.selected_session()
-                        .map(|session| (session.workspace_root.clone(), session.workspace_mode))
-                })
-                .or_else(|| {
-                    let selected_workspace_id =
-                        self.ui_state.workbench.selected_workspace_id.as_deref()?;
-                    self.workspaces
-                        .iter()
-                        .find(|(_, workspace)| workspace.id.as_str() == selected_workspace_id)
-                        .map(|(_, workspace)| (workspace.root_path.clone(), workspace.mode))
-                });
-            let (workspace_root, workspace_mode) =
-                workspace.unwrap_or_else(|| (String::new(), WorkspaceMode::CurrentCheckout));
-            self.new_session_workspace_mode = workspace_mode;
-            self.new_session_workspace_input
-                .update(cx, |input, cx| input.set_value(workspace_root, window, cx));
             self.new_session_input
                 .update(cx, |input, cx| input.set_value("", window, cx));
+            self.new_session_workspace.clear(
+                RequestId::new().to_string(),
+                self.new_session_managed_root(),
+            );
             self.new_session_draft_initialized = true;
-        } else if let Some((workspace_root, workspace_mode)) = workspace {
-            self.new_session_workspace_mode = workspace_mode;
-            self.new_session_workspace_input
-                .update(cx, |input, cx| input.set_value(workspace_root, window, cx));
+        }
+        let target = target.or_else(|| {
+            initialize_draft
+                .then(|| self.inferred_new_session_target())
+                .flatten()
+        });
+        if (initialize_draft || explicit_target)
+            && let Some(target) = target
+        {
+            self.select_new_session_target(target, window, cx);
         }
         self.new_session_input
             .update(cx, |input, cx| input.focus(window, cx));
@@ -8430,15 +8555,24 @@ impl VibexWorkbench {
         self.reset_new_session_project_menu(window, cx);
         self.new_session_open = false;
         self.new_session_draft_initialized = false;
+        self.initial_new_session_setup_pending = false;
         self.new_session_runtime_menu_open = false;
         self.runtime_choice_menu_open = None;
         self.new_session_runtime_menu_profile_id = None;
+        self.new_session_worktree_settings_open = false;
+        self.new_session_eligibility_error = None;
+        self.new_session_eligibility_task = None;
         self.new_session_error = None;
         self.new_session_attachments.clear();
         self.new_session_command_entry = None;
         self.clear_suggestions();
+        self.new_session_workspace.clear(
+            RequestId::new().to_string(),
+            self.new_session_managed_root(),
+        );
         self.new_session_input
             .update(cx, |input, cx| input.set_value("", window, cx));
+        self.sync_new_session_worktree_inputs(window, cx);
         if self.selected_session_id.is_some() {
             self.composer_input
                 .update(cx, |input, cx| input.focus(window, cx));
@@ -8446,17 +8580,253 @@ impl VibexWorkbench {
         cx.notify();
     }
 
-    fn set_new_session_workspace(
+    fn current_checkout_for_project(
+        &self,
+        project_id: &ProjectId,
+    ) -> Option<(ProjectRecord, WorkspaceRecord)> {
+        self.workspaces
+            .iter()
+            .find(|(project, workspace)| {
+                project.id == *project_id && workspace.mode == WorkspaceMode::CurrentCheckout
+            })
+            .or_else(|| {
+                self.workspaces
+                    .iter()
+                    .find(|(project, _)| project.id == *project_id)
+            })
+            .cloned()
+    }
+
+    fn inferred_new_session_target(&self) -> Option<NewSessionOpenTarget> {
+        self.selected_session()
+            .map(|session| NewSessionOpenTarget::Project(session.project_id.clone()))
+            .or_else(|| {
+                let selected_workspace_id =
+                    self.ui_state.workbench.selected_workspace_id.as_deref()?;
+                self.workspaces
+                    .iter()
+                    .find(|(_, workspace)| workspace.id.as_str() == selected_workspace_id)
+                    .map(|(project, _)| NewSessionOpenTarget::Project(project.id.clone()))
+            })
+            .or_else(|| {
+                self.workspaces
+                    .iter()
+                    .find(|(_, workspace)| workspace.mode == WorkspaceMode::CurrentCheckout)
+                    .map(|(project, _)| NewSessionOpenTarget::Project(project.id.clone()))
+            })
+    }
+
+    fn new_session_managed_root(&self) -> std::path::PathBuf {
+        self.config
+            .as_ref()
+            .map(|config| config.home_dir.clone())
+            .unwrap_or_default()
+    }
+
+    fn new_session_prompt_title(&self, cx: &App) -> Option<String> {
+        session_title_from_first_message(self.new_session_input.read(cx).value().as_ref())
+    }
+
+    fn select_new_session_target(
         &mut self,
-        workspace_root: String,
-        workspace_mode: WorkspaceMode,
+        target: NewSessionOpenTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.new_session_workspace_mode = workspace_mode;
-        self.new_session_workspace_input
-            .update(cx, |input, cx| input.set_value(workspace_root, window, cx));
+        let prompt_title = self.new_session_prompt_title(cx);
+        let nonce = RequestId::new().to_string();
+        let managed_root = self.new_session_managed_root();
+        let ticket = match target {
+            NewSessionOpenTarget::Project(project_id) => {
+                let Some((project, origin_workspace)) =
+                    self.current_checkout_for_project(&project_id)
+                else {
+                    return;
+                };
+                let preference = self
+                    .ui_state
+                    .sidebar
+                    .project_location_preferences
+                    .get(project.id.as_str())
+                    .copied()
+                    .unwrap_or_default();
+                self.new_session_workspace.select_project(
+                    &project,
+                    &origin_workspace,
+                    preference,
+                    nonce,
+                    managed_root,
+                    prompt_title.as_deref(),
+                )
+            }
+            NewSessionOpenTarget::Workspace(workspace_id) => {
+                let Some((project, workspace)) = self
+                    .workspaces
+                    .iter()
+                    .find(|(_, workspace)| workspace.id == workspace_id)
+                    .cloned()
+                else {
+                    return;
+                };
+                let Some((_, origin_workspace)) = self.current_checkout_for_project(&project.id)
+                else {
+                    return;
+                };
+                self.new_session_workspace.select_existing_workspace(
+                    &project,
+                    &origin_workspace,
+                    &workspace,
+                    nonce,
+                    managed_root,
+                    prompt_title.as_deref(),
+                )
+            }
+        };
+        self.new_session_error = None;
+        self.new_session_eligibility_error = None;
+        self.sync_new_session_worktree_inputs(window, cx);
+        self.probe_new_session_eligibility(ticket, window, cx);
         self.refresh_active_suggestions(ComposerTarget::NewSession, cx);
+        cx.notify();
+    }
+
+    fn probe_new_session_eligibility(
+        &mut self,
+        ticket: NewSessionProjectTicket,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.new_session_eligibility_task = None;
+        let Some(backend) = self.backend.clone() else {
+            self.new_session_eligibility_error = Some("backend_unavailable".into());
+            return;
+        };
+        if !backend
+            .capabilities()
+            .git
+            .supports(BackendOperation::GitWorktreeRead)
+        {
+            self.new_session_eligibility_error = Some("worktree_read_unsupported".into());
+            return;
+        }
+        self.new_session_eligibility_error = None;
+        let workspace_id = ticket.origin_workspace_id.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend.git().git_worktree_eligibility(workspace_id).await
+        });
+        self.new_session_eligibility_task = Some(cx.spawn_in(
+            window,
+            async move |entity: WeakEntity<Self>, cx| {
+                let outcome = runner.await;
+                let _ = entity.update_in(cx, |this, window, cx| {
+                    if this.new_session_workspace.ticket().as_ref() != Some(&ticket) {
+                        return;
+                    }
+                    this.new_session_eligibility_task = None;
+                    match outcome {
+                        Ok(Ok(eligibility)) => {
+                            if this
+                                .new_session_workspace
+                                .apply_eligibility(&ticket, eligibility)
+                            {
+                                this.new_session_eligibility_error = None;
+                                this.sync_new_session_worktree_inputs(window, cx);
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            this.new_session_eligibility_error = Some(error.code);
+                        }
+                        Err(error) => {
+                            this.new_session_eligibility_error =
+                                Some(format!("worktree_probe_failed: {error}"));
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
+    fn retry_new_session_eligibility(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ticket) = self.new_session_workspace.ticket() {
+            self.new_session_workspace.eligibility = None;
+            self.probe_new_session_eligibility(ticket, window, cx);
+            cx.notify();
+        }
+    }
+
+    fn sync_new_session_worktree_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.new_session_workspace.worktree_name.clone();
+        let path = self.new_session_workspace.worktree_path.clone();
+        self.new_session_worktree_input_syncing = true;
+        self.new_session_worktree_name_input
+            .update(cx, |input, cx| input.set_value(name, window, cx));
+        self.new_session_worktree_path_input
+            .update(cx, |input, cx| input.set_value(path, window, cx));
+        self.new_session_worktree_input_syncing = false;
+    }
+
+    fn refresh_new_session_worktree_suggestions(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prompt_title = self.new_session_prompt_title(cx);
+        self.new_session_workspace
+            .refresh_auto_values(prompt_title.as_deref());
+        self.sync_new_session_worktree_inputs(window, cx);
+    }
+
+    fn set_new_session_location(
+        &mut self,
+        location: NewSessionLocation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.new_session_workspace.set_location(location) {
+            self.new_session_error = None;
+            self.sync_new_session_worktree_inputs(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn set_new_session_base_ref(&mut self, base_ref: String, cx: &mut Context<Self>) {
+        if self.new_session_workspace.set_base_ref(base_ref) {
+            self.new_session_error = None;
+            cx.notify();
+        }
+    }
+
+    fn restore_new_session_worktree_auto_values(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prompt_title = self.new_session_prompt_title(cx);
+        self.new_session_workspace
+            .restore_auto_values(prompt_title.as_deref());
+        self.sync_new_session_worktree_inputs(window, cx);
+        cx.notify();
+    }
+
+    fn set_new_session_default_worktree(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let Some(project_id) = self.new_session_workspace.project_id.as_ref() else {
+            return;
+        };
+        if enabled {
+            self.ui_state.sidebar.project_location_preferences.insert(
+                project_id.as_str().to_string(),
+                NewSessionLocation::NewWorktree,
+            );
+            self.new_session_workspace.preference = NewSessionLocation::NewWorktree;
+        } else {
+            self.ui_state
+                .sidebar
+                .project_location_preferences
+                .remove(project_id.as_str());
+            self.new_session_workspace.preference = NewSessionLocation::CurrentCheckout;
+        }
+        self.queue_ui_state();
         cx.notify();
     }
 
@@ -8657,14 +9027,60 @@ impl VibexWorkbench {
             cx.notify();
             return;
         }
-        let workspace_root = self
-            .new_session_workspace_input
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        let workspace_mode = self.new_session_workspace_mode;
+        let selected_workspace = self.new_session_workspace.selected_workspace().cloned();
+        let origin_workspace = self
+            .new_session_workspace
+            .origin_workspace_id
+            .as_ref()
+            .and_then(|workspace_id| {
+                self.workspaces
+                    .iter()
+                    .find(|(_, workspace)| workspace.id == *workspace_id)
+                    .map(|(_, workspace)| workspace.clone())
+            });
+        let create_worktree = self.new_session_workspace.location
+            == NewSessionLocation::NewWorktree
+            && selected_workspace.is_none();
+        let worktree_mutation = if create_worktree {
+            let Some(backend) = self.backend.as_ref() else {
+                self.new_session_error = Some("Local backend is not ready".into());
+                cx.notify();
+                return;
+            };
+            if !backend
+                .capabilities()
+                .git
+                .supports(BackendOperation::GitWorktreeCreate)
+            {
+                self.new_session_error = Some("worktree_create_unsupported".into());
+                cx.notify();
+                return;
+            }
+            let payload = match self.new_session_workspace.worktree_create_request() {
+                Ok(payload) => payload,
+                Err(code) => {
+                    self.new_session_error = Some(code.into());
+                    cx.notify();
+                    return;
+                }
+            };
+            let mut request = MutationRequest::new(payload).with_idempotency_key(
+                self.new_session_workspace
+                    .submission
+                    .idempotency_key
+                    .clone(),
+            );
+            if let Some(revision) = self.new_session_workspace.expected_revision() {
+                request = request.with_expected_revision(revision.to_string());
+            }
+            Some(request)
+        } else {
+            None
+        };
         let raw_text = self.new_session_input.read(cx).value().to_string();
+        let draft_raw_text = raw_text.clone();
+        let draft_attachments = self.new_session_attachments.clone();
+        let draft_command_entry = self.new_session_command_entry.clone();
         let (text, attachments) =
             composer_submission_payload(&raw_text, &self.new_session_attachments);
         self.sync_composer_command_entry(ComposerTarget::NewSession, cx);
@@ -8689,17 +9105,38 @@ impl VibexWorkbench {
         );
         let title = session_title_from_first_message(&text);
         let has_initial_message = !text.trim().is_empty() || !attachments.is_empty();
+        self.new_session_workspace.begin_submission();
         self.agent_action_pending = true;
         self.new_session_error = None;
         self.clear_suggestions();
         let generation = self.session_generation;
+        let backend = self.backend.clone();
         let (created_tx, mut created_rx) = mpsc::unbounded_channel();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let workspace_root = if workspace_root.is_empty() {
-                ensure_temporary_session_root()?
+            let workspace = if let Some(workspace) = selected_workspace {
+                Some(workspace)
+            } else if let Some(request) = worktree_mutation {
+                let backend = backend.ok_or_else(|| {
+                    vibex_backend::BackendError::offline(
+                        "backend_unavailable",
+                        "backend is unavailable for Worktree creation",
+                    )
+                })?;
+                let result = backend.git().git_worktree_create(request).await?;
+                let workspace = result.workspace;
+                let _ = created_tx.send(NewSessionCreateSignal::WorkspaceReady(workspace.clone()));
+                Some(workspace)
             } else {
-                workspace_root
+                origin_workspace
             };
+            let (workspace_root, workspace_mode) = workspace
+                .as_ref()
+                .map(|workspace| (workspace.root_path.clone(), workspace.mode))
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    ensure_temporary_session_root()
+                        .map(|root| (root, WorkspaceMode::CurrentCheckout))
+                })?;
             let session = runtime
                 .agent()
                 .manager()
@@ -8768,7 +9205,11 @@ impl VibexWorkbench {
             };
             let initial_message_error = announce_created_session_before_initial_message(
                 created_tx,
-                (session.clone(), workspaces, has_initial_message),
+                NewSessionCreateSignal::SessionReady(
+                    session.clone(),
+                    workspaces,
+                    has_initial_message,
+                ),
                 initial_message,
             )
             .await
@@ -8779,7 +9220,7 @@ impl VibexWorkbench {
                 .get_session(&session.id)
                 .await
                 .ok();
-            Ok::<_, vibex_core::VibexError>((
+            Ok::<_, vibex_backend::BackendError>((
                 session.id,
                 has_initial_message,
                 initial_message_error,
@@ -8788,10 +9229,40 @@ impl VibexWorkbench {
         });
         let new_session_input = self.new_session_input.clone();
         cx.spawn_in(window, async move |entity: WeakEntity<Self>, cx| {
-            let (created_session_id, turn_generation) =
-                if let Some((session, workspaces, has_initial_message)) = created_rx.recv().await {
-                    entity
-                        .update_in(cx, |this, window, cx| {
+            let mut created_session_id = None;
+            let mut turn_generation = None;
+            while let Some(signal) = created_rx.recv().await {
+                match signal {
+                    NewSessionCreateSignal::WorkspaceReady(workspace) => {
+                        let _ = entity.update_in(cx, |this, _window, cx| {
+                            this.new_session_workspace
+                                .mark_workspace_ready(workspace.clone());
+                            if let Some(project) =
+                                this.new_session_workspace.project_id.as_ref().and_then(
+                                    |project_id| {
+                                        this.workspaces
+                                            .iter()
+                                            .find(|(project, _)| project.id == *project_id)
+                                            .map(|(project, _)| project.clone())
+                                    },
+                                )
+                            {
+                                this.workspaces
+                                    .retain(|(_, current)| current.id != workspace.id);
+                                this.workspaces.push((project, workspace.clone()));
+                            }
+                            this.activate_workspace(workspace, cx);
+                            this.reconcile_sidebar_state();
+                            this.refresh_workspace_contexts(cx);
+                            cx.notify();
+                        });
+                    }
+                    NewSessionCreateSignal::SessionReady(
+                        session,
+                        workspaces,
+                        has_initial_message,
+                    ) => {
+                        let update = entity.update_in(cx, |this, _window, cx| {
                             if let Some(workspaces) = workspaces {
                                 this.workspaces = workspaces;
                             }
@@ -8802,14 +9273,14 @@ impl VibexWorkbench {
                             }
                             this.reconcile_sidebar_state();
                             let created_session_id = session_id.clone();
-
                             let turn_generation =
                                 if this.session_generation == generation && this.new_session_open {
-                                    this.new_session_attachments.clear();
-                                    this.new_session_draft_initialized = false;
-                                    this.new_session_command_entry = None;
-                                    new_session_input
-                                        .update(cx, |input, cx| input.set_value("", window, cx));
+                                    this.new_session_workspace
+                                        .mark_stage(if has_initial_message {
+                                            NewSessionSubmissionStage::SendingPrompt
+                                        } else {
+                                            NewSessionSubmissionStage::StartingAgent
+                                        });
                                     this.select_session_with_history(session_id, false, cx);
                                     if has_initial_message {
                                         this.rebuild_timeline_sizes();
@@ -8821,21 +9292,24 @@ impl VibexWorkbench {
                                     this.agent_action_pending = false;
                                     None
                                 };
+                            this.refresh_workspace_contexts(cx);
                             cx.notify();
                             (created_session_id, turn_generation)
-                        })
-                        .ok()
-                        .map_or((None, None), |(session_id, turn_generation)| {
-                            (Some(session_id), turn_generation)
-                        })
-                } else {
-                    (None, None)
-                };
+                        });
+                        if let Ok((session_id, generation)) = update {
+                            created_session_id = Some(session_id);
+                            turn_generation = generation;
+                        }
+                        break;
+                    }
+                }
+            }
             let outcome = runner.await;
-            let _ = entity.update_in(cx, |this, _window, cx| {
+            let _ = entity.update_in(cx, |this, window, cx| {
                 if let Some(session_id) = created_session_id.as_ref() {
                     this.set_session_turn_pending(session_id, false);
                 }
+                this.agent_action_pending = false;
                 match outcome {
                     Ok(Ok((
                         session_id,
@@ -8861,19 +9335,33 @@ impl VibexWorkbench {
                         if let Some(error) = initial_message_error {
                             this.runtime_note =
                                 Some(format!("Session created; initial message failed: {error}"));
+                            if this.selected_session_id.as_ref() == Some(&session_id) {
+                                this.composer_input.update(cx, |input, cx| {
+                                    input.set_value(draft_raw_text.clone(), window, cx)
+                                });
+                                this.composer_attachments = draft_attachments.clone();
+                                this.composer_command_entry = draft_command_entry.clone();
+                            }
                         }
+                        this.new_session_attachments.clear();
+                        this.new_session_draft_initialized = false;
+                        this.new_session_command_entry = None;
+                        new_session_input.update(cx, |input, cx| input.set_value("", window, cx));
+                        this.new_session_workspace.reset_after_success();
                         this.reconcile_sidebar_state();
+                        this.refresh_workspace_contexts(cx);
                     }
                     Ok(Err(error)) => {
                         if this.session_generation == generation && this.new_session_open {
-                            this.agent_action_pending = false;
+                            this.new_session_workspace.mark_failed(error.code.clone());
                             this.new_session_error =
                                 Some(format!("{}: {}", error.code, error.message));
                         }
                     }
                     Err(error) => {
                         if this.session_generation == generation && this.new_session_open {
-                            this.agent_action_pending = false;
+                            this.new_session_workspace
+                                .mark_failed("new_session_task_failed");
                             this.new_session_error =
                                 Some(format!("session creation failed: {error}"));
                         }
@@ -9907,7 +10395,7 @@ impl VibexWorkbench {
         let project_ids = self
             .workspaces
             .iter()
-            .map(|(_, workspace)| workspace.id.as_str().to_string())
+            .map(|(project, _)| project.id.as_str().to_string())
             .collect::<BTreeSet<_>>();
         toggle_sidebar_project_collapse_all(
             &mut self.sidebar_state.collapsed_ids,
@@ -9915,6 +10403,15 @@ impl VibexWorkbench {
             &project_ids,
         );
         self.queue_agent_ui_state();
+        cx.notify();
+    }
+
+    fn toggle_sidebar_hierarchy_mode(&mut self, cx: &mut Context<Self>) {
+        self.ui_state.sidebar.hierarchy_mode = match self.ui_state.sidebar.hierarchy_mode {
+            SidebarHierarchyMode::Compact => SidebarHierarchyMode::Detailed,
+            SidebarHierarchyMode::Detailed => SidebarHierarchyMode::Compact,
+        };
+        self.queue_ui_state();
         cx.notify();
     }
 
@@ -11222,9 +11719,22 @@ impl VibexWorkbench {
         self.new_session_input.update(cx, |input, cx| {
             input.set_placeholder(strings.new_session_prompt_placeholder, window, cx)
         });
-        self.new_session_workspace_input.update(cx, |input, cx| {
-            input.set_placeholder(strings.new_session_project_placeholder, window, cx)
-        });
+        self.new_session_worktree_name_input
+            .update(cx, |input, cx| {
+                input.set_placeholder(
+                    locale::text("Worktree name", "Worktree 名称", "Worktree 名稱"),
+                    window,
+                    cx,
+                )
+            });
+        self.new_session_worktree_path_input
+            .update(cx, |input, cx| {
+                input.set_placeholder(
+                    locale::text("Managed path", "托管路径", "受管路徑"),
+                    window,
+                    cx,
+                )
+            });
         self.new_session_project_search.update(cx, |input, cx| {
             input.set_placeholder(strings.new_session_search_project, window, cx)
         });
@@ -11447,10 +11957,35 @@ impl VibexWorkbench {
 
     fn render_title_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let strings = self.strings();
-        let workspace_label = self
-            .selected_session()
-            .map(|session| workspace_display_name(&session.workspace_root))
+        let selected_context = self.selected_session().and_then(|session| {
+            self.workspace_contexts
+                .get(session.workspace_id.as_str())
+                .cloned()
+        });
+        let workspace_tooltip = selected_context
+            .as_ref()
+            .map(|context| context.workspace_root.clone());
+        let workspace_label = selected_context
+            .as_ref()
+            .map(|context| {
+                let branch = context
+                    .branch
+                    .as_deref()
+                    .unwrap_or_else(|| locale::text("No branch", "无分支", "無分支"));
+                let identity = match context.workspace_mode {
+                    WorkspaceMode::CurrentCheckout => {
+                        locale::text("Current Checkout", "当前目录", "目前目錄")
+                    }
+                    WorkspaceMode::VibexWorktree => "Worktree",
+                };
+                format!("{} · {branch} · {identity}", context.project_name)
+            })
+            .or_else(|| {
+                self.selected_session()
+                    .map(|session| workspace_display_name(&session.workspace_root))
+            })
             .unwrap_or_else(|| strings.no_workspace.to_string());
+        let workspace_tooltip = workspace_tooltip.unwrap_or_else(|| workspace_label.clone());
         let sidebar_selected = if self.last_visibility.sidebar_docked {
             self.ui_state.workbench.sidebar_visible
         } else {
@@ -11615,10 +12150,14 @@ impl VibexWorkbench {
                             .px_4()
                             .child(
                                 div()
+                                    .id("title-workspace-context")
                                     .min_w_0()
                                     .truncate()
                                     .text_sm()
                                     .font_semibold()
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(workspace_tooltip.clone()).build(window, cx)
+                                    })
                                     .child(workspace_label),
                             ),
                     )
@@ -11700,11 +12239,13 @@ impl VibexWorkbench {
             });
         let mut group_elements = Vec::with_capacity(groups.len());
         for group in groups {
-            let active = sidebar_project_is_active(
-                selected_workspace_id.as_deref(),
-                group.workspace.id.as_str(),
-                self.selected_session_id.is_some(),
-            );
+            let active = group.workspaces.iter().any(|workspace| {
+                sidebar_project_is_active(
+                    selected_workspace_id.as_deref(),
+                    workspace.workspace.id.as_str(),
+                    self.selected_session_id.is_some(),
+                )
+            });
             group_elements.push(self.render_sidebar_project(
                 group,
                 active,
@@ -11818,6 +12359,47 @@ impl VibexWorkbench {
                         h_flex()
                             .items_center()
                             .gap_1()
+                            .child(
+                                Button::new("sidebar-toggle-hierarchy")
+                                    .small()
+                                    .ghost()
+                                    .compact()
+                                    .w(px(28.0))
+                                    .h(px(28.0))
+                                    .selected(
+                                        self.ui_state.sidebar.hierarchy_mode
+                                            == SidebarHierarchyMode::Detailed,
+                                    )
+                                    .icon(
+                                        if self.ui_state.sidebar.hierarchy_mode
+                                            == SidebarHierarchyMode::Detailed
+                                        {
+                                            IconName::Folder
+                                        } else {
+                                            IconName::Menu
+                                        },
+                                    )
+                                    .tooltip(
+                                        if self.ui_state.sidebar.hierarchy_mode
+                                            == SidebarHierarchyMode::Detailed
+                                        {
+                                            locale::text(
+                                                "Detailed workspace hierarchy",
+                                                "详细工作区层级",
+                                                "詳細工作區層級",
+                                            )
+                                        } else {
+                                            locale::text(
+                                                "Compact session hierarchy",
+                                                "简洁会话层级",
+                                                "簡潔工作階段層級",
+                                            )
+                                        },
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_sidebar_hierarchy_mode(cx)
+                                    })),
+                            )
                             .child(
                                 Button::new("sidebar-toggle-batch")
                                     .small()
@@ -12006,39 +12588,49 @@ impl VibexWorkbench {
 
     fn render_sidebar_project(
         &mut self,
-        group: SidebarWorkspaceGroup,
+        group: SidebarProjectProjection,
         active: bool,
         reorder_enabled: bool,
         strings: Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let workspace_id = group.workspace.id.as_str().to_string();
         let project_id = group.project.id.clone();
+        let project_id_string = project_id.as_str().to_string();
         let project_name = group.project.name.clone();
-        let workspace_root = group.workspace.root_path.clone();
-        let workspace_mode = group.workspace.mode;
-        let collapsed = self.sidebar_state.collapsed_ids.contains(&workspace_id);
-        let project_session_ids = self
-            .sessions
+        let Some(current_workspace) = group
+            .workspaces
             .iter()
-            .filter(|session| session.workspace_id == group.workspace.id)
+            .find(|workspace| workspace.workspace.mode == WorkspaceMode::CurrentCheckout)
+            .or_else(|| group.workspaces.first())
+            .map(|workspace| workspace.workspace.clone())
+        else {
+            return Empty.into_any_element();
+        };
+        let collapsed = self
+            .sidebar_state
+            .collapsed_ids
+            .contains(&project_id_string);
+        let project_session_ids = group
+            .compact_sessions
+            .iter()
             .map(|session| session.id.as_str().to_string())
             .collect::<Vec<_>>();
         let project_has_sessions = !project_session_ids.is_empty();
         let selection_state =
             sidebar_selection_state(&project_session_ids, &self.sidebar_state.selected_ids);
-        let hover_group: SharedString = format!("sidebar-project-{workspace_id}").into();
+        let hover_group: SharedString = format!("sidebar-project-{project_id_string}").into();
         let active_drop_after = self
             .sidebar_project_drop_target
             .as_ref()
             .and_then(|target| {
-                (cx.has_active_drag() && target.workspace_id == workspace_id)
+                (cx.has_active_drag() && target.project_id == project_id_string)
                     .then_some(target.after)
             });
-        let workspace_for_click = group.workspace.clone();
-        let workspace_for_new = (workspace_root.clone(), workspace_mode);
+        let workspace_for_click = current_workspace.clone();
+        let click_project_id = project_id.clone();
+        let new_session_project_id = project_id.clone();
         let batch_ids = project_session_ids.clone();
-        let import_workspace = (workspace_root.clone(), workspace_mode);
+        let import_workspace = (current_workspace.root_path.clone(), current_workspace.mode);
         let menu_entity = cx.weak_entity();
         let import_entity = cx.weak_entity();
         let delete_entity = cx.weak_entity();
@@ -12050,7 +12642,7 @@ impl VibexWorkbench {
         let new_session_label = sidebar_new_session_for_project_label(locale, &project_name);
 
         let project_row = div()
-            .id(format!("sidebar-project-row-{workspace_id}"))
+            .id(format!("sidebar-project-row-{project_id_string}"))
             .group(hover_group.clone())
             .relative()
             .h(px(32.0))
@@ -12066,7 +12658,11 @@ impl VibexWorkbench {
             })
             .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.45)))
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.activate_and_toggle_workspace(workspace_for_click.clone(), cx)
+                this.activate_and_toggle_project(
+                    click_project_id.clone(),
+                    workspace_for_click.clone(),
+                    cx,
+                )
             }))
             .child(
                 h_flex()
@@ -12099,7 +12695,7 @@ impl VibexWorkbench {
             .when(self.sidebar_batch_mode, |this| {
                 this.child(
                     div()
-                        .id(format!("sidebar-project-select-{workspace_id}"))
+                        .id(format!("sidebar-project-select-{project_id_string}"))
                         .absolute()
                         .left_2()
                         .top(px(9.0))
@@ -12119,7 +12715,7 @@ impl VibexWorkbench {
             .when(!self.sidebar_batch_mode, |this| {
                 this.child(
                     h_flex()
-                        .id(format!("sidebar-project-actions-{workspace_id}"))
+                        .id(format!("sidebar-project-actions-{project_id_string}"))
                         .absolute()
                         .right_1()
                         .top_1()
@@ -12130,7 +12726,7 @@ impl VibexWorkbench {
                         .group_hover(&hover_group, |style| style.visible())
                         .on_click(|_, _, cx| cx.stop_propagation())
                         .child(
-                            Button::new(format!("sidebar-project-menu-{workspace_id}"))
+                            Button::new(format!("sidebar-project-menu-{project_id_string}"))
                                 .xsmall()
                                 .ghost()
                                 .compact()
@@ -12181,7 +12777,7 @@ impl VibexWorkbench {
                                 .anchor(gpui::Anchor::TopRight),
                         )
                         .child(
-                            Button::new(format!("sidebar-project-new-{workspace_id}"))
+                            Button::new(format!("sidebar-project-new-{project_id_string}"))
                                 .xsmall()
                                 .ghost()
                                 .compact()
@@ -12193,7 +12789,9 @@ impl VibexWorkbench {
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     cx.stop_propagation();
                                     this.open_new_session(
-                                        Some(workspace_for_new.clone()),
+                                        Some(NewSessionOpenTarget::Project(
+                                            new_session_project_id.clone(),
+                                        )),
                                         window,
                                         cx,
                                     )
@@ -12204,39 +12802,44 @@ impl VibexWorkbench {
 
         let mut session_elements = Vec::new();
         if !collapsed {
-            if group.sessions.is_empty() {
-                session_elements.push(
-                    h_flex()
-                        .h(px(28.0))
-                        .items_center()
-                        .gap_2()
-                        .text_size(px(13.0))
-                        .text_color(cx.theme().sidebar_foreground.opacity(0.45))
-                        .child(sidebar_icon("icons/vibex/message-square.svg").size(px(14.0)))
-                        .child(strings.sidebar_no_sessions)
-                        .into_any_element(),
-                );
-            } else {
-                for session in group.sessions {
-                    session_elements.push(self.render_sidebar_session(
-                        session,
-                        reorder_enabled,
-                        strings,
-                        cx,
-                    ));
+            match self.ui_state.sidebar.hierarchy_mode {
+                SidebarHierarchyMode::Compact => {
+                    if group.compact_sessions.is_empty() {
+                        session_elements.push(sidebar_empty_sessions(strings, cx));
+                    } else {
+                        for session in group.compact_sessions {
+                            session_elements.push(self.render_sidebar_session(
+                                session,
+                                reorder_enabled,
+                                true,
+                                strings,
+                                cx,
+                            ));
+                        }
+                    }
+                }
+                SidebarHierarchyMode::Detailed => {
+                    for workspace in group.workspaces {
+                        session_elements.push(self.render_sidebar_workspace(
+                            workspace,
+                            reorder_enabled,
+                            strings,
+                            cx,
+                        ));
+                    }
                 }
             }
         }
 
         let drag_payload = SidebarProjectDrag {
-            workspace_id: workspace_id.clone(),
+            project_id: project_id_string.clone(),
             label: project_name.into(),
         };
         let drag_entity = cx.weak_entity();
-        let drag_target_workspace_id = workspace_id.clone();
-        let drop_target_workspace_id = workspace_id.clone();
+        let drag_target_project_id = project_id_string.clone();
+        let drop_target_project_id = project_id_string.clone();
         v_flex()
-            .id(format!("sidebar-project-{workspace_id}"))
+            .id(format!("sidebar-project-{project_id_string}"))
             .relative()
             .w_full()
             .min_w_0()
@@ -12265,9 +12868,9 @@ impl VibexWorkbench {
                     move |this, event: &DragMoveEvent<SidebarProjectDrag>, _, cx| {
                         let drag = event.drag(cx);
                         let next = (event.bounds.contains(&event.event.position)
-                            && drag.workspace_id != drag_target_workspace_id)
+                            && drag.project_id != drag_target_project_id)
                             .then_some(SidebarProjectDropTarget {
-                                workspace_id: drag_target_workspace_id.clone(),
+                                project_id: drag_target_project_id.clone(),
                                 after: event.event.position.y >= event.bounds.center().y,
                             });
                         if this.sidebar_project_drop_target != next {
@@ -12280,11 +12883,11 @@ impl VibexWorkbench {
                     move |this, drag: &SidebarProjectDrag, _, cx| {
                         let target = this.sidebar_project_drop_target.take();
                         if let Some(target) =
-                            target.filter(|target| target.workspace_id == drop_target_workspace_id)
+                            target.filter(|target| target.project_id == drop_target_project_id)
                         {
                             this.move_project_order_relative(
-                                &drag.workspace_id,
-                                &target.workspace_id,
+                                &drag.project_id,
+                                &target.project_id,
                                 target.after,
                                 cx,
                             );
@@ -12301,8 +12904,166 @@ impl VibexWorkbench {
                         .w_full()
                         .min_w_0()
                         .gap(px(2.0))
-                        .pl_6()
+                        .when(
+                            self.ui_state.sidebar.hierarchy_mode == SidebarHierarchyMode::Compact,
+                            |this| this.pl_6(),
+                        )
+                        .when(
+                            self.ui_state.sidebar.hierarchy_mode == SidebarHierarchyMode::Detailed,
+                            |this| this.pl_3(),
+                        )
                         .children(session_elements),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_sidebar_workspace(
+        &mut self,
+        projection: SidebarWorkspaceProjection,
+        reorder_enabled: bool,
+        strings: Strings,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let workspace = projection.workspace.clone();
+        let workspace_id = workspace.id.as_str().to_string();
+        let branch = projection
+            .context
+            .branch
+            .clone()
+            .unwrap_or_else(|| locale::text("No branch", "无分支", "無分支").to_string());
+        let identity = match workspace.mode {
+            WorkspaceMode::CurrentCheckout => {
+                locale::text("Current Checkout", "当前目录", "目前目錄")
+            }
+            WorkspaceMode::VibexWorktree => "Worktree",
+        };
+        let status =
+            sidebar_workspace_agent_summary_label(self.resolved_locale(), projection.agent_summary);
+        let dirty = projection.context.git_dirty;
+        let collapsed = self
+            .ui_state
+            .sidebar
+            .collapsed_workspace_ids
+            .contains(&workspace_id);
+        let selected =
+            self.ui_state.workbench.selected_workspace_id.as_deref() == Some(workspace_id.as_str());
+        let workspace_for_click = workspace.clone();
+        let workspace_for_new = workspace.id.clone();
+        let tooltip = format!("{identity} · {branch} · {}", workspace.root_path);
+        let row = div()
+            .id(format!("sidebar-workspace-row-{workspace_id}"))
+            .relative()
+            .w_full()
+            .min_w_0()
+            .min_h(px(40.0))
+            .cursor_pointer()
+            .rounded(px(6.0))
+            .bg(if selected {
+                cx.theme().sidebar_accent.opacity(0.42)
+            } else {
+                cx.theme().transparent
+            })
+            .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.32)))
+            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.activate_and_toggle_sidebar_workspace(workspace_for_click.clone(), cx)
+            }))
+            .child(
+                h_flex()
+                    .min_h(px(40.0))
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap(px(7.0))
+                    .pl_2()
+                    .pr(px(34.0))
+                    .child(
+                        sidebar_icon("icons/vibex/git-branch.svg")
+                            .size(px(14.0))
+                            .text_color(cx.theme().sidebar_foreground.opacity(0.62)),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(px(1.0))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(12.0))
+                                    .font_medium()
+                                    .child(branch),
+                            )
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .gap(px(5.0))
+                                    .text_size(px(10.0))
+                                    .text_color(cx.theme().sidebar_foreground.opacity(0.48))
+                                    .child(identity)
+                                    .when(dirty, |this| {
+                                        this.child(locale::text("Dirty", "有更改", "有變更"))
+                                    })
+                                    .when_some(status, |this, status| {
+                                        this.child(div().truncate().child(status))
+                                    }),
+                            ),
+                    ),
+            )
+            .child(
+                Button::new(format!("sidebar-workspace-new-{workspace_id}"))
+                    .xsmall()
+                    .ghost()
+                    .compact()
+                    .absolute()
+                    .right_1()
+                    .top(px(8.0))
+                    .w(px(24.0))
+                    .h(px(24.0))
+                    .icon(IconName::Plus)
+                    .tooltip(locale::text(
+                        "New Session in this Workspace",
+                        "在此工作区新建会话",
+                        "在此工作區新增工作階段",
+                    ))
+                    .disabled(self.agent_action_pending)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.open_new_session(
+                            Some(NewSessionOpenTarget::Workspace(workspace_for_new.clone())),
+                            window,
+                            cx,
+                        );
+                    })),
+            );
+
+        let sessions = if projection.sessions.is_empty() {
+            vec![sidebar_empty_sessions(strings, cx)]
+        } else {
+            projection
+                .sessions
+                .into_iter()
+                .map(|session| {
+                    self.render_sidebar_session(session, reorder_enabled, false, strings, cx)
+                })
+                .collect()
+        };
+        v_flex()
+            .id(format!("sidebar-workspace-{workspace_id}"))
+            .w_full()
+            .min_w_0()
+            .gap(px(2.0))
+            .child(row)
+            .when(!collapsed, |this| {
+                this.child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap(px(2.0))
+                        .pl_5()
+                        .children(sessions),
                 )
             })
             .into_any_element()
@@ -12312,6 +13073,7 @@ impl VibexWorkbench {
         &mut self,
         session: AgentSession,
         reorder_enabled: bool,
+        show_worktree_identity: bool,
         strings: Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -12323,6 +13085,16 @@ impl VibexWorkbench {
             .contains(session.id.as_str());
         let renaming = self.sidebar_renaming_session_id.as_ref() == Some(&session.id);
         let session_id_string = session.id.as_str().to_string();
+        let worktree_tooltip = (show_worktree_identity
+            && session.workspace_mode == WorkspaceMode::VibexWorktree)
+            .then(|| {
+                let branch = self
+                    .workspace_contexts
+                    .get(session.workspace_id.as_str())
+                    .and_then(|context| context.branch.as_deref())
+                    .unwrap_or("unknown");
+                format!("Worktree · {branch}")
+            });
         let selected_desired_agent_id = selected
             .then(|| {
                 self.runtime_selection
@@ -12399,6 +13171,20 @@ impl VibexWorkbench {
                                 sidebar_icon("icons/vibex/pin.svg")
                                     .size(px(12.0))
                                     .text_color(cx.theme().warning),
+                            )
+                        })
+                        .when_some(worktree_tooltip.clone(), |this, tooltip| {
+                            this.child(
+                                div()
+                                    .id(format!("sidebar-session-worktree-{session_id_string}"))
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(tooltip.clone()).build(window, cx)
+                                    })
+                                    .child(
+                                        sidebar_icon("icons/vibex/git-branch.svg")
+                                            .size(px(12.0))
+                                            .text_color(cx.theme().accent_foreground),
+                                    ),
                             )
                         })
                         .child(sidebar_agent_logo(sidebar_agent_id.as_str(), selected, cx))
@@ -12610,6 +13396,20 @@ impl VibexWorkbench {
                                     sidebar_icon("icons/vibex/pin.svg")
                                         .size(px(12.0))
                                         .text_color(cx.theme().warning),
+                                )
+                            })
+                            .when_some(worktree_tooltip, |this, tooltip| {
+                                this.child(
+                                    div()
+                                        .id(format!("sidebar-session-worktree-{session_id_string}"))
+                                        .tooltip(move |window, cx| {
+                                            Tooltip::new(tooltip.clone()).build(window, cx)
+                                        })
+                                        .child(
+                                            sidebar_icon("icons/vibex/git-branch.svg")
+                                                .size(px(12.0))
+                                                .text_color(cx.theme().accent_foreground),
+                                        ),
                                 )
                             })
                             .child(sidebar_agent_logo(sidebar_agent_id.as_str(), selected, cx))
@@ -13605,8 +14405,6 @@ impl VibexWorkbench {
         let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
         let popover_color = theme::semantic_color("popover", is_dark);
         let popover_foreground = theme::semantic_color("popover-foreground", is_dark);
-        let accent_color = theme::semantic_color("accent", is_dark);
-        let accent_foreground = theme::semantic_color("accent-foreground", is_dark);
         let border_color = theme::semantic_color("border", is_dark);
         let input_color = theme::semantic_color("input", is_dark);
         let ring_color = theme::semantic_color("ring", is_dark);
@@ -13752,20 +14550,14 @@ impl VibexWorkbench {
                 .collect::<Vec<_>>()
         };
 
-        let workspace_root = self
-            .new_session_workspace_input
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        let active_workspace = self
-            .workspaces
-            .iter()
-            .find(|(_, workspace)| workspace.root_path == workspace_root);
-        let workspace_label = active_workspace
-            .map(|(project, _)| project.name.clone())
-            .or_else(|| {
-                (!workspace_root.is_empty()).then(|| workspace_display_name(&workspace_root))
+        let active_project_id = self.new_session_workspace.project_id.clone();
+        let workspace_label = active_project_id
+            .as_ref()
+            .and_then(|project_id| {
+                self.workspaces
+                    .iter()
+                    .find(|(project, _)| project.id == *project_id)
+                    .map(|(project, _)| project.name.clone())
             })
             .unwrap_or_else(|| strings.new_session_working_in.to_string());
         let project_query = self
@@ -13775,27 +14567,24 @@ impl VibexWorkbench {
             .trim()
             .to_lowercase();
         let project_rows = self
-            .workspaces
-            .iter()
-            .filter(|(project, workspace)| {
-                project_workspace_matches_search(project, workspace, &project_query)
-            })
-            .cloned()
-            .map(|(project, workspace)| {
+            .sidebar_workspace_groups(&project_query)
+            .into_iter()
+            .map(|projection| {
+                let project = projection.project;
                 let project_name = project.name;
-                let workspace_id = workspace.id.as_str().to_string();
-                let workspace_root = workspace.root_path;
-                let workspace_mode = workspace.mode;
+                let project_id = project.id;
+                let project_id_string = project_id.as_str().to_string();
+                let selected = active_project_id.as_ref() == Some(&project_id);
                 button_with_aria_label(
-                    Button::new(format!("new-session-project-{workspace_id}"))
+                    Button::new(format!("new-session-project-{project_id_string}"))
                         .small()
                         .ghost()
                         .w_full()
                         .h(px(28.0))
                         .px_2()
+                        .selected(selected)
                         .rounded(gpui_component::button::ButtonRounded::Size(px(8.0)))
                         .text_color(popover_foreground)
-                        .hover(|this| this.bg(accent_color).text_color(accent_foreground))
                         .child(
                             h_flex()
                                 .w_full()
@@ -13814,9 +14603,8 @@ impl VibexWorkbench {
                                 ),
                         )
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.set_new_session_workspace(
-                                workspace_root.clone(),
-                                workspace_mode,
+                            this.select_new_session_target(
+                                NewSessionOpenTarget::Project(project_id.clone()),
                                 window,
                                 cx,
                             );
@@ -13916,7 +14704,6 @@ impl VibexWorkbench {
                     .px_2()
                     .rounded(gpui_component::button::ButtonRounded::Size(px(8.0)))
                     .text_color(popover_foreground)
-                    .hover(|this| this.bg(accent_color).text_color(accent_foreground))
                     .child(
                         h_flex()
                             .w_full()
@@ -13961,14 +14748,6 @@ impl VibexWorkbench {
             .tooltip(strings.new_session_project_label)
             .text_color(muted_foreground)
             .when(!project_menu_open, |this| this.bg(cx.theme().transparent))
-            .hover(|this| {
-                this.bg(if is_dark {
-                    muted_color.opacity(0.50)
-                } else {
-                    muted_color
-                })
-                .text_color(popover_foreground)
-            })
             .when(project_menu_open, |this| {
                 this.bg(muted_color).text_color(popover_foreground)
             })
@@ -13999,9 +14778,404 @@ impl VibexWorkbench {
             .child(project_menu_content)
             .into_any_element();
 
+        let can_create_worktree = self.backend.as_ref().is_some_and(|backend| {
+            backend
+                .capabilities()
+                .git
+                .supports(BackendOperation::GitWorktreeCreate)
+        });
+        let fixed_workspace = self.new_session_workspace.fixed_workspace.is_some();
+        let worktree_selected = self.new_session_workspace.location
+            == NewSessionLocation::NewWorktree
+            && !fixed_workspace;
+        let worktree_ready = can_create_worktree && self.new_session_workspace.worktree_available();
+        let worktree_reason = new_session_worktree_unavailable_reason(
+            self.resolved_locale(),
+            &self.new_session_workspace,
+            self.new_session_eligibility_error.as_deref(),
+            can_create_worktree,
+        );
+        let current_location_label = if fixed_workspace {
+            locale::text("This Workspace", "此工作区", "此工作區")
+        } else {
+            locale::text("Current Checkout", "当前项目目录", "目前專案目錄")
+        };
+        let location_control = h_flex()
+            .min_w_0()
+            .max_w(px(392.0))
+            .flex_1()
+            .rounded(px(7.0))
+            .bg(muted_color.opacity(0.55))
+            .p(px(2.0))
+            .child(
+                Button::new("new-session-location-current")
+                    .xsmall()
+                    .ghost()
+                    .h(px(28.0))
+                    .min_w(px(120.0))
+                    .flex_1()
+                    .justify_center()
+                    .selected(!worktree_selected)
+                    .icon(IconName::Folder)
+                    .label(current_location_label)
+                    .disabled(self.agent_action_pending)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.set_new_session_location(
+                            NewSessionLocation::CurrentCheckout,
+                            window,
+                            cx,
+                        )
+                    })),
+            )
+            .when(can_create_worktree && !fixed_workspace, |this| {
+                this.child(
+                    Button::new("new-session-location-worktree")
+                        .xsmall()
+                        .ghost()
+                        .h(px(28.0))
+                        .min_w(px(152.0))
+                        .flex_1()
+                        .justify_center()
+                        .selected(worktree_selected)
+                        .icon(Icon::default().path("icons/vibex/git-branch.svg"))
+                        .label(locale::text(
+                            "New Worktree",
+                            "新建隔离工作区",
+                            "新增隔離工作區",
+                        ))
+                        .tooltip(worktree_reason.clone().unwrap_or_else(|| {
+                            locale::text(
+                                "Create an isolated Git Worktree",
+                                "创建隔离的 Git Worktree",
+                                "建立隔離的 Git Worktree",
+                            )
+                            .to_string()
+                        }))
+                        .disabled(self.agent_action_pending || !worktree_ready)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.set_new_session_location(
+                                NewSessionLocation::NewWorktree,
+                                window,
+                                cx,
+                            )
+                        })),
+                )
+            });
+
+        let selected_base_ref = self.new_session_workspace.base_ref.clone();
+        let base_ref_options = self
+            .new_session_workspace
+            .eligibility
+            .as_ref()
+            .map(|eligibility| eligibility.selectable_base_refs.clone())
+            .unwrap_or_default();
+        let base_ref_entity = cx.weak_entity();
+        let selected_base_ref_for_menu = selected_base_ref.clone();
+        let base_ref_button = Button::new("new-session-base-ref")
+            .xsmall()
+            .ghost()
+            .h(px(32.0))
+            .max_w(px(208.0))
+            .px_2()
+            .tooltip(locale::text("Base branch", "基于分支", "基於分支"))
+            .disabled(self.agent_action_pending || base_ref_options.is_empty())
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .gap(px(6.0))
+                    .child(
+                        sidebar_icon("icons/vibex/git-branch.svg")
+                            .size(px(14.0))
+                            .text_color(muted_foreground),
+                    )
+                    .child(div().min_w_0().truncate().text_xs().child(
+                        selected_base_ref.clone().unwrap_or_else(|| {
+                            locale::text("Select base", "选择基线", "選擇基線").to_string()
+                        }),
+                    ))
+                    .child(Icon::new(IconName::ChevronDown).size(px(13.0))),
+            )
+            .dropdown_menu(move |menu, _, _| {
+                let mut menu = menu;
+                for base_ref in &base_ref_options {
+                    let entity = base_ref_entity.clone();
+                    let value = base_ref.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(base_ref.clone())
+                            .checked(selected_base_ref_for_menu.as_ref() == Some(base_ref))
+                            .on_click(move |_, _, cx| {
+                                let _ = entity.update(cx, |this, cx| {
+                                    this.set_new_session_base_ref(value.clone(), cx)
+                                });
+                            }),
+                    );
+                }
+                menu
+            });
+
+        let custom_path = self.new_session_workspace.worktree_path.trim();
+        let custom_path_invalid = self.new_session_workspace.path_touched
+            && (custom_path.is_empty()
+                || custom_path.len() > 4_096
+                || custom_path.chars().any(char::is_control)
+                || !custom_worktree_path_is_absolute(custom_path));
+        let worktree_name = self.new_session_workspace.worktree_name.trim();
+        let worktree_name_invalid = worktree_name.is_empty()
+            || worktree_name.len() > 128
+            || worktree_name.chars().any(char::is_control);
+        let default_worktree = active_project_id.as_ref().is_some_and(|project_id| {
+            self.ui_state
+                .sidebar
+                .project_location_preferences
+                .get(project_id.as_str())
+                == Some(&NewSessionLocation::NewWorktree)
+        });
+        let branch_preview = self.new_session_workspace.branch_name();
+        let path_preview = self.new_session_workspace.worktree_path.clone();
+        let settings_disabled = self.agent_action_pending
+            || self
+                .new_session_workspace
+                .submission
+                .created_workspace
+                .is_some();
+        let settings_panel_width =
+            (f32::from(window.viewport_size().width) - 24.0).clamp(280.0, 360.0);
+        let settings_panel = v_flex()
+            .w(px(settings_panel_width))
+            .min_w_0()
+            .gap_3()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(border_color)
+            .bg(popover_color)
+            .p_3()
+            .text_color(popover_foreground)
+            .shadow_lg()
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(div().text_sm().font_semibold().child(locale::text(
+                        "Worktree settings",
+                        "Worktree 设置",
+                        "Worktree 設定",
+                    )))
+                    .child(
+                        Button::new("new-session-worktree-restore-auto")
+                            .xsmall()
+                            .ghost()
+                            .compact()
+                            .w(px(28.0))
+                            .h(px(28.0))
+                            .icon(IconName::Undo)
+                            .tooltip(locale::text(
+                                "Restore automatic values",
+                                "恢复自动值",
+                                "還原自動值",
+                            ))
+                            .disabled(settings_disabled)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.restore_new_session_worktree_auto_values(window, cx)
+                            })),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted_foreground)
+                            .child(locale::text(
+                                "Worktree name",
+                                "Worktree 名称",
+                                "Worktree 名稱",
+                            )),
+                    )
+                    .child(
+                        div()
+                            .h(px(32.0))
+                            .rounded(px(6.0))
+                            .border_1()
+                            .border_color(if worktree_name_invalid {
+                                cx.theme().danger
+                            } else {
+                                input_color
+                            })
+                            .child(
+                                Input::new(&self.new_session_worktree_name_input)
+                                    .small()
+                                    .appearance(false)
+                                    .h_full()
+                                    .disabled(settings_disabled),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(11.0))
+                            .text_color(muted_foreground)
+                            .child(format!(
+                                "{}: {branch_preview}",
+                                locale::text("Branch", "分支", "分支")
+                            )),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted_foreground)
+                            .child(locale::text("Path", "路径", "路徑")),
+                    )
+                    .child(
+                        div()
+                            .h(px(32.0))
+                            .rounded(px(6.0))
+                            .border_1()
+                            .border_color(if custom_path_invalid {
+                                cx.theme().danger
+                            } else {
+                                input_color
+                            })
+                            .child(
+                                Input::new(&self.new_session_worktree_path_input)
+                                    .small()
+                                    .appearance(false)
+                                    .h_full()
+                                    .disabled(settings_disabled),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_size(px(11.0))
+                            .text_color(if custom_path_invalid {
+                                cx.theme().danger
+                            } else {
+                                muted_foreground
+                            })
+                            .child(if custom_path_invalid {
+                                locale::text(
+                                    "Choose an absolute path",
+                                    "请选择绝对路径",
+                                    "請選擇絕對路徑",
+                                )
+                                .to_string()
+                            } else {
+                                path_preview
+                            }),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(div().min_w_0().text_xs().child(locale::text(
+                        "Default to a new Worktree for this Project",
+                        "此项目默认新建 Worktree",
+                        "此專案預設新增 Worktree",
+                    )))
+                    .child(
+                        Switch::new("new-session-default-worktree")
+                            .small()
+                            .checked(default_worktree)
+                            .disabled(settings_disabled || !worktree_ready)
+                            .on_click(cx.listener(|this, enabled, _, cx| {
+                                this.set_new_session_default_worktree(*enabled, cx)
+                            })),
+                    ),
+            );
+        let settings_trigger = Button::new("new-session-worktree-settings")
+            .xsmall()
+            .ghost()
+            .compact()
+            .w(px(32.0))
+            .h(px(32.0))
+            .icon(IconName::Settings)
+            .selected(self.new_session_worktree_settings_open)
+            .tooltip(locale::text(
+                "Worktree settings",
+                "Worktree 设置",
+                "Worktree 設定",
+            ))
+            .disabled(settings_disabled);
+        let settings_button = Popover::new("new-session-worktree-settings-popover")
+            .appearance(false)
+            .open(self.new_session_worktree_settings_open)
+            .on_open_change(cx.listener(|this, open, _, cx| {
+                this.new_session_worktree_settings_open = *open;
+                cx.notify();
+            }))
+            .trigger(settings_trigger)
+            .child(settings_panel)
+            .into_any_element();
+        let workspace_controls = v_flex()
+            .w_full()
+            .min_w_0()
+            .gap(px(6.0))
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(workspace_button)
+                    .child(location_control)
+                    .when(worktree_selected, |this| {
+                        this.child(base_ref_button).child(settings_button)
+                    }),
+            )
+            .when_some(
+                (can_create_worktree && !fixed_workspace && !worktree_ready)
+                    .then_some(worktree_reason)
+                    .flatten(),
+                |this, reason| {
+                    this.child(
+                        h_flex()
+                            .min_w_0()
+                            .gap_1()
+                            .text_size(px(11.0))
+                            .text_color(muted_foreground)
+                            .child(div().min_w_0().flex_1().child(reason))
+                            .when(self.new_session_eligibility_error.is_some(), |this| {
+                                this.child(
+                                    Button::new("new-session-retry-worktree-probe")
+                                        .xsmall()
+                                        .ghost()
+                                        .compact()
+                                        .w(px(24.0))
+                                        .h(px(24.0))
+                                        .icon(IconName::Undo)
+                                        .tooltip(locale::text(
+                                            "Retry Git check",
+                                            "重试 Git 检查",
+                                            "重試 Git 檢查",
+                                        ))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.retry_new_session_eligibility(window, cx)
+                                        })),
+                                )
+                            }),
+                    )
+                },
+            );
+
+        let worktree_form_valid = !worktree_selected
+            || (worktree_ready
+                && self.new_session_workspace.base_ref.is_some()
+                && !worktree_name_invalid
+                && !custom_path_invalid);
         let can_create = matches!(self.runtime_status, RuntimeStatus::Ready)
             && has_agent_choices
             && self.new_session_runtime_selection.is_some()
+            && worktree_form_valid
             && !self.agent_action_pending;
         let input_geometry_entity = cx.weak_entity();
         h_flex()
@@ -14346,31 +15520,13 @@ impl VibexWorkbench {
                                         )
                                     })
                                     .child(
-                                        h_flex()
+                                        v_flex()
+                                            .w_full()
                                             .min_w_0()
-                                            .items_center()
-                                            .gap_2()
                                             .border_t_1()
                                             .border_color(cx.theme().border.opacity(0.50))
                                             .pt_2()
-                                            .child(workspace_button)
-                                            .child(
-                                                div()
-                                                    .h(px(32.0))
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .rounded(px(6.0))
-                                                    .bg(muted_color.opacity(0.45))
-                                                    .child(
-                                                        Input::new(
-                                                            &self.new_session_workspace_input,
-                                                        )
-                                                        .small()
-                                                        .appearance(false)
-                                                        .text_xs()
-                                                        .h_full(),
-                                                    ),
-                                            ),
+                                            .child(workspace_controls),
                                     )
                                     .when_some(self.new_session_error.clone(), |this, error| {
                                         this.child(
@@ -20978,6 +22134,142 @@ fn sidebar_project_is_active(
     !session_selected && selected_workspace_id == Some(workspace_id)
 }
 
+fn sidebar_empty_sessions(strings: Strings, cx: &App) -> AnyElement {
+    h_flex()
+        .h(px(28.0))
+        .items_center()
+        .gap_2()
+        .text_size(px(13.0))
+        .text_color(cx.theme().sidebar_foreground.opacity(0.45))
+        .child(sidebar_icon("icons/vibex/message-square.svg").size(px(14.0)))
+        .child(strings.sidebar_no_sessions)
+        .into_any_element()
+}
+
+fn sidebar_workspace_agent_summary_label(
+    locale: locale::ResolvedLocale,
+    summary: WorkspaceAgentSummary,
+) -> Option<String> {
+    let (count, en, zh_cn, zh_tw) = if summary.failed > 0 {
+        (summary.failed, "failed", "失败", "失敗")
+    } else if summary.needs_input > 0 {
+        (summary.needs_input, "needs input", "等待输入", "等待輸入")
+    } else if summary.running > 0 {
+        (summary.running, "running", "运行中", "執行中")
+    } else if summary.total > 0 {
+        (summary.total, "sessions", "个会话", "個工作階段")
+    } else {
+        return None;
+    };
+    Some(match locale {
+        locale::ResolvedLocale::En => format!("{count} {en}"),
+        locale::ResolvedLocale::ZhCn => format!("{count} {zh_cn}"),
+        locale::ResolvedLocale::ZhTw => format!("{count} {zh_tw}"),
+    })
+}
+
+fn new_session_worktree_unavailable_reason(
+    locale: locale::ResolvedLocale,
+    state: &NewSessionWorkspaceState,
+    probe_error: Option<&str>,
+    mutation_supported: bool,
+) -> Option<String> {
+    let localized = |en: &str, zh_cn: &str, zh_tw: &str| match locale {
+        locale::ResolvedLocale::En => en.to_string(),
+        locale::ResolvedLocale::ZhCn => zh_cn.to_string(),
+        locale::ResolvedLocale::ZhTw => zh_tw.to_string(),
+    };
+    if !mutation_supported {
+        return Some(localized(
+            "Worktree creation is unavailable on this client",
+            "此客户端不支持创建 Worktree",
+            "此用戶端不支援建立 Worktree",
+        ));
+    }
+    if state.project_id.is_none() {
+        return Some(localized(
+            "Choose a Project first",
+            "请先选择项目",
+            "請先選擇專案",
+        ));
+    }
+    if probe_error.is_some() {
+        return Some(localized(
+            "Git status could not be checked",
+            "无法检查 Git 状态",
+            "無法檢查 Git 狀態",
+        ));
+    }
+    let Some(eligibility) = state.eligibility.as_ref() else {
+        return Some(localized(
+            "Checking Git status...",
+            "正在检查 Git 状态...",
+            "正在檢查 Git 狀態...",
+        ));
+    };
+    match eligibility.state {
+        GitProjectEligibilityState::Probing => Some(localized(
+            "Checking Git status...",
+            "正在检查 Git 状态...",
+            "正在檢查 Git 狀態...",
+        )),
+        GitProjectEligibilityState::Eligible if eligibility.is_eligible() => None,
+        GitProjectEligibilityState::Eligible => Some(localized(
+            "No valid base branch is available",
+            "没有可用的基线分支",
+            "沒有可用的基線分支",
+        )),
+        GitProjectEligibilityState::Ineligible | GitProjectEligibilityState::Unknown => {
+            let reason = match eligibility.disabled_reason {
+                Some(GitProjectIneligibleReason::PathMissing) => localized(
+                    "Project path does not exist",
+                    "项目路径不存在",
+                    "專案路徑不存在",
+                ),
+                Some(GitProjectIneligibleReason::PathNotDirectory) => localized(
+                    "Project path is not a directory",
+                    "项目路径不是目录",
+                    "專案路徑不是目錄",
+                ),
+                Some(GitProjectIneligibleReason::GitUnavailable) => {
+                    localized("Git is unavailable", "Git 不可用", "Git 不可用")
+                }
+                Some(GitProjectIneligibleReason::NotWorkingTree) => localized(
+                    "Project is not a Git working tree",
+                    "项目不是 Git 工作目录",
+                    "專案不是 Git 工作目錄",
+                ),
+                Some(GitProjectIneligibleReason::BareRepository) => localized(
+                    "Bare repositories cannot create Worktrees here",
+                    "裸仓库无法在此创建 Worktree",
+                    "裸儲存庫無法在此建立 Worktree",
+                ),
+                Some(GitProjectIneligibleReason::UnbornHead) => localized(
+                    "Create the first commit before using Worktrees",
+                    "首次提交后才能使用 Worktree",
+                    "首次提交後才能使用 Worktree",
+                ),
+                Some(GitProjectIneligibleReason::BaseRefUnavailable) => localized(
+                    "No valid base branch is available",
+                    "没有可用的基线分支",
+                    "沒有可用的基線分支",
+                ),
+                Some(GitProjectIneligibleReason::RepositoryIdentityUnavailable) => localized(
+                    "Git repository identity is unavailable",
+                    "无法识别 Git 仓库",
+                    "無法識別 Git 儲存庫",
+                ),
+                Some(GitProjectIneligibleReason::Unknown) | None => localized(
+                    "Project is not eligible for Worktrees",
+                    "此项目无法使用 Worktree",
+                    "此專案無法使用 Worktree",
+                ),
+            };
+            Some(reason)
+        }
+    }
+}
+
 fn toggle_sidebar_project_collapse_all(
     collapsed_ids: &mut BTreeSet<String>,
     restore_snapshot: &mut Option<BTreeSet<String>>,
@@ -22193,6 +23485,7 @@ fn format_sidebar_session_time(
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 fn project_workspace_matches_search(
     project: &ProjectRecord,
     workspace: &WorkspaceRecord,
@@ -25104,6 +26397,17 @@ fn startup_loading_overlay(show_loading_indicator: bool, cx: &App) -> AnyElement
 
 impl Render for VibexWorkbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.initial_new_session_setup_pending {
+            self.initial_new_session_setup_pending = false;
+            let workbench = cx.weak_entity();
+            window.defer(cx, move |window, cx| {
+                let _ = workbench.update(cx, |this, cx| {
+                    if this.new_session_open && !this.new_session_draft_initialized {
+                        this.open_new_session(None, window, cx);
+                    }
+                });
+            });
+        }
         if self.appearance_reload_pending {
             self.appearance_reload_pending = false;
             let appearance = self.ui_state.appearance.clone();
@@ -28326,7 +29630,36 @@ mod tests {
             .expect("session selection should remain inspectable");
         assert!(!select_session.contains("new_session_attachments.clear"));
         assert!(!select_session.contains("new_session_input"));
-        assert!(source.contains("this.new_session_draft_initialized = sessions_empty;"));
+        let overview = source
+            .split_once("    fn load_agent_overview(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn refresh_workspace_contexts("))
+            .map(|(body, _)| body)
+            .expect("agent overview should remain inspectable");
+        assert!(!overview.contains("this.new_session_draft_initialized = sessions_empty;"));
+    }
+
+    #[test]
+    fn empty_session_startup_runs_the_normal_new_session_initialization_flow() {
+        let source = include_str!("app.rs");
+        let overview = source
+            .split_once("    fn load_agent_overview(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn refresh_workspace_contexts("))
+            .map(|(body, _)| body)
+            .expect("agent overview should remain inspectable");
+        assert!(overview.contains("sessions_empty && !this.new_session_draft_initialized"));
+        assert!(overview.contains("this.initial_new_session_setup_pending ="));
+
+        let render = source
+            .split_once("impl Render for VibexWorkbench")
+            .map(|(_, body)| body)
+            .expect("workbench render should remain inspectable");
+        let pending = render
+            .find("if self.initial_new_session_setup_pending")
+            .expect("empty-session startup should defer window-aware setup");
+        let open = render
+            .find("this.open_new_session(None, window, cx);")
+            .expect("startup should reuse the normal New Session flow");
+        assert!(pending < open);
     }
 
     #[test]
@@ -29422,6 +30755,85 @@ mod tests {
     fn title_bar_uses_the_workspace_leaf_name() {
         assert_eq!(workspace_display_name("/home/user/code/vibex"), "vibex");
         assert_eq!(workspace_display_name("/home/user/code/vibex/"), "vibex");
+    }
+
+    #[test]
+    fn worktree_new_session_flow_preserves_authoritative_stage_order() {
+        let source = include_str!("app.rs");
+        let submit = source
+            .split_once("    fn submit_new_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn choose_runtime_selection("))
+            .map(|(body, _)| body)
+            .expect("new-session submission should remain inspectable");
+        let worktree_create = submit
+            .find("git_worktree_create(request).await")
+            .expect("Worktree mutation should use the Backend facade");
+        let workspace_ready = submit
+            .find("NewSessionCreateSignal::WorkspaceReady")
+            .expect("authoritative Workspace should be announced immediately");
+        let session_create = submit
+            .find(".create_session(CreateAgentSessionRequest")
+            .expect("Session should be created after the Workspace is ready");
+        assert!(worktree_create < workspace_ready);
+        assert!(workspace_ready < session_create);
+        assert!(submit.contains(".with_idempotency_key("));
+        assert!(submit.contains(".with_expected_revision("));
+        assert!(submit.contains("mark_workspace_ready(workspace.clone())"));
+        assert!(submit.contains("mark_failed(error.code.clone())"));
+        assert!(submit.contains("this.composer_attachments = draft_attachments.clone()"));
+    }
+
+    #[test]
+    fn worktree_session_ui_keeps_project_location_and_hierarchy_controls_separate() {
+        let source = include_str!("app.rs");
+        let panel = source
+            .split_once("    fn render_new_session_panel(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn show_turn_preview_rail("))
+            .map(|(body, _)| body)
+            .expect("new-session panel should remain inspectable");
+        assert!(panel.contains("new-session-project-menu"));
+        assert!(panel.contains("new-session-location-current"));
+        assert!(panel.contains("new-session-location-worktree"));
+        assert!(panel.contains("new-session-base-ref"));
+        assert!(panel.contains("new-session-worktree-settings-popover"));
+        assert!(panel.contains("new-session-default-worktree"));
+        assert!(panel.contains("can_create_worktree && !fixed_workspace"));
+
+        let sidebar = source
+            .split_once("    fn render_agent_sidebar(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_choice_popover("))
+            .map(|(body, _)| body)
+            .expect("sidebar hierarchy should remain inspectable");
+        assert!(sidebar.contains("sidebar-toggle-hierarchy"));
+        assert!(sidebar.contains("SidebarHierarchyMode::Compact"));
+        assert!(sidebar.contains("SidebarHierarchyMode::Detailed"));
+        assert!(sidebar.contains("NewSessionOpenTarget::Workspace"));
+        assert!(sidebar.contains("icons/vibex/git-branch.svg"));
+    }
+
+    #[test]
+    fn worktree_unavailable_reason_is_localized_and_capability_aware() {
+        let state = NewSessionWorkspaceState::default();
+        assert_eq!(
+            new_session_worktree_unavailable_reason(
+                locale::ResolvedLocale::En,
+                &state,
+                None,
+                true,
+            )
+            .as_deref(),
+            Some("Choose a Project first")
+        );
+        assert_eq!(
+            new_session_worktree_unavailable_reason(
+                locale::ResolvedLocale::ZhCn,
+                &state,
+                None,
+                false,
+            )
+            .as_deref(),
+            Some("此客户端不支持创建 Worktree")
+        );
     }
 
     #[test]

@@ -701,6 +701,46 @@ const ERROR_MESSAGES: &[MessageTranslation] = &[
         zh_tw: "另一項 Git 操作正在執行",
     },
     MessageTranslation {
+        en: "worktree name must be non-empty and bounded",
+        zh_cn: "Worktree 名称不能为空且长度必须受限",
+        zh_tw: "Worktree 名稱不能為空且長度必須受限",
+    },
+    MessageTranslation {
+        en: "custom worktree path must be non-empty and bounded",
+        zh_cn: "自定义 Worktree 路径不能为空且长度必须受限",
+        zh_tw: "自訂 Worktree 路徑不能為空且長度必須受限",
+    },
+    MessageTranslation {
+        en: "custom worktree path must be absolute",
+        zh_cn: "自定义 Worktree 路径必须是绝对路径",
+        zh_tw: "自訂 Worktree 路徑必須是絕對路徑",
+    },
+    MessageTranslation {
+        en: "custom worktree path already exists",
+        zh_cn: "自定义 Worktree 路径已存在",
+        zh_tw: "自訂 Worktree 路徑已存在",
+    },
+    MessageTranslation {
+        en: "custom worktree path is already owned by a managed worktree",
+        zh_cn: "自定义路径已属于另一个托管 Worktree",
+        zh_tw: "自訂路徑已屬於另一個受管 Worktree",
+    },
+    MessageTranslation {
+        en: "custom worktree path must be outside the repository checkout",
+        zh_cn: "自定义 Worktree 路径必须位于仓库目录之外",
+        zh_tw: "自訂 Worktree 路徑必須位於儲存庫目錄之外",
+    },
+    MessageTranslation {
+        en: "custom worktree path must be outside an existing project workspace",
+        zh_cn: "自定义 Worktree 路径必须位于现有项目工作区之外",
+        zh_tw: "自訂 Worktree 路徑必須位於現有專案工作區之外",
+    },
+    MessageTranslation {
+        en: "project Git eligibility changed before worktree creation",
+        zh_cn: "创建 Worktree 前项目 Git 状态已变化，请重试",
+        zh_tw: "建立 Worktree 前專案 Git 狀態已變更，請重試",
+    },
+    MessageTranslation {
         en: "A workspace-relative path is required",
         zh_cn: "请输入工作区相对路径",
         zh_tw: "請輸入工作區相對路徑",
@@ -1491,6 +1531,13 @@ mod tests {
         assert_eq!(
             localize_error_message_for(ResolvedLocale::En, "请输入会话标题。"),
             "Enter a session title."
+        );
+        assert_eq!(
+            localize_error_message_for(
+                ResolvedLocale::ZhCn,
+                "worktree_path_exists: custom worktree path already exists",
+            ),
+            "worktree_path_exists: 自定义 Worktree 路径已存在"
         );
     }
 
