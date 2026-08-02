@@ -304,3 +304,226 @@ let request = GitWorktreeCreateRequest {
 let result = backend.git_worktree_create(MutationRequest::new(request)).await?;
 use_authoritative_workspace(result.workspace);
 ```
+
+## Scenario: Merge Recovery And Managed Directory Lifecycle
+
+### 1. Scope / Trigger
+
+- Trigger: changing Worktree readiness, merge planning/execution, target queueing,
+  conflict recovery, Agent assistance, Archive/Restore/Discard, or the lifecycle
+  snapshot consumed by Desktop and remote clients.
+- `DesktopRuntime::WorktreeCoordinator` remains the only cross-Git/SQLite
+  authority. `crates/git` owns Git facts and commands, while `crates/db` stores
+  readiness and operation checkpoints. UI state never completes an operation.
+- Agent sessions, Terminals, Files, and ordinary reads are not lifecycle lock
+  consumers. Running Agent/Terminal counts are warning facts, not admission
+  control, and no lifecycle command silently stops them.
+
+### 2. Signatures
+
+```text
+GitBackend
+  git_worktree_snapshot(workspaceId) -> GitWorktreeLifecycleSnapshot
+  git_worktree_readiness(workspaceId) -> GitWorktreeReadinessRecord?
+  git_worktree_set_readiness(MutationRequest<GitWorktreeReadinessRequest>)
+    -> GitWorktreeReadinessRecord
+  git_worktree_merge_plan(GitWorktreeMergeRequest) -> GitWorktreeMergePlan
+  git_worktree_merge(MutationRequest<GitWorktreeMergeRequest>)
+    -> GitWorktreeOperationRecord
+  git_worktree_resolve_conflict(MutationRequest<GitWorktreeConflictResolveRequest>)
+    -> GitWorktreeOperationRecord
+  git_worktree_stage_conflicts(MutationRequest<GitWorktreeConflictStageRequest>)
+    -> GitWorktreeOperationRecord
+  git_worktree_bind_assistance_session(
+    MutationRequest<GitWorktreeAssistanceSessionRequest>)
+    -> GitWorktreeOperationRecord
+  git_worktree_continue_merge(MutationRequest<GitWorktreeOperationRequest>)
+    -> GitWorktreeOperationRecord
+  git_worktree_abort_merge(MutationRequest<GitWorktreeOperationRequest>)
+    -> GitWorktreeOperationRecord
+  git_worktree_{archive,restore,discard}_preflight(request)
+    -> GitWorktreeDestructivePreflight
+  git_worktree_{archive,restore,discard}(MutationRequest<request>)
+    -> GitWorktreeOperationRecord
+
+GitWorktreeReadinessRecord {
+  worktreeId, workspaceId,
+  state: working | reviewing | ready_to_merge | merge_queued | merge_running,
+  sourceHead, dirtyFingerprint, targetWorkspaceId, targetBranch,
+  checks[], revision, updatedAtMs
+}
+
+GitWorktreeMergePlan {
+  planId, sourceWorkspaceId, sourcePath, sourceBranch, sourceHead,
+  targetWorkspaceId, targetPath, targetBranch, targetHead,
+  summary, readiness, runningConsumers, preflight
+}
+
+GitWorktreeOperationDetail {
+  expectedSourceHead, expectedTargetHead, targetBranch,
+  mergeStrategy, queueKey, queuePosition, conflicts[],
+  sourceCommitsAfterStart, assistanceSessionId, checkpoint, diagnostic
+}
+```
+
+SQLite schema version 34 adds one table without rewriting v33 rows:
+
+```text
+git_worktree_readiness(
+  worktree_id PK -> git_managed_worktrees ON DELETE CASCADE,
+  workspace_id -> workspaces ON DELETE CASCADE,
+  state, source_head, dirty_fingerprint,
+  target_workspace_id, target_branch, checks_json, revision, updated_at_ms
+)
+```
+
+### 3. Contracts
+
+#### Readiness and immutable merge plans
+
+- Readiness belongs to one managed Worktree. Marking `ready_to_merge` requires a
+  clean source and exact `sourceHead` plus `dirtyFingerprint`. Any later HEAD or
+  dirty-fingerprint change durably returns it to `working`; optional check
+  records are bounded user/Agent-reported facts, never commands Vibex claims to
+  have run.
+- A merge plan uses the managed record's fixed target Workspace/branch and exact
+  source/target heads. It includes typed blocking risks, non-blocking unpushed and
+  running-consumer warnings, a concrete action label, and a revision derived from
+  all executable facts.
+- Confirmation supplies the plan's source head, target head, and preflight
+  revision. The coordinator reacquires ordered lifecycle locks and the Git
+  common-directory mutation lock, then reloads ownership, branch, heads, dirty
+  state, readiness, active Git operations, and risks. Changed facts require a
+  new plan; an old confirmation never executes against a newer target.
+- Merges targeting one Workspace serialize through the durable target queue.
+  Queue position is visible, but reaching the front is not approval: the queued
+  operation must still match the confirmed source/target facts before executing
+  `git merge --no-ff <exact-source-head>`.
+
+#### Conflict, assistance, and finalization
+
+- A verified conflict records `NeedsResolution`, `ConflictDetected`, exact
+  source/target heads, typed conflict files, and the target Workspace. It is not
+  flattened to `Failed`. Source commits made after merge start are counted but
+  never enter this merge scene.
+- Conflict resolution requests name the operation, target Workspace, path, and
+  `target` or `source` version. Controlled stage accepts only paths owned by that
+  operation. Completion is based on the unmerged index, not conflict-marker text.
+- While a target operation is live, runtime lifecycle calls plus generic
+  checkout, commit, and revert are rejected by
+  `worktree_target_operation_fenced`. Reads, edits, controlled stage, Terminal,
+  and Agent sessions remain available. This fence does not pretend to intercept
+  arbitrary commands typed in a Terminal.
+- Agent assistance binds one active, non-archived Session in the target
+  Workspace to `assistanceSessionId` in durable operation detail. Reuse validates
+  the same operation/Workspace/Session fence. The injected context is bounded,
+  uses fixed heads and typed conflict paths, and states that only the user may
+  continue or abort. Other Sessions remain unrestricted.
+- Continue revalidates operation identity, branch, `MERGE_HEAD`, expected heads,
+  and an empty unmerged index before making the merge commit. Abort runs
+  `git merge --abort` and proves the target returned to `head_before`. Any
+  unprovable result remains `NeedsAttention`; there is no reset fallback.
+
+#### Archive, Restore, Discard, and reconciliation
+
+- Archive, Restore, Discard, and Merge Back are separate operation kinds with
+  separate preflights. Archive rejects dirty content and preserves Workspace,
+  branch, managed record, and Session history. Restore must reuse the same
+  Workspace ID, canonical path, branch, and recorded head. Discard removes the
+  directory/registration but does not delete the branch.
+- Dirty Discard is permitted only through the explicit `force` request after its
+  risk was shown. Active Git operations, ownership mismatch, occupied restore
+  paths, stale revisions, and inconsistent registrations remain blocking.
+  Unpushed commits and running consumers remain visible non-blocking risks.
+- Startup reconciliation joins durable operation/checkpoint data with
+  `MERGE_HEAD`, unmerged entries, current heads/branch, managed records, Git
+  registrations, and directory presence. It may prove Completed, Aborted, or
+  NeedsResolution. Inconsistent or external merge scenes become NeedsAttention
+  and are preserved; repeated reconciliation is idempotent.
+- Native advertises `GitWorktreeLifecycleMutate`. A negotiated remote client may
+  advertise `GitWorktreeRead`, but every lifecycle mutation returns
+  `remote_worktree_mutation_unsupported` and cannot synthesize a local plan.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Ready request observes dirty source or stale head/fingerprint | `worktree_readiness_dirty_source` or `worktree_readiness_stale`; persist/return `working`. |
+| Merge source is unmanaged, cross-repository, same checkout, or redirected to another target | `worktree_not_managed`, ownership risk, or `worktree_target_override_rejected`; no Git side effect. |
+| Source/target head, branch, dirty state, readiness, operation, or warnings changed after confirmation | `worktree_preflight_stale` or `worktree_merge_queue_confirmation_stale`; require a fresh plan. |
+| `git merge --no-ff` produces a matching live conflict scene | Persist `NeedsResolution` plus typed conflicts; keep the target fence. |
+| Generic checkout/commit/revert targets a live conflict Workspace | `worktree_target_operation_fenced`; preserve file, index, and `MERGE_HEAD`. |
+| Conflict request has the wrong operation, Workspace, path, or Git scene | `worktree_merge_resolution_fence_mismatch` / `worktree_merge_resolution_scene_changed`; preserve the scene. |
+| Assistance Session is missing, archived/deleted, in another Workspace, or already bound elsewhere | Stable `worktree_assistance_session_*`; do not replace the durable association. |
+| Continue sees a mismatched `MERGE_HEAD` or unmerged entries | Keep NeedsResolution/NeedsAttention; do not commit. |
+| Abort cannot prove exact `head_before` and cleared Git markers | `worktree_merge_abort_needs_attention`; never reset. |
+| Archive is dirty, Restore path is occupied, or lifecycle facts changed | Blocking preflight / `worktree_preflight_stale`; keep the managed record and files. |
+| Remote client calls any lifecycle mutation | `remote_worktree_mutation_unsupported`; no RPC/local Git mutation. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: two ready sources queue for `main`; the first merge advances target
+  HEAD, so the second receives a refreshed plan instead of executing its old
+  confirmation.
+- Good: a conflict survives restart, an associated target Session is restored,
+  source gains another commit, and continue merges only the originally pinned
+  source head.
+- Good: Archive removes a clean directory and Restore recreates the same path,
+  branch, Workspace ID, and Session history owner.
+- Base: running Agent sessions and Terminals appear as warnings and keep running
+  during merge/conflict; a normal checkout with no target operation has no
+  managed lifecycle state.
+- Bad: infer target from the currently checked-out branch, trust a UI pending
+  flag as serialization, stage conflict paths through the ordinary Changes
+  selection, or resolve uncertain recovery with force/reset/branch deletion.
+
+### 6. Tests Required
+
+- Core serde tests cover readiness, merge strategy/conflict kinds, assistance
+  association, legacy operation detail defaults, and unknown enum fail-closed
+  behavior.
+- SQLite tests migrate through v34 and round-trip readiness revisions/checks,
+  operation detail, assistance Session ID, cascade behavior, and legacy rows.
+- Git temporary-repository tests cover exact-head no-ff merge, modified/modified,
+  added/added, delete/modify, binary conflicts, source/target selection,
+  controlled stage, continue, abort, and common-dir lock revalidation.
+- Runtime tests cover dirty/stale readiness, fixed-target plan refresh, same-target
+  queue serialization, restart reconciliation, external merge preservation,
+  source commits after start, assistance binding, generic revert fencing, and
+  Archive/Restore identity reuse.
+- Backend/remote tests cover every native trait method, disconnected fixtures,
+  negotiated read-only lifecycle snapshots, and one stable remote mutation error.
+- Run affected package tests and `pnpm check:rust`; changes to Code Workbench
+  inputs must also regenerate and validate its evidence through the writer.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+if ui_confirmed {
+    git_merge(&target.current_branch, &source.current_head)?;
+}
+
+if merge_failed {
+    operation.status = Failed;
+    git_reset_hard(&target, &head_before)?;
+}
+```
+
+#### Correct
+
+```rust
+let plan = coordinator.merge_plan(&draft)?;
+let confirmed = GitWorktreeMergeRequest {
+    expected_source_head: Some(plan.source_head.clone()),
+    expected_target_head: Some(plan.target_head.clone()),
+    preflight_revision: Some(plan.preflight.revision.clone()),
+    ..draft
+};
+let operation = coordinator.merge(&confirmed)?;
+
+if operation.status == GitWorktreeOperationStatus::NeedsResolution {
+    preserve_target_scene_and_publish_snapshot(operation);
+}
+```

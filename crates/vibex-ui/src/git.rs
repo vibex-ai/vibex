@@ -708,8 +708,12 @@ mod tests {
 
     use super::*;
     use vibex_core::{
-        GitProjectEligibility, GitWorktreeCreateRequest, GitWorktreeCreateResult,
-        GitWorktreeLifecycleSnapshot,
+        GitProjectEligibility, GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
+        GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest,
+        GitWorktreeCreateRequest, GitWorktreeCreateResult, GitWorktreeDestructivePreflight,
+        GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan,
+        GitWorktreeMergeRequest, GitWorktreeOperationRecord, GitWorktreeOperationRequest,
+        GitWorktreeReadinessRecord, GitWorktreeReadinessRequest, GitWorktreeRestoreRequest,
     };
 
     #[derive(Clone)]
@@ -754,6 +758,156 @@ mod tests {
             &self,
             _request: MutationRequest<GitWorktreeCreateRequest>,
         ) -> BackendFuture<'_, GitWorktreeCreateResult> {
+            error_future(BackendError::unsupported(
+                "fixture_worktree_unsupported",
+                "fixture Git backend does not expose managed worktrees",
+            ))
+        }
+
+        fn git_worktree_readiness(
+            &self,
+            _workspace_id: WorkspaceId,
+        ) -> BackendFuture<'_, Option<GitWorktreeReadinessRecord>> {
+            error_future(BackendError::unsupported(
+                "fixture_worktree_unsupported",
+                "fixture Git backend does not expose managed worktrees",
+            ))
+        }
+
+        fn git_worktree_set_readiness(
+            &self,
+            _request: MutationRequest<GitWorktreeReadinessRequest>,
+        ) -> BackendFuture<'_, GitWorktreeReadinessRecord> {
+            error_future(BackendError::unsupported(
+                "fixture_worktree_unsupported",
+                "fixture Git backend does not expose managed worktrees",
+            ))
+        }
+
+        fn git_worktree_merge_plan(
+            &self,
+            _request: GitWorktreeMergeRequest,
+        ) -> BackendFuture<'_, GitWorktreeMergePlan> {
+            error_future(BackendError::unsupported(
+                "fixture_worktree_unsupported",
+                "fixture Git backend does not expose managed worktrees",
+            ))
+        }
+
+        fn git_worktree_merge(
+            &self,
+            _request: MutationRequest<GitWorktreeMergeRequest>,
+        ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+            error_future(BackendError::unsupported(
+                "fixture_worktree_unsupported",
+                "fixture Git backend does not expose managed worktrees",
+            ))
+        }
+
+        fn git_worktree_resolve_conflict(
+            &self,
+            _request: MutationRequest<GitWorktreeConflictResolveRequest>,
+        ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+            error_future(BackendError::unsupported(
+                "fixture_worktree_unsupported",
+                "fixture Git backend does not expose managed worktrees",
+            ))
+        }
+
+        fn git_worktree_stage_conflicts(
+            &self,
+            _request: MutationRequest<GitWorktreeConflictStageRequest>,
+        ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+            error_future(BackendError::unsupported(
+                "fixture_worktree_unsupported",
+                "fixture Git backend does not expose managed worktrees",
+            ))
+        }
+
+        fn git_worktree_bind_assistance_session(
+            &self,
+            _request: MutationRequest<GitWorktreeAssistanceSessionRequest>,
+        ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+            error_future(BackendError::unsupported(
+                "fixture_worktree_unsupported",
+                "fixture Git backend does not expose managed worktrees",
+            ))
+        }
+
+        fn git_worktree_continue_merge(
+            &self,
+            _request: MutationRequest<GitWorktreeOperationRequest>,
+        ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+            error_future(BackendError::unsupported(
+                "fixture_worktree_unsupported",
+                "fixture Git backend does not expose managed worktrees",
+            ))
+        }
+
+        fn git_worktree_abort_merge(
+            &self,
+            _request: MutationRequest<GitWorktreeOperationRequest>,
+        ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+            error_future(BackendError::unsupported(
+                "fixture_worktree_unsupported",
+                "fixture Git backend does not expose managed worktrees",
+            ))
+        }
+
+        fn git_worktree_archive_preflight(
+            &self,
+            _request: GitWorktreeArchiveRequest,
+        ) -> BackendFuture<'_, GitWorktreeDestructivePreflight> {
+            error_future(BackendError::unsupported(
+                "fixture_worktree_unsupported",
+                "fixture Git backend does not expose managed worktrees",
+            ))
+        }
+
+        fn git_worktree_archive(
+            &self,
+            _request: MutationRequest<GitWorktreeArchiveRequest>,
+        ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+            error_future(BackendError::unsupported(
+                "fixture_worktree_unsupported",
+                "fixture Git backend does not expose managed worktrees",
+            ))
+        }
+
+        fn git_worktree_restore_preflight(
+            &self,
+            _request: GitWorktreeRestoreRequest,
+        ) -> BackendFuture<'_, GitWorktreeDestructivePreflight> {
+            error_future(BackendError::unsupported(
+                "fixture_worktree_unsupported",
+                "fixture Git backend does not expose managed worktrees",
+            ))
+        }
+
+        fn git_worktree_restore(
+            &self,
+            _request: MutationRequest<GitWorktreeRestoreRequest>,
+        ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+            error_future(BackendError::unsupported(
+                "fixture_worktree_unsupported",
+                "fixture Git backend does not expose managed worktrees",
+            ))
+        }
+
+        fn git_worktree_discard_preflight(
+            &self,
+            _request: GitWorktreeDiscardRequest,
+        ) -> BackendFuture<'_, GitWorktreeDestructivePreflight> {
+            error_future(BackendError::unsupported(
+                "fixture_worktree_unsupported",
+                "fixture Git backend does not expose managed worktrees",
+            ))
+        }
+
+        fn git_worktree_discard(
+            &self,
+            _request: MutationRequest<GitWorktreeDiscardRequest>,
+        ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
             error_future(BackendError::unsupported(
                 "fixture_worktree_unsupported",
                 "fixture Git backend does not expose managed worktrees",

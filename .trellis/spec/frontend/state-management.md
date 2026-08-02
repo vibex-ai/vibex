@@ -1714,3 +1714,166 @@ ManagementWorkflowController::revoke_device(request)
   administration/profile selection are not advertised when unsupported.
 - Run the locked Terminal/UI/Remote tests, WASM graph check, browser gate, and
   workspace Rust quality gate before commit.
+
+## Scenario: Current-Worktree Changes Lifecycle And Conflict Projection
+
+### 1. Scope / Trigger
+
+- Trigger: GPUI Changes or sidebar code renders managed Worktree readiness,
+  merge/lifecycle actions, a target-owned conflict, or Agent assistance.
+- `GitWorktreeLifecycleSnapshot` is the single authoritative input for both the
+  detailed Changes surface and compact Workspace/Session identity. The view
+  never owns a second operation state or infers Git completion from a toast.
+- Desktop is the mutation surface. Web/mobile may render negotiated read-only
+  lifecycle state but never expose local Worktree mutation controls.
+
+### 2. Signatures
+
+```text
+WorktreeLifecycleView {
+  workspaceId,
+  managed: GitManagedWorktreeRecord?,
+  readiness: GitWorktreeReadinessRecord?,
+  operation: GitWorktreeOperationRecord?,
+  targetOwned: bool,
+  state: Working | Reviewing | Ready | Queued | Merging |
+    NeedsResolution | Aborting | Archiving | Archived | Restoring |
+    Discarding | Discarded | Failed | NeedsAttention
+}
+
+WorktreeLifecycleView::from_snapshot(workspaceId, snapshot)
+  -> WorktreeLifecycleView?
+
+WorktreeLifecycleConfirmation =
+  Merge(GitWorktreeMergePlan)
+  | Archive { request, preflight }
+  | Restore { request, preflight }
+  | Discard { request, preflight }
+  | Continue(GitWorktreeOperationRequest)
+  | Abort(GitWorktreeOperationRequest)
+
+WorkspaceContextProjection {
+  workspaceId, workspaceMode, workspaceRoot, branch,
+  managedWorktreeId, gitDirty, worktreeLifecycleState
+}
+```
+
+Capability contract:
+
+```text
+GitWorktreeRead             -> fetch/render lifecycle snapshot
+GitWorktreeLifecycleMutate  -> readiness, merge, conflict, archive/restore/discard controls
+```
+
+### 3. Contracts
+
+- Code Workbench loads lifecycle state on Workspace activation and with Git
+  refresh. Results are fenced by the Workspace generation. If a refresh is
+  already running, set one reload request and fetch again after completion;
+  concurrent polling must not drop the newest state or spawn an unbounded task
+  set.
+- `WorktreeLifecycleView::from_snapshot` first selects a visible operation owned
+  by the current target Workspace, then a source operation. A normal checkout
+  therefore has no managed header, while the same checkout still receives a
+  persistent conflict/needs-attention banner when it owns the target operation.
+- The Changes header shows managed branch, fixed target, readiness, dirty state,
+  exact-head summary, and concrete lifecycle actions. Confirmation state stores
+  typed plans/preflights, not reconstructed labels or booleans. Changed plan
+  facts clear stale confirmation and require another review.
+- Conflict rows are derived from the target-owned operation and render before
+  ordinary Changes. Their typed category and binary state come from Core DTOs.
+  Active conflict paths are removed from the ordinary tree and generic
+  stage/commit selection; target/source version selection and stage use the
+  operation-scoped Backend methods.
+- Continue stays disabled until the authoritative operation has no unmerged
+  entries. Continue and Abort each show a named confirmation. Abort copy states
+  that only the target resolution scene is discarded and the source Worktree is
+  unchanged.
+- Merge conflict/needs-attention completion focuses the target Workspace's
+  Changes surface. Agent assistance creates or reuses the operation-associated
+  target Session, injects bounded structured context with a deterministic key,
+  and uses its own task slot. It must not set global `agent_action_pending` or
+  prevent unrelated Sessions from running.
+- Sidebar detailed rows and compact Worktree icons consume
+  `WorkspaceContextProjection.worktreeLifecycleState`. Pending/running Archive,
+  Restore, and Discard keep their own labels instead of appearing as Merge.
+  Unknown/ambiguous states render NeedsAttention and remain actionable through
+  the detailed Changes surface.
+- Rendering `GitWorktreeRead` without `GitWorktreeLifecycleMutate` is valid:
+  branch/readiness/conflict state remains visible, while every mutation and its
+  confirmation entry point is absent. Capability hiding is presentation only;
+  the Backend still rejects unsupported calls.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Lifecycle response belongs to an older Workspace generation | Ignore it; preserve the current Workspace snapshot. |
+| Refresh is requested while one is loading | Coalesce one follow-up load; do not lose it or run parallel unbounded loads. |
+| Current checkout is neither managed nor a target | Render ordinary Changes with no lifecycle header/banner. |
+| Current checkout owns NeedsResolution/NeedsAttention | Render the persistent target banner and conflict rows even without a managed source record. |
+| Conflict path also appears in ordinary Git status | Show it only in the typed conflict section; exclude it from generic selection. |
+| Backend loses `GitWorktreeLifecycleMutate` | Remove mutation controls/confirmation; retain read-only projection when `GitWorktreeRead` remains. |
+| Merge/preflight returns stale-plan error | Clear old confirmation, refresh lifecycle, and require a new plan. |
+| Assistance operation/Session fence is invalid | Show the stable Backend error; do not fall back to another Workspace or global Agent lock. |
+| Continue/Abort succeeds or conflict is returned | Refresh status and lifecycle, refresh sidebar projection, and focus target Changes when attention is required. |
+| Lifecycle state is unknown | Render NeedsAttention; never treat it as Working, Ready, or success. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: a managed source is marked Ready, reviews an exact merge plan, enters a
+  conflict, and the UI moves to the target Changes surface where typed conflict
+  rows precede ordinary changes.
+- Good: the user asks an Agent for help; the associated target Session opens,
+  other Sessions keep running, and only the explicit Continue confirmation can
+  finalize the merge.
+- Good: a remote read-only client displays `Archived` or `NeedsResolution`
+  without showing Archive, Discard, Continue, or Abort controls.
+- Base: a CurrentCheckout Workspace with no managed or target-owned operation
+  behaves exactly like the ordinary Git Changes surface.
+- Bad: keep a page-local merge status after navigating away, infer conflicts
+  from `GitChangeKind` alone, stage active conflicts through generic selection,
+  reuse `agent_action_pending` for assistance, or render a disabled mutation
+  control on a client that cannot call it.
+
+### 6. Tests Required
+
+- Desktop-model tests assert target-operation precedence, source/target projection
+  from one snapshot, full lifecycle-state ordering, and distinct
+  Archiving/Restoring/Discarding labels.
+- Git Workbench model tests assert conflict paths precede ordinary rows and are
+  excluded from generic select-all, stage, and commit path sets.
+- GPUI source-contract tests assert managed header, persistent target banner,
+  typed conflict actions, named confirmations, stale-plan refresh, capability
+  gates, and Agent assistance's dedicated task/deterministic message contract.
+- Backend fixture tests keep Native, disconnected, and Remote Git trait surfaces
+  exhaustive; remote tests assert read capability never implies lifecycle
+  mutation.
+- Run Desktop/model/UI tests, `pnpm check:rust`, and
+  `pnpm check:code-workbench`. When physical visual capture is deferred, evidence
+  must explicitly remain `model_passed_visual_pending` rather than claiming a
+  passed screenshot review.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+self.merge_state = Some("conflict".into());
+self.git.select_path(conflict_path, false);
+self.agent_action_pending = true;
+render_merge_button_even_when_remote();
+```
+
+#### Correct
+
+```rust
+let view = WorktreeLifecycleView::from_snapshot(&workspace.id, &snapshot);
+self.git.set_lifecycle_conflict_paths(target_conflict_paths(&view));
+
+if capabilities.git.supports(BackendOperation::GitWorktreeLifecycleMutate) {
+    render_typed_lifecycle_actions(view);
+}
+
+start_operation_assistance_task_without_blocking_other_agent_sessions();
+```

@@ -3,8 +3,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use vibex_core::{
-    AgentSession, AgentSessionState, GitProjectEligibility, GitWorktreeCreateRequest,
-    GitWorktreeLifecycleSnapshot, ProjectId, ProjectRecord, WorkspaceId, WorkspaceMode,
+    AgentSession, AgentSessionState, GitManagedWorktreeRecord, GitManagedWorktreeStatus,
+    GitProjectEligibility, GitWorktreeCreateRequest, GitWorktreeLifecycleSnapshot,
+    GitWorktreeOperationRecord, GitWorktreeOperationStatus, GitWorktreeReadinessRecord,
+    GitWorktreeReadinessState, ProjectId, ProjectRecord, WorkspaceId, WorkspaceMode,
     WorkspaceRecord, managed_worktree_name_slug,
 };
 
@@ -424,6 +426,7 @@ pub struct WorkspaceContextProjection {
     pub branch: Option<String>,
     pub managed_worktree_id: Option<String>,
     pub git_dirty: bool,
+    pub worktree_lifecycle_state: Option<WorktreeLifecycleDisplayState>,
 }
 
 impl WorkspaceContextProjection {
@@ -445,6 +448,8 @@ impl WorkspaceContextProjection {
                         .find(|managed| managed.workspace_id.as_ref() == Some(&workspace.id))
                 })
         });
+        let lifecycle_view = lifecycle
+            .and_then(|snapshot| WorktreeLifecycleView::from_snapshot(&workspace.id, snapshot));
         Self {
             project_id: project.id.clone(),
             project_name: project.name.clone(),
@@ -457,7 +462,199 @@ impl WorkspaceContextProjection {
                 .or_else(|| git_branch.map(str::to_string)),
             managed_worktree_id: managed.map(|managed| managed.worktree_id.to_string()),
             git_dirty,
+            worktree_lifecycle_state: lifecycle_view.map(|view| view.state),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeLifecycleDisplayState {
+    Working,
+    Reviewing,
+    Ready,
+    Queued,
+    Merging,
+    NeedsResolution,
+    Aborting,
+    Archiving,
+    Archived,
+    Restoring,
+    Discarding,
+    Discarded,
+    Failed,
+    NeedsAttention,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeLifecycleView {
+    pub workspace_id: WorkspaceId,
+    pub managed: Option<GitManagedWorktreeRecord>,
+    pub readiness: Option<GitWorktreeReadinessRecord>,
+    pub operation: Option<GitWorktreeOperationRecord>,
+    pub target_owned: bool,
+    pub state: WorktreeLifecycleDisplayState,
+}
+
+impl WorktreeLifecycleView {
+    pub fn from_snapshot(
+        workspace_id: &WorkspaceId,
+        snapshot: &GitWorktreeLifecycleSnapshot,
+    ) -> Option<Self> {
+        let managed = snapshot
+            .managed_worktrees
+            .iter()
+            .find(|managed| managed.workspace_id.as_ref() == Some(workspace_id))
+            .cloned();
+        let target_operation = snapshot
+            .operations
+            .iter()
+            .find(|operation| {
+                operation.target_workspace_id.as_ref() == Some(workspace_id)
+                    && lifecycle_operation_is_visible(operation.status)
+            })
+            .cloned();
+        let source_operation = snapshot
+            .operations
+            .iter()
+            .find(|operation| {
+                operation.source_workspace_id.as_ref() == Some(workspace_id)
+                    && lifecycle_operation_is_visible(operation.status)
+            })
+            .cloned();
+        let target_owned = target_operation.is_some();
+        let operation = target_operation.or(source_operation);
+        if managed.is_none() && operation.is_none() {
+            return None;
+        }
+        let readiness = managed.as_ref().and_then(|managed| {
+            snapshot
+                .readiness
+                .iter()
+                .find(|readiness| readiness.worktree_id == managed.worktree_id)
+                .cloned()
+        });
+        let state =
+            lifecycle_display_state(managed.as_ref(), readiness.as_ref(), operation.as_ref());
+        Some(Self {
+            workspace_id: workspace_id.clone(),
+            managed,
+            readiness,
+            operation,
+            target_owned,
+            state,
+        })
+    }
+}
+
+fn lifecycle_operation_is_visible(status: GitWorktreeOperationStatus) -> bool {
+    matches!(
+        status,
+        GitWorktreeOperationStatus::Pending
+            | GitWorktreeOperationStatus::Queued
+            | GitWorktreeOperationStatus::Running
+            | GitWorktreeOperationStatus::Failed
+            | GitWorktreeOperationStatus::Recoverable
+            | GitWorktreeOperationStatus::NeedsResolution
+            | GitWorktreeOperationStatus::Aborting
+            | GitWorktreeOperationStatus::NeedsAttention
+            | GitWorktreeOperationStatus::Unknown
+    )
+}
+
+fn lifecycle_display_state(
+    managed: Option<&GitManagedWorktreeRecord>,
+    readiness: Option<&GitWorktreeReadinessRecord>,
+    operation: Option<&GitWorktreeOperationRecord>,
+) -> WorktreeLifecycleDisplayState {
+    if let Some(operation) = operation {
+        match operation.status {
+            GitWorktreeOperationStatus::Pending | GitWorktreeOperationStatus::Queued => {
+                return match operation.operation {
+                    vibex_core::GitWorktreeOperationKind::Archive => {
+                        WorktreeLifecycleDisplayState::Archiving
+                    }
+                    vibex_core::GitWorktreeOperationKind::Restore => {
+                        WorktreeLifecycleDisplayState::Restoring
+                    }
+                    vibex_core::GitWorktreeOperationKind::Discard => {
+                        WorktreeLifecycleDisplayState::Discarding
+                    }
+                    vibex_core::GitWorktreeOperationKind::MergeBack
+                    | vibex_core::GitWorktreeOperationKind::Create
+                    | vibex_core::GitWorktreeOperationKind::Open
+                    | vibex_core::GitWorktreeOperationKind::Unknown => {
+                        WorktreeLifecycleDisplayState::Queued
+                    }
+                };
+            }
+            GitWorktreeOperationStatus::Running => {
+                return match operation.operation {
+                    vibex_core::GitWorktreeOperationKind::Archive => {
+                        WorktreeLifecycleDisplayState::Archiving
+                    }
+                    vibex_core::GitWorktreeOperationKind::Restore => {
+                        WorktreeLifecycleDisplayState::Restoring
+                    }
+                    vibex_core::GitWorktreeOperationKind::Discard => {
+                        WorktreeLifecycleDisplayState::Discarding
+                    }
+                    vibex_core::GitWorktreeOperationKind::MergeBack
+                    | vibex_core::GitWorktreeOperationKind::Create
+                    | vibex_core::GitWorktreeOperationKind::Open
+                    | vibex_core::GitWorktreeOperationKind::Unknown => {
+                        WorktreeLifecycleDisplayState::Merging
+                    }
+                };
+            }
+            GitWorktreeOperationStatus::NeedsResolution => {
+                return WorktreeLifecycleDisplayState::NeedsResolution;
+            }
+            GitWorktreeOperationStatus::Aborting => {
+                return WorktreeLifecycleDisplayState::Aborting;
+            }
+            GitWorktreeOperationStatus::Failed | GitWorktreeOperationStatus::Recoverable => {
+                return WorktreeLifecycleDisplayState::Failed;
+            }
+            GitWorktreeOperationStatus::NeedsAttention | GitWorktreeOperationStatus::Unknown => {
+                return WorktreeLifecycleDisplayState::NeedsAttention;
+            }
+            GitWorktreeOperationStatus::Completed | GitWorktreeOperationStatus::Aborted => {}
+        }
+    }
+    if let Some(managed) = managed {
+        match managed.status {
+            GitManagedWorktreeStatus::Archiving => {
+                return WorktreeLifecycleDisplayState::Archiving;
+            }
+            GitManagedWorktreeStatus::Discarding => {
+                return WorktreeLifecycleDisplayState::Discarding;
+            }
+            GitManagedWorktreeStatus::Archived => {
+                return WorktreeLifecycleDisplayState::Archived;
+            }
+            GitManagedWorktreeStatus::Restoring => {
+                return WorktreeLifecycleDisplayState::Restoring;
+            }
+            GitManagedWorktreeStatus::Discarded => {
+                return WorktreeLifecycleDisplayState::Discarded;
+            }
+            GitManagedWorktreeStatus::Failed => {
+                return WorktreeLifecycleDisplayState::Failed;
+            }
+            GitManagedWorktreeStatus::NeedsAttention | GitManagedWorktreeStatus::Unknown => {
+                return WorktreeLifecycleDisplayState::NeedsAttention;
+            }
+            GitManagedWorktreeStatus::Active | GitManagedWorktreeStatus::Merged => {}
+        }
+    }
+    match readiness.map(|readiness| readiness.state) {
+        Some(GitWorktreeReadinessState::Reviewing) => WorktreeLifecycleDisplayState::Reviewing,
+        Some(GitWorktreeReadinessState::ReadyToMerge) => WorktreeLifecycleDisplayState::Ready,
+        Some(GitWorktreeReadinessState::MergeQueued) => WorktreeLifecycleDisplayState::Queued,
+        Some(GitWorktreeReadinessState::MergeRunning) => WorktreeLifecycleDisplayState::Merging,
+        Some(GitWorktreeReadinessState::Unknown) => WorktreeLifecycleDisplayState::NeedsAttention,
+        Some(GitWorktreeReadinessState::Working) | None => WorktreeLifecycleDisplayState::Working,
     }
 }
 
@@ -592,6 +789,7 @@ pub fn sidebar_project_projections(
                         branch: None,
                         managed_worktree_id: None,
                         git_dirty: false,
+                        worktree_lifecycle_state: None,
                     });
                 let workspace_matches = project_matches
                     || query.is_empty()
@@ -683,7 +881,8 @@ mod tests {
     use super::*;
     use vibex_core::{
         AgentId, AgentSessionSafety, GitManagedWorktreeRecord, GitManagedWorktreeStatus,
-        GitPathIdentity, GitProjectEligibilityState, GitWorktreeReconciliationState, RequestId,
+        GitPathIdentity, GitProjectEligibilityState, GitWorktreeOperationDetail,
+        GitWorktreeOperationKind, GitWorktreeReconciliationState, RequestId,
     };
 
     fn project() -> ProjectRecord {
@@ -954,6 +1153,7 @@ mod tests {
             eligibility: eligibility(&project, "/wt", "r1"),
             managed_worktrees: vec![managed.clone()],
             operations: Vec::new(),
+            readiness: Vec::new(),
             diagnostics: Vec::new(),
             revision: "snapshot".into(),
         };
@@ -971,5 +1171,135 @@ mod tests {
             Some(managed.worktree_id.as_str())
         );
         assert!(context.git_dirty);
+    }
+
+    #[test]
+    fn lifecycle_view_projects_readiness_and_target_owned_conflict_from_one_snapshot() {
+        let project = project();
+        let target = workspace(&project, WorkspaceMode::CurrentCheckout, "/repo");
+        let source = workspace(&project, WorkspaceMode::VibexWorktree, "/wt");
+        let worktree_id = RequestId::new();
+        let managed = GitManagedWorktreeRecord {
+            worktree_id: worktree_id.clone(),
+            project_id: project.id.clone(),
+            workspace_id: Some(source.id.clone()),
+            repo_root: "/repo".into(),
+            worktree_path: "/wt".into(),
+            repository_identity: None,
+            worktree_path_identity: None,
+            branch: Some("feature".into()),
+            origin_workspace_id: Some(target.id.clone()),
+            base_ref: Some("main".into()),
+            base_head: Some("a".repeat(40)),
+            target_workspace_id: Some(target.id.clone()),
+            target_branch: Some("main".into()),
+            head: Some("b".repeat(40)),
+            status: GitManagedWorktreeStatus::Active,
+            reconciliation_state: GitWorktreeReconciliationState::Consistent,
+            diagnostic: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            closed_at_ms: None,
+        };
+        let readiness = GitWorktreeReadinessRecord {
+            worktree_id,
+            workspace_id: source.id.clone(),
+            state: GitWorktreeReadinessState::ReadyToMerge,
+            source_head: "b".repeat(40),
+            dirty_fingerprint: "clean-v1".into(),
+            target_workspace_id: target.id.clone(),
+            target_branch: "main".into(),
+            checks: Vec::new(),
+            revision: "ready-v1".into(),
+            updated_at_ms: 1,
+        };
+        let operation = GitWorktreeOperationRecord {
+            operation_id: RequestId::new(),
+            project_id: project.id.clone(),
+            source_workspace_id: Some(source.id.clone()),
+            target_workspace_id: Some(target.id.clone()),
+            operation: GitWorktreeOperationKind::MergeBack,
+            status: GitWorktreeOperationStatus::NeedsResolution,
+            worktree_path: Some("/wt".into()),
+            branch: Some("feature".into()),
+            base_ref: Some("main".into()),
+            head_before: Some("a".repeat(40)),
+            head_after: None,
+            error: None,
+            detail: GitWorktreeOperationDetail {
+                target_branch: Some("main".into()),
+                ..GitWorktreeOperationDetail::default()
+            },
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        let snapshot = GitWorktreeLifecycleSnapshot {
+            workspace_id: target.id.clone(),
+            eligibility: eligibility(&project, "/repo", "r1"),
+            managed_worktrees: vec![managed],
+            operations: vec![operation],
+            readiness: vec![readiness],
+            diagnostics: Vec::new(),
+            revision: "snapshot".into(),
+        };
+
+        let source_view = WorktreeLifecycleView::from_snapshot(&source.id, &snapshot).unwrap();
+        assert!(!source_view.target_owned);
+        assert_eq!(
+            source_view.readiness.as_ref().map(|value| value.state),
+            Some(GitWorktreeReadinessState::ReadyToMerge)
+        );
+        assert_eq!(
+            source_view.state,
+            WorktreeLifecycleDisplayState::NeedsResolution
+        );
+        let target_view = WorktreeLifecycleView::from_snapshot(&target.id, &snapshot).unwrap();
+        assert!(target_view.target_owned);
+        assert_eq!(
+            target_view.state,
+            WorktreeLifecycleDisplayState::NeedsResolution
+        );
+    }
+
+    #[test]
+    fn running_non_merge_operations_keep_their_lifecycle_identity() {
+        let project = project();
+        let source = workspace(&project, WorkspaceMode::VibexWorktree, "/wt");
+        for (operation_kind, expected) in [
+            (
+                GitWorktreeOperationKind::Archive,
+                WorktreeLifecycleDisplayState::Archiving,
+            ),
+            (
+                GitWorktreeOperationKind::Restore,
+                WorktreeLifecycleDisplayState::Restoring,
+            ),
+            (
+                GitWorktreeOperationKind::Discard,
+                WorktreeLifecycleDisplayState::Discarding,
+            ),
+        ] {
+            let operation = GitWorktreeOperationRecord {
+                operation_id: RequestId::new(),
+                project_id: project.id.clone(),
+                source_workspace_id: Some(source.id.clone()),
+                target_workspace_id: None,
+                operation: operation_kind,
+                status: GitWorktreeOperationStatus::Running,
+                worktree_path: Some("/wt".into()),
+                branch: Some("feature".into()),
+                base_ref: Some("main".into()),
+                head_before: Some("a".repeat(40)),
+                head_after: None,
+                error: None,
+                detail: GitWorktreeOperationDetail::default(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            };
+            assert_eq!(
+                lifecycle_display_state(None, None, Some(&operation)),
+                expected
+            );
+        }
     }
 }

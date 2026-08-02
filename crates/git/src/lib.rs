@@ -5,6 +5,7 @@ use std::process::{Command, Output};
 
 use fs2::FileExt as _;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use vibex_core::{
     GitBlameLine, GitBlameRequest, GitBlameResponse, GitBranchCheckoutRequest,
     GitBranchCreateRequest, GitBranchListResponse, GitBranchSummary, GitChange, GitChangeKind,
@@ -12,9 +13,10 @@ use vibex_core::{
     GitCommitResult, GitCommitSummary, GitDiffRequest, GitDiffResponse, GitHistoryAuthor,
     GitHistoryRequest, GitHistoryResponse, GitRemoteActionKind, GitRemoteActionRequest,
     GitRemoteActionResult, GitRemoteSummary, GitStageRequest, GitStatusSummary,
-    GitWorktreeCreateRequest, GitWorktreeDiscardRequest, GitWorktreeListResponse,
-    GitWorktreeMergeRequest, GitWorktreeSummary, VibexError, VibexResult, WorkspaceId,
-    unix_timestamp_ms,
+    GitWorktreeChangeSummary, GitWorktreeConflictFile, GitWorktreeConflictKind,
+    GitWorktreeConflictVersion, GitWorktreeCreateRequest, GitWorktreeDiscardRequest,
+    GitWorktreeListResponse, GitWorktreeMergeRequest, GitWorktreeSummary, VibexError, VibexResult,
+    WorkspaceId, unix_timestamp_ms,
 };
 
 mod identity;
@@ -582,10 +584,448 @@ pub fn worktree_merge(
             "merge".to_string(),
             "--no-ff".to_string(),
             "--no-edit".to_string(),
-            source_ref.to_string(),
+            expected_source_head.to_string(),
         ],
     )?;
     Ok(output.trim().to_string())
+}
+
+pub fn worktree_dirty_fingerprint(repo_path: impl AsRef<Path>) -> VibexResult<String> {
+    let root = repo_root(repo_path.as_ref())?;
+    let head = resolve_head(&root)?;
+    let porcelain = run_git_owned(
+        &root,
+        &[
+            "status".to_string(),
+            "--porcelain=v1".to_string(),
+            "--untracked-files=all".to_string(),
+            "-z".to_string(),
+        ],
+    )?;
+    let mut digest = Sha256::new();
+    digest.update(head.as_bytes());
+    digest.update([0]);
+    digest.update(porcelain.as_bytes());
+    Ok(format!("worktree-dirty-v1:{:x}", digest.finalize()))
+}
+
+pub fn worktree_merge_summary(
+    repo_path: impl AsRef<Path>,
+    target_head: &str,
+    source_head: &str,
+) -> VibexResult<GitWorktreeChangeSummary> {
+    let root = repo_root(repo_path.as_ref())?;
+    validate_commitish(target_head)?;
+    validate_commitish(source_head)?;
+    let commit_count = run_git_owned(
+        &root,
+        &[
+            "rev-list".to_string(),
+            "--count".to_string(),
+            format!("{target_head}..{source_head}"),
+        ],
+    )?
+    .trim()
+    .parse::<u32>()
+    .map_err(|error| {
+        VibexError::process(
+            "worktree_merge_summary_parse_failed",
+            "failed to parse merge commit count",
+        )
+        .with_diagnostic("error", error.to_string())
+    })?;
+    let numstat = run_git_owned(
+        &root,
+        &[
+            "diff".to_string(),
+            "--numstat".to_string(),
+            format!("{target_head}...{source_head}"),
+        ],
+    )?;
+    let mut file_count = 0_u32;
+    let mut additions = 0_u32;
+    let mut deletions = 0_u32;
+    for line in numstat.lines() {
+        let mut fields = line.splitn(3, '\t');
+        let Some(added) = fields.next() else {
+            continue;
+        };
+        let Some(deleted) = fields.next() else {
+            continue;
+        };
+        if fields.next().is_none() {
+            continue;
+        }
+        file_count = file_count.saturating_add(1);
+        additions = additions.saturating_add(parse_numstat_count(added));
+        deletions = deletions.saturating_add(parse_numstat_count(deleted));
+    }
+    Ok(GitWorktreeChangeSummary {
+        commit_count,
+        file_count,
+        additions,
+        deletions,
+    })
+}
+
+pub fn unpushed_commit_count(
+    repo_path: impl AsRef<Path>,
+    branch: &str,
+) -> VibexResult<Option<u32>> {
+    let root = repo_root(repo_path.as_ref())?;
+    validate_ref_arg(branch)?;
+    let upstream = run_git_optional(
+        &root,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            &format!("{branch}@{{upstream}}"),
+        ],
+    )?;
+    let Some(upstream) = upstream
+        .as_deref()
+        .map(str::trim)
+        .filter(|upstream| !upstream.is_empty())
+    else {
+        return Ok(None);
+    };
+    let count = run_git_owned(
+        &root,
+        &[
+            "rev-list".to_string(),
+            "--count".to_string(),
+            format!("{upstream}..{branch}"),
+        ],
+    )?
+    .trim()
+    .parse::<u32>()
+    .map_err(|error| {
+        VibexError::process(
+            "git_unpushed_count_parse_failed",
+            "failed to parse unpushed commit count",
+        )
+        .with_diagnostic("error", error.to_string())
+    })?;
+    Ok(Some(count))
+}
+
+pub fn active_git_operation(repo_path: impl AsRef<Path>) -> VibexResult<Option<String>> {
+    let root = repo_root(repo_path.as_ref())?;
+    if merge_head(&root)?.is_some() {
+        return Ok(Some("merge".to_string()));
+    }
+    if run_git_optional(&root, &["rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"])?.is_some() {
+        return Ok(Some("cherry_pick".to_string()));
+    }
+    let git_dir = run_git(&root, &["rev-parse", "--absolute-git-dir"])?;
+    let git_dir = PathBuf::from(git_dir.trim());
+    if git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists() {
+        return Ok(Some("rebase".to_string()));
+    }
+    Ok(None)
+}
+
+pub fn merge_head(repo_path: impl AsRef<Path>) -> VibexResult<Option<String>> {
+    let root = repo_root(repo_path.as_ref())?;
+    Ok(
+        run_git_optional(&root, &["rev-parse", "-q", "--verify", "MERGE_HEAD"])?
+            .map(|head| head.trim().to_string())
+            .filter(|head| !head.is_empty()),
+    )
+}
+
+pub fn worktree_conflicts(
+    repo_path: impl AsRef<Path>,
+) -> VibexResult<Vec<GitWorktreeConflictFile>> {
+    let root = repo_root(repo_path.as_ref())?;
+    let output = run_git_owned(
+        &root,
+        &["ls-files".to_string(), "-u".to_string(), "-z".to_string()],
+    )?;
+    let mut stages_by_path: HashMap<String, Vec<u8>> = HashMap::new();
+    for entry in output.split('\0').filter(|entry| !entry.is_empty()) {
+        let Some((metadata, path)) = entry.split_once('\t') else {
+            continue;
+        };
+        let Some(stage) = metadata
+            .split_whitespace()
+            .nth(2)
+            .and_then(|value| value.parse::<u8>().ok())
+        else {
+            continue;
+        };
+        stages_by_path
+            .entry(path.to_string())
+            .or_default()
+            .push(stage);
+    }
+    let mut conflicts = stages_by_path
+        .into_iter()
+        .map(|(path, mut stages)| {
+            stages.sort_unstable();
+            stages.dedup();
+            let binary = conflict_path_is_binary(&root, &path);
+            let kind = if binary {
+                GitWorktreeConflictKind::Binary
+            } else {
+                match stages.as_slice() {
+                    [2, 3] => GitWorktreeConflictKind::BothAdded,
+                    [1, 2] => GitWorktreeConflictKind::DeletedBySource,
+                    [1, 3] => GitWorktreeConflictKind::DeletedByTarget,
+                    [1, 2, 3] => GitWorktreeConflictKind::BothModified,
+                    _ => GitWorktreeConflictKind::Other,
+                }
+            };
+            GitWorktreeConflictFile {
+                path,
+                kind,
+                binary,
+                resolved: false,
+            }
+        })
+        .collect::<Vec<_>>();
+    conflicts.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(conflicts)
+}
+
+pub fn worktree_select_conflict_version(
+    repo_path: impl AsRef<Path>,
+    path: &str,
+    version: GitWorktreeConflictVersion,
+) -> VibexResult<Vec<GitWorktreeConflictFile>> {
+    let root = repo_root(repo_path.as_ref())?;
+    let _mutation = GitMutationGuard::claim(&root)?;
+    validate_git_path(path)?;
+    if merge_head(&root)?.is_none() {
+        return Err(VibexError::conflict(
+            "worktree_merge_scene_missing",
+            "target workspace no longer has an active merge",
+        ));
+    }
+    let conflicts = worktree_conflicts(&root)?;
+    let _conflict = conflicts
+        .iter()
+        .find(|conflict| conflict.path == path)
+        .ok_or_else(|| {
+            VibexError::conflict(
+                "worktree_conflict_path_missing",
+                "path is not an unresolved merge conflict",
+            )
+        })?;
+    let stage = match version {
+        GitWorktreeConflictVersion::Target => 2,
+        GitWorktreeConflictVersion::Source => 3,
+    };
+    let has_stage = conflict_has_stage(&root, path, stage)?;
+    if has_stage {
+        run_git_owned(
+            &root,
+            &[
+                "checkout-index".to_string(),
+                "--force".to_string(),
+                format!("--stage={stage}"),
+                "--".to_string(),
+                path.to_string(),
+            ],
+        )?;
+    } else {
+        let full_path = root.join(path);
+        if full_path.is_file() || full_path.is_symlink() {
+            std::fs::remove_file(&full_path).map_err(|error| {
+                VibexError::storage(
+                    "worktree_conflict_version_remove_failed",
+                    "failed to apply the selected deleted file version",
+                )
+                .with_diagnostic("path", path)
+                .with_diagnostic("error", error.to_string())
+            })?;
+        }
+    }
+    worktree_conflicts(&root)
+}
+
+pub fn worktree_stage_conflicts(
+    workspace_id: WorkspaceId,
+    repo_path: impl AsRef<Path>,
+    paths: &[String],
+) -> VibexResult<Vec<GitWorktreeConflictFile>> {
+    let root = repo_root(repo_path.as_ref())?;
+    let _mutation = GitMutationGuard::claim(&root)?;
+    if paths.is_empty() {
+        return Err(VibexError::validation(
+            "worktree_conflict_paths_empty",
+            "at least one conflict path is required",
+        ));
+    }
+    let current = worktree_conflicts(&root)?;
+    for path in paths {
+        validate_git_path(path)?;
+        if !current.iter().any(|conflict| conflict.path == *path) {
+            return Err(VibexError::conflict(
+                "worktree_conflict_path_missing",
+                "path is not an unresolved merge conflict",
+            )
+            .with_diagnostic("path", path));
+        }
+    }
+    let _ = workspace_id;
+    let paths = validate_paths(paths)?;
+    run_git_paths(&root, &["add"], &paths)?;
+    worktree_conflicts(&root)
+}
+
+pub fn worktree_merge_continue(
+    target_repo_path: impl AsRef<Path>,
+    expected_source_head: &str,
+    expected_target_branch: &str,
+    expected_target_head: &str,
+) -> VibexResult<String> {
+    let root = repo_root(target_repo_path.as_ref())?;
+    let _mutation = GitMutationGuard::claim(&root)?;
+    verify_merge_scene(
+        &root,
+        expected_source_head,
+        expected_target_branch,
+        expected_target_head,
+    )?;
+    if !worktree_conflicts(&root)?.is_empty() {
+        return Err(VibexError::conflict(
+            "worktree_conflicts_unresolved",
+            "all merge conflicts must be staged before continuing",
+        ));
+    }
+    run_git_owned(
+        &root,
+        &[
+            "-c".to_string(),
+            "core.editor=true".to_string(),
+            "commit".to_string(),
+            "--no-edit".to_string(),
+        ],
+    )?;
+    let head_after = resolve_head(&root)?;
+    let parents = run_git_owned(
+        &root,
+        &[
+            "rev-list".to_string(),
+            "--parents".to_string(),
+            "-n".to_string(),
+            "1".to_string(),
+            head_after.clone(),
+        ],
+    )?;
+    let fields = parents.split_whitespace().collect::<Vec<_>>();
+    if fields.len() != 3 || fields[1] != expected_target_head || fields[2] != expected_source_head {
+        return Err(VibexError::conflict(
+            "worktree_merge_commit_identity_mismatch",
+            "completed merge commit does not have the expected parents",
+        ));
+    }
+    Ok(head_after)
+}
+
+pub fn is_expected_merge_commit(
+    repo_path: impl AsRef<Path>,
+    commit: &str,
+    expected_target_parent: &str,
+    expected_source_parent: &str,
+) -> VibexResult<bool> {
+    let root = repo_root(repo_path.as_ref())?;
+    validate_commitish(commit)?;
+    validate_commitish(expected_target_parent)?;
+    validate_commitish(expected_source_parent)?;
+    let parents = run_git_owned(
+        &root,
+        &[
+            "rev-list".to_string(),
+            "--parents".to_string(),
+            "-n".to_string(),
+            "1".to_string(),
+            commit.to_string(),
+        ],
+    )?;
+    let fields = parents.split_whitespace().collect::<Vec<_>>();
+    Ok(fields.len() == 3
+        && fields[0] == commit
+        && fields[1] == expected_target_parent
+        && fields[2] == expected_source_parent)
+}
+
+pub fn worktree_merge_abort(
+    target_repo_path: impl AsRef<Path>,
+    expected_source_head: &str,
+    expected_target_branch: &str,
+    expected_target_head: &str,
+) -> VibexResult<()> {
+    let root = repo_root(target_repo_path.as_ref())?;
+    let _mutation = GitMutationGuard::claim(&root)?;
+    verify_merge_scene(
+        &root,
+        expected_source_head,
+        expected_target_branch,
+        expected_target_head,
+    )?;
+    run_git_owned(&root, &["merge".to_string(), "--abort".to_string()])?;
+    if merge_head(&root)?.is_some()
+        || resolve_head(&root)? != expected_target_head
+        || status(WorkspaceId::new(), &root)?.dirty
+    {
+        return Err(VibexError::conflict(
+            "worktree_merge_abort_unproven",
+            "merge abort did not restore the exact clean target state",
+        ));
+    }
+    Ok(())
+}
+
+pub fn worktree_restore(
+    repo_path: impl AsRef<Path>,
+    worktree_path: impl AsRef<Path>,
+    branch: &str,
+    expected_head: &str,
+) -> VibexResult<GitWorktreeSummary> {
+    let root = repo_root(repo_path.as_ref())?;
+    let _mutation = GitMutationGuard::claim(&root)?;
+    let path = worktree_path.as_ref();
+    if !path.is_absolute() {
+        return Err(VibexError::validation(
+            "worktree_path_not_absolute",
+            "restored worktree path must be absolute",
+        ));
+    }
+    if path.exists() {
+        return Err(VibexError::conflict(
+            "worktree_restore_path_exists",
+            "original worktree path is already occupied",
+        ));
+    }
+    validate_ref_arg(branch)?;
+    if resolve_ref_head(&root, branch)? != expected_head {
+        return Err(VibexError::conflict(
+            "worktree_source_head_changed",
+            "worktree branch changed after archive",
+        ));
+    }
+    run_git_owned(
+        &root,
+        &[
+            "worktree".to_string(),
+            "add".to_string(),
+            path.to_string_lossy().to_string(),
+            branch.to_string(),
+        ],
+    )?;
+    worktree_list(WorkspaceId::new(), &root)?
+        .worktrees
+        .into_iter()
+        .find(|worktree| same_path_identity(&worktree.path, path))
+        .ok_or_else(|| {
+            VibexError::process(
+                "worktree_restore_missing_after_add",
+                "restored worktree is missing from Git registration",
+            )
+        })
 }
 
 pub fn worktree_remove(
@@ -936,6 +1376,61 @@ fn change_kind(x: char, y: char) -> GitChangeKind {
         'T' => GitChangeKind::TypeChanged,
         _ => GitChangeKind::Unknown,
     }
+}
+
+fn conflict_has_stage(root: &Path, path: &str, expected_stage: u8) -> VibexResult<bool> {
+    let output = run_git_owned(
+        root,
+        &[
+            "ls-files".to_string(),
+            "-u".to_string(),
+            "--".to_string(),
+            path.to_string(),
+        ],
+    )?;
+    Ok(output.lines().any(|line| {
+        line.split_once('\t')
+            .and_then(|(metadata, _)| metadata.split_whitespace().nth(2))
+            .and_then(|stage| stage.parse::<u8>().ok())
+            == Some(expected_stage)
+    }))
+}
+
+fn conflict_path_is_binary(root: &Path, path: &str) -> bool {
+    let Ok(bytes) = std::fs::read(root.join(path)) else {
+        return false;
+    };
+    bytes.iter().take(8 * 1024).any(|byte| *byte == 0)
+}
+
+fn verify_merge_scene(
+    root: &Path,
+    expected_source_head: &str,
+    expected_target_branch: &str,
+    expected_target_head: &str,
+) -> VibexResult<()> {
+    validate_commitish(expected_source_head)?;
+    validate_ref_arg(expected_target_branch)?;
+    validate_commitish(expected_target_head)?;
+    if merge_head(root)?.as_deref() != Some(expected_source_head) {
+        return Err(VibexError::conflict(
+            "worktree_merge_head_changed",
+            "active merge does not match the fixed source head",
+        ));
+    }
+    if current_branch(root)?.as_deref() != Some(expected_target_branch) {
+        return Err(VibexError::conflict(
+            "worktree_target_branch_changed",
+            "target branch changed during merge resolution",
+        ));
+    }
+    if resolve_head(root)? != expected_target_head {
+        return Err(VibexError::conflict(
+            "worktree_target_head_changed",
+            "target head changed during merge resolution",
+        ));
+    }
+    Ok(())
 }
 
 fn is_untracked(root: &Path, path: &str) -> VibexResult<bool> {
@@ -2344,6 +2839,156 @@ mod tests {
     }
 
     #[test]
+    fn merge_readiness_facts_and_conflict_lifecycle_are_exact() {
+        let root = temp_repo("worktree-conflict-continue");
+        let (source_branch, source_head, target_branch, target_head) =
+            prepare_conflict(&root, Some(b"base\n"), Some(b"source\n"), Some(b"target\n"));
+        let clean_fingerprint = worktree_dirty_fingerprint(&root).unwrap();
+        assert!(!clean_fingerprint.is_empty());
+        let summary = worktree_merge_summary(&root, &target_head, &source_head).unwrap();
+        assert_eq!(summary.commit_count, 1);
+        assert_eq!(summary.file_count, 1);
+
+        let error = worktree_merge(
+            &root,
+            &source_branch,
+            &source_head,
+            &target_branch,
+            &target_head,
+        )
+        .unwrap_err();
+        assert_eq!(
+            active_git_operation(&root).unwrap().as_deref(),
+            Some("merge")
+        );
+        assert!(!error.code.is_empty());
+        let conflicts = worktree_conflicts(&root).unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].kind, GitWorktreeConflictKind::BothModified);
+        assert_ne!(
+            worktree_dirty_fingerprint(&root).unwrap(),
+            clean_fingerprint
+        );
+
+        worktree_select_conflict_version(&root, "conflict.bin", GitWorktreeConflictVersion::Source)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(root.join("conflict.bin")).unwrap(),
+            b"source\n"
+        );
+        assert_eq!(
+            worktree_stage_conflicts(WorkspaceId::new(), &root, &["conflict.bin".to_string()])
+                .unwrap(),
+            Vec::new()
+        );
+        let head_after =
+            worktree_merge_continue(&root, &source_head, &target_branch, &target_head).unwrap();
+        assert_eq!(resolve_head(&root).unwrap(), head_after);
+        assert!(merge_head(&root).unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn conflict_categories_and_abort_preserve_the_target() {
+        type ConflictScenario<'a> = (
+            &'a str,
+            Option<&'a [u8]>,
+            Option<&'a [u8]>,
+            Option<&'a [u8]>,
+            GitWorktreeConflictKind,
+        );
+        let scenarios: [ConflictScenario<'_>; 3] = [
+            (
+                "both-added",
+                None,
+                Some(b"source\n"),
+                Some(b"target\n"),
+                GitWorktreeConflictKind::BothAdded,
+            ),
+            (
+                "delete-modify",
+                Some(b"base\n"),
+                None,
+                Some(b"target\n"),
+                GitWorktreeConflictKind::DeletedBySource,
+            ),
+            (
+                "binary",
+                Some(b"base\0value"),
+                Some(b"source\0value"),
+                Some(b"target\0value"),
+                GitWorktreeConflictKind::Binary,
+            ),
+        ];
+        for (label, base, source, target, expected_kind) in scenarios {
+            let root = temp_repo(label);
+            let (source_branch, source_head, target_branch, target_head) =
+                prepare_conflict(&root, base, source, target);
+            worktree_merge(
+                &root,
+                &source_branch,
+                &source_head,
+                &target_branch,
+                &target_head,
+            )
+            .unwrap_err();
+            let conflicts = worktree_conflicts(&root).unwrap();
+            assert_eq!(conflicts.len(), 1, "{label}");
+            assert_eq!(conflicts[0].kind, expected_kind, "{label}");
+            worktree_merge_abort(&root, &source_head, &target_branch, &target_head).unwrap();
+            assert_eq!(resolve_head(&root).unwrap(), target_head, "{label}");
+            assert!(merge_head(&root).unwrap().is_none(), "{label}");
+            assert!(!status(WorkspaceId::new(), &root).unwrap().dirty, "{label}");
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn archived_worktree_restores_the_exact_path_branch_and_head() {
+        let root = temp_repo("worktree-restore-main");
+        std::fs::create_dir_all(&root).unwrap();
+        init_repo_with_commit(&root, "README.md", "hello\n", "initial");
+        let path = temp_repo("worktree-restore-feature");
+        let branch = "feature/restore";
+        let workspace_id = WorkspaceId::new();
+        let created = worktree_add(
+            &root,
+            &path,
+            &GitWorktreeCreateRequest {
+                workspace_id: workspace_id.clone(),
+                branch_name: branch.to_string(),
+                base_ref: Some("HEAD".to_string()),
+                name: None,
+                worktree_path: None,
+                target_workspace_id: None,
+                target_branch: None,
+            },
+        )
+        .unwrap();
+        let expected_head = created.head.unwrap();
+        worktree_remove(
+            &root,
+            &GitWorktreeDiscardRequest {
+                workspace_id,
+                worktree_path: path.to_string_lossy().into_owned(),
+                force: false,
+                expected_head: Some(expected_head.clone()),
+                preflight_revision: None,
+            },
+        )
+        .unwrap();
+        assert!(!path.exists());
+        let restored = worktree_restore(&root, &path, branch, &expected_head).unwrap();
+        assert!(same_path_identity(&restored.path, &path));
+        assert_eq!(restored.branch.as_deref(), Some(branch));
+        assert_eq!(restored.head.as_deref(), Some(expected_head.as_str()));
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
     fn same_path_identity_matches_canonical_aliases() {
         let root = temp_repo("path-alias");
         let child = root.join("child");
@@ -2360,6 +3005,51 @@ mod tests {
             "vibex-git-{label}-{}",
             vibex_core::RequestId::new().as_str()
         ))
+    }
+
+    fn prepare_conflict(
+        root: &Path,
+        base: Option<&[u8]>,
+        source: Option<&[u8]>,
+        target: Option<&[u8]>,
+    ) -> (String, String, String, String) {
+        std::fs::create_dir_all(root).unwrap();
+        run_raw(root, &["init"]).unwrap();
+        run_raw(root, &["config", "user.email", "vibex@example.invalid"]).unwrap();
+        run_raw(root, &["config", "user.name", "Vibex Test"]).unwrap();
+        std::fs::write(root.join("seed.txt"), b"seed\n").unwrap();
+        if let Some(base) = base {
+            std::fs::write(root.join("conflict.bin"), base).unwrap();
+        }
+        run_raw(root, &["add", "-A"]).unwrap();
+        run_raw(root, &["commit", "-m", "base"]).unwrap();
+        let target_branch = current_branch(root).unwrap().unwrap();
+        let source_branch = format!("feature/{}", vibex_core::RequestId::new().as_str());
+        run_raw(root, &["switch", "-c", &source_branch]).unwrap();
+        match source {
+            Some(content) => std::fs::write(root.join("conflict.bin"), content).unwrap(),
+            None => {
+                if root.join("conflict.bin").exists() {
+                    std::fs::remove_file(root.join("conflict.bin")).unwrap();
+                }
+            }
+        }
+        run_raw(root, &["add", "-A"]).unwrap();
+        run_raw(root, &["commit", "-m", "source"]).unwrap();
+        let source_head = resolve_head(root).unwrap();
+        run_raw(root, &["switch", &target_branch]).unwrap();
+        match target {
+            Some(content) => std::fs::write(root.join("conflict.bin"), content).unwrap(),
+            None => {
+                if root.join("conflict.bin").exists() {
+                    std::fs::remove_file(root.join("conflict.bin")).unwrap();
+                }
+            }
+        }
+        run_raw(root, &["add", "-A"]).unwrap();
+        run_raw(root, &["commit", "-m", "target"]).unwrap();
+        let target_head = resolve_head(root).unwrap();
+        (source_branch, source_head, target_branch, target_head)
     }
 
     fn run_raw(root: &Path, args: &[&str]) -> std::io::Result<()> {

@@ -18,10 +18,15 @@ use vibex_core::{
     FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest,
     GetMessageSubmissionRequest, GitCommitRequest, GitCommitResult, GitDiffRequest,
     GitDiffResponse, GitProjectEligibility, GitStageRequest, GitStatusSummary,
-    GitWorktreeCreateRequest, GitWorktreeCreateResult, GitWorktreeLifecycleSnapshot,
-    MessageSubmissionState, OpenWorkspaceRequest, ProjectId, ProjectWorkspaceSummary,
-    ProviderHealthSummary, ProviderProfileSummary, ProviderRunHealthProbesRequest,
-    ProviderRunHealthProbesResult, RemoteActionClass, RemoteAgentCancelRuntimeSwitchRequest,
+    GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
+    GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeCreateRequest,
+    GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
+    GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
+    GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeReadinessRecord,
+    GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, MessageSubmissionState,
+    OpenWorkspaceRequest, ProjectId, ProjectWorkspaceSummary, ProviderHealthSummary,
+    ProviderProfileSummary, ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult,
+    RemoteActionClass, RemoteAgentCancelRuntimeSwitchRequest,
     RemoteAgentCancelRuntimeSwitchResponse, RemoteAgentDeepLinkResolveRequest,
     RemoteAgentDeepLinkResolveResponse, RemoteAgentInterruptRequest, RemoteAgentInterruptResponse,
     RemoteAgentMessageSubmissionRequest, RemoteAgentMessageSubmissionResponse, RemoteAgentRequest,
@@ -1093,6 +1098,160 @@ impl GitBackend for WebRemoteBackend {
         )
     }
 
+    fn git_worktree_readiness(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BackendFuture<'_, Option<GitWorktreeReadinessRecord>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let snapshot = this.git_worktree_snapshot(workspace_id.clone()).await?;
+            Ok(snapshot
+                .readiness
+                .into_iter()
+                .find(|readiness| readiness.workspace_id == workspace_id))
+        })
+    }
+
+    fn git_worktree_set_readiness(
+        &self,
+        _request: MutationRequest<GitWorktreeReadinessRequest>,
+    ) -> BackendFuture<'_, GitWorktreeReadinessRecord> {
+        self.unsupported(
+            "remote_worktree_mutation_unsupported",
+            "worktree readiness mutation is available only on the desktop runtime",
+        )
+    }
+
+    fn git_worktree_merge_plan(
+        &self,
+        _request: GitWorktreeMergeRequest,
+    ) -> BackendFuture<'_, GitWorktreeMergePlan> {
+        self.unsupported(
+            "remote_worktree_mutation_unsupported",
+            "worktree merge planning is available only on the desktop runtime",
+        )
+    }
+
+    fn git_worktree_merge(
+        &self,
+        _request: MutationRequest<GitWorktreeMergeRequest>,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+        self.unsupported(
+            "remote_worktree_mutation_unsupported",
+            "worktree merge is available only on the desktop runtime",
+        )
+    }
+
+    fn git_worktree_resolve_conflict(
+        &self,
+        _request: MutationRequest<GitWorktreeConflictResolveRequest>,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+        self.unsupported(
+            "remote_worktree_mutation_unsupported",
+            "worktree conflict mutation is available only on the desktop runtime",
+        )
+    }
+
+    fn git_worktree_stage_conflicts(
+        &self,
+        _request: MutationRequest<GitWorktreeConflictStageRequest>,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+        self.unsupported(
+            "remote_worktree_mutation_unsupported",
+            "worktree conflict staging is available only on the desktop runtime",
+        )
+    }
+
+    fn git_worktree_bind_assistance_session(
+        &self,
+        _request: MutationRequest<GitWorktreeAssistanceSessionRequest>,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+        self.unsupported(
+            "remote_worktree_mutation_unsupported",
+            "worktree assistance Session binding is available only on the desktop runtime",
+        )
+    }
+
+    fn git_worktree_continue_merge(
+        &self,
+        _request: MutationRequest<GitWorktreeOperationRequest>,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+        self.unsupported(
+            "remote_worktree_mutation_unsupported",
+            "worktree merge continue is available only on the desktop runtime",
+        )
+    }
+
+    fn git_worktree_abort_merge(
+        &self,
+        _request: MutationRequest<GitWorktreeOperationRequest>,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+        self.unsupported(
+            "remote_worktree_mutation_unsupported",
+            "worktree merge abort is available only on the desktop runtime",
+        )
+    }
+
+    fn git_worktree_archive_preflight(
+        &self,
+        _request: GitWorktreeArchiveRequest,
+    ) -> BackendFuture<'_, GitWorktreeDestructivePreflight> {
+        self.unsupported(
+            "remote_worktree_mutation_unsupported",
+            "worktree archive planning is available only on the desktop runtime",
+        )
+    }
+
+    fn git_worktree_archive(
+        &self,
+        _request: MutationRequest<GitWorktreeArchiveRequest>,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+        self.unsupported(
+            "remote_worktree_mutation_unsupported",
+            "worktree archive is available only on the desktop runtime",
+        )
+    }
+
+    fn git_worktree_restore_preflight(
+        &self,
+        _request: GitWorktreeRestoreRequest,
+    ) -> BackendFuture<'_, GitWorktreeDestructivePreflight> {
+        self.unsupported(
+            "remote_worktree_mutation_unsupported",
+            "worktree restore planning is available only on the desktop runtime",
+        )
+    }
+
+    fn git_worktree_restore(
+        &self,
+        _request: MutationRequest<GitWorktreeRestoreRequest>,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+        self.unsupported(
+            "remote_worktree_mutation_unsupported",
+            "worktree restore is available only on the desktop runtime",
+        )
+    }
+
+    fn git_worktree_discard_preflight(
+        &self,
+        _request: GitWorktreeDiscardRequest,
+    ) -> BackendFuture<'_, GitWorktreeDestructivePreflight> {
+        self.unsupported(
+            "remote_worktree_mutation_unsupported",
+            "worktree discard planning is available only on the desktop runtime",
+        )
+    }
+
+    fn git_worktree_discard(
+        &self,
+        _request: MutationRequest<GitWorktreeDiscardRequest>,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+        self.unsupported(
+            "remote_worktree_mutation_unsupported",
+            "worktree discard is available only on the desktop runtime",
+        )
+    }
+
     fn stage(
         &self,
         request: MutationRequest<GitStageRequest>,
@@ -2093,14 +2252,46 @@ mod tests {
         assert!(!snapshot.file.supports(BackendOperation::FileDelete));
         assert!(!snapshot.git.supports(BackendOperation::GitWorktreeRead));
         assert!(!snapshot.git.supports(BackendOperation::GitWorktreeCreate));
+        assert!(
+            !snapshot
+                .git
+                .supports(BackendOperation::GitWorktreeLifecycleMutate)
+        );
     }
 
     #[test]
-    fn negotiated_remote_exposes_worktree_read_but_never_create() {
+    fn negotiated_remote_exposes_worktree_read_but_never_lifecycle_mutation() {
         let info = full_control_server_info(&["git", "git_worktree_read"]);
         let snapshot = remote_capabilities(Some(&info));
         assert!(snapshot.git.supports(BackendOperation::GitWorktreeRead));
         assert!(!snapshot.git.supports(BackendOperation::GitWorktreeCreate));
+        assert!(
+            !snapshot
+                .git
+                .supports(BackendOperation::GitWorktreeLifecycleMutate)
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_lifecycle_mutations_fail_with_one_stable_capability_code() {
+        let backend = WebRemoteBackend::new(
+            Arc::new(MockTransport::new([])),
+            RemoteAuthProof {
+                device_id: vibex_core::DeviceId::new(),
+                auth_token: "test-token".to_string(),
+            },
+        );
+        let error = backend
+            .git_worktree_set_readiness(MutationRequest::new(GitWorktreeReadinessRequest {
+                workspace_id: WorkspaceId::new(),
+                state: vibex_core::GitWorktreeReadinessState::Reviewing,
+                expected_source_head: None,
+                expected_dirty_fingerprint: None,
+                checks: Vec::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "remote_worktree_mutation_unsupported");
     }
 
     #[test]

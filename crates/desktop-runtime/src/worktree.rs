@@ -5,20 +5,26 @@ use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 use vibex_core::{
-    GitManagedWorktreeRecord, GitManagedWorktreeStatus, GitPathIdentity, GitProjectEligibility,
-    GitProjectEligibilityState, GitWorktreeCreateRequest, GitWorktreeCreateResult,
+    AgentSessionState, GitManagedWorktreeRecord, GitManagedWorktreeStatus, GitPathIdentity,
+    GitProjectEligibility, GitProjectEligibilityState, GitWorktreeArchiveRequest,
+    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictResolveRequest,
+    GitWorktreeConflictStageRequest, GitWorktreeCreateRequest, GitWorktreeCreateResult,
     GitWorktreeDestructiveAction, GitWorktreeDestructivePreflight, GitWorktreeDiagnostic,
     GitWorktreeDiagnosticSeverity, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
-    GitWorktreeListResponse, GitWorktreeLockKey, GitWorktreeLockKind, GitWorktreeMergeRequest,
-    GitWorktreeOperationCheckpoint, GitWorktreeOperationDetail, GitWorktreeOperationKind,
-    GitWorktreeOperationRecord, GitWorktreeOperationStatus, GitWorktreeReconcileReport,
-    GitWorktreeReconciliationState, GitWorktreeRisk, GitWorktreeRiskKind, GitWorktreeSummary,
-    ProjectId, RequestId, VibexError, VibexResult, WorkspaceId, WorkspaceMode, WorkspaceRecord,
+    GitWorktreeListResponse, GitWorktreeLockKey, GitWorktreeLockKind, GitWorktreeMergePlan,
+    GitWorktreeMergeRequest, GitWorktreeMergeStrategy, GitWorktreeOperationCheckpoint,
+    GitWorktreeOperationDetail, GitWorktreeOperationKind, GitWorktreeOperationRecord,
+    GitWorktreeOperationRequest, GitWorktreeOperationStatus, GitWorktreeReadinessRecord,
+    GitWorktreeReadinessRequest, GitWorktreeReadinessState, GitWorktreeReconcileReport,
+    GitWorktreeReconciliationState, GitWorktreeRestoreRequest, GitWorktreeRisk,
+    GitWorktreeRiskKind, GitWorktreeRunningConsumers, GitWorktreeSummary, ProjectId, RequestId,
+    TerminalStatus, VibexError, VibexResult, WorkspaceId, WorkspaceMode, WorkspaceRecord,
     unix_timestamp_ms,
 };
 use vibex_db::{
-    ManagedWorktreeRepository, WorkspaceRepository, WorktreeOperationClaimOutcome,
-    WorktreeOperationRepository, open_database,
+    ManagedWorktreeRepository, SessionRepository, TerminalSessionRepository, WorkspaceRepository,
+    WorktreeOperationClaimOutcome, WorktreeOperationRepository, WorktreeReadinessRepository,
+    open_database,
 };
 
 use crate::GitHandle;
@@ -80,9 +86,16 @@ impl WorktreeCoordinator {
         let (project, workspace) = workspace_record(&connection, workspace_id)?;
         let eligibility =
             vibex_git::project_git_eligibility(project.id.clone(), &workspace.root_path);
+        if eligibility.is_eligible() {
+            self.reconcile_external_merge(&connection, &project, &workspace)?;
+        }
         let managed_worktrees =
             ManagedWorktreeRepository::list_for_project(&connection, &project.id)?;
+        for managed in &managed_worktrees {
+            self.refresh_readiness_for_managed(&connection, managed)?;
+        }
         let operations = WorktreeOperationRepository::list_for_project(&connection, &project.id)?;
+        let readiness = WorktreeReadinessRepository::list_for_project(&connection, &project.id)?;
         let diagnostics = managed_worktrees
             .iter()
             .filter_map(|record| record.diagnostic.clone())
@@ -92,15 +105,141 @@ impl WorktreeCoordinator {
                     .filter_map(|record| record.detail.diagnostic.clone()),
             )
             .collect::<Vec<_>>();
-        let revision = snapshot_revision(&eligibility, &managed_worktrees, &operations)?;
+        let revision =
+            snapshot_revision(&eligibility, &managed_worktrees, &operations, &readiness)?;
         Ok(GitWorktreeLifecycleSnapshot {
             workspace_id: workspace.id,
             eligibility,
             managed_worktrees,
             operations,
+            readiness,
             diagnostics,
             revision,
         })
+    }
+
+    fn reconcile_external_merge(
+        &self,
+        connection: &vibex_db::DbConnection,
+        project: &vibex_core::ProjectRecord,
+        workspace: &WorkspaceRecord,
+    ) -> VibexResult<()> {
+        let operations = WorktreeOperationRepository::list_for_project(connection, &project.id)?;
+        let live_merge_head = vibex_git::merge_head(&workspace.root_path)?;
+        let external_operations = operations.iter().filter(|operation| {
+            operation.target_workspace_id.as_ref() == Some(&workspace.id)
+                && operation
+                    .detail
+                    .diagnostic
+                    .as_ref()
+                    .is_some_and(|diagnostic| {
+                        diagnostic.code == "worktree_external_merge_needs_attention"
+                    })
+                && operation.status == GitWorktreeOperationStatus::NeedsAttention
+        });
+        if live_merge_head.is_none() {
+            for operation in external_operations {
+                WorktreeOperationRepository::mark_outcome(
+                    connection,
+                    &operation.operation_id,
+                    GitWorktreeOperationStatus::Completed,
+                    GitWorktreeOperationCheckpoint::Completed,
+                    vibex_git::resolve_head(&workspace.root_path)
+                        .ok()
+                        .as_deref(),
+                    None,
+                )?;
+            }
+            return Ok(());
+        }
+        let live_merge_head = live_merge_head.expect("checked above");
+        let already_owned = operations.iter().any(|operation| {
+            operation.target_workspace_id.as_ref() == Some(&workspace.id)
+                && operation.detail.expected_source_head.as_deref() == Some(&live_merge_head)
+                && matches!(
+                    operation.status,
+                    GitWorktreeOperationStatus::Running
+                        | GitWorktreeOperationStatus::NeedsResolution
+                        | GitWorktreeOperationStatus::Aborting
+                        | GitWorktreeOperationStatus::NeedsAttention
+                )
+                && !operation
+                    .detail
+                    .diagnostic
+                    .as_ref()
+                    .is_some_and(|diagnostic| {
+                        diagnostic.code == "worktree_external_merge_needs_attention"
+                    })
+        });
+        if already_owned {
+            return Ok(());
+        }
+        let current_head = vibex_git::resolve_head(&workspace.root_path)?;
+        let idempotency_key = format!(
+            "worktree-external-merge:{}:{}:{}",
+            workspace.id.as_str(),
+            current_head,
+            live_merge_head
+        );
+        if WorktreeOperationRepository::get_by_idempotency_key(connection, &idempotency_key)?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let repository_identity = vibex_git::repository_identity(&workspace.root_path)?;
+        let now = unix_timestamp_ms();
+        let operation_id = RequestId::new();
+        let mut operation = GitWorktreeOperationRecord {
+            operation_id: operation_id.clone(),
+            project_id: project.id.clone(),
+            source_workspace_id: None,
+            target_workspace_id: Some(workspace.id.clone()),
+            operation: GitWorktreeOperationKind::MergeBack,
+            status: GitWorktreeOperationStatus::NeedsAttention,
+            worktree_path: None,
+            branch: None,
+            base_ref: None,
+            head_before: Some(current_head.clone()),
+            head_after: None,
+            error: None,
+            detail: GitWorktreeOperationDetail {
+                idempotency_key: Some(idempotency_key.clone()),
+                request_fingerprint: Some(idempotency_key),
+                repository_identity: Some(repository_identity.clone()),
+                target_path_identity: Some(vibex_git::canonical_path_identity(
+                    &workspace.root_path,
+                )),
+                lock_keys: vec![
+                    GitWorktreeLockKey {
+                        kind: GitWorktreeLockKind::Repository,
+                        key: repository_identity.comparison_key,
+                    },
+                    GitWorktreeLockKey {
+                        kind: GitWorktreeLockKind::WorkspaceIndex,
+                        key: workspace.id.as_str().to_string(),
+                    },
+                ],
+                target_branch: vibex_git::status(workspace.id.clone(), &workspace.root_path)?
+                    .branch,
+                expected_source_head: Some(live_merge_head),
+                expected_target_head: Some(current_head),
+                checkpoint: GitWorktreeOperationCheckpoint::NeedsAttention,
+                merge_strategy: Some(GitWorktreeMergeStrategy::Unknown),
+                ..GitWorktreeOperationDetail::default()
+            },
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        let diagnostic = lifecycle_diagnostic(
+            &operation,
+            "worktree_external_merge_needs_attention",
+            "target workspace has an external merge scene; Vibex will preserve it",
+            false,
+            Some("inspect_target"),
+        );
+        operation.error = Some(diagnostic.summary.clone());
+        operation.detail.diagnostic = Some(diagnostic);
+        WorktreeOperationRepository::insert(connection, &operation)
     }
 
     pub fn list(&self, workspace_id: &WorkspaceId) -> VibexResult<GitWorktreeListResponse> {
@@ -118,6 +257,294 @@ impl WorktreeCoordinator {
             }
         }
         Ok(response)
+    }
+
+    pub fn readiness(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> VibexResult<Option<GitWorktreeReadinessRecord>> {
+        let connection = open_database(&self.db_path)?;
+        let (_, workspace) = workspace_record(&connection, workspace_id)?;
+        let Some(managed) = managed_for_path(&connection, &workspace.root_path)? else {
+            return Ok(None);
+        };
+        self.refresh_readiness_for_managed(&connection, &managed)
+    }
+
+    pub fn set_readiness(
+        &self,
+        request: &GitWorktreeReadinessRequest,
+    ) -> VibexResult<GitWorktreeReadinessRecord> {
+        validate_readiness_checks(&request.checks)?;
+        if !matches!(
+            request.state,
+            GitWorktreeReadinessState::Working
+                | GitWorktreeReadinessState::Reviewing
+                | GitWorktreeReadinessState::ReadyToMerge
+        ) {
+            return Err(VibexError::validation(
+                "worktree_readiness_state_invalid",
+                "users may set readiness only to working, reviewing, or ready to merge",
+            ));
+        }
+        let connection = open_database(&self.db_path)?;
+        let (_, workspace) = workspace_record(&connection, &request.workspace_id)?;
+        let managed = managed_for_path(&connection, &workspace.root_path)?.ok_or_else(|| {
+            VibexError::validation(
+                "worktree_not_managed",
+                "readiness belongs only to a Vibex-managed worktree",
+            )
+        })?;
+        verify_managed_source(&managed, &workspace)?;
+        if managed.status != GitManagedWorktreeStatus::Active
+            || managed.reconciliation_state != GitWorktreeReconciliationState::Consistent
+        {
+            return Err(VibexError::conflict(
+                "worktree_readiness_unavailable",
+                "managed worktree is not in a consistent active state",
+            ));
+        }
+        let source_head = vibex_git::resolve_head(&workspace.root_path)?;
+        let dirty_fingerprint = vibex_git::worktree_dirty_fingerprint(&workspace.root_path)?;
+        let status = vibex_git::status(workspace.id.clone(), &workspace.root_path)?;
+        if request
+            .expected_source_head
+            .as_deref()
+            .is_some_and(|expected| expected != source_head)
+            || request
+                .expected_dirty_fingerprint
+                .as_deref()
+                .is_some_and(|expected| expected != dirty_fingerprint)
+        {
+            return Err(VibexError::conflict(
+                "worktree_readiness_stale",
+                "worktree changed after the readiness review started",
+            ));
+        }
+        if request.state == GitWorktreeReadinessState::ReadyToMerge {
+            if status.dirty {
+                return Err(VibexError::conflict(
+                    "worktree_readiness_dirty_source",
+                    "all tracked and untracked source changes must be committed before merge",
+                ));
+            }
+            if vibex_git::active_git_operation(&workspace.root_path)?.is_some() {
+                return Err(VibexError::conflict(
+                    "worktree_readiness_git_operation_active",
+                    "source worktree has an active Git operation",
+                ));
+            }
+        }
+        let target_workspace_id = managed.target_workspace_id.clone().ok_or_else(|| {
+            VibexError::conflict(
+                "worktree_fixed_target_missing",
+                "managed worktree has no fixed target workspace",
+            )
+        })?;
+        let target_branch = managed.target_branch.clone().ok_or_else(|| {
+            VibexError::conflict(
+                "worktree_fixed_target_branch_missing",
+                "managed worktree has no fixed target branch",
+            )
+        })?;
+        let revision = readiness_revision(
+            &managed.worktree_id,
+            request.state,
+            &source_head,
+            &dirty_fingerprint,
+            &target_workspace_id,
+            &target_branch,
+            &request.checks,
+        )?;
+        let readiness = GitWorktreeReadinessRecord {
+            worktree_id: managed.worktree_id,
+            workspace_id: workspace.id,
+            state: request.state,
+            source_head,
+            dirty_fingerprint,
+            target_workspace_id,
+            target_branch,
+            checks: request.checks.clone(),
+            revision,
+            updated_at_ms: unix_timestamp_ms(),
+        };
+        WorktreeReadinessRepository::upsert(&connection, &readiness)?;
+        Ok(readiness)
+    }
+
+    pub fn assert_target_operation_fence(
+        &self,
+        workspace_id: &WorkspaceId,
+        command: &str,
+    ) -> VibexResult<()> {
+        let connection = open_database(&self.db_path)?;
+        let (project, _) = workspace_record(&connection, workspace_id)?;
+        let fenced = WorktreeOperationRepository::list_for_project(&connection, &project.id)?
+            .into_iter()
+            .find(|operation| {
+                operation.target_workspace_id.as_ref() == Some(workspace_id)
+                    && matches!(
+                        operation.status,
+                        GitWorktreeOperationStatus::Running
+                            | GitWorktreeOperationStatus::NeedsResolution
+                            | GitWorktreeOperationStatus::Aborting
+                            | GitWorktreeOperationStatus::NeedsAttention
+                    )
+            });
+        if let Some(operation) = fenced {
+            return Err(VibexError::conflict(
+                "worktree_target_operation_fenced",
+                "target workspace has an active Git operation that must be continued or aborted",
+            )
+            .with_diagnostic("command", command)
+            .with_diagnostic("operationId", operation.operation_id.as_str()));
+        }
+        Ok(())
+    }
+
+    fn refresh_readiness_for_managed(
+        &self,
+        connection: &vibex_db::DbConnection,
+        managed: &GitManagedWorktreeRecord,
+    ) -> VibexResult<Option<GitWorktreeReadinessRecord>> {
+        let existing =
+            WorktreeReadinessRepository::get_by_worktree_id(connection, &managed.worktree_id)?;
+        if managed.status != GitManagedWorktreeStatus::Active
+            || managed.reconciliation_state != GitWorktreeReconciliationState::Consistent
+        {
+            return Ok(existing);
+        }
+        let Some(workspace_id) = managed.workspace_id.as_ref() else {
+            return Ok(existing);
+        };
+        let Some((_, workspace)) = WorkspaceRepository::get(connection, workspace_id)? else {
+            return Ok(existing);
+        };
+        if !Path::new(&workspace.root_path).is_dir() {
+            return Ok(existing);
+        }
+        let Some(target_workspace_id) = managed.target_workspace_id.clone() else {
+            return Ok(existing);
+        };
+        let Some(target_branch) = managed.target_branch.clone() else {
+            return Ok(existing);
+        };
+        let source_head = vibex_git::resolve_head(&workspace.root_path)?;
+        let dirty_fingerprint = vibex_git::worktree_dirty_fingerprint(&workspace.root_path)?;
+        if existing.as_ref().is_some_and(|readiness| {
+            readiness.source_head == source_head
+                && readiness.dirty_fingerprint == dirty_fingerprint
+                && readiness.target_workspace_id == target_workspace_id
+                && readiness.target_branch == target_branch
+        }) {
+            return Ok(existing);
+        }
+        let state = GitWorktreeReadinessState::Working;
+        let checks = Vec::new();
+        let revision = readiness_revision(
+            &managed.worktree_id,
+            state,
+            &source_head,
+            &dirty_fingerprint,
+            &target_workspace_id,
+            &target_branch,
+            &checks,
+        )?;
+        let readiness = GitWorktreeReadinessRecord {
+            worktree_id: managed.worktree_id.clone(),
+            workspace_id: workspace.id,
+            state,
+            source_head,
+            dirty_fingerprint,
+            target_workspace_id,
+            target_branch,
+            checks,
+            revision,
+            updated_at_ms: unix_timestamp_ms(),
+        };
+        WorktreeReadinessRepository::upsert(connection, &readiness)?;
+        Ok(Some(readiness))
+    }
+
+    fn transition_readiness(
+        &self,
+        connection: &vibex_db::DbConnection,
+        worktree_id: &RequestId,
+        state: GitWorktreeReadinessState,
+    ) -> VibexResult<Option<GitWorktreeReadinessRecord>> {
+        let Some(mut readiness) =
+            WorktreeReadinessRepository::get_by_worktree_id(connection, worktree_id)?
+        else {
+            return Ok(None);
+        };
+        readiness.state = state;
+        readiness.updated_at_ms = unix_timestamp_ms();
+        readiness.revision = readiness_revision(
+            &readiness.worktree_id,
+            readiness.state,
+            &readiness.source_head,
+            &readiness.dirty_fingerprint,
+            &readiness.target_workspace_id,
+            &readiness.target_branch,
+            &readiness.checks,
+        )?;
+        WorktreeReadinessRepository::upsert(connection, &readiness)?;
+        Ok(Some(readiness))
+    }
+
+    fn reconcile_queued_confirmation(
+        &self,
+        connection: &vibex_db::DbConnection,
+        managed: &GitManagedWorktreeRecord,
+        source_head: Option<&str>,
+        target_head: Option<&str>,
+    ) -> VibexResult<Option<RequestId>> {
+        let mut matching = None;
+        let mut retired = false;
+        for mut operation in
+            WorktreeOperationRepository::list_for_project(connection, &managed.project_id)?
+                .into_iter()
+                .filter(|operation| operation.operation == GitWorktreeOperationKind::MergeBack)
+                .filter(|operation| operation.status == GitWorktreeOperationStatus::Queued)
+                .filter(|operation| {
+                    operation.worktree_path.as_deref().is_some_and(|path| {
+                        vibex_git::same_path_identity(path, &managed.worktree_path)
+                    })
+                })
+        {
+            if operation.detail.expected_source_head.as_deref() == source_head
+                && operation.detail.expected_target_head.as_deref() == target_head
+            {
+                matching = Some(operation.operation_id.clone());
+                continue;
+            }
+            operation.status = GitWorktreeOperationStatus::Failed;
+            operation.detail.queue_position = None;
+            operation.detail.lease_owner = None;
+            operation.detail.lease_expires_at_ms = None;
+            operation.detail.diagnostic = Some(lifecycle_diagnostic(
+                &operation,
+                "worktree_merge_queue_confirmation_stale",
+                "queued merge facts changed and require a refreshed confirmation",
+                true,
+                Some("refresh_merge_plan"),
+            ));
+            operation.error = operation
+                .detail
+                .diagnostic
+                .as_ref()
+                .map(|diagnostic| diagnostic.summary.clone());
+            WorktreeOperationRepository::save(connection, &operation)?;
+            retired = true;
+        }
+        if retired {
+            self.transition_readiness(
+                connection,
+                &managed.worktree_id,
+                GitWorktreeReadinessState::ReadyToMerge,
+            )?;
+        }
+        Ok(matching)
     }
 
     pub fn create(
@@ -174,6 +601,84 @@ impl WorktreeCoordinator {
         Ok(self.merge_preflight_facts(request, None)?.preflight)
     }
 
+    pub fn merge_plan(
+        &self,
+        request: &GitWorktreeMergeRequest,
+    ) -> VibexResult<GitWorktreeMergePlan> {
+        let facts = self.merge_preflight_facts(request, None)?;
+        let target_workspace = facts.target_workspace.as_ref().ok_or_else(|| {
+            VibexError::conflict(
+                "worktree_target_workspace_missing",
+                "managed worktree has no fixed target workspace",
+            )
+        })?;
+        let source_workspace_id = facts.managed.workspace_id.clone().ok_or_else(|| {
+            VibexError::conflict(
+                "worktree_source_workspace_missing",
+                "managed worktree has no source workspace",
+            )
+        })?;
+        let source_branch = facts.managed.branch.clone().ok_or_else(|| {
+            VibexError::conflict(
+                "worktree_source_branch_missing",
+                "managed worktree has no source branch",
+            )
+        })?;
+        let source_head = facts.preflight.source_head.clone().ok_or_else(|| {
+            VibexError::conflict(
+                "worktree_source_head_missing",
+                "managed worktree source head is unavailable",
+            )
+        })?;
+        let target_branch = facts.managed.target_branch.clone().ok_or_else(|| {
+            VibexError::conflict(
+                "worktree_fixed_target_branch_missing",
+                "managed worktree has no fixed target branch",
+            )
+        })?;
+        let target_head = facts.preflight.target_head.clone().ok_or_else(|| {
+            VibexError::conflict(
+                "worktree_target_head_missing",
+                "managed worktree target head is unavailable",
+            )
+        })?;
+        let connection = open_database(&self.db_path)?;
+        let readiness = WorktreeReadinessRepository::get_by_worktree_id(
+            &connection,
+            &facts.managed.worktree_id,
+        )?
+        .ok_or_else(|| {
+            VibexError::conflict(
+                "worktree_readiness_required",
+                "worktree must be reviewed and marked ready before merge",
+            )
+        })?;
+        let running_consumers = running_consumers(
+            &connection,
+            &[source_workspace_id.clone(), target_workspace.id.clone()],
+        )?;
+        let summary = vibex_git::worktree_merge_summary(
+            &facts.managed.repo_root,
+            &target_head,
+            &source_head,
+        )?;
+        Ok(GitWorktreeMergePlan {
+            plan_id: RequestId::new(),
+            source_workspace_id,
+            source_path: facts.managed.worktree_path,
+            source_branch,
+            source_head,
+            target_workspace_id: target_workspace.id.clone(),
+            target_path: target_workspace.root_path.clone(),
+            target_branch,
+            target_head,
+            summary,
+            readiness,
+            running_consumers,
+            preflight: facts.preflight,
+        })
+    }
+
     pub fn discard_preflight(
         &self,
         request: &GitWorktreeDiscardRequest,
@@ -210,7 +715,32 @@ impl WorktreeCoordinator {
             return Ok(operation);
         }
         ensure_lifecycle_operation_contract(&connection, &operation)?;
-        let _locks = self.claim_lifecycle_locks(&connection, &operation)?;
+        let _locks = match self.claim_lifecycle_locks(&connection, &operation) {
+            Ok(locks) => locks,
+            Err(error) if error.code == "worktree_lifecycle_busy" => {
+                let mut queued = operation.clone();
+                queued.status = GitWorktreeOperationStatus::Queued;
+                queued.detail.queue_key = queued
+                    .target_workspace_id
+                    .as_ref()
+                    .map(|workspace_id| format!("target:{}", workspace_id.as_str()));
+                queued.detail.queue_position = Some(queue_position(
+                    &connection,
+                    queued.target_workspace_id.as_ref(),
+                    &queued.operation_id,
+                )?);
+                queued.detail.lease_owner = None;
+                queued.detail.lease_expires_at_ms = None;
+                let queued = WorktreeOperationRepository::save(&connection, &queued)?;
+                self.transition_readiness(
+                    &connection,
+                    &initial.managed.worktree_id,
+                    GitWorktreeReadinessState::MergeQueued,
+                )?;
+                return Ok(queued);
+            }
+            Err(error) => return Err(error),
+        };
         let claimed = match claim_lifecycle_operation(&connection, &operation, &self.lease_owner)? {
             LifecycleClaim::Acquired(record) => record,
             LifecycleClaim::Completed(record) => return Ok(record),
@@ -226,6 +756,11 @@ impl WorktreeCoordinator {
         if !current.preflight.allowed {
             let error = blocked_preflight_error(&current.preflight);
             mark_lifecycle_failure(&connection, &claimed, &error, false)?;
+            self.transition_readiness(
+                &connection,
+                &current.managed.worktree_id,
+                GitWorktreeReadinessState::ReadyToMerge,
+            )?;
             return Err(error);
         }
         let target_workspace = current.target_workspace.as_ref().ok_or_else(|| {
@@ -258,6 +793,17 @@ impl WorktreeCoordinator {
                 "worktree target head is unavailable after preflight",
             )
         })?;
+        let mut running = claimed.clone();
+        running.status = GitWorktreeOperationStatus::Running;
+        running.detail.checkpoint = GitWorktreeOperationCheckpoint::MergeStarted;
+        running.detail.merge_strategy = Some(GitWorktreeMergeStrategy::NoFfMerge);
+        running.detail.queue_position = None;
+        running = WorktreeOperationRepository::save(&connection, &running)?;
+        self.transition_readiness(
+            &connection,
+            &current.managed.worktree_id,
+            GitWorktreeReadinessState::MergeRunning,
+        )?;
         let result = vibex_git::worktree_merge(
             &target_workspace.root_path,
             source_ref,
@@ -271,13 +817,18 @@ impl WorktreeCoordinator {
                 ManagedWorktreeRepository::update_status(
                     &connection,
                     &current.managed.worktree_path,
-                    GitManagedWorktreeStatus::Merged,
-                    Some(&head_after),
-                    Some(unix_timestamp_ms()),
+                    GitManagedWorktreeStatus::Active,
+                    Some(expected_source_head),
+                    None,
+                )?;
+                self.transition_readiness(
+                    &connection,
+                    &current.managed.worktree_id,
+                    GitWorktreeReadinessState::Working,
                 )?;
                 WorktreeOperationRepository::mark_outcome(
                     &connection,
-                    &claimed.operation_id,
+                    &running.operation_id,
                     GitWorktreeOperationStatus::Completed,
                     GitWorktreeOperationCheckpoint::Completed,
                     Some(&head_after),
@@ -285,16 +836,528 @@ impl WorktreeCoordinator {
                 )
             }
             Err(error) => {
-                let needs_resolution =
-                    vibex_git::status(target_workspace.id.clone(), &target_workspace.root_path)
-                        .map(|status| {
-                            status
-                                .changes
-                                .iter()
-                                .any(|change| change.kind == vibex_core::GitChangeKind::Unmerged)
-                        })
-                        .unwrap_or(false);
-                mark_lifecycle_failure(&connection, &claimed, &error, needs_resolution)?;
+                let conflicts =
+                    vibex_git::worktree_conflicts(&target_workspace.root_path).unwrap_or_default();
+                if !conflicts.is_empty()
+                    && vibex_git::merge_head(&target_workspace.root_path)?.as_deref()
+                        == Some(expected_source_head)
+                {
+                    let mut conflict = running;
+                    conflict.status = GitWorktreeOperationStatus::NeedsResolution;
+                    conflict.detail.checkpoint = GitWorktreeOperationCheckpoint::ConflictDetected;
+                    conflict.detail.conflicts = conflicts;
+                    conflict.detail.lease_owner = None;
+                    conflict.detail.lease_expires_at_ms = None;
+                    let diagnostic = lifecycle_diagnostic(
+                        &conflict,
+                        "worktree_merge_needs_resolution",
+                        "merge requires conflict resolution in the target workspace",
+                        false,
+                        Some("resolve_conflicts"),
+                    );
+                    conflict.error = Some(diagnostic.summary.clone());
+                    conflict.detail.diagnostic = Some(diagnostic);
+                    WorktreeOperationRepository::save(&connection, &conflict)
+                } else {
+                    mark_lifecycle_failure(&connection, &running, &error, false)?;
+                    self.transition_readiness(
+                        &connection,
+                        &current.managed.worktree_id,
+                        GitWorktreeReadinessState::ReadyToMerge,
+                    )?;
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub fn resolve_conflict(
+        &self,
+        request: &GitWorktreeConflictResolveRequest,
+    ) -> VibexResult<GitWorktreeOperationRecord> {
+        let connection = open_database(&self.db_path)?;
+        let mut operation = self.merge_resolution_operation(
+            &connection,
+            &request.operation_id,
+            &request.workspace_id,
+        )?;
+        let _locks = self.claim_lifecycle_locks(&connection, &operation)?;
+        let (_, target_workspace) = workspace_record(&connection, &request.workspace_id)?;
+        verify_resolution_scene(&operation, &target_workspace)?;
+        operation.detail.conflicts = vibex_git::worktree_select_conflict_version(
+            &target_workspace.root_path,
+            &request.path,
+            request.version,
+        )?;
+        operation.detail.source_commits_after_start =
+            source_commits_after_start(&operation, &connection)?;
+        WorktreeOperationRepository::save(&connection, &operation)
+    }
+
+    pub fn stage_conflicts(
+        &self,
+        request: &GitWorktreeConflictStageRequest,
+    ) -> VibexResult<GitWorktreeOperationRecord> {
+        let connection = open_database(&self.db_path)?;
+        let mut operation = self.merge_resolution_operation(
+            &connection,
+            &request.operation_id,
+            &request.workspace_id,
+        )?;
+        let _locks = self.claim_lifecycle_locks(&connection, &operation)?;
+        let (_, target_workspace) = workspace_record(&connection, &request.workspace_id)?;
+        verify_resolution_scene(&operation, &target_workspace)?;
+        operation.detail.conflicts = vibex_git::worktree_stage_conflicts(
+            request.workspace_id.clone(),
+            &target_workspace.root_path,
+            &request.paths,
+        )?;
+        operation.detail.source_commits_after_start =
+            source_commits_after_start(&operation, &connection)?;
+        WorktreeOperationRepository::save(&connection, &operation)
+    }
+
+    pub fn bind_assistance_session(
+        &self,
+        request: &GitWorktreeAssistanceSessionRequest,
+    ) -> VibexResult<GitWorktreeOperationRecord> {
+        let connection = open_database(&self.db_path)?;
+        let initial = WorktreeOperationRepository::get(&connection, &request.operation_id)?
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "worktree_operation_not_found",
+                    "merge operation was not found",
+                )
+            })?;
+        let _locks = self.claim_lifecycle_locks(&connection, &initial)?;
+        let mut operation = WorktreeOperationRepository::get(&connection, &request.operation_id)?
+            .ok_or_else(|| {
+            VibexError::validation(
+                "worktree_operation_not_found",
+                "merge operation was not found",
+            )
+        })?;
+        if operation.operation != GitWorktreeOperationKind::MergeBack
+            || !matches!(
+                operation.status,
+                GitWorktreeOperationStatus::NeedsResolution
+                    | GitWorktreeOperationStatus::NeedsAttention
+            )
+            || operation.target_workspace_id.as_ref() != Some(&request.workspace_id)
+        {
+            return Err(VibexError::conflict(
+                "worktree_assistance_session_fence_mismatch",
+                "request does not match an active target merge operation",
+            ));
+        }
+        ensure_lifecycle_operation_contract(&connection, &operation)?;
+        let session =
+            SessionRepository::get(&connection, &request.session_id)?.ok_or_else(|| {
+                VibexError::validation(
+                    "worktree_assistance_session_not_found",
+                    "Agent session was not found",
+                )
+            })?;
+        if session.workspace_id != request.workspace_id || session.archived_at_ms.is_some() {
+            return Err(VibexError::validation(
+                "worktree_assistance_session_workspace_mismatch",
+                "Agent session must be active in the merge target Workspace",
+            ));
+        }
+        if let Some(bound_id) = operation.detail.assistance_session_id.as_ref()
+            && bound_id != &request.session_id
+            && SessionRepository::get(&connection, bound_id)?
+                .is_some_and(|session| session.archived_at_ms.is_none())
+        {
+            return Err(VibexError::conflict(
+                "worktree_assistance_session_already_bound",
+                "merge operation already has an active assistance Session",
+            ));
+        }
+        operation.detail.assistance_session_id = Some(request.session_id.clone());
+        WorktreeOperationRepository::save(&connection, &operation)
+    }
+
+    pub fn continue_merge(
+        &self,
+        request: &GitWorktreeOperationRequest,
+    ) -> VibexResult<GitWorktreeOperationRecord> {
+        let connection = open_database(&self.db_path)?;
+        let mut operation = self.merge_resolution_operation(
+            &connection,
+            &request.operation_id,
+            &request.workspace_id,
+        )?;
+        let _locks = self.claim_lifecycle_locks(&connection, &operation)?;
+        let (_, target_workspace) = workspace_record(&connection, &request.workspace_id)?;
+        verify_resolution_scene(&operation, &target_workspace)?;
+        operation.status = GitWorktreeOperationStatus::Running;
+        operation.detail.checkpoint = GitWorktreeOperationCheckpoint::ContinueStarted;
+        operation.detail.source_commits_after_start =
+            source_commits_after_start(&operation, &connection)?;
+        operation = WorktreeOperationRepository::save(&connection, &operation)?;
+        let source_head = operation_expected_source_head(&operation)?;
+        let target_head = operation_expected_target_head(&operation)?;
+        let target_branch = operation_target_branch(&operation)?;
+        match vibex_git::worktree_merge_continue(
+            &target_workspace.root_path,
+            source_head,
+            target_branch,
+            target_head,
+        ) {
+            Ok(head_after) => {
+                if let Some(managed) = managed_for_operation(&connection, &operation)? {
+                    ManagedWorktreeRepository::update_status(
+                        &connection,
+                        &managed.worktree_path,
+                        GitManagedWorktreeStatus::Active,
+                        Some(source_head),
+                        None,
+                    )?;
+                    self.transition_readiness(
+                        &connection,
+                        &managed.worktree_id,
+                        GitWorktreeReadinessState::Working,
+                    )?;
+                }
+                WorktreeOperationRepository::mark_outcome(
+                    &connection,
+                    &operation.operation_id,
+                    GitWorktreeOperationStatus::Completed,
+                    GitWorktreeOperationCheckpoint::Completed,
+                    Some(&head_after),
+                    None,
+                )
+            }
+            Err(error) => {
+                preserve_merge_scene_or_attention(
+                    &connection,
+                    &operation,
+                    &target_workspace,
+                    &error,
+                )?;
+                Err(error)
+            }
+        }
+    }
+
+    pub fn abort_merge(
+        &self,
+        request: &GitWorktreeOperationRequest,
+    ) -> VibexResult<GitWorktreeOperationRecord> {
+        let connection = open_database(&self.db_path)?;
+        let mut operation = self.merge_resolution_operation(
+            &connection,
+            &request.operation_id,
+            &request.workspace_id,
+        )?;
+        let _locks = self.claim_lifecycle_locks(&connection, &operation)?;
+        let (_, target_workspace) = workspace_record(&connection, &request.workspace_id)?;
+        verify_resolution_scene(&operation, &target_workspace)?;
+        operation.status = GitWorktreeOperationStatus::Aborting;
+        operation.detail.checkpoint = GitWorktreeOperationCheckpoint::AbortStarted;
+        operation = WorktreeOperationRepository::save(&connection, &operation)?;
+        let source_head = operation_expected_source_head(&operation)?;
+        let target_head = operation_expected_target_head(&operation)?;
+        let target_branch = operation_target_branch(&operation)?;
+        match vibex_git::worktree_merge_abort(
+            &target_workspace.root_path,
+            source_head,
+            target_branch,
+            target_head,
+        ) {
+            Ok(()) => {
+                if let Some(managed) = managed_for_operation(&connection, &operation)? {
+                    self.refresh_readiness_for_managed(&connection, &managed)?;
+                }
+                WorktreeOperationRepository::mark_outcome(
+                    &connection,
+                    &operation.operation_id,
+                    GitWorktreeOperationStatus::Aborted,
+                    GitWorktreeOperationCheckpoint::Completed,
+                    None,
+                    None,
+                )
+            }
+            Err(error) => {
+                let diagnostic = lifecycle_diagnostic(
+                    &operation,
+                    "worktree_merge_abort_needs_attention",
+                    "merge abort could not prove the exact original target state",
+                    false,
+                    Some("inspect_target"),
+                );
+                WorktreeOperationRepository::mark_outcome(
+                    &connection,
+                    &operation.operation_id,
+                    GitWorktreeOperationStatus::NeedsAttention,
+                    GitWorktreeOperationCheckpoint::NeedsAttention,
+                    None,
+                    Some(&diagnostic),
+                )?;
+                Err(error)
+            }
+        }
+    }
+
+    fn merge_resolution_operation(
+        &self,
+        connection: &vibex_db::DbConnection,
+        operation_id: &RequestId,
+        target_workspace_id: &WorkspaceId,
+    ) -> VibexResult<GitWorktreeOperationRecord> {
+        let operation =
+            WorktreeOperationRepository::get(connection, operation_id)?.ok_or_else(|| {
+                VibexError::validation(
+                    "worktree_operation_not_found",
+                    "merge operation was not found",
+                )
+            })?;
+        if operation.operation != GitWorktreeOperationKind::MergeBack
+            || operation.status != GitWorktreeOperationStatus::NeedsResolution
+            || operation.target_workspace_id.as_ref() != Some(target_workspace_id)
+        {
+            return Err(VibexError::conflict(
+                "worktree_merge_resolution_fence_mismatch",
+                "request does not match the active target merge operation",
+            ));
+        }
+        ensure_lifecycle_operation_contract(connection, &operation)?;
+        Ok(operation)
+    }
+
+    pub fn archive_preflight(
+        &self,
+        request: &GitWorktreeArchiveRequest,
+    ) -> VibexResult<GitWorktreeDestructivePreflight> {
+        Ok(self.archive_preflight_facts(request, None)?.preflight)
+    }
+
+    pub fn archive(
+        &self,
+        request: &GitWorktreeArchiveRequest,
+    ) -> VibexResult<GitWorktreeOperationRecord> {
+        let initial = self.archive_preflight_facts(request, None)?;
+        validate_lifecycle_confirmation(
+            request.preflight_revision.as_deref(),
+            request.expected_head.as_deref(),
+            &initial.preflight,
+        )?;
+        if !initial.preflight.allowed {
+            return Err(blocked_preflight_error(&initial.preflight));
+        }
+        let mut connection = open_database(&self.db_path)?;
+        let operation = lifecycle_operation(
+            &initial.managed,
+            GitWorktreeOperationKind::Archive,
+            None,
+            &initial.preflight,
+            lifecycle_lock_keys(&initial.managed, None)?,
+            request_fingerprint("archive", request)?,
+        );
+        let operation = WorktreeOperationRepository::reserve(&mut connection, &operation)?;
+        if operation.status == GitWorktreeOperationStatus::Completed {
+            return Ok(operation);
+        }
+        ensure_lifecycle_operation_contract(&connection, &operation)?;
+        let _locks = self.claim_lifecycle_locks(&connection, &operation)?;
+        let claimed = match claim_lifecycle_operation(&connection, &operation, &self.lease_owner)? {
+            LifecycleClaim::Acquired(record) => record,
+            LifecycleClaim::Completed(record) => return Ok(record),
+        };
+        let current = self.archive_preflight_facts(request, Some(&claimed.operation_id))?;
+        validate_lifecycle_confirmation(
+            request.preflight_revision.as_deref(),
+            request.expected_head.as_deref(),
+            &current.preflight,
+        )?;
+        if !current.preflight.allowed {
+            let error = blocked_preflight_error(&current.preflight);
+            mark_lifecycle_failure(&connection, &claimed, &error, false)?;
+            return Err(error);
+        }
+        let source_head = current.preflight.source_head.as_deref().ok_or_else(|| {
+            VibexError::conflict(
+                "worktree_source_head_missing",
+                "worktree head is unavailable after archive preflight",
+            )
+        })?;
+        let mut running = claimed;
+        running.detail.checkpoint = GitWorktreeOperationCheckpoint::ArchiveStarted;
+        running = WorktreeOperationRepository::save(&connection, &running)?;
+        ManagedWorktreeRepository::update_status(
+            &connection,
+            &current.managed.worktree_path,
+            GitManagedWorktreeStatus::Archiving,
+            Some(source_head),
+            None,
+        )?;
+        let remove = GitWorktreeDiscardRequest {
+            workspace_id: request.workspace_id.clone(),
+            worktree_path: current.managed.worktree_path.clone(),
+            force: false,
+            expected_head: Some(source_head.to_string()),
+            preflight_revision: request.preflight_revision.clone(),
+        };
+        match vibex_git::worktree_remove(&current.managed.repo_root, &remove) {
+            Ok(_) => {
+                WorktreeOperationRepository::update_checkpoint(
+                    &connection,
+                    &running.operation_id,
+                    GitWorktreeOperationCheckpoint::WorktreeRemoved,
+                    None,
+                )?;
+                ManagedWorktreeRepository::update_status(
+                    &connection,
+                    &current.managed.worktree_path,
+                    GitManagedWorktreeStatus::Archived,
+                    Some(source_head),
+                    Some(unix_timestamp_ms()),
+                )?;
+                WorktreeOperationRepository::mark_outcome(
+                    &connection,
+                    &running.operation_id,
+                    GitWorktreeOperationStatus::Completed,
+                    GitWorktreeOperationCheckpoint::Completed,
+                    Some(source_head),
+                    None,
+                )
+            }
+            Err(error) => {
+                ManagedWorktreeRepository::update_status(
+                    &connection,
+                    &current.managed.worktree_path,
+                    GitManagedWorktreeStatus::Active,
+                    Some(source_head),
+                    None,
+                )?;
+                mark_lifecycle_failure(&connection, &running, &error, false)?;
+                Err(error)
+            }
+        }
+    }
+
+    pub fn restore_preflight(
+        &self,
+        request: &GitWorktreeRestoreRequest,
+    ) -> VibexResult<GitWorktreeDestructivePreflight> {
+        Ok(self.restore_preflight_facts(request, None)?.preflight)
+    }
+
+    pub fn restore(
+        &self,
+        request: &GitWorktreeRestoreRequest,
+    ) -> VibexResult<GitWorktreeOperationRecord> {
+        let initial = self.restore_preflight_facts(request, None)?;
+        validate_restore_confirmation(request.preflight_revision.as_deref(), &initial.preflight)?;
+        if !initial.preflight.allowed {
+            return Err(blocked_preflight_error(&initial.preflight));
+        }
+        let mut connection = open_database(&self.db_path)?;
+        let operation = lifecycle_operation(
+            &initial.managed,
+            GitWorktreeOperationKind::Restore,
+            None,
+            &initial.preflight,
+            lifecycle_lock_keys(&initial.managed, None)?,
+            request_fingerprint("restore", request)?,
+        );
+        let operation = WorktreeOperationRepository::reserve(&mut connection, &operation)?;
+        if operation.status == GitWorktreeOperationStatus::Completed {
+            return Ok(operation);
+        }
+        ensure_lifecycle_operation_contract(&connection, &operation)?;
+        let _locks = self.claim_lifecycle_locks(&connection, &operation)?;
+        let claimed = match claim_lifecycle_operation(&connection, &operation, &self.lease_owner)? {
+            LifecycleClaim::Acquired(record) => record,
+            LifecycleClaim::Completed(record) => return Ok(record),
+        };
+        let current = self.restore_preflight_facts(request, Some(&claimed.operation_id))?;
+        validate_restore_confirmation(request.preflight_revision.as_deref(), &current.preflight)?;
+        if !current.preflight.allowed {
+            let error = blocked_preflight_error(&current.preflight);
+            mark_lifecycle_failure(&connection, &claimed, &error, false)?;
+            return Err(error);
+        }
+        let branch = current.managed.branch.as_deref().ok_or_else(|| {
+            VibexError::conflict(
+                "worktree_source_branch_missing",
+                "archived worktree has no source branch",
+            )
+        })?;
+        let expected_head = current.preflight.source_head.as_deref().ok_or_else(|| {
+            VibexError::conflict(
+                "worktree_source_head_missing",
+                "archived worktree has no recorded head",
+            )
+        })?;
+        let mut running = claimed;
+        running.detail.checkpoint = GitWorktreeOperationCheckpoint::RestoreStarted;
+        running = WorktreeOperationRepository::save(&connection, &running)?;
+        ManagedWorktreeRepository::update_status(
+            &connection,
+            &current.managed.worktree_path,
+            GitManagedWorktreeStatus::Restoring,
+            Some(expected_head),
+            current.managed.closed_at_ms,
+        )?;
+        match vibex_git::worktree_restore(
+            &current.managed.repo_root,
+            &current.managed.worktree_path,
+            branch,
+            expected_head,
+        ) {
+            Ok(summary) => {
+                if summary.head.as_deref() != Some(expected_head)
+                    || summary.branch.as_deref() != Some(branch)
+                {
+                    return Err(VibexError::conflict(
+                        "worktree_restore_identity_mismatch",
+                        "restored worktree does not match its durable branch and head",
+                    ));
+                }
+                WorktreeOperationRepository::update_checkpoint(
+                    &connection,
+                    &running.operation_id,
+                    GitWorktreeOperationCheckpoint::WorktreeRestored,
+                    None,
+                )?;
+                ManagedWorktreeRepository::update_status(
+                    &connection,
+                    &current.managed.worktree_path,
+                    GitManagedWorktreeStatus::Active,
+                    Some(expected_head),
+                    None,
+                )?;
+                ManagedWorktreeRepository::update_reconciliation(
+                    &connection,
+                    &current.managed.worktree_id,
+                    GitWorktreeReconciliationState::Consistent,
+                    None,
+                )?;
+                if let Some(restored) =
+                    ManagedWorktreeRepository::get_by_id(&connection, &current.managed.worktree_id)?
+                {
+                    self.refresh_readiness_for_managed(&connection, &restored)?;
+                }
+                WorktreeOperationRepository::mark_outcome(
+                    &connection,
+                    &running.operation_id,
+                    GitWorktreeOperationStatus::Completed,
+                    GitWorktreeOperationCheckpoint::Completed,
+                    Some(expected_head),
+                    None,
+                )
+            }
+            Err(error) => {
+                ManagedWorktreeRepository::update_status(
+                    &connection,
+                    &current.managed.worktree_path,
+                    GitManagedWorktreeStatus::Archived,
+                    Some(expected_head),
+                    current.managed.closed_at_ms.or(Some(unix_timestamp_ms())),
+                )?;
+                mark_lifecycle_failure(&connection, &running, &error, false)?;
                 Err(error)
             }
         }
@@ -407,24 +1470,44 @@ impl WorktreeCoordinator {
                 "managed worktree target belongs to a different project",
             ));
         }
-        let target_branch = managed.target_branch.as_deref().ok_or_else(|| {
+        let target_branch = managed.target_branch.clone().ok_or_else(|| {
             VibexError::conflict(
                 "worktree_fixed_target_branch_missing",
                 "managed worktree has no provable fixed target branch",
             )
         })?;
-        let source_branch = managed.branch.as_deref().ok_or_else(|| {
+        let source_branch = managed.branch.clone().ok_or_else(|| {
             VibexError::conflict(
                 "worktree_source_branch_missing",
                 "managed worktree has no source branch",
             )
         })?;
-        let source_head = vibex_git::resolve_ref_head(&managed.repo_root, source_branch).ok();
+        let source_head = vibex_git::resolve_ref_head(&managed.repo_root, &source_branch).ok();
         let target_head = vibex_git::resolve_head(&target_workspace.root_path).ok();
+        let matching_queued = self.reconcile_queued_confirmation(
+            &connection,
+            &managed,
+            source_head.as_deref(),
+            target_head.as_deref(),
+        )?;
+        let confirmation_operation_id = ignored_operation.or(matching_queued.as_ref());
+        let active_confirmation_matches = match confirmation_operation_id {
+            Some(operation_id) => WorktreeOperationRepository::get(&connection, operation_id)?
+                .is_some_and(|operation| {
+                    operation.operation == GitWorktreeOperationKind::MergeBack
+                        && operation.detail.expected_source_head.as_deref()
+                            == source_head.as_deref()
+                        && operation.detail.expected_target_head.as_deref()
+                            == target_head.as_deref()
+                }),
+            None => false,
+        };
         let source_status =
             vibex_git::status(source_workspace.id.clone(), &source_workspace.root_path)?;
         let target_status =
             vibex_git::status(target_workspace.id.clone(), &target_workspace.root_path)?;
+        let dirty_fingerprint = vibex_git::worktree_dirty_fingerprint(&source_workspace.root_path)?;
+        let readiness = self.refresh_readiness_for_managed(&connection, &managed)?;
         let registration_matches = registered_managed_worktree(&managed);
         let mut risks = Vec::new();
         if managed.status != GitManagedWorktreeStatus::Active {
@@ -448,6 +1531,24 @@ impl WorktreeCoordinator {
                 "source worktree has uncommitted changes",
             ));
         }
+        if !readiness.as_ref().is_some_and(|readiness| {
+            (readiness.state == GitWorktreeReadinessState::ReadyToMerge
+                || (matches!(
+                    readiness.state,
+                    GitWorktreeReadinessState::MergeQueued
+                        | GitWorktreeReadinessState::MergeRunning
+                ) && active_confirmation_matches))
+                && source_head.as_deref() == Some(readiness.source_head.as_str())
+                && dirty_fingerprint == readiness.dirty_fingerprint
+                && managed.target_workspace_id.as_ref() == Some(&readiness.target_workspace_id)
+                && managed.target_branch.as_deref() == Some(readiness.target_branch.as_str())
+        }) {
+            risks.push(risk(
+                GitWorktreeRiskKind::StaleReadiness,
+                true,
+                "source must be clean and marked ready at its current head",
+            ));
+        }
         if target_status.dirty {
             risks.push(risk(
                 GitWorktreeRiskKind::DirtyTarget,
@@ -455,11 +1556,47 @@ impl WorktreeCoordinator {
                 "target workspace has uncommitted changes",
             ));
         }
-        if target_status.branch.as_deref() != Some(target_branch) {
+        if target_status.branch.as_deref() != Some(target_branch.as_str()) {
+            risks.push(risk(
+                GitWorktreeRiskKind::WrongTargetBranch,
+                true,
+                "target workspace is not on the fixed target branch",
+            ));
+        }
+        if vibex_git::same_path_identity(&source_workspace.root_path, &target_workspace.root_path) {
             risks.push(risk(
                 GitWorktreeRiskKind::OwnershipMismatch,
                 true,
-                "target workspace is not on the fixed target branch",
+                "source and target resolve to the same checkout",
+            ));
+        }
+        match (
+            vibex_git::repository_identity(&source_workspace.root_path),
+            vibex_git::repository_identity(&target_workspace.root_path),
+        ) {
+            (Ok(source_repository), Ok(target_repository))
+                if source_repository.comparison_key != target_repository.comparison_key =>
+            {
+                risks.push(risk(
+                    GitWorktreeRiskKind::OwnershipMismatch,
+                    true,
+                    "source and target belong to different Git repositories",
+                ));
+            }
+            (Err(_), _) | (_, Err(_)) => risks.push(risk(
+                GitWorktreeRiskKind::UnknownState,
+                true,
+                "source or target repository identity is unavailable",
+            )),
+            _ => {}
+        }
+        if vibex_git::active_git_operation(&source_workspace.root_path)?.is_some()
+            || vibex_git::active_git_operation(&target_workspace.root_path)?.is_some()
+        {
+            risks.push(risk(
+                GitWorktreeRiskKind::ActiveGitOperation,
+                true,
+                "source or target has an active merge, rebase, or cherry-pick",
             ));
         }
         if request
@@ -484,7 +1621,13 @@ impl WorktreeCoordinator {
                 "target head changed after preflight",
             ));
         }
-        append_active_operation_risk(&connection, &managed, ignored_operation, &mut risks)?;
+        append_unpushed_risk(&managed, &mut risks)?;
+        append_active_operation_risk(&connection, &managed, confirmation_operation_id, &mut risks)?;
+        append_running_consumer_risk(
+            &connection,
+            &[source_workspace.id.clone(), target_workspace.id.clone()],
+            &mut risks,
+        )?;
         let revision = destructive_revision(
             GitWorktreeDestructiveAction::MergeBack,
             &managed,
@@ -502,6 +1645,174 @@ impl WorktreeCoordinator {
                 source_head,
                 target_head,
                 risks,
+                action_label: format!("Merge into {target_branch}"),
+                observed_at_ms: unix_timestamp_ms(),
+            },
+        })
+    }
+
+    fn archive_preflight_facts(
+        &self,
+        request: &GitWorktreeArchiveRequest,
+        ignored_operation: Option<&RequestId>,
+    ) -> VibexResult<DestructiveFacts> {
+        let connection = open_database(&self.db_path)?;
+        let managed = managed_for_path(&connection, &request.worktree_path)?.ok_or_else(|| {
+            VibexError::validation("worktree_not_managed", "worktree is not managed by Vibex")
+        })?;
+        let (_, source_workspace) = workspace_record(&connection, &request.workspace_id)?;
+        verify_managed_source(&managed, &source_workspace)?;
+        let source_head = managed
+            .branch
+            .as_deref()
+            .and_then(|branch| vibex_git::resolve_ref_head(&managed.repo_root, branch).ok());
+        let source_status =
+            vibex_git::status(source_workspace.id.clone(), &source_workspace.root_path)?;
+        let mut risks = Vec::new();
+        if managed.status != GitManagedWorktreeStatus::Active
+            || managed.reconciliation_state != GitWorktreeReconciliationState::Consistent
+        {
+            risks.push(risk(
+                GitWorktreeRiskKind::UnknownState,
+                true,
+                "managed worktree is not active and consistent",
+            ));
+        }
+        if !registered_managed_worktree(&managed) {
+            risks.push(risk(
+                GitWorktreeRiskKind::MissingGitRegistration,
+                true,
+                "managed worktree has no matching Git registration",
+            ));
+        }
+        if source_status.dirty {
+            risks.push(risk(
+                GitWorktreeRiskKind::DirtySource,
+                true,
+                "archive cannot remove a worktree with uncommitted or untracked content",
+            ));
+        }
+        if vibex_git::active_git_operation(&source_workspace.root_path)?.is_some() {
+            risks.push(risk(
+                GitWorktreeRiskKind::ActiveGitOperation,
+                true,
+                "archive cannot remove a worktree with an active Git operation",
+            ));
+        }
+        if request
+            .expected_head
+            .as_deref()
+            .is_some_and(|expected| source_head.as_deref() != Some(expected))
+        {
+            risks.push(risk(
+                GitWorktreeRiskKind::SourceHeadChanged,
+                true,
+                "source head changed after archive preflight",
+            ));
+        }
+        append_unpushed_risk(&managed, &mut risks)?;
+        append_active_operation_risk(&connection, &managed, ignored_operation, &mut risks)?;
+        append_running_consumer_risk(&connection, &[source_workspace.id], &mut risks)?;
+        let revision = destructive_revision(
+            GitWorktreeDestructiveAction::Archive,
+            &managed,
+            source_head.as_deref(),
+            None,
+            &risks,
+        )?;
+        Ok(DestructiveFacts {
+            managed,
+            target_workspace: None,
+            preflight: GitWorktreeDestructivePreflight {
+                action: GitWorktreeDestructiveAction::Archive,
+                allowed: !risks.iter().any(|risk| risk.blocking),
+                revision,
+                source_head,
+                target_head: None,
+                risks,
+                action_label: "Archive worktree".to_string(),
+                observed_at_ms: unix_timestamp_ms(),
+            },
+        })
+    }
+
+    fn restore_preflight_facts(
+        &self,
+        request: &GitWorktreeRestoreRequest,
+        ignored_operation: Option<&RequestId>,
+    ) -> VibexResult<DestructiveFacts> {
+        let connection = open_database(&self.db_path)?;
+        let managed = ManagedWorktreeRepository::get_by_id(&connection, &request.worktree_id)?
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "worktree_not_managed",
+                    "archived worktree is not managed by Vibex",
+                )
+            })?;
+        let (_, workspace) = workspace_record(&connection, &request.workspace_id)?;
+        verify_managed_source(&managed, &workspace)?;
+        let source_head = managed.head.clone();
+        let mut risks = Vec::new();
+        if managed.status != GitManagedWorktreeStatus::Archived {
+            risks.push(risk(
+                GitWorktreeRiskKind::UnknownState,
+                true,
+                "only an archived worktree can be restored",
+            ));
+        }
+        if Path::new(&managed.worktree_path).exists() {
+            risks.push(risk(
+                GitWorktreeRiskKind::PathConflict,
+                true,
+                "the original worktree path is occupied",
+            ));
+        }
+        if registered_managed_worktree(&managed) {
+            risks.push(risk(
+                GitWorktreeRiskKind::OwnershipMismatch,
+                true,
+                "archived worktree is still registered with Git",
+            ));
+        }
+        match (managed.branch.as_deref(), source_head.as_deref()) {
+            (Some(branch), Some(expected_head)) => {
+                if vibex_git::resolve_ref_head(&managed.repo_root, branch)
+                    .ok()
+                    .as_deref()
+                    != Some(expected_head)
+                {
+                    risks.push(risk(
+                        GitWorktreeRiskKind::SourceHeadChanged,
+                        true,
+                        "archived branch no longer matches its recorded head",
+                    ));
+                }
+            }
+            _ => risks.push(risk(
+                GitWorktreeRiskKind::UnknownState,
+                true,
+                "archived worktree branch or head is unavailable",
+            )),
+        }
+        append_active_operation_risk(&connection, &managed, ignored_operation, &mut risks)?;
+        let revision = destructive_revision(
+            GitWorktreeDestructiveAction::Restore,
+            &managed,
+            source_head.as_deref(),
+            None,
+            &risks,
+        )?;
+        Ok(DestructiveFacts {
+            managed,
+            target_workspace: None,
+            preflight: GitWorktreeDestructivePreflight {
+                action: GitWorktreeDestructiveAction::Restore,
+                allowed: !risks.iter().any(|risk| risk.blocking),
+                revision,
+                source_head,
+                target_head: None,
+                risks,
+                action_label: "Restore worktree".to_string(),
                 observed_at_ms: unix_timestamp_ms(),
             },
         })
@@ -546,6 +1857,13 @@ impl WorktreeCoordinator {
                 "source worktree has uncommitted changes",
             ));
         }
+        if vibex_git::active_git_operation(&source_workspace.root_path)?.is_some() {
+            risks.push(risk(
+                GitWorktreeRiskKind::ActiveGitOperation,
+                true,
+                "discard cannot remove a worktree with an active Git operation",
+            ));
+        }
         if request
             .expected_head
             .as_deref()
@@ -557,7 +1875,9 @@ impl WorktreeCoordinator {
                 "source head changed after preflight",
             ));
         }
+        append_unpushed_risk(&managed, &mut risks)?;
         append_active_operation_risk(&connection, &managed, ignored_operation, &mut risks)?;
+        append_running_consumer_risk(&connection, &[source_workspace.id], &mut risks)?;
         let revision = destructive_revision(
             GitWorktreeDestructiveAction::Discard,
             &managed,
@@ -575,6 +1895,7 @@ impl WorktreeCoordinator {
                 source_head,
                 target_head: None,
                 risks,
+                action_label: "Discard worktree".to_string(),
                 observed_at_ms: unix_timestamp_ms(),
             },
         })
@@ -1113,6 +2434,7 @@ impl WorktreeCoordinator {
         for operation in operations {
             report.inspected_operations = report.inspected_operations.saturating_add(1);
             if operation.operation != GitWorktreeOperationKind::Create {
+                self.reconcile_lifecycle_operation(&operation, &mut report)?;
                 continue;
             }
             let classification = classify_create_state(&operation);
@@ -1177,6 +2499,381 @@ impl WorktreeCoordinator {
         self.reconcile_managed_records(&mut report)?;
         self.report_orphan_directories(&mut report)?;
         Ok(report)
+    }
+
+    fn reconcile_lifecycle_operation(
+        &self,
+        operation: &GitWorktreeOperationRecord,
+        report: &mut GitWorktreeReconcileReport,
+    ) -> VibexResult<()> {
+        let connection = open_database(&self.db_path)?;
+        if !operation_detail_is_executable(&operation.detail) {
+            let diagnostic = lifecycle_diagnostic(
+                operation,
+                "worktree_operation_contract_unknown",
+                "worktree lifecycle operation uses an unknown durable contract",
+                false,
+                Some("upgrade_or_inspect"),
+            );
+            WorktreeOperationRepository::mark_outcome(
+                &connection,
+                &operation.operation_id,
+                GitWorktreeOperationStatus::NeedsAttention,
+                GitWorktreeOperationCheckpoint::NeedsAttention,
+                None,
+                Some(&diagnostic),
+            )?;
+            report.needs_attention = report.needs_attention.saturating_add(1);
+            return Ok(());
+        }
+        match operation.operation {
+            GitWorktreeOperationKind::MergeBack => {
+                if operation
+                    .detail
+                    .diagnostic
+                    .as_ref()
+                    .is_some_and(|diagnostic| {
+                        diagnostic.code == "worktree_external_merge_needs_attention"
+                    })
+                {
+                    let Some(target_workspace_id) = operation.target_workspace_id.as_ref() else {
+                        report.needs_attention = report.needs_attention.saturating_add(1);
+                        return Ok(());
+                    };
+                    let Some((_, target_workspace)) =
+                        WorkspaceRepository::get(&connection, target_workspace_id)?
+                    else {
+                        report.needs_attention = report.needs_attention.saturating_add(1);
+                        return Ok(());
+                    };
+                    if vibex_git::merge_head(&target_workspace.root_path)?.is_some() {
+                        report.needs_attention = report.needs_attention.saturating_add(1);
+                    } else {
+                        let head_after = vibex_git::resolve_head(&target_workspace.root_path)?;
+                        WorktreeOperationRepository::mark_outcome(
+                            &connection,
+                            &operation.operation_id,
+                            GitWorktreeOperationStatus::Completed,
+                            GitWorktreeOperationCheckpoint::Completed,
+                            Some(&head_after),
+                            None,
+                        )?;
+                        report.completed_operations = report.completed_operations.saturating_add(1);
+                    }
+                    return Ok(());
+                }
+                let Some(target_workspace_id) = operation.target_workspace_id.as_ref() else {
+                    return reconcile_operation_needs_attention(
+                        &connection,
+                        operation,
+                        report,
+                        "worktree_merge_target_missing",
+                        "merge operation target workspace is unavailable",
+                    );
+                };
+                let Some((_, target_workspace)) =
+                    WorkspaceRepository::get(&connection, target_workspace_id)?
+                else {
+                    return reconcile_operation_needs_attention(
+                        &connection,
+                        operation,
+                        report,
+                        "worktree_merge_target_missing",
+                        "merge operation target workspace is unavailable",
+                    );
+                };
+                let (source_head, target_head, target_branch) = match (
+                    operation.detail.expected_source_head.as_deref(),
+                    operation.detail.expected_target_head.as_deref(),
+                    operation.detail.target_branch.as_deref(),
+                ) {
+                    (Some(source), Some(target), Some(branch)) => (source, target, branch),
+                    _ => {
+                        return reconcile_operation_needs_attention(
+                            &connection,
+                            operation,
+                            report,
+                            "worktree_merge_identity_missing",
+                            "merge operation fixed heads or target branch are unavailable",
+                        );
+                    }
+                };
+                let live_merge_head = vibex_git::merge_head(&target_workspace.root_path)?;
+                let current_head = vibex_git::resolve_head(&target_workspace.root_path)?;
+                let current_branch =
+                    vibex_git::status(target_workspace.id.clone(), &target_workspace.root_path)?
+                        .branch;
+                if current_branch.as_deref() != Some(target_branch) {
+                    return reconcile_operation_needs_attention(
+                        &connection,
+                        operation,
+                        report,
+                        "worktree_target_branch_changed",
+                        "target branch changed while reconciling merge operation",
+                    );
+                }
+                match live_merge_head.as_deref() {
+                    Some(live_source)
+                        if live_source == source_head && current_head == target_head =>
+                    {
+                        let mut recovered = operation.clone();
+                        let conflicts = vibex_git::worktree_conflicts(&target_workspace.root_path)?;
+                        let source_delta = source_commits_after_start(&recovered, &connection)?;
+                        let unchanged = recovered.status
+                            == GitWorktreeOperationStatus::NeedsResolution
+                            && recovered.detail.checkpoint
+                                == GitWorktreeOperationCheckpoint::ConflictDetected
+                            && recovered.detail.conflicts == conflicts
+                            && recovered.detail.source_commits_after_start == source_delta;
+                        if !unchanged {
+                            recovered.status = GitWorktreeOperationStatus::NeedsResolution;
+                            recovered.detail.checkpoint =
+                                GitWorktreeOperationCheckpoint::ConflictDetected;
+                            recovered.detail.conflicts = conflicts;
+                            recovered.detail.source_commits_after_start = source_delta;
+                            recovered.detail.lease_owner = None;
+                            recovered.detail.lease_expires_at_ms = None;
+                            recovered.detail.diagnostic = Some(lifecycle_diagnostic(
+                                &recovered,
+                                "worktree_merge_needs_resolution",
+                                "merge conflict scene was restored from Git",
+                                false,
+                                Some("resolve_conflicts"),
+                            ));
+                            recovered.error = recovered
+                                .detail
+                                .diagnostic
+                                .as_ref()
+                                .map(|diagnostic| diagnostic.summary.clone());
+                            WorktreeOperationRepository::save(&connection, &recovered)?;
+                        }
+                        report.recoverable_operations =
+                            report.recoverable_operations.saturating_add(1);
+                    }
+                    Some(_) => {
+                        reconcile_operation_needs_attention(
+                            &connection,
+                            operation,
+                            report,
+                            "worktree_merge_head_mismatch",
+                            "live MERGE_HEAD does not match the durable source head",
+                        )?;
+                    }
+                    None if vibex_git::is_expected_merge_commit(
+                        &target_workspace.root_path,
+                        &current_head,
+                        target_head,
+                        source_head,
+                    )? =>
+                    {
+                        WorktreeOperationRepository::mark_outcome(
+                            &connection,
+                            &operation.operation_id,
+                            GitWorktreeOperationStatus::Completed,
+                            GitWorktreeOperationCheckpoint::Completed,
+                            Some(&current_head),
+                            None,
+                        )?;
+                        if let Some(managed) = managed_for_operation(&connection, operation)? {
+                            ManagedWorktreeRepository::update_status(
+                                &connection,
+                                &managed.worktree_path,
+                                GitManagedWorktreeStatus::Active,
+                                Some(source_head),
+                                None,
+                            )?;
+                            self.transition_readiness(
+                                &connection,
+                                &managed.worktree_id,
+                                GitWorktreeReadinessState::Working,
+                            )?;
+                        }
+                        report.completed_operations = report.completed_operations.saturating_add(1);
+                    }
+                    None if current_head == target_head => {
+                        let resolution_had_started = matches!(
+                            operation.status,
+                            GitWorktreeOperationStatus::NeedsResolution
+                                | GitWorktreeOperationStatus::Aborting
+                        ) || matches!(
+                            operation.detail.checkpoint,
+                            GitWorktreeOperationCheckpoint::ConflictDetected
+                                | GitWorktreeOperationCheckpoint::ContinueStarted
+                                | GitWorktreeOperationCheckpoint::AbortStarted
+                        );
+                        if resolution_had_started {
+                            WorktreeOperationRepository::mark_outcome(
+                                &connection,
+                                &operation.operation_id,
+                                GitWorktreeOperationStatus::Aborted,
+                                GitWorktreeOperationCheckpoint::Completed,
+                                None,
+                                None,
+                            )?;
+                            report.completed_operations =
+                                report.completed_operations.saturating_add(1);
+                        } else {
+                            let diagnostic = lifecycle_diagnostic(
+                                operation,
+                                "worktree_merge_interrupted_before_effect",
+                                "merge stopped before a durable Git scene was observed",
+                                true,
+                                Some("refresh_merge_plan"),
+                            );
+                            WorktreeOperationRepository::mark_outcome(
+                                &connection,
+                                &operation.operation_id,
+                                GitWorktreeOperationStatus::Failed,
+                                operation.detail.checkpoint,
+                                None,
+                                Some(&diagnostic),
+                            )?;
+                            report.failed_operations = report.failed_operations.saturating_add(1);
+                        }
+                    }
+                    None => {
+                        reconcile_operation_needs_attention(
+                            &connection,
+                            operation,
+                            report,
+                            "worktree_merge_scene_inconsistent",
+                            "target head changed without the expected merge commit",
+                        )?;
+                    }
+                }
+            }
+            GitWorktreeOperationKind::Archive
+            | GitWorktreeOperationKind::Discard
+            | GitWorktreeOperationKind::Restore => {
+                let Some(managed) = managed_for_operation(&connection, operation)? else {
+                    return reconcile_operation_needs_attention(
+                        &connection,
+                        operation,
+                        report,
+                        "worktree_lifecycle_record_missing",
+                        "managed worktree record is unavailable",
+                    );
+                };
+                let path_exists = Path::new(&managed.worktree_path).exists();
+                let registered = registered_managed_worktree(&managed);
+                match operation.operation {
+                    GitWorktreeOperationKind::Archive | GitWorktreeOperationKind::Discard
+                        if !path_exists && !registered =>
+                    {
+                        let status = if operation.operation == GitWorktreeOperationKind::Archive {
+                            GitManagedWorktreeStatus::Archived
+                        } else {
+                            GitManagedWorktreeStatus::Discarded
+                        };
+                        ManagedWorktreeRepository::update_status(
+                            &connection,
+                            &managed.worktree_path,
+                            status,
+                            operation.detail.expected_source_head.as_deref(),
+                            Some(unix_timestamp_ms()),
+                        )?;
+                        WorktreeOperationRepository::mark_outcome(
+                            &connection,
+                            &operation.operation_id,
+                            GitWorktreeOperationStatus::Completed,
+                            GitWorktreeOperationCheckpoint::Completed,
+                            operation.detail.expected_source_head.as_deref(),
+                            None,
+                        )?;
+                        report.completed_operations = report.completed_operations.saturating_add(1);
+                    }
+                    GitWorktreeOperationKind::Restore if path_exists && registered => {
+                        ManagedWorktreeRepository::update_status(
+                            &connection,
+                            &managed.worktree_path,
+                            GitManagedWorktreeStatus::Active,
+                            operation.detail.expected_source_head.as_deref(),
+                            None,
+                        )?;
+                        WorktreeOperationRepository::mark_outcome(
+                            &connection,
+                            &operation.operation_id,
+                            GitWorktreeOperationStatus::Completed,
+                            GitWorktreeOperationCheckpoint::Completed,
+                            operation.detail.expected_source_head.as_deref(),
+                            None,
+                        )?;
+                        report.completed_operations = report.completed_operations.saturating_add(1);
+                    }
+                    GitWorktreeOperationKind::Archive | GitWorktreeOperationKind::Discard
+                        if path_exists && registered =>
+                    {
+                        ManagedWorktreeRepository::update_status(
+                            &connection,
+                            &managed.worktree_path,
+                            GitManagedWorktreeStatus::Active,
+                            operation.detail.expected_source_head.as_deref(),
+                            None,
+                        )?;
+                        let diagnostic = lifecycle_diagnostic(
+                            operation,
+                            "worktree_lifecycle_interrupted_before_effect",
+                            "lifecycle operation stopped before removing the worktree",
+                            true,
+                            Some("retry"),
+                        );
+                        WorktreeOperationRepository::mark_outcome(
+                            &connection,
+                            &operation.operation_id,
+                            GitWorktreeOperationStatus::Failed,
+                            operation.detail.checkpoint,
+                            None,
+                            Some(&diagnostic),
+                        )?;
+                        report.failed_operations = report.failed_operations.saturating_add(1);
+                    }
+                    GitWorktreeOperationKind::Restore if !path_exists && !registered => {
+                        ManagedWorktreeRepository::update_status(
+                            &connection,
+                            &managed.worktree_path,
+                            GitManagedWorktreeStatus::Archived,
+                            operation.detail.expected_source_head.as_deref(),
+                            managed.closed_at_ms.or(Some(unix_timestamp_ms())),
+                        )?;
+                        let diagnostic = lifecycle_diagnostic(
+                            operation,
+                            "worktree_restore_interrupted_before_effect",
+                            "restore stopped before recreating the worktree",
+                            true,
+                            Some("retry_restore"),
+                        );
+                        WorktreeOperationRepository::mark_outcome(
+                            &connection,
+                            &operation.operation_id,
+                            GitWorktreeOperationStatus::Failed,
+                            operation.detail.checkpoint,
+                            None,
+                            Some(&diagnostic),
+                        )?;
+                        report.failed_operations = report.failed_operations.saturating_add(1);
+                    }
+                    _ => {
+                        reconcile_operation_needs_attention(
+                            &connection,
+                            operation,
+                            report,
+                            "worktree_lifecycle_scene_inconsistent",
+                            "worktree directory and Git registration disagree",
+                        )?;
+                    }
+                }
+            }
+            _ => {
+                reconcile_operation_needs_attention(
+                    &connection,
+                    operation,
+                    report,
+                    "worktree_operation_kind_unknown",
+                    "worktree lifecycle operation kind cannot be reconciled",
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn reconcile_managed_records(
@@ -1480,11 +3177,95 @@ impl GitHandle {
         self.worktrees.merge_preflight(request)
     }
 
+    pub fn worktree_readiness(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> VibexResult<Option<GitWorktreeReadinessRecord>> {
+        self.worktrees.readiness(workspace_id)
+    }
+
+    pub fn worktree_set_readiness(
+        &self,
+        request: &GitWorktreeReadinessRequest,
+    ) -> VibexResult<GitWorktreeReadinessRecord> {
+        self.worktrees.set_readiness(request)
+    }
+
+    pub fn worktree_merge_plan(
+        &self,
+        request: &GitWorktreeMergeRequest,
+    ) -> VibexResult<GitWorktreeMergePlan> {
+        self.worktrees.merge_plan(request)
+    }
+
     pub fn worktree_merge(
         &self,
         request: &GitWorktreeMergeRequest,
     ) -> VibexResult<GitWorktreeOperationRecord> {
         self.worktrees.merge(request)
+    }
+
+    pub fn worktree_resolve_conflict(
+        &self,
+        request: &GitWorktreeConflictResolveRequest,
+    ) -> VibexResult<GitWorktreeOperationRecord> {
+        self.worktrees.resolve_conflict(request)
+    }
+
+    pub fn worktree_stage_conflicts(
+        &self,
+        request: &GitWorktreeConflictStageRequest,
+    ) -> VibexResult<GitWorktreeOperationRecord> {
+        self.worktrees.stage_conflicts(request)
+    }
+
+    pub fn worktree_bind_assistance_session(
+        &self,
+        request: &GitWorktreeAssistanceSessionRequest,
+    ) -> VibexResult<GitWorktreeOperationRecord> {
+        self.worktrees.bind_assistance_session(request)
+    }
+
+    pub fn worktree_continue_merge(
+        &self,
+        request: &GitWorktreeOperationRequest,
+    ) -> VibexResult<GitWorktreeOperationRecord> {
+        self.worktrees.continue_merge(request)
+    }
+
+    pub fn worktree_abort_merge(
+        &self,
+        request: &GitWorktreeOperationRequest,
+    ) -> VibexResult<GitWorktreeOperationRecord> {
+        self.worktrees.abort_merge(request)
+    }
+
+    pub fn worktree_archive_preflight(
+        &self,
+        request: &GitWorktreeArchiveRequest,
+    ) -> VibexResult<GitWorktreeDestructivePreflight> {
+        self.worktrees.archive_preflight(request)
+    }
+
+    pub fn worktree_archive(
+        &self,
+        request: &GitWorktreeArchiveRequest,
+    ) -> VibexResult<GitWorktreeOperationRecord> {
+        self.worktrees.archive(request)
+    }
+
+    pub fn worktree_restore_preflight(
+        &self,
+        request: &GitWorktreeRestoreRequest,
+    ) -> VibexResult<GitWorktreeDestructivePreflight> {
+        self.worktrees.restore_preflight(request)
+    }
+
+    pub fn worktree_restore(
+        &self,
+        request: &GitWorktreeRestoreRequest,
+    ) -> VibexResult<GitWorktreeOperationRecord> {
+        self.worktrees.restore(request)
     }
 
     pub fn worktree_discard_preflight(
@@ -1575,8 +3356,11 @@ fn append_active_operation_risk(
             matches!(
                 operation.status,
                 GitWorktreeOperationStatus::Pending
+                    | GitWorktreeOperationStatus::Queued
                     | GitWorktreeOperationStatus::Running
                     | GitWorktreeOperationStatus::Recoverable
+                    | GitWorktreeOperationStatus::NeedsResolution
+                    | GitWorktreeOperationStatus::Aborting
             )
         })
         .any(|operation| {
@@ -1601,6 +3385,397 @@ fn risk(kind: GitWorktreeRiskKind, blocking: bool, summary: &str) -> GitWorktree
         blocking,
         summary: summary.to_string(),
     }
+}
+
+fn validate_readiness_checks(checks: &[vibex_core::GitWorktreeCheckRecord]) -> VibexResult<()> {
+    if checks.len() > 16 {
+        return Err(VibexError::validation(
+            "worktree_readiness_checks_too_many",
+            "at most 16 recent readiness checks may be recorded",
+        ));
+    }
+    if checks.iter().any(|check| {
+        check.command.trim().is_empty()
+            || check.command.len() > 512
+            || check.command.chars().any(char::is_control)
+    }) {
+        return Err(VibexError::validation(
+            "worktree_readiness_check_invalid",
+            "readiness check commands must be non-empty, bounded, and control-free",
+        ));
+    }
+    Ok(())
+}
+
+fn readiness_revision(
+    worktree_id: &RequestId,
+    state: GitWorktreeReadinessState,
+    source_head: &str,
+    dirty_fingerprint: &str,
+    target_workspace_id: &WorkspaceId,
+    target_branch: &str,
+    checks: &[vibex_core::GitWorktreeCheckRecord],
+) -> VibexResult<String> {
+    let payload = serde_json::to_vec(&(
+        worktree_id,
+        state,
+        source_head,
+        dirty_fingerprint,
+        target_workspace_id,
+        target_branch,
+        checks,
+    ))
+    .map_err(|_| {
+        VibexError::process(
+            "worktree_readiness_revision_failed",
+            "worktree readiness could not be fingerprinted",
+        )
+    })?;
+    Ok(format!(
+        "worktree-readiness-v1:{:x}",
+        Sha256::digest(payload)
+    ))
+}
+
+fn running_consumers(
+    connection: &vibex_db::DbConnection,
+    workspace_ids: &[WorkspaceId],
+) -> VibexResult<GitWorktreeRunningConsumers> {
+    let workspace_ids = workspace_ids
+        .iter()
+        .map(WorkspaceId::as_str)
+        .collect::<BTreeSet<_>>();
+    let agent_count = SessionRepository::list(connection, false)?
+        .into_iter()
+        .filter(|session| workspace_ids.contains(session.workspace_id.as_str()))
+        .filter(|session| {
+            matches!(
+                session.state,
+                AgentSessionState::Initializing
+                    | AgentSessionState::Running
+                    | AgentSessionState::NeedsInput
+            )
+        })
+        .count() as u32;
+    let mut terminal_count = 0_u32;
+    for workspace_id in workspace_ids {
+        let workspace_id = WorkspaceId::parse(workspace_id).map_err(|_| {
+            VibexError::validation(
+                "worktree_workspace_identity_invalid",
+                "worktree consumer workspace identity is invalid",
+            )
+        })?;
+        terminal_count = terminal_count.saturating_add(
+            TerminalSessionRepository::list(connection, &workspace_id)?
+                .into_iter()
+                .filter(|terminal| terminal.status == TerminalStatus::Running)
+                .count() as u32,
+        );
+    }
+    Ok(GitWorktreeRunningConsumers {
+        agent_count,
+        terminal_count,
+    })
+}
+
+fn append_running_consumer_risk(
+    connection: &vibex_db::DbConnection,
+    workspace_ids: &[WorkspaceId],
+    risks: &mut Vec<GitWorktreeRisk>,
+) -> VibexResult<()> {
+    let consumers = running_consumers(connection, workspace_ids)?;
+    if consumers.agent_count > 0 || consumers.terminal_count > 0 {
+        risks.push(risk(
+            GitWorktreeRiskKind::RunningConsumers,
+            false,
+            &format!(
+                "{} Agent session(s) and {} Terminal(s) will keep running",
+                consumers.agent_count, consumers.terminal_count
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn append_unpushed_risk(
+    managed: &GitManagedWorktreeRecord,
+    risks: &mut Vec<GitWorktreeRisk>,
+) -> VibexResult<()> {
+    let Some(branch) = managed.branch.as_deref() else {
+        return Ok(());
+    };
+    match vibex_git::unpushed_commit_count(&managed.repo_root, branch)? {
+        Some(0) => {}
+        Some(count) => risks.push(risk(
+            GitWorktreeRiskKind::UnpushedCommits,
+            false,
+            &format!("branch has {count} unpushed commit(s)"),
+        )),
+        None => risks.push(risk(
+            GitWorktreeRiskKind::UnpushedCommits,
+            false,
+            "branch has no upstream; push state cannot be proven",
+        )),
+    }
+    Ok(())
+}
+
+fn queue_position(
+    connection: &vibex_db::DbConnection,
+    target_workspace_id: Option<&WorkspaceId>,
+    operation_id: &RequestId,
+) -> VibexResult<u32> {
+    let Some(target_workspace_id) = target_workspace_id else {
+        return Ok(1);
+    };
+    let operation =
+        WorktreeOperationRepository::get(connection, operation_id)?.ok_or_else(|| {
+            VibexError::storage(
+                "worktree_operation_not_found",
+                "queued worktree operation was not found",
+            )
+        })?;
+    let count = WorktreeOperationRepository::list_for_project(connection, &operation.project_id)?
+        .into_iter()
+        .filter(|candidate| candidate.operation_id != *operation_id)
+        .filter(|candidate| candidate.target_workspace_id.as_ref() == Some(target_workspace_id))
+        .filter(|candidate| {
+            matches!(
+                candidate.status,
+                GitWorktreeOperationStatus::Queued
+                    | GitWorktreeOperationStatus::Running
+                    | GitWorktreeOperationStatus::NeedsResolution
+                    | GitWorktreeOperationStatus::Aborting
+            )
+        })
+        .filter(|candidate| candidate.created_at_ms <= operation.created_at_ms)
+        .count() as u32;
+    Ok(count.saturating_add(1))
+}
+
+fn operation_expected_source_head(operation: &GitWorktreeOperationRecord) -> VibexResult<&str> {
+    operation
+        .detail
+        .expected_source_head
+        .as_deref()
+        .ok_or_else(|| {
+            VibexError::conflict(
+                "worktree_source_head_missing",
+                "merge operation has no fixed source head",
+            )
+        })
+}
+
+fn operation_expected_target_head(operation: &GitWorktreeOperationRecord) -> VibexResult<&str> {
+    operation
+        .detail
+        .expected_target_head
+        .as_deref()
+        .ok_or_else(|| {
+            VibexError::conflict(
+                "worktree_target_head_missing",
+                "merge operation has no fixed target head",
+            )
+        })
+}
+
+fn operation_target_branch(operation: &GitWorktreeOperationRecord) -> VibexResult<&str> {
+    operation.detail.target_branch.as_deref().ok_or_else(|| {
+        VibexError::conflict(
+            "worktree_fixed_target_branch_missing",
+            "merge operation has no fixed target branch",
+        )
+    })
+}
+
+fn verify_resolution_scene(
+    operation: &GitWorktreeOperationRecord,
+    target_workspace: &WorkspaceRecord,
+) -> VibexResult<()> {
+    let source_head = operation_expected_source_head(operation)?;
+    let target_head = operation_expected_target_head(operation)?;
+    let target_branch = operation_target_branch(operation)?;
+    if vibex_git::merge_head(&target_workspace.root_path)?.as_deref() != Some(source_head)
+        || vibex_git::resolve_head(&target_workspace.root_path)? != target_head
+        || vibex_git::status(target_workspace.id.clone(), &target_workspace.root_path)?
+            .branch
+            .as_deref()
+            != Some(target_branch)
+    {
+        return Err(VibexError::conflict(
+            "worktree_merge_resolution_scene_changed",
+            "target Git scene no longer matches the durable merge operation",
+        ));
+    }
+    Ok(())
+}
+
+fn managed_for_operation(
+    connection: &vibex_db::DbConnection,
+    operation: &GitWorktreeOperationRecord,
+) -> VibexResult<Option<GitManagedWorktreeRecord>> {
+    let Some(path) = operation.worktree_path.as_deref() else {
+        return Ok(None);
+    };
+    managed_for_path(connection, path)
+}
+
+fn source_commits_after_start(
+    operation: &GitWorktreeOperationRecord,
+    connection: &vibex_db::DbConnection,
+) -> VibexResult<u32> {
+    let Some(managed) = managed_for_operation(connection, operation)? else {
+        return Ok(0);
+    };
+    let Some(branch) = managed.branch.as_deref() else {
+        return Ok(0);
+    };
+    let expected = operation_expected_source_head(operation)?;
+    let current = vibex_git::resolve_ref_head(&managed.repo_root, branch)?;
+    if current == expected {
+        return Ok(0);
+    }
+    Ok(vibex_git::worktree_merge_summary(&managed.repo_root, expected, &current)?.commit_count)
+}
+
+fn lifecycle_diagnostic(
+    operation: &GitWorktreeOperationRecord,
+    code: &str,
+    summary: &str,
+    retryable: bool,
+    recovery_action: Option<&str>,
+) -> GitWorktreeDiagnostic {
+    GitWorktreeDiagnostic {
+        code: code.to_string(),
+        summary: summary.chars().take(512).collect(),
+        severity: GitWorktreeDiagnosticSeverity::Error,
+        retryable,
+        recovery_action: recovery_action.map(str::to_string),
+        operation_id: Some(operation.operation_id.clone()),
+        worktree_id: None,
+        observed_at_ms: unix_timestamp_ms(),
+    }
+}
+
+fn reconcile_operation_needs_attention(
+    connection: &vibex_db::DbConnection,
+    operation: &GitWorktreeOperationRecord,
+    report: &mut GitWorktreeReconcileReport,
+    code: &str,
+    summary: &str,
+) -> VibexResult<()> {
+    let already_recorded = operation.status == GitWorktreeOperationStatus::NeedsAttention
+        && operation.detail.checkpoint == GitWorktreeOperationCheckpoint::NeedsAttention
+        && operation
+            .detail
+            .diagnostic
+            .as_ref()
+            .is_some_and(|diagnostic| diagnostic.code == code && diagnostic.summary == summary);
+    if !already_recorded {
+        let diagnostic =
+            lifecycle_diagnostic(operation, code, summary, false, Some("inspect_target"));
+        WorktreeOperationRepository::mark_outcome(
+            connection,
+            &operation.operation_id,
+            GitWorktreeOperationStatus::NeedsAttention,
+            GitWorktreeOperationCheckpoint::NeedsAttention,
+            None,
+            Some(&diagnostic),
+        )?;
+    }
+    report.needs_attention = report.needs_attention.saturating_add(1);
+    Ok(())
+}
+
+fn preserve_merge_scene_or_attention(
+    connection: &vibex_db::DbConnection,
+    operation: &GitWorktreeOperationRecord,
+    target_workspace: &WorkspaceRecord,
+    error: &VibexError,
+) -> VibexResult<GitWorktreeOperationRecord> {
+    let matching_scene = vibex_git::merge_head(&target_workspace.root_path)?.as_deref()
+        == operation.detail.expected_source_head.as_deref();
+    let mut current = operation.clone();
+    current.detail.lease_owner = None;
+    current.detail.lease_expires_at_ms = None;
+    if matching_scene {
+        current.status = GitWorktreeOperationStatus::NeedsResolution;
+        current.detail.checkpoint = GitWorktreeOperationCheckpoint::ConflictDetected;
+        current.detail.conflicts = vibex_git::worktree_conflicts(&target_workspace.root_path)?;
+        current.detail.diagnostic = Some(lifecycle_diagnostic(
+            &current,
+            "worktree_merge_needs_resolution",
+            "merge scene remains available for conflict resolution",
+            false,
+            Some("resolve_conflicts"),
+        ));
+    } else {
+        current.status = GitWorktreeOperationStatus::NeedsAttention;
+        current.detail.checkpoint = GitWorktreeOperationCheckpoint::NeedsAttention;
+        current.detail.diagnostic = Some(lifecycle_diagnostic(
+            &current,
+            "worktree_merge_scene_inconsistent",
+            "merge operation and target Git scene disagree",
+            false,
+            Some("inspect_target"),
+        ));
+    }
+    current.error = Some(format!(
+        "{}: {}",
+        current
+            .detail
+            .diagnostic
+            .as_ref()
+            .map(|diagnostic| diagnostic.summary.as_str())
+            .unwrap_or("merge operation requires attention"),
+        bounded_error_code(error)
+    ));
+    WorktreeOperationRepository::save(connection, &current)
+}
+
+fn validate_lifecycle_confirmation(
+    revision: Option<&str>,
+    expected_head: Option<&str>,
+    preflight: &GitWorktreeDestructivePreflight,
+) -> VibexResult<()> {
+    let revision = revision.ok_or_else(|| {
+        VibexError::validation(
+            "worktree_preflight_required",
+            "lifecycle operation requires a current preflight revision",
+        )
+    })?;
+    let expected_head = expected_head.ok_or_else(|| {
+        VibexError::validation(
+            "worktree_expected_source_head_required",
+            "lifecycle operation requires the preflight source head",
+        )
+    })?;
+    if revision != preflight.revision || preflight.source_head.as_deref() != Some(expected_head) {
+        return Err(VibexError::conflict(
+            "worktree_preflight_stale",
+            "worktree lifecycle facts changed after preflight",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_restore_confirmation(
+    revision: Option<&str>,
+    preflight: &GitWorktreeDestructivePreflight,
+) -> VibexResult<()> {
+    let revision = revision.ok_or_else(|| {
+        VibexError::validation(
+            "worktree_preflight_required",
+            "restore requires a current preflight revision",
+        )
+    })?;
+    if revision != preflight.revision {
+        return Err(VibexError::conflict(
+            "worktree_preflight_stale",
+            "worktree restore facts changed after preflight",
+        ));
+    }
+    Ok(())
 }
 
 fn destructive_revision(
@@ -1675,6 +3850,8 @@ fn lifecycle_operation(
     let kind_label = match kind {
         GitWorktreeOperationKind::MergeBack => "merge",
         GitWorktreeOperationKind::Discard => "discard",
+        GitWorktreeOperationKind::Archive => "archive",
+        GitWorktreeOperationKind::Restore => "restore",
         _ => "lifecycle",
     };
     let idempotency_key = format!(
@@ -1693,7 +3870,11 @@ fn lifecycle_operation(
         worktree_path: Some(managed.worktree_path.clone()),
         branch: managed.branch.clone(),
         base_ref: managed.base_ref.clone(),
-        head_before: preflight.source_head.clone(),
+        head_before: if kind == GitWorktreeOperationKind::MergeBack {
+            preflight.target_head.clone()
+        } else {
+            preflight.source_head.clone()
+        },
         head_after: None,
         error: None,
         detail: GitWorktreeOperationDetail {
@@ -1711,6 +3892,10 @@ fn lifecycle_operation(
             expected_target_head: preflight.target_head.clone(),
             preflight_revision: Some(preflight.revision.clone()),
             checkpoint: GitWorktreeOperationCheckpoint::IntentRecorded,
+            merge_strategy: (kind == GitWorktreeOperationKind::MergeBack)
+                .then_some(GitWorktreeMergeStrategy::NoFfMerge),
+            queue_key: target_workspace
+                .map(|workspace| format!("target:{}", workspace.id.as_str())),
             ..GitWorktreeOperationDetail::default()
         },
         created_at_ms: now,
@@ -2120,15 +4305,17 @@ fn snapshot_revision(
     eligibility: &GitProjectEligibility,
     managed: &[GitManagedWorktreeRecord],
     operations: &[GitWorktreeOperationRecord],
+    readiness: &[vibex_core::GitWorktreeReadinessRecord],
 ) -> VibexResult<String> {
-    let payload = serde_json::to_vec(&(eligibility, managed, operations)).map_err(|_| {
-        VibexError::process(
-            "worktree_snapshot_revision_failed",
-            "worktree lifecycle snapshot could not be fingerprinted",
-        )
-    })?;
+    let payload =
+        serde_json::to_vec(&(eligibility, managed, operations, readiness)).map_err(|_| {
+            VibexError::process(
+                "worktree_snapshot_revision_failed",
+                "worktree lifecycle snapshot could not be fingerprinted",
+            )
+        })?;
     Ok(format!(
-        "worktree-snapshot-v1:{:x}",
+        "worktree-snapshot-v2:{:x}",
         Sha256::digest(payload)
     ))
 }
@@ -2603,6 +4790,7 @@ mod tests {
             Path::new(&created.worktree.path),
             &["commit", "-m", "feature"],
         );
+        fixture.mark_ready(&created.workspace.id);
 
         let draft = GitWorktreeMergeRequest {
             workspace_id: created.workspace.id.clone(),
@@ -2640,6 +4828,399 @@ mod tests {
     }
 
     #[test]
+    fn readiness_rejects_dirty_source_and_invalidates_after_change() {
+        let fixture = Fixture::new();
+        let created = fixture.create();
+        let initial = fixture
+            .coordinator
+            .readiness(&created.workspace.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(initial.state, GitWorktreeReadinessState::Working);
+
+        fs::write(
+            Path::new(&created.worktree.path).join("dirty.txt"),
+            "dirty\n",
+        )
+        .unwrap();
+        let dirty = fixture
+            .coordinator
+            .readiness(&created.workspace.id)
+            .unwrap()
+            .unwrap();
+        let error = fixture
+            .coordinator
+            .set_readiness(&GitWorktreeReadinessRequest {
+                workspace_id: created.workspace.id.clone(),
+                state: GitWorktreeReadinessState::ReadyToMerge,
+                expected_source_head: Some(dirty.source_head.clone()),
+                expected_dirty_fingerprint: Some(dirty.dirty_fingerprint.clone()),
+                checks: Vec::new(),
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "worktree_readiness_dirty_source");
+
+        git(Path::new(&created.worktree.path), &["add", "dirty.txt"]);
+        git(
+            Path::new(&created.worktree.path),
+            &["commit", "-m", "commit dirty file"],
+        );
+        let ready = fixture.mark_ready(&created.workspace.id);
+        assert_eq!(ready.state, GitWorktreeReadinessState::ReadyToMerge);
+        fs::write(
+            Path::new(&created.worktree.path).join("dirty.txt"),
+            "changed again\n",
+        )
+        .unwrap();
+        let invalidated = fixture
+            .coordinator
+            .readiness(&created.workspace.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(invalidated.state, GitWorktreeReadinessState::Working);
+        assert_ne!(invalidated.dirty_fingerprint, ready.dirty_fingerprint);
+        let draft = merge_draft(&created);
+        let preflight = fixture.coordinator.merge_preflight(&draft).unwrap();
+        assert!(!preflight.allowed);
+        assert!(
+            preflight
+                .risks
+                .iter()
+                .any(|risk| { risk.kind == GitWorktreeRiskKind::StaleReadiness && risk.blocking })
+        );
+    }
+
+    #[test]
+    fn conflict_survives_restart_and_continue_excludes_new_source_commits() {
+        let fixture = Fixture::new();
+        let created = fixture.create();
+        fs::write(
+            Path::new(&created.worktree.path).join("README.md"),
+            "source version\n",
+        )
+        .unwrap();
+        git(Path::new(&created.worktree.path), &["add", "README.md"]);
+        git(
+            Path::new(&created.worktree.path),
+            &["commit", "-m", "source conflict"],
+        );
+        fs::write(fixture.repo().join("README.md"), "target version\n").unwrap();
+        git(&fixture.repo(), &["add", "README.md"]);
+        git(&fixture.repo(), &["commit", "-m", "target conflict"]);
+        fixture.mark_ready(&created.workspace.id);
+        let draft = merge_draft(&created);
+        let preflight = fixture.coordinator.merge_preflight(&draft).unwrap();
+        let operation = fixture
+            .coordinator
+            .merge(&confirmed_merge(draft, &preflight))
+            .unwrap();
+        assert_eq!(
+            operation.status,
+            GitWorktreeOperationStatus::NeedsResolution
+        );
+        assert_eq!(operation.detail.conflicts.len(), 1);
+        assert_eq!(
+            operation.detail.conflicts[0].kind,
+            vibex_core::GitWorktreeConflictKind::BothModified
+        );
+        assert_eq!(
+            fixture
+                .coordinator
+                .assert_target_operation_fence(&fixture.workspace.id, "branch_checkout")
+                .unwrap_err()
+                .code,
+            "worktree_target_operation_fenced"
+        );
+        let target_conflict_before = fs::read_to_string(fixture.repo().join("README.md")).unwrap();
+        let git_handle = GitHandle {
+            db_path: fixture.coordinator.db_path.clone(),
+            mutation_claims: Arc::new(Mutex::new(BTreeSet::new())),
+            worktrees: Arc::new(fixture.coordinator.clone()),
+        };
+        let revert_error = git_handle
+            .revert(&vibex_core::GitStageRequest {
+                workspace_id: fixture.workspace.id.clone(),
+                paths: vec!["README.md".to_string()],
+            })
+            .unwrap_err();
+        assert_eq!(revert_error.code, "worktree_target_operation_fenced");
+        assert_eq!(
+            fs::read_to_string(fixture.repo().join("README.md")).unwrap(),
+            target_conflict_before
+        );
+        assert!(vibex_git::merge_head(fixture.repo()).unwrap().is_some());
+
+        let assistance_session = vibex_core::AgentSession {
+            id: vibex_core::VibexSessionId::new(),
+            title: "Resolve merge conflict".to_string(),
+            project_id: fixture.workspace.project_id.clone(),
+            workspace_id: fixture.workspace.id.clone(),
+            workspace_root: fixture.workspace.root_path.clone(),
+            workspace_mode: WorkspaceMode::CurrentCheckout,
+            agent_id: vibex_core::AgentId::parse("codex").unwrap(),
+            state: AgentSessionState::Idle,
+            safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        let connection = open_database(&fixture.coordinator.db_path).unwrap();
+        SessionRepository::insert(&connection, &assistance_session).unwrap();
+        let bound = fixture
+            .coordinator
+            .bind_assistance_session(&GitWorktreeAssistanceSessionRequest {
+                operation_id: operation.operation_id.clone(),
+                workspace_id: fixture.workspace.id.clone(),
+                session_id: assistance_session.id.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            bound.detail.assistance_session_id.as_ref(),
+            Some(&assistance_session.id)
+        );
+
+        let restarted = WorktreeCoordinator::new(fixture.coordinator.db_path.clone());
+        restarted.reconcile_on_startup().unwrap();
+        let before = restarted.lifecycle_snapshot(&fixture.workspace.id).unwrap();
+        restarted.reconcile_on_startup().unwrap();
+        let repeated = restarted.lifecycle_snapshot(&fixture.workspace.id).unwrap();
+        assert_eq!(before, repeated);
+        assert!(before.operations.iter().any(|candidate| {
+            candidate.operation_id == operation.operation_id
+                && candidate.status == GitWorktreeOperationStatus::NeedsResolution
+                && candidate.detail.assistance_session_id.as_ref() == Some(&assistance_session.id)
+        }));
+
+        fs::write(
+            Path::new(&created.worktree.path).join("after-start.txt"),
+            "new source commit\n",
+        )
+        .unwrap();
+        git(
+            Path::new(&created.worktree.path),
+            &["add", "after-start.txt"],
+        );
+        git(
+            Path::new(&created.worktree.path),
+            &["commit", "-m", "after merge started"],
+        );
+        restarted
+            .resolve_conflict(&GitWorktreeConflictResolveRequest {
+                operation_id: operation.operation_id.clone(),
+                workspace_id: fixture.workspace.id.clone(),
+                path: "README.md".to_string(),
+                version: vibex_core::GitWorktreeConflictVersion::Source,
+            })
+            .unwrap();
+        let staged = restarted
+            .stage_conflicts(&GitWorktreeConflictStageRequest {
+                operation_id: operation.operation_id.clone(),
+                workspace_id: fixture.workspace.id.clone(),
+                paths: vec!["README.md".to_string()],
+            })
+            .unwrap();
+        assert!(staged.detail.conflicts.is_empty());
+        assert_eq!(staged.detail.source_commits_after_start, 1);
+        let completed = restarted
+            .continue_merge(&GitWorktreeOperationRequest {
+                operation_id: operation.operation_id,
+                workspace_id: fixture.workspace.id.clone(),
+            })
+            .unwrap();
+        assert_eq!(completed.status, GitWorktreeOperationStatus::Completed);
+        assert_eq!(
+            fs::read_to_string(fixture.repo().join("README.md")).unwrap(),
+            "source version\n"
+        );
+        assert!(!fixture.repo().join("after-start.txt").exists());
+        assert!(Path::new(&created.worktree.path).is_dir());
+    }
+
+    #[test]
+    fn abort_restores_exact_target_without_changing_source() {
+        let fixture = Fixture::new();
+        let created = fixture.create();
+        fs::write(
+            Path::new(&created.worktree.path).join("README.md"),
+            "source version\n",
+        )
+        .unwrap();
+        git(Path::new(&created.worktree.path), &["add", "README.md"]);
+        git(
+            Path::new(&created.worktree.path),
+            &["commit", "-m", "source conflict"],
+        );
+        fs::write(fixture.repo().join("README.md"), "target version\n").unwrap();
+        git(&fixture.repo(), &["add", "README.md"]);
+        git(&fixture.repo(), &["commit", "-m", "target conflict"]);
+        fixture.mark_ready(&created.workspace.id);
+        let draft = merge_draft(&created);
+        let preflight = fixture.coordinator.merge_preflight(&draft).unwrap();
+        let operation = fixture
+            .coordinator
+            .merge(&confirmed_merge(draft, &preflight))
+            .unwrap();
+        let aborted = fixture
+            .coordinator
+            .abort_merge(&GitWorktreeOperationRequest {
+                operation_id: operation.operation_id,
+                workspace_id: fixture.workspace.id.clone(),
+            })
+            .unwrap();
+        assert_eq!(aborted.status, GitWorktreeOperationStatus::Aborted);
+        assert_eq!(
+            fs::read_to_string(fixture.repo().join("README.md")).unwrap(),
+            "target version\n"
+        );
+        assert_eq!(
+            fs::read_to_string(Path::new(&created.worktree.path).join("README.md")).unwrap(),
+            "source version\n"
+        );
+    }
+
+    #[test]
+    fn archive_and_restore_reuse_workspace_identity_path_branch_and_history_owner() {
+        let fixture = Fixture::new();
+        let created = fixture.create();
+        let archive_draft = GitWorktreeArchiveRequest {
+            workspace_id: created.workspace.id.clone(),
+            worktree_path: created.worktree.path.clone(),
+            expected_head: None,
+            preflight_revision: None,
+        };
+        let archive_preflight = fixture
+            .coordinator
+            .archive_preflight(&archive_draft)
+            .unwrap();
+        assert!(archive_preflight.allowed);
+        let archived = fixture
+            .coordinator
+            .archive(&GitWorktreeArchiveRequest {
+                expected_head: archive_preflight.source_head,
+                preflight_revision: Some(archive_preflight.revision),
+                ..archive_draft
+            })
+            .unwrap();
+        assert_eq!(archived.status, GitWorktreeOperationStatus::Completed);
+        assert!(!Path::new(&created.worktree.path).exists());
+        let connection = open_database(&fixture.coordinator.db_path).unwrap();
+        let managed = ManagedWorktreeRepository::get_by_path(&connection, &created.worktree.path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(managed.status, GitManagedWorktreeStatus::Archived);
+        assert_eq!(managed.workspace_id, Some(created.workspace.id.clone()));
+        assert!(
+            WorkspaceRepository::get(&connection, &created.workspace.id)
+                .unwrap()
+                .is_some()
+        );
+        drop(connection);
+        let archived_snapshot = fixture
+            .coordinator
+            .lifecycle_snapshot(&created.workspace.id)
+            .unwrap();
+        assert!(archived_snapshot.managed_worktrees.iter().any(|record| {
+            record.worktree_id == managed.worktree_id
+                && record.status == GitManagedWorktreeStatus::Archived
+        }));
+
+        let restore_draft = GitWorktreeRestoreRequest {
+            workspace_id: created.workspace.id.clone(),
+            worktree_id: managed.worktree_id.clone(),
+            preflight_revision: None,
+        };
+        let restore_preflight = fixture
+            .coordinator
+            .restore_preflight(&restore_draft)
+            .unwrap();
+        assert!(restore_preflight.allowed);
+        let restored = fixture
+            .coordinator
+            .restore(&GitWorktreeRestoreRequest {
+                preflight_revision: Some(restore_preflight.revision),
+                ..restore_draft
+            })
+            .unwrap();
+        assert_eq!(restored.status, GitWorktreeOperationStatus::Completed);
+        assert!(Path::new(&created.worktree.path).is_dir());
+        let connection = open_database(&fixture.coordinator.db_path).unwrap();
+        let managed_after = ManagedWorktreeRepository::get_by_id(&connection, &managed.worktree_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(managed_after.status, GitManagedWorktreeStatus::Active);
+        assert_eq!(managed_after.workspace_id, Some(created.workspace.id));
+        assert_eq!(managed_after.worktree_path, created.worktree.path);
+        assert_eq!(managed_after.branch, created.worktree.branch);
+    }
+
+    #[test]
+    fn external_merge_scene_is_visible_but_never_taken_over() {
+        let fixture = Fixture::new();
+        let created = fixture.create();
+        fs::write(
+            Path::new(&created.worktree.path).join("README.md"),
+            "source external\n",
+        )
+        .unwrap();
+        git(Path::new(&created.worktree.path), &["add", "README.md"]);
+        git(
+            Path::new(&created.worktree.path),
+            &["commit", "-m", "source external conflict"],
+        );
+        fs::write(fixture.repo().join("README.md"), "target external\n").unwrap();
+        git(&fixture.repo(), &["add", "README.md"]);
+        git(
+            &fixture.repo(),
+            &["commit", "-m", "target external conflict"],
+        );
+        let branch = created.managed.branch.as_deref().unwrap();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(fixture.repo())
+            .args(["merge", "--no-ff", "--no-edit", branch])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+
+        let snapshot = fixture
+            .coordinator
+            .lifecycle_snapshot(&fixture.workspace.id)
+            .unwrap();
+        let external = snapshot
+            .operations
+            .iter()
+            .find(|operation| {
+                operation
+                    .detail
+                    .diagnostic
+                    .as_ref()
+                    .is_some_and(|diagnostic| {
+                        diagnostic.code == "worktree_external_merge_needs_attention"
+                    })
+            })
+            .unwrap();
+        assert_eq!(external.status, GitWorktreeOperationStatus::NeedsAttention);
+        assert_eq!(
+            fixture
+                .coordinator
+                .assert_target_operation_fence(&fixture.workspace.id, "branch_checkout")
+                .unwrap_err()
+                .code,
+            "worktree_target_operation_fenced"
+        );
+        git(&fixture.repo(), &["merge", "--abort"]);
+        let reconciled = fixture
+            .coordinator
+            .lifecycle_snapshot(&fixture.workspace.id)
+            .unwrap();
+        assert!(reconciled.operations.iter().any(|operation| {
+            operation.operation_id == external.operation_id
+                && operation.status == GitWorktreeOperationStatus::Completed
+        }));
+    }
+
+    #[test]
     fn concurrent_source_merges_serialize_and_revalidate_target_head() {
         use std::sync::Barrier;
         use std::thread;
@@ -2672,6 +5253,7 @@ mod tests {
                 Path::new(&created.worktree.path),
                 &["commit", "-m", &format!("add {file}")],
             );
+            fixture.mark_ready(&created.workspace.id);
         }
 
         let first_draft = GitWorktreeMergeRequest {
@@ -2726,12 +5308,31 @@ mod tests {
         let first_result = first_handle.join().unwrap();
         let second_result = second_handle.join().unwrap();
         assert_eq!(
-            [first_result.is_ok(), second_result.is_ok()]
+            [&first_result, &second_result]
                 .into_iter()
-                .filter(|succeeded| *succeeded)
+                .filter(|result| {
+                    result.as_ref().is_ok_and(|operation| {
+                        operation.status == GitWorktreeOperationStatus::Completed
+                    })
+                })
                 .count(),
             1
         );
+        assert!([&first_result, &second_result].into_iter().all(|result| {
+            result.as_ref().is_ok_and(|operation| {
+                matches!(
+                    operation.status,
+                    GitWorktreeOperationStatus::Completed | GitWorktreeOperationStatus::Queued
+                )
+            }) || result.as_ref().is_err_and(|error| {
+                matches!(
+                    error.code.as_str(),
+                    "worktree_lifecycle_busy"
+                        | "worktree_operation_busy"
+                        | "worktree_preflight_stale"
+                )
+            })
+        }));
         for error in [first_result.as_ref().err(), second_result.as_ref().err()]
             .into_iter()
             .flatten()
@@ -2747,10 +5348,13 @@ mod tests {
             );
         }
 
-        let retry_draft = if first_result.is_err() {
-            first_draft
-        } else {
+        let retry_draft = if first_result
+            .as_ref()
+            .is_ok_and(|operation| operation.status == GitWorktreeOperationStatus::Completed)
+        {
             second_draft
+        } else {
+            first_draft
         };
         let current = coordinator.merge_preflight(&retry_draft).unwrap();
         assert!(current.allowed);
@@ -2771,7 +5375,7 @@ mod tests {
         assert!(
             managed
                 .iter()
-                .all(|record| record.status == GitManagedWorktreeStatus::Merged)
+                .all(|record| record.status == GitManagedWorktreeStatus::Active)
         );
         let (_, project_workspace) = workspace_record(&connection, &fixture.workspace.id).unwrap();
         let operations = WorktreeOperationRepository::list_for_project(
@@ -2984,6 +5588,29 @@ mod tests {
         assert_eq!(error.code, "worktree_path_inside_workspace");
     }
 
+    fn merge_draft(created: &GitWorktreeCreateResult) -> GitWorktreeMergeRequest {
+        GitWorktreeMergeRequest {
+            workspace_id: created.workspace.id.clone(),
+            source_path: created.worktree.path.clone(),
+            target_workspace_id: None,
+            expected_source_head: None,
+            expected_target_head: None,
+            preflight_revision: None,
+        }
+    }
+
+    fn confirmed_merge(
+        draft: GitWorktreeMergeRequest,
+        preflight: &GitWorktreeDestructivePreflight,
+    ) -> GitWorktreeMergeRequest {
+        GitWorktreeMergeRequest {
+            expected_source_head: preflight.source_head.clone(),
+            expected_target_head: preflight.target_head.clone(),
+            preflight_revision: Some(preflight.revision.clone()),
+            ..draft
+        }
+    }
+
     struct Fixture {
         _temp: TempDir,
         repo: PathBuf,
@@ -3046,6 +5673,19 @@ mod tests {
 
         fn repo(&self) -> PathBuf {
             self.repo.clone()
+        }
+
+        fn mark_ready(&self, workspace_id: &WorkspaceId) -> GitWorktreeReadinessRecord {
+            let current = self.coordinator.readiness(workspace_id).unwrap().unwrap();
+            self.coordinator
+                .set_readiness(&GitWorktreeReadinessRequest {
+                    workspace_id: workspace_id.clone(),
+                    state: GitWorktreeReadinessState::ReadyToMerge,
+                    expected_source_head: Some(current.source_head),
+                    expected_dirty_fingerprint: Some(current.dirty_fingerprint),
+                    checks: Vec::new(),
+                })
+                .unwrap()
         }
 
         fn assert_single_result(&self) {

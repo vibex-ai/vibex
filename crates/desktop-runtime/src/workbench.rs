@@ -170,6 +170,8 @@ impl GitHandle {
 
     pub fn revert(&self, request: &GitStageRequest) -> VibexResult<GitStatusSummary> {
         let _claim = GitMutationClaim::claim(self.mutation_claims.clone(), &request.workspace_id)?;
+        self.worktrees
+            .assert_target_operation_fence(&request.workspace_id, "revert")?;
         self.stage_inner(request, GitStageOperation::Revert)
     }
 
@@ -197,6 +199,8 @@ impl GitHandle {
 
     pub fn commit(&self, request: &GitCommitRequest) -> VibexResult<GitCommitResult> {
         let _claim = GitMutationClaim::claim(self.mutation_claims.clone(), &request.workspace_id)?;
+        self.worktrees
+            .assert_target_operation_fence(&request.workspace_id, "commit")?;
         let connection = open_database(&self.db_path)?;
         let workspace = workspace_record(&connection, &request.workspace_id)?.1;
         let result = vibex_git::commit(workspace.id.clone(), &workspace.root_path, request)?;
@@ -207,6 +211,10 @@ impl GitHandle {
 
     pub fn branch_create(&self, request: &GitBranchCreateRequest) -> VibexResult<GitStatusSummary> {
         let _claim = GitMutationClaim::claim(self.mutation_claims.clone(), &request.workspace_id)?;
+        if request.checkout {
+            self.worktrees
+                .assert_target_operation_fence(&request.workspace_id, "branch_checkout")?;
+        }
         let connection = open_database(&self.db_path)?;
         let workspace = workspace_record(&connection, &request.workspace_id)?.1;
         let status = vibex_git::branch_create(workspace.id, &workspace.root_path, request)?;
@@ -219,6 +227,8 @@ impl GitHandle {
         request: &GitBranchCheckoutRequest,
     ) -> VibexResult<GitStatusSummary> {
         let _claim = GitMutationClaim::claim(self.mutation_claims.clone(), &request.workspace_id)?;
+        self.worktrees
+            .assert_target_operation_fence(&request.workspace_id, "branch_checkout")?;
         let connection = open_database(&self.db_path)?;
         let workspace = workspace_record(&connection, &request.workspace_id)?.1;
         let status = vibex_git::branch_checkout(workspace.id, &workspace.root_path, request)?;

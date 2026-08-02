@@ -8,15 +8,20 @@ use vibex_core::{
     FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
     FileTreeRequest, FileWriteRequest, GitCommitRequest, GitCommitResult, GitDiffRequest,
     GitDiffResponse, GitProjectEligibility, GitStageRequest, GitStatusSummary,
-    GitWorktreeCreateRequest, GitWorktreeCreateResult, GitWorktreeLifecycleSnapshot,
-    OpenWorkspaceRequest, ProjectId, ProviderHealthSummary, ProviderRunHealthProbesRequest,
-    ProviderRunHealthProbesResult, RemoteAuditListRequest, RemoteAuditRecord,
-    RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
-    RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeviceDetail,
-    RemoteRevokeDeviceRequest, RenameAgentSessionRequest, ResolvePermissionRequest,
-    SendAgentMessageRequest, SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest,
-    TerminalCreateRequest, TerminalId, TerminalResizeRequest, TerminalSession, TerminalSnapshot,
-    TerminalStatus, TerminalWriteRequest, TimelineItem, TimelinePage, VibexSessionId, WorkspaceId,
+    GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
+    GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeCreateRequest,
+    GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
+    GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
+    GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeReadinessRecord,
+    GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, OpenWorkspaceRequest, ProjectId,
+    ProviderHealthSummary, ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult,
+    RemoteAuditListRequest, RemoteAuditRecord, RemoteCreatePairingCodeRequest,
+    RemoteCreatePairingCodeResponse, RemoteCreatePairingOfferRequest,
+    RemoteCreatePairingOfferResponse, RemoteDeviceDetail, RemoteRevokeDeviceRequest,
+    RenameAgentSessionRequest, ResolvePermissionRequest, SendAgentMessageRequest,
+    SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
+    TerminalId, TerminalResizeRequest, TerminalSession, TerminalSnapshot, TerminalStatus,
+    TerminalWriteRequest, TimelineItem, TimelinePage, VibexSessionId, WorkspaceId,
 };
 use vibex_desktop_runtime::{
     AuthoritativeRefetch, DesktopEvent, DesktopEventReceiver, DesktopEventStream, DesktopRuntime,
@@ -604,6 +609,226 @@ impl GitBackend for NativeBackend {
             runtime
                 .git()
                 .worktree_create_with_context(&request.payload, context)
+                .map_err(Into::into)
+        })
+    }
+
+    fn git_worktree_readiness(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BackendFuture<'_, Option<GitWorktreeReadinessRecord>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .git()
+                .worktree_readiness(&workspace_id)
+                .map_err(Into::into)
+        })
+    }
+
+    fn git_worktree_set_readiness(
+        &self,
+        request: MutationRequest<GitWorktreeReadinessRequest>,
+    ) -> BackendFuture<'_, GitWorktreeReadinessRecord> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .git()
+                .worktree_set_readiness(&request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn git_worktree_merge_plan(
+        &self,
+        request: GitWorktreeMergeRequest,
+    ) -> BackendFuture<'_, GitWorktreeMergePlan> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .git()
+                .worktree_merge_plan(&request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn git_worktree_merge(
+        &self,
+        request: MutationRequest<GitWorktreeMergeRequest>,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .git()
+                .worktree_merge(&request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn git_worktree_resolve_conflict(
+        &self,
+        request: MutationRequest<GitWorktreeConflictResolveRequest>,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .git()
+                .worktree_resolve_conflict(&request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn git_worktree_stage_conflicts(
+        &self,
+        request: MutationRequest<GitWorktreeConflictStageRequest>,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .git()
+                .worktree_stage_conflicts(&request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn git_worktree_bind_assistance_session(
+        &self,
+        request: MutationRequest<GitWorktreeAssistanceSessionRequest>,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .git()
+                .worktree_bind_assistance_session(&request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn git_worktree_continue_merge(
+        &self,
+        request: MutationRequest<GitWorktreeOperationRequest>,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .git()
+                .worktree_continue_merge(&request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn git_worktree_abort_merge(
+        &self,
+        request: MutationRequest<GitWorktreeOperationRequest>,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .git()
+                .worktree_abort_merge(&request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn git_worktree_archive_preflight(
+        &self,
+        request: GitWorktreeArchiveRequest,
+    ) -> BackendFuture<'_, GitWorktreeDestructivePreflight> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .git()
+                .worktree_archive_preflight(&request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn git_worktree_archive(
+        &self,
+        request: MutationRequest<GitWorktreeArchiveRequest>,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .git()
+                .worktree_archive(&request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn git_worktree_restore_preflight(
+        &self,
+        request: GitWorktreeRestoreRequest,
+    ) -> BackendFuture<'_, GitWorktreeDestructivePreflight> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .git()
+                .worktree_restore_preflight(&request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn git_worktree_restore(
+        &self,
+        request: MutationRequest<GitWorktreeRestoreRequest>,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .git()
+                .worktree_restore(&request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn git_worktree_discard_preflight(
+        &self,
+        request: GitWorktreeDiscardRequest,
+    ) -> BackendFuture<'_, GitWorktreeDestructivePreflight> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .git()
+                .worktree_discard_preflight(&request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn git_worktree_discard(
+        &self,
+        request: MutationRequest<GitWorktreeDiscardRequest>,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .git()
+                .worktree_discard(&request.payload)
                 .map_err(Into::into)
         })
     }

@@ -33,6 +33,7 @@ pub enum BackendOperation {
     GitCommit,
     GitWorktreeRead,
     GitWorktreeCreate,
+    GitWorktreeLifecycleMutate,
     TerminalList,
     TerminalCreate,
     TerminalAttach,
@@ -146,6 +147,7 @@ impl BackendCapabilitySnapshot {
                 GitCommit,
                 GitWorktreeRead,
                 GitWorktreeCreate,
+                GitWorktreeLifecycleMutate,
             ]),
             terminal: DomainCapabilities::available([
                 TerminalList,
@@ -188,6 +190,11 @@ mod tests {
         assert!(snapshot.file.supports(BackendOperation::FileWrite));
         assert!(snapshot.device.supports(BackendOperation::DevicePairing));
         assert!(snapshot.git.supports(BackendOperation::GitWorktreeCreate));
+        assert!(
+            snapshot
+                .git
+                .supports(BackendOperation::GitWorktreeLifecycleMutate)
+        );
         assert!(!snapshot.git.supports(BackendOperation::TerminalCreate));
     }
 

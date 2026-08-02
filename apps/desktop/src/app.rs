@@ -52,7 +52,9 @@ use tokio::sync::mpsc;
 use vibex_agent_acp::build_runtime_option_catalog;
 use vibex_agent_claude::{ClaudeSessionImportPreviewRequest, preview_claude_external_sessions};
 use vibex_agent_codex::{CodexSessionImportPreviewRequest, preview_codex_external_sessions};
-use vibex_backend::{BackendFacade, BackendOperation, MutationRequest, NativeBackend};
+use vibex_backend::{
+    BackendError, BackendFacade, BackendOperation, MutationRequest, NativeBackend,
+};
 use vibex_config_switch::skills::LocalSkillScanRequest;
 use vibex_core::{
     AgentCommandDiscoverRequest, AgentCommandDiscoverResponse, AgentCommandEntry,
@@ -63,11 +65,13 @@ use vibex_core::{
     CreateAgentSessionRequest, DetachRuntimeRequest, ExternalSessionImportCandidateStatus,
     ExternalSessionImportRequest, FetchTimelineRequest, FileEntryKind, FileTreeRequest,
     ForkAgentSessionRequest, GetMessageSubmissionRequest, GitProjectEligibilityState,
-    GitProjectIneligibleReason, MessageAttachment, MessageSubmissionState, MessageSubmissionStatus,
-    OpenWorkspaceRequest, PermissionResolution, PermissionResponseKind, ProjectId, ProjectRecord,
-    PromptId, ProviderBindingMetadata, ProviderKind, ProviderProfileId, ProviderProfileStatus,
-    ProviderProfileSummary, RenameAgentSessionRequest, RequestId, ResolvePermissionRequest,
-    RightRailPlugin, RightRailPluginCreateRequest, RightRailPluginDeleteRequest, RightRailPluginId,
+    GitProjectIneligibleReason, GitWorktreeAssistanceSessionRequest, GitWorktreeConflictKind,
+    GitWorktreeOperationRecord, GitWorktreeOperationStatus, MessageAttachment,
+    MessageSubmissionState, MessageSubmissionStatus, OpenWorkspaceRequest, PermissionResolution,
+    PermissionResponseKind, ProjectId, ProjectRecord, PromptId, ProviderBindingMetadata,
+    ProviderKind, ProviderProfileId, ProviderProfileStatus, ProviderProfileSummary,
+    RenameAgentSessionRequest, RequestId, ResolvePermissionRequest, RightRailPlugin,
+    RightRailPluginCreateRequest, RightRailPluginDeleteRequest, RightRailPluginId,
     RightRailPluginKind, RightRailPluginReorderRequest, RightRailPluginStatus,
     RightRailPluginUpdateRequest, RightRailSystemPluginKey, RightRailWebPluginUaMode,
     RuntimeClientId, RuntimeLeaseRole, RuntimeSelectionInteraction, SendAgentMessageRequest,
@@ -86,8 +90,8 @@ use vibex_desktop_model::{
     ThemeMode as ModelThemeMode, ThrottledUiStateWriter, TimelineConversationTurn,
     TimelineFollowState, TimelineModel, TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
     UiStateStore, WorkbenchRoute, WorkspaceAgentSummary, WorkspaceContextProjection,
-    composer_trigger_at, custom_worktree_path_is_absolute, sidebar_project_projections,
-    timeline_conversation_turns,
+    WorktreeLifecycleDisplayState, composer_trigger_at, custom_worktree_path_is_absolute,
+    sidebar_project_projections, timeline_conversation_turns,
 };
 use vibex_desktop_runtime::{
     DesktopEvent, DesktopRuntime, DesktopRuntimeConfig, DesktopRuntimeFacade, PREVIEW_APP_ID,
@@ -2197,6 +2201,8 @@ pub struct VibexWorkbench {
     sidebar_picker_task: Option<Task<()>>,
     new_session_eligibility_task: Option<Task<()>>,
     workspace_context_task: Option<Task<()>>,
+    worktree_assistance_task: Option<Task<()>>,
+    worktree_assistance_operation_id: Option<RequestId>,
     runtime_heartbeat_task: Option<Task<()>>,
     agent_poll_task: Option<Task<()>>,
     composer_attachment_task: Option<Task<()>>,
@@ -2695,6 +2701,8 @@ impl VibexWorkbench {
             sidebar_picker_task: None,
             new_session_eligibility_task: None,
             workspace_context_task: None,
+            worktree_assistance_task: None,
+            worktree_assistance_operation_id: None,
             runtime_heartbeat_task: None,
             agent_poll_task: None,
             composer_attachment_task: None,
@@ -2761,6 +2769,8 @@ impl VibexWorkbench {
         };
         self.runtime = None;
         self.backend = None;
+        self.code_workbench
+            .update(cx, |workbench, cx| workbench.clear_backend(cx));
         self.shared_workflow = None;
         self.shared_terminal = None;
         self.shared_management = None;
@@ -2831,6 +2841,9 @@ impl VibexWorkbench {
                             ));
                             this.usage_view
                                 .update(cx, |usage, cx| usage.set_backend(facade.clone(), cx));
+                            this.code_workbench.update(cx, |workbench, cx| {
+                                workbench.set_backend(facade.clone(), cx)
+                            });
                             this.backend = Some(facade);
                             this.management_view.update(cx, |management, cx| {
                                 management.set_runtime(runtime.clone(), cx)
@@ -3179,7 +3192,7 @@ impl VibexWorkbench {
         ));
     }
 
-    fn refresh_workspace_contexts(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn refresh_workspace_contexts(&mut self, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
             return;
         };
@@ -3965,6 +3978,276 @@ impl VibexWorkbench {
             });
         }
         self.queue_ui_state();
+    }
+
+    pub(crate) fn focus_worktree_operation_target(
+        &mut self,
+        workspace_id: vibex_core::WorkspaceId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self
+            .workspaces
+            .iter()
+            .find(|(_, workspace)| workspace.id == workspace_id)
+            .map(|(_, workspace)| workspace.clone())
+        else {
+            self.runtime_note = Some("worktree_target_workspace_not_found".to_string());
+            cx.notify();
+            return;
+        };
+        self.activate_workspace(workspace, cx);
+        self.open_right_rail_mode(RightRailMode::Git, cx);
+        self.code_workbench.update(cx, |workbench, cx| {
+            workbench.set_git_mode(vibex_desktop_model::GitWorkbenchMode::Changes, cx)
+        });
+    }
+
+    pub(crate) fn assist_worktree_merge(
+        &mut self,
+        operation: GitWorktreeOperationRecord,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(
+            operation.status,
+            GitWorktreeOperationStatus::NeedsResolution
+                | GitWorktreeOperationStatus::NeedsAttention
+        ) {
+            self.agent_error = Some("worktree_assistance_operation_inactive".to_string());
+            cx.notify();
+            return;
+        }
+        if self.worktree_assistance_task.is_some() {
+            if self.worktree_assistance_operation_id.as_ref() != Some(&operation.operation_id) {
+                self.runtime_note = Some("Another Worktree assistance action is starting".into());
+            }
+            cx.notify();
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            self.agent_error = Some("backend_unavailable".to_string());
+            cx.notify();
+            return;
+        };
+        if !backend
+            .capabilities()
+            .agent
+            .supports(BackendOperation::AgentCreateSession)
+            || !backend
+                .capabilities()
+                .git
+                .supports(BackendOperation::GitWorktreeLifecycleMutate)
+        {
+            self.agent_error = Some("worktree_assistance_unsupported".to_string());
+            cx.notify();
+            return;
+        }
+        let Some(target_workspace_id) = operation.target_workspace_id.clone() else {
+            self.agent_error = Some("worktree_target_workspace_missing".to_string());
+            cx.notify();
+            return;
+        };
+        let Some(target_workspace) = self
+            .workspaces
+            .iter()
+            .find(|(_, workspace)| workspace.id == target_workspace_id)
+            .map(|(_, workspace)| workspace.clone())
+        else {
+            self.agent_error = Some("worktree_target_workspace_not_found".to_string());
+            cx.notify();
+            return;
+        };
+        let runtime_selection = self
+            .runtime_selection
+            .as_ref()
+            .map(|state| state.desired.clone())
+            .or_else(|| self.new_session_runtime_selection.clone())
+            .or_else(|| {
+                self.runtime_catalog.as_ref().and_then(|catalog| {
+                    catalog
+                        .options
+                        .iter()
+                        .find(|option| {
+                            option.availability == vibex_core::RuntimeOptionAvailability::Available
+                        })
+                        .map(|option| option.selection.clone())
+                })
+            });
+        if operation.detail.assistance_session_id.is_none() && runtime_selection.is_none() {
+            self.agent_error = Some("worktree_assistance_runtime_unavailable".to_string());
+            cx.notify();
+            return;
+        }
+
+        let operation_id = operation.operation_id.clone();
+        let prompt = worktree_assistance_prompt(&operation);
+        let source_branch = operation.branch.as_deref().unwrap_or("source").to_string();
+        let target_branch = operation
+            .detail
+            .target_branch
+            .as_deref()
+            .unwrap_or("target")
+            .to_string();
+        let title = format!("Resolve merge: {source_branch} -> {target_branch}");
+        let bound_session_id = operation.detail.assistance_session_id.clone();
+        let target_root = target_workspace.root_path.clone();
+        let target_mode = target_workspace.mode;
+        let target_id = target_workspace.id.clone();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        self.worktree_assistance_operation_id = Some(operation_id.clone());
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let session = if let Some(session_id) = bound_session_id {
+                match backend.agent().open_session(session_id).await {
+                    Ok(session)
+                        if session.workspace_id == target_id
+                            && session.archived_at_ms.is_none()
+                            && session.deleted_at_ms.is_none() =>
+                    {
+                        session
+                    }
+                    Ok(_) => {
+                        return Err(BackendError::conflict(
+                            "worktree_assistance_session_workspace_mismatch",
+                            "bound assistance Session is not active in the target Workspace",
+                        ));
+                    }
+                    Err(_) => {
+                        let selection = runtime_selection.clone().ok_or_else(|| {
+                            BackendError::unsupported(
+                                "worktree_assistance_runtime_unavailable",
+                                "no Agent runtime is available for a replacement Session",
+                            )
+                        })?;
+                        backend
+                            .agent()
+                            .create_session(
+                                MutationRequest::new(CreateAgentSessionRequest {
+                                    runtime: selection,
+                                    workspace_root: target_root.clone(),
+                                    workspace_mode: target_mode,
+                                    title: Some(title.clone()),
+                                    safety: None,
+                                })
+                                .with_idempotency_key(format!(
+                                    "worktree-assistance-session:{}",
+                                    operation_id.as_str()
+                                )),
+                            )
+                            .await?
+                    }
+                }
+            } else {
+                let selection = runtime_selection.clone().ok_or_else(|| {
+                    BackendError::unsupported(
+                        "worktree_assistance_runtime_unavailable",
+                        "no Agent runtime is available for an assistance Session",
+                    )
+                })?;
+                backend
+                    .agent()
+                    .create_session(
+                        MutationRequest::new(CreateAgentSessionRequest {
+                            runtime: selection,
+                            workspace_root: target_root,
+                            workspace_mode: target_mode,
+                            title: Some(title),
+                            safety: None,
+                        })
+                        .with_idempotency_key(format!(
+                            "worktree-assistance-session:{}",
+                            operation_id.as_str()
+                        )),
+                    )
+                    .await?
+            };
+            backend
+                .git()
+                .git_worktree_bind_assistance_session(
+                    MutationRequest::new(GitWorktreeAssistanceSessionRequest {
+                        operation_id: operation_id.clone(),
+                        workspace_id: target_id,
+                        session_id: session.id.clone(),
+                    })
+                    .with_idempotency_key(format!(
+                        "worktree-assistance-bind:{}",
+                        operation_id.as_str()
+                    )),
+                )
+                .await?;
+            let _ = session_tx.send(session.clone());
+            let selection = backend
+                .agent()
+                .runtime_selection(session.id.clone())
+                .await?
+                .effective;
+            backend
+                .agent()
+                .send_message(
+                    MutationRequest::new(SendAgentMessageRequest {
+                        session_id: session.id.clone(),
+                        message_idempotency_key: format!(
+                            "worktree-assistance-context:{}",
+                            operation_id.as_str()
+                        ),
+                        reasoning_effort: selection.reasoning_effort.clone(),
+                        desired_runtime: selection,
+                        text: prompt,
+                        attachments: Vec::new(),
+                        correlation_id: None,
+                    })
+                    .with_idempotency_key(format!(
+                        "worktree-assistance-context:{}",
+                        operation_id.as_str()
+                    )),
+                )
+                .await?;
+            backend.agent().open_session(session.id).await
+        });
+        self.agent_error = None;
+        self.worktree_assistance_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let announced = session_rx.recv().await;
+                if let Some(session) = announced.as_ref() {
+                    let _ = entity.update(cx, |this, cx| {
+                        this.upsert_session_snapshot(session.clone());
+                        this.set_session_turn_pending(&session.id, true);
+                        this.reconcile_sidebar_state();
+                        this.select_session_with_history(session.id.clone(), false, cx);
+                        this.refresh_workspace_contexts(cx);
+                        cx.notify();
+                    });
+                }
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    if let Some(session) = announced.as_ref() {
+                        this.set_session_turn_pending(&session.id, false);
+                    }
+                    this.worktree_assistance_task = None;
+                    this.worktree_assistance_operation_id = None;
+                    match outcome {
+                        Ok(Ok(session)) => {
+                            let session_id = session.id.clone();
+                            this.upsert_session_snapshot(session);
+                            this.reconcile_sidebar_state();
+                            if this.selected_session_id.as_ref() == Some(&session_id) {
+                                this.refresh_selected_agent_timeline(cx);
+                            }
+                            this.code_workbench
+                                .update(cx, |workbench, cx| workbench.refresh_git(cx));
+                            this.refresh_workspace_contexts(cx);
+                        }
+                        Ok(Err(error)) => {
+                            this.agent_error = Some(format!("{}: {}", error.code, error.message));
+                        }
+                        Err(error) => {
+                            this.agent_error =
+                                Some(format!("Worktree assistance task failed: {error}"));
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+        cx.notify();
     }
 
     fn activate_and_toggle_project(
@@ -12941,6 +13224,7 @@ impl VibexWorkbench {
         let status =
             sidebar_workspace_agent_summary_label(self.resolved_locale(), projection.agent_summary);
         let dirty = projection.context.git_dirty;
+        let lifecycle_state = projection.context.worktree_lifecycle_state;
         let collapsed = self
             .ui_state
             .sidebar
@@ -13005,6 +13289,15 @@ impl VibexWorkbench {
                                     .child(identity)
                                     .when(dirty, |this| {
                                         this.child(locale::text("Dirty", "有更改", "有變更"))
+                                    })
+                                    .when_some(lifecycle_state, |this, state| {
+                                        this.child(
+                                            div()
+                                                .text_color(sidebar_worktree_lifecycle_color(
+                                                    state, cx,
+                                                ))
+                                                .child(sidebar_worktree_lifecycle_label(state)),
+                                        )
                                     })
                                     .when_some(status, |this, status| {
                                         this.child(div().truncate().child(status))
@@ -13088,12 +13381,21 @@ impl VibexWorkbench {
         let worktree_tooltip = (show_worktree_identity
             && session.workspace_mode == WorkspaceMode::VibexWorktree)
             .then(|| {
-                let branch = self
-                    .workspace_contexts
-                    .get(session.workspace_id.as_str())
+                let context = self.workspace_contexts.get(session.workspace_id.as_str());
+                let branch = context
                     .and_then(|context| context.branch.as_deref())
                     .unwrap_or("unknown");
-                format!("Worktree · {branch}")
+                let lifecycle_state = context.and_then(|context| context.worktree_lifecycle_state);
+                let tooltip = lifecycle_state.map_or_else(
+                    || format!("Worktree · {branch}"),
+                    |state| {
+                        format!(
+                            "Worktree · {branch} · {}",
+                            sidebar_worktree_lifecycle_label(state)
+                        )
+                    },
+                );
+                (tooltip, lifecycle_state)
             });
         let selected_desired_agent_id = selected
             .then(|| {
@@ -13173,7 +13475,7 @@ impl VibexWorkbench {
                                     .text_color(cx.theme().warning),
                             )
                         })
-                        .when_some(worktree_tooltip.clone(), |this, tooltip| {
+                        .when_some(worktree_tooltip.clone(), |this, (tooltip, state)| {
                             this.child(
                                 div()
                                     .id(format!("sidebar-session-worktree-{session_id_string}"))
@@ -13183,7 +13485,14 @@ impl VibexWorkbench {
                                     .child(
                                         sidebar_icon("icons/vibex/git-branch.svg")
                                             .size(px(12.0))
-                                            .text_color(cx.theme().accent_foreground),
+                                            .text_color(
+                                                state.map_or(
+                                                    cx.theme().accent_foreground,
+                                                    |state| {
+                                                        sidebar_worktree_lifecycle_color(state, cx)
+                                                    },
+                                                ),
+                                            ),
                                     ),
                             )
                         })
@@ -13398,7 +13707,7 @@ impl VibexWorkbench {
                                         .text_color(cx.theme().warning),
                                 )
                             })
-                            .when_some(worktree_tooltip, |this, tooltip| {
+                            .when_some(worktree_tooltip, |this, (tooltip, state)| {
                                 this.child(
                                     div()
                                         .id(format!("sidebar-session-worktree-{session_id_string}"))
@@ -13408,7 +13717,12 @@ impl VibexWorkbench {
                                         .child(
                                             sidebar_icon("icons/vibex/git-branch.svg")
                                                 .size(px(12.0))
-                                                .text_color(cx.theme().accent_foreground),
+                                                .text_color(state.map_or(
+                                                    cx.theme().accent_foreground,
+                                                    |state| {
+                                                        sidebar_worktree_lifecycle_color(state, cx)
+                                                    },
+                                                )),
                                         ),
                                 )
                             })
@@ -23121,6 +23435,81 @@ fn session_title_from_first_message(message: &str) -> Option<String> {
     }
 }
 
+fn worktree_assistance_prompt(operation: &GitWorktreeOperationRecord) -> String {
+    const CONFLICT_LIMIT: usize = 256;
+    const PROMPT_CHAR_LIMIT: usize = 64 * 1024;
+    let source_branch = operation.branch.as_deref().unwrap_or("source");
+    let target_branch = operation
+        .detail
+        .target_branch
+        .as_deref()
+        .unwrap_or("target");
+    let source_head = operation
+        .detail
+        .expected_source_head
+        .as_deref()
+        .unwrap_or("unknown");
+    let target_head = operation
+        .detail
+        .expected_target_head
+        .as_deref()
+        .unwrap_or("unknown");
+    let mut lines = vec![
+        "Help resolve the active Vibex-managed Git merge in this target Workspace.".to_string(),
+        format!("Operation: {}", operation.operation_id.as_str()),
+        format!("Source: {source_branch} at {source_head}"),
+        format!("Target: {target_branch} at {target_head}"),
+        format!(
+            "Strategy: {}",
+            match operation.detail.merge_strategy {
+                Some(vibex_core::GitWorktreeMergeStrategy::NoFfMerge) => "no-ff merge",
+                Some(vibex_core::GitWorktreeMergeStrategy::Unknown) | None => "unknown",
+            }
+        ),
+        String::new(),
+        "Conflict files:".to_string(),
+    ];
+    lines.extend(
+        operation
+            .detail
+            .conflicts
+            .iter()
+            .take(CONFLICT_LIMIT)
+            .map(|conflict| {
+                format!(
+                    "- {} [{}{}]",
+                    conflict.path,
+                    worktree_assistance_conflict_kind(conflict.kind),
+                    if conflict.binary { ", binary" } else { "" }
+                )
+            }),
+    );
+    if operation.detail.conflicts.len() > CONFLICT_LIMIT {
+        lines.push(format!(
+            "- ... {} additional conflict(s) omitted from this bounded context",
+            operation.detail.conflicts.len() - CONFLICT_LIMIT
+        ));
+    }
+    lines.extend([
+        String::new(),
+        "Inspect the index and working tree, edit the resolution, and explain what you changed. You may use normal file and terminal tools in this Workspace.".to_string(),
+        "Do not run git merge --continue, git merge --abort, commit the merge, reset, checkout another branch, archive, or discard the Worktree. The user owns staging review and final continue/abort through Vibex.".to_string(),
+    ]);
+    lines.join("\n").chars().take(PROMPT_CHAR_LIMIT).collect()
+}
+
+fn worktree_assistance_conflict_kind(kind: GitWorktreeConflictKind) -> &'static str {
+    match kind {
+        GitWorktreeConflictKind::BothModified => "both_modified",
+        GitWorktreeConflictKind::BothAdded => "both_added",
+        GitWorktreeConflictKind::DeletedBySource => "deleted_by_source",
+        GitWorktreeConflictKind::DeletedByTarget => "deleted_by_target",
+        GitWorktreeConflictKind::Binary => "binary",
+        GitWorktreeConflictKind::Other => "other",
+        GitWorktreeConflictKind::Unknown => "unknown",
+    }
+}
+
 fn ensure_temporary_session_root() -> vibex_core::VibexResult<String> {
     let root = std::env::temp_dir().join("vibex").join("sessions");
     std::fs::create_dir_all(&root).map_err(|error| {
@@ -23145,6 +23534,46 @@ fn ensure_temporary_session_root() -> vibex_core::VibexResult<String> {
 
 fn sidebar_icon(path: &'static str) -> Icon {
     Icon::default().path(path).small()
+}
+
+fn sidebar_worktree_lifecycle_label(state: WorktreeLifecycleDisplayState) -> &'static str {
+    match state {
+        WorktreeLifecycleDisplayState::Working => locale::text("Working", "开发中", "開發中"),
+        WorktreeLifecycleDisplayState::Reviewing => locale::text("Reviewing", "检查中", "檢查中"),
+        WorktreeLifecycleDisplayState::Ready => locale::text("Ready", "可合并", "可合併"),
+        WorktreeLifecycleDisplayState::Queued => locale::text("Queued", "排队中", "排隊中"),
+        WorktreeLifecycleDisplayState::Merging => locale::text("Merging", "合并中", "合併中"),
+        WorktreeLifecycleDisplayState::NeedsResolution => locale::text("Conflict", "冲突", "衝突"),
+        WorktreeLifecycleDisplayState::Aborting => locale::text("Aborting", "中止中", "中止中"),
+        WorktreeLifecycleDisplayState::Archiving => locale::text("Archiving", "归档中", "封存中"),
+        WorktreeLifecycleDisplayState::Archived => locale::text("Archived", "已归档", "已封存"),
+        WorktreeLifecycleDisplayState::Restoring => locale::text("Restoring", "恢复中", "還原中"),
+        WorktreeLifecycleDisplayState::Discarding => locale::text("Discarding", "丢弃中", "捨棄中"),
+        WorktreeLifecycleDisplayState::Discarded => locale::text("Discarded", "已丢弃", "已捨棄"),
+        WorktreeLifecycleDisplayState::Failed => locale::text("Failed", "失败", "失敗"),
+        WorktreeLifecycleDisplayState::NeedsAttention => {
+            locale::text("Needs attention", "需要处理", "需要處理")
+        }
+    }
+}
+
+fn sidebar_worktree_lifecycle_color(state: WorktreeLifecycleDisplayState, cx: &App) -> Hsla {
+    match state {
+        WorktreeLifecycleDisplayState::Ready => cx.theme().success,
+        WorktreeLifecycleDisplayState::Reviewing
+        | WorktreeLifecycleDisplayState::Queued
+        | WorktreeLifecycleDisplayState::Archiving
+        | WorktreeLifecycleDisplayState::Restoring
+        | WorktreeLifecycleDisplayState::Discarding => cx.theme().warning,
+        WorktreeLifecycleDisplayState::Merging => cx.theme().primary,
+        WorktreeLifecycleDisplayState::NeedsResolution
+        | WorktreeLifecycleDisplayState::Aborting
+        | WorktreeLifecycleDisplayState::Failed
+        | WorktreeLifecycleDisplayState::NeedsAttention => cx.theme().danger,
+        WorktreeLifecycleDisplayState::Working
+        | WorktreeLifecycleDisplayState::Archived
+        | WorktreeLifecycleDisplayState::Discarded => cx.theme().sidebar_foreground.opacity(0.48),
+    }
 }
 
 fn agent_brand_identity(agent: &AgentSnapshotEntry) -> String {
@@ -26926,9 +27355,68 @@ mod tests {
     use gpui::TestAppContext;
     use vibex_core::{
         AgentCommandExecutionBehavior, AgentCommandSelectionBehavior, AgentId, AgentMessagePayload,
-        ProviderProfileId, RuntimeOptionAvailability, SessionConfigValue, SessionRuntimeOption,
-        TimelineItemId, TimelineRedactionState, TimelineSource, UserMessagePayload, WorkspaceId,
+        GitWorktreeConflictFile, GitWorktreeMergeStrategy, GitWorktreeOperationDetail,
+        GitWorktreeOperationKind, ProviderProfileId, RuntimeOptionAvailability, SessionConfigValue,
+        SessionRuntimeOption, TimelineItemId, TimelineRedactionState, TimelineSource,
+        UserMessagePayload, WorkspaceId,
     };
+
+    #[test]
+    fn worktree_assistance_context_is_bounded_structured_and_keeps_finalization_with_the_user() {
+        let source_workspace_id = WorkspaceId::new();
+        let target_workspace_id = WorkspaceId::new();
+        let operation = GitWorktreeOperationRecord {
+            operation_id: RequestId::new(),
+            project_id: ProjectId::new(),
+            source_workspace_id: Some(source_workspace_id),
+            target_workspace_id: Some(target_workspace_id),
+            operation: GitWorktreeOperationKind::MergeBack,
+            status: GitWorktreeOperationStatus::NeedsResolution,
+            worktree_path: None,
+            branch: Some("feature/lifecycle".into()),
+            base_ref: Some("main".into()),
+            head_before: Some("a".repeat(40)),
+            head_after: None,
+            error: None,
+            detail: GitWorktreeOperationDetail {
+                target_branch: Some("main".into()),
+                expected_source_head: Some("b".repeat(40)),
+                expected_target_head: Some("a".repeat(40)),
+                merge_strategy: Some(GitWorktreeMergeStrategy::NoFfMerge),
+                conflicts: vec![GitWorktreeConflictFile {
+                    path: "src/lib.rs".into(),
+                    kind: GitWorktreeConflictKind::BothModified,
+                    binary: false,
+                    resolved: false,
+                }],
+                ..GitWorktreeOperationDetail::default()
+            },
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+
+        let prompt = worktree_assistance_prompt(&operation);
+        assert!(prompt.len() <= 64 * 1024);
+        assert!(prompt.contains("feature/lifecycle"));
+        assert!(prompt.contains("src/lib.rs [both_modified]"));
+        assert!(prompt.contains(&"b".repeat(40)));
+        assert!(prompt.contains("Do not run git merge --continue"));
+        assert!(prompt.contains("The user owns staging review and final continue/abort"));
+    }
+
+    #[test]
+    fn worktree_assistance_uses_its_own_task_and_the_typed_session_binding() {
+        let source = include_str!("app.rs");
+        let assistance = source
+            .split_once("    pub(crate) fn assist_worktree_merge(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn activate_and_toggle_project("))
+            .map(|(body, _)| body)
+            .unwrap();
+        assert!(assistance.contains("worktree_assistance_task"));
+        assert!(assistance.contains("git_worktree_bind_assistance_session"));
+        assert!(assistance.contains("worktree-assistance-context:"));
+        assert!(!assistance.contains("self.agent_action_pending = true"));
+    }
 
     fn indexed_timeline_item(
         session_id: &VibexSessionId,
@@ -29632,7 +30120,9 @@ mod tests {
         assert!(!select_session.contains("new_session_input"));
         let overview = source
             .split_once("    fn load_agent_overview(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn refresh_workspace_contexts("))
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    pub(crate) fn refresh_workspace_contexts(")
+            })
             .map(|(body, _)| body)
             .expect("agent overview should remain inspectable");
         assert!(!overview.contains("this.new_session_draft_initialized = sessions_empty;"));
@@ -29643,7 +30133,9 @@ mod tests {
         let source = include_str!("app.rs");
         let overview = source
             .split_once("    fn load_agent_overview(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn refresh_workspace_contexts("))
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    pub(crate) fn refresh_workspace_contexts(")
+            })
             .map(|(body, _)| body)
             .expect("agent overview should remain inspectable");
         assert!(overview.contains("sessions_empty && !this.new_session_draft_initialized"));

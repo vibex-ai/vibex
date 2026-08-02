@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -25,6 +26,7 @@ use gpui_component::{
     v_flex,
 };
 use sha2::{Digest as _, Sha256};
+use vibex_backend::{BackendError, BackendFacade, BackendOperation, MutationRequest};
 use vibex_content::{
     ContentSurfaceKind, ContentSurfaceLifecycle, ContentSurfaceOrigin, LogicalSurfaceBounds,
 };
@@ -32,9 +34,15 @@ use vibex_core::{
     FileEncoding, FileEntryKind, FileLineEnding, FileMutationRequest, FilePreviewKind,
     FileReadRequest, FileReadResponse, FileTreeEntry, FileTreeRequest, FileWriteRequest, GitChange,
     GitChangeKind, GitCommitDetailRequest, GitCommitRequest, GitDiffRequest, GitDiffResponse,
-    GitHistoryRequest, GitRemoteActionKind, GitRemoteActionRequest, GitStageRequest,
-    GitStatusSummary, RequestId, TerminalId, TerminalSession, TerminalStatus, VibexError,
-    VibexResult, WorkspaceId, unix_timestamp_ms,
+    GitHistoryRequest, GitManagedWorktreeStatus, GitRemoteActionKind, GitRemoteActionRequest,
+    GitStageRequest, GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeConflictFile,
+    GitWorktreeConflictKind, GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest,
+    GitWorktreeConflictVersion, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
+    GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
+    GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeOperationStatus,
+    GitWorktreeReadinessRequest, GitWorktreeReadinessState, GitWorktreeRestoreRequest,
+    GitWorktreeRisk, GitWorktreeRiskKind, RequestId, TerminalId, TerminalSession, TerminalStatus,
+    VibexError, VibexResult, WorkspaceId, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     BoundedImageCache, ContentPreviewKind, EditorBufferAvailability, EditorBufferRegistry,
@@ -43,8 +51,9 @@ use vibex_desktop_model::{
     GitPathSelectionState, GitQueryKind, GitSelectionKey, GitTreeRow, GitTreeRowKind,
     GitWorkbenchMode, GitWorkbenchState, ImageCacheKey, PendingFileMutation,
     PreviewCloseDisposition, PreviewPane, PreviewSplitNode, PreviewSplitPosition, PreviewState,
-    PreviewTab, PreviewTarget, UnifiedDiffLineKind, content_preview_kind,
-    content_preview_kind_for_path, file_icon_descriptor, mutation_scope,
+    PreviewTab, PreviewTarget, UnifiedDiffLineKind, WorktreeLifecycleDisplayState,
+    WorktreeLifecycleView, content_preview_kind, content_preview_kind_for_path,
+    file_icon_descriptor, mutation_scope,
 };
 use vibex_desktop_runtime::{DesktopRuntime, GitHandle, validate_external_open_url};
 use vibex_markdown::{
@@ -86,6 +95,7 @@ const IMAGE_SOURCE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const MARKDOWN_LOCAL_IMAGE_LIMIT: usize = 32;
 const MARKDOWN_LOCAL_IMAGE_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 const GIT_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const WORKTREE_CONFLICT_RENDER_LIMIT: usize = 256;
 pub const CODE_WORKBENCH_MAX_EAGER_ROWS: usize = 5_000;
 pub const CODE_WORKBENCH_INITIAL_DIFF_ROWS: usize = 500;
 
@@ -307,9 +317,29 @@ enum GitTreeInteraction {
     Commit { hash: String, subject: String },
 }
 
+#[derive(Clone)]
+enum WorktreeLifecycleConfirmation {
+    Merge(GitWorktreeMergePlan),
+    Archive {
+        request: GitWorktreeArchiveRequest,
+        preflight: GitWorktreeDestructivePreflight,
+    },
+    Restore {
+        request: GitWorktreeRestoreRequest,
+        preflight: GitWorktreeDestructivePreflight,
+    },
+    Discard {
+        request: GitWorktreeDiscardRequest,
+        preflight: GitWorktreeDestructivePreflight,
+    },
+    Continue(GitWorktreeOperationRequest),
+    Abort(GitWorktreeOperationRequest),
+}
+
 pub struct CodeWorkbench {
     parent: Option<WeakEntity<VibexWorkbench>>,
     runtime: Option<Arc<DesktopRuntime>>,
+    backend: Option<BackendFacade>,
     workspace: Option<WorkbenchWorkspace>,
     pending_workspace: Option<PendingWorkspace>,
     workspace_generation: u64,
@@ -352,10 +382,17 @@ pub struct CodeWorkbench {
     status_task: Option<Task<()>>,
     history_task: Option<Task<()>>,
     branch_task: Option<Task<()>>,
+    lifecycle_task: Option<Task<()>>,
+    lifecycle_action_task: Option<Task<()>>,
     file_tasks: BTreeMap<String, Task<()>>,
     diff_tasks: BTreeMap<GitSelectionKey, Task<()>>,
     commit_detail_tasks: BTreeMap<String, Task<()>>,
     mutation_task: Option<Task<()>>,
+    lifecycle_snapshot: Option<GitWorktreeLifecycleSnapshot>,
+    lifecycle_confirmation: Option<WorktreeLifecycleConfirmation>,
+    lifecycle_loading: bool,
+    lifecycle_reload_requested: bool,
+    lifecycle_action_pending: bool,
     file_scroll: UniformListScrollHandle,
     git_scroll: UniformListScrollHandle,
     preview_diff_lists: BTreeMap<String, PatchListState>,
@@ -429,6 +466,7 @@ impl CodeWorkbench {
         Self {
             parent,
             runtime: None,
+            backend: None,
             workspace: None,
             pending_workspace: None,
             workspace_generation: 0,
@@ -471,10 +509,17 @@ impl CodeWorkbench {
             status_task: None,
             history_task: None,
             branch_task: None,
+            lifecycle_task: None,
+            lifecycle_action_task: None,
             file_tasks: BTreeMap::new(),
             diff_tasks: BTreeMap::new(),
             commit_detail_tasks: BTreeMap::new(),
             mutation_task: None,
+            lifecycle_snapshot: None,
+            lifecycle_confirmation: None,
+            lifecycle_loading: false,
+            lifecycle_reload_requested: false,
+            lifecycle_action_pending: false,
             file_scroll: UniformListScrollHandle::new(),
             git_scroll: UniformListScrollHandle::new(),
             preview_diff_lists: BTreeMap::new(),
@@ -818,6 +863,24 @@ impl CodeWorkbench {
         self.apply_workspace(runtime, workspace_id, root, cx);
     }
 
+    pub(crate) fn set_backend(&mut self, backend: BackendFacade, cx: &mut Context<Self>) {
+        self.backend = Some(backend);
+        if self.workspace.is_some() {
+            self.load_worktree_lifecycle(cx);
+        }
+    }
+
+    pub(crate) fn clear_backend(&mut self, cx: &mut Context<Self>) {
+        self.backend = None;
+        self.lifecycle_task = None;
+        self.lifecycle_action_task = None;
+        self.lifecycle_loading = false;
+        self.lifecycle_reload_requested = false;
+        self.lifecycle_action_pending = false;
+        self.lifecycle_confirmation = None;
+        cx.notify();
+    }
+
     pub(crate) fn discard_and_apply_pending_workspace(&mut self, cx: &mut Context<Self>) {
         let Some(pending) = self.pending_workspace.take() else {
             return;
@@ -880,6 +943,13 @@ impl CodeWorkbench {
         self.tree_refresh_task = None;
         self.workspace_poll_task = None;
         self.git_status_poll_task = None;
+        self.lifecycle_task = None;
+        self.lifecycle_action_task = None;
+        self.lifecycle_snapshot = None;
+        self.lifecycle_confirmation = None;
+        self.lifecycle_loading = false;
+        self.lifecycle_reload_requested = false;
+        self.lifecycle_action_pending = false;
         self.diff_tasks.clear();
         self.commit_detail_tasks.clear();
         self.file_tree.reset_workspace(workspace_id.clone());
@@ -1180,6 +1250,7 @@ impl CodeWorkbench {
                         }
                         if !this.status_loading && !this.file_mutation_pending {
                             this.load_git_status(cx);
+                            this.load_worktree_lifecycle(cx);
                         }
                         true
                     })
@@ -1390,6 +1461,7 @@ impl CodeWorkbench {
 
     pub(crate) fn refresh_git(&mut self, cx: &mut Context<Self>) {
         self.load_git_status(cx);
+        self.load_worktree_lifecycle(cx);
         self.load_branches(cx);
         if self.git.mode == GitWorkbenchMode::History {
             self.load_history(false, cx);
@@ -1433,6 +1505,637 @@ impl CodeWorkbench {
                 cx.notify();
             });
         }));
+    }
+
+    fn worktree_lifecycle_view(&self) -> Option<WorktreeLifecycleView> {
+        let workspace = self.workspace.as_ref()?;
+        WorktreeLifecycleView::from_snapshot(&workspace.id, self.lifecycle_snapshot.as_ref()?)
+    }
+
+    fn apply_worktree_lifecycle_snapshot(&mut self, snapshot: GitWorktreeLifecycleSnapshot) {
+        let Some(workspace) = self.workspace.as_ref() else {
+            return;
+        };
+        if snapshot.workspace_id != workspace.id {
+            return;
+        }
+        let conflict_paths = WorktreeLifecycleView::from_snapshot(&workspace.id, &snapshot)
+            .filter(|view| view.target_owned)
+            .and_then(|view| view.operation)
+            .filter(|operation| {
+                matches!(
+                    operation.status,
+                    GitWorktreeOperationStatus::NeedsResolution
+                        | GitWorktreeOperationStatus::NeedsAttention
+                )
+            })
+            .map(|operation| {
+                operation
+                    .detail
+                    .conflicts
+                    .into_iter()
+                    .filter(|conflict| !conflict.resolved)
+                    .map(|conflict| conflict.path)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.git.set_lifecycle_conflict_paths(conflict_paths);
+        self.lifecycle_snapshot = Some(snapshot);
+    }
+
+    fn load_worktree_lifecycle(&mut self, cx: &mut Context<Self>) {
+        if self.lifecycle_loading {
+            self.lifecycle_reload_requested = true;
+            return;
+        }
+        let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
+        else {
+            return;
+        };
+        if !backend
+            .capabilities()
+            .git
+            .supports(BackendOperation::GitWorktreeRead)
+        {
+            self.lifecycle_snapshot = None;
+            self.git.set_lifecycle_conflict_paths(Vec::new());
+            return;
+        }
+        self.lifecycle_loading = true;
+        let workspace_id = workspace.id.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend.git().git_worktree_snapshot(workspace_id).await
+        });
+        self.lifecycle_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                if this.workspace.as_ref().map(|current| current.generation)
+                    != Some(workspace.generation)
+                {
+                    return;
+                }
+                this.lifecycle_loading = false;
+                let reload = std::mem::take(&mut this.lifecycle_reload_requested);
+                match outcome {
+                    Ok(Ok(snapshot)) => this.apply_worktree_lifecycle_snapshot(snapshot),
+                    Ok(Err(error)) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("Worktree lifecycle task failed: {error}"));
+                    }
+                }
+                if reload {
+                    this.load_worktree_lifecycle(cx);
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn lifecycle_mutation_backend(&mut self) -> Option<BackendFacade> {
+        let backend = self.backend.clone()?;
+        if !backend
+            .capabilities()
+            .git
+            .supports(BackendOperation::GitWorktreeLifecycleMutate)
+        {
+            self.error = Some("worktree_lifecycle_mutation_unsupported".to_string());
+            return None;
+        }
+        Some(backend)
+    }
+
+    fn request_parent_lifecycle_refresh(&self, cx: &mut Context<Self>) {
+        let Some(parent) = self.parent.clone() else {
+            return;
+        };
+        cx.defer(move |cx| {
+            let _ = parent.update(cx, |parent, cx| parent.refresh_workspace_contexts(cx));
+        });
+    }
+
+    fn request_operation_target_focus(
+        &self,
+        operation: &GitWorktreeOperationRecord,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(
+            operation.status,
+            GitWorktreeOperationStatus::NeedsResolution
+                | GitWorktreeOperationStatus::NeedsAttention
+        ) {
+            return;
+        }
+        let (Some(parent), Some(target_workspace_id)) =
+            (self.parent.clone(), operation.target_workspace_id.clone())
+        else {
+            return;
+        };
+        cx.defer(move |cx| {
+            let _ = parent.update(cx, |parent, cx| {
+                parent.focus_worktree_operation_target(target_workspace_id.clone(), cx)
+            });
+        });
+    }
+
+    fn run_worktree_operation<F, Fut>(
+        &mut self,
+        operation: F,
+        retry_confirmation: Option<WorktreeLifecycleConfirmation>,
+        cx: &mut Context<Self>,
+    ) where
+        F: FnOnce(BackendFacade) -> Fut + 'static,
+        Fut: Future<Output = Result<GitWorktreeOperationRecord, BackendError>> + Send + 'static,
+    {
+        if self.lifecycle_action_pending {
+            self.error = Some("Another Worktree lifecycle action is already running".to_string());
+            cx.notify();
+            return;
+        }
+        let Some(backend) = self.lifecycle_mutation_backend() else {
+            cx.notify();
+            return;
+        };
+        self.lifecycle_action_pending = true;
+        self.lifecycle_confirmation = None;
+        self.error = None;
+        self.note = Some("Worktree lifecycle action is running".to_string());
+        let runner = gpui_tokio::Tokio::spawn(cx, operation(backend));
+        self.lifecycle_action_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                this.lifecycle_action_pending = false;
+                match outcome {
+                    Ok(Ok(operation)) => {
+                        this.note = Some("Worktree lifecycle action completed".to_string());
+                        this.request_operation_target_focus(&operation, cx);
+                        this.load_git_status(cx);
+                        this.load_worktree_lifecycle(cx);
+                        this.request_parent_lifecycle_refresh(cx);
+                    }
+                    Ok(Err(error)) => {
+                        this.lifecycle_confirmation =
+                            if worktree_plan_error_requires_refresh(&error.code) {
+                                None
+                            } else {
+                                retry_confirmation.clone()
+                            };
+                        this.note = None;
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        this.load_worktree_lifecycle(cx);
+                    }
+                    Err(error) => {
+                        this.lifecycle_confirmation = retry_confirmation.clone();
+                        this.note = None;
+                        this.error = Some(format!("Worktree lifecycle task failed: {error}"));
+                        this.load_worktree_lifecycle(cx);
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn run_lifecycle_confirmation_query<T, F, Fut, Build>(
+        &mut self,
+        operation: F,
+        build: Build,
+        cx: &mut Context<Self>,
+    ) where
+        T: Send + 'static,
+        F: FnOnce(BackendFacade) -> Fut + 'static,
+        Fut: Future<Output = Result<T, BackendError>> + Send + 'static,
+        Build: FnOnce(T) -> WorktreeLifecycleConfirmation + 'static,
+    {
+        if self.lifecycle_action_pending {
+            return;
+        }
+        let Some(backend) = self.lifecycle_mutation_backend() else {
+            cx.notify();
+            return;
+        };
+        self.lifecycle_action_pending = true;
+        self.lifecycle_confirmation = None;
+        self.error = None;
+        let runner = gpui_tokio::Tokio::spawn(cx, operation(backend));
+        self.lifecycle_action_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                this.lifecycle_action_pending = false;
+                match outcome {
+                    Ok(Ok(value)) => {
+                        this.lifecycle_confirmation = Some(build(value));
+                    }
+                    Ok(Err(error)) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("Worktree lifecycle task failed: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    pub(crate) fn set_worktree_readiness(
+        &mut self,
+        state: GitWorktreeReadinessState,
+        cx: &mut Context<Self>,
+    ) {
+        if self.lifecycle_action_pending {
+            return;
+        }
+        let Some(view) = self.worktree_lifecycle_view() else {
+            return;
+        };
+        let Some(backend) = self.lifecycle_mutation_backend() else {
+            cx.notify();
+            return;
+        };
+        let expected = (state == GitWorktreeReadinessState::ReadyToMerge)
+            .then_some(view.readiness)
+            .flatten();
+        let request = GitWorktreeReadinessRequest {
+            workspace_id: view.workspace_id,
+            state,
+            expected_source_head: expected
+                .as_ref()
+                .map(|readiness| readiness.source_head.clone()),
+            expected_dirty_fingerprint: expected
+                .as_ref()
+                .map(|readiness| readiness.dirty_fingerprint.clone()),
+            checks: expected
+                .map(|readiness| readiness.checks)
+                .unwrap_or_default(),
+        };
+        self.lifecycle_action_pending = true;
+        self.error = None;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .git()
+                .git_worktree_set_readiness(MutationRequest::new(request))
+                .await
+        });
+        self.lifecycle_action_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                this.lifecycle_action_pending = false;
+                match outcome {
+                    Ok(Ok(_)) => {
+                        this.note = Some("Worktree readiness updated".to_string());
+                        this.load_worktree_lifecycle(cx);
+                        this.request_parent_lifecycle_refresh(cx);
+                    }
+                    Ok(Err(error)) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("Worktree readiness task failed: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    pub(crate) fn request_worktree_merge_confirmation(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.worktree_lifecycle_view() else {
+            return;
+        };
+        let Some(managed) = view.managed else {
+            return;
+        };
+        let request = GitWorktreeMergeRequest {
+            workspace_id: view.workspace_id,
+            source_path: managed.worktree_path,
+            target_workspace_id: managed.target_workspace_id,
+            expected_source_head: None,
+            expected_target_head: None,
+            preflight_revision: None,
+        };
+        self.run_lifecycle_confirmation_query(
+            move |backend| async move { backend.git().git_worktree_merge_plan(request).await },
+            WorktreeLifecycleConfirmation::Merge,
+            cx,
+        );
+    }
+
+    pub(crate) fn request_worktree_archive_confirmation(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.worktree_lifecycle_view() else {
+            return;
+        };
+        let Some(managed) = view.managed else {
+            return;
+        };
+        let request = GitWorktreeArchiveRequest {
+            workspace_id: view.workspace_id,
+            worktree_path: managed.worktree_path,
+            expected_head: None,
+            preflight_revision: None,
+        };
+        let request_for_query = request.clone();
+        self.run_lifecycle_confirmation_query(
+            move |backend| async move {
+                backend
+                    .git()
+                    .git_worktree_archive_preflight(request_for_query)
+                    .await
+            },
+            move |preflight| {
+                let mut request = request;
+                request.expected_head = preflight.source_head.clone();
+                request.preflight_revision = Some(preflight.revision.clone());
+                WorktreeLifecycleConfirmation::Archive { request, preflight }
+            },
+            cx,
+        );
+    }
+
+    pub(crate) fn request_worktree_restore_confirmation(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.worktree_lifecycle_view() else {
+            return;
+        };
+        let Some(managed) = view.managed else {
+            return;
+        };
+        let request = GitWorktreeRestoreRequest {
+            workspace_id: view.workspace_id,
+            worktree_id: managed.worktree_id,
+            preflight_revision: None,
+        };
+        let request_for_query = request.clone();
+        self.run_lifecycle_confirmation_query(
+            move |backend| async move {
+                backend
+                    .git()
+                    .git_worktree_restore_preflight(request_for_query)
+                    .await
+            },
+            move |preflight| {
+                let mut request = request;
+                request.preflight_revision = Some(preflight.revision.clone());
+                WorktreeLifecycleConfirmation::Restore { request, preflight }
+            },
+            cx,
+        );
+    }
+
+    pub(crate) fn request_worktree_discard_confirmation(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.worktree_lifecycle_view() else {
+            return;
+        };
+        let Some(managed) = view.managed else {
+            return;
+        };
+        let force = self.git.status.as_ref().is_some_and(|status| status.dirty);
+        let request = GitWorktreeDiscardRequest {
+            workspace_id: view.workspace_id,
+            worktree_path: managed.worktree_path,
+            force,
+            expected_head: None,
+            preflight_revision: None,
+        };
+        let request_for_query = request.clone();
+        self.run_lifecycle_confirmation_query(
+            move |backend| async move {
+                backend
+                    .git()
+                    .git_worktree_discard_preflight(request_for_query)
+                    .await
+            },
+            move |preflight| {
+                let mut request = request;
+                request.expected_head = preflight.source_head.clone();
+                request.preflight_revision = Some(preflight.revision.clone());
+                WorktreeLifecycleConfirmation::Discard { request, preflight }
+            },
+            cx,
+        );
+    }
+
+    pub(crate) fn request_worktree_abort_confirmation(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.worktree_lifecycle_view() else {
+            return;
+        };
+        let Some(operation) = view.operation else {
+            return;
+        };
+        self.lifecycle_confirmation = Some(WorktreeLifecycleConfirmation::Abort(
+            GitWorktreeOperationRequest {
+                operation_id: operation.operation_id,
+                workspace_id: view.workspace_id,
+            },
+        ));
+        cx.notify();
+    }
+
+    pub(crate) fn request_worktree_continue_confirmation(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.worktree_lifecycle_view() else {
+            return;
+        };
+        let Some(operation) = view.operation else {
+            return;
+        };
+        self.lifecycle_confirmation = Some(WorktreeLifecycleConfirmation::Continue(
+            GitWorktreeOperationRequest {
+                operation_id: operation.operation_id,
+                workspace_id: view.workspace_id,
+            },
+        ));
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_worktree_lifecycle_confirmation(&mut self, cx: &mut Context<Self>) {
+        self.lifecycle_confirmation = None;
+        cx.notify();
+    }
+
+    pub(crate) fn confirm_worktree_lifecycle_action(&mut self, cx: &mut Context<Self>) {
+        let Some(confirmation) = self.lifecycle_confirmation.take() else {
+            return;
+        };
+        match confirmation.clone() {
+            WorktreeLifecycleConfirmation::Merge(plan) => {
+                if !plan.preflight.allowed {
+                    self.lifecycle_confirmation = Some(confirmation);
+                    self.error = Some("worktree_preflight_blocked".to_string());
+                    cx.notify();
+                    return;
+                }
+                let request = GitWorktreeMergeRequest {
+                    workspace_id: plan.source_workspace_id,
+                    source_path: plan.source_path,
+                    target_workspace_id: Some(plan.target_workspace_id),
+                    expected_source_head: Some(plan.source_head),
+                    expected_target_head: Some(plan.target_head),
+                    preflight_revision: Some(plan.preflight.revision),
+                };
+                self.run_worktree_operation(
+                    move |backend| async move {
+                        backend
+                            .git()
+                            .git_worktree_merge(MutationRequest::new(request))
+                            .await
+                    },
+                    Some(confirmation),
+                    cx,
+                );
+            }
+            WorktreeLifecycleConfirmation::Archive { request, preflight } => {
+                if !preflight.allowed {
+                    self.lifecycle_confirmation = Some(confirmation);
+                    self.error = Some("worktree_preflight_blocked".to_string());
+                    cx.notify();
+                    return;
+                }
+                self.run_worktree_operation(
+                    move |backend| async move {
+                        backend
+                            .git()
+                            .git_worktree_archive(MutationRequest::new(request))
+                            .await
+                    },
+                    Some(confirmation),
+                    cx,
+                );
+            }
+            WorktreeLifecycleConfirmation::Restore { request, preflight } => {
+                if !preflight.allowed {
+                    self.lifecycle_confirmation = Some(confirmation);
+                    self.error = Some("worktree_preflight_blocked".to_string());
+                    cx.notify();
+                    return;
+                }
+                self.run_worktree_operation(
+                    move |backend| async move {
+                        backend
+                            .git()
+                            .git_worktree_restore(MutationRequest::new(request))
+                            .await
+                    },
+                    Some(confirmation),
+                    cx,
+                );
+            }
+            WorktreeLifecycleConfirmation::Discard { request, preflight } => {
+                if !preflight.allowed {
+                    self.lifecycle_confirmation = Some(confirmation);
+                    self.error = Some("worktree_preflight_blocked".to_string());
+                    cx.notify();
+                    return;
+                }
+                self.run_worktree_operation(
+                    move |backend| async move {
+                        backend
+                            .git()
+                            .git_worktree_discard(MutationRequest::new(request))
+                            .await
+                    },
+                    Some(confirmation),
+                    cx,
+                );
+            }
+            WorktreeLifecycleConfirmation::Continue(request) => {
+                self.run_worktree_operation(
+                    move |backend| async move {
+                        backend
+                            .git()
+                            .git_worktree_continue_merge(MutationRequest::new(request))
+                            .await
+                    },
+                    Some(confirmation),
+                    cx,
+                );
+            }
+            WorktreeLifecycleConfirmation::Abort(request) => {
+                self.run_worktree_operation(
+                    move |backend| async move {
+                        backend
+                            .git()
+                            .git_worktree_abort_merge(MutationRequest::new(request))
+                            .await
+                    },
+                    Some(confirmation),
+                    cx,
+                );
+            }
+        }
+    }
+
+    pub(crate) fn resolve_worktree_conflict(
+        &mut self,
+        path: String,
+        version: GitWorktreeConflictVersion,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.worktree_lifecycle_view() else {
+            return;
+        };
+        let Some(operation) = view.operation else {
+            return;
+        };
+        let request = GitWorktreeConflictResolveRequest {
+            operation_id: operation.operation_id,
+            workspace_id: view.workspace_id,
+            path,
+            version,
+        };
+        self.run_worktree_operation(
+            move |backend| async move {
+                backend
+                    .git()
+                    .git_worktree_resolve_conflict(MutationRequest::new(request))
+                    .await
+            },
+            None,
+            cx,
+        );
+    }
+
+    pub(crate) fn stage_worktree_conflict(&mut self, path: String, cx: &mut Context<Self>) {
+        let Some(view) = self.worktree_lifecycle_view() else {
+            return;
+        };
+        let Some(operation) = view.operation else {
+            return;
+        };
+        let request = GitWorktreeConflictStageRequest {
+            operation_id: operation.operation_id,
+            workspace_id: view.workspace_id,
+            paths: vec![path],
+        };
+        self.run_worktree_operation(
+            move |backend| async move {
+                backend
+                    .git()
+                    .git_worktree_stage_conflicts(MutationRequest::new(request))
+                    .await
+            },
+            None,
+            cx,
+        );
+    }
+
+    pub(crate) fn request_worktree_agent_assistance(&self, cx: &mut Context<Self>) {
+        let Some(view) = self.worktree_lifecycle_view() else {
+            return;
+        };
+        let Some(operation) = view.operation else {
+            return;
+        };
+        let Some(parent) = self.parent.clone() else {
+            return;
+        };
+        cx.defer(move |cx| {
+            let _ = parent.update(cx, |parent, cx| {
+                parent.assist_worktree_merge(operation.clone(), cx)
+            });
+        });
     }
 
     pub(crate) fn set_git_mode(&mut self, mode: GitWorkbenchMode, cx: &mut Context<Self>) {
@@ -6890,6 +7593,679 @@ impl CodeRightRail {
             .into_any_element()
     }
 
+    fn render_worktree_lifecycle(
+        &mut self,
+        view: WorktreeLifecycleView,
+        confirmation: Option<WorktreeLifecycleConfirmation>,
+        loading: bool,
+        pending: bool,
+        mutations_available: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let dirty = self
+            .workbench
+            .read(cx)
+            .git
+            .status
+            .as_ref()
+            .is_some_and(|status| status.dirty);
+        let mut surface = v_flex()
+            .w_full()
+            .flex_none()
+            .border_b_1()
+            .border_color(cx.theme().border.opacity(0.75));
+
+        if let Some(managed) = view.managed.clone() {
+            let source_branch = managed
+                .branch
+                .as_deref()
+                .unwrap_or_else(|| locale::text("Unknown branch", "未知分支", "未知分支"))
+                .to_string();
+            let target_branch = managed
+                .target_branch
+                .as_deref()
+                .unwrap_or_else(|| locale::text("Unknown target", "未知目标", "未知目標"))
+                .to_string();
+            let state_label = worktree_lifecycle_state_label(view.state);
+            let state_color = worktree_lifecycle_state_color(view.state, cx);
+            let readiness_action = if mutations_available {
+                match view.state {
+                    WorktreeLifecycleDisplayState::Working => Some(
+                        Button::new("worktree-review-changes")
+                            .small()
+                            .outline()
+                            .label(locale::text("Review changes", "检查改动", "檢查變更"))
+                            .disabled(pending)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.update_workbench(cx, |workbench, cx| {
+                                    workbench.set_worktree_readiness(
+                                        GitWorktreeReadinessState::Reviewing,
+                                        cx,
+                                    )
+                                })
+                            }))
+                            .into_any_element(),
+                    ),
+                    WorktreeLifecycleDisplayState::Reviewing => Some(
+                        Button::new("worktree-mark-ready")
+                            .small()
+                            .primary()
+                            .label(locale::text("Mark ready", "标记可合并", "標記可合併"))
+                            .disabled(pending || dirty)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.update_workbench(cx, |workbench, cx| {
+                                    workbench.set_worktree_readiness(
+                                        GitWorktreeReadinessState::ReadyToMerge,
+                                        cx,
+                                    )
+                                })
+                            }))
+                            .into_any_element(),
+                    ),
+                    WorktreeLifecycleDisplayState::Ready => {
+                        let label = localized_merge_action_label(&target_branch);
+                        Some(
+                            Button::new("worktree-merge-back")
+                                .small()
+                                .primary()
+                                .label(label)
+                                .disabled(pending)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.update_workbench(cx, |workbench, cx| {
+                                        workbench.request_worktree_merge_confirmation(cx)
+                                    })
+                                }))
+                                .into_any_element(),
+                        )
+                    }
+                    WorktreeLifecycleDisplayState::Archived => Some(
+                        Button::new("worktree-restore")
+                            .small()
+                            .primary()
+                            .label(locale::text(
+                                "Restore Worktree",
+                                "恢复 Worktree",
+                                "還原 Worktree",
+                            ))
+                            .disabled(pending)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.update_workbench(cx, |workbench, cx| {
+                                    workbench.request_worktree_restore_confirmation(cx)
+                                })
+                            }))
+                            .into_any_element(),
+                    ),
+                    WorktreeLifecycleDisplayState::Queued
+                    | WorktreeLifecycleDisplayState::Merging
+                    | WorktreeLifecycleDisplayState::NeedsResolution
+                    | WorktreeLifecycleDisplayState::Aborting
+                    | WorktreeLifecycleDisplayState::Archiving
+                    | WorktreeLifecycleDisplayState::Restoring
+                    | WorktreeLifecycleDisplayState::Discarding
+                    | WorktreeLifecycleDisplayState::Discarded
+                    | WorktreeLifecycleDisplayState::Failed
+                    | WorktreeLifecycleDisplayState::NeedsAttention => None,
+                }
+            } else {
+                None
+            };
+            let more_actions = (mutations_available
+                && managed.status == GitManagedWorktreeStatus::Active
+                && !view.target_owned)
+                .then(|| {
+                    let archive_workbench = self.workbench.downgrade();
+                    let discard_workbench = self.workbench.downgrade();
+                    Button::new("worktree-more-actions")
+                        .small()
+                        .ghost()
+                        .compact()
+                        .icon(IconName::ChevronDown)
+                        .tooltip(locale::text(
+                            "More Worktree actions",
+                            "更多 Worktree 操作",
+                            "更多 Worktree 操作",
+                        ))
+                        .disabled(pending)
+                        .dropdown_menu(move |menu, _, _| {
+                            let archive_workbench = archive_workbench.clone();
+                            let discard_workbench = discard_workbench.clone();
+                            menu.item(
+                                PopupMenuItem::new(locale::text(
+                                    "Archive Worktree",
+                                    "归档 Worktree",
+                                    "封存 Worktree",
+                                ))
+                                .on_click(move |_, _, cx| {
+                                    let _ = archive_workbench.update(cx, |workbench, cx| {
+                                        workbench.request_worktree_archive_confirmation(cx)
+                                    });
+                                }),
+                            )
+                            .item(
+                                PopupMenuItem::new(locale::text(
+                                    "Discard Worktree",
+                                    "丢弃 Worktree",
+                                    "捨棄 Worktree",
+                                ))
+                                .on_click(move |_, _, cx| {
+                                    let _ = discard_workbench.update(cx, |workbench, cx| {
+                                        workbench.request_worktree_discard_confirmation(cx)
+                                    });
+                                }),
+                            )
+                        })
+                        .into_any_element()
+                });
+            surface = surface.child(
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_2()
+                    .px_3()
+                    .py_3()
+                    .bg(cx.theme().sidebar.opacity(0.72))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Icon::default()
+                                    .path("icons/vibex/git-branch.svg")
+                                    .size(px(15.0))
+                                    .text_color(state_color),
+                            )
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap(px(2.0))
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(px(12.0))
+                                            .font_semibold()
+                                            .child(format!("{source_branch} -> {target_branch}")),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .flex_wrap()
+                                            .gap_2()
+                                            .text_size(px(10.0))
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(div().text_color(state_color).child(state_label))
+                                            .child(if dirty {
+                                                locale::text(
+                                                    "Uncommitted changes",
+                                                    "有未提交改动",
+                                                    "有未提交變更",
+                                                )
+                                            } else {
+                                                locale::text(
+                                                    "Source committed",
+                                                    "源改动已提交",
+                                                    "來源變更已提交",
+                                                )
+                                            }),
+                                    ),
+                            )
+                            .when(loading || pending, |this| {
+                                this.child(Icon::new(IconName::LoaderCircle).size(px(14.0)))
+                            }),
+                    )
+                    .when(
+                        readiness_action.is_some() || more_actions.is_some(),
+                        |this| {
+                            this.child(
+                                h_flex()
+                                    .w_full()
+                                    .flex_wrap()
+                                    .justify_end()
+                                    .gap_2()
+                                    .children(readiness_action)
+                                    .children(more_actions),
+                            )
+                        },
+                    ),
+            );
+        }
+
+        if view.target_owned
+            && let Some(operation) = view.operation.clone()
+        {
+            let source_branch = operation
+                .branch
+                .as_deref()
+                .unwrap_or_else(|| locale::text("source", "源分支", "來源分支"));
+            let target_branch = operation
+                .detail
+                .target_branch
+                .as_deref()
+                .unwrap_or_else(|| locale::text("target", "目标分支", "目標分支"));
+            let unresolved = operation
+                .detail
+                .conflicts
+                .iter()
+                .filter(|conflict| !conflict.resolved)
+                .count();
+            let needs_resolution = operation.status == GitWorktreeOperationStatus::NeedsResolution;
+            let assistance_enabled = mutations_available && !pending;
+            surface = surface.child(
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_2()
+                    .px_3()
+                    .py_3()
+                    .bg(if needs_resolution {
+                        cx.theme().warning.opacity(0.10)
+                    } else {
+                        cx.theme().danger.opacity(0.10)
+                    })
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .gap_2()
+                            .child(
+                                Icon::default()
+                                    .path("icons/vibex/shield-alert.svg")
+                                    .size(px(15.0))
+                                    .text_color(if needs_resolution {
+                                        cx.theme().warning
+                                    } else {
+                                        cx.theme().danger
+                                    }),
+                            )
+                            .child(
+                                v_flex()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .gap(px(2.0))
+                                    .child(
+                                        div().min_w_0().whitespace_normal().font_semibold().child(
+                                            if needs_resolution {
+                                                localized_conflict_title(
+                                                    source_branch,
+                                                    target_branch,
+                                                )
+                                            } else {
+                                                localized_attention_title(
+                                                    source_branch,
+                                                    target_branch,
+                                                )
+                                            },
+                                        ),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.0))
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(localized_conflict_count(unresolved)),
+                                    ),
+                            ),
+                    )
+                    .when(operation.detail.source_commits_after_start > 0, |this| {
+                        this.child(
+                            div()
+                                .whitespace_normal()
+                                .text_size(px(10.0))
+                                .text_color(cx.theme().warning)
+                                .child(localized_source_delta(
+                                    operation.detail.source_commits_after_start,
+                                )),
+                        )
+                    })
+                    .when_some(operation.detail.diagnostic.clone(), |this, diagnostic| {
+                        this.child(
+                            div()
+                                .whitespace_normal()
+                                .text_size(px(10.0))
+                                .text_color(cx.theme().muted_foreground)
+                                .child(locale::localize_ui_message(&diagnostic.summary)),
+                        )
+                    })
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(
+                                Button::new("worktree-agent-assistance")
+                                    .small()
+                                    .outline()
+                                    .icon(IconName::Bot)
+                                    .label(locale::text(
+                                        "Ask Agent",
+                                        "让 Agent 协助",
+                                        "讓 Agent 協助",
+                                    ))
+                                    .disabled(!assistance_enabled)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.update_workbench(cx, |workbench, cx| {
+                                            workbench.request_worktree_agent_assistance(cx)
+                                        })
+                                    })),
+                            )
+                            .child(
+                                Button::new("worktree-open-terminal")
+                                    .small()
+                                    .outline()
+                                    .label(locale::text("Open terminal", "打开终端", "開啟終端機"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_workspace_integrated_terminal(window, cx)
+                                    })),
+                            )
+                            .when(needs_resolution && mutations_available, |this| {
+                                this.child(
+                                    Button::new("worktree-abort-merge")
+                                        .small()
+                                        .danger()
+                                        .label(locale::text("Abort merge", "中止合并", "中止合併"))
+                                        .disabled(pending)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.update_workbench(cx, |workbench, cx| {
+                                                workbench.request_worktree_abort_confirmation(cx)
+                                            })
+                                        })),
+                                )
+                                .child(
+                                    Button::new("worktree-complete-merge")
+                                        .small()
+                                        .primary()
+                                        .label(locale::text(
+                                            "Complete merge",
+                                            "完成合并",
+                                            "完成合併",
+                                        ))
+                                        .disabled(pending || unresolved > 0)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.update_workbench(cx, |workbench, cx| {
+                                                workbench.request_worktree_continue_confirmation(cx)
+                                            })
+                                        })),
+                                )
+                            }),
+                    ),
+            );
+        }
+
+        if let Some(confirmation) = confirmation {
+            surface = surface.child(self.render_worktree_confirmation(confirmation, pending, cx));
+        }
+        surface.into_any_element()
+    }
+
+    fn render_worktree_confirmation(
+        &mut self,
+        confirmation: WorktreeLifecycleConfirmation,
+        pending: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (title, summary, action_label, allowed, dangerous, risks) =
+            worktree_confirmation_copy(&confirmation);
+        let confirm_button = Button::new("confirm-worktree-lifecycle-action")
+            .small()
+            .label(action_label)
+            .disabled(pending || !allowed);
+        let confirm_button = if dangerous {
+            confirm_button.danger()
+        } else {
+            confirm_button.primary()
+        };
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_2()
+            .border_t_1()
+            .border_color(cx.theme().border.opacity(0.65))
+            .px_3()
+            .py_3()
+            .bg(cx.theme().background.opacity(0.94))
+            .child(div().font_semibold().text_size(px(12.0)).child(title))
+            .child(
+                div()
+                    .min_w_0()
+                    .whitespace_normal()
+                    .text_size(px(10.0))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(summary),
+            )
+            .children(risks.into_iter().map(|risk| {
+                div()
+                    .min_w_0()
+                    .whitespace_normal()
+                    .text_size(px(10.0))
+                    .text_color(if risk.blocking {
+                        cx.theme().danger
+                    } else {
+                        cx.theme().warning
+                    })
+                    .child(format!(
+                        "{}: {}",
+                        worktree_risk_label(risk.kind),
+                        risk.summary
+                    ))
+            }))
+            .child(
+                h_flex()
+                    .w_full()
+                    .flex_wrap()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("cancel-worktree-lifecycle-action")
+                            .small()
+                            .outline()
+                            .label(locale::text("Cancel", "取消", "取消"))
+                            .disabled(pending)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.update_workbench(cx, |workbench, cx| {
+                                    workbench.cancel_worktree_lifecycle_confirmation(cx)
+                                })
+                            })),
+                    )
+                    .child(confirm_button.on_click(cx.listener(|this, _, _, cx| {
+                        this.update_workbench(cx, |workbench, cx| {
+                            workbench.confirm_worktree_lifecycle_action(cx)
+                        })
+                    }))),
+            )
+            .into_any_element()
+    }
+
+    fn render_worktree_conflicts(
+        &mut self,
+        conflicts: Vec<GitWorktreeConflictFile>,
+        source_branch: String,
+        target_branch: String,
+        pending: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let total = conflicts.len();
+        let rows = conflicts
+            .into_iter()
+            .take(WORKTREE_CONFLICT_RENDER_LIMIT)
+            .map(|conflict| {
+                self.render_worktree_conflict_row(
+                    conflict,
+                    &source_branch,
+                    &target_branch,
+                    pending,
+                    cx,
+                )
+            })
+            .collect::<Vec<_>>();
+        v_flex()
+            .w_full()
+            .flex_none()
+            .border_b_1()
+            .border_color(cx.theme().border.opacity(0.70))
+            .child(
+                h_flex()
+                    .h(px(34.0))
+                    .px_3()
+                    .gap_2()
+                    .bg(cx.theme().warning.opacity(0.08))
+                    .child(
+                        Icon::default()
+                            .path("icons/vibex/shield-alert.svg")
+                            .size(px(13.0))
+                            .text_color(cx.theme().warning),
+                    )
+                    .child(
+                        div()
+                            .font_semibold()
+                            .text_size(px(11.0))
+                            .child(locale::text("Conflicts", "冲突", "衝突")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(total.to_string()),
+                    ),
+            )
+            .children(rows)
+            .when(total > WORKTREE_CONFLICT_RENDER_LIMIT, |this| {
+                this.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .whitespace_normal()
+                        .text_size(px(10.0))
+                        .text_color(cx.theme().muted_foreground)
+                        .child(localized_conflict_render_limit(
+                            WORKTREE_CONFLICT_RENDER_LIMIT,
+                            total,
+                        )),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_worktree_conflict_row(
+        &mut self,
+        conflict: GitWorktreeConflictFile,
+        source_branch: &str,
+        target_branch: &str,
+        pending: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let path = conflict.path.clone();
+        let open_path = path.clone();
+        let target_path = path.clone();
+        let source_path = path.clone();
+        let stage_path = path.clone();
+        let target_label = localized_use_version_label(target_branch);
+        let source_label = localized_use_version_label(source_branch);
+        v_flex()
+            .id(format!("worktree-conflict-row-{path}"))
+            .w_full()
+            .min_w_0()
+            .gap_2()
+            .border_t_1()
+            .border_color(cx.theme().border.opacity(0.45))
+            .px_3()
+            .py_2()
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_family("monospace")
+                            .font_semibold()
+                            .text_color(cx.theme().warning)
+                            .child("!"),
+                    )
+                    .child(
+                        div()
+                            .id(format!("open-worktree-conflict-{path}"))
+                            .flex_1()
+                            .min_w_0()
+                            .cursor_pointer()
+                            .truncate()
+                            .font_family("monospace")
+                            .text_size(px(11.0))
+                            .child(path.clone())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.update_workbench(cx, |workbench, cx| {
+                                    workbench.open_diff(
+                                        GitSelectionKey {
+                                            path: open_path.clone(),
+                                            staged: false,
+                                        },
+                                        cx,
+                                    )
+                                })
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(10.0))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(worktree_conflict_kind_label(conflict.kind, conflict.binary)),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(
+                        Button::new(format!("use-target-conflict-{path}"))
+                            .small()
+                            .outline()
+                            .label(target_label)
+                            .disabled(pending)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.update_workbench(cx, |workbench, cx| {
+                                    workbench.resolve_worktree_conflict(
+                                        target_path.clone(),
+                                        GitWorktreeConflictVersion::Target,
+                                        cx,
+                                    )
+                                })
+                            })),
+                    )
+                    .child(
+                        Button::new(format!("use-source-conflict-{path}"))
+                            .small()
+                            .outline()
+                            .label(source_label)
+                            .disabled(pending)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.update_workbench(cx, |workbench, cx| {
+                                    workbench.resolve_worktree_conflict(
+                                        source_path.clone(),
+                                        GitWorktreeConflictVersion::Source,
+                                        cx,
+                                    )
+                                })
+                            })),
+                    )
+                    .child(
+                        Button::new(format!("stage-worktree-conflict-{path}"))
+                            .small()
+                            .primary()
+                            .label(locale::text("Mark resolved", "标记已解决", "標記已解決"))
+                            .disabled(pending)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.update_workbench(cx, |workbench, cx| {
+                                    workbench.stage_worktree_conflict(stage_path.clone(), cx)
+                                })
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_git(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let (
             workspace_available,
@@ -6902,6 +8278,11 @@ impl CodeRightRail {
             all_directories_expanded,
             status,
             workspace_name,
+            lifecycle_view,
+            lifecycle_confirmation,
+            lifecycle_loading,
+            lifecycle_action_pending,
+            lifecycle_mutations_available,
         ) = {
             let workbench = self.workbench.read(cx);
             (
@@ -6922,6 +8303,16 @@ impl CodeRightRail {
                     .filter(|name| !name.is_empty())
                     .unwrap_or("Changes")
                     .to_string(),
+                workbench.worktree_lifecycle_view(),
+                workbench.lifecycle_confirmation.clone(),
+                workbench.lifecycle_loading,
+                workbench.lifecycle_action_pending,
+                workbench.backend.as_ref().is_some_and(|backend| {
+                    backend
+                        .capabilities()
+                        .git
+                        .supports(BackendOperation::GitWorktreeLifecycleMutate)
+                }),
             )
         };
         if !workspace_available {
@@ -6938,6 +8329,16 @@ impl CodeRightRail {
 
         let changes_active = mode == GitWorkbenchMode::Changes;
         let history_active = mode == GitWorkbenchMode::History;
+        let lifecycle_fenced = lifecycle_view.as_ref().is_some_and(|view| {
+            view.target_owned
+                && view.operation.as_ref().is_some_and(|operation| {
+                    matches!(
+                        operation.status,
+                        GitWorktreeOperationStatus::NeedsResolution
+                            | GitWorktreeOperationStatus::NeedsAttention
+                    )
+                })
+        });
         let changes = status
             .as_ref()
             .map(|status| status.changes.as_slice())
@@ -7020,6 +8421,18 @@ impl CodeRightRail {
                             })),
                     ),
             )
+            .when(changes_active, |this| {
+                this.when_some(lifecycle_view, |this, view| {
+                    this.child(self.render_worktree_lifecycle(
+                        view,
+                        lifecycle_confirmation,
+                        lifecycle_loading,
+                        lifecycle_action_pending,
+                        lifecycle_mutations_available,
+                        cx,
+                    ))
+                })
+            })
             .child(
                 h_flex()
                     .h(px(48.0))
@@ -7100,7 +8513,12 @@ impl CodeRightRail {
                                     "回滚所选更改",
                                     "回復所選變更",
                                 ))
-                                .disabled(pending || selected_count == 0)
+                                .disabled(
+                                    pending
+                                        || lifecycle_action_pending
+                                        || lifecycle_fenced
+                                        || selected_count == 0,
+                                )
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.confirm_git_action(
                                         locale::text(
@@ -7281,8 +8699,38 @@ impl CodeRightRail {
     }
 
     fn render_git_changes(&mut self, pending: bool, cx: &mut Context<Self>) -> AnyElement {
-        let (change_row_count, commit_message, commit_type, amend, selected_count, scroll_handle) = {
+        let (
+            change_row_count,
+            commit_message,
+            commit_type,
+            amend,
+            selected_count,
+            scroll_handle,
+            conflict_context,
+            lifecycle_pending,
+        ) = {
             let workbench = self.workbench.read(cx);
+            let conflict_context = workbench
+                .worktree_lifecycle_view()
+                .filter(|view| view.target_owned)
+                .and_then(|view| view.operation)
+                .filter(|operation| {
+                    matches!(
+                        operation.status,
+                        GitWorktreeOperationStatus::NeedsResolution
+                            | GitWorktreeOperationStatus::NeedsAttention
+                    )
+                })
+                .map(|operation| {
+                    (
+                        operation.detail.conflicts,
+                        operation.branch.unwrap_or_else(|| "source".to_string()),
+                        operation
+                            .detail
+                            .target_branch
+                            .unwrap_or_else(|| "target".to_string()),
+                    )
+                });
             (
                 workbench.git.change_tree_row_count(),
                 workbench.commit_message.clone(),
@@ -7290,23 +8738,51 @@ impl CodeRightRail {
                 workbench.amend_commit,
                 workbench.git.selected_path_count(),
                 workbench.git_scroll.clone(),
+                conflict_context,
+                workbench.lifecycle_action_pending,
             )
         };
         let type_workbench = self.workbench.downgrade();
         let active_type = commit_type.clone();
         let push_workbench = self.workbench.downgrade();
+        let has_conflicts = conflict_context
+            .as_ref()
+            .is_some_and(|(conflicts, _, _)| !conflicts.is_empty());
+        let lifecycle_fenced = conflict_context.is_some();
+        let action_pending = pending || lifecycle_pending || lifecycle_fenced;
 
         v_flex()
             .flex_1()
             .min_h_0()
+            .when_some(conflict_context, |this, (conflicts, source, target)| {
+                this.child(self.render_worktree_conflicts(
+                    conflicts,
+                    source,
+                    target,
+                    lifecycle_pending,
+                    cx,
+                ))
+            })
             .child(if change_row_count == 0 {
                 rail_empty_card(
-                    locale::text("clean", "干净", "乾淨"),
-                    locale::text(
-                        "No changed files in this workspace.",
-                        "此工作区没有更改的文件。",
-                        "此工作區沒有變更的檔案。",
-                    ),
+                    if has_conflicts {
+                        locale::text("Other changes", "其他更改", "其他變更")
+                    } else {
+                        locale::text("clean", "干净", "乾淨")
+                    },
+                    if has_conflicts {
+                        locale::text(
+                            "No other changed files in this workspace.",
+                            "此工作区没有其他更改的文件。",
+                            "此工作區沒有其他變更的檔案。",
+                        )
+                    } else {
+                        locale::text(
+                            "No changed files in this workspace.",
+                            "此工作区没有更改的文件。",
+                            "此工作區沒有變更的檔案。",
+                        )
+                    },
                     cx,
                 )
             } else {
@@ -7459,7 +8935,7 @@ impl CodeRightRail {
                                     .px_4()
                                     .icon(Icon::default().path("icons/vibex/rotate-ccw.svg"))
                                     .label(locale::text("Rollback", "回滚", "回復"))
-                                    .disabled(pending || selected_count == 0)
+                                    .disabled(action_pending || selected_count == 0)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.confirm_git_action(
                                             locale::text(
@@ -7496,8 +8972,8 @@ impl CodeRightRail {
                                             .h_full()
                                             .px_4()
                                             .label(locale::text("Commit", "提交", "提交"))
-                                            .loading(pending)
-                                            .disabled(pending || selected_count == 0)
+                                            .loading(pending || lifecycle_pending)
+                                            .disabled(action_pending || selected_count == 0)
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 let window_handle = window.window_handle();
                                                 this.update_workbench(cx, |workbench, cx| {
@@ -7521,7 +8997,7 @@ impl CodeRightRail {
                                                 "更多提交操作",
                                                 "更多提交操作",
                                             ))
-                                            .disabled(pending || selected_count == 0)
+                                            .disabled(action_pending || selected_count == 0)
                                             .dropdown_menu(move |menu, _, _| {
                                                 let workbench = push_workbench.clone();
                                                 menu.item(
@@ -10059,6 +11535,320 @@ fn preview_target_references_path(target: &PreviewTarget, path: &str) -> bool {
     }
 }
 
+fn worktree_lifecycle_state_label(state: WorktreeLifecycleDisplayState) -> &'static str {
+    match state {
+        WorktreeLifecycleDisplayState::Working => locale::text("Working", "开发中", "開發中"),
+        WorktreeLifecycleDisplayState::Reviewing => locale::text("Reviewing", "检查中", "檢查中"),
+        WorktreeLifecycleDisplayState::Ready => locale::text("Ready", "可合并", "可合併"),
+        WorktreeLifecycleDisplayState::Queued => locale::text("Queued", "排队中", "排隊中"),
+        WorktreeLifecycleDisplayState::Merging => locale::text("Merging", "合并中", "合併中"),
+        WorktreeLifecycleDisplayState::NeedsResolution => {
+            locale::text("Needs resolution", "等待解决冲突", "等待解決衝突")
+        }
+        WorktreeLifecycleDisplayState::Aborting => locale::text("Aborting", "正在中止", "正在中止"),
+        WorktreeLifecycleDisplayState::Archiving => locale::text("Archiving", "归档中", "封存中"),
+        WorktreeLifecycleDisplayState::Archived => locale::text("Archived", "已归档", "已封存"),
+        WorktreeLifecycleDisplayState::Restoring => locale::text("Restoring", "恢复中", "還原中"),
+        WorktreeLifecycleDisplayState::Discarding => locale::text("Discarding", "丢弃中", "捨棄中"),
+        WorktreeLifecycleDisplayState::Discarded => locale::text("Discarded", "已丢弃", "已捨棄"),
+        WorktreeLifecycleDisplayState::Failed => locale::text("Failed", "失败", "失敗"),
+        WorktreeLifecycleDisplayState::NeedsAttention => {
+            locale::text("Needs attention", "需要处理", "需要處理")
+        }
+    }
+}
+
+fn worktree_lifecycle_state_color(
+    state: WorktreeLifecycleDisplayState,
+    cx: &Context<CodeRightRail>,
+) -> Hsla {
+    match state {
+        WorktreeLifecycleDisplayState::Ready => cx.theme().success,
+        WorktreeLifecycleDisplayState::Reviewing
+        | WorktreeLifecycleDisplayState::Queued
+        | WorktreeLifecycleDisplayState::Archiving
+        | WorktreeLifecycleDisplayState::Restoring
+        | WorktreeLifecycleDisplayState::Discarding => cx.theme().warning,
+        WorktreeLifecycleDisplayState::Merging => cx.theme().primary,
+        WorktreeLifecycleDisplayState::NeedsResolution
+        | WorktreeLifecycleDisplayState::Aborting
+        | WorktreeLifecycleDisplayState::Failed
+        | WorktreeLifecycleDisplayState::NeedsAttention => cx.theme().danger,
+        WorktreeLifecycleDisplayState::Working
+        | WorktreeLifecycleDisplayState::Archived
+        | WorktreeLifecycleDisplayState::Discarded => cx.theme().muted_foreground,
+    }
+}
+
+fn localized_merge_action_label(target: &str) -> String {
+    match locale::current_locale() {
+        locale::ResolvedLocale::En => format!("Merge to {}", bounded_ref_label(target)),
+        locale::ResolvedLocale::ZhCn => format!("合并到 {}", bounded_ref_label(target)),
+        locale::ResolvedLocale::ZhTw => format!("合併到 {}", bounded_ref_label(target)),
+    }
+}
+
+fn localized_conflict_title(source: &str, target: &str) -> String {
+    match locale::current_locale() {
+        locale::ResolvedLocale::En => format!("Merge paused: {source} -> {target}"),
+        locale::ResolvedLocale::ZhCn => format!("合并已暂停：{source} -> {target}"),
+        locale::ResolvedLocale::ZhTw => format!("合併已暫停：{source} -> {target}"),
+    }
+}
+
+fn localized_attention_title(source: &str, target: &str) -> String {
+    match locale::current_locale() {
+        locale::ResolvedLocale::En => format!("Merge needs attention: {source} -> {target}"),
+        locale::ResolvedLocale::ZhCn => format!("合并需要处理：{source} -> {target}"),
+        locale::ResolvedLocale::ZhTw => format!("合併需要處理：{source} -> {target}"),
+    }
+}
+
+fn localized_conflict_count(count: usize) -> String {
+    match locale::current_locale() {
+        locale::ResolvedLocale::En => format!("{count} unresolved conflict(s)"),
+        locale::ResolvedLocale::ZhCn => format!("{count} 个冲突未解决"),
+        locale::ResolvedLocale::ZhTw => format!("{count} 個衝突未解決"),
+    }
+}
+
+fn localized_source_delta(count: u32) -> String {
+    match locale::current_locale() {
+        locale::ResolvedLocale::En => {
+            format!("{count} new source commit(s) are excluded from this merge")
+        }
+        locale::ResolvedLocale::ZhCn => format!("源分支新增 {count} 个提交，不包含在本次合并中"),
+        locale::ResolvedLocale::ZhTw => format!("來源分支新增 {count} 個提交，不包含在本次合併中"),
+    }
+}
+
+fn localized_conflict_render_limit(limit: usize, total: usize) -> String {
+    match locale::current_locale() {
+        locale::ResolvedLocale::En => {
+            format!("Showing the first {limit} of {total} conflicts")
+        }
+        locale::ResolvedLocale::ZhCn => format!("显示 {total} 个冲突中的前 {limit} 个"),
+        locale::ResolvedLocale::ZhTw => format!("顯示 {total} 個衝突中的前 {limit} 個"),
+    }
+}
+
+fn localized_use_version_label(branch: &str) -> String {
+    let branch = bounded_ref_label(branch);
+    match locale::current_locale() {
+        locale::ResolvedLocale::En => format!("Use {branch}"),
+        locale::ResolvedLocale::ZhCn => format!("使用 {branch}"),
+        locale::ResolvedLocale::ZhTw => format!("使用 {branch}"),
+    }
+}
+
+fn bounded_ref_label(value: &str) -> String {
+    const MAX_CHARS: usize = 24;
+    let mut chars = value.chars();
+    let prefix = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}...")
+    } else {
+        prefix
+    }
+}
+
+fn worktree_conflict_kind_label(kind: GitWorktreeConflictKind, binary: bool) -> &'static str {
+    if binary {
+        return locale::text("Binary", "二进制", "二進位");
+    }
+    match kind {
+        GitWorktreeConflictKind::BothModified => {
+            locale::text("Both modified", "两边都修改", "兩邊都修改")
+        }
+        GitWorktreeConflictKind::BothAdded => {
+            locale::text("Both added", "两边都新增", "兩邊都新增")
+        }
+        GitWorktreeConflictKind::DeletedBySource => {
+            locale::text("Source deleted", "源分支删除", "來源分支刪除")
+        }
+        GitWorktreeConflictKind::DeletedByTarget => {
+            locale::text("Target deleted", "目标分支删除", "目標分支刪除")
+        }
+        GitWorktreeConflictKind::Binary => locale::text("Binary", "二进制", "二進位"),
+        GitWorktreeConflictKind::Other | GitWorktreeConflictKind::Unknown => {
+            locale::text("Conflict", "冲突", "衝突")
+        }
+    }
+}
+
+fn worktree_confirmation_copy(
+    confirmation: &WorktreeLifecycleConfirmation,
+) -> (String, String, String, bool, bool, Vec<GitWorktreeRisk>) {
+    match confirmation {
+        WorktreeLifecycleConfirmation::Merge(plan) => {
+            let summary = match locale::current_locale() {
+                locale::ResolvedLocale::En => format!(
+                    "{} -> {} at exact heads. {} commit(s), {} file(s), +{} / -{}. {} Agent(s) and {} terminal(s) remain independent.",
+                    plan.source_branch,
+                    plan.target_branch,
+                    plan.summary.commit_count,
+                    plan.summary.file_count,
+                    plan.summary.additions,
+                    plan.summary.deletions,
+                    plan.running_consumers.agent_count,
+                    plan.running_consumers.terminal_count,
+                ),
+                locale::ResolvedLocale::ZhCn => format!(
+                    "{} -> {}，按固定提交合并。{} 个提交、{} 个文件、+{} / -{}。{} 个 Agent 和 {} 个终端保持独立运行。",
+                    plan.source_branch,
+                    plan.target_branch,
+                    plan.summary.commit_count,
+                    plan.summary.file_count,
+                    plan.summary.additions,
+                    plan.summary.deletions,
+                    plan.running_consumers.agent_count,
+                    plan.running_consumers.terminal_count,
+                ),
+                locale::ResolvedLocale::ZhTw => format!(
+                    "{} -> {}，依固定提交合併。{} 個提交、{} 個檔案、+{} / -{}。{} 個 Agent 和 {} 個終端機保持獨立執行。",
+                    plan.source_branch,
+                    plan.target_branch,
+                    plan.summary.commit_count,
+                    plan.summary.file_count,
+                    plan.summary.additions,
+                    plan.summary.deletions,
+                    plan.running_consumers.agent_count,
+                    plan.running_consumers.terminal_count,
+                ),
+            };
+            (
+                locale::text("Merge Worktree", "合并 Worktree", "合併 Worktree").to_string(),
+                summary,
+                localized_merge_action_label(&plan.target_branch),
+                plan.preflight.allowed,
+                false,
+                plan.preflight.risks.clone(),
+            )
+        }
+        WorktreeLifecycleConfirmation::Archive { preflight, .. } => (
+            locale::text("Archive Worktree", "归档 Worktree", "封存 Worktree").to_string(),
+            locale::text(
+                "The Workspace, branch, Session history, and managed record are retained.",
+                "将保留 Workspace、分支、Session 历史和托管记录。",
+                "將保留 Workspace、分支、Session 歷史和受管理記錄。",
+            )
+            .to_string(),
+            locale::text("Archive Worktree", "归档 Worktree", "封存 Worktree").to_string(),
+            preflight.allowed,
+            false,
+            preflight.risks.clone(),
+        ),
+        WorktreeLifecycleConfirmation::Restore { preflight, .. } => (
+            locale::text("Restore Worktree", "恢复 Worktree", "還原 Worktree").to_string(),
+            locale::text(
+                "Restore the original Workspace path, branch, and Session history.",
+                "按原路径和分支恢复同一 Workspace 与 Session 历史。",
+                "依原路徑和分支還原同一 Workspace 與 Session 歷史。",
+            )
+            .to_string(),
+            locale::text("Restore Worktree", "恢复 Worktree", "還原 Worktree").to_string(),
+            preflight.allowed,
+            false,
+            preflight.risks.clone(),
+        ),
+        WorktreeLifecycleConfirmation::Discard { preflight, .. } => (
+            locale::text("Discard Worktree", "丢弃 Worktree", "捨棄 Worktree").to_string(),
+            locale::text(
+                "Remove the Worktree directory. The branch is not deleted; audit and Session history remain.",
+                "移除 Worktree 目录。不会删除分支；审计和 Session 历史仍保留。",
+                "移除 Worktree 目錄。不會刪除分支；稽核和 Session 歷史仍保留。",
+            )
+            .to_string(),
+            locale::text("Discard Worktree", "丢弃 Worktree", "捨棄 Worktree").to_string(),
+            preflight.allowed,
+            true,
+            preflight.risks.clone(),
+        ),
+        WorktreeLifecycleConfirmation::Continue(_) => (
+            locale::text("Complete merge", "完成合并", "完成合併").to_string(),
+            locale::text(
+                "Create the merge commit after revalidating the target, MERGE_HEAD, and index.",
+                "重新校验目标、MERGE_HEAD 和索引后创建合并提交。",
+                "重新驗證目標、MERGE_HEAD 和索引後建立合併提交。",
+            )
+            .to_string(),
+            locale::text("Complete merge", "完成合并", "完成合併").to_string(),
+            true,
+            false,
+            Vec::new(),
+        ),
+        WorktreeLifecycleConfirmation::Abort(_) => (
+            locale::text("Abort merge", "中止合并", "中止合併").to_string(),
+            locale::text(
+                "Discard only this target conflict-resolution scene. The source Worktree is unchanged.",
+                "仅丢弃本次目标冲突解决改动，不改变源 Worktree。",
+                "僅捨棄本次目標衝突解決變更，不改變來源 Worktree。",
+            )
+            .to_string(),
+            locale::text("Abort merge", "中止合并", "中止合併").to_string(),
+            true,
+            true,
+            Vec::new(),
+        ),
+    }
+}
+
+fn worktree_risk_label(kind: GitWorktreeRiskKind) -> &'static str {
+    match kind {
+        GitWorktreeRiskKind::DirtySource => {
+            locale::text("Source changes", "源目录改动", "來源目錄變更")
+        }
+        GitWorktreeRiskKind::DirtyTarget => {
+            locale::text("Target changes", "目标目录改动", "目標目錄變更")
+        }
+        GitWorktreeRiskKind::SourceHeadChanged => {
+            locale::text("Source changed", "源提交已变化", "來源提交已變更")
+        }
+        GitWorktreeRiskKind::TargetHeadChanged => {
+            locale::text("Target changed", "目标提交已变化", "目標提交已變更")
+        }
+        GitWorktreeRiskKind::OwnershipMismatch => {
+            locale::text("Ownership", "所有权不匹配", "所有權不符")
+        }
+        GitWorktreeRiskKind::ActiveOperation => {
+            locale::text("Lifecycle operation", "生命周期操作", "生命週期操作")
+        }
+        GitWorktreeRiskKind::MissingGitRegistration => {
+            locale::text("Git registration", "缺少 Git 注册", "缺少 Git 註冊")
+        }
+        GitWorktreeRiskKind::StaleReadiness => {
+            locale::text("Readiness changed", "准备状态已变化", "準備狀態已變更")
+        }
+        GitWorktreeRiskKind::WrongTargetBranch => {
+            locale::text("Target branch", "目标分支不匹配", "目標分支不符")
+        }
+        GitWorktreeRiskKind::ActiveGitOperation => {
+            locale::text("Git operation", "存在 Git 操作", "存在 Git 操作")
+        }
+        GitWorktreeRiskKind::UnpushedCommits => {
+            locale::text("Unpushed commits", "存在未推送提交", "存在未推送提交")
+        }
+        GitWorktreeRiskKind::RunningConsumers => {
+            locale::text("Running activity", "仍有运行中任务", "仍有執行中工作")
+        }
+        GitWorktreeRiskKind::PathConflict => locale::text("Path conflict", "路径冲突", "路徑衝突"),
+        GitWorktreeRiskKind::UnknownState | GitWorktreeRiskKind::Unknown => {
+            locale::text("Unknown state", "状态未知", "狀態未知")
+        }
+    }
+}
+
+fn worktree_plan_error_requires_refresh(code: &str) -> bool {
+    matches!(
+        code,
+        "worktree_preflight_stale"
+            | "worktree_source_head_changed"
+            | "worktree_target_head_changed"
+            | "worktree_target_branch_changed"
+            | "worktree_readiness_stale"
+    )
+}
+
 fn bounded_uniform_range(
     range: std::ops::Range<usize>,
     total: usize,
@@ -10103,6 +11893,48 @@ mod tests {
             [RightRailMode::Files, RightRailMode::Git].map(RightRailMode::title),
             ["Files", "Git"]
         );
+    }
+
+    #[test]
+    fn worktree_lifecycle_renderer_keeps_conflicts_before_ordinary_changes_and_named_actions() {
+        let source = include_str!("code_workbench.rs");
+        let changes = source
+            .split_once("    fn render_git_changes(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_git_tree_row("))
+            .map(|(body, _)| body)
+            .unwrap();
+        assert!(
+            changes.find("render_worktree_conflicts").unwrap()
+                < changes.find(".child(if change_row_count == 0").unwrap()
+        );
+        for action in [
+            "worktree-review-changes",
+            "worktree-mark-ready",
+            "worktree-merge-back",
+            "worktree-restore",
+            "worktree-agent-assistance",
+            "worktree-abort-merge",
+            "worktree-complete-merge",
+            "use-target-conflict-",
+            "use-source-conflict-",
+            "stage-worktree-conflict-",
+        ] {
+            assert!(source.contains(action), "missing lifecycle action {action}");
+        }
+    }
+
+    #[test]
+    fn stale_worktree_plans_require_a_fresh_confirmation() {
+        for code in [
+            "worktree_preflight_stale",
+            "worktree_source_head_changed",
+            "worktree_target_head_changed",
+            "worktree_target_branch_changed",
+            "worktree_readiness_stale",
+        ] {
+            assert!(worktree_plan_error_requires_refresh(code));
+        }
+        assert!(!worktree_plan_error_requires_refresh("temporary_failure"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{ProjectId, RequestId, WorkspaceId};
+use crate::ids::{ProjectId, RequestId, VibexSessionId, WorkspaceId};
 use crate::workspace::WorkspaceRecord;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,7 +276,10 @@ pub struct GitRemoteActionResult {
 #[serde(rename_all = "snake_case")]
 pub enum GitManagedWorktreeStatus {
     Active,
+    Archiving,
     Archived,
+    Restoring,
+    Discarding,
     Merged,
     Discarded,
     Failed,
@@ -302,11 +305,13 @@ pub enum GitWorktreeOperationKind {
 #[serde(rename_all = "snake_case")]
 pub enum GitWorktreeOperationStatus {
     Pending,
+    Queued,
     Running,
     Completed,
     Failed,
     Recoverable,
     NeedsResolution,
+    Aborting,
     NeedsAttention,
     Aborted,
     #[serde(other)]
@@ -408,6 +413,14 @@ pub enum GitWorktreeOperationCheckpoint {
     WorkspacePersisted,
     ManagedRecordPersisted,
     DatabaseCommitted,
+    MergeStarted,
+    ConflictDetected,
+    ContinueStarted,
+    AbortStarted,
+    ArchiveStarted,
+    WorktreeRemoved,
+    RestoreStarted,
+    WorktreeRestored,
     Completed,
     CompensationPending,
     Compensated,
@@ -446,6 +459,7 @@ pub struct GitWorktreeDiagnostic {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 #[serde(rename_all = "camelCase")]
 pub struct GitWorktreeOperationDetail {
     pub schema_version: u16,
@@ -466,6 +480,18 @@ pub struct GitWorktreeOperationDetail {
     pub lease_owner: Option<String>,
     pub lease_expires_at_ms: Option<i64>,
     pub diagnostic: Option<GitWorktreeDiagnostic>,
+    #[serde(default)]
+    pub merge_strategy: Option<GitWorktreeMergeStrategy>,
+    #[serde(default)]
+    pub queue_key: Option<String>,
+    #[serde(default)]
+    pub queue_position: Option<u32>,
+    #[serde(default)]
+    pub conflicts: Vec<GitWorktreeConflictFile>,
+    #[serde(default)]
+    pub source_commits_after_start: u32,
+    #[serde(default)]
+    pub assistance_session_id: Option<VibexSessionId>,
 }
 
 impl Default for GitWorktreeOperationDetail {
@@ -489,8 +515,90 @@ impl Default for GitWorktreeOperationDetail {
             lease_owner: None,
             lease_expires_at_ms: None,
             diagnostic: None,
+            merge_strategy: None,
+            queue_key: None,
+            queue_position: None,
+            conflicts: Vec::new(),
+            source_commits_after_start: 0,
+            assistance_session_id: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitWorktreeMergeStrategy {
+    NoFfMerge,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitWorktreeConflictKind {
+    BothModified,
+    BothAdded,
+    DeletedBySource,
+    DeletedByTarget,
+    Binary,
+    Other,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitWorktreeConflictFile {
+    pub path: String,
+    pub kind: GitWorktreeConflictKind,
+    pub binary: bool,
+    pub resolved: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GitWorktreeReadinessState {
+    #[default]
+    Working,
+    Reviewing,
+    ReadyToMerge,
+    MergeQueued,
+    MergeRunning,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitWorktreeCheckOutcome {
+    Passed,
+    Failed,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitWorktreeCheckRecord {
+    pub command: String,
+    pub outcome: GitWorktreeCheckOutcome,
+    pub recorded_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitWorktreeReadinessRecord {
+    pub worktree_id: RequestId,
+    pub workspace_id: WorkspaceId,
+    pub state: GitWorktreeReadinessState,
+    pub source_head: String,
+    pub dirty_fingerprint: String,
+    pub target_workspace_id: WorkspaceId,
+    pub target_branch: String,
+    #[serde(default)]
+    pub checks: Vec<GitWorktreeCheckRecord>,
+    pub revision: String,
+    pub updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -624,6 +732,78 @@ pub struct GitWorktreeMergeRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GitWorktreeReadinessRequest {
+    pub workspace_id: WorkspaceId,
+    pub state: GitWorktreeReadinessState,
+    #[serde(default)]
+    pub expected_source_head: Option<String>,
+    #[serde(default)]
+    pub expected_dirty_fingerprint: Option<String>,
+    #[serde(default)]
+    pub checks: Vec<GitWorktreeCheckRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitWorktreeOperationRequest {
+    pub operation_id: RequestId,
+    pub workspace_id: WorkspaceId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitWorktreeAssistanceSessionRequest {
+    pub operation_id: RequestId,
+    pub workspace_id: WorkspaceId,
+    pub session_id: VibexSessionId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitWorktreeConflictVersion {
+    Target,
+    Source,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitWorktreeConflictResolveRequest {
+    pub operation_id: RequestId,
+    pub workspace_id: WorkspaceId,
+    pub path: String,
+    pub version: GitWorktreeConflictVersion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitWorktreeConflictStageRequest {
+    pub operation_id: RequestId,
+    pub workspace_id: WorkspaceId,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitWorktreeArchiveRequest {
+    pub workspace_id: WorkspaceId,
+    pub worktree_path: String,
+    #[serde(default)]
+    pub expected_head: Option<String>,
+    #[serde(default)]
+    pub preflight_revision: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitWorktreeRestoreRequest {
+    pub workspace_id: WorkspaceId,
+    pub worktree_id: RequestId,
+    #[serde(default)]
+    pub preflight_revision: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GitWorktreeDiscardRequest {
     pub workspace_id: WorkspaceId,
     pub worktree_path: String,
@@ -661,6 +841,7 @@ pub enum GitWorktreeDestructiveAction {
     MergeBack,
     Discard,
     Archive,
+    Restore,
     #[serde(other)]
     Unknown,
 }
@@ -675,6 +856,12 @@ pub enum GitWorktreeRiskKind {
     OwnershipMismatch,
     ActiveOperation,
     MissingGitRegistration,
+    StaleReadiness,
+    WrongTargetBranch,
+    ActiveGitOperation,
+    UnpushedCommits,
+    RunningConsumers,
+    PathConflict,
     UnknownState,
     #[serde(other)]
     Unknown,
@@ -697,7 +884,43 @@ pub struct GitWorktreeDestructivePreflight {
     pub source_head: Option<String>,
     pub target_head: Option<String>,
     pub risks: Vec<GitWorktreeRisk>,
+    #[serde(default)]
+    pub action_label: String,
     pub observed_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GitWorktreeChangeSummary {
+    pub commit_count: u32,
+    pub file_count: u32,
+    pub additions: u32,
+    pub deletions: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GitWorktreeRunningConsumers {
+    pub agent_count: u32,
+    pub terminal_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitWorktreeMergePlan {
+    pub plan_id: RequestId,
+    pub source_workspace_id: WorkspaceId,
+    pub source_path: String,
+    pub source_branch: String,
+    pub source_head: String,
+    pub target_workspace_id: WorkspaceId,
+    pub target_path: String,
+    pub target_branch: String,
+    pub target_head: String,
+    pub summary: GitWorktreeChangeSummary,
+    pub readiness: GitWorktreeReadinessRecord,
+    pub running_consumers: GitWorktreeRunningConsumers,
+    pub preflight: GitWorktreeDestructivePreflight,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -707,6 +930,8 @@ pub struct GitWorktreeLifecycleSnapshot {
     pub eligibility: GitProjectEligibility,
     pub managed_worktrees: Vec<GitManagedWorktreeRecord>,
     pub operations: Vec<GitWorktreeOperationRecord>,
+    #[serde(default)]
+    pub readiness: Vec<GitWorktreeReadinessRecord>,
     pub diagnostics: Vec<GitWorktreeDiagnostic>,
     pub revision: String,
 }
@@ -825,6 +1050,60 @@ mod worktree_contract_tests {
         assert_eq!(
             decoded.detail.checkpoint,
             GitWorktreeOperationCheckpoint::IntentRecorded
+        );
+    }
+
+    #[test]
+    fn readiness_and_conflict_detail_round_trip_without_changing_legacy_defaults() {
+        let readiness = GitWorktreeReadinessRecord {
+            worktree_id: RequestId::new(),
+            workspace_id: WorkspaceId::new(),
+            state: GitWorktreeReadinessState::ReadyToMerge,
+            source_head: "a".repeat(40),
+            dirty_fingerprint: "clean-v1".to_string(),
+            target_workspace_id: WorkspaceId::new(),
+            target_branch: "main".to_string(),
+            checks: vec![GitWorktreeCheckRecord {
+                command: "cargo test -p vibex-git --locked".to_string(),
+                outcome: GitWorktreeCheckOutcome::Passed,
+                recorded_at_ms: 1,
+            }],
+            revision: "ready-v1".to_string(),
+            updated_at_ms: 1,
+        };
+        let encoded = serde_json::to_string(&readiness).unwrap();
+        assert_eq!(
+            serde_json::from_str::<GitWorktreeReadinessRecord>(&encoded).unwrap(),
+            readiness
+        );
+
+        let detail: GitWorktreeOperationDetail = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 1,
+            "checkpoint": "conflict_detected",
+            "conflicts": [{
+                "path": "src/lib.rs",
+                "kind": "both_modified",
+                "binary": false,
+                "resolved": false
+            }]
+        }))
+        .unwrap();
+        assert_eq!(detail.conflicts.len(), 1);
+        assert_eq!(detail.merge_strategy, None);
+        assert_eq!(detail.source_commits_after_start, 0);
+        assert_eq!(detail.assistance_session_id, None);
+
+        let assistance_session_id = VibexSessionId::new();
+        let associated = GitWorktreeOperationDetail {
+            assistance_session_id: Some(assistance_session_id.clone()),
+            ..detail
+        };
+        let encoded = serde_json::to_string(&associated).unwrap();
+        assert_eq!(
+            serde_json::from_str::<GitWorktreeOperationDetail>(&encoded)
+                .unwrap()
+                .assistance_session_id,
+            Some(assistance_session_id)
         );
     }
 }

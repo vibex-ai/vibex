@@ -6,8 +6,13 @@ use vibex_core::{
     FetchTimelineRequest, FileMutationRequest, FileReadRequest, FileReadResponse,
     FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest,
     GitCommitRequest, GitCommitResult, GitDiffRequest, GitDiffResponse, GitProjectEligibility,
-    GitStageRequest, GitStatusSummary, GitWorktreeCreateRequest, GitWorktreeCreateResult,
-    GitWorktreeLifecycleSnapshot, OpenWorkspaceRequest, ProjectId, ProviderHealthSummary,
+    GitStageRequest, GitStatusSummary, GitWorktreeArchiveRequest,
+    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictResolveRequest,
+    GitWorktreeConflictStageRequest, GitWorktreeCreateRequest, GitWorktreeCreateResult,
+    GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
+    GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeOperationRecord,
+    GitWorktreeOperationRequest, GitWorktreeReadinessRecord, GitWorktreeReadinessRequest,
+    GitWorktreeRestoreRequest, OpenWorkspaceRequest, ProjectId, ProviderHealthSummary,
     ProviderProfileSummary, ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult,
     RemoteAuditListRequest, RemoteAuditRecord, RemoteCancelPairingOfferRequest,
     RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
@@ -249,6 +254,111 @@ impl GitBackend for DisconnectedBackend {
         &self,
         _request: MutationRequest<GitWorktreeCreateRequest>,
     ) -> BackendFuture<'_, GitWorktreeCreateResult> {
+        disconnected_future!()
+    }
+
+    fn git_worktree_readiness(
+        &self,
+        _workspace_id: WorkspaceId,
+    ) -> BackendFuture<'_, Option<GitWorktreeReadinessRecord>> {
+        disconnected_future!()
+    }
+
+    fn git_worktree_set_readiness(
+        &self,
+        _request: MutationRequest<GitWorktreeReadinessRequest>,
+    ) -> BackendFuture<'_, GitWorktreeReadinessRecord> {
+        disconnected_future!()
+    }
+
+    fn git_worktree_merge_plan(
+        &self,
+        _request: GitWorktreeMergeRequest,
+    ) -> BackendFuture<'_, GitWorktreeMergePlan> {
+        disconnected_future!()
+    }
+
+    fn git_worktree_merge(
+        &self,
+        _request: MutationRequest<GitWorktreeMergeRequest>,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+        disconnected_future!()
+    }
+
+    fn git_worktree_resolve_conflict(
+        &self,
+        _request: MutationRequest<GitWorktreeConflictResolveRequest>,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+        disconnected_future!()
+    }
+
+    fn git_worktree_stage_conflicts(
+        &self,
+        _request: MutationRequest<GitWorktreeConflictStageRequest>,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+        disconnected_future!()
+    }
+
+    fn git_worktree_bind_assistance_session(
+        &self,
+        _request: MutationRequest<GitWorktreeAssistanceSessionRequest>,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+        disconnected_future!()
+    }
+
+    fn git_worktree_continue_merge(
+        &self,
+        _request: MutationRequest<GitWorktreeOperationRequest>,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+        disconnected_future!()
+    }
+
+    fn git_worktree_abort_merge(
+        &self,
+        _request: MutationRequest<GitWorktreeOperationRequest>,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+        disconnected_future!()
+    }
+
+    fn git_worktree_archive_preflight(
+        &self,
+        _request: GitWorktreeArchiveRequest,
+    ) -> BackendFuture<'_, GitWorktreeDestructivePreflight> {
+        disconnected_future!()
+    }
+
+    fn git_worktree_archive(
+        &self,
+        _request: MutationRequest<GitWorktreeArchiveRequest>,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+        disconnected_future!()
+    }
+
+    fn git_worktree_restore_preflight(
+        &self,
+        _request: GitWorktreeRestoreRequest,
+    ) -> BackendFuture<'_, GitWorktreeDestructivePreflight> {
+        disconnected_future!()
+    }
+
+    fn git_worktree_restore(
+        &self,
+        _request: MutationRequest<GitWorktreeRestoreRequest>,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
+        disconnected_future!()
+    }
+
+    fn git_worktree_discard_preflight(
+        &self,
+        _request: GitWorktreeDiscardRequest,
+    ) -> BackendFuture<'_, GitWorktreeDestructivePreflight> {
+        disconnected_future!()
+    }
+
+    fn git_worktree_discard(
+        &self,
+        _request: MutationRequest<GitWorktreeDiscardRequest>,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
         disconnected_future!()
     }
 

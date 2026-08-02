@@ -3636,6 +3636,7 @@ mod tests {
             eligibility: eligibility.clone(),
             managed_worktrees: Vec::new(),
             operations: Vec::new(),
+            readiness: Vec::new(),
             diagnostics: Vec::new(),
             revision: "test-worktree-snapshot".to_string(),
         };

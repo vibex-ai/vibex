@@ -445,6 +445,7 @@ pub struct GitWorkbenchState {
     change_row_index: Vec<(usize, bool)>,
     change_tree_root: GitTreeNode,
     change_tree_rows: Vec<GitTreeRow>,
+    lifecycle_conflict_paths: BTreeSet<String>,
     change_directory_paths: BTreeSet<String>,
     expanded_change_directories: BTreeSet<String>,
     pub history: Vec<vibex_core::GitCommitSummary>,
@@ -496,6 +497,7 @@ impl GitWorkbenchState {
         self.change_row_index.clear();
         self.change_tree_root = GitTreeNode::default();
         self.change_tree_rows.clear();
+        self.lifecycle_conflict_paths.clear();
         self.change_directory_paths.clear();
         self.expanded_change_directories.clear();
         self.history.clear();
@@ -839,6 +841,7 @@ impl GitWorkbenchState {
             .as_ref()
             .into_iter()
             .flat_map(|status| status.changes.iter())
+            .filter(|change| !self.is_lifecycle_conflict(&change.path))
             .flat_map(change_selection_keys)
             .filter(|key| staged.is_none_or(|staged| key.staged == staged))
             .take(GIT_CHANGE_MAX_ROWS)
@@ -847,6 +850,9 @@ impl GitWorkbenchState {
 
     pub fn select_path(&mut self, path: &str, selected: bool) -> bool {
         let path = normalize_path(path);
+        if self.is_lifecycle_conflict(&path) {
+            return false;
+        }
         let Some(change) = self
             .status
             .as_ref()
@@ -873,6 +879,7 @@ impl GitWorkbenchState {
             .as_ref()
             .into_iter()
             .flat_map(|status| status.changes.iter())
+            .filter(|change| !self.is_lifecycle_conflict(&change.path))
             .filter(|change| path.is_empty() || path_is_equal_or_descendant(&change.path, &path))
             .map(|change| change.path.clone())
             .collect::<Vec<_>>();
@@ -900,6 +907,7 @@ impl GitWorkbenchState {
             .as_ref()
             .into_iter()
             .flat_map(|status| status.changes.iter())
+            .filter(|change| !self.is_lifecycle_conflict(&change.path))
             .filter(|change| path.is_empty() || path_is_equal_or_descendant(&change.path, &path))
             .map(|change| change.path.as_str())
             .collect::<BTreeSet<_>>();
@@ -947,6 +955,27 @@ impl GitWorkbenchState {
             .change_index
             .and_then(|change_index| self.status.as_ref()?.changes.get(change_index));
         Some((row, change))
+    }
+
+    pub fn set_lifecycle_conflict_paths(
+        &mut self,
+        paths: impl IntoIterator<Item = String>,
+    ) -> bool {
+        let next = paths
+            .into_iter()
+            .map(|path| normalize_path(&path))
+            .filter(|path| !path.is_empty())
+            .collect::<BTreeSet<_>>();
+        if self.lifecycle_conflict_paths == next {
+            return false;
+        }
+        self.lifecycle_conflict_paths = next;
+        let conflict_paths = &self.lifecycle_conflict_paths;
+        self.selected_changes
+            .retain(|key| !conflict_paths.contains(&normalize_path(&key.path)));
+        self.rebuild_change_row_index();
+        self.rebuild_change_tree();
+        true
     }
 
     pub fn toggle_change_directories(&mut self, paths: &[String]) {
@@ -1202,6 +1231,9 @@ impl GitWorkbenchState {
     }
 
     fn change_exists(&self, key: &GitSelectionKey) -> bool {
+        if self.is_lifecycle_conflict(&key.path) {
+            return false;
+        }
         self.status.as_ref().is_some_and(|status| {
             status
                 .changes
@@ -1217,6 +1249,7 @@ impl GitWorkbenchState {
             .as_ref()
             .into_iter()
             .flat_map(|status| status.changes.iter())
+            .filter(|change| !self.is_lifecycle_conflict(&change.path))
             .flat_map(change_selection_keys)
             .collect::<BTreeSet<_>>();
         self.selected_changes.retain(|key| valid.contains(key));
@@ -1228,6 +1261,7 @@ impl GitWorkbenchState {
             .as_ref()
             .into_iter()
             .flat_map(|status| status.changes.iter())
+            .filter(|change| !self.is_lifecycle_conflict(&change.path))
             .map(|change| normalize_path(&change.path))
             .collect::<BTreeSet<_>>();
         if available_paths.is_empty() {
@@ -1249,6 +1283,7 @@ impl GitWorkbenchState {
             .as_ref()
             .into_iter()
             .flat_map(|status| status.changes.iter())
+            .filter(|change| !self.is_lifecycle_conflict(&change.path))
             .filter(|change| retained_paths.contains(&normalize_path(&change.path)))
             .flat_map(change_selection_keys)
             .collect();
@@ -1267,6 +1302,7 @@ impl GitWorkbenchState {
                 .as_ref()
                 .map(|status| status.changes.as_slice())
                 .unwrap_or_default(),
+            Some(&self.lifecycle_conflict_paths),
         );
         let next_paths = collect_git_directory_paths(&self.change_tree_root);
         if next_paths != self.change_directory_paths {
@@ -1287,7 +1323,7 @@ impl GitWorkbenchState {
     }
 
     fn rebuild_commit_tree(&mut self) {
-        self.commit_tree_root = build_git_tree(&self.commit_tree_changes);
+        self.commit_tree_root = build_git_tree(&self.commit_tree_changes, None);
         self.commit_directory_paths = collect_git_directory_paths(&self.commit_tree_root);
         self.expanded_commit_directories = self.commit_directory_paths.clone();
         self.rebuild_commit_tree_rows();
@@ -1317,6 +1353,12 @@ impl GitWorkbenchState {
             return;
         };
         for (index, change) in status.changes.iter().enumerate() {
+            if self
+                .lifecycle_conflict_paths
+                .contains(&normalize_path(&change.path))
+            {
+                continue;
+            }
             if self.change_row_index.len() >= GIT_CHANGE_MAX_ROWS {
                 break;
             }
@@ -1328,11 +1370,23 @@ impl GitWorkbenchState {
             }
         }
     }
+
+    fn is_lifecycle_conflict(&self, path: &str) -> bool {
+        self.lifecycle_conflict_paths
+            .contains(&normalize_path(path))
+    }
 }
 
-fn build_git_tree(changes: &[GitChange]) -> GitTreeNode {
+fn build_git_tree(changes: &[GitChange], excluded_paths: Option<&BTreeSet<String>>) -> GitTreeNode {
     let mut root = GitTreeNode::default();
-    for (change_index, change) in changes.iter().enumerate().take(GIT_CHANGE_MAX_ROWS) {
+    for (change_index, change) in changes
+        .iter()
+        .enumerate()
+        .filter(|(_, change)| {
+            excluded_paths.is_none_or(|paths| !paths.contains(&normalize_path(&change.path)))
+        })
+        .take(GIT_CHANGE_MAX_ROWS)
+    {
         let path = normalize_path(&change.path);
         let parts = path.split('/').filter(|part| !part.is_empty());
         let mut current = &mut root;
@@ -1683,6 +1737,50 @@ mod tests {
         assert_eq!(state.change_row_count(), 2);
         assert!(state.change_row(0).unwrap().1);
         assert!(!state.change_row(1).unwrap().1);
+    }
+
+    #[test]
+    fn lifecycle_conflicts_precede_the_ordinary_tree_and_cannot_use_generic_stage_selection() {
+        let workspace_id = WorkspaceId::new();
+        let mut response = status(&workspace_id);
+        response.changes = vec![
+            GitChange {
+                path: "src/conflict.rs".into(),
+                original_path: None,
+                kind: GitChangeKind::Unmerged,
+                staged: false,
+                unstaged: true,
+                additions: 0,
+                deletions: 0,
+            },
+            GitChange {
+                path: "src/ordinary.rs".into(),
+                original_path: None,
+                kind: GitChangeKind::Modified,
+                staged: false,
+                unstaged: true,
+                additions: 1,
+                deletions: 0,
+            },
+        ];
+        let mut state = GitWorkbenchState::default();
+        state.reset_workspace(workspace_id);
+        let ticket = state.begin_query(GitQueryKind::Status, "status").unwrap();
+        assert!(state.apply_status(&ticket, response));
+
+        assert!(state.set_lifecycle_conflict_paths(vec!["src/conflict.rs".into()]));
+        let visible_paths = (0..state.change_tree_row_count())
+            .filter_map(|index| state.change_tree_row(index))
+            .map(|(row, _)| row.path.clone())
+            .collect::<Vec<_>>();
+        assert!(!visible_paths.iter().any(|path| path == "src/conflict.rs"));
+        assert!(visible_paths.iter().any(|path| path == "src/ordinary.rs"));
+        assert!(!state.select_path("src/conflict.rs", true));
+        assert_eq!(state.selected_change_paths(), vec!["src/ordinary.rs"]);
+        assert_eq!(
+            state.path_selection_state(""),
+            GitPathSelectionState::Checked
+        );
     }
 
     #[test]
