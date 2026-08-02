@@ -3996,6 +3996,7 @@ fn gateway_features(state: &GatewayState) -> Vec<String> {
         "agent",
         "workspace_file",
         "git",
+        "git_worktree_read",
         "terminal",
         "provider_settings",
         "device_management",

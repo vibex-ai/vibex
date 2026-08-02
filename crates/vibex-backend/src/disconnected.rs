@@ -5,8 +5,9 @@ use vibex_core::{
     CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
     FetchTimelineRequest, FileMutationRequest, FileReadRequest, FileReadResponse,
     FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest,
-    GitCommitRequest, GitCommitResult, GitDiffRequest, GitDiffResponse, GitStageRequest,
-    GitStatusSummary, OpenWorkspaceRequest, ProjectId, ProviderHealthSummary,
+    GitCommitRequest, GitCommitResult, GitDiffRequest, GitDiffResponse, GitProjectEligibility,
+    GitStageRequest, GitStatusSummary, GitWorktreeCreateRequest, GitWorktreeCreateResult,
+    GitWorktreeLifecycleSnapshot, OpenWorkspaceRequest, ProjectId, ProviderHealthSummary,
     ProviderProfileSummary, ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult,
     RemoteAuditListRequest, RemoteAuditRecord, RemoteCancelPairingOfferRequest,
     RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
@@ -227,6 +228,27 @@ impl GitBackend for DisconnectedBackend {
     }
 
     fn git_diff(&self, _request: GitDiffRequest) -> BackendFuture<'_, GitDiffResponse> {
+        disconnected_future!()
+    }
+
+    fn git_worktree_eligibility(
+        &self,
+        _workspace_id: WorkspaceId,
+    ) -> BackendFuture<'_, GitProjectEligibility> {
+        disconnected_future!()
+    }
+
+    fn git_worktree_snapshot(
+        &self,
+        _workspace_id: WorkspaceId,
+    ) -> BackendFuture<'_, GitWorktreeLifecycleSnapshot> {
+        disconnected_future!()
+    }
+
+    fn git_worktree_create(
+        &self,
+        _request: MutationRequest<GitWorktreeCreateRequest>,
+    ) -> BackendFuture<'_, GitWorktreeCreateResult> {
         disconnected_future!()
     }
 

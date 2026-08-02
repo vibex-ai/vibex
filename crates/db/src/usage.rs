@@ -1283,8 +1283,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        RuntimeBindingRepository, SessionRepository, WorkspaceRepository, apply_migrations,
-        current_schema_version, open_database,
+        CURRENT_SCHEMA_VERSION, RuntimeBindingRepository, SessionRepository, WorkspaceRepository,
+        apply_migrations, current_schema_version, open_database,
     };
 
     const AGENT_USAGE_MIGRATION_VERSION: i64 = 31;
@@ -1416,7 +1416,10 @@ mod tests {
         let path = temp_db("migration");
         let mut conn = open_database(&path).unwrap();
         apply_migrations(&mut conn).unwrap();
-        assert_eq!(current_schema_version(&conn).unwrap(), 32);
+        assert_eq!(
+            current_schema_version(&conn).unwrap(),
+            CURRENT_SCHEMA_VERSION
+        );
         for table in ["agent_usage_checkpoints", "agent_turn_usage_facts"] {
             let exists: i64 = conn
                 .query_row(

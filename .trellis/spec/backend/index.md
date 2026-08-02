@@ -42,6 +42,7 @@ Read these files before backend work:
 | [Agent Session Protocol](./agent-session-protocol.md) | Touching Agent sessions, timeline events, permissions, provider adapters, or live event sync. |
 | [Agent Usage Statistics](./agent-usage-statistics.md) | Touching ACP usage capture, execution facts, cumulative checkpoints, token aggregation, or typed Usage queries. |
 | [Runtime Switch Coordinator](./runtime-switch-coordinator.md) | Touching durable runtime switching, worker leases, active-work gates, operation journals, or startup reconciliation. |
+| [Managed Worktree Identity And Recovery](./worktree-coordinator.md) | Touching Worktree identity, eligibility, lifecycle coordination, recovery, destructive preflight, or remote Worktree capabilities. |
 | [Provider Configuration](./provider-config.md) | Touching Provider profiles, MCP, Skills, runtime injection, health checks, or config import/export. |
 | [Remote and Relay Protocol](./remote-relay-protocol.md) | Touching LAN access, WebSocket APIs, pairing, device permissions, Relay rooms, or E2EE transport. |
 | [Database Guidelines](./database-guidelines.md) | Adding SQLite tables, migrations, persistence, or local file storage. |

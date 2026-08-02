@@ -17,7 +17,8 @@ use crate::git::{
     GitBlameRequest, GitBlameResponse, GitBranchCheckoutRequest, GitBranchCreateRequest,
     GitBranchListResponse, GitCommitDetail, GitCommitDetailRequest, GitCommitRequest,
     GitCommitResult, GitDiffRequest, GitDiffResponse, GitHistoryRequest, GitHistoryResponse,
-    GitRemoteActionRequest, GitRemoteActionResult, GitStageRequest, GitStatusSummary,
+    GitProjectEligibility, GitRemoteActionRequest, GitRemoteActionResult, GitStageRequest,
+    GitStatusSummary, GitWorktreeLifecycleSnapshot,
 };
 use crate::ids::{
     CorrelationId, DeviceId, EventId, RequestId, RuntimeProcessId, TerminalId, VibexSessionId,
@@ -75,6 +76,8 @@ pub struct RemoteCapabilitySummary {
     pub supports_seamless_runtime_selection: bool,
     pub supports_workspace_files: bool,
     pub supports_git: bool,
+    #[serde(default)]
+    pub supports_worktree_read: bool,
     pub supports_terminal: bool,
     pub supports_provider_settings: bool,
     pub live_event_channels: Vec<RemoteLiveEventChannel>,
@@ -92,6 +95,7 @@ impl RemoteCapabilitySummary {
             supports_seamless_runtime_selection: false,
             supports_workspace_files: false,
             supports_git: false,
+            supports_worktree_read: false,
             supports_terminal: false,
             supports_provider_settings: false,
             live_event_channels: vec![RemoteLiveEventChannel::System],
@@ -111,6 +115,7 @@ impl RemoteCapabilitySummary {
         let mut capabilities = Self::with_agent_sessions();
         capabilities.supports_workspace_files = true;
         capabilities.supports_git = true;
+        capabilities.supports_worktree_read = true;
         capabilities.supports_terminal = true;
         capabilities
     }
@@ -729,6 +734,8 @@ pub enum RemoteWorkbenchOperationKind {
     GitBranchCreate,
     GitBranchCheckout,
     GitRemoteAction,
+    GitWorktreeEligibility,
+    GitWorktreeSnapshot,
     TerminalList,
     TerminalCreate,
     TerminalSnapshot,
@@ -844,6 +851,32 @@ pub struct RemoteGitStatusRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteGitStatusResponse {
     pub status: GitStatusSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteGitWorktreeEligibilityRequest {
+    pub auth: RemoteAuthProof,
+    pub workspace_id: crate::ids::WorkspaceId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteGitWorktreeEligibilityResponse {
+    pub eligibility: GitProjectEligibility,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteGitWorktreeSnapshotRequest {
+    pub auth: RemoteAuthProof,
+    pub workspace_id: crate::ids::WorkspaceId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteGitWorktreeSnapshotResponse {
+    pub snapshot: GitWorktreeLifecycleSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1067,6 +1100,8 @@ pub enum RemoteWorkbenchRequest {
     GitBranchCreate(RemoteGitBranchCreateRequest),
     GitBranchCheckout(RemoteGitBranchCheckoutRequest),
     GitRemoteAction(RemoteGitRemoteActionRequest),
+    GitWorktreeEligibility(RemoteGitWorktreeEligibilityRequest),
+    GitWorktreeSnapshot(RemoteGitWorktreeSnapshotRequest),
     TerminalList(RemoteTerminalListRequest),
     TerminalCreate(RemoteTerminalCreateRequest),
     TerminalSnapshot(RemoteTerminalSnapshotRequest),
@@ -1099,6 +1134,8 @@ impl RemoteWorkbenchRequest {
             Self::GitBranchCreate(_) => RemoteWorkbenchOperationKind::GitBranchCreate,
             Self::GitBranchCheckout(_) => RemoteWorkbenchOperationKind::GitBranchCheckout,
             Self::GitRemoteAction(_) => RemoteWorkbenchOperationKind::GitRemoteAction,
+            Self::GitWorktreeEligibility(_) => RemoteWorkbenchOperationKind::GitWorktreeEligibility,
+            Self::GitWorktreeSnapshot(_) => RemoteWorkbenchOperationKind::GitWorktreeSnapshot,
             Self::TerminalList(_) => RemoteWorkbenchOperationKind::TerminalList,
             Self::TerminalCreate(_) => RemoteWorkbenchOperationKind::TerminalCreate,
             Self::TerminalSnapshot(_) => RemoteWorkbenchOperationKind::TerminalSnapshot,
@@ -1727,6 +1764,43 @@ mod tests {
             json["data"]["auth"]["authToken"],
             "auth-token-returned-once"
         );
+    }
+
+    #[test]
+    fn remote_worktree_reads_have_distinct_stable_operation_tags() {
+        let auth = RemoteAuthProof {
+            device_id: DeviceId::new(),
+            auth_token: "auth-token-returned-once".to_string(),
+        };
+        let workspace_id = crate::ids::WorkspaceId::new();
+        let eligibility =
+            RemoteWorkbenchRequest::GitWorktreeEligibility(RemoteGitWorktreeEligibilityRequest {
+                auth: auth.clone(),
+                workspace_id: workspace_id.clone(),
+            });
+        let snapshot =
+            RemoteWorkbenchRequest::GitWorktreeSnapshot(RemoteGitWorktreeSnapshotRequest {
+                auth,
+                workspace_id,
+            });
+
+        assert_eq!(
+            eligibility.operation_kind(),
+            RemoteWorkbenchOperationKind::GitWorktreeEligibility
+        );
+        assert_eq!(
+            snapshot.operation_kind(),
+            RemoteWorkbenchOperationKind::GitWorktreeSnapshot
+        );
+        assert_eq!(
+            serde_json::to_value(&eligibility).unwrap()["type"],
+            "git_worktree_eligibility"
+        );
+        assert_eq!(
+            serde_json::to_value(&snapshot).unwrap()["type"],
+            "git_worktree_snapshot"
+        );
+        assert!(!format!("{eligibility:?}{snapshot:?}").contains("auth-token-returned-once"));
     }
 
     #[test]

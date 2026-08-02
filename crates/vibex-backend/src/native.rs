@@ -7,19 +7,20 @@ use vibex_core::{
     ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest, FileMutationRequest,
     FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
     FileTreeRequest, FileWriteRequest, GitCommitRequest, GitCommitResult, GitDiffRequest,
-    GitDiffResponse, GitStageRequest, GitStatusSummary, OpenWorkspaceRequest, ProjectId,
-    ProviderHealthSummary, ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult,
-    RemoteAuditListRequest, RemoteAuditRecord, RemoteCreatePairingCodeRequest,
-    RemoteCreatePairingCodeResponse, RemoteCreatePairingOfferRequest,
-    RemoteCreatePairingOfferResponse, RemoteDeviceDetail, RemoteRevokeDeviceRequest,
-    RenameAgentSessionRequest, ResolvePermissionRequest, SendAgentMessageRequest,
-    SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
-    TerminalId, TerminalResizeRequest, TerminalSession, TerminalSnapshot, TerminalStatus,
-    TerminalWriteRequest, TimelineItem, TimelinePage, VibexSessionId, WorkspaceId,
+    GitDiffResponse, GitProjectEligibility, GitStageRequest, GitStatusSummary,
+    GitWorktreeCreateRequest, GitWorktreeCreateResult, GitWorktreeLifecycleSnapshot,
+    OpenWorkspaceRequest, ProjectId, ProviderHealthSummary, ProviderRunHealthProbesRequest,
+    ProviderRunHealthProbesResult, RemoteAuditListRequest, RemoteAuditRecord,
+    RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
+    RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeviceDetail,
+    RemoteRevokeDeviceRequest, RenameAgentSessionRequest, ResolvePermissionRequest,
+    SendAgentMessageRequest, SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest,
+    TerminalCreateRequest, TerminalId, TerminalResizeRequest, TerminalSession, TerminalSnapshot,
+    TerminalStatus, TerminalWriteRequest, TimelineItem, TimelinePage, VibexSessionId, WorkspaceId,
 };
 use vibex_desktop_runtime::{
     AuthoritativeRefetch, DesktopEvent, DesktopEventReceiver, DesktopEventStream, DesktopRuntime,
-    DesktopRuntimeFacade, RelayClientConnectionState, TerminalHandle,
+    DesktopRuntimeFacade, RelayClientConnectionState, TerminalHandle, WorktreeCreateContext,
 };
 
 use crate::{
@@ -549,6 +550,61 @@ impl GitBackend for NativeBackend {
         Box::pin(async move {
             runtime.ensure_accepting_actions()?;
             runtime.git().diff(&request).map_err(Into::into)
+        })
+    }
+
+    fn git_worktree_eligibility(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BackendFuture<'_, GitProjectEligibility> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .git()
+                .project_git_eligibility(&workspace_id)
+                .map_err(Into::into)
+        })
+    }
+
+    fn git_worktree_snapshot(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BackendFuture<'_, GitWorktreeLifecycleSnapshot> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .git()
+                .worktree_snapshot(&workspace_id)
+                .map_err(Into::into)
+        })
+    }
+
+    fn git_worktree_create(
+        &self,
+        request: MutationRequest<GitWorktreeCreateRequest>,
+    ) -> BackendFuture<'_, GitWorktreeCreateResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            if let Some(expected_revision) = request.expected_revision.as_deref() {
+                let eligibility = runtime
+                    .git()
+                    .project_git_eligibility(&request.payload.workspace_id)?;
+                if eligibility.revision != expected_revision {
+                    return Err(BackendError::conflict(
+                        "worktree_eligibility_stale",
+                        "project Git eligibility changed before worktree creation",
+                    ));
+                }
+            }
+            let context = WorktreeCreateContext::new(request.request_id, request.idempotency_key);
+            runtime
+                .git()
+                .worktree_create_with_context(&request.payload, context)
+                .map_err(Into::into)
         })
     }
 

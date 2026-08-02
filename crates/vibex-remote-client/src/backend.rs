@@ -17,10 +17,11 @@ use vibex_core::{
     FetchTimelineRequest, FileMutationRequest, FileReadRequest, FileReadResponse,
     FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest,
     GetMessageSubmissionRequest, GitCommitRequest, GitCommitResult, GitDiffRequest,
-    GitDiffResponse, GitStageRequest, GitStatusSummary, MessageSubmissionState,
-    OpenWorkspaceRequest, ProjectId, ProjectWorkspaceSummary, ProviderHealthSummary,
-    ProviderProfileSummary, ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult,
-    RemoteActionClass, RemoteAgentCancelRuntimeSwitchRequest,
+    GitDiffResponse, GitProjectEligibility, GitStageRequest, GitStatusSummary,
+    GitWorktreeCreateRequest, GitWorktreeCreateResult, GitWorktreeLifecycleSnapshot,
+    MessageSubmissionState, OpenWorkspaceRequest, ProjectId, ProjectWorkspaceSummary,
+    ProviderHealthSummary, ProviderProfileSummary, ProviderRunHealthProbesRequest,
+    ProviderRunHealthProbesResult, RemoteActionClass, RemoteAgentCancelRuntimeSwitchRequest,
     RemoteAgentCancelRuntimeSwitchResponse, RemoteAgentDeepLinkResolveRequest,
     RemoteAgentDeepLinkResolveResponse, RemoteAgentInterruptRequest, RemoteAgentInterruptResponse,
     RemoteAgentMessageSubmissionRequest, RemoteAgentMessageSubmissionResponse, RemoteAgentRequest,
@@ -42,7 +43,9 @@ use vibex_core::{
     RemoteFileTreeResponse, RemoteFileWriteRequest, RemoteFileWriteResponse,
     RemoteGitCommitRequest, RemoteGitCommitResponse, RemoteGitDiffRequest, RemoteGitDiffResponse,
     RemoteGitStageRequest, RemoteGitStatusMutationResponse, RemoteGitStatusRequest,
-    RemoteGitStatusResponse, RemoteOperationKind, RemotePairingOfferSummary,
+    RemoteGitStatusResponse, RemoteGitWorktreeEligibilityRequest,
+    RemoteGitWorktreeEligibilityResponse, RemoteGitWorktreeSnapshotRequest,
+    RemoteGitWorktreeSnapshotResponse, RemoteOperationKind, RemotePairingOfferSummary,
     RemoteProviderHealthSummaryListRequest, RemoteProviderHealthSummaryListResponse,
     RemoteProviderRequest, RemoteProviderRunHealthProbesRequest,
     RemoteProviderRunHealthProbesResponse, RemoteRevokeDeviceRequest, RemoteTerminalCreateRequest,
@@ -1031,6 +1034,65 @@ impl GitBackend for WebRemoteBackend {
         })
     }
 
+    fn git_worktree_eligibility(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BackendFuture<'_, GitProjectEligibility> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteWorkbenchRequest::GitWorktreeEligibility(
+                RemoteGitWorktreeEligibilityRequest {
+                    auth: this.auth(),
+                    workspace_id,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::Git,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<RemoteGitWorktreeEligibilityResponse>(value)?.eligibility)
+        })
+    }
+
+    fn git_worktree_snapshot(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BackendFuture<'_, GitWorktreeLifecycleSnapshot> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload =
+                RemoteWorkbenchRequest::GitWorktreeSnapshot(RemoteGitWorktreeSnapshotRequest {
+                    auth: this.auth(),
+                    workspace_id,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::Git,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<RemoteGitWorktreeSnapshotResponse>(value)?.snapshot)
+        })
+    }
+
+    fn git_worktree_create(
+        &self,
+        _request: MutationRequest<GitWorktreeCreateRequest>,
+    ) -> BackendFuture<'_, GitWorktreeCreateResult> {
+        self.unsupported(
+            "remote_worktree_mutation_unsupported",
+            "managed worktree creation is available only on the desktop runtime",
+        )
+    }
+
     fn stage(
         &self,
         request: MutationRequest<GitStageRequest>,
@@ -1592,6 +1654,7 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
     let has_agent = features.is_empty() || features.contains("agent");
     let has_workbench = features.is_empty() || features.contains("workspace_file");
     let has_git = features.is_empty() || features.contains("git");
+    let has_worktree_read = features.contains("git_worktree_read");
     let has_terminal = features.is_empty() || features.contains("terminal");
     let has_provider = features.is_empty() || features.contains("provider_settings");
     let has_device = features.contains("device_management");
@@ -1704,6 +1767,10 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
                 (
                     BackendOperation::GitCommit,
                     permits(RemoteActionClass::MutateGit),
+                ),
+                (
+                    BackendOperation::GitWorktreeRead,
+                    has_worktree_read && permits(RemoteActionClass::ReadProject),
                 ),
             ])
         } else {
@@ -2024,6 +2091,16 @@ mod tests {
         assert!(snapshot.file.supports(BackendOperation::FileWrite));
         assert!(!snapshot.file.supports(BackendOperation::FileMove));
         assert!(!snapshot.file.supports(BackendOperation::FileDelete));
+        assert!(!snapshot.git.supports(BackendOperation::GitWorktreeRead));
+        assert!(!snapshot.git.supports(BackendOperation::GitWorktreeCreate));
+    }
+
+    #[test]
+    fn negotiated_remote_exposes_worktree_read_but_never_create() {
+        let info = full_control_server_info(&["git", "git_worktree_read"]);
+        let snapshot = remote_capabilities(Some(&info));
+        assert!(snapshot.git.supports(BackendOperation::GitWorktreeRead));
+        assert!(!snapshot.git.supports(BackendOperation::GitWorktreeCreate));
     }
 
     #[test]

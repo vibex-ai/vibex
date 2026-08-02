@@ -36,16 +36,16 @@ use vibex_core::{
     RemoteFileTreeResponse, RemoteFileWriteResponse, RemoteGitBlameResponse,
     RemoteGitBranchListResponse, RemoteGitCommitDetailResponse, RemoteGitCommitResponse,
     RemoteGitDiffResponse, RemoteGitHistoryResponse, RemoteGitRemoteActionResponse,
-    RemoteGitStatusMutationResponse, RemoteGitStatusResponse, RemoteHandshakeResponse,
-    RemoteHealthState, RemoteHealthStatus, RemoteLiveEventChannel, RemoteLiveEventEnvelope,
-    RemoteOperationKind, RemotePairingCode, RemoteProtocolVersion,
-    RemoteProviderFailoverRecommendationListResponse, RemoteProviderHealthSummaryListResponse,
-    RemoteProviderInjectionPreviewResponse, RemoteProviderProfileListResponse,
-    RemoteProviderRequest, RemoteProviderRunHealthProbesResponse,
-    RemoteProviderUsageSummaryListResponse, RemoteRequestEnvelope, RemoteResponseEnvelope,
-    RemoteRevokeDeviceRequest, RemoteServiceInfo, RemoteTerminalCreateResponse,
-    RemoteTerminalKillResponse, RemoteTerminalListResponse, RemoteTerminalResizeResponse,
-    RemoteTerminalSnapshotResponse, RemoteTerminalWriteResponse,
+    RemoteGitStatusMutationResponse, RemoteGitStatusResponse, RemoteGitWorktreeEligibilityResponse,
+    RemoteGitWorktreeSnapshotResponse, RemoteHandshakeResponse, RemoteHealthState,
+    RemoteHealthStatus, RemoteLiveEventChannel, RemoteLiveEventEnvelope, RemoteOperationKind,
+    RemotePairingCode, RemoteProtocolVersion, RemoteProviderFailoverRecommendationListResponse,
+    RemoteProviderHealthSummaryListResponse, RemoteProviderInjectionPreviewResponse,
+    RemoteProviderProfileListResponse, RemoteProviderRequest,
+    RemoteProviderRunHealthProbesResponse, RemoteProviderUsageSummaryListResponse,
+    RemoteRequestEnvelope, RemoteResponseEnvelope, RemoteRevokeDeviceRequest, RemoteServiceInfo,
+    RemoteTerminalCreateResponse, RemoteTerminalKillResponse, RemoteTerminalListResponse,
+    RemoteTerminalResizeResponse, RemoteTerminalSnapshotResponse, RemoteTerminalWriteResponse,
     RemoteWorkbenchListWorkspacesResponse, RemoteWorkbenchOpenWorkspaceResponse,
     RemoteWorkbenchRequest, RequestId, ResolvePermissionRequest, RuntimeLeaseRole,
     SessionRuntimeOptionCatalog, TerminalSession, TerminalStatus, TimelineLiveEvent, VibexError,
@@ -122,6 +122,19 @@ pub trait RemoteRuntimeOptionCatalogSource: Send + Sync {
     async fn list_runtime_options(&self) -> VibexResult<SessionRuntimeOptionCatalog>;
 }
 
+#[async_trait]
+pub trait RemoteWorktreeSnapshotSource: Send + Sync {
+    async fn worktree_eligibility(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> VibexResult<vibex_core::GitProjectEligibility>;
+
+    async fn worktree_snapshot(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> VibexResult<vibex_core::GitWorktreeLifecycleSnapshot>;
+}
+
 #[derive(Clone)]
 pub struct RemoteDispatcher {
     state: RemoteRouterState,
@@ -131,6 +144,7 @@ pub struct RemoteDispatcher {
 pub struct RemoteWorkbenchRuntime {
     db_path: PathBuf,
     terminals: TerminalManager,
+    worktrees: Option<Arc<dyn RemoteWorktreeSnapshotSource>>,
 }
 
 impl RemoteWorkbenchRuntime {
@@ -138,7 +152,16 @@ impl RemoteWorkbenchRuntime {
         Self {
             db_path: db_path.into(),
             terminals,
+            worktrees: None,
         }
+    }
+
+    pub fn with_worktree_snapshot_source(
+        mut self,
+        source: Arc<dyn RemoteWorktreeSnapshotSource>,
+    ) -> Self {
+        self.worktrees = Some(source);
+        self
     }
 }
 
@@ -1931,6 +1954,42 @@ async fn dispatch_workbench_request(
             serde_json::to_value(RemoteGitRemoteActionResponse { result })
                 .map_err(remote_payload_encode_error)
         }
+        RemoteWorkbenchRequest::GitWorktreeEligibility(request) => {
+            authorize_workbench_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProject,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let source = runtime.worktrees.as_ref().ok_or_else(|| {
+                VibexError::validation(
+                    "remote_worktree_read_unavailable",
+                    "remote worktree snapshots are unavailable",
+                )
+            })?;
+            let eligibility = source.worktree_eligibility(request.workspace_id).await?;
+            serde_json::to_value(RemoteGitWorktreeEligibilityResponse { eligibility })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteWorkbenchRequest::GitWorktreeSnapshot(request) => {
+            authorize_workbench_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProject,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let source = runtime.worktrees.as_ref().ok_or_else(|| {
+                VibexError::validation(
+                    "remote_worktree_read_unavailable",
+                    "remote worktree snapshots are unavailable",
+                )
+            })?;
+            let snapshot = source.worktree_snapshot(request.workspace_id).await?;
+            serde_json::to_value(RemoteGitWorktreeSnapshotResponse { snapshot })
+                .map_err(remote_payload_encode_error)
+        }
         RemoteWorkbenchRequest::TerminalList(request) => {
             authorize_workbench_action(
                 runtime,
@@ -2660,6 +2719,11 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct TestWorktreeSnapshotSource {
+        eligibility: vibex_core::GitProjectEligibility,
+        snapshot: vibex_core::GitWorktreeLifecycleSnapshot,
+    }
+
     impl TestRuntimeCatalogSource {
         fn new(session: &AgentSession) -> Self {
             let mut selection = remote_test_selection(session);
@@ -2695,6 +2759,23 @@ mod tests {
         async fn list_runtime_options(&self) -> VibexResult<SessionRuntimeOptionCatalog> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.catalog.clone())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteWorktreeSnapshotSource for TestWorktreeSnapshotSource {
+        async fn worktree_eligibility(
+            &self,
+            _workspace_id: WorkspaceId,
+        ) -> VibexResult<vibex_core::GitProjectEligibility> {
+            Ok(self.eligibility.clone())
+        }
+
+        async fn worktree_snapshot(
+            &self,
+            _workspace_id: WorkspaceId,
+        ) -> VibexResult<vibex_core::GitWorktreeLifecycleSnapshot> {
+            Ok(self.snapshot.clone())
         }
     }
 
@@ -3527,6 +3608,80 @@ mod tests {
             payload.file.content.as_deref(),
             Some("pub fn marker() {}\n")
         );
+
+        cleanup_db(db_path);
+        cleanup_workspace(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn remote_workbench_worktree_reads_use_the_injected_authority() {
+        let (db_path, manager) = test_agent_manager("worktree-read");
+        let workspace_root = temp_workspace_root("worktree-read");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let workspace = ensure_workspace(&db_path, &workspace_root);
+        let eligibility = vibex_core::GitProjectEligibility {
+            project_id: workspace.project_id.clone(),
+            project_canonical_path: vibex_git::canonical_path_identity(&workspace_root),
+            state: vibex_core::GitProjectEligibilityState::Ineligible,
+            repository_identity: None,
+            current_branch: None,
+            default_base_ref: None,
+            selectable_base_refs: Vec::new(),
+            observed_head: None,
+            revision: "test-worktree-eligibility".to_string(),
+            disabled_reason: Some(vibex_core::GitProjectIneligibleReason::NotWorkingTree),
+        };
+        let snapshot = vibex_core::GitWorktreeLifecycleSnapshot {
+            workspace_id: workspace.id.clone(),
+            eligibility: eligibility.clone(),
+            managed_worktrees: Vec::new(),
+            operations: Vec::new(),
+            diagnostics: Vec::new(),
+            revision: "test-worktree-snapshot".to_string(),
+        };
+        let source = Arc::new(TestWorktreeSnapshotSource {
+            eligibility: eligibility.clone(),
+            snapshot: snapshot.clone(),
+        });
+        let auth = pair_device(&db_path, RemoteDevicePermissionLevel::ReadOnly, "Reader");
+        let router = build_router_with_agent_and_workbench(
+            RemoteServiceConfig::loopback_disabled(),
+            manager,
+            RemoteWorkbenchRuntime::new(db_path.clone(), TerminalManager::new())
+                .with_worktree_snapshot_source(source),
+        );
+
+        let eligibility_response = post_workbench(
+            router.clone(),
+            RemoteOperationKind::Git,
+            RemoteWorkbenchRequest::GitWorktreeEligibility(
+                vibex_core::RemoteGitWorktreeEligibilityRequest {
+                    auth: auth.clone(),
+                    workspace_id: workspace.id.clone(),
+                },
+            ),
+        )
+        .await;
+        let eligibility_payload: vibex_core::RemoteGitWorktreeEligibilityResponse =
+            serde_json::from_value(eligibility_response.payload.unwrap()).unwrap();
+        assert_eq!(eligibility_response.status, RemoteEnvelopeStatus::Ok);
+        assert_eq!(eligibility_payload.eligibility, eligibility);
+
+        let snapshot_response = post_workbench(
+            router,
+            RemoteOperationKind::Git,
+            RemoteWorkbenchRequest::GitWorktreeSnapshot(
+                vibex_core::RemoteGitWorktreeSnapshotRequest {
+                    auth,
+                    workspace_id: workspace.id.clone(),
+                },
+            ),
+        )
+        .await;
+        let snapshot_payload: vibex_core::RemoteGitWorktreeSnapshotResponse =
+            serde_json::from_value(snapshot_response.payload.unwrap()).unwrap();
+        assert_eq!(snapshot_response.status, RemoteEnvelopeStatus::Ok);
+        assert_eq!(snapshot_payload.snapshot, snapshot);
 
         cleanup_db(db_path);
         cleanup_workspace(workspace_root);

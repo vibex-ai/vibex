@@ -9,6 +9,7 @@ mod relay;
 mod remote_connectivity;
 mod usage;
 mod workbench;
+mod worktree;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -43,7 +44,7 @@ use vibex_desktop_model::DesktopPollingPolicy;
 use vibex_diagnostics::{DiagnosticBundleService, DiagnosticBundleServiceConfig};
 use vibex_remote::{
     RemoteDispatcher, RemoteGateway, RemoteGatewayConfig, RemoteRouter, RemoteServiceConfig,
-    RemoteWorkbenchRuntime, build_router_with_dispatcher,
+    RemoteWorkbenchRuntime, RemoteWorktreeSnapshotSource, build_router_with_dispatcher,
 };
 use vibex_terminal::TerminalManager;
 
@@ -78,6 +79,7 @@ pub use remote_connectivity::{
     parse_tailscale_inspection,
 };
 pub use usage::AgentUsageService;
+pub use worktree::{WorktreeCoordinator, WorktreeCreateContext};
 
 pub const STABLE_DESKTOP_APP_ID: &str = "dev.vibex.desktop";
 pub const PREVIEW_APP_ID: &str = "dev.vibex.desktop.preview";
@@ -403,11 +405,29 @@ impl FileHandle {
 pub struct GitHandle {
     db_path: PathBuf,
     mutation_claims: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    worktrees: Arc<WorktreeCoordinator>,
 }
 
 impl GitHandle {
     pub fn database_path(&self) -> &Path {
         &self.db_path
+    }
+}
+
+#[async_trait]
+impl RemoteWorktreeSnapshotSource for GitHandle {
+    async fn worktree_eligibility(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> VibexResult<vibex_core::GitProjectEligibility> {
+        self.project_git_eligibility(&workspace_id)
+    }
+
+    async fn worktree_snapshot(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> VibexResult<vibex_core::GitWorktreeLifecycleSnapshot> {
+        self.worktree_snapshot(&workspace_id)
     }
 }
 
@@ -713,6 +733,11 @@ impl DesktopRuntime {
             NATIVE_TERMINAL_RING_CAPACITY,
             NATIVE_TERMINAL_RAW_CAPACITY_BYTES,
         );
+        let git = GitHandle {
+            db_path: db_path.clone(),
+            mutation_claims: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+            worktrees: Arc::new(WorktreeCoordinator::new(db_path.clone())),
+        };
         let remote_config = config.remote_gateway.service.clone();
         let remote_dispatcher = RemoteDispatcher::with_agent_runtime_lifecycle_and_workbench(
             remote_config.clone(),
@@ -720,7 +745,8 @@ impl DesktopRuntime {
             runtime_selection.clone(),
             runtime_lifecycle.clone(),
             message_submission.clone(),
-            RemoteWorkbenchRuntime::new(db_path.clone(), terminals.clone()),
+            RemoteWorkbenchRuntime::new(db_path.clone(), terminals.clone())
+                .with_worktree_snapshot_source(Arc::new(git.clone())),
         )
         .with_runtime_option_catalog_source(runtime_catalog.clone());
         let remote_gateway = RemoteGateway::new(
@@ -775,10 +801,7 @@ impl DesktopRuntime {
             files: FileHandle {
                 db_path: db_path.clone(),
             },
-            git: GitHandle {
-                db_path: db_path.clone(),
-                mutation_claims: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
-            },
+            git,
             terminals: TerminalHandle {
                 db_path: db_path.clone(),
                 manager: terminals,
@@ -824,6 +847,13 @@ impl DesktopRuntime {
     }
 
     async fn activate(self: &Arc<Self>) -> VibexResult<()> {
+        if let Err(error) = self.git.reconcile_worktrees_on_startup() {
+            tracing::warn!(
+                target: "vibex_desktop",
+                error_code = %error.code,
+                "managed worktree startup reconciliation failed"
+            );
+        }
         self.agent
             .runtime_lifecycle
             .start(&tokio::runtime::Handle::current())?;

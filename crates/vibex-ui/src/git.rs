@@ -707,6 +707,10 @@ mod tests {
     use std::process::Command;
 
     use super::*;
+    use vibex_core::{
+        GitProjectEligibility, GitWorktreeCreateRequest, GitWorktreeCreateResult,
+        GitWorktreeLifecycleSnapshot,
+    };
 
     #[derive(Clone)]
     struct FixtureGitBackend {
@@ -724,6 +728,36 @@ mod tests {
         fn git_diff(&self, request: GitDiffRequest) -> BackendFuture<'_, GitDiffResponse> {
             let repo = self.repo.clone();
             Box::pin(async move { vibex_git::diff(repo.as_path(), &request).map_err(Into::into) })
+        }
+
+        fn git_worktree_eligibility(
+            &self,
+            _workspace_id: WorkspaceId,
+        ) -> BackendFuture<'_, GitProjectEligibility> {
+            error_future(BackendError::unsupported(
+                "fixture_worktree_unsupported",
+                "fixture Git backend does not expose managed worktrees",
+            ))
+        }
+
+        fn git_worktree_snapshot(
+            &self,
+            _workspace_id: WorkspaceId,
+        ) -> BackendFuture<'_, GitWorktreeLifecycleSnapshot> {
+            error_future(BackendError::unsupported(
+                "fixture_worktree_unsupported",
+                "fixture Git backend does not expose managed worktrees",
+            ))
+        }
+
+        fn git_worktree_create(
+            &self,
+            _request: MutationRequest<GitWorktreeCreateRequest>,
+        ) -> BackendFuture<'_, GitWorktreeCreateResult> {
+            error_future(BackendError::unsupported(
+                "fixture_worktree_unsupported",
+                "fixture Git backend does not expose managed worktrees",
+            ))
         }
 
         fn stage(

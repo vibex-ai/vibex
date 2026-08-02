@@ -15,12 +15,14 @@ use vibex_core::{
     AutomationRun, AutomationRunCreateRequest, AutomationRunId, AutomationRunListRequest,
     AutomationRunStep, AutomationRunStepCreateRequest, AutomationRunStepId,
     AutomationRunStepListRequest, AutomationRunStepUpdateRequest, AutomationRunUpdateRequest,
-    CorrelationId, DeviceId, GitManagedWorktreeStatus, GitWorktreeOperationRecord,
-    GitWorktreeOperationStatus, Hook, HookCreateRequest, HookId, HookInstallPreview,
-    HookInstallState, McpServer, McpServerAgentMatrix, McpServerCreateRequest, McpServerId,
-    McpServerProviderMatrix, McpServerSecretReference, McpServerStatus, PermissionActionDetail,
-    PermissionRequest, PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
-    ProjectId, ProjectRecord, Prompt, PromptCreateRequest, PromptId, PromptStatus,
+    CorrelationId, DeviceId, GitManagedWorktreeRecord, GitManagedWorktreeStatus,
+    GitWorktreeDiagnostic, GitWorktreeOperationCheckpoint, GitWorktreeOperationDetail,
+    GitWorktreeOperationRecord, GitWorktreeOperationStatus, GitWorktreeReconciliationState, Hook,
+    HookCreateRequest, HookId, HookInstallPreview, HookInstallState, McpServer,
+    McpServerAgentMatrix, McpServerCreateRequest, McpServerId, McpServerProviderMatrix,
+    McpServerSecretReference, McpServerStatus, PermissionActionDetail, PermissionRequest,
+    PermissionRequestStatus, PermissionResolution, PermissionResponseKind, ProjectId,
+    ProjectRecord, Prompt, PromptCreateRequest, PromptId, PromptStatus,
     ProviderCapabilityProbeResult, ProviderHealthProbeResult, ProviderInjectionPreview,
     ProviderInjectionPreviewRequest, ProviderKind, ProviderNativeExportApplyResult,
     ProviderNativeExportFilePlan, ProviderNativeExportListRequest, ProviderNativeExportPreview,
@@ -64,7 +66,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 32;
+pub const CURRENT_SCHEMA_VERSION: i64 = 33;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -1425,6 +1427,45 @@ const MIGRATIONS: &[Migration] = &[
                     CHECK(usage_zero_baseline_activation_generation >= 0);
         ",
     },
+    Migration {
+        version: 33,
+        name: "managed_worktree_recovery_foundation",
+        sql: "
+            ALTER TABLE git_managed_worktrees ADD COLUMN repo_identity_key TEXT NULL;
+            ALTER TABLE git_managed_worktrees ADD COLUMN worktree_identity_key TEXT NULL;
+            ALTER TABLE git_managed_worktrees ADD COLUMN repository_identity_json TEXT NULL;
+            ALTER TABLE git_managed_worktrees ADD COLUMN worktree_identity_json TEXT NULL;
+            ALTER TABLE git_managed_worktrees ADD COLUMN canonical_worktree_path TEXT NULL;
+            ALTER TABLE git_managed_worktrees ADD COLUMN origin_workspace_id TEXT NULL;
+            ALTER TABLE git_managed_worktrees ADD COLUMN base_head TEXT NULL;
+            ALTER TABLE git_managed_worktrees ADD COLUMN target_workspace_id TEXT NULL;
+            ALTER TABLE git_managed_worktrees ADD COLUMN target_branch TEXT NULL;
+            ALTER TABLE git_managed_worktrees
+                ADD COLUMN reconciliation_state TEXT NOT NULL DEFAULT 'unverified';
+            ALTER TABLE git_managed_worktrees ADD COLUMN diagnostic_json TEXT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_git_managed_worktrees_identity
+                ON git_managed_worktrees(worktree_identity_key)
+                WHERE worktree_identity_key IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_git_managed_worktrees_repo_identity
+                ON git_managed_worktrees(repo_identity_key, status, updated_at_ms);
+
+            ALTER TABLE git_worktree_operations ADD COLUMN idempotency_key TEXT NULL;
+            ALTER TABLE git_worktree_operations ADD COLUMN request_fingerprint TEXT NULL;
+            ALTER TABLE git_worktree_operations
+                ADD COLUMN checkpoint TEXT NOT NULL DEFAULT 'intent_recorded';
+            ALTER TABLE git_worktree_operations ADD COLUMN detail_json TEXT NULL;
+            ALTER TABLE git_worktree_operations ADD COLUMN lease_owner TEXT NULL;
+            ALTER TABLE git_worktree_operations ADD COLUMN lease_expires_at_ms INTEGER NULL;
+            ALTER TABLE git_worktree_operations
+                ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0 CHECK(attempt >= 0);
+            ALTER TABLE git_worktree_operations ADD COLUMN diagnostic_json TEXT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_git_worktree_operations_idempotency
+                ON git_worktree_operations(idempotency_key)
+                WHERE idempotency_key IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_git_worktree_operations_reconcile
+                ON git_worktree_operations(status, lease_expires_at_ms, updated_at_ms);
+        ",
+    },
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -1530,21 +1571,14 @@ macro_rules! provider_profile_params {
     };
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ManagedWorktreeRecord {
-    pub worktree_id: RequestId,
-    pub project_id: ProjectId,
-    pub workspace_id: Option<WorkspaceId>,
-    pub repo_root: String,
-    pub worktree_path: String,
-    pub branch: Option<String>,
-    pub base_ref: Option<String>,
-    pub head: Option<String>,
-    pub status: GitManagedWorktreeStatus,
-    pub created_at_ms: i64,
-    pub updated_at_ms: i64,
-    pub closed_at_ms: Option<i64>,
+pub type ManagedWorktreeRecord = GitManagedWorktreeRecord;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeOperationClaimOutcome {
+    Acquired(GitWorktreeOperationRecord),
+    Completed(GitWorktreeOperationRecord),
+    Busy(GitWorktreeOperationRecord),
+    NeedsAttention(GitWorktreeOperationRecord),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -7396,13 +7430,39 @@ impl GitSnapshotRepository {
 
 impl ManagedWorktreeRepository {
     pub fn insert(conn: &Connection, record: &ManagedWorktreeRecord) -> VibexResult<()> {
+        if let Some(identity) = record.worktree_path_identity.as_ref()
+            && let Some(existing) = Self::get_by_identity_key(conn, &identity.comparison_key)?
+            && existing.worktree_id != record.worktree_id
+        {
+            return Err(VibexError::conflict(
+                "managed_worktree_identity_conflict",
+                "canonical worktree identity is already managed",
+            ));
+        }
+        let repository_identity_json = record
+            .repository_identity
+            .as_ref()
+            .map(json_to_db)
+            .transpose()?;
+        let worktree_identity_json = record
+            .worktree_path_identity
+            .as_ref()
+            .map(json_to_db)
+            .transpose()?;
+        let diagnostic_json = record.diagnostic.as_ref().map(json_to_db).transpose()?;
         conn.execute(
             "
             INSERT INTO git_managed_worktrees (
                 worktree_id, project_id, workspace_id, repo_root, worktree_path,
-                branch, base_ref, head, status, created_at_ms, updated_at_ms, closed_at_ms
+                repo_identity_key, worktree_identity_key, repository_identity_json,
+                worktree_identity_json, canonical_worktree_path, branch, origin_workspace_id,
+                base_ref, base_head, target_workspace_id, target_branch, head, status,
+                reconciliation_state, diagnostic_json, created_at_ms, updated_at_ms, closed_at_ms
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
+            )
             ",
             params![
                 record.worktree_id.as_str(),
@@ -7410,10 +7470,32 @@ impl ManagedWorktreeRepository {
                 record.workspace_id.as_ref().map(WorkspaceId::as_str),
                 record.repo_root,
                 record.worktree_path,
+                record
+                    .repository_identity
+                    .as_ref()
+                    .map(|identity| identity.comparison_key.as_str()),
+                record
+                    .worktree_path_identity
+                    .as_ref()
+                    .map(|identity| identity.comparison_key.as_str()),
+                repository_identity_json,
+                worktree_identity_json,
+                record.worktree_path_identity.as_ref().map(|identity| {
+                    identity
+                        .canonical_path
+                        .as_deref()
+                        .unwrap_or(&identity.normalized_path)
+                }),
                 record.branch,
+                record.origin_workspace_id.as_ref().map(WorkspaceId::as_str),
                 record.base_ref,
+                record.base_head,
+                record.target_workspace_id.as_ref().map(WorkspaceId::as_str),
+                record.target_branch,
                 record.head,
                 enum_to_db(&record.status)?,
+                enum_to_db(&record.reconciliation_state)?,
+                diagnostic_json,
                 record.created_at_ms,
                 record.updated_at_ms,
                 record.closed_at_ms
@@ -7427,19 +7509,56 @@ impl ManagedWorktreeRepository {
     }
 
     pub fn upsert(conn: &Connection, record: &ManagedWorktreeRecord) -> VibexResult<()> {
+        if let Some(identity) = record.worktree_path_identity.as_ref()
+            && let Some(existing) = Self::get_by_identity_key(conn, &identity.comparison_key)?
+            && existing.worktree_id != record.worktree_id
+        {
+            return Err(VibexError::conflict(
+                "managed_worktree_identity_conflict",
+                "canonical worktree identity is already managed",
+            ));
+        }
+        let repository_identity_json = record
+            .repository_identity
+            .as_ref()
+            .map(json_to_db)
+            .transpose()?;
+        let worktree_identity_json = record
+            .worktree_path_identity
+            .as_ref()
+            .map(json_to_db)
+            .transpose()?;
+        let diagnostic_json = record.diagnostic.as_ref().map(json_to_db).transpose()?;
         conn.execute(
             "
             INSERT INTO git_managed_worktrees (
                 worktree_id, project_id, workspace_id, repo_root, worktree_path,
-                branch, base_ref, head, status, created_at_ms, updated_at_ms, closed_at_ms
+                repo_identity_key, worktree_identity_key, repository_identity_json,
+                worktree_identity_json, canonical_worktree_path, branch, origin_workspace_id,
+                base_ref, base_head, target_workspace_id, target_branch, head, status,
+                reconciliation_state, diagnostic_json, created_at_ms, updated_at_ms, closed_at_ms
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
+            )
             ON CONFLICT(worktree_path) DO UPDATE SET
                 workspace_id = excluded.workspace_id,
+                repo_identity_key = excluded.repo_identity_key,
+                worktree_identity_key = excluded.worktree_identity_key,
+                repository_identity_json = excluded.repository_identity_json,
+                worktree_identity_json = excluded.worktree_identity_json,
+                canonical_worktree_path = excluded.canonical_worktree_path,
                 branch = excluded.branch,
+                origin_workspace_id = excluded.origin_workspace_id,
                 base_ref = excluded.base_ref,
+                base_head = excluded.base_head,
+                target_workspace_id = excluded.target_workspace_id,
+                target_branch = excluded.target_branch,
                 head = excluded.head,
                 status = excluded.status,
+                reconciliation_state = excluded.reconciliation_state,
+                diagnostic_json = excluded.diagnostic_json,
                 updated_at_ms = excluded.updated_at_ms,
                 closed_at_ms = excluded.closed_at_ms
             ",
@@ -7449,10 +7568,32 @@ impl ManagedWorktreeRepository {
                 record.workspace_id.as_ref().map(WorkspaceId::as_str),
                 record.repo_root,
                 record.worktree_path,
+                record
+                    .repository_identity
+                    .as_ref()
+                    .map(|identity| identity.comparison_key.as_str()),
+                record
+                    .worktree_path_identity
+                    .as_ref()
+                    .map(|identity| identity.comparison_key.as_str()),
+                repository_identity_json,
+                worktree_identity_json,
+                record.worktree_path_identity.as_ref().map(|identity| {
+                    identity
+                        .canonical_path
+                        .as_deref()
+                        .unwrap_or(&identity.normalized_path)
+                }),
                 record.branch,
+                record.origin_workspace_id.as_ref().map(WorkspaceId::as_str),
                 record.base_ref,
+                record.base_head,
+                record.target_workspace_id.as_ref().map(WorkspaceId::as_str),
+                record.target_branch,
                 record.head,
                 enum_to_db(&record.status)?,
+                enum_to_db(&record.reconciliation_state)?,
+                diagnostic_json,
                 record.created_at_ms,
                 record.updated_at_ms,
                 record.closed_at_ms
@@ -7513,6 +7654,40 @@ impl ManagedWorktreeRepository {
         Ok(())
     }
 
+    pub fn update_reconciliation(
+        conn: &Connection,
+        worktree_id: &RequestId,
+        state: GitWorktreeReconciliationState,
+        diagnostic: Option<&GitWorktreeDiagnostic>,
+    ) -> VibexResult<()> {
+        let diagnostic_json = diagnostic.map(json_to_db).transpose()?;
+        let changed = conn
+            .execute(
+                "
+                UPDATE git_managed_worktrees
+                SET reconciliation_state = ?2, diagnostic_json = ?3, updated_at_ms = ?4
+                WHERE worktree_id = ?1
+                ",
+                params![
+                    worktree_id.as_str(),
+                    enum_to_db(&state)?,
+                    diagnostic_json,
+                    unix_timestamp_ms()
+                ],
+            )
+            .map_err(storage_err(
+                "managed_worktree_reconciliation_update_failed",
+                "failed to update managed worktree reconciliation state",
+            ))?;
+        if changed == 0 {
+            return Err(VibexError::storage(
+                "managed_worktree_not_found",
+                "managed worktree was not found",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn get_by_path(
         conn: &Connection,
         worktree_path: &str,
@@ -7520,11 +7695,59 @@ impl ManagedWorktreeRepository {
         conn.query_row(
             "
             SELECT worktree_id, project_id, workspace_id, repo_root, worktree_path,
-                branch, base_ref, head, status, created_at_ms, updated_at_ms, closed_at_ms
+                repository_identity_json, worktree_identity_json, branch, origin_workspace_id,
+                base_ref, base_head, target_workspace_id, target_branch, head, status,
+                reconciliation_state, diagnostic_json, created_at_ms, updated_at_ms, closed_at_ms
             FROM git_managed_worktrees
             WHERE worktree_path = ?1
             ",
             params![worktree_path],
+            map_managed_worktree,
+        )
+        .optional()
+        .map_err(storage_err(
+            "managed_worktree_lookup_failed",
+            "failed to lookup managed worktree",
+        ))
+    }
+
+    pub fn get_by_identity_key(
+        conn: &Connection,
+        identity_key: &str,
+    ) -> VibexResult<Option<ManagedWorktreeRecord>> {
+        conn.query_row(
+            "
+            SELECT worktree_id, project_id, workspace_id, repo_root, worktree_path,
+                repository_identity_json, worktree_identity_json, branch, origin_workspace_id,
+                base_ref, base_head, target_workspace_id, target_branch, head, status,
+                reconciliation_state, diagnostic_json, created_at_ms, updated_at_ms, closed_at_ms
+            FROM git_managed_worktrees
+            WHERE worktree_identity_key = ?1
+            ",
+            params![identity_key],
+            map_managed_worktree,
+        )
+        .optional()
+        .map_err(storage_err(
+            "managed_worktree_identity_lookup_failed",
+            "failed to lookup managed worktree identity",
+        ))
+    }
+
+    pub fn get_by_id(
+        conn: &Connection,
+        worktree_id: &RequestId,
+    ) -> VibexResult<Option<ManagedWorktreeRecord>> {
+        conn.query_row(
+            "
+            SELECT worktree_id, project_id, workspace_id, repo_root, worktree_path,
+                repository_identity_json, worktree_identity_json, branch, origin_workspace_id,
+                base_ref, base_head, target_workspace_id, target_branch, head, status,
+                reconciliation_state, diagnostic_json, created_at_ms, updated_at_ms, closed_at_ms
+            FROM git_managed_worktrees
+            WHERE worktree_id = ?1
+            ",
+            params![worktree_id.as_str()],
             map_managed_worktree,
         )
         .optional()
@@ -7542,7 +7765,9 @@ impl ManagedWorktreeRepository {
             .prepare(
                 "
                 SELECT worktree_id, project_id, workspace_id, repo_root, worktree_path,
-                    branch, base_ref, head, status, created_at_ms, updated_at_ms, closed_at_ms
+                    repository_identity_json, worktree_identity_json, branch, origin_workspace_id,
+                    base_ref, base_head, target_workspace_id, target_branch, head, status,
+                    reconciliation_state, diagnostic_json, created_at_ms, updated_at_ms, closed_at_ms
                 FROM git_managed_worktrees
                 WHERE project_id = ?1
                 ORDER BY updated_at_ms DESC
@@ -7568,18 +7793,59 @@ impl ManagedWorktreeRepository {
         }
         Ok(records)
     }
+
+    pub fn list_all(conn: &Connection) -> VibexResult<Vec<ManagedWorktreeRecord>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT worktree_id, project_id, workspace_id, repo_root, worktree_path,
+                    repository_identity_json, worktree_identity_json, branch, origin_workspace_id,
+                    base_ref, base_head, target_workspace_id, target_branch, head, status,
+                    reconciliation_state, diagnostic_json, created_at_ms, updated_at_ms, closed_at_ms
+                FROM git_managed_worktrees
+                ORDER BY updated_at_ms DESC
+                ",
+            )
+            .map_err(storage_err(
+                "managed_worktree_list_failed",
+                "failed to list managed worktrees",
+            ))?;
+        let rows = stmt
+            .query_map([], map_managed_worktree)
+            .map_err(storage_err(
+                "managed_worktree_list_failed",
+                "failed to list managed worktrees",
+            ))?;
+        collect_rows(
+            rows,
+            "managed_worktree_decode_failed",
+            "failed to decode managed worktree",
+        )
+    }
 }
 
 impl WorktreeOperationRepository {
     pub fn insert(conn: &Connection, record: &GitWorktreeOperationRecord) -> VibexResult<()> {
+        let detail_json = json_to_db(&record.detail)?;
+        let diagnostic_json = record
+            .detail
+            .diagnostic
+            .as_ref()
+            .map(json_to_db)
+            .transpose()?;
         conn.execute(
             "
             INSERT INTO git_worktree_operations (
                 operation_id, project_id, source_workspace_id, target_workspace_id,
                 operation, status, worktree_path, branch, base_ref, head_before,
-                head_after, error, created_at_ms, updated_at_ms
+                head_after, error, created_at_ms, updated_at_ms, idempotency_key,
+                request_fingerprint, checkpoint, detail_json, lease_owner,
+                lease_expires_at_ms, attempt, diagnostic_json
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
+            )
             ",
             params![
                 record.operation_id.as_str(),
@@ -7595,7 +7861,15 @@ impl WorktreeOperationRepository {
                 record.head_after,
                 record.error,
                 record.created_at_ms,
-                record.updated_at_ms
+                record.updated_at_ms,
+                record.detail.idempotency_key,
+                record.detail.request_fingerprint,
+                enum_to_db(&record.detail.checkpoint)?,
+                detail_json,
+                record.detail.lease_owner,
+                record.detail.lease_expires_at_ms,
+                i64::from(record.detail.attempt),
+                diagnostic_json
             ],
         )
         .map_err(storage_err(
@@ -7605,30 +7879,178 @@ impl WorktreeOperationRepository {
         Ok(())
     }
 
-    pub fn update(
+    pub fn reserve(
+        conn: &mut Connection,
+        record: &GitWorktreeOperationRecord,
+    ) -> VibexResult<GitWorktreeOperationRecord> {
+        let idempotency_key = validate_worktree_operation_token(
+            record.detail.idempotency_key.as_deref(),
+            "worktree_operation_idempotency_key_invalid",
+            "worktree operation idempotency key must be non-empty and bounded",
+        )?;
+        let request_fingerprint = validate_worktree_operation_token(
+            record.detail.request_fingerprint.as_deref(),
+            "worktree_operation_fingerprint_invalid",
+            "worktree operation request fingerprint must be non-empty and bounded",
+        )?;
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "worktree_operation_reserve_transaction_failed",
+                "failed to reserve worktree operation",
+            ))?;
+        if let Some(existing) = Self::get_by_idempotency_key(&transaction, idempotency_key)? {
+            if existing.detail.request_fingerprint.as_deref() != Some(request_fingerprint)
+                || existing.project_id != record.project_id
+                || existing.operation != record.operation
+            {
+                return Err(VibexError::conflict(
+                    "worktree_operation_idempotency_conflict",
+                    "worktree operation idempotency key belongs to another request",
+                ));
+            }
+            transaction.commit().map_err(storage_err(
+                "worktree_operation_reserve_commit_failed",
+                "failed to finish worktree operation reservation",
+            ))?;
+            return Ok(existing);
+        }
+        Self::insert(&transaction, record)?;
+        transaction.commit().map_err(storage_err(
+            "worktree_operation_reserve_commit_failed",
+            "failed to finish worktree operation reservation",
+        ))?;
+        Ok(record.clone())
+    }
+
+    pub fn try_claim(
         conn: &Connection,
         operation_id: &RequestId,
-        status: GitWorktreeOperationStatus,
+        lease_owner: &str,
+        now_ms: i64,
+        lease_duration_ms: i64,
+    ) -> VibexResult<WorktreeOperationClaimOutcome> {
+        validate_worktree_operation_token(
+            Some(lease_owner),
+            "worktree_operation_lease_owner_invalid",
+            "worktree operation lease owner must be non-empty and bounded",
+        )?;
+        if !(1..=86_400_000).contains(&lease_duration_ms) {
+            return Err(VibexError::validation(
+                "worktree_operation_lease_duration_invalid",
+                "worktree operation lease duration must be positive and at most 24 hours",
+            ));
+        }
+        let existing = Self::get(conn, operation_id)?.ok_or_else(|| {
+            VibexError::storage(
+                "worktree_operation_not_found",
+                "worktree operation was not found",
+            )
+        })?;
+        match existing.status {
+            GitWorktreeOperationStatus::Completed => {
+                return Ok(WorktreeOperationClaimOutcome::Completed(existing));
+            }
+            GitWorktreeOperationStatus::NeedsAttention
+            | GitWorktreeOperationStatus::NeedsResolution
+            | GitWorktreeOperationStatus::Aborted
+            | GitWorktreeOperationStatus::Unknown => {
+                return Ok(WorktreeOperationClaimOutcome::NeedsAttention(existing));
+            }
+            GitWorktreeOperationStatus::Pending
+            | GitWorktreeOperationStatus::Running
+            | GitWorktreeOperationStatus::Failed
+            | GitWorktreeOperationStatus::Recoverable => {}
+        }
+
+        let lease_expires_at_ms = now_ms.saturating_add(lease_duration_ms);
+        let mut detail = existing.detail.clone();
+        detail.attempt = detail.attempt.saturating_add(1);
+        detail.lease_owner = Some(lease_owner.to_string());
+        detail.lease_expires_at_ms = Some(lease_expires_at_ms);
+        let detail_json = json_to_db(&detail)?;
+        let pending = enum_to_db(&GitWorktreeOperationStatus::Pending)?;
+        let running = enum_to_db(&GitWorktreeOperationStatus::Running)?;
+        let failed = enum_to_db(&GitWorktreeOperationStatus::Failed)?;
+        let recoverable = enum_to_db(&GitWorktreeOperationStatus::Recoverable)?;
+        let changed = conn
+            .execute(
+                "
+                UPDATE git_worktree_operations
+                SET status = ?2, detail_json = ?3, lease_owner = ?4,
+                    lease_expires_at_ms = ?5, attempt = ?6, updated_at_ms = ?7
+                WHERE operation_id = ?1
+                  AND (
+                    status IN (?8, ?9, ?10)
+                    OR (status = ?2 AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?11))
+                  )
+                ",
+                params![
+                    operation_id.as_str(),
+                    running,
+                    detail_json,
+                    lease_owner,
+                    lease_expires_at_ms,
+                    i64::from(detail.attempt),
+                    now_ms,
+                    pending,
+                    failed,
+                    recoverable,
+                    now_ms
+                ],
+            )
+            .map_err(storage_err(
+                "worktree_operation_claim_failed",
+                "failed to claim worktree operation",
+            ))?;
+        let current = Self::get(conn, operation_id)?.ok_or_else(|| {
+            VibexError::storage(
+                "worktree_operation_missing_after_claim",
+                "worktree operation was not found after claim",
+            )
+        })?;
+        if changed == 1 {
+            Ok(WorktreeOperationClaimOutcome::Acquired(current))
+        } else {
+            Ok(WorktreeOperationClaimOutcome::Busy(current))
+        }
+    }
+
+    pub fn update_checkpoint(
+        conn: &Connection,
+        operation_id: &RequestId,
+        checkpoint: GitWorktreeOperationCheckpoint,
         head_after: Option<&str>,
-        error: Option<&str>,
     ) -> VibexResult<GitWorktreeOperationRecord> {
+        let mut record = Self::get(conn, operation_id)?.ok_or_else(|| {
+            VibexError::storage(
+                "worktree_operation_not_found",
+                "worktree operation was not found",
+            )
+        })?;
+        record.detail.checkpoint = checkpoint;
+        if let Some(head_after) = head_after {
+            record.head_after = Some(head_after.to_string());
+        }
+        let detail_json = json_to_db(&record.detail)?;
         conn.execute(
             "
             UPDATE git_worktree_operations
-            SET status = ?2, head_after = COALESCE(?3, head_after), error = ?4, updated_at_ms = ?5
+            SET checkpoint = ?2, detail_json = ?3,
+                head_after = COALESCE(?4, head_after), updated_at_ms = ?5
             WHERE operation_id = ?1
             ",
             params![
                 operation_id.as_str(),
-                enum_to_db(&status)?,
+                enum_to_db(&checkpoint)?,
+                detail_json,
                 head_after,
-                error,
                 unix_timestamp_ms()
             ],
         )
         .map_err(storage_err(
-            "worktree_operation_update_failed",
-            "failed to update worktree operation",
+            "worktree_operation_checkpoint_update_failed",
+            "failed to update worktree operation checkpoint",
         ))?;
         Self::get(conn, operation_id)?.ok_or_else(|| {
             VibexError::storage(
@@ -7636,6 +8058,97 @@ impl WorktreeOperationRepository {
                 "worktree operation was not found after update",
             )
         })
+    }
+
+    pub fn mark_outcome(
+        conn: &Connection,
+        operation_id: &RequestId,
+        status: GitWorktreeOperationStatus,
+        checkpoint: GitWorktreeOperationCheckpoint,
+        head_after: Option<&str>,
+        diagnostic: Option<&GitWorktreeDiagnostic>,
+    ) -> VibexResult<GitWorktreeOperationRecord> {
+        let mut record = Self::get(conn, operation_id)?.ok_or_else(|| {
+            VibexError::storage(
+                "worktree_operation_not_found",
+                "worktree operation was not found",
+            )
+        })?;
+        record.status = status;
+        record.detail.checkpoint = checkpoint;
+        record.detail.lease_owner = None;
+        record.detail.lease_expires_at_ms = None;
+        record.detail.diagnostic = diagnostic.cloned();
+        record.error = diagnostic.map(|value| value.summary.clone());
+        if let Some(head_after) = head_after {
+            record.head_after = Some(head_after.to_string());
+        }
+        let detail_json = json_to_db(&record.detail)?;
+        let diagnostic_json = diagnostic.map(json_to_db).transpose()?;
+        conn.execute(
+            "
+            UPDATE git_worktree_operations
+            SET status = ?2, checkpoint = ?3, detail_json = ?4,
+                head_after = COALESCE(?5, head_after), error = ?6,
+                lease_owner = NULL, lease_expires_at_ms = NULL,
+                diagnostic_json = ?7, updated_at_ms = ?8
+            WHERE operation_id = ?1
+            ",
+            params![
+                operation_id.as_str(),
+                enum_to_db(&status)?,
+                enum_to_db(&checkpoint)?,
+                detail_json,
+                head_after,
+                record.error,
+                diagnostic_json,
+                unix_timestamp_ms()
+            ],
+        )
+        .map_err(storage_err(
+            "worktree_operation_outcome_update_failed",
+            "failed to update worktree operation outcome",
+        ))?;
+        Self::get(conn, operation_id)?.ok_or_else(|| {
+            VibexError::storage(
+                "worktree_operation_missing_after_update",
+                "worktree operation was not found after update",
+            )
+        })
+    }
+
+    pub fn update(
+        conn: &Connection,
+        operation_id: &RequestId,
+        status: GitWorktreeOperationStatus,
+        head_after: Option<&str>,
+        error: Option<&str>,
+    ) -> VibexResult<GitWorktreeOperationRecord> {
+        let diagnostic = error.map(|summary| GitWorktreeDiagnostic {
+            code: "worktree_operation_failed".to_string(),
+            summary: summary.chars().take(512).collect(),
+            severity: vibex_core::GitWorktreeDiagnosticSeverity::Error,
+            retryable: status == GitWorktreeOperationStatus::Failed,
+            recovery_action: None,
+            operation_id: Some(operation_id.clone()),
+            worktree_id: None,
+            observed_at_ms: unix_timestamp_ms(),
+        });
+        let checkpoint = if status == GitWorktreeOperationStatus::Completed {
+            GitWorktreeOperationCheckpoint::Completed
+        } else {
+            Self::get(conn, operation_id)?
+                .map(|record| record.detail.checkpoint)
+                .unwrap_or_default()
+        };
+        Self::mark_outcome(
+            conn,
+            operation_id,
+            status,
+            checkpoint,
+            head_after,
+            diagnostic.as_ref(),
+        )
     }
 
     pub fn get(
@@ -7646,7 +8159,9 @@ impl WorktreeOperationRepository {
             "
             SELECT operation_id, project_id, source_workspace_id, target_workspace_id,
                 operation, status, worktree_path, branch, base_ref, head_before,
-                head_after, error, created_at_ms, updated_at_ms
+                head_after, error, created_at_ms, updated_at_ms, idempotency_key,
+                request_fingerprint, checkpoint, detail_json, lease_owner,
+                lease_expires_at_ms, attempt, diagnostic_json
             FROM git_worktree_operations
             WHERE operation_id = ?1
             ",
@@ -7658,6 +8173,98 @@ impl WorktreeOperationRepository {
             "worktree_operation_lookup_failed",
             "failed to lookup worktree operation",
         ))
+    }
+
+    pub fn get_by_idempotency_key(
+        conn: &Connection,
+        idempotency_key: &str,
+    ) -> VibexResult<Option<GitWorktreeOperationRecord>> {
+        conn.query_row(
+            "
+            SELECT operation_id, project_id, source_workspace_id, target_workspace_id,
+                operation, status, worktree_path, branch, base_ref, head_before,
+                head_after, error, created_at_ms, updated_at_ms, idempotency_key,
+                request_fingerprint, checkpoint, detail_json, lease_owner,
+                lease_expires_at_ms, attempt, diagnostic_json
+            FROM git_worktree_operations
+            WHERE idempotency_key = ?1
+            ",
+            params![idempotency_key],
+            map_worktree_operation,
+        )
+        .optional()
+        .map_err(storage_err(
+            "worktree_operation_idempotency_lookup_failed",
+            "failed to lookup worktree operation idempotency key",
+        ))
+    }
+
+    pub fn list_for_project(
+        conn: &Connection,
+        project_id: &ProjectId,
+    ) -> VibexResult<Vec<GitWorktreeOperationRecord>> {
+        let mut statement = conn
+            .prepare(
+                "
+                SELECT operation_id, project_id, source_workspace_id, target_workspace_id,
+                    operation, status, worktree_path, branch, base_ref, head_before,
+                    head_after, error, created_at_ms, updated_at_ms, idempotency_key,
+                    request_fingerprint, checkpoint, detail_json, lease_owner,
+                    lease_expires_at_ms, attempt, diagnostic_json
+                FROM git_worktree_operations
+                WHERE project_id = ?1
+                ORDER BY updated_at_ms DESC
+                ",
+            )
+            .map_err(storage_err(
+                "worktree_operation_list_failed",
+                "failed to list worktree operations",
+            ))?;
+        let rows = statement
+            .query_map(params![project_id.as_str()], map_worktree_operation)
+            .map_err(storage_err(
+                "worktree_operation_list_failed",
+                "failed to list worktree operations",
+            ))?;
+        collect_rows(
+            rows,
+            "worktree_operation_decode_failed",
+            "failed to decode worktree operation",
+        )
+    }
+
+    pub fn list_reconcilable(conn: &Connection) -> VibexResult<Vec<GitWorktreeOperationRecord>> {
+        let completed = enum_to_db(&GitWorktreeOperationStatus::Completed)?;
+        let failed = enum_to_db(&GitWorktreeOperationStatus::Failed)?;
+        let aborted = enum_to_db(&GitWorktreeOperationStatus::Aborted)?;
+        let mut statement = conn
+            .prepare(
+                "
+                SELECT operation_id, project_id, source_workspace_id, target_workspace_id,
+                    operation, status, worktree_path, branch, base_ref, head_before,
+                    head_after, error, created_at_ms, updated_at_ms, idempotency_key,
+                    request_fingerprint, checkpoint, detail_json, lease_owner,
+                    lease_expires_at_ms, attempt, diagnostic_json
+                FROM git_worktree_operations
+                WHERE status NOT IN (?1, ?2, ?3)
+                ORDER BY updated_at_ms ASC
+                ",
+            )
+            .map_err(storage_err(
+                "worktree_operation_reconcile_list_failed",
+                "failed to list reconcilable worktree operations",
+            ))?;
+        let rows = statement
+            .query_map(params![completed, failed, aborted], map_worktree_operation)
+            .map_err(storage_err(
+                "worktree_operation_reconcile_list_failed",
+                "failed to list reconcilable worktree operations",
+            ))?;
+        collect_rows(
+            rows,
+            "worktree_operation_decode_failed",
+            "failed to decode worktree operation",
+        )
     }
 }
 
@@ -8398,6 +9005,26 @@ fn optional_enum_from_db_sql<T: DeserializeOwned>(
 
 fn json_from_db_sql<T: DeserializeOwned>(value: String) -> rusqlite::Result<T> {
     sql_decode(json_from_db(value))
+}
+
+fn optional_json_from_db_sql<T: DeserializeOwned>(
+    value: Option<String>,
+) -> rusqlite::Result<Option<T>> {
+    value.map(json_from_db).transpose().map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })
+}
+
+fn validate_worktree_operation_token<'a>(
+    value: Option<&'a str>,
+    code: &'static str,
+    message: &'static str,
+) -> VibexResult<&'a str> {
+    let value = value.ok_or_else(|| VibexError::validation(code, message))?;
+    if value.trim().is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+        return Err(VibexError::validation(code, message));
+    }
+    Ok(value)
 }
 
 fn collect_rows<T>(
@@ -9969,17 +10596,49 @@ fn map_managed_worktree(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedWork
         workspace_id: parse_optional_id_sql(row.get::<_, Option<String>>(2)?, WorkspaceId::parse)?,
         repo_root: row.get(3)?,
         worktree_path: row.get(4)?,
-        branch: row.get(5)?,
-        base_ref: row.get(6)?,
-        head: row.get(7)?,
-        status: enum_from_db_sql(row.get(8)?)?,
-        created_at_ms: row.get(9)?,
-        updated_at_ms: row.get(10)?,
-        closed_at_ms: row.get(11)?,
+        repository_identity: optional_json_from_db_sql(row.get(5)?)?,
+        worktree_path_identity: optional_json_from_db_sql(row.get(6)?)?,
+        branch: row.get(7)?,
+        origin_workspace_id: parse_optional_id_sql(
+            row.get::<_, Option<String>>(8)?,
+            WorkspaceId::parse,
+        )?,
+        base_ref: row.get(9)?,
+        base_head: row.get(10)?,
+        target_workspace_id: parse_optional_id_sql(
+            row.get::<_, Option<String>>(11)?,
+            WorkspaceId::parse,
+        )?,
+        target_branch: row.get(12)?,
+        head: row.get(13)?,
+        status: enum_from_db_sql(row.get(14)?)?,
+        reconciliation_state: enum_from_db_sql(row.get(15)?)?,
+        diagnostic: optional_json_from_db_sql(row.get(16)?)?,
+        created_at_ms: row.get(17)?,
+        updated_at_ms: row.get(18)?,
+        closed_at_ms: row.get(19)?,
     })
 }
 
 fn map_worktree_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<GitWorktreeOperationRecord> {
+    let mut detail =
+        optional_json_from_db_sql::<GitWorktreeOperationDetail>(row.get(17)?)?.unwrap_or_default();
+    detail.idempotency_key = row.get::<_, Option<String>>(14)?.or(detail.idempotency_key);
+    detail.request_fingerprint = row
+        .get::<_, Option<String>>(15)?
+        .or(detail.request_fingerprint);
+    detail.checkpoint = enum_from_db_sql(row.get(16)?)?;
+    detail.lease_owner = row.get(18)?;
+    detail.lease_expires_at_ms = row.get(19)?;
+    let attempt = row.get::<_, i64>(20)?;
+    detail.attempt = u32::try_from(attempt).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            20,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })?;
+    detail.diagnostic = optional_json_from_db_sql(row.get(21)?)?.or(detail.diagnostic);
     Ok(GitWorktreeOperationRecord {
         operation_id: parse_id_sql(row.get(0)?, RequestId::parse)?,
         project_id: parse_id_sql(row.get(1)?, ProjectId::parse)?,
@@ -9999,6 +10658,7 @@ fn map_worktree_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<GitWorktr
         head_before: row.get(9)?,
         head_after: row.get(10)?,
         error: row.get(11)?,
+        detail,
         created_at_ms: row.get(12)?,
         updated_at_ms: row.get(13)?,
     })
@@ -10123,7 +10783,10 @@ mod tests {
 
         assert_eq!(
             apply_migrations(&mut conn).unwrap(),
-            vec!["32:agent_usage_zero_baseline_fence"]
+            vec![
+                "32:agent_usage_zero_baseline_fence",
+                "33:managed_worktree_recovery_foundation"
+            ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
             .query_row(
@@ -10257,7 +10920,8 @@ mod tests {
                 "29:remote_protocol_v2_pairing_offers",
                 "30:provider_runtime_option_snapshots",
                 "31:agent_usage_statistics",
-                "32:agent_usage_zero_baseline_fence"
+                "32:agent_usage_zero_baseline_fence",
+                "33:managed_worktree_recovery_foundation"
             ]
         );
         assert_eq!(
@@ -11563,10 +12227,18 @@ mod tests {
             workspace_id: Some(worktree_workspace.id.clone()),
             repo_root: main_workspace.root_path.clone(),
             worktree_path: worktree_workspace.root_path.clone(),
+            repository_identity: None,
+            worktree_path_identity: None,
             branch: Some("feature/demo".to_string()),
+            origin_workspace_id: Some(main_workspace.id.clone()),
             base_ref: Some("main".to_string()),
+            base_head: Some("abc1234".to_string()),
+            target_workspace_id: Some(main_workspace.id.clone()),
+            target_branch: Some("main".to_string()),
             head: Some("abc1234".to_string()),
             status: GitManagedWorktreeStatus::Active,
+            reconciliation_state: GitWorktreeReconciliationState::Consistent,
+            diagnostic: None,
             created_at_ms: now,
             updated_at_ms: now,
             closed_at_ms: None,
@@ -11591,6 +12263,16 @@ mod tests {
             head_before: Some("abc1234".to_string()),
             head_after: None,
             error: None,
+            detail: GitWorktreeOperationDetail {
+                idempotency_key: Some("merge:worktree-demo".to_string()),
+                request_fingerprint: Some("merge:worktree-demo:main".to_string()),
+                origin_workspace_id: Some(main_workspace.id.clone()),
+                base_head: record.base_head.clone(),
+                target_branch: record.target_branch.clone(),
+                expected_source_head: record.head.clone(),
+                expected_target_head: Some("abc1234".to_string()),
+                ..GitWorktreeOperationDetail::default()
+            },
             created_at_ms: now,
             updated_at_ms: now,
         };
@@ -11606,6 +12288,249 @@ mod tests {
         assert_eq!(completed.status, GitWorktreeOperationStatus::Completed);
         assert_eq!(completed.head_after.as_deref(), Some("def5678"));
 
+        ManagedWorktreeRepository::update_status(
+            &conn,
+            &record.worktree_path,
+            GitManagedWorktreeStatus::Archived,
+            Some("def5678"),
+            Some(now + 1),
+        )
+        .unwrap();
+        let archived = ManagedWorktreeRepository::get_by_id(&conn, &record.worktree_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(archived.status, GitManagedWorktreeStatus::Archived);
+        assert_eq!(archived.origin_workspace_id, record.origin_workspace_id);
+        assert_eq!(archived.base_head, record.base_head);
+        assert_eq!(archived.target_workspace_id, record.target_workspace_id);
+        assert_eq!(archived.target_branch, record.target_branch);
+
+        conn.execute(
+            "DELETE FROM workspaces WHERE workspace_id = ?1",
+            params![worktree_workspace.id.as_str()],
+        )
+        .unwrap();
+        let detached = ManagedWorktreeRepository::get_by_id(&conn, &record.worktree_id)
+            .unwrap()
+            .unwrap();
+        assert!(detached.workspace_id.is_none());
+        assert_eq!(detached.origin_workspace_id, record.origin_workspace_id);
+        assert_eq!(detached.target_workspace_id, record.target_workspace_id);
+        let detached_operation = WorktreeOperationRepository::get(&conn, &operation.operation_id)
+            .unwrap()
+            .unwrap();
+        assert!(detached_operation.source_workspace_id.is_none());
+        assert_eq!(
+            detached_operation.target_workspace_id,
+            Some(main_workspace.id)
+        );
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn worktree_v33_migrates_legacy_rows_additively() {
+        let temp = temp_db_path("worktree-v33-legacy");
+        let mut conn = open_database(&temp).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at_ms INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 32)
+        {
+            let transaction = conn.transaction().unwrap();
+            transaction.execute_batch(migration.sql).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations (version, name, applied_at_ms)
+                     VALUES (?1, ?2, ?3)",
+                    params![migration.version, migration.name, unix_timestamp_ms()],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        let (project, workspace) = WorkspaceRepository::ensure(
+            &conn,
+            "/tmp/vibex-db-worktree-v33-legacy",
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let worktree_id = RequestId::new();
+        let operation_id = RequestId::new();
+        let now = unix_timestamp_ms();
+        conn.execute(
+            "INSERT INTO git_managed_worktrees (
+                worktree_id, project_id, workspace_id, repo_root, worktree_path,
+                branch, base_ref, head, status, created_at_ms, updated_at_ms, closed_at_ms
+             ) VALUES (?1, ?2, NULL, ?3, ?4, 'feature/legacy', 'main', 'abc',
+                       'active', ?5, ?5, NULL)",
+            params![
+                worktree_id.as_str(),
+                project.id.as_str(),
+                workspace.root_path,
+                "/tmp/vibex-db-worktree-v33-legacy-feature",
+                now
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO git_worktree_operations (
+                operation_id, project_id, source_workspace_id, target_workspace_id,
+                operation, status, worktree_path, branch, base_ref, head_before,
+                head_after, error, created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, NULL, 'create', 'running', ?4,
+                       'feature/legacy', 'main', 'abc', NULL, NULL, ?5, ?5)",
+            params![
+                operation_id.as_str(),
+                project.id.as_str(),
+                workspace.id.as_str(),
+                "/tmp/vibex-db-worktree-v33-legacy-feature",
+                now
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            apply_migrations(&mut conn).unwrap(),
+            vec!["33:managed_worktree_recovery_foundation"]
+        );
+        let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(managed.branch.as_deref(), Some("feature/legacy"));
+        assert_eq!(
+            managed.reconciliation_state,
+            GitWorktreeReconciliationState::Unverified
+        );
+        assert!(managed.repository_identity.is_none());
+        let operation = WorktreeOperationRepository::get(&conn, &operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.status, GitWorktreeOperationStatus::Running);
+        assert_eq!(
+            operation.detail.checkpoint,
+            GitWorktreeOperationCheckpoint::IntentRecorded
+        );
+        assert_eq!(operation.detail.attempt, 0);
+
+        drop(conn);
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn worktree_operation_reserve_and_lease_claim_are_idempotent() {
+        let temp = temp_db_path("worktree-operation-claim");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let (project, workspace) = WorkspaceRepository::ensure(
+            &conn,
+            "/tmp/vibex-db-worktree-operation-claim",
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let now = unix_timestamp_ms();
+        let operation = GitWorktreeOperationRecord {
+            operation_id: RequestId::new(),
+            project_id: project.id.clone(),
+            source_workspace_id: Some(workspace.id.clone()),
+            target_workspace_id: Some(workspace.id.clone()),
+            operation: GitWorktreeOperationKind::Create,
+            status: GitWorktreeOperationStatus::Pending,
+            worktree_path: Some("/tmp/vibex-db-worktree-operation-claim-feature".to_string()),
+            branch: Some("feature/claim".to_string()),
+            base_ref: Some("main".to_string()),
+            head_before: Some("abc".to_string()),
+            head_after: None,
+            error: None,
+            detail: GitWorktreeOperationDetail {
+                idempotency_key: Some("create:workspace:feature-claim".to_string()),
+                request_fingerprint: Some("create:workspace:feature-claim:main".to_string()),
+                origin_workspace_id: Some(workspace.id.clone()),
+                ..GitWorktreeOperationDetail::default()
+            },
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        let first = WorktreeOperationRepository::reserve(&mut conn, &operation).unwrap();
+        let mut retry = operation.clone();
+        retry.operation_id = RequestId::new();
+        let repeated = WorktreeOperationRepository::reserve(&mut conn, &retry).unwrap();
+        assert_eq!(repeated.operation_id, first.operation_id);
+
+        let mut conflict = retry;
+        conflict.detail.request_fingerprint = Some("different-request".to_string());
+        let error = WorktreeOperationRepository::reserve(&mut conn, &conflict).unwrap_err();
+        assert_eq!(error.code, "worktree_operation_idempotency_conflict");
+
+        let claimed = WorktreeOperationRepository::try_claim(
+            &conn,
+            &first.operation_id,
+            "worker-a",
+            now,
+            1_000,
+        )
+        .unwrap();
+        let WorktreeOperationClaimOutcome::Acquired(claimed) = claimed else {
+            panic!("first worker did not acquire operation");
+        };
+        assert_eq!(claimed.detail.attempt, 1);
+        assert!(matches!(
+            WorktreeOperationRepository::try_claim(
+                &conn,
+                &first.operation_id,
+                "worker-b",
+                now + 1,
+                1_000,
+            )
+            .unwrap(),
+            WorktreeOperationClaimOutcome::Busy(_)
+        ));
+        let takeover = WorktreeOperationRepository::try_claim(
+            &conn,
+            &first.operation_id,
+            "worker-b",
+            now + 1_001,
+            1_000,
+        )
+        .unwrap();
+        let WorktreeOperationClaimOutcome::Acquired(takeover) = takeover else {
+            panic!("expired lease was not taken over");
+        };
+        assert_eq!(takeover.detail.attempt, 2);
+        WorktreeOperationRepository::mark_outcome(
+            &conn,
+            &first.operation_id,
+            GitWorktreeOperationStatus::Completed,
+            GitWorktreeOperationCheckpoint::Completed,
+            Some("def"),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            WorktreeOperationRepository::try_claim(
+                &conn,
+                &first.operation_id,
+                "worker-c",
+                now + 2_100,
+                1_000,
+            )
+            .unwrap(),
+            WorktreeOperationClaimOutcome::Completed(_)
+        ));
+        assert_eq!(
+            WorktreeOperationRepository::list_for_project(&conn, &project.id)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        drop(conn);
         cleanup_db(temp);
     }
 

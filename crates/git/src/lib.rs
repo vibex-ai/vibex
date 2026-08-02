@@ -17,6 +17,9 @@ use vibex_core::{
     unix_timestamp_ms,
 };
 
+mod identity;
+pub use identity::*;
+
 const MAX_DIFF_BYTES: usize = 512 * 1024;
 const MAX_HISTORY_LIMIT: u32 = 100;
 const DEFAULT_HISTORY_LIMIT: u32 = 50;
@@ -29,13 +32,14 @@ struct GitMutationGuard {
 
 impl GitMutationGuard {
     fn claim(root: &Path) -> VibexResult<Self> {
-        let common_dir = run_git(root, &["rev-parse", "--git-common-dir"])?;
-        let common_dir = PathBuf::from(common_dir.trim());
-        let common_dir = if common_dir.is_absolute() {
-            common_dir
-        } else {
-            root.join(common_dir)
-        };
+        let identity = repository_identity(root)?;
+        let common_dir = PathBuf::from(
+            identity
+                .git_common_dir
+                .canonical_path
+                .as_deref()
+                .unwrap_or(&identity.git_common_dir.normalized_path),
+        );
         let lock_path = common_dir.join(VIBEX_GIT_MUTATION_LOCK_FILE);
         let file = OpenOptions::new()
             .read(true)
@@ -365,10 +369,16 @@ pub fn worktree_list(
     repo_path: impl AsRef<Path>,
 ) -> VibexResult<GitWorktreeListResponse> {
     let root = repo_root(repo_path.as_ref())?;
+    let repository_identity = repository_identity(&root)?;
     let output = run_git(&root, &["worktree", "list", "--porcelain"])?;
+    let mut worktrees = parse_worktree_list(&output);
+    for worktree in &mut worktrees {
+        worktree.path_identity = Some(canonical_path_identity(&worktree.path));
+        worktree.repository_identity = Some(repository_identity.clone());
+    }
     Ok(GitWorktreeListResponse {
         workspace_id,
-        worktrees: parse_worktree_list(&output),
+        worktrees,
     })
 }
 
@@ -376,6 +386,34 @@ pub fn worktree_add(
     repo_path: impl AsRef<Path>,
     path: impl AsRef<Path>,
     request: &GitWorktreeCreateRequest,
+) -> VibexResult<GitWorktreeSummary> {
+    worktree_add_recoverable(repo_path, path, request, None, false)
+}
+
+pub fn validate_worktree_create(
+    repo_path: impl AsRef<Path>,
+    request: &GitWorktreeCreateRequest,
+) -> VibexResult<()> {
+    let root = repo_root(repo_path.as_ref())?;
+    validate_branch_name(&root, &request.branch_name)?;
+    if let Some(base_ref) = request.base_ref.as_deref() {
+        validate_existing_commitish(&root, base_ref)?;
+    }
+    if local_branch_head(&root, &request.branch_name)?.is_some() {
+        return Err(VibexError::conflict(
+            "worktree_branch_exists",
+            "Git branch already exists",
+        ));
+    }
+    Ok(())
+}
+
+pub fn worktree_add_recoverable(
+    repo_path: impl AsRef<Path>,
+    path: impl AsRef<Path>,
+    request: &GitWorktreeCreateRequest,
+    expected_base_head: Option<&str>,
+    allow_existing_branch: bool,
 ) -> VibexResult<GitWorktreeSummary> {
     let root = repo_root(repo_path.as_ref())?;
     let _mutation = GitMutationGuard::claim(&root)?;
@@ -385,28 +423,77 @@ pub fn worktree_add(
     }
     let path = path.as_ref();
     let path_text = path.to_string_lossy().to_string();
-    let mut args = vec![
-        "worktree".to_string(),
-        "add".to_string(),
-        "-b".to_string(),
-        request.branch_name.clone(),
-        path_text.clone(),
-    ];
-    if let Some(base_ref) = request.base_ref.as_deref() {
-        args.push(base_ref.to_string());
+    let existing = worktree_list(request.workspace_id.clone(), &root)?
+        .worktrees
+        .into_iter()
+        .find(|worktree| same_path_identity(&worktree.path, path));
+    if let Some(worktree) = existing {
+        verify_created_worktree(&worktree, request, expected_base_head)?;
+        return Ok(worktree);
+    }
+    if path.exists() {
+        return Err(VibexError::conflict(
+            "worktree_unregistered_path_exists",
+            "managed worktree path exists without matching Git registration",
+        ));
+    }
+
+    let existing_branch_head = local_branch_head(&root, &request.branch_name)?;
+    let mut args = vec!["worktree".to_string(), "add".to_string()];
+    match existing_branch_head {
+        Some(branch_head) => {
+            if !allow_existing_branch || expected_base_head != Some(branch_head.as_str()) {
+                return Err(VibexError::conflict(
+                    "worktree_branch_recovery_conflict",
+                    "managed worktree branch already exists with unproven ownership",
+                ));
+            }
+            args.push(path_text);
+            args.push(request.branch_name.clone());
+        }
+        None => {
+            args.push("-b".to_string());
+            args.push(request.branch_name.clone());
+            args.push(path_text);
+            if let Some(base_ref) = request.base_ref.as_deref() {
+                args.push(base_ref.to_string());
+            }
+        }
     }
     run_git_owned(&root, &args)?;
     let list = worktree_list(request.workspace_id.clone(), &root)?;
-    list.worktrees
+    let worktree = list
+        .worktrees
         .into_iter()
-        .find(|worktree| same_path_text(&worktree.path, &path_text))
+        .find(|worktree| same_path_identity(&worktree.path, path))
         .ok_or_else(|| {
             VibexError::process(
                 "worktree_create_missing_after_add",
                 "created worktree was not found in Git worktree list",
             )
-            .with_diagnostic("path", path_text)
-        })
+        })?;
+    verify_created_worktree(&worktree, request, expected_base_head)?;
+    Ok(worktree)
+}
+
+fn verify_created_worktree(
+    worktree: &GitWorktreeSummary,
+    request: &GitWorktreeCreateRequest,
+    expected_base_head: Option<&str>,
+) -> VibexResult<()> {
+    if worktree.branch.as_deref() != Some(request.branch_name.as_str()) {
+        return Err(VibexError::conflict(
+            "worktree_branch_identity_mismatch",
+            "Git worktree branch does not match the durable create intent",
+        ));
+    }
+    if expected_base_head.is_some_and(|expected| worktree.head.as_deref() != Some(expected)) {
+        return Err(VibexError::conflict(
+            "worktree_head_identity_mismatch",
+            "Git worktree head does not match the durable create baseline",
+        ));
+    }
+    Ok(())
 }
 
 pub fn worktree_merge_preflight(
@@ -423,10 +510,42 @@ pub fn worktree_merge_preflight(
     Ok(())
 }
 
-pub fn worktree_merge(target_repo_path: impl AsRef<Path>, source_ref: &str) -> VibexResult<String> {
+pub fn worktree_merge(
+    target_repo_path: impl AsRef<Path>,
+    source_ref: &str,
+    expected_source_head: &str,
+    expected_target_branch: &str,
+    expected_target_head: &str,
+) -> VibexResult<String> {
     let target_root = repo_root(target_repo_path.as_ref())?;
     let _mutation = GitMutationGuard::claim(&target_root)?;
     validate_ref_arg(source_ref)?;
+    validate_ref_arg(expected_target_branch)?;
+    let source_head = resolve_ref_head(&target_root, source_ref)?;
+    if source_head != expected_source_head {
+        return Err(VibexError::conflict(
+            "worktree_source_head_changed",
+            "source head changed after worktree preflight",
+        ));
+    }
+    if current_branch(&target_root)?.as_deref() != Some(expected_target_branch) {
+        return Err(VibexError::conflict(
+            "worktree_target_branch_changed",
+            "target branch changed after worktree preflight",
+        ));
+    }
+    if resolve_head(&target_root)? != expected_target_head {
+        return Err(VibexError::conflict(
+            "worktree_target_head_changed",
+            "target head changed after worktree preflight",
+        ));
+    }
+    if status(WorkspaceId::new(), &target_root)?.dirty {
+        return Err(VibexError::conflict(
+            "worktree_merge_dirty_target",
+            "target checkout has uncommitted changes",
+        ));
+    }
     let output = run_git_owned(
         &target_root,
         &[
@@ -451,6 +570,24 @@ pub fn worktree_remove(
             "worktree_path_empty",
             "worktree path must not be empty",
         ));
+    }
+    if let Some(expected_head) = request.expected_head.as_deref() {
+        let registered = worktree_list(request.workspace_id.clone(), &root)?
+            .worktrees
+            .into_iter()
+            .find(|worktree| same_path_identity(&worktree.path, path))
+            .ok_or_else(|| {
+                VibexError::conflict(
+                    "worktree_registration_missing",
+                    "managed worktree is no longer registered with Git",
+                )
+            })?;
+        if registered.head.as_deref() != Some(expected_head) {
+            return Err(VibexError::conflict(
+                "worktree_source_head_changed",
+                "source head changed after worktree preflight",
+            ));
+        }
     }
     let mut args = vec!["worktree".to_string(), "remove".to_string()];
     if request.force {
@@ -1206,6 +1343,8 @@ fn parse_worktree_list(output: &str) -> Vec<GitWorktreeSummary> {
             }
             current = Some(GitWorktreeSummary {
                 path: path.to_string(),
+                path_identity: None,
+                repository_identity: None,
                 branch: None,
                 head: None,
                 detached: false,
@@ -1322,40 +1461,6 @@ fn parse_numstat_count(value: &str) -> u32 {
 fn is_hash_like(value: &str) -> bool {
     let value = value.strip_prefix('^').unwrap_or(value);
     value.len() >= 8 && value.chars().all(|character| character.is_ascii_hexdigit())
-}
-
-fn same_path_text(left: &str, right: &str) -> bool {
-    let left = Path::new(left);
-    let right = Path::new(right);
-    if left == right {
-        return true;
-    }
-
-    match (left.canonicalize(), right.canonicalize()) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => normalized_path_text(left) == normalized_path_text(right),
-    }
-}
-
-fn normalized_path_text(path: &Path) -> String {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() && !normalized.has_root() {
-                    normalized.push("..");
-                }
-            }
-            _ => normalized.push(component.as_os_str()),
-        }
-    }
-    let normalized = normalized.to_string_lossy().replace('\\', "/");
-    if cfg!(windows) {
-        normalized.to_ascii_lowercase()
-    } else {
-        normalized
-    }
 }
 
 fn normalized_optional(value: &Option<String>) -> Option<&str> {
@@ -2090,18 +2195,17 @@ mod tests {
             branch_name: "feature/worktree-test".to_string(),
             base_ref: Some("HEAD".to_string()),
             name: None,
+            target_workspace_id: None,
+            target_branch: None,
         };
         let created = worktree_add(&root, &worktree_path, &request).unwrap();
-        assert!(same_path_text(
-            &created.path,
-            worktree_path.to_str().unwrap()
-        ));
+        assert!(same_path_identity(&created.path, &worktree_path));
 
         let list = worktree_list(workspace_id.clone(), &root).unwrap();
         assert!(
             list.worktrees
                 .iter()
-                .any(|worktree| same_path_text(&worktree.path, worktree_path.to_str().unwrap()))
+                .any(|worktree| same_path_identity(&worktree.path, &worktree_path))
         );
 
         let removed = worktree_remove(
@@ -2110,6 +2214,8 @@ mod tests {
                 workspace_id,
                 worktree_path: worktree_path.to_string_lossy().to_string(),
                 force: false,
+                expected_head: created.head,
+                preflight_revision: None,
             },
         )
         .unwrap();
@@ -2120,16 +2226,67 @@ mod tests {
     }
 
     #[test]
-    fn same_path_text_matches_canonical_aliases() {
+    fn worktree_merge_revalidates_source_and_target_under_mutation_lock() {
+        let root = temp_repo("worktree-verified-merge-main");
+        std::fs::create_dir_all(&root).unwrap();
+        init_repo_with_commit(&root, "README.md", "hello\n", "initial");
+        let worktree_path = temp_repo("worktree-verified-merge-feature");
+        let workspace_id = WorkspaceId::new();
+        let branch = "feature/verified-merge";
+        let _created = worktree_add(
+            &root,
+            &worktree_path,
+            &GitWorktreeCreateRequest {
+                workspace_id: workspace_id.clone(),
+                branch_name: branch.to_string(),
+                base_ref: Some("HEAD".to_string()),
+                name: None,
+                target_workspace_id: None,
+                target_branch: None,
+            },
+        )
+        .unwrap();
+        std::fs::write(worktree_path.join("feature.txt"), "feature\n").unwrap();
+        run_raw(&worktree_path, &["add", "feature.txt"]).unwrap();
+        run_raw(&worktree_path, &["commit", "-m", "feature"]).unwrap();
+        let source_head = resolve_ref_head(&root, branch).unwrap();
+        let target_branch = current_branch(&root).unwrap().unwrap();
+        let target_head = resolve_head(&root).unwrap();
+
+        let error = worktree_merge(&root, branch, &"0".repeat(40), &target_branch, &target_head)
+            .unwrap_err();
+        assert_eq!(error.code, "worktree_source_head_changed");
+        let error = worktree_merge(&root, branch, &source_head, &target_branch, &"0".repeat(40))
+            .unwrap_err();
+        assert_eq!(error.code, "worktree_target_head_changed");
+        assert!(!root.join("feature.txt").exists());
+
+        worktree_merge(&root, branch, &source_head, &target_branch, &target_head).unwrap();
+        assert!(root.join("feature.txt").is_file());
+        worktree_remove(
+            &root,
+            &GitWorktreeDiscardRequest {
+                workspace_id,
+                worktree_path: worktree_path.to_string_lossy().to_string(),
+                force: false,
+                expected_head: Some(source_head),
+                preflight_revision: None,
+            },
+        )
+        .unwrap();
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(worktree_path);
+    }
+
+    #[test]
+    fn same_path_identity_matches_canonical_aliases() {
         let root = temp_repo("path-alias");
         let child = root.join("child");
         std::fs::create_dir_all(&child).unwrap();
         let aliased = child.join("..");
 
-        assert!(same_path_text(
-            root.to_str().unwrap(),
-            aliased.to_str().unwrap()
-        ));
+        assert!(same_path_identity(&root, &aliased));
 
         let _ = std::fs::remove_dir_all(root);
     }
