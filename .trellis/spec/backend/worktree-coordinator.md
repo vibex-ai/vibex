@@ -177,6 +177,12 @@ IntentRecorded -> LocksAcquired -> GitAddStarted -> GitAdded
 - Remote capability may expose `GitWorktreeRead` only when the server negotiates
   `git_worktree_read`. `RemoteWorkbenchRuntime` reads through an injected
   `RemoteWorktreeSnapshotSource` backed by the desktop authority.
+- Before serialization, remote eligibility/lifecycle reads replace every local
+  display/canonical repository and Worktree path with an opaque ID-based
+  projection while preserving non-sensitive presence/`exists` semantics. They
+  remove operation idempotency keys, request fingerprints, path identities,
+  lock/lease/queue keys and preflight revisions. Readiness check commands become
+  `recorded-check`; outcome and timestamp remain available.
 - `WebRemoteBackend::git_worktree_create` always fails with
   `remote_worktree_mutation_unsupported`; Web/mobile never execute local Git
   mutation.
@@ -204,6 +210,7 @@ IntentRecorded -> LocksAcquired -> GitAddStarted -> GitAdded
 | Unknown lifecycle/status/checkpoint/lock value or detail schema is decoded | Preserve it for diagnostics, map enum values to `Unknown`, and fail closed as `NeedsAttention`. |
 | Remote client requests create | `remote_worktree_mutation_unsupported`, even if read capability is available. |
 | Remote read source is not installed | `remote_worktree_read_unavailable`. |
+| Remote lifecycle serialization contains a local path, check command, idempotency/fingerprint, lease, lock, queue key, or preflight revision | Fail the redaction regression; never send the unsanitized snapshot. |
 
 Diagnostics contain stable code, bounded safe summary, severity, retryability,
 optional recovery action and IDs. Do not include auth tokens, environment
@@ -258,7 +265,9 @@ values, file contents, or unbounded Git output.
   path, relative/control/oversize input, existing paths, repository nesting,
   nesting under another Project's Workspace, and managed identity conflicts.
 - Backend/remote tests assert native read/create, negotiated remote read only,
-  stable request tags, auth redaction, and injected-authority HTTP routing.
+  stable request tags, auth redaction, injected-authority HTTP routing, opaque
+  path identity, preserved non-sensitive existence/outcome facts, and absence of
+  private operation/check-command sentinels in serialized snapshots.
 - Run focused crate tests, `cargo check -p vibex-remote-client
   --target wasm32-unknown-unknown --locked`, `pnpm check:frontend`, and the full
   `pnpm check:rust` gate with a clean Python environment when the host injects
@@ -491,6 +500,16 @@ git_worktree_readiness(
   queue serialization, restart reconciliation, external merge preservation,
   source commits after start, assistance binding, generic revert fencing, and
   Archive/Restore identity reuse.
+- External-merge reconciliation tests must exercise both lifecycle refresh and
+  startup recovery: an exact target/source-parent merge commit is `Completed`, a
+  clean return to the recorded target head is `Aborted`, and any other scene
+  without `MERGE_HEAD` remains `NeedsAttention`. Marker absence alone is never
+  evidence of completion.
+- Restore recovery completes only when the registration, branch, path, and
+  recorded head all match. An Archived/Discarded record whose directory or Git
+  registration reappears, or whose repository cannot be inspected, remains
+  closed but becomes `NeedsAttention`; repeated recovery preserves the same
+  diagnostic and must not relabel that scene `Consistent` or adopt its new head.
 - Backend/remote tests cover every native trait method, disconnected fixtures,
   negotiated read-only lifecycle snapshots, and one stable remote mutation error.
 - Run affected package tests and `pnpm check:rust`; changes to Code Workbench

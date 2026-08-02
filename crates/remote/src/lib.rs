@@ -979,6 +979,98 @@ fn decode_agent_request(request: &RemoteRequestEnvelope) -> VibexResult<RemoteAg
     })
 }
 
+fn remote_worktree_path_identity(
+    scope: &str,
+    id: &str,
+    exists: bool,
+) -> vibex_core::GitPathIdentity {
+    let label = format!("remote:{scope}:{id}");
+    vibex_core::GitPathIdentity {
+        original_path: label.clone(),
+        normalized_path: label.clone(),
+        canonical_path: None,
+        filesystem_id: None,
+        comparison_key: label,
+        exists,
+    }
+}
+
+fn remote_worktree_repository_identity(
+    project_id: &vibex_core::ProjectId,
+    identity: &vibex_core::GitRepositoryIdentity,
+) -> vibex_core::GitRepositoryIdentity {
+    vibex_core::GitRepositoryIdentity {
+        repository_root: remote_worktree_path_identity(
+            "repository",
+            project_id.as_str(),
+            identity.repository_root.exists,
+        ),
+        git_common_dir: remote_worktree_path_identity(
+            "git-common-dir",
+            project_id.as_str(),
+            identity.git_common_dir.exists,
+        ),
+        comparison_key: format!("remote:repository:{}", project_id.as_str()),
+    }
+}
+
+fn sanitize_remote_worktree_eligibility(
+    mut eligibility: vibex_core::GitProjectEligibility,
+) -> vibex_core::GitProjectEligibility {
+    let project_path_exists = eligibility.project_canonical_path.exists;
+    eligibility.project_canonical_path = remote_worktree_path_identity(
+        "project",
+        eligibility.project_id.as_str(),
+        project_path_exists,
+    );
+    eligibility.repository_identity = eligibility
+        .repository_identity
+        .take()
+        .map(|identity| remote_worktree_repository_identity(&eligibility.project_id, &identity));
+    eligibility
+}
+
+fn sanitize_remote_worktree_snapshot(
+    mut snapshot: vibex_core::GitWorktreeLifecycleSnapshot,
+) -> vibex_core::GitWorktreeLifecycleSnapshot {
+    snapshot.eligibility = sanitize_remote_worktree_eligibility(snapshot.eligibility);
+    for managed in &mut snapshot.managed_worktrees {
+        managed.repo_root = format!("remote:repository:{}", managed.project_id.as_str());
+        managed.worktree_path = format!("remote:worktree:{}", managed.worktree_id.as_str());
+        managed.repository_identity = managed
+            .repository_identity
+            .take()
+            .map(|identity| remote_worktree_repository_identity(&managed.project_id, &identity));
+        managed.worktree_path_identity = managed.worktree_path_identity.take().map(|identity| {
+            remote_worktree_path_identity("worktree", managed.worktree_id.as_str(), identity.exists)
+        });
+    }
+    for operation in &mut snapshot.operations {
+        operation.worktree_path = operation.worktree_path.as_ref().map(|_| {
+            format!(
+                "remote:worktree-operation:{}",
+                operation.operation_id.as_str()
+            )
+        });
+        operation.detail.idempotency_key = None;
+        operation.detail.request_fingerprint = None;
+        operation.detail.repository_identity = None;
+        operation.detail.source_path_identity = None;
+        operation.detail.target_path_identity = None;
+        operation.detail.lock_keys.clear();
+        operation.detail.preflight_revision = None;
+        operation.detail.lease_owner = None;
+        operation.detail.lease_expires_at_ms = None;
+        operation.detail.queue_key = None;
+    }
+    for readiness in &mut snapshot.readiness {
+        for check in &mut readiness.checks {
+            check.command = "recorded-check".to_string();
+        }
+    }
+    snapshot
+}
+
 async fn handle_workbench_request(
     state: &RemoteRouterState,
     request: RemoteRequestEnvelope,
@@ -1968,7 +2060,9 @@ async fn dispatch_workbench_request(
                     "remote worktree snapshots are unavailable",
                 )
             })?;
-            let eligibility = source.worktree_eligibility(request.workspace_id).await?;
+            let eligibility = sanitize_remote_worktree_eligibility(
+                source.worktree_eligibility(request.workspace_id).await?,
+            );
             serde_json::to_value(RemoteGitWorktreeEligibilityResponse { eligibility })
                 .map_err(remote_payload_encode_error)
         }
@@ -1986,7 +2080,9 @@ async fn dispatch_workbench_request(
                     "remote worktree snapshots are unavailable",
                 )
             })?;
-            let snapshot = source.worktree_snapshot(request.workspace_id).await?;
+            let snapshot = sanitize_remote_worktree_snapshot(
+                source.worktree_snapshot(request.workspace_id).await?,
+            );
             serde_json::to_value(RemoteGitWorktreeSnapshotResponse { snapshot })
                 .map_err(remote_payload_encode_error)
         }
@@ -3619,24 +3715,105 @@ mod tests {
         let workspace_root = temp_workspace_root("worktree-read");
         std::fs::create_dir_all(&workspace_root).unwrap();
         let workspace = ensure_workspace(&db_path, &workspace_root);
+        let repository_identity = vibex_core::GitRepositoryIdentity {
+            repository_root: vibex_git::canonical_path_identity(workspace_root.join("repository")),
+            git_common_dir: vibex_git::canonical_path_identity(workspace_root.join("private.git")),
+            comparison_key: format!("private-repository:{}", workspace_root.display()),
+        };
         let eligibility = vibex_core::GitProjectEligibility {
             project_id: workspace.project_id.clone(),
             project_canonical_path: vibex_git::canonical_path_identity(&workspace_root),
-            state: vibex_core::GitProjectEligibilityState::Ineligible,
-            repository_identity: None,
-            current_branch: None,
-            default_base_ref: None,
-            selectable_base_refs: Vec::new(),
-            observed_head: None,
+            state: vibex_core::GitProjectEligibilityState::Eligible,
+            repository_identity: Some(repository_identity.clone()),
+            current_branch: Some("main".to_string()),
+            default_base_ref: Some("main".to_string()),
+            selectable_base_refs: vec!["main".to_string()],
+            observed_head: Some("a".repeat(40)),
             revision: "test-worktree-eligibility".to_string(),
-            disabled_reason: Some(vibex_core::GitProjectIneligibleReason::NotWorkingTree),
+            disabled_reason: None,
+        };
+        let worktree_id = RequestId::new();
+        let operation_id = RequestId::new();
+        let worktree_path = workspace_root.join("private-worktree");
+        let managed = vibex_core::GitManagedWorktreeRecord {
+            worktree_id: worktree_id.clone(),
+            project_id: workspace.project_id.clone(),
+            workspace_id: Some(workspace.id.clone()),
+            repo_root: workspace_root.join("repository").display().to_string(),
+            worktree_path: worktree_path.display().to_string(),
+            repository_identity: Some(repository_identity.clone()),
+            worktree_path_identity: Some(vibex_git::canonical_path_identity(&worktree_path)),
+            branch: Some("feature/remote".to_string()),
+            origin_workspace_id: Some(workspace.id.clone()),
+            base_ref: Some("main".to_string()),
+            base_head: Some("a".repeat(40)),
+            target_workspace_id: Some(workspace.id.clone()),
+            target_branch: Some("main".to_string()),
+            head: Some("b".repeat(40)),
+            status: vibex_core::GitManagedWorktreeStatus::Active,
+            reconciliation_state: vibex_core::GitWorktreeReconciliationState::Consistent,
+            diagnostic: None,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            closed_at_ms: None,
+        };
+        let operation = vibex_core::GitWorktreeOperationRecord {
+            operation_id,
+            project_id: workspace.project_id.clone(),
+            source_workspace_id: Some(workspace.id.clone()),
+            target_workspace_id: Some(workspace.id.clone()),
+            operation: vibex_core::GitWorktreeOperationKind::MergeBack,
+            status: vibex_core::GitWorktreeOperationStatus::Queued,
+            worktree_path: Some(worktree_path.display().to_string()),
+            branch: Some("feature/remote".to_string()),
+            base_ref: Some("main".to_string()),
+            head_before: Some("a".repeat(40)),
+            head_after: None,
+            error: None,
+            detail: vibex_core::GitWorktreeOperationDetail {
+                idempotency_key: Some("private-idempotency".to_string()),
+                request_fingerprint: Some("private-fingerprint".to_string()),
+                repository_identity: Some(repository_identity),
+                source_path_identity: Some(vibex_git::canonical_path_identity(&worktree_path)),
+                target_path_identity: Some(vibex_git::canonical_path_identity(&workspace_root)),
+                lock_keys: vec![vibex_core::GitWorktreeLockKey {
+                    kind: vibex_core::GitWorktreeLockKind::Repository,
+                    key: format!("private-lock:{}", workspace_root.display()),
+                }],
+                preflight_revision: Some("private-preflight".to_string()),
+                lease_owner: Some("private-lease-owner".to_string()),
+                lease_expires_at_ms: Some(99),
+                queue_key: Some("private-queue-key".to_string()),
+                queue_position: Some(2),
+                ..vibex_core::GitWorktreeOperationDetail::default()
+            },
+            created_at_ms: 1,
+            updated_at_ms: 2,
         };
         let snapshot = vibex_core::GitWorktreeLifecycleSnapshot {
             workspace_id: workspace.id.clone(),
             eligibility: eligibility.clone(),
-            managed_worktrees: Vec::new(),
-            operations: Vec::new(),
-            readiness: Vec::new(),
+            managed_worktrees: vec![managed],
+            operations: vec![operation],
+            readiness: vec![vibex_core::GitWorktreeReadinessRecord {
+                worktree_id,
+                workspace_id: workspace.id.clone(),
+                state: vibex_core::GitWorktreeReadinessState::ReadyToMerge,
+                source_head: "b".repeat(40),
+                dirty_fingerprint: "private-dirty-fingerprint".to_string(),
+                target_workspace_id: workspace.id.clone(),
+                target_branch: "main".to_string(),
+                checks: vec![vibex_core::GitWorktreeCheckRecord {
+                    command: format!(
+                        "private-check --workspace {} --token secret",
+                        workspace_root.display()
+                    ),
+                    outcome: vibex_core::GitWorktreeCheckOutcome::Passed,
+                    recorded_at_ms: 42,
+                }],
+                revision: "readiness-revision".to_string(),
+                updated_at_ms: 43,
+            }],
             diagnostics: Vec::new(),
             revision: "test-worktree-snapshot".to_string(),
         };
@@ -3666,7 +3843,10 @@ mod tests {
         let eligibility_payload: vibex_core::RemoteGitWorktreeEligibilityResponse =
             serde_json::from_value(eligibility_response.payload.unwrap()).unwrap();
         assert_eq!(eligibility_response.status, RemoteEnvelopeStatus::Ok);
-        assert_eq!(eligibility_payload.eligibility, eligibility);
+        assert_eq!(
+            eligibility_payload.eligibility,
+            sanitize_remote_worktree_eligibility(eligibility)
+        );
 
         let snapshot_response = post_workbench(
             router,
@@ -3682,7 +3862,49 @@ mod tests {
         let snapshot_payload: vibex_core::RemoteGitWorktreeSnapshotResponse =
             serde_json::from_value(snapshot_response.payload.unwrap()).unwrap();
         assert_eq!(snapshot_response.status, RemoteEnvelopeStatus::Ok);
-        assert_eq!(snapshot_payload.snapshot, snapshot);
+        assert_eq!(
+            snapshot_payload.snapshot,
+            sanitize_remote_worktree_snapshot(snapshot)
+        );
+        let encoded = serde_json::to_string(&snapshot_payload).unwrap();
+        assert!(!encoded.contains(workspace_root.to_string_lossy().as_ref()));
+        for private_value in [
+            "private-idempotency",
+            "private-fingerprint",
+            "private-preflight",
+            "private-lease-owner",
+            "private-queue-key",
+            "private-lock",
+            "private-check",
+            "--token secret",
+        ] {
+            assert!(!encoded.contains(private_value));
+        }
+        assert_eq!(
+            snapshot_payload.snapshot.operations[0]
+                .detail
+                .queue_position,
+            Some(2)
+        );
+        assert_eq!(
+            snapshot_payload.snapshot.readiness[0].checks[0].command,
+            "recorded-check"
+        );
+        assert_eq!(
+            snapshot_payload.snapshot.readiness[0].checks[0].outcome,
+            vibex_core::GitWorktreeCheckOutcome::Passed
+        );
+        assert_eq!(
+            snapshot_payload.snapshot.readiness[0].checks[0].recorded_at_ms,
+            42
+        );
+        assert!(
+            !snapshot_payload.snapshot.managed_worktrees[0]
+                .worktree_path_identity
+                .as_ref()
+                .unwrap()
+                .exists
+        );
 
         cleanup_db(db_path);
         cleanup_workspace(workspace_root);

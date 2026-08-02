@@ -139,16 +139,29 @@ impl WorktreeCoordinator {
         });
         if live_merge_head.is_none() {
             for operation in external_operations {
-                WorktreeOperationRepository::mark_outcome(
-                    connection,
-                    &operation.operation_id,
-                    GitWorktreeOperationStatus::Completed,
-                    GitWorktreeOperationCheckpoint::Completed,
-                    vibex_git::resolve_head(&workspace.root_path)
-                        .ok()
-                        .as_deref(),
-                    None,
-                )?;
+                match classify_external_merge_resolution(operation, workspace)? {
+                    ExternalMergeResolution::Completed(head_after) => {
+                        WorktreeOperationRepository::mark_outcome(
+                            connection,
+                            &operation.operation_id,
+                            GitWorktreeOperationStatus::Completed,
+                            GitWorktreeOperationCheckpoint::Completed,
+                            Some(&head_after),
+                            None,
+                        )?;
+                    }
+                    ExternalMergeResolution::Aborted => {
+                        WorktreeOperationRepository::mark_outcome(
+                            connection,
+                            &operation.operation_id,
+                            GitWorktreeOperationStatus::Aborted,
+                            GitWorktreeOperationCheckpoint::Completed,
+                            None,
+                            None,
+                        )?;
+                    }
+                    ExternalMergeResolution::NeedsAttention => {}
+                }
             }
             return Ok(());
         }
@@ -2546,19 +2559,34 @@ impl WorktreeCoordinator {
                         report.needs_attention = report.needs_attention.saturating_add(1);
                         return Ok(());
                     };
-                    if vibex_git::merge_head(&target_workspace.root_path)?.is_some() {
-                        report.needs_attention = report.needs_attention.saturating_add(1);
-                    } else {
-                        let head_after = vibex_git::resolve_head(&target_workspace.root_path)?;
-                        WorktreeOperationRepository::mark_outcome(
-                            &connection,
-                            &operation.operation_id,
-                            GitWorktreeOperationStatus::Completed,
-                            GitWorktreeOperationCheckpoint::Completed,
-                            Some(&head_after),
-                            None,
-                        )?;
-                        report.completed_operations = report.completed_operations.saturating_add(1);
+                    match classify_external_merge_resolution(operation, &target_workspace)? {
+                        ExternalMergeResolution::Completed(head_after) => {
+                            WorktreeOperationRepository::mark_outcome(
+                                &connection,
+                                &operation.operation_id,
+                                GitWorktreeOperationStatus::Completed,
+                                GitWorktreeOperationCheckpoint::Completed,
+                                Some(&head_after),
+                                None,
+                            )?;
+                            report.completed_operations =
+                                report.completed_operations.saturating_add(1);
+                        }
+                        ExternalMergeResolution::Aborted => {
+                            WorktreeOperationRepository::mark_outcome(
+                                &connection,
+                                &operation.operation_id,
+                                GitWorktreeOperationStatus::Aborted,
+                                GitWorktreeOperationCheckpoint::Completed,
+                                None,
+                                None,
+                            )?;
+                            report.completed_operations =
+                                report.completed_operations.saturating_add(1);
+                        }
+                        ExternalMergeResolution::NeedsAttention => {
+                            report.needs_attention = report.needs_attention.saturating_add(1);
+                        }
                     }
                     return Ok(());
                 }
@@ -2755,7 +2783,8 @@ impl WorktreeCoordinator {
                     );
                 };
                 let path_exists = Path::new(&managed.worktree_path).exists();
-                let registered = registered_managed_worktree(&managed);
+                let registration = registered_managed_worktree_summary(&managed);
+                let registered = registration.is_some();
                 match operation.operation {
                     GitWorktreeOperationKind::Archive | GitWorktreeOperationKind::Discard
                         if !path_exists && !registered =>
@@ -2782,7 +2811,13 @@ impl WorktreeCoordinator {
                         )?;
                         report.completed_operations = report.completed_operations.saturating_add(1);
                     }
-                    GitWorktreeOperationKind::Restore if path_exists && registered => {
+                    GitWorktreeOperationKind::Restore
+                        if path_exists
+                            && registration.as_ref().is_some_and(|summary| {
+                                summary.head.as_deref()
+                                    == operation.detail.expected_source_head.as_deref()
+                            }) =>
+                    {
                         ManagedWorktreeRepository::update_status(
                             &connection,
                             &managed.worktree_path,
@@ -2884,30 +2919,63 @@ impl WorktreeCoordinator {
         let records = ManagedWorktreeRepository::list_all(&connection)?;
         for mut record in records {
             report.inspected_worktrees = report.inspected_worktrees.saturating_add(1);
+            let registration_probe =
+                vibex_git::worktree_list(WorkspaceId::new(), &record.repo_root);
+            let registration_uninspectable = registration_probe.is_err();
+            let registration = registration_probe.ok().and_then(|list| {
+                list.worktrees
+                    .into_iter()
+                    .find(|summary| managed_matches_summary(&record, summary))
+            });
+            let path_exists = Path::new(&record.worktree_path).is_dir();
             if matches!(
                 record.status,
                 GitManagedWorktreeStatus::Archived | GitManagedWorktreeStatus::Discarded
             ) {
-                if record.reconciliation_state != GitWorktreeReconciliationState::Consistent
-                    || record.diagnostic.is_some()
-                {
-                    ManagedWorktreeRepository::update_reconciliation(
-                        &connection,
-                        &record.worktree_id,
-                        GitWorktreeReconciliationState::Consistent,
-                        None,
-                    )?;
+                if !registration_uninspectable && registration.is_none() && !path_exists {
+                    if record.reconciliation_state != GitWorktreeReconciliationState::Consistent
+                        || record.diagnostic.is_some()
+                    {
+                        ManagedWorktreeRepository::update_reconciliation(
+                            &connection,
+                            &record.worktree_id,
+                            GitWorktreeReconciliationState::Consistent,
+                            None,
+                        )?;
+                    }
+                } else {
+                    let (code, summary) = if registration_uninspectable {
+                        (
+                            "managed_worktree_closed_repository_uninspectable",
+                            "archived or discarded worktree repository could not be inspected",
+                        )
+                    } else {
+                        (
+                            "managed_worktree_closed_scene_present",
+                            "archived or discarded worktree still has a directory or Git registration",
+                        )
+                    };
+                    let diagnostic = record
+                        .diagnostic
+                        .as_ref()
+                        .filter(|diagnostic| diagnostic.code == code)
+                        .cloned()
+                        .unwrap_or_else(|| managed_diagnostic(&record, code, summary));
+                    if record.reconciliation_state != GitWorktreeReconciliationState::NeedsAttention
+                        || record.diagnostic.as_ref() != Some(&diagnostic)
+                    {
+                        ManagedWorktreeRepository::update_reconciliation(
+                            &connection,
+                            &record.worktree_id,
+                            GitWorktreeReconciliationState::NeedsAttention,
+                            Some(&diagnostic),
+                        )?;
+                    }
+                    report.needs_attention = report.needs_attention.saturating_add(1);
+                    report.diagnostics.push(diagnostic);
                 }
                 continue;
             }
-            let registration = vibex_git::worktree_list(WorkspaceId::new(), &record.repo_root)
-                .ok()
-                .and_then(|list| {
-                    list.worktrees
-                        .into_iter()
-                        .find(|summary| managed_matches_summary(&record, summary))
-                });
-            let path_exists = Path::new(&record.worktree_path).is_dir();
             let fixed_identity_complete = record.origin_workspace_id.is_some()
                 && record.base_head.is_some()
                 && record.target_workspace_id.is_some()
@@ -3293,6 +3361,12 @@ struct DestructiveFacts {
     preflight: GitWorktreeDestructivePreflight,
 }
 
+enum ExternalMergeResolution {
+    Completed(String),
+    Aborted,
+    NeedsAttention,
+}
+
 enum LifecycleClaim {
     Acquired(GitWorktreeOperationRecord),
     Completed(GitWorktreeOperationRecord),
@@ -3333,14 +3407,20 @@ fn verify_managed_source(
 }
 
 fn registered_managed_worktree(managed: &GitManagedWorktreeRecord) -> bool {
+    registered_managed_worktree_summary(managed).is_some()
+}
+
+fn registered_managed_worktree_summary(
+    managed: &GitManagedWorktreeRecord,
+) -> Option<GitWorktreeSummary> {
     vibex_git::worktree_list(WorkspaceId::new(), &managed.repo_root)
-        .map(|list| {
-            list.worktrees.into_iter().any(|summary| {
-                managed_matches_summary(managed, &summary)
+        .ok()
+        .and_then(|list| {
+            list.worktrees.into_iter().find(|summary| {
+                managed_matches_summary(managed, summary)
                     && managed.branch.as_deref() == summary.branch.as_deref()
             })
         })
-        .unwrap_or(false)
 }
 
 fn append_active_operation_risk(
@@ -3636,6 +3716,40 @@ fn source_commits_after_start(
         return Ok(0);
     }
     Ok(vibex_git::worktree_merge_summary(&managed.repo_root, expected, &current)?.commit_count)
+}
+
+fn classify_external_merge_resolution(
+    operation: &GitWorktreeOperationRecord,
+    target_workspace: &WorkspaceRecord,
+) -> VibexResult<ExternalMergeResolution> {
+    if vibex_git::merge_head(&target_workspace.root_path)?.is_some() {
+        return Ok(ExternalMergeResolution::NeedsAttention);
+    }
+    let current_head = vibex_git::resolve_head(&target_workspace.root_path)?;
+    let completed = match (
+        operation.head_before.as_deref(),
+        operation.detail.expected_source_head.as_deref(),
+    ) {
+        (Some(target_parent), Some(source_parent)) => vibex_git::is_expected_merge_commit(
+            &target_workspace.root_path,
+            &current_head,
+            target_parent,
+            source_parent,
+        )?,
+        _ => false,
+    };
+    if completed {
+        return Ok(ExternalMergeResolution::Completed(current_head));
+    }
+    let target_clean =
+        !vibex_git::status(target_workspace.id.clone(), &target_workspace.root_path)?.dirty;
+    if operation.head_before.as_deref() == Some(current_head.as_str())
+        && target_clean
+        && vibex_git::active_git_operation(&target_workspace.root_path)?.is_none()
+    {
+        return Ok(ExternalMergeResolution::Aborted);
+    }
+    Ok(ExternalMergeResolution::NeedsAttention)
 }
 
 fn lifecycle_diagnostic(
@@ -5155,33 +5269,150 @@ mod tests {
     }
 
     #[test]
-    fn external_merge_scene_is_visible_but_never_taken_over() {
+    fn archived_record_with_recreated_git_scene_requires_attention() {
         let fixture = Fixture::new();
         let created = fixture.create();
-        fs::write(
-            Path::new(&created.worktree.path).join("README.md"),
-            "source external\n",
-        )
-        .unwrap();
-        git(Path::new(&created.worktree.path), &["add", "README.md"]);
-        git(
-            Path::new(&created.worktree.path),
-            &["commit", "-m", "source external conflict"],
-        );
-        fs::write(fixture.repo().join("README.md"), "target external\n").unwrap();
-        git(&fixture.repo(), &["add", "README.md"]);
+        let (managed, _) = archive_created(&fixture, &created);
         git(
             &fixture.repo(),
-            &["commit", "-m", "target external conflict"],
+            &[
+                "worktree",
+                "add",
+                &created.worktree.path,
+                managed.branch.as_deref().unwrap(),
+            ],
         );
-        let branch = created.managed.branch.as_deref().unwrap();
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(fixture.repo())
-            .args(["merge", "--no-ff", "--no-edit", branch])
-            .output()
+
+        let restarted = WorktreeCoordinator::new(fixture.coordinator.db_path.clone());
+        let report = restarted.reconcile_on_startup().unwrap();
+        assert_eq!(report.needs_attention, 1);
+        let connection = open_database(&fixture.coordinator.db_path).unwrap();
+        let reconciled = ManagedWorktreeRepository::get_by_id(&connection, &managed.worktree_id)
+            .unwrap()
             .unwrap();
-        assert!(!output.status.success());
+        assert_eq!(reconciled.status, GitManagedWorktreeStatus::Archived);
+        assert_eq!(
+            reconciled.reconciliation_state,
+            GitWorktreeReconciliationState::NeedsAttention
+        );
+        assert_eq!(
+            reconciled
+                .diagnostic
+                .as_ref()
+                .map(|value| value.code.as_str()),
+            Some("managed_worktree_closed_scene_present")
+        );
+    }
+
+    #[test]
+    fn archived_record_with_uninspectable_repository_requires_stable_attention() {
+        let fixture = Fixture::new();
+        let created = fixture.create();
+        let (managed, _) = archive_created(&fixture, &created);
+        fs::rename(
+            fixture.repo(),
+            fixture.repo().with_file_name("repo-unavailable"),
+        )
+        .unwrap();
+
+        let restarted = WorktreeCoordinator::new(fixture.coordinator.db_path.clone());
+        let first_report = restarted.reconcile_on_startup().unwrap();
+        assert_eq!(first_report.needs_attention, 1);
+        let connection = open_database(&fixture.coordinator.db_path).unwrap();
+        let first = ManagedWorktreeRepository::get_by_id(&connection, &managed.worktree_id)
+            .unwrap()
+            .unwrap();
+        drop(connection);
+        assert_eq!(first.status, GitManagedWorktreeStatus::Archived);
+        assert_eq!(
+            first.reconciliation_state,
+            GitWorktreeReconciliationState::NeedsAttention
+        );
+        assert_eq!(
+            first.diagnostic.as_ref().map(|value| value.code.as_str()),
+            Some("managed_worktree_closed_repository_uninspectable")
+        );
+
+        let repeated_report = restarted.reconcile_on_startup().unwrap();
+        assert_eq!(repeated_report.needs_attention, 1);
+        let connection = open_database(&fixture.coordinator.db_path).unwrap();
+        let repeated = ManagedWorktreeRepository::get_by_id(&connection, &managed.worktree_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repeated, first);
+    }
+
+    #[test]
+    fn interrupted_restore_with_moved_head_is_not_completed_on_startup() {
+        let fixture = Fixture::new();
+        let created = fixture.create();
+        let (managed, _) = archive_created(&fixture, &created);
+        let restore_draft = GitWorktreeRestoreRequest {
+            workspace_id: created.workspace.id.clone(),
+            worktree_id: managed.worktree_id.clone(),
+            preflight_revision: None,
+        };
+        let preflight = fixture
+            .coordinator
+            .restore_preflight(&restore_draft)
+            .unwrap();
+        let mut interrupted = fixture
+            .coordinator
+            .restore(&GitWorktreeRestoreRequest {
+                preflight_revision: Some(preflight.revision),
+                ..restore_draft
+            })
+            .unwrap();
+        fs::write(
+            Path::new(&created.worktree.path).join("post-restore.txt"),
+            "head moved after restore\n",
+        )
+        .unwrap();
+        git(
+            Path::new(&created.worktree.path),
+            &["add", "post-restore.txt"],
+        );
+        git(
+            Path::new(&created.worktree.path),
+            &["commit", "-m", "move restored head"],
+        );
+
+        let connection = open_database(&fixture.coordinator.db_path).unwrap();
+        interrupted.status = GitWorktreeOperationStatus::Running;
+        interrupted.detail.checkpoint = GitWorktreeOperationCheckpoint::RestoreStarted;
+        interrupted.head_after = None;
+        WorktreeOperationRepository::save(&connection, &interrupted).unwrap();
+        ManagedWorktreeRepository::update_status(
+            &connection,
+            &managed.worktree_path,
+            GitManagedWorktreeStatus::Restoring,
+            interrupted.detail.expected_source_head.as_deref(),
+            managed.closed_at_ms,
+        )
+        .unwrap();
+        drop(connection);
+
+        let restarted = WorktreeCoordinator::new(fixture.coordinator.db_path.clone());
+        restarted.reconcile_on_startup().unwrap();
+        let connection = open_database(&fixture.coordinator.db_path).unwrap();
+        let operation = WorktreeOperationRepository::get(&connection, &interrupted.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.status, GitWorktreeOperationStatus::NeedsAttention);
+        assert_eq!(
+            operation
+                .detail
+                .diagnostic
+                .as_ref()
+                .map(|value| value.code.as_str()),
+            Some("worktree_lifecycle_scene_inconsistent")
+        );
+    }
+
+    #[test]
+    fn external_merge_scene_is_visible_and_abort_is_classified_without_takeover() {
+        let fixture = Fixture::new();
+        start_external_conflicting_merge(&fixture, "abort");
 
         let snapshot = fixture
             .coordinator
@@ -5210,13 +5441,98 @@ mod tests {
             "worktree_target_operation_fenced"
         );
         git(&fixture.repo(), &["merge", "--abort"]);
+        let restarted = WorktreeCoordinator::new(fixture.coordinator.db_path.clone());
+        let report = restarted.reconcile_on_startup().unwrap();
+        assert_eq!(report.completed_operations, 1);
+        let reconciled = restarted.lifecycle_snapshot(&fixture.workspace.id).unwrap();
+        assert!(reconciled.operations.iter().any(|operation| {
+            operation.operation_id == external.operation_id
+                && operation.status == GitWorktreeOperationStatus::Aborted
+        }));
+    }
+
+    #[test]
+    fn external_merge_reconciliation_proves_completed_merge_commit() {
+        let fixture = Fixture::new();
+        start_external_conflicting_merge(&fixture, "completed");
+        let external = fixture
+            .coordinator
+            .lifecycle_snapshot(&fixture.workspace.id)
+            .unwrap()
+            .operations
+            .into_iter()
+            .find(|operation| {
+                operation
+                    .detail
+                    .diagnostic
+                    .as_ref()
+                    .is_some_and(|diagnostic| {
+                        diagnostic.code == "worktree_external_merge_needs_attention"
+                    })
+            })
+            .unwrap();
+
+        fs::write(
+            fixture.repo().join("README.md"),
+            "resolved external merge\n",
+        )
+        .unwrap();
+        git(&fixture.repo(), &["add", "README.md"]);
+        git(&fixture.repo(), &["commit", "--no-edit"]);
+        let expected_head_after = vibex_git::resolve_head(fixture.repo()).unwrap();
+
+        let reconciled = fixture
+            .coordinator
+            .lifecycle_snapshot(&fixture.workspace.id)
+            .unwrap();
+        let completed = reconciled
+            .operations
+            .iter()
+            .find(|operation| operation.operation_id == external.operation_id)
+            .unwrap();
+        assert_eq!(completed.status, GitWorktreeOperationStatus::Completed);
+        assert_eq!(
+            completed.head_after.as_deref(),
+            Some(expected_head_after.as_str())
+        );
+    }
+
+    #[test]
+    fn external_merge_reconciliation_preserves_ambiguous_post_abort_head() {
+        let fixture = Fixture::new();
+        start_external_conflicting_merge(&fixture, "ambiguous");
+        let external = fixture
+            .coordinator
+            .lifecycle_snapshot(&fixture.workspace.id)
+            .unwrap()
+            .operations
+            .into_iter()
+            .find(|operation| {
+                operation
+                    .detail
+                    .diagnostic
+                    .as_ref()
+                    .is_some_and(|diagnostic| {
+                        diagnostic.code == "worktree_external_merge_needs_attention"
+                    })
+            })
+            .unwrap();
+
+        git(&fixture.repo(), &["merge", "--abort"]);
+        fs::write(fixture.repo().join("after-abort.txt"), "unrelated change\n").unwrap();
+        git(&fixture.repo(), &["add", "after-abort.txt"]);
+        git(
+            &fixture.repo(),
+            &["commit", "-m", "unrelated post-abort commit"],
+        );
+
         let reconciled = fixture
             .coordinator
             .lifecycle_snapshot(&fixture.workspace.id)
             .unwrap();
         assert!(reconciled.operations.iter().any(|operation| {
             operation.operation_id == external.operation_id
-                && operation.status == GitWorktreeOperationStatus::Completed
+                && operation.status == GitWorktreeOperationStatus::NeedsAttention
         }));
     }
 
@@ -5399,6 +5715,208 @@ mod tests {
                 GitWorktreeOperationStatus::Pending | GitWorktreeOperationStatus::Running
             )
         }));
+    }
+
+    #[test]
+    fn three_agents_two_worktrees_survive_clean_merge_conflict_and_restart() {
+        let fixture = Fixture::new();
+        let first = fixture.create();
+        let second_id = RequestId::new();
+        let second = fixture
+            .coordinator
+            .create(
+                &GitWorktreeCreateRequest {
+                    workspace_id: fixture.workspace.id.clone(),
+                    branch_name: format!(
+                        "feature/{}",
+                        second_id.as_str().rsplit('_').next().unwrap_or("conflict")
+                    ),
+                    base_ref: Some("main".to_string()),
+                    name: Some("parallel-conflict".to_string()),
+                    worktree_path: None,
+                    target_workspace_id: Some(fixture.workspace.id.clone()),
+                    target_branch: Some("main".to_string()),
+                },
+                WorktreeCreateContext::new(second_id, Some("parallel-conflict".to_string())),
+            )
+            .unwrap();
+
+        let sessions = [
+            (
+                "Shared workspace agent one",
+                &first.workspace,
+                vibex_core::AgentId::parse("codex").unwrap(),
+            ),
+            (
+                "Shared workspace agent two",
+                &first.workspace,
+                vibex_core::AgentId::parse("claude").unwrap(),
+            ),
+            (
+                "Independent workspace agent",
+                &second.workspace,
+                vibex_core::AgentId::parse("opencode").unwrap(),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(
+            |(index, (title, workspace, agent_id))| vibex_core::AgentSession {
+                id: vibex_core::VibexSessionId::new(),
+                title: title.to_string(),
+                project_id: workspace.project_id.clone(),
+                workspace_id: workspace.id.clone(),
+                workspace_root: workspace.root_path.clone(),
+                workspace_mode: workspace.mode,
+                agent_id,
+                state: AgentSessionState::Running,
+                safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+                created_at_ms: index as i64 + 1,
+                updated_at_ms: index as i64 + 1,
+                archived_at_ms: None,
+                deleted_at_ms: None,
+            },
+        )
+        .collect::<Vec<_>>();
+        let connection = open_database(&fixture.coordinator.db_path).unwrap();
+        for session in &sessions {
+            SessionRepository::insert(&connection, session).unwrap();
+        }
+        drop(connection);
+        let assert_agents_still_running = || {
+            let connection = open_database(&fixture.coordinator.db_path).unwrap();
+            let stored_sessions = SessionRepository::list(&connection, false).unwrap();
+            assert_eq!(stored_sessions.len(), 3);
+            assert_eq!(
+                stored_sessions
+                    .iter()
+                    .filter(|session| session.workspace_id == first.workspace.id)
+                    .count(),
+                2
+            );
+            assert_eq!(
+                stored_sessions
+                    .iter()
+                    .filter(|session| session.workspace_id == second.workspace.id)
+                    .count(),
+                1
+            );
+            assert!(
+                stored_sessions
+                    .iter()
+                    .all(|session| session.state == AgentSessionState::Running)
+            );
+        };
+        assert_agents_still_running();
+
+        fs::write(
+            Path::new(&first.worktree.path).join("clean-result.txt"),
+            "clean result\n",
+        )
+        .unwrap();
+        git(
+            Path::new(&first.worktree.path),
+            &["add", "clean-result.txt"],
+        );
+        git(
+            Path::new(&first.worktree.path),
+            &["commit", "-m", "clean parallel result"],
+        );
+        fs::write(
+            Path::new(&second.worktree.path).join("README.md"),
+            "conflicting source result\n",
+        )
+        .unwrap();
+        git(Path::new(&second.worktree.path), &["add", "README.md"]);
+        git(
+            Path::new(&second.worktree.path),
+            &["commit", "-m", "conflicting parallel result"],
+        );
+        fs::write(
+            fixture.repo().join("README.md"),
+            "conflicting target result\n",
+        )
+        .unwrap();
+        git(&fixture.repo(), &["add", "README.md"]);
+        git(
+            &fixture.repo(),
+            &["commit", "-m", "prepare target conflict"],
+        );
+        fixture.mark_ready(&first.workspace.id);
+        fixture.mark_ready(&second.workspace.id);
+
+        let first_draft = merge_draft(&first);
+        let first_plan = fixture.coordinator.merge_plan(&first_draft).unwrap();
+        assert_eq!(first_plan.target_workspace_id, fixture.workspace.id);
+        assert_eq!(first_plan.target_branch, "main");
+        assert_eq!(first_plan.running_consumers.agent_count, 2);
+        assert!(
+            first_plan.preflight.risks.iter().any(|risk| {
+                risk.kind == GitWorktreeRiskKind::RunningConsumers && !risk.blocking
+            })
+        );
+        let first_merge = fixture
+            .coordinator
+            .merge(&confirmed_merge(first_draft, &first_plan.preflight))
+            .unwrap();
+        assert_eq!(first_merge.status, GitWorktreeOperationStatus::Completed);
+        assert!(fixture.repo().join("clean-result.txt").is_file());
+        assert_agents_still_running();
+
+        let second_draft = merge_draft(&second);
+        let second_plan = fixture.coordinator.merge_plan(&second_draft).unwrap();
+        assert_eq!(second_plan.target_workspace_id, fixture.workspace.id);
+        assert_eq!(second_plan.target_branch, "main");
+        assert_eq!(second_plan.running_consumers.agent_count, 1);
+        assert!(
+            second_plan.preflight.risks.iter().any(|risk| {
+                risk.kind == GitWorktreeRiskKind::RunningConsumers && !risk.blocking
+            })
+        );
+        let conflict = fixture
+            .coordinator
+            .merge(&confirmed_merge(second_draft, &second_plan.preflight))
+            .unwrap();
+        assert_eq!(conflict.status, GitWorktreeOperationStatus::NeedsResolution);
+        assert_agents_still_running();
+
+        let restarted = WorktreeCoordinator::new(fixture.coordinator.db_path.clone());
+        restarted.reconcile_on_startup().unwrap();
+        let recovered = restarted.lifecycle_snapshot(&fixture.workspace.id).unwrap();
+        assert!(recovered.operations.iter().any(|operation| {
+            operation.operation_id == conflict.operation_id
+                && operation.status == GitWorktreeOperationStatus::NeedsResolution
+        }));
+        assert_agents_still_running();
+        restarted
+            .resolve_conflict(&GitWorktreeConflictResolveRequest {
+                operation_id: conflict.operation_id.clone(),
+                workspace_id: fixture.workspace.id.clone(),
+                path: "README.md".to_string(),
+                version: vibex_core::GitWorktreeConflictVersion::Source,
+            })
+            .unwrap();
+        restarted
+            .stage_conflicts(&GitWorktreeConflictStageRequest {
+                operation_id: conflict.operation_id.clone(),
+                workspace_id: fixture.workspace.id.clone(),
+                paths: vec!["README.md".to_string()],
+            })
+            .unwrap();
+        let completed = restarted
+            .continue_merge(&GitWorktreeOperationRequest {
+                operation_id: conflict.operation_id,
+                workspace_id: fixture.workspace.id.clone(),
+            })
+            .unwrap();
+        assert_eq!(completed.status, GitWorktreeOperationStatus::Completed);
+        assert_eq!(
+            fs::read_to_string(fixture.repo().join("README.md")).unwrap(),
+            "conflicting source result\n"
+        );
+        assert!(Path::new(&first.worktree.path).is_dir());
+        assert!(Path::new(&second.worktree.path).is_dir());
+        assert_agents_still_running();
     }
 
     #[test]
@@ -5609,6 +6127,65 @@ mod tests {
             preflight_revision: Some(preflight.revision.clone()),
             ..draft
         }
+    }
+
+    fn start_external_conflicting_merge(fixture: &Fixture, label: &str) -> GitWorktreeCreateResult {
+        let created = fixture.create();
+        fs::write(
+            Path::new(&created.worktree.path).join("README.md"),
+            format!("source external {label}\n"),
+        )
+        .unwrap();
+        git(Path::new(&created.worktree.path), &["add", "README.md"]);
+        git(
+            Path::new(&created.worktree.path),
+            &["commit", "-m", &format!("source external {label}")],
+        );
+        fs::write(
+            fixture.repo().join("README.md"),
+            format!("target external {label}\n"),
+        )
+        .unwrap();
+        git(&fixture.repo(), &["add", "README.md"]);
+        git(
+            &fixture.repo(),
+            &["commit", "-m", &format!("target external {label}")],
+        );
+        let branch = created.managed.branch.as_deref().unwrap();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(fixture.repo())
+            .args(["merge", "--no-ff", "--no-edit", branch])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        created
+    }
+
+    fn archive_created(
+        fixture: &Fixture,
+        created: &GitWorktreeCreateResult,
+    ) -> (GitManagedWorktreeRecord, GitWorktreeOperationRecord) {
+        let draft = GitWorktreeArchiveRequest {
+            workspace_id: created.workspace.id.clone(),
+            worktree_path: created.worktree.path.clone(),
+            expected_head: None,
+            preflight_revision: None,
+        };
+        let preflight = fixture.coordinator.archive_preflight(&draft).unwrap();
+        let operation = fixture
+            .coordinator
+            .archive(&GitWorktreeArchiveRequest {
+                expected_head: preflight.source_head,
+                preflight_revision: Some(preflight.revision),
+                ..draft
+            })
+            .unwrap();
+        let connection = open_database(&fixture.coordinator.db_path).unwrap();
+        let managed = ManagedWorktreeRepository::get_by_path(&connection, &created.worktree.path)
+            .unwrap()
+            .unwrap();
+        (managed, operation)
     }
 
     struct Fixture {

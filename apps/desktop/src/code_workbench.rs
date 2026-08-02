@@ -171,6 +171,27 @@ struct WorkbenchWorkspace {
     generation: u64,
 }
 
+#[derive(Debug, Clone)]
+struct WorkspaceGenerationFence {
+    workspace_id: WorkspaceId,
+    generation: u64,
+}
+
+impl WorkspaceGenerationFence {
+    fn capture(workspace: &WorkbenchWorkspace) -> Self {
+        Self {
+            workspace_id: workspace.id.clone(),
+            generation: workspace.generation,
+        }
+    }
+
+    fn matches(&self, workspace: Option<&WorkbenchWorkspace>) -> bool {
+        workspace.is_some_and(|workspace| {
+            workspace.id == self.workspace_id && workspace.generation == self.generation
+        })
+    }
+}
+
 #[derive(Clone)]
 struct PendingWorkspace {
     runtime: Arc<DesktopRuntime>,
@@ -334,6 +355,40 @@ enum WorktreeLifecycleConfirmation {
     },
     Continue(GitWorktreeOperationRequest),
     Abort(GitWorktreeOperationRequest),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorktreeLifecyclePrimaryAction {
+    ReviewChanges,
+    MarkReady,
+    MergeBack,
+    ReviewQueuedMerge,
+    Restore,
+}
+
+fn worktree_lifecycle_primary_action(
+    state: WorktreeLifecycleDisplayState,
+) -> Option<WorktreeLifecyclePrimaryAction> {
+    match state {
+        WorktreeLifecycleDisplayState::Working => {
+            Some(WorktreeLifecyclePrimaryAction::ReviewChanges)
+        }
+        WorktreeLifecycleDisplayState::Reviewing => Some(WorktreeLifecyclePrimaryAction::MarkReady),
+        WorktreeLifecycleDisplayState::Ready => Some(WorktreeLifecyclePrimaryAction::MergeBack),
+        WorktreeLifecycleDisplayState::Queued => {
+            Some(WorktreeLifecyclePrimaryAction::ReviewQueuedMerge)
+        }
+        WorktreeLifecycleDisplayState::Archived => Some(WorktreeLifecyclePrimaryAction::Restore),
+        WorktreeLifecycleDisplayState::Merging
+        | WorktreeLifecycleDisplayState::NeedsResolution
+        | WorktreeLifecycleDisplayState::Aborting
+        | WorktreeLifecycleDisplayState::Archiving
+        | WorktreeLifecycleDisplayState::Restoring
+        | WorktreeLifecycleDisplayState::Discarding
+        | WorktreeLifecycleDisplayState::Discarded
+        | WorktreeLifecycleDisplayState::Failed
+        | WorktreeLifecycleDisplayState::NeedsAttention => None,
+    }
 }
 
 pub struct CodeWorkbench {
@@ -1562,6 +1617,7 @@ impl CodeWorkbench {
             return;
         }
         self.lifecycle_loading = true;
+        let workspace_fence = WorkspaceGenerationFence::capture(&workspace);
         let workspace_id = workspace.id.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             backend.git().git_worktree_snapshot(workspace_id).await
@@ -1569,9 +1625,7 @@ impl CodeWorkbench {
         self.lifecycle_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
-                if this.workspace.as_ref().map(|current| current.generation)
-                    != Some(workspace.generation)
-                {
+                if !workspace_fence.matches(this.workspace.as_ref()) {
                     return;
                 }
                 this.lifecycle_loading = false;
@@ -1657,6 +1711,13 @@ impl CodeWorkbench {
             cx.notify();
             return;
         };
+        let Some(workspace_fence) = self
+            .workspace
+            .as_ref()
+            .map(WorkspaceGenerationFence::capture)
+        else {
+            return;
+        };
         self.lifecycle_action_pending = true;
         self.lifecycle_confirmation = None;
         self.error = None;
@@ -1665,6 +1726,9 @@ impl CodeWorkbench {
         self.lifecycle_action_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
+                if !workspace_fence.matches(this.workspace.as_ref()) {
+                    return;
+                }
                 this.lifecycle_action_pending = false;
                 match outcome {
                     Ok(Ok(operation)) => {
@@ -1716,6 +1780,13 @@ impl CodeWorkbench {
             cx.notify();
             return;
         };
+        let Some(workspace_fence) = self
+            .workspace
+            .as_ref()
+            .map(WorkspaceGenerationFence::capture)
+        else {
+            return;
+        };
         self.lifecycle_action_pending = true;
         self.lifecycle_confirmation = None;
         self.error = None;
@@ -1723,6 +1794,9 @@ impl CodeWorkbench {
         self.lifecycle_action_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
+                if !workspace_fence.matches(this.workspace.as_ref()) {
+                    return;
+                }
                 this.lifecycle_action_pending = false;
                 match outcome {
                     Ok(Ok(value)) => {
@@ -1756,6 +1830,13 @@ impl CodeWorkbench {
             cx.notify();
             return;
         };
+        let Some(workspace_fence) = self
+            .workspace
+            .as_ref()
+            .map(WorkspaceGenerationFence::capture)
+        else {
+            return;
+        };
         let expected = (state == GitWorktreeReadinessState::ReadyToMerge)
             .then_some(view.readiness)
             .flatten();
@@ -1783,6 +1864,9 @@ impl CodeWorkbench {
         self.lifecycle_action_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
+                if !workspace_fence.matches(this.workspace.as_ref()) {
+                    return;
+                }
                 this.lifecycle_action_pending = false;
                 match outcome {
                     Ok(Ok(_)) => {
@@ -7629,8 +7713,8 @@ impl CodeRightRail {
             let state_label = worktree_lifecycle_state_label(view.state);
             let state_color = worktree_lifecycle_state_color(view.state, cx);
             let readiness_action = if mutations_available {
-                match view.state {
-                    WorktreeLifecycleDisplayState::Working => Some(
+                match worktree_lifecycle_primary_action(view.state) {
+                    Some(WorktreeLifecyclePrimaryAction::ReviewChanges) => Some(
                         Button::new("worktree-review-changes")
                             .small()
                             .outline()
@@ -7646,7 +7730,7 @@ impl CodeRightRail {
                             }))
                             .into_any_element(),
                     ),
-                    WorktreeLifecycleDisplayState::Reviewing => Some(
+                    Some(WorktreeLifecyclePrimaryAction::MarkReady) => Some(
                         Button::new("worktree-mark-ready")
                             .small()
                             .primary()
@@ -7662,7 +7746,7 @@ impl CodeRightRail {
                             }))
                             .into_any_element(),
                     ),
-                    WorktreeLifecycleDisplayState::Ready => {
+                    Some(WorktreeLifecyclePrimaryAction::MergeBack) => {
                         let label = localized_merge_action_label(&target_branch);
                         Some(
                             Button::new("worktree-merge-back")
@@ -7678,7 +7762,20 @@ impl CodeRightRail {
                                 .into_any_element(),
                         )
                     }
-                    WorktreeLifecycleDisplayState::Archived => Some(
+                    Some(WorktreeLifecyclePrimaryAction::ReviewQueuedMerge) => Some(
+                        Button::new("worktree-review-queued-merge")
+                            .small()
+                            .outline()
+                            .label(locale::text("Review merge", "检查合并", "檢查合併"))
+                            .disabled(pending)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.update_workbench(cx, |workbench, cx| {
+                                    workbench.request_worktree_merge_confirmation(cx)
+                                })
+                            }))
+                            .into_any_element(),
+                    ),
+                    Some(WorktreeLifecyclePrimaryAction::Restore) => Some(
                         Button::new("worktree-restore")
                             .small()
                             .primary()
@@ -7695,16 +7792,7 @@ impl CodeRightRail {
                             }))
                             .into_any_element(),
                     ),
-                    WorktreeLifecycleDisplayState::Queued
-                    | WorktreeLifecycleDisplayState::Merging
-                    | WorktreeLifecycleDisplayState::NeedsResolution
-                    | WorktreeLifecycleDisplayState::Aborting
-                    | WorktreeLifecycleDisplayState::Archiving
-                    | WorktreeLifecycleDisplayState::Restoring
-                    | WorktreeLifecycleDisplayState::Discarding
-                    | WorktreeLifecycleDisplayState::Discarded
-                    | WorktreeLifecycleDisplayState::Failed
-                    | WorktreeLifecycleDisplayState::NeedsAttention => None,
+                    None => None,
                 }
             } else {
                 None
@@ -7851,7 +7939,6 @@ impl CodeRightRail {
                 .filter(|conflict| !conflict.resolved)
                 .count();
             let needs_resolution = operation.status == GitWorktreeOperationStatus::NeedsResolution;
-            let assistance_enabled = mutations_available && !pending;
             surface = surface.child(
                 v_flex()
                     .w_full()
@@ -7931,23 +8018,25 @@ impl CodeRightRail {
                             .w_full()
                             .flex_wrap()
                             .gap_2()
-                            .child(
-                                Button::new("worktree-agent-assistance")
-                                    .small()
-                                    .outline()
-                                    .icon(IconName::Bot)
-                                    .label(locale::text(
-                                        "Ask Agent",
-                                        "让 Agent 协助",
-                                        "讓 Agent 協助",
-                                    ))
-                                    .disabled(!assistance_enabled)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.update_workbench(cx, |workbench, cx| {
-                                            workbench.request_worktree_agent_assistance(cx)
-                                        })
-                                    })),
-                            )
+                            .when(mutations_available, |this| {
+                                this.child(
+                                    Button::new("worktree-agent-assistance")
+                                        .small()
+                                        .outline()
+                                        .icon(IconName::Bot)
+                                        .label(locale::text(
+                                            "Ask Agent",
+                                            "让 Agent 协助",
+                                            "讓 Agent 協助",
+                                        ))
+                                        .disabled(pending)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.update_workbench(cx, |workbench, cx| {
+                                                workbench.request_worktree_agent_assistance(cx)
+                                            })
+                                        })),
+                                )
+                            })
                             .child(
                                 Button::new("worktree-open-terminal")
                                     .small()
@@ -7991,7 +8080,7 @@ impl CodeRightRail {
             );
         }
 
-        if let Some(confirmation) = confirmation {
+        if mutations_available && let Some(confirmation) = confirmation {
             surface = surface.child(self.render_worktree_confirmation(confirmation, pending, cx));
         }
         surface.into_any_element()
@@ -8080,6 +8169,7 @@ impl CodeRightRail {
         conflicts: Vec<GitWorktreeConflictFile>,
         source_branch: String,
         target_branch: String,
+        mutations_available: bool,
         pending: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -8092,6 +8182,7 @@ impl CodeRightRail {
                     conflict,
                     &source_branch,
                     &target_branch,
+                    mutations_available,
                     pending,
                     cx,
                 )
@@ -8150,6 +8241,7 @@ impl CodeRightRail {
         conflict: GitWorktreeConflictFile,
         source_branch: &str,
         target_branch: &str,
+        mutations_available: bool,
         pending: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -8212,57 +8304,59 @@ impl CodeRightRail {
                             .child(worktree_conflict_kind_label(conflict.kind, conflict.binary)),
                     ),
             )
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .flex_wrap()
-                    .gap_2()
-                    .child(
-                        Button::new(format!("use-target-conflict-{path}"))
-                            .small()
-                            .outline()
-                            .label(target_label)
-                            .disabled(pending)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.update_workbench(cx, |workbench, cx| {
-                                    workbench.resolve_worktree_conflict(
-                                        target_path.clone(),
-                                        GitWorktreeConflictVersion::Target,
-                                        cx,
-                                    )
-                                })
-                            })),
-                    )
-                    .child(
-                        Button::new(format!("use-source-conflict-{path}"))
-                            .small()
-                            .outline()
-                            .label(source_label)
-                            .disabled(pending)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.update_workbench(cx, |workbench, cx| {
-                                    workbench.resolve_worktree_conflict(
-                                        source_path.clone(),
-                                        GitWorktreeConflictVersion::Source,
-                                        cx,
-                                    )
-                                })
-                            })),
-                    )
-                    .child(
-                        Button::new(format!("stage-worktree-conflict-{path}"))
-                            .small()
-                            .primary()
-                            .label(locale::text("Mark resolved", "标记已解决", "標記已解決"))
-                            .disabled(pending)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.update_workbench(cx, |workbench, cx| {
-                                    workbench.stage_worktree_conflict(stage_path.clone(), cx)
-                                })
-                            })),
-                    ),
-            )
+            .when(mutations_available, |this| {
+                this.child(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(
+                            Button::new(format!("use-target-conflict-{path}"))
+                                .small()
+                                .outline()
+                                .label(target_label)
+                                .disabled(pending)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.update_workbench(cx, |workbench, cx| {
+                                        workbench.resolve_worktree_conflict(
+                                            target_path.clone(),
+                                            GitWorktreeConflictVersion::Target,
+                                            cx,
+                                        )
+                                    })
+                                })),
+                        )
+                        .child(
+                            Button::new(format!("use-source-conflict-{path}"))
+                                .small()
+                                .outline()
+                                .label(source_label)
+                                .disabled(pending)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.update_workbench(cx, |workbench, cx| {
+                                        workbench.resolve_worktree_conflict(
+                                            source_path.clone(),
+                                            GitWorktreeConflictVersion::Source,
+                                            cx,
+                                        )
+                                    })
+                                })),
+                        )
+                        .child(
+                            Button::new(format!("stage-worktree-conflict-{path}"))
+                                .small()
+                                .primary()
+                                .label(locale::text("Mark resolved", "标记已解决", "標記已解決"))
+                                .disabled(pending)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.update_workbench(cx, |workbench, cx| {
+                                        workbench.stage_worktree_conflict(stage_path.clone(), cx)
+                                    })
+                                })),
+                        ),
+                )
+            })
             .into_any_element()
     }
 
@@ -8708,6 +8802,7 @@ impl CodeRightRail {
             scroll_handle,
             conflict_context,
             lifecycle_pending,
+            lifecycle_mutations_available,
         ) = {
             let workbench = self.workbench.read(cx);
             let conflict_context = workbench
@@ -8740,6 +8835,12 @@ impl CodeRightRail {
                 workbench.git_scroll.clone(),
                 conflict_context,
                 workbench.lifecycle_action_pending,
+                workbench.backend.as_ref().is_some_and(|backend| {
+                    backend
+                        .capabilities()
+                        .git
+                        .supports(BackendOperation::GitWorktreeLifecycleMutate)
+                }),
             )
         };
         let type_workbench = self.workbench.downgrade();
@@ -8759,6 +8860,7 @@ impl CodeRightRail {
                     conflicts,
                     source,
                     target,
+                    lifecycle_mutations_available,
                     lifecycle_pending,
                     cx,
                 ))
@@ -11896,6 +11998,30 @@ mod tests {
     }
 
     #[test]
+    fn workspace_generation_fence_requires_the_exact_workspace_generation() {
+        let workspace_id = WorkspaceId::new();
+        let workspace = WorkbenchWorkspace {
+            id: workspace_id.clone(),
+            root: PathBuf::from("/workspace/one"),
+            generation: 7,
+        };
+        let fence = WorkspaceGenerationFence::capture(&workspace);
+
+        assert!(fence.matches(Some(&workspace)));
+        assert!(!fence.matches(None));
+        assert!(!fence.matches(Some(&WorkbenchWorkspace {
+            id: workspace_id,
+            root: PathBuf::from("/workspace/one"),
+            generation: 8,
+        })));
+        assert!(!fence.matches(Some(&WorkbenchWorkspace {
+            id: WorkspaceId::new(),
+            root: PathBuf::from("/workspace/two"),
+            generation: 7,
+        })));
+    }
+
+    #[test]
     fn worktree_lifecycle_renderer_keeps_conflicts_before_ordinary_changes_and_named_actions() {
         let source = include_str!("code_workbench.rs");
         let changes = source
@@ -11911,6 +12037,7 @@ mod tests {
             "worktree-review-changes",
             "worktree-mark-ready",
             "worktree-merge-back",
+            "worktree-review-queued-merge",
             "worktree-restore",
             "worktree-agent-assistance",
             "worktree-abort-merge",
@@ -11920,6 +12047,39 @@ mod tests {
             "stage-worktree-conflict-",
         ] {
             assert!(source.contains(action), "missing lifecycle action {action}");
+        }
+        let lifecycle = source
+            .split_once("    fn render_worktree_lifecycle(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_worktree_confirmation("))
+            .map(|(body, _)| body)
+            .unwrap();
+        assert!(
+            lifecycle.contains("if mutations_available && let Some(confirmation) = confirmation")
+        );
+        let conflict_row = source
+            .split_once("    fn render_worktree_conflict_row(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_git("))
+            .map(|(body, _)| body)
+            .unwrap();
+        assert!(conflict_row.contains(".when(mutations_available, |this|"));
+    }
+
+    #[test]
+    fn queued_worktree_keeps_a_fresh_merge_review_action() {
+        assert_eq!(
+            worktree_lifecycle_primary_action(WorktreeLifecycleDisplayState::Queued),
+            Some(WorktreeLifecyclePrimaryAction::ReviewQueuedMerge)
+        );
+        assert_eq!(
+            worktree_lifecycle_primary_action(WorktreeLifecycleDisplayState::Ready),
+            Some(WorktreeLifecyclePrimaryAction::MergeBack)
+        );
+        for state in [
+            WorktreeLifecycleDisplayState::Merging,
+            WorktreeLifecycleDisplayState::NeedsResolution,
+            WorktreeLifecycleDisplayState::NeedsAttention,
+        ] {
+            assert_eq!(worktree_lifecycle_primary_action(state), None);
         }
     }
 

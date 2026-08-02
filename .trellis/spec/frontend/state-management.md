@@ -1772,6 +1772,11 @@ GitWorktreeLifecycleMutate  -> readiness, merge, conflict, archive/restore/disca
   already running, set one reload request and fetch again after completion;
   concurrent polling must not drop the newest state or spawn an unbounded task
   set.
+- Every lifecycle snapshot, plan/preflight query, readiness update, and mutation
+  completion captures the exact `{workspaceId, generation}` before dispatch and
+  may change pending/error/confirmation/snapshot state only while that fence
+  still matches. A Workspace switch resets the task slots and pending state;
+  the old completion is ignored rather than applied to the new Workspace.
 - `WorktreeLifecycleView::from_snapshot` first selects a visible operation owned
   by the current target Workspace, then a source operation. A normal checkout
   therefore has no managed header, while the same checkout still receives a
@@ -1780,6 +1785,9 @@ GitWorktreeLifecycleMutate  -> readiness, merge, conflict, archive/restore/disca
   exact-head summary, and concrete lifecycle actions. Confirmation state stores
   typed plans/preflights, not reconstructed labels or booleans. Changed plan
   facts clear stale confirmation and require another review.
+- `Queued` remains visibly actionable through `Review merge`, which requests a
+  fresh typed merge plan. Reaching the front never auto-executes the previously
+  confirmed plan; changed target facts require another explicit confirmation.
 - Conflict rows are derived from the target-owned operation and render before
   ordinary Changes. Their typed category and binary state come from Core DTOs.
   Active conflict paths are removed from the ordinary tree and generic
@@ -1801,20 +1809,24 @@ GitWorktreeLifecycleMutate  -> readiness, merge, conflict, archive/restore/disca
   the detailed Changes surface.
 - Rendering `GitWorktreeRead` without `GitWorktreeLifecycleMutate` is valid:
   branch/readiness/conflict state remains visible, while every mutation and its
-  confirmation entry point is absent. Capability hiding is presentation only;
-  the Backend still rejects unsupported calls.
+  confirmation entry point is absent, including conflict resolution, staging,
+  and Agent-assistance controls. Read-only users may still inspect conflict
+  diffs and open a terminal. Capability hiding is presentation only; the Backend
+  still rejects unsupported calls.
 
 ### 4. Validation & Error Matrix
 
 | Condition | Required result |
 | --- | --- |
 | Lifecycle response belongs to an older Workspace generation | Ignore it; preserve the current Workspace snapshot. |
+| Lifecycle plan/readiness/mutation completes for another Workspace ID or generation | Ignore the entire completion, including pending/error/confirmation changes; the current Workspace owns its own task state. |
 | Refresh is requested while one is loading | Coalesce one follow-up load; do not lose it or run parallel unbounded loads. |
 | Current checkout is neither managed nor a target | Render ordinary Changes with no lifecycle header/banner. |
 | Current checkout owns NeedsResolution/NeedsAttention | Render the persistent target banner and conflict rows even without a managed source record. |
 | Conflict path also appears in ordinary Git status | Show it only in the typed conflict section; exclude it from generic selection. |
 | Backend loses `GitWorktreeLifecycleMutate` | Remove mutation controls/confirmation; retain read-only projection when `GitWorktreeRead` remains. |
 | Merge/preflight returns stale-plan error | Clear old confirmation, refresh lifecycle, and require a new plan. |
+| A queued merge reaches the front or its target facts change | Keep a visible merge-review action, fetch a fresh plan, and require explicit confirmation before execution. |
 | Assistance operation/Session fence is invalid | Show the stable Backend error; do not fall back to another Workspace or global Agent lock. |
 | Continue/Abort succeeds or conflict is returned | Refresh status and lifecycle, refresh sidebar projection, and focus target Changes when attention is required. |
 | Lifecycle state is unknown | Render NeedsAttention; never treat it as Working, Ready, or success. |
@@ -1844,8 +1856,10 @@ GitWorktreeLifecycleMutate  -> readiness, merge, conflict, archive/restore/disca
 - Git Workbench model tests assert conflict paths precede ordinary rows and are
   excluded from generic select-all, stage, and commit path sets.
 - GPUI source-contract tests assert managed header, persistent target banner,
-  typed conflict actions, named confirmations, stale-plan refresh, capability
-  gates, and Agent assistance's dedicated task/deterministic message contract.
+  typed conflict actions, named confirmations, stale-plan refresh, exact
+  Workspace ID/generation fences for reads and mutations, queued merge review,
+  capability gates, and Agent assistance's dedicated task/deterministic message
+  contract.
 - Backend fixture tests keep Native, disconnected, and Remote Git trait surfaces
   exhaustive; remote tests assert read capability never implies lifecycle
   mutation.
