@@ -2178,6 +2178,7 @@ pub struct VibexWorkbench {
     fork_session_pending: bool,
     pending_agent_turn_session_ids: BTreeSet<String>,
     agent_turn_pending: bool,
+    auto_continue_default_project_ids: BTreeSet<String>,
     auto_continue_session_ids: BTreeSet<String>,
     auto_continue_paused_error_session_ids: BTreeSet<String>,
     auto_continue_handled_errors: BTreeMap<String, i64>,
@@ -2678,6 +2679,7 @@ impl VibexWorkbench {
             fork_session_pending: false,
             pending_agent_turn_session_ids: BTreeSet::new(),
             agent_turn_pending: false,
+            auto_continue_default_project_ids: BTreeSet::new(),
             auto_continue_session_ids: BTreeSet::new(),
             auto_continue_paused_error_session_ids: BTreeSet::new(),
             auto_continue_handled_errors: BTreeMap::new(),
@@ -3631,6 +3633,8 @@ impl VibexWorkbench {
             .iter()
             .map(|(project, _)| project.id.as_str().to_string())
             .collect::<BTreeSet<_>>();
+        self.auto_continue_default_project_ids
+            .retain(|id| valid_project_ids.contains(id));
         let mut seen = BTreeSet::new();
         self.ui_state
             .sidebar
@@ -3672,6 +3676,7 @@ impl VibexWorkbench {
         {
             return;
         }
+        let auto_continue_by_default = self.project_auto_continue_enabled(&session.project_id);
         if let Some(existing) = self
             .sessions
             .iter_mut()
@@ -3679,6 +3684,10 @@ impl VibexWorkbench {
         {
             *existing = session;
         } else {
+            if auto_continue_by_default {
+                self.auto_continue_session_ids
+                    .insert(session.id.as_str().to_string());
+            }
             self.sessions.insert(0, session);
         }
     }
@@ -3701,6 +3710,36 @@ impl VibexWorkbench {
         if self.selected_session_id.as_ref() == Some(session_id) {
             self.agent_turn_pending = pending;
         }
+    }
+
+    fn project_auto_continue_enabled(&self, project_id: &ProjectId) -> bool {
+        self.auto_continue_default_project_ids
+            .contains(project_id.as_str())
+    }
+
+    fn set_project_auto_continue_enabled(
+        &mut self,
+        project_id: ProjectId,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if enabled {
+            self.auto_continue_default_project_ids
+                .insert(project_id.as_str().to_string());
+            let session_ids = self
+                .sessions
+                .iter()
+                .filter(|session| session.project_id.as_str() == project_id.as_str())
+                .map(|session| session.id.clone())
+                .collect::<Vec<_>>();
+            for session_id in session_ids {
+                self.set_auto_continue_enabled(session_id, true, cx);
+            }
+        } else {
+            self.auto_continue_default_project_ids
+                .remove(project_id.as_str());
+        }
+        cx.notify();
     }
 
     fn auto_continue_enabled(&self, session_id: &VibexSessionId) -> bool {
@@ -12921,12 +12960,16 @@ impl VibexWorkbench {
         let batch_ids = project_session_ids.clone();
         let import_workspace = (current_workspace.root_path.clone(), current_workspace.mode);
         let menu_entity = cx.weak_entity();
+        let auto_continue_entity = cx.weak_entity();
+        let auto_continue_project_id = project_id.clone();
         let import_entity = cx.weak_entity();
         let delete_entity = cx.weak_entity();
         let delete_project_id = project_id.clone();
         let delete_project_name = project_name.clone();
         let menu_project_name = project_name.clone();
         let locale = self.resolved_locale();
+        let project_auto_continue_enabled = self.project_auto_continue_enabled(&project_id);
+        let auto_continue_label = locale::text("Auto continue", "自动继续", "自動繼續");
         let project_actions_label = sidebar_project_actions_label(locale, &project_name);
         let new_session_label = sidebar_new_session_for_project_label(locale, &project_name);
 
@@ -13026,6 +13069,8 @@ impl VibexWorkbench {
                                 .dropdown_menu(move |menu, _, cx| {
                                     let _ = menu_entity
                                         .update(cx, |this, _| this.retain_sidebar_hover_preview());
+                                    let auto_continue_entity = auto_continue_entity.clone();
+                                    let auto_continue_project_id = auto_continue_project_id.clone();
                                     let import_entity = import_entity.clone();
                                     let import_workspace = import_workspace.clone();
                                     let import_project_name = menu_project_name.to_string();
@@ -13033,6 +13078,23 @@ impl VibexWorkbench {
                                     let delete_project_id = delete_project_id.clone();
                                     let delete_project_name = delete_project_name.clone();
                                     menu.item(PopupMenuItem::label(menu_project_name.clone()))
+                                        .separator()
+                                        .item(
+                                            PopupMenuItem::new(auto_continue_label)
+                                                .checked(project_auto_continue_enabled)
+                                                .on_click(move |_, _, cx| {
+                                                    let _ = auto_continue_entity.update(
+                                                        cx,
+                                                        |this, cx| {
+                                                            this.set_project_auto_continue_enabled(
+                                                                auto_continue_project_id.clone(),
+                                                                !project_auto_continue_enabled,
+                                                                cx,
+                                                            )
+                                                        },
+                                                    );
+                                                }),
+                                        )
                                         .separator()
                                         .item(
                                             PopupMenuItem::new(strings.sidebar_import_sessions)
@@ -13785,7 +13847,11 @@ impl VibexWorkbench {
                                         .child(
                                             Spinner::new()
                                                 .icon(Icon::new(IconName::LoaderCircle))
-                                                .color(cx.theme().sidebar_foreground.opacity(0.58))
+                                                .color(if auto_continue_enabled {
+                                                    cx.theme().success
+                                                } else {
+                                                    cx.theme().sidebar_foreground.opacity(0.58)
+                                                })
                                                 .xsmall(),
                                         ),
                                 )
@@ -29805,6 +29871,7 @@ mod tests {
     #[test]
     fn auto_continue_ui_supports_session_scoping_countdown_and_pause() {
         let source = include_str!("app.rs");
+        assert!(source.contains("auto_continue_default_project_ids"));
         let state = source
             .split_once("    fn auto_continue_enabled(")
             .and_then(|(_, tail)| tail.split_once("\n    fn sidebar_workspace_groups("))
@@ -29839,6 +29906,31 @@ mod tests {
         assert!(sidebar.contains("PopupMenuItem::new(auto_continue_label)"));
         assert!(sidebar.contains(".checked(auto_continue_enabled)"));
         assert!(sidebar.contains("this.set_auto_continue_enabled("));
+
+        let project = source
+            .split_once("    fn render_sidebar_project(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_workspace("))
+            .map(|(body, _)| body)
+            .expect("sidebar project renderer should remain inspectable");
+        assert!(project.contains("PopupMenuItem::new(auto_continue_label)"));
+        assert!(project.contains(".checked(project_auto_continue_enabled)"));
+        assert!(project.contains("this.set_project_auto_continue_enabled("));
+
+        let project_toggle = source
+            .split_once("    fn set_project_auto_continue_enabled(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn auto_continue_enabled("))
+            .map(|(body, _)| body)
+            .expect("project auto-continue toggle should remain inspectable");
+        assert!(project_toggle.contains("session.project_id.as_str() == project_id.as_str()"));
+        assert!(project_toggle.contains("self.set_auto_continue_enabled(session_id, true, cx)"));
+
+        let upsert = source
+            .split_once("    fn upsert_session_snapshot(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn session_turn_pending("))
+            .map(|(body, _)| body)
+            .expect("session snapshot reconciliation should remain inspectable");
+        assert!(upsert.contains("self.project_auto_continue_enabled(&session.project_id)"));
+        assert!(upsert.contains("self.auto_continue_session_ids"));
     }
 
     #[test]
