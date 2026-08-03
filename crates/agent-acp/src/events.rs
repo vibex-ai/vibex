@@ -203,7 +203,15 @@ pub struct ClaudeEventEnricher;
 impl AgentEventEnricher for ClaudeEventEnricher {
     fn enrich(&self, input: &AgentEventInput) -> Vec<CanonicalAgentEvent> {
         let kind = normalized_kind(&input.tool_name);
-        if matches!(kind.as_str(), "claude_subagent" | "claude_background_task") {
+        if matches!(
+            kind.as_str(),
+            "claude_subagent"
+                | "claude_background_task"
+                | "claude_background_agent"
+                | "claude_background_shell"
+                | "claude_task_notification"
+                | "claude_task_update"
+        ) {
             return vec![collaboration_event(input)];
         }
         PassthroughEventEnricher.enrich(input)
@@ -990,6 +998,27 @@ mod tests {
                 );
             }
             other => panic!("expected camelCase command event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_background_extensions_share_the_collaboration_projection() {
+        for kind in [
+            "claude_subagent",
+            "claude_background_task",
+            "claude_background_agent",
+            "claude_background_shell",
+            "claude_task_notification",
+            "claude_task_update",
+        ] {
+            let events = normalize_agent_event(
+                AgentEventEnricherKind::Claude,
+                &input(kind, json!({"agent":"reviewer"})),
+            );
+            assert!(matches!(
+                events[0].event,
+                CanonicalAgentEvent::Collaboration(_)
+            ));
         }
     }
 

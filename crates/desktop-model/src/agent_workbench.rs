@@ -235,6 +235,16 @@ pub struct AgentPlanProjection {
     pub steps: Vec<PlanStepPayload>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveCollaborationProjection {
+    pub sequence: i64,
+    pub action: String,
+    pub status: vibex_core::ToolCallStatus,
+    pub summary: String,
+    pub agent_label: Option<String>,
+}
+
 impl AgentPlanProjection {
     pub fn completed_step_count(&self) -> usize {
         self.steps
@@ -295,6 +305,43 @@ pub fn current_agent_plan(items: &[TimelineItem]) -> Option<AgentPlanProjection>
                 steps: steps.clone(),
             })
         })
+}
+
+pub fn active_collaborations(items: &[TimelineItem]) -> Vec<ActiveCollaborationProjection> {
+    let mut latest_by_identity = BTreeMap::<String, ActiveCollaborationProjection>::new();
+    for item in items {
+        let TimelinePayload::Collaboration(collaboration) = &item.payload else {
+            continue;
+        };
+        let identity = item.provider_correlation_id.clone().unwrap_or_else(|| {
+            format!(
+                "{}:{}",
+                collaboration.action,
+                collaboration.agent_label.as_deref().unwrap_or_default()
+            )
+        });
+        latest_by_identity.insert(
+            identity,
+            ActiveCollaborationProjection {
+                sequence: item.sequence,
+                action: collaboration.action.clone(),
+                status: collaboration.status,
+                summary: collaboration.summary.clone(),
+                agent_label: collaboration.agent_label.clone(),
+            },
+        );
+    }
+    let mut active = latest_by_identity
+        .into_values()
+        .filter(|collaboration| {
+            matches!(
+                collaboration.status,
+                vibex_core::ToolCallStatus::Started | vibex_core::ToolCallStatus::Progress
+            )
+        })
+        .collect::<Vec<_>>();
+    active.sort_by_key(|collaboration| collaboration.sequence);
+    active
 }
 
 pub fn timeline_conversation_turns(
@@ -482,13 +529,10 @@ pub fn timeline_process_activity_groups(rows: &[TimelineRow]) -> Vec<TimelinePro
 fn is_process_activity_row(kind: TimelineRowKind) -> bool {
     matches!(
         kind,
-        TimelineRowKind::Command
-            | TimelineRowKind::ToolCall
-            | TimelineRowKind::FileOperation
+        TimelineRowKind::ToolCall
             | TimelineRowKind::WebSearch
             | TimelineRowKind::TodoUpdate
             | TimelineRowKind::Collaboration
-            | TimelineRowKind::ImageGeneration
     )
 }
 
@@ -561,9 +605,16 @@ fn process_compaction_key(item: &TimelineItem) -> Option<String> {
         }
         TimelinePayload::WebSearch(search) => Some(format!("web:{}", search.query)),
         TimelinePayload::TodoUpdate(todo) => Some(format!("todo:{}", todo.title)),
-        TimelinePayload::Collaboration(collaboration) => {
-            Some(format!("collaboration:{}", collaboration.action))
-        }
+        TimelinePayload::Collaboration(collaboration) => Some(format!(
+            "collaboration:{}",
+            item.provider_correlation_id
+                .clone()
+                .unwrap_or_else(|| format!(
+                    "{}:{}",
+                    collaboration.action,
+                    collaboration.agent_label.as_deref().unwrap_or_default()
+                ))
+        )),
         TimelinePayload::ImageGeneration(_) => Some(format!(
             "image:{}",
             item.provider_correlation_id
@@ -1201,9 +1252,10 @@ mod tests {
     use serde_json::json;
     use vibex_core::{
         AgentId, AgentMessageDeltaPayload, AgentMessagePayload, AgentSessionSafety,
-        FileOperationPayload, PlanPayload, ProjectId, ReasoningPayload, TimelineItemId,
-        TimelineRedactionState, TimelineSource, TodoUpdatePayload, ToolCallPayload, ToolCallStatus,
-        TurnExecutionAttributionView, UserMessagePayload, WorkspaceId, WorkspaceMode,
+        CollaborationPayload, FileOperationPayload, PlanPayload, ProjectId, ReasoningPayload,
+        TimelineItemId, TimelineRedactionState, TimelineSource, TodoUpdatePayload, ToolCallPayload,
+        ToolCallStatus, TurnExecutionAttributionView, UserMessagePayload, WorkspaceId,
+        WorkspaceMode,
     };
 
     fn session(id: &str, project: &str, title: &str, updated_at_ms: i64) -> AgentSession {
@@ -1722,6 +1774,47 @@ mod tests {
         ];
 
         assert!(current_agent_plan(&items).is_none());
+    }
+
+    #[test]
+    fn active_collaboration_projection_keeps_only_latest_running_identities() {
+        let collaboration = |sequence, identity: &str, agent: &str, status| {
+            let mut item = item(
+                sequence,
+                None,
+                TimelinePayload::Collaboration(CollaborationPayload {
+                    action: "spawn_agent".into(),
+                    status,
+                    summary: format!("{agent} {status:?}"),
+                    agent_label: Some(agent.into()),
+                    raw_extension: None,
+                }),
+            );
+            item.provider_correlation_id = Some(identity.into());
+            item
+        };
+        let items = [
+            collaboration(1, "worker-a", "Reviewer", ToolCallStatus::Started),
+            collaboration(2, "worker-b", "Builder", ToolCallStatus::Progress),
+            collaboration(3, "worker-a", "Reviewer", ToolCallStatus::Completed),
+        ];
+
+        let active = active_collaborations(&items);
+
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].agent_label.as_deref(), Some("Builder"));
+        assert_eq!(active[0].sequence, 2);
+        assert_eq!(active[0].status, ToolCallStatus::Progress);
+    }
+
+    #[test]
+    fn heavyweight_timeline_cards_do_not_collapse_into_activity_groups() {
+        assert!(is_process_activity_row(TimelineRowKind::ToolCall));
+        assert!(is_process_activity_row(TimelineRowKind::WebSearch));
+        assert!(is_process_activity_row(TimelineRowKind::Collaboration));
+        assert!(!is_process_activity_row(TimelineRowKind::Command));
+        assert!(!is_process_activity_row(TimelineRowKind::FileOperation));
+        assert!(!is_process_activity_row(TimelineRowKind::ImageGeneration));
     }
 
     #[test]

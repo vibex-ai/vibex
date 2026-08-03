@@ -91,9 +91,10 @@ use vibex_desktop_model::{
     SidebarState, SidebarWorkspaceProjection, ThemeMode as ModelThemeMode, ThrottledUiStateWriter,
     TimelineConversationTurn, TimelineFollowState, TimelineModel, TimelineProcessActivityGroup,
     TimelineRow, TimelineRowKind, UiStateStore, WorkbenchRoute, WorkspaceAgentSummary,
-    WorkspaceContextProjection, WorktreeLifecycleDisplayState, composer_trigger_at,
-    current_agent_plan, custom_worktree_path_is_absolute, sidebar_project_projections,
-    timeline_agent_message_count_after_sequence, timeline_conversation_turns,
+    WorkspaceContextProjection, WorktreeLifecycleDisplayState, active_collaborations,
+    composer_trigger_at, current_agent_plan, custom_worktree_path_is_absolute,
+    sidebar_project_projections, timeline_agent_message_count_after_sequence,
+    timeline_conversation_turns,
 };
 use vibex_desktop_runtime::{
     DesktopEvent, DesktopRuntime, DesktopRuntimeConfig, DesktopRuntimeFacade, PREVIEW_APP_ID,
@@ -19712,9 +19713,9 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // Codex-parity: the process area is a flat document flow — paragraphs for
-        // text/reasoning, one-line icon entries for tool activity, cards only for
-        // permissions and errors.
+        // Keep prose in the document flow, lightweight activity on compact lines,
+        // and structured command, file, image, permission, and error payloads in
+        // dedicated cards.
         let element = match row.kind {
             TimelineRowKind::UserMessage => {
                 self.render_user_message_row(row, None, false, false, window, cx)
@@ -19727,13 +19728,13 @@ impl VibexWorkbench {
             }
             TimelineRowKind::Error => self.render_error_row(row, conversation_conclusion, cx),
             TimelineRowKind::PermissionRequest => self.render_permission_request_card(row, cx),
-            TimelineRowKind::Command
-            | TimelineRowKind::ToolCall
-            | TimelineRowKind::FileOperation
+            TimelineRowKind::Command => self.render_command_execution_card(row, cx),
+            TimelineRowKind::FileOperation => self.render_file_operation_card(row, cx),
+            TimelineRowKind::ImageGeneration => self.render_image_generation_card(row, cx),
+            TimelineRowKind::ToolCall
             | TimelineRowKind::WebSearch
             | TimelineRowKind::TodoUpdate
-            | TimelineRowKind::Collaboration
-            | TimelineRowKind::ImageGeneration => self.render_process_activity_line(row, cx),
+            | TimelineRowKind::Collaboration => self.render_process_activity_line(row, cx),
             TimelineRowKind::GitNotice
             | TimelineRowKind::SystemNotice
             | TimelineRowKind::PermissionResolution => self.render_fallback_process_row(row, cx),
@@ -19952,13 +19953,67 @@ impl VibexWorkbench {
                 }
                 height
             }
-            TimelineRowKind::Command
-            | TimelineRowKind::ToolCall
-            | TimelineRowKind::FileOperation
+            TimelineRowKind::Command => {
+                let Some(vibex_core::TimelinePayload::Command(command)) = payload else {
+                    return 40.0;
+                };
+                let expanded = self
+                    .timeline_command_expansion
+                    .get(&row.id)
+                    .copied()
+                    .unwrap_or(command.status == vibex_core::CommandStatus::Started);
+                if !expanded {
+                    return 40.0;
+                }
+                let mut height = 40.0 + 24.0 + estimated_pre_block_height(&command.command);
+                if let Some(output) = command.output_summary.as_deref() {
+                    height += 20.0 + estimated_detail_block_height(output);
+                }
+                if command.cwd.is_some() {
+                    height += 28.0;
+                }
+                if command.exit_code.is_some() {
+                    height += 24.0;
+                }
+                height
+            }
+            TimelineRowKind::FileOperation => {
+                let Some(vibex_core::TimelinePayload::FileOperation(operation)) = payload else {
+                    return 40.0;
+                };
+                let expanded = self
+                    .timeline_command_expansion
+                    .get(&row.id)
+                    .copied()
+                    .unwrap_or(false);
+                if !expanded {
+                    return 40.0;
+                }
+                let preview = agent_file_diff_preview(
+                    operation.old_text.as_deref(),
+                    operation.new_text.as_deref(),
+                );
+                40.0 + (preview.lines.len().max(1) as f32 * 20.0).min(320.0)
+            }
+            TimelineRowKind::ImageGeneration => {
+                let Some(vibex_core::TimelinePayload::ImageGeneration(image)) = payload else {
+                    return 40.0;
+                };
+                let in_progress = matches!(
+                    image.status,
+                    vibex_core::ToolCallStatus::Started | vibex_core::ToolCallStatus::Progress
+                );
+                let expanded = self
+                    .timeline_command_expansion
+                    .get(&row.id)
+                    .copied()
+                    .unwrap_or(in_progress || image.image_reference.is_some());
+                if expanded { 312.0 } else { 40.0 }
+            }
+            TimelineRowKind::ToolCall
             | TimelineRowKind::WebSearch
             | TimelineRowKind::TodoUpdate
-            | TimelineRowKind::Collaboration
-            | TimelineRowKind::ImageGeneration => {
+            | TimelineRowKind::Collaboration => {
                 let projection = tool_card_projection(row, payload);
                 let mut height = 24.0;
                 let expanded = !projection.details.is_empty()
@@ -20569,8 +20624,8 @@ impl VibexWorkbench {
         row: &TimelineRow,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // Codex-parity: tool/command activity is a single muted line — icon plus a
-        // compact summary. Clicking a line toggles its mono detail blocks.
+        // Lightweight tool activity is a single muted line. Structured command,
+        // file, and image payloads use their dedicated renderers instead.
         let projection = self.tool_card_projection_cached(row);
         let icon = process_activity_icon(row.kind);
         let has_details = !projection.details.is_empty();
@@ -20653,6 +20708,585 @@ impl VibexWorkbench {
                                 this.open_code_file(path.clone(), window, cx)
                             })),
                     ),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_command_execution_card(
+        &mut self,
+        row: &TimelineRow,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(command) =
+            self.timeline_row_latest_item(row)
+                .and_then(|item| match &item.payload {
+                    vibex_core::TimelinePayload::Command(command) => Some(command.clone()),
+                    _ => None,
+                })
+        else {
+            return self.render_process_activity_line(row, cx);
+        };
+        let has_details = command.cwd.is_some()
+            || command.output_summary.is_some()
+            || command.exit_code.is_some()
+            || !command.command.is_empty();
+        let expanded = has_details
+            && self
+                .timeline_command_expansion
+                .get(&row.id)
+                .copied()
+                .unwrap_or(command.status == vibex_core::CommandStatus::Started);
+        let toggle_id = row.id.clone();
+        let measured_turn_id = row.turn_id.clone();
+        let failed = command.status == vibex_core::CommandStatus::Failed;
+        let in_progress = command.status == vibex_core::CommandStatus::Started;
+        let command_title = if command.command.trim().is_empty() {
+            locale::text("Command", "命令", "命令").to_string()
+        } else {
+            command.command.clone()
+        };
+        let card_bg = theme::semantic_color("card", cx.theme().is_dark());
+
+        v_flex()
+            .id(row.id.clone())
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
+            .rounded_lg()
+            .border_1()
+            .border_color(if failed {
+                cx.theme().danger.opacity(0.38)
+            } else {
+                cx.theme().border
+            })
+            .bg(card_bg.opacity(0.72))
+            .child(
+                h_flex()
+                    .id(SharedString::from(format!(
+                        "command-card-header:{}",
+                        row.id
+                    )))
+                    .w_full()
+                    .min_w_0()
+                    .min_h(px(40.0))
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .when(has_details, |this| {
+                        this.cursor_pointer()
+                            .hover(|style| style.bg(cx.theme().muted.opacity(0.35)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(turn_id) = measured_turn_id.as_deref() {
+                                    this.invalidate_timeline_turn_measurement(turn_id);
+                                }
+                                this.timeline_command_expansion
+                                    .insert(toggle_id.clone(), !expanded);
+                                this.rebuild_timeline_sizes();
+                                cx.notify();
+                            }))
+                    })
+                    .child(
+                        Icon::new(IconName::SquareTerminal)
+                            .size(px(15.0))
+                            .flex_none()
+                            .text_color(if failed {
+                                cx.theme().danger
+                            } else {
+                                cx.theme().muted_foreground
+                            }),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_size(cx.theme().mono_font_size)
+                            .child(command_title),
+                    )
+                    .child(Self::render_process_status_badge(
+                        command_status_label(command.status).to_string(),
+                        failed,
+                        in_progress,
+                        cx,
+                    ))
+                    .when(has_details, |this| {
+                        this.child(
+                            Icon::new(if expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .size(px(14.0))
+                            .flex_none()
+                            .text_color(cx.theme().muted_foreground),
+                        )
+                    }),
+            )
+            .when(expanded, |this| {
+                this.child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_2()
+                        .border_t_1()
+                        .border_color(cx.theme().border.opacity(0.72))
+                        .px_3()
+                        .py_3()
+                        .when_some(command.cwd.clone(), |this, cwd| {
+                            this.child(
+                                h_flex()
+                                    .min_w_0()
+                                    .gap_2()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(locale::text(
+                                        "Working directory",
+                                        "工作目录",
+                                        "工作目錄",
+                                    ))
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .font_family(cx.theme().mono_font_family.clone())
+                                            .child(cwd),
+                                    ),
+                            )
+                        })
+                        .child(
+                            self.render_process_detail_value(format!("$ {}", command.command), cx),
+                        )
+                        .when_some(command.output_summary.clone(), |this, output| {
+                            this.child(self.render_process_detail(
+                                locale::text("Output", "输出", "輸出").to_string(),
+                                output,
+                                cx,
+                            ))
+                        })
+                        .when_some(command.exit_code, |this, exit_code| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(if exit_code == 0 {
+                                        cx.theme().success
+                                    } else {
+                                        cx.theme().danger
+                                    })
+                                    .child(format!(
+                                        "{}: {exit_code}",
+                                        locale::text("Exit code", "退出码", "結束代碼")
+                                    )),
+                            )
+                        }),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_file_operation_card(
+        &mut self,
+        row: &TimelineRow,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(operation) =
+            self.timeline_row_latest_item(row)
+                .and_then(|item| match &item.payload {
+                    vibex_core::TimelinePayload::FileOperation(operation) => {
+                        Some(operation.clone())
+                    }
+                    _ => None,
+                })
+        else {
+            return self.render_process_activity_line(row, cx);
+        };
+        let preview =
+            agent_file_diff_preview(operation.old_text.as_deref(), operation.new_text.as_deref());
+        let has_diff = operation.old_text.is_some() || operation.new_text.is_some();
+        let expanded = has_diff
+            && self
+                .timeline_command_expansion
+                .get(&row.id)
+                .copied()
+                .unwrap_or(false);
+        let toggle_id = row.id.clone();
+        let measured_turn_id = row.turn_id.clone();
+        let open_path = operation.path.clone();
+        let title = format!(
+            "{} {}",
+            file_operation_verb(operation.operation),
+            agent_turn_preview_file_name(&operation.path)
+        );
+        let card_bg = theme::semantic_color("card", cx.theme().is_dark());
+
+        v_flex()
+            .id(row.id.clone())
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(card_bg.opacity(0.72))
+            .child(
+                h_flex()
+                    .id(SharedString::from(format!("file-card-header:{}", row.id)))
+                    .w_full()
+                    .min_w_0()
+                    .min_h(px(40.0))
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .when(has_diff, |this| {
+                        this.cursor_pointer()
+                            .hover(|style| style.bg(cx.theme().muted.opacity(0.35)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(turn_id) = measured_turn_id.as_deref() {
+                                    this.invalidate_timeline_turn_measurement(turn_id);
+                                }
+                                this.timeline_command_expansion
+                                    .insert(toggle_id.clone(), !expanded);
+                                this.rebuild_timeline_sizes();
+                                cx.notify();
+                            }))
+                    })
+                    .child(
+                        Icon::default()
+                            .path("icons/vibex/file-text.svg")
+                            .size(px(15.0))
+                            .flex_none()
+                            .text_color(cx.theme().muted_foreground),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .font_medium()
+                            .child(title),
+                    )
+                    .when(preview.removed_lines > 0, |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .text_xs()
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .text_color(cx.theme().danger)
+                                .child(format!("-{}", preview.removed_lines)),
+                        )
+                    })
+                    .when(preview.added_lines > 0, |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .text_xs()
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .text_color(cx.theme().success)
+                                .child(format!("+{}", preview.added_lines)),
+                        )
+                    })
+                    .child(
+                        Button::new(format!("open-agent-file-card:{}", row.id))
+                            .xsmall()
+                            .ghost()
+                            .compact()
+                            .size(px(28.0))
+                            .icon(IconName::FolderOpen)
+                            .tooltip(locale::text(
+                                "Open file in Preview",
+                                "在预览中打开文件",
+                                "在預覽中開啟檔案",
+                            ))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.open_code_file(open_path.clone(), window, cx)
+                            })),
+                    )
+                    .when(has_diff, |this| {
+                        this.child(
+                            Icon::new(if expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .size(px(14.0))
+                            .flex_none()
+                            .text_color(cx.theme().muted_foreground),
+                        )
+                    }),
+            )
+            .when(expanded, |this| {
+                this.child(self.render_agent_file_diff_preview(&preview, cx))
+            })
+            .into_any_element()
+    }
+
+    fn render_agent_file_diff_preview(
+        &self,
+        preview: &AgentFileDiffPreview,
+        cx: &App,
+    ) -> AnyElement {
+        if preview.lines.is_empty() {
+            return div()
+                .border_t_1()
+                .border_color(cx.theme().border.opacity(0.72))
+                .px_3()
+                .py_3()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(locale::text(
+                    "No text changes",
+                    "没有文本变化",
+                    "沒有文字變更",
+                ))
+                .into_any_element();
+        }
+        let rows = preview
+            .lines
+            .iter()
+            .map(|line| {
+                let (prefix, background, foreground) = match line.kind {
+                    AgentFileDiffLineKind::Context => (
+                        " ",
+                        cx.theme().transparent,
+                        cx.theme().foreground.opacity(0.82),
+                    ),
+                    AgentFileDiffLineKind::Add => {
+                        ("+", cx.theme().success.opacity(0.11), cx.theme().success)
+                    }
+                    AgentFileDiffLineKind::Delete => {
+                        ("-", cx.theme().danger.opacity(0.11), cx.theme().danger)
+                    }
+                    AgentFileDiffLineKind::Omitted => (
+                        "…",
+                        cx.theme().muted.opacity(0.42),
+                        cx.theme().muted_foreground,
+                    ),
+                };
+                h_flex()
+                    .min_w_full()
+                    .items_start()
+                    .bg(background)
+                    .px_2()
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .text_size(cx.theme().mono_font_size)
+                    .line_height(px(20.0))
+                    .text_color(foreground)
+                    .child(div().w(px(18.0)).flex_none().child(prefix))
+                    .child(div().whitespace_nowrap().child(line.text.clone()))
+            })
+            .collect::<Vec<_>>();
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .max_h(px(320.0))
+            .border_t_1()
+            .border_color(cx.theme().border.opacity(0.72))
+            .overflow_y_scrollbar()
+            .child(
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .overflow_x_scrollbar()
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+
+    fn render_image_generation_card(
+        &mut self,
+        row: &TimelineRow,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(image) = self
+            .timeline_row_latest_item(row)
+            .and_then(|item| match &item.payload {
+                vibex_core::TimelinePayload::ImageGeneration(image) => Some(image.clone()),
+                _ => None,
+            })
+        else {
+            return self.render_process_activity_line(row, cx);
+        };
+        let workspace_root = self
+            .selected_session_id
+            .as_ref()
+            .and_then(|session_id| {
+                self.sessions
+                    .iter()
+                    .find(|session| &session.id == session_id)
+            })
+            .map(|session| session.workspace_root.as_str());
+        let preview_source = image
+            .image_reference
+            .as_deref()
+            .and_then(|reference| generated_image_preview_source(reference, workspace_root));
+        let in_progress = matches!(
+            image.status,
+            vibex_core::ToolCallStatus::Started | vibex_core::ToolCallStatus::Progress
+        );
+        let failed = image.status == vibex_core::ToolCallStatus::Failed;
+        let has_details = in_progress || failed || image.image_reference.is_some();
+        let expanded = has_details
+            && self
+                .timeline_command_expansion
+                .get(&row.id)
+                .copied()
+                .unwrap_or(in_progress || image.image_reference.is_some());
+        let toggle_id = row.id.clone();
+        let measured_turn_id = row.turn_id.clone();
+        let card_bg = theme::semantic_color("card", cx.theme().is_dark());
+        let summary = if image.summary.trim().is_empty() {
+            locale::text("Image generation", "图片生成", "圖片生成").to_string()
+        } else {
+            image.summary.clone()
+        };
+
+        v_flex()
+            .id(row.id.clone())
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
+            .rounded_lg()
+            .border_1()
+            .border_color(if failed {
+                cx.theme().danger.opacity(0.38)
+            } else {
+                cx.theme().border
+            })
+            .bg(card_bg.opacity(0.72))
+            .child(
+                h_flex()
+                    .id(SharedString::from(format!("image-card-header:{}", row.id)))
+                    .w_full()
+                    .min_w_0()
+                    .min_h(px(40.0))
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .when(has_details, |this| {
+                        this.cursor_pointer()
+                            .hover(|style| style.bg(cx.theme().muted.opacity(0.35)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(turn_id) = measured_turn_id.as_deref() {
+                                    this.invalidate_timeline_turn_measurement(turn_id);
+                                }
+                                this.timeline_command_expansion
+                                    .insert(toggle_id.clone(), !expanded);
+                                this.rebuild_timeline_sizes();
+                                cx.notify();
+                            }))
+                    })
+                    .child(
+                        Icon::default()
+                            .path("icons/vibex/image.svg")
+                            .size(px(15.0))
+                            .flex_none()
+                            .text_color(if failed {
+                                cx.theme().danger
+                            } else {
+                                cx.theme().muted_foreground
+                            }),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .font_medium()
+                            .child(summary.clone()),
+                    )
+                    .child(Self::render_process_status_badge(
+                        agent_activity_status_label(image.status).to_string(),
+                        failed,
+                        in_progress,
+                        cx,
+                    ))
+                    .when(has_details, |this| {
+                        this.child(
+                            Icon::new(if expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .size(px(14.0))
+                            .flex_none()
+                            .text_color(cx.theme().muted_foreground),
+                        )
+                    }),
+            )
+            .when(expanded, |this| {
+                this.child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_2()
+                        .border_t_1()
+                        .border_color(cx.theme().border.opacity(0.72))
+                        .p_3()
+                        .when(in_progress, |this| {
+                            this.child(
+                                h_flex()
+                                    .h(px(120.0))
+                                    .w_full()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap_2()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(
+                                        ProgressCircle::new(format!(
+                                            "image-generation-progress:{}",
+                                            row.id
+                                        ))
+                                        .size(px(22.0)),
+                                    )
+                                    .child(summary.clone()),
+                            )
+                        })
+                        .when_some(preview_source.clone(), |this, source| {
+                            let preview = match source {
+                                GeneratedImagePreviewSource::Local(path) => img(path),
+                                GeneratedImagePreviewSource::Remote(url) => img(url),
+                            };
+                            this.child(
+                                div()
+                                    .w_full()
+                                    .h(px(240.0))
+                                    .overflow_hidden()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(cx.theme().border.opacity(0.72))
+                                    .bg(cx.theme().muted.opacity(0.28))
+                                    .child(preview.size_full().object_fit(ObjectFit::Contain)),
+                            )
+                        })
+                        .when(
+                            !in_progress
+                                && preview_source.is_none()
+                                && image.image_reference.is_some(),
+                            |this| {
+                                this.child(
+                                    self.render_process_detail(
+                                        locale::text("Image reference", "图片引用", "圖片參照")
+                                            .to_string(),
+                                        image.image_reference.clone().unwrap_or_default(),
+                                        cx,
+                                    ),
+                                )
+                            },
+                        )
+                        .when(failed, |this| {
+                            this.child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().danger)
+                                    .child(summary.clone()),
+                            )
+                        }),
                 )
             })
             .into_any_element()
@@ -21354,6 +21988,189 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
+    fn render_composer_collaboration(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let session_id = self.selected_session_id.as_ref()?;
+        let collaborations = active_collaborations(&self.timeline.items);
+        let latest = collaborations.last()?;
+        let expansion_key = format!("composer-collaboration:{}", session_id);
+        let expanded = self
+            .timeline_command_expansion
+            .get(&expansion_key)
+            .copied()
+            .unwrap_or(false);
+        let title = if collaborations.len() == 1 {
+            latest
+                .agent_label
+                .clone()
+                .unwrap_or_else(|| latest.action.clone())
+        } else {
+            format!(
+                "{} · {}",
+                locale::text("Background work", "后台工作", "背景工作"),
+                collaborations.len()
+            )
+        };
+        let summary = if collaborations.len() == 1 {
+            latest.summary.clone()
+        } else {
+            latest
+                .agent_label
+                .clone()
+                .map(|agent| format!("{agent}: {}", latest.summary))
+                .unwrap_or_else(|| latest.summary.clone())
+        };
+        let rows = collaborations
+            .iter()
+            .enumerate()
+            .map(|(index, collaboration)| {
+                let label = collaboration
+                    .agent_label
+                    .clone()
+                    .unwrap_or_else(|| collaboration.action.clone());
+                h_flex()
+                    .id(SharedString::from(format!(
+                        "composer-collaboration-row-{index}"
+                    )))
+                    .w_full()
+                    .min_w_0()
+                    .items_start()
+                    .gap_2()
+                    .py_1()
+                    .child(
+                        ProgressCircle::new(format!(
+                            "composer-collaboration-progress-{}",
+                            collaboration.sequence
+                        ))
+                        .size(px(16.0)),
+                    )
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .gap_1()
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .truncate()
+                                            .font_medium()
+                                            .child(label),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(agent_activity_status_label(
+                                                collaboration.status,
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(collaboration.summary.clone()),
+                            ),
+                    )
+            })
+            .collect::<Vec<_>>();
+        let card_bg = composer_queue_surface_background(cx.theme().is_dark());
+        let header_key = expansion_key.clone();
+        let expanded_rows = v_flex()
+            .w_full()
+            .min_w_0()
+            .max_h(px(180.0))
+            .overflow_y_scrollbar()
+            .gap_1()
+            .children(rows);
+        let header = h_flex()
+            .id("composer-collaboration-summary")
+            .w_full()
+            .min_w_0()
+            .min_h(px(40.0))
+            .items_center()
+            .gap_2()
+            .px_3()
+            .cursor_pointer()
+            .role(Role::Group)
+            .aria_label(format!("{}: {}", title, summary))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let expanded = this
+                    .timeline_command_expansion
+                    .get(&header_key)
+                    .copied()
+                    .unwrap_or(false);
+                this.timeline_command_expansion
+                    .insert(header_key.clone(), !expanded);
+                cx.notify();
+            }))
+            .child(
+                Icon::new(IconName::User)
+                    .size(px(17.0))
+                    .flex_none()
+                    .text_color(cx.theme().primary),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .truncate()
+                    .font_medium()
+                    .child(title),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .truncate()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(summary),
+            )
+            .child(
+                Icon::new(if expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .size(px(14.0))
+                .flex_none()
+                .text_color(cx.theme().muted_foreground),
+            );
+        Some(
+            v_flex()
+                .id("composer-collaboration")
+                .w_full()
+                .min_w_0()
+                .overflow_hidden()
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(cx.theme().border)
+                .bg(card_bg)
+                .child(header)
+                .when(expanded, |this| {
+                    this.child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .border_t_1()
+                            .border_color(cx.theme().border)
+                            .px_3()
+                            .py_2()
+                            .child(expanded_rows),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
     fn render_composer_plan(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let session_id = self.selected_session_id.as_ref()?;
         let plan = current_agent_plan(&self.timeline.items)?;
@@ -22041,6 +22858,7 @@ impl VibexWorkbench {
         let content_max_width = session_content_max_width(self.ui_state.session.content_width);
         let is_dark = cx.theme().is_dark();
         let composer_background = composer_surface_background(is_dark);
+        let composer_collaboration = self.render_composer_collaboration(cx);
         let composer_plan = self.render_composer_plan(cx);
         let composer_queue = self.render_composer_queue(cx);
         let composer_queue_visible = composer_queue.is_some();
@@ -22300,6 +23118,16 @@ impl VibexWorkbench {
                         this.max_w(px(max_width))
                     })
                     .min_w_0()
+                    .when_some(composer_collaboration, |this, collaboration| {
+                        this.child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .px(px(COMPOSER_QUEUE_HORIZONTAL_INSET))
+                                .pb_2()
+                                .child(collaboration),
+                        )
+                    })
                     .when_some(composer_plan, |this, plan| {
                         this.child(
                             div()
@@ -23757,6 +24585,205 @@ fn format_compact_duration(started_at_ms: i64, ended_at_ms: Option<i64>) -> Stri
         format!("{minutes}m {seconds}s")
     } else {
         format!("{seconds}s")
+    }
+}
+
+const AGENT_FILE_DIFF_CONTEXT_LINES: usize = 3;
+const AGENT_FILE_DIFF_MAX_CHANGED_LINES: usize = 160;
+const AGENT_FILE_DIFF_MAX_LINE_BYTES: usize = 2_048;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentFileDiffLineKind {
+    Context,
+    Add,
+    Delete,
+    Omitted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentFileDiffLine {
+    kind: AgentFileDiffLineKind,
+    text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentFileDiffPreview {
+    lines: Vec<AgentFileDiffLine>,
+    added_lines: usize,
+    removed_lines: usize,
+    omitted_lines: usize,
+}
+
+fn agent_file_diff_preview(old_text: Option<&str>, new_text: Option<&str>) -> AgentFileDiffPreview {
+    let old_lines = old_text
+        .filter(|text| !text.is_empty())
+        .map(|text| text.lines().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let new_lines = new_text
+        .filter(|text| !text.is_empty())
+        .map(|text| text.lines().collect::<Vec<_>>())
+        .unwrap_or_default();
+    if old_lines == new_lines {
+        return AgentFileDiffPreview {
+            lines: Vec::new(),
+            added_lines: 0,
+            removed_lines: 0,
+            omitted_lines: 0,
+        };
+    }
+    let common_prefix = old_lines
+        .iter()
+        .zip(&new_lines)
+        .take_while(|(old, new)| old == new)
+        .count();
+    let remaining_old = old_lines.len().saturating_sub(common_prefix);
+    let remaining_new = new_lines.len().saturating_sub(common_prefix);
+    let common_suffix = old_lines[..remaining_old + common_prefix]
+        .iter()
+        .rev()
+        .zip(new_lines[..remaining_new + common_prefix].iter().rev())
+        .take_while(|(old, new)| old == new)
+        .count()
+        .min(remaining_old)
+        .min(remaining_new);
+    let old_change_end = old_lines.len().saturating_sub(common_suffix);
+    let new_change_end = new_lines.len().saturating_sub(common_suffix);
+    let removed_lines = old_change_end.saturating_sub(common_prefix);
+    let added_lines = new_change_end.saturating_sub(common_prefix);
+
+    let prefix_start = common_prefix.saturating_sub(AGENT_FILE_DIFF_CONTEXT_LINES);
+    let mut lines = old_lines[prefix_start..common_prefix]
+        .iter()
+        .map(|line| AgentFileDiffLine {
+            kind: AgentFileDiffLineKind::Context,
+            text: bounded_agent_diff_line(line),
+        })
+        .collect::<Vec<_>>();
+    let changed_lines = old_lines[common_prefix..old_change_end]
+        .iter()
+        .map(|line| AgentFileDiffLine {
+            kind: AgentFileDiffLineKind::Delete,
+            text: bounded_agent_diff_line(line),
+        })
+        .chain(
+            new_lines[common_prefix..new_change_end]
+                .iter()
+                .map(|line| AgentFileDiffLine {
+                    kind: AgentFileDiffLineKind::Add,
+                    text: bounded_agent_diff_line(line),
+                }),
+        )
+        .collect::<Vec<_>>();
+    let omitted_lines = changed_lines
+        .len()
+        .saturating_sub(AGENT_FILE_DIFF_MAX_CHANGED_LINES);
+    if omitted_lines == 0 {
+        lines.extend(changed_lines);
+    } else {
+        let head = AGENT_FILE_DIFF_MAX_CHANGED_LINES / 2;
+        let tail = AGENT_FILE_DIFF_MAX_CHANGED_LINES.saturating_sub(head);
+        lines.extend(changed_lines.iter().take(head).cloned());
+        lines.push(AgentFileDiffLine {
+            kind: AgentFileDiffLineKind::Omitted,
+            text: format!("{omitted_lines} changed lines omitted"),
+        });
+        lines.extend(
+            changed_lines
+                .iter()
+                .skip(changed_lines.len().saturating_sub(tail))
+                .cloned(),
+        );
+    }
+    lines.extend(
+        new_lines[new_change_end..]
+            .iter()
+            .take(AGENT_FILE_DIFF_CONTEXT_LINES)
+            .map(|line| AgentFileDiffLine {
+                kind: AgentFileDiffLineKind::Context,
+                text: bounded_agent_diff_line(line),
+            }),
+    );
+    AgentFileDiffPreview {
+        lines,
+        added_lines,
+        removed_lines,
+        omitted_lines,
+    }
+}
+
+fn bounded_agent_diff_line(line: &str) -> String {
+    let prefix = utf8_prefix(line, AGENT_FILE_DIFF_MAX_LINE_BYTES);
+    if prefix.len() == line.len() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}...(truncated)")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GeneratedImagePreviewSource {
+    Local(Arc<std::path::Path>),
+    Remote(SharedString),
+}
+
+fn generated_image_preview_source(
+    reference: &str,
+    workspace_root: Option<&str>,
+) -> Option<GeneratedImagePreviewSource> {
+    let reference = reference.trim();
+    if reference.is_empty() {
+        return None;
+    }
+    if let Ok(url) = url::Url::parse(reference) {
+        match url.scheme() {
+            "http" | "https" => {
+                return Some(GeneratedImagePreviewSource::Remote(reference.into()));
+            }
+            "file" => {
+                let path = url.to_file_path().ok()?;
+                return generated_image_local_source(path, workspace_root);
+            }
+            _ => return None,
+        }
+    }
+    generated_image_local_source(std::path::PathBuf::from(reference), workspace_root)
+}
+
+fn generated_image_local_source(
+    path: std::path::PathBuf,
+    workspace_root: Option<&str>,
+) -> Option<GeneratedImagePreviewSource> {
+    if path
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        return None;
+    }
+    let workspace_root = std::path::Path::new(workspace_root?);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        workspace_root.join(path)
+    };
+    path.starts_with(workspace_root).then(|| {
+        GeneratedImagePreviewSource::Local(Arc::<std::path::Path>::from(path.into_boxed_path()))
+    })
+}
+
+fn agent_activity_status_label(status: vibex_core::ToolCallStatus) -> &'static str {
+    match status {
+        vibex_core::ToolCallStatus::Started => locale::text("Started", "已开始", "已開始"),
+        vibex_core::ToolCallStatus::Progress => locale::text("Running", "进行中", "進行中"),
+        vibex_core::ToolCallStatus::Completed => locale::text("Completed", "已完成", "已完成"),
+        vibex_core::ToolCallStatus::Failed => locale::text("Failed", "失败", "失敗"),
+    }
+}
+
+fn command_status_label(status: vibex_core::CommandStatus) -> &'static str {
+    match status {
+        vibex_core::CommandStatus::Started => locale::text("Running", "运行中", "執行中"),
+        vibex_core::CommandStatus::Completed => locale::text("Completed", "已完成", "已完成"),
+        vibex_core::CommandStatus::Failed => locale::text("Failed", "失败", "失敗"),
     }
 }
 
@@ -34224,6 +35251,88 @@ mod tests {
 
         assert_eq!(paths, ["src/early.rs"]);
         assert!(!paths.iter().any(|path| path == "src/late.rs"));
+    }
+
+    #[test]
+    fn agent_file_diff_preview_keeps_context_and_bounds_large_changes() {
+        let preview = agent_file_diff_preview(Some("same\nold\ntail"), Some("same\nnew\ntail"));
+        assert_eq!(preview.removed_lines, 1);
+        assert_eq!(preview.added_lines, 1);
+        assert_eq!(
+            preview
+                .lines
+                .iter()
+                .map(|line| (line.kind, line.text.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (AgentFileDiffLineKind::Context, "same"),
+                (AgentFileDiffLineKind::Delete, "old"),
+                (AgentFileDiffLineKind::Add, "new"),
+                (AgentFileDiffLineKind::Context, "tail"),
+            ]
+        );
+
+        let old = (0..400)
+            .map(|index| format!("old-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new = (0..400)
+            .map(|index| format!("new-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let bounded = agent_file_diff_preview(Some(&old), Some(&new));
+        assert_eq!(bounded.omitted_lines, 640);
+        assert_eq!(
+            bounded
+                .lines
+                .iter()
+                .filter(|line| line.kind == AgentFileDiffLineKind::Omitted)
+                .count(),
+            1
+        );
+        assert_eq!(bounded.lines.len(), AGENT_FILE_DIFF_MAX_CHANGED_LINES + 1);
+    }
+
+    #[test]
+    fn agent_file_diff_preview_is_empty_when_text_is_unchanged() {
+        let preview = agent_file_diff_preview(Some("same\ntext"), Some("same\ntext"));
+
+        assert!(preview.lines.is_empty());
+        assert_eq!(preview.added_lines, 0);
+        assert_eq!(preview.removed_lines, 0);
+        assert_eq!(preview.omitted_lines, 0);
+    }
+
+    #[test]
+    fn agent_file_diff_preview_truncates_oversized_lines() {
+        let source = "x".repeat(AGENT_FILE_DIFF_MAX_LINE_BYTES + 1);
+        let preview = agent_file_diff_preview(None, Some(&source));
+        let line = preview.lines.first().expect("added diff line");
+
+        assert_eq!(line.kind, AgentFileDiffLineKind::Add);
+        assert!(line.text.ends_with("...(truncated)"));
+        assert_eq!(
+            line.text.len(),
+            AGENT_FILE_DIFF_MAX_LINE_BYTES + "...(truncated)".len()
+        );
+    }
+
+    #[test]
+    fn generated_image_preview_accepts_http_and_workspace_local_sources_only() {
+        assert!(matches!(
+            generated_image_preview_source("https://example.com/result.png", Some("/workspace")),
+            Some(GeneratedImagePreviewSource::Remote(_))
+        ));
+        assert!(matches!(
+            generated_image_preview_source("artifacts/result.png", Some("/workspace")),
+            Some(GeneratedImagePreviewSource::Local(path))
+                if path.as_ref() == std::path::Path::new("/workspace/artifacts/result.png")
+        ));
+        assert!(generated_image_preview_source("../secret.png", Some("/workspace")).is_none());
+        assert!(
+            generated_image_preview_source("/outside/result.png", Some("/workspace")).is_none()
+        );
+        assert!(generated_image_preview_source("asset:private", Some("/workspace")).is_none());
     }
 
     #[test]
