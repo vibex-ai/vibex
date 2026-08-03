@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use vibex_core::{
@@ -296,8 +296,34 @@ pub struct EditorRecoveryBuffer {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct EditorRecoverySnapshot {
-    pub buffers: Vec<EditorRecoveryBuffer>,
+    #[serde(with = "recovery_buffers")]
+    pub buffers: Arc<[EditorRecoveryBuffer]>,
     pub truncated: bool,
+}
+
+mod recovery_buffers {
+    use std::sync::Arc;
+
+    use serde::{Deserialize as _, Deserializer, Serialize as _, Serializer};
+
+    use super::EditorRecoveryBuffer;
+
+    pub fn serialize<S>(
+        buffers: &Arc<[EditorRecoveryBuffer]>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        buffers.as_ref().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Arc<[EditorRecoveryBuffer]>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Vec::<EditorRecoveryBuffer>::deserialize(deserializer).map(Arc::from)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -430,14 +456,18 @@ impl EditorBufferRegistry {
             total = total.saturating_add(bytes);
             buffers.push(buffer);
         }
-        EditorRecoverySnapshot { buffers, truncated }
+        EditorRecoverySnapshot {
+            buffers: Arc::from(buffers),
+            truncated,
+        }
     }
 
     pub fn restore_recovery(&mut self, snapshot: EditorRecoverySnapshot) {
         for recovery in snapshot
             .buffers
-            .into_iter()
+            .iter()
             .take(EDITOR_RECOVERY_BUFFER_LIMIT)
+            .cloned()
         {
             let path = normalize_path(&recovery.path);
             if path.is_empty()
@@ -583,6 +613,22 @@ mod tests {
         let restored = restored.buffers.get("src/lib.rs").unwrap();
         assert!(restored.dirty);
         assert_eq!(restored.external, EditorExternalState::VerificationRequired);
+    }
+
+    #[test]
+    fn recovery_snapshot_clones_share_buffers_and_keep_the_json_contract() {
+        let mut registry = EditorBufferRegistry::default();
+        registry.insert_read(read("src/lib.rs", "one", "r1"));
+        registry.active_mut().unwrap().update_content("local");
+
+        let snapshot = registry.recovery_snapshot();
+        let cloned = snapshot.clone();
+        assert!(Arc::ptr_eq(&snapshot.buffers, &cloned.buffers));
+
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert!(json["buffers"].is_array());
+        let decoded: EditorRecoverySnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, snapshot);
     }
 
     #[test]

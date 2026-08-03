@@ -436,6 +436,7 @@ pub struct GitWorkbenchState {
     workspace_id: Option<WorkspaceId>,
     workspace_generation: u64,
     revision_epoch: u64,
+    presentation_revision: u64,
     next_query_generation: u64,
     active_queries: BTreeMap<(GitQueryKind, String), u64>,
     pub mode: GitWorkbenchMode,
@@ -485,6 +486,10 @@ impl GitWorkbenchState {
         self.revision_epoch
     }
 
+    pub fn presentation_revision(&self) -> u64 {
+        self.presentation_revision
+    }
+
     pub fn reset_workspace(&mut self, workspace_id: WorkspaceId) {
         self.workspace_id = Some(workspace_id);
         self.workspace_generation = self.workspace_generation.saturating_add(1).max(1);
@@ -521,6 +526,7 @@ impl GitWorkbenchState {
         self.diff_cache_epoch = 0;
         self.pending_mutation = None;
         self.last_error_code = None;
+        self.touch_presentation();
     }
 
     pub fn begin_query(
@@ -600,6 +606,7 @@ impl GitWorkbenchState {
         self.history_has_more = response.has_more;
         self.history_authors = response.authors;
         self.last_error_code = None;
+        self.touch_presentation();
         true
     }
 
@@ -753,6 +760,7 @@ impl GitWorkbenchState {
         }
         self.branches = Some(branches);
         self.last_error_code = None;
+        self.touch_presentation();
         true
     }
 
@@ -769,6 +777,7 @@ impl GitWorkbenchState {
         }
         self.worktrees = Some(worktrees);
         self.last_error_code = None;
+        self.touch_presentation();
         true
     }
 
@@ -781,7 +790,11 @@ impl GitWorkbenchState {
     }
 
     pub fn set_mode(&mut self, mode: GitWorkbenchMode) {
+        if self.mode == mode {
+            return;
+        }
         self.mode = mode;
+        self.touch_presentation();
     }
 
     pub fn set_history_filter(&mut self, filter: GitHistoryFilter) {
@@ -795,6 +808,7 @@ impl GitWorkbenchState {
         self.commit_detail = None;
         self.clear_commit_tree();
         self.invalidate_queries();
+        self.touch_presentation();
     }
 
     pub fn select_commit(&mut self, hash: impl Into<String>) {
@@ -806,12 +820,17 @@ impl GitWorkbenchState {
             self.commit_detail = None;
             self.clear_commit_tree();
         }
+        self.touch_presentation();
     }
 
     pub fn clear_commit_selection(&mut self) {
+        if self.selected_commit_hash.is_none() && self.commit_detail.is_none() {
+            return;
+        }
         self.selected_commit_hash = None;
         self.commit_detail = None;
         self.clear_commit_tree();
+        self.touch_presentation();
     }
 
     pub fn select_change(&mut self, key: GitSelectionKey, toggle: bool) -> bool {
@@ -831,6 +850,7 @@ impl GitWorkbenchState {
             self.selected_changes.clear();
             self.selected_changes.insert(key);
         }
+        self.touch_presentation();
         true
     }
 
@@ -846,6 +866,7 @@ impl GitWorkbenchState {
             .filter(|key| staged.is_none_or(|staged| key.staged == staged))
             .take(GIT_CHANGE_MAX_ROWS)
             .collect();
+        self.touch_presentation();
     }
 
     pub fn select_path(&mut self, path: &str, selected: bool) -> bool {
@@ -869,6 +890,7 @@ impl GitWorkbenchState {
                 self.selected_changes.remove(&key);
             }
         }
+        self.touch_presentation();
         true
     }
 
@@ -1054,6 +1076,7 @@ impl GitWorkbenchState {
         self.rebuild_change_tree();
         self.invalidate_queries();
         self.reconcile_change_selection();
+        self.touch_presentation();
     }
 
     pub fn delete_path(&mut self, path: &str) {
@@ -1064,6 +1087,7 @@ impl GitWorkbenchState {
         self.selected_changes
             .retain(|key| !path_is_equal_or_descendant(&key.path, &path));
         self.invalidate_queries();
+        self.touch_presentation();
     }
 
     pub fn history_window(
@@ -1093,6 +1117,7 @@ impl GitWorkbenchState {
             confirmation_label: bounded_text(&scope.confirmation_label, 240),
         });
         self.last_error_code = None;
+        self.touch_presentation();
         true
     }
 
@@ -1129,6 +1154,7 @@ impl GitWorkbenchState {
         self.rebuild_change_tree();
         self.reconcile_path_selection(selected_paths);
         self.last_error_code = None;
+        self.touch_presentation();
         true
     }
 
@@ -1142,6 +1168,7 @@ impl GitWorkbenchState {
         }
         self.pending_mutation = None;
         self.last_error_code = Some(bounded_text(error_code, 120));
+        self.touch_presentation();
         true
     }
 
@@ -1320,6 +1347,7 @@ impl GitWorkbenchState {
             &self.expanded_change_directories,
             &mut self.change_tree_rows,
         );
+        self.touch_presentation();
     }
 
     fn rebuild_commit_tree(&mut self) {
@@ -1337,6 +1365,7 @@ impl GitWorkbenchState {
             &self.expanded_commit_directories,
             &mut self.commit_tree_rows,
         );
+        self.touch_presentation();
     }
 
     fn clear_commit_tree(&mut self) {
@@ -1345,6 +1374,7 @@ impl GitWorkbenchState {
         self.commit_tree_rows.clear();
         self.commit_directory_paths.clear();
         self.expanded_commit_directories.clear();
+        self.touch_presentation();
     }
 
     fn rebuild_change_row_index(&mut self) {
@@ -1374,6 +1404,10 @@ impl GitWorkbenchState {
     fn is_lifecycle_conflict(&self, path: &str) -> bool {
         self.lifecycle_conflict_paths
             .contains(&normalize_path(path))
+    }
+
+    fn touch_presentation(&mut self) {
+        self.presentation_revision = self.presentation_revision.saturating_add(1).max(1);
     }
 }
 

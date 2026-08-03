@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use vibex_core::{FileEntryKind, FileTreeEntry, GitChange, GitChangeKind, WorkspaceId};
@@ -216,7 +217,9 @@ pub struct FileTreeProjection {
     pending: BTreeMap<String, PendingFileMutation>,
     query: String,
     #[serde(skip)]
-    visible_rows: Vec<FileExplorerRow>,
+    visible_rows: Arc<Vec<FileExplorerRow>>,
+    #[serde(skip)]
+    presentation_revision: u64,
 }
 
 impl FileTreeProjection {
@@ -244,7 +247,8 @@ impl FileTreeProjection {
         self.git_states.clear();
         self.pending.clear();
         self.query.clear();
-        self.visible_rows.clear();
+        self.visible_rows = Arc::default();
+        self.presentation_revision = self.presentation_revision.saturating_add(1).max(1);
         self.generation
     }
 
@@ -260,6 +264,18 @@ impl FileTreeProjection {
 
     pub fn root_name(&self) -> &str {
         &self.root_name
+    }
+
+    pub fn presentation_revision(&self) -> u64 {
+        self.presentation_revision
+    }
+
+    pub fn visible_rows_snapshot(&self) -> Arc<Vec<FileExplorerRow>> {
+        self.visible_rows.clone()
+    }
+
+    pub fn expanded_paths_snapshot(&self) -> Arc<BTreeSet<String>> {
+        Arc::new(self.expanded_paths.clone())
     }
 
     pub fn begin_load(&mut self, path: &str) -> u64 {
@@ -881,7 +897,8 @@ impl FileTreeProjection {
                 &mut rows,
             );
         }
-        self.visible_rows = rows;
+        self.visible_rows = Arc::new(rows);
+        self.presentation_revision = self.presentation_revision.saturating_add(1).max(1);
     }
 }
 

@@ -590,7 +590,20 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   same stream type merge while execution attribution remains compatible; a User,
   another event type, or conflicting attribution fences the merge. An adjacent
   compatible final Agent message replaces the streaming body while retaining the
-  first row id and every source item id.
+  first row id and the row's inclusive sequence range.
+- An append-only live batch may update only the final projected Turn when the
+  session identity, item identity, and sequence values are strictly contiguous
+  and no authoritative refetch is pending. A missing sequence, reconnect marker,
+  replacement, attribution change, or non-delta snapshot must abandon that fast
+  path and rebuild from the authoritative timeline. A merged streaming row keeps
+  at most its first and last source item ids; `turn_item_count` and the inclusive
+  sequence range retain the count and navigation semantics without one heap String
+  per token.
+- Streaming row height estimates keep a compact text-metrics accumulator. After
+  the first full scan, each accepted delta updates only the appended chunk;
+  replacement/final snapshots clear the accumulator before measuring the new body.
+  The incremental estimate must remain equivalent to the bounded full estimator,
+  including newline wrapping and workspace-link affordances.
 - Turn projection treats a persisted `error` as the conclusion of a completed
   display turn. Later Agent/Provider output starts a continuation turn even
   when the provider used a hidden prompt and no new `user_message` exists.
@@ -612,6 +625,12 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   height cap or nested vertical scrollbar. Short Agent messages and non-Agent
   document surfaces keep the full-render path. Markdown above the synchronous
   parse budget parses in the background and applies only the latest generation.
+- Copying a complete streaming Markdown source is throttled per row (time and
+  byte thresholds) while deltas arrive; a final or non-streaming row refreshes
+  immediately. Markdown and tool-card projection caches are both bounded by an
+  entry limit and a resident-byte budget, and a single oversized active value may
+  remain as the sole cached entry without allowing older entries to grow
+  unbounded.
 - A GPUI User bubble uses one full-width `flex + justify_end` wrapper and an
   intrinsic-width, non-shrinking bubble with a bounded maximum width. Keep its
   text body as a plain intrinsic child: do not put `min_w_0` on it and do not
@@ -619,12 +638,65 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   projects `size_full`, so an auto-width bubble can collapse to a padding-only
   vertical pill even while the virtual Turn reserves the expected height. Do
   not wrap the bubble in a second full-width horizontal flex either.
-- Opened sessions use a bounded 12-entry LRU presentation cache. Before a switch,
+- Opened sessions use a bounded 6-entry LRU presentation cache. Before a switch,
   snapshot the current `TimelineModel`, runtime selection, follow/scroll state,
   and disclosure state; restore a cached target synchronously with no loading
   blank, then replace it from the complete authoritative prefix in the
   background. A cache is display optimization only and never advances authority
   or bypasses generation fencing.
+- The session presentation cache also enforces a total resident-byte budget. Its
+  entries carry a precomputed weight from timeline/presentation strings and
+  containers, so eviction does not serialize or rescan inactive conversations;
+  an individual session over the budget is rendered from storage and is not
+  retained in the cache.
+- The desktop runtime event bridge drains a bounded batch of queued signals per
+  GPUI update. Contiguous `DesktopEvent::Timeline` values for the selected
+  session go through one `TimelineModel::apply_live_batch`; plan reconciliation,
+  derived Turn projection, row-size rebuilding, follow-state updates, and root
+  notification run once per batch. Non-timeline events fence batches so their
+  original ordering remains observable. Background-session timeline events are
+  discarded before projection and do not repaint the selected workbench. The
+  runtime-to-GPUI channel is bounded and applies sender backpressure; if the
+  upstream broadcast then reports `Lagged`, the existing authoritative-refetch
+  path restores correctness instead of allowing queued event memory to grow.
+- Root workbench layout must not observe or tracked-read the complete
+  `CodeWorkbench` entity. The child emits a narrow `CodeWorkbenchEvent` only for
+  parent-owned layout changes such as Preview fullscreen; the root mirrors that
+  scalar state. Stable, fixed-size child entities (`CodeWorkbench`, right rail,
+  Management, Usage, Terminal, PDF, and Office surfaces) render through GPUI
+  `Entity::cached(StyleRefinement::default().size_full())` boundaries so child
+  notifications do not rebuild unrelated parent element trees.
+- The unfiltered sidebar project/workspace/session projection is cached behind
+  an explicit revision and shared as `Rc<Vec<SidebarProjectProjection>>`.
+  Authoritative workspace/session/context replacement, pin changes, and
+  project/session ordering invalidate it. Rendering consumes projections by
+  reference; query-filtered projections remain uncached because their input is
+  transient.
+- Editor keystrokes update the editor entity immediately but debounce the full
+  recovery snapshot by 200 ms. Ordinary layout persistence reuses the last
+  recovery snapshot and must not walk every dirty buffer. Recovery buffers use
+  shared immutable storage when `DesktopUiStateV1` is cloned for the throttled
+  writer, while serde preserves the existing JSON array contract. Successful
+  save, force-close/discard, rename/delete, and workspace reset refresh recovery;
+  app quit synchronously captures the latest buffers before the final flush.
+- Embedded terminals poll only while visible. Preview activates the terminal
+  selected in every visible split pane; Composer activates only its selected
+  terminal while terminal mode is on. Hidden surfaces cancel polling and cursor
+  blink tasks. A visible terminal polls at 16 ms while output changes, then
+  backs off to 100 ms after four idle snapshots; repeated identical errors do
+  not notify again.
+- Timeline fallback polling resets its idle counter after content and backs off
+  exponentially after repeated empty polls, capped at two seconds. Files and Git
+  refresh loops use the actual rendered surface visibility: hidden surfaces skip
+  normal refresh work and only perform the low-frequency 30-second check; opening
+  a surface triggers an immediate refresh.
+- Session full-text search builds its timeline index only for the open search
+  dialog and clears the index/task while advancing its generation when the
+  dialog closes, so a closed search cannot retain every session's message text
+  or accept a stale indexing completion.
+- Turn-preview summaries use a strict UTF-8 source budget (8 KiB), node budget,
+  and workspace-resource budget. The full selected-session timeline remains
+  authoritative; only the compact preview is truncated and bounded.
 - A compact Turn preview rail may derive one button per stable `turnId` from the
   visible row projection. Activating a preview only scrolls the virtual list to
   that row and marks the reader away from the bottom; it must not mutate timeline
@@ -738,6 +810,12 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
 
 - Live sequence skips one or more items -> keep bounded presentation state,
   set `needs_authoritative_refetch`, and reload the selected session.
+- A batch is not a strictly contiguous append, or a reconnect/replacement/final
+  snapshot arrives -> discard streaming text metrics and rebuild the affected
+  projection from the authoritative items; never append into a stale row.
+- Runtime-to-GPUI delivery reaches its bounded capacity -> apply sender
+  backpressure. If the upstream broadcast reports lag, mark the affected
+  projection for authoritative refetch; never switch back to an unbounded queue.
 - Async result generation differs from active generation -> ignore active-view
   mutations; a global list refresh may still reconcile durable changes.
 - Session switches while send/runtime/permission/interrupt is pending -> the
@@ -748,6 +826,8 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   keep `agent_loading=false`, and refresh authoritatively in the background.
 - Cached refresh fails -> retain cached content and surface the bounded error;
   do not replace the conversation with a loading or empty state.
+- One inactive session exceeds the presentation-cache byte budget -> do not
+  cache it; reload its authoritative prefix when selected again.
 - Owner materialization or a runtime catalog probe remains pending -> render the
   authoritative timeline as soon as its fetch completes; runtime-dependent
   Composer controls may remain unavailable until their projection arrives.
@@ -765,6 +845,10 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   submission error and must not infer `Error` from provider message text.
 - Runtime event stream lags -> keep fallback polling active and refetch the
   required authoritative projections.
+- Session search closes while indexing -> advance its generation, cancel/drop
+  the task, and clear all indexed documents; stale completions are ignored.
+- Files, Git, or Terminal is hidden -> skip its normal refresh/blink work. The
+  next visible transition performs an immediate refresh before normal polling.
 - No sessions exist -> keep the global new-session action reachable and render
   an honest empty state rather than fabricating a runtime/session.
 - Drag target is the same row, another project, or another pin band -> reject the
@@ -854,6 +938,13 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   cap and does not gain an inner scrollbar.
 - GPUI unit tests cover LRU recency/eviction and complete-prefix pagination; a
   cached session switch must not clear its Timeline or enter a loading state.
+- GPUI unit/source-contract tests cover the session-cache byte budget, bounded
+  runtime event channel, search-index release, and real Files/Git/Terminal
+  visibility gates.
+- Streaming tests assert historical Turns remain `Rc`-shared for append-only
+  updates, sequence gaps reject the fast path, incremental height metrics equal
+  full estimation, and a throttled Markdown snapshot keeps its source and
+  revision paired while replacement/final snapshots refresh immediately.
 - `desktop-model` runtime tests feed descriptions and shuffled Effort values,
   then assert value-derived names, semantic low-to-high ordering, deterministic
   unknown ordering, and no `Default` effort.

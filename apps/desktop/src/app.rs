@@ -17,10 +17,10 @@ use gpui::{
     HighlightStyle, Hsla, Image, IntoElement, KeyBinding, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, ObjectFit, Orientation, ParentElement as _, PathBuilder,
     Pixels, Render, Rgba, Role, ScrollDelta, ScrollStrategy, ScrollWheelEvent, SharedString, Size,
-    StatefulInteractiveElement as _, Styled as _, StyledImage as _, StyledText, Subscription, Task,
-    WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowDecorations, WindowOptions, canvas, div, img, linear_color_stop, linear_gradient, point,
-    prelude::*, px, relative, rgb, size,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, StyledText,
+    Subscription, Task, WeakEntity, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, WindowDecorations, WindowOptions, canvas, div, img, linear_color_stop,
+    linear_gradient, point, prelude::*, px, relative, rgb, size,
 };
 use gpui_component::{
     ActiveTheme as _, Colorize as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath,
@@ -100,8 +100,8 @@ use vibex_desktop_runtime::{
     ProviderConfigChangePhase, RC_APP_ID, STABLE_DESKTOP_APP_ID, validate_external_open_url,
 };
 use vibex_markdown::{
-    MarkdownInput, MarkdownPresentation, MarkdownSurface, MarkdownView, ResolvedResource,
-    ResourceKind, parse_markdown,
+    MarkdownInput, MarkdownLimits, MarkdownPresentation, MarkdownSurface, MarkdownView,
+    ResolvedResource, ResourceKind, parse_markdown_with_limits, utf8_prefix,
 };
 use vibex_ui::{
     AgentFileGitController, ManagementWorkflowCapabilities, ManagementWorkflowController,
@@ -114,7 +114,7 @@ use crate::actions::{
 };
 use crate::assets::{agent_brand_icon, agent_brand_logo, model_brand_icon};
 use crate::code_workbench::{
-    CodeRightRail, CodeWorkbench, CodeWorkbenchPersistedState, RightRailMode,
+    CodeRightRail, CodeWorkbench, CodeWorkbenchEvent, CodeWorkbenchPersistedState, RightRailMode,
 };
 use crate::gpui_ext::button_with_aria_label;
 use crate::locale::{self, Strings};
@@ -177,6 +177,9 @@ const SIDEBAR_FLOATING_TRANSITION_DURATION: Duration = Duration::from_millis(200
 const STARTUP_LOADING_INDICATOR_DELAY: Duration = Duration::from_secs(5);
 // Tauri parity: submission locators poll `agent_get_message_submission` every 500ms.
 const SUBMISSION_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const RUNTIME_UI_SIGNAL_BATCH_LIMIT: usize = 256;
+const RUNTIME_UI_SIGNAL_QUEUE_CAPACITY: usize = RUNTIME_UI_SIGNAL_BATCH_LIMIT;
+const RUNTIME_UI_SIGNAL_COALESCE_DELAY: Duration = Duration::from_millis(16);
 
 #[derive(Clone)]
 struct ComposerSubmissionLocator {
@@ -192,11 +195,23 @@ const NEW_SESSION_COMPACT_SELECTOR_MAX_WIDTH: u32 = 860;
 const AGENT_TIMELINE_FETCH_PAGE_LIMIT: u32 = 500;
 const AGENT_CONTENT_NARROW_MAX_WIDTH: f32 = 768.0;
 const AGENT_CONTENT_STANDARD_MAX_WIDTH: f32 = 1024.0;
-const AGENT_SESSION_VIEW_CACHE_LIMIT: usize = 12;
+const AGENT_SESSION_VIEW_CACHE_LIMIT: usize = 6;
+const AGENT_SESSION_VIEW_CACHE_BYTES: usize = 32 * 1024 * 1024;
+const TIMELINE_MARKDOWN_SOURCE_CACHE_LIMIT: usize = 32;
+const TIMELINE_MARKDOWN_SOURCE_CACHE_BYTES: usize = 2 * 1024 * 1024;
+const TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
+const TIMELINE_STREAMING_MARKDOWN_REFRESH_BYTES: usize = 8 * 1024;
+const TIMELINE_TOOL_PROJECTION_CACHE_LIMIT: usize = 128;
+const TIMELINE_TOOL_PROJECTION_CACHE_BYTES: usize = 2 * 1024 * 1024;
+const AGENT_TIMELINE_IDLE_POLL_THRESHOLD: u16 = 4;
+const AGENT_TIMELINE_IDLE_POLL_MAX_MS: u64 = 2_000;
 const AGENT_TURN_PREVIEW_EDGE_TRIGGER_WIDTH: f32 = 18.0;
 const AGENT_TURN_PREVIEW_RAIL_WIDTH: f32 = 35.2;
 const AGENT_TURN_PREVIEW_COMPACT_MAX_TURNS: usize = 6;
 const AGENT_TURN_PREVIEW_MESSAGE_MAX_CHARS: usize = 180;
+const AGENT_TURN_PREVIEW_MARKDOWN_MAX_BYTES: usize = 8 * 1024;
+const AGENT_TURN_PREVIEW_MARKDOWN_MAX_NODES: usize = 4_096;
+const AGENT_TURN_PREVIEW_MARKDOWN_MAX_RESOURCES: usize = 32;
 const AGENT_TURN_PREVIEW_CARD_MAX_WIDTH: f32 = 320.0;
 const AGENT_TURN_PREVIEW_CARD_MIN_WIDTH: f32 = 248.0;
 const AGENT_TURN_PREVIEW_CARD_VIEWPORT_INSET: f32 = 80.0;
@@ -686,14 +701,122 @@ fn insert_bounded_session_view<T>(
     key: String,
     entry: T,
     limit: usize,
+    max_bytes: usize,
+    weight: impl Fn(&T) -> usize,
 ) {
+    let entry_bytes = weight(&entry);
+    cache.remove(&key);
+    lru.retain(|cached| cached != &key);
+    if limit == 0 || entry_bytes > max_bytes {
+        return;
+    }
     cache.insert(key.clone(), entry);
     touch_session_view_lru(lru, &key);
-    while lru.len() > limit {
-        if let Some(evicted) = lru.pop_front() {
-            cache.remove(&evicted);
+    let mut total_bytes = cache
+        .values()
+        .map(&weight)
+        .fold(0_usize, usize::saturating_add);
+    while lru.len() > limit || total_bytes > max_bytes {
+        let Some(evicted) = lru.pop_front() else {
+            cache.clear();
+            break;
+        };
+        if let Some(entry) = cache.remove(&evicted) {
+            total_bytes = total_bytes.saturating_sub(weight(&entry));
         }
     }
+}
+
+fn insert_bounded_timeline_projection<T>(
+    cache: &mut BTreeMap<String, (i64, T)>,
+    key: String,
+    sequence: i64,
+    value: T,
+    max_entries: usize,
+    max_bytes: usize,
+    weight: impl Fn(&T) -> usize,
+) {
+    if max_entries == 0 {
+        cache.clear();
+        return;
+    }
+    cache.insert(key.clone(), (sequence, value));
+    loop {
+        let total_bytes = cache
+            .values()
+            .map(|(_, value)| weight(value))
+            .sum::<usize>();
+        if cache.len() <= max_entries && total_bytes <= max_bytes {
+            break;
+        }
+        let evicted = cache
+            .iter()
+            .filter(|(candidate, _)| candidate.as_str() != key)
+            .max_by_key(|(_, (candidate_sequence, _))| candidate_sequence.abs_diff(sequence))
+            .map(|(candidate, _)| candidate.clone());
+        let Some(evicted) = evicted else {
+            // One visible entry may itself exceed the byte budget. Retain it so
+            // the active Markdown row does not allocate its source every frame.
+            break;
+        };
+        cache.remove(&evicted);
+    }
+}
+
+#[derive(Clone)]
+struct TimelineMarkdownSourceSnapshot {
+    source: Arc<str>,
+    refreshed_at: Instant,
+}
+
+fn timeline_markdown_source_snapshot(
+    cache: &mut BTreeMap<String, (i64, TimelineMarkdownSourceSnapshot)>,
+    row: &TimelineRow,
+    now: Instant,
+    allow_throttle: bool,
+) -> (Arc<str>, i64) {
+    if let Some((sequence, snapshot)) = cache.get(&row.id) {
+        if *sequence == row.last_sequence && snapshot.source.len() == row.body.len() {
+            return (snapshot.source.clone(), *sequence);
+        }
+        if row.streaming && allow_throttle {
+            let pending_bytes = row.body.len().abs_diff(snapshot.source.len());
+            if now.saturating_duration_since(snapshot.refreshed_at)
+                < TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL
+                && pending_bytes < TIMELINE_STREAMING_MARKDOWN_REFRESH_BYTES
+            {
+                return (snapshot.source.clone(), *sequence);
+            }
+        }
+    }
+
+    let source: Arc<str> = Arc::from(row.body.as_str());
+    insert_bounded_timeline_projection(
+        cache,
+        row.id.clone(),
+        row.last_sequence,
+        TimelineMarkdownSourceSnapshot {
+            source: source.clone(),
+            refreshed_at: now,
+        },
+        TIMELINE_MARKDOWN_SOURCE_CACHE_LIMIT,
+        TIMELINE_MARKDOWN_SOURCE_CACHE_BYTES,
+        |snapshot| snapshot.source.len(),
+    );
+    (source, row.last_sequence)
+}
+
+fn agent_timeline_poll_interval(base_ms: u64, idle_poll_count: u16) -> Duration {
+    let base_ms = base_ms.max(1);
+    let exponent = idle_poll_count
+        .saturating_sub(AGENT_TIMELINE_IDLE_POLL_THRESHOLD)
+        .min(8) as u32;
+    let multiplier = 1_u64.checked_shl(exponent).unwrap_or(u64::MAX);
+    Duration::from_millis(
+        base_ms
+            .saturating_mul(multiplier)
+            .min(AGENT_TIMELINE_IDLE_POLL_MAX_MS.max(base_ms)),
+    )
 }
 
 fn agent_turn_completion_is_active(
@@ -1602,15 +1725,19 @@ struct ConversationTurnsSummary {
 }
 
 impl ConversationTurnsSummary {
-    fn from_turns(turns: &[TimelineConversationTurn]) -> Self {
+    fn from_turns<T>(turns: &[T]) -> Self
+    where
+        T: std::borrow::Borrow<TimelineConversationTurn>,
+    {
         Self {
-            has_incomplete_turn: turns.iter().any(|turn| !turn.complete),
-            has_pending_permission: turns.iter().any(|turn| turn.pending_permission),
+            has_incomplete_turn: turns.iter().any(|turn| !turn.borrow().complete),
+            has_pending_permission: turns.iter().any(|turn| turn.borrow().pending_permission),
         }
     }
 }
 
 struct AgentSessionViewCacheEntry {
+    estimated_resident_bytes: usize,
     timeline: TimelineModel,
     runtime_selection: Option<AgentSessionRuntimeSelectionState>,
     token_usage: Option<AgentTokenUsage>,
@@ -1619,30 +1746,579 @@ struct AgentSessionViewCacheEntry {
     timeline_row_sizes: Rc<Vec<Size<gpui::Pixels>>>,
     timeline_measured_turn_heights: BTreeMap<String, f32>,
     timeline_estimated_turn_heights: BTreeMap<String, (u64, f32)>,
-    timeline_markdown_sources: BTreeMap<String, (i64, Arc<str>)>,
-    timeline_tool_card_projections: BTreeMap<String, (i64, Rc<ToolCardProjection>)>,
-    conversation_turns_cache: Rc<Vec<TimelineConversationTurn>>,
+    conversation_turns_cache: Rc<Vec<Rc<TimelineConversationTurn>>>,
     conversation_turns_cache_key: Option<ConversationTurnsCacheKey>,
     conversation_turns_summary: ConversationTurnsSummary,
+    streaming_row_metrics: Option<StreamingRowMetricsCache>,
     content_width: SessionContentWidthMode,
     collapsed_timeline_rows: BTreeSet<String>,
     timeline_process_expansion: BTreeMap<String, bool>,
     timeline_command_expansion: BTreeMap<String, bool>,
 }
 
-/// Inputs that `conversation_turns` depends on: timeline identity/content
-/// (session id, revision, item count, end sequence) plus the presentation
-/// flags and pending edit projection. Timeline swaps reset `revision`, so
-/// identity+content fields guard against collisions across whole-model assignments.
-type ConversationTurnsCacheKey = (
-    Option<VibexSessionId>,
-    u64,
-    usize,
-    Option<i64>,
-    Option<AgentSessionState>,
-    bool,
-    Option<(VibexSessionId, i64, i64)>,
-);
+impl AgentSessionViewCacheEntry {
+    fn calculate_estimated_resident_bytes(&self) -> usize {
+        timeline_items_resident_bytes(&self.timeline.items)
+            .saturating_add(
+                self.conversation_turns_cache
+                    .iter()
+                    .map(|turn| timeline_conversation_turn_resident_bytes(turn))
+                    .fold(0_usize, usize::saturating_add),
+            )
+            .saturating_add(
+                self.timeline_row_sizes.len() * std::mem::size_of::<Size<gpui::Pixels>>(),
+            )
+            .saturating_add(
+                self.timeline_measured_turn_heights
+                    .keys()
+                    .map(String::len)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.timeline_estimated_turn_heights
+                    .keys()
+                    .map(String::len)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.collapsed_timeline_rows
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.timeline_process_expansion
+                    .keys()
+                    .map(String::len)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.timeline_command_expansion
+                    .keys()
+                    .map(String::len)
+                    .sum::<usize>(),
+            )
+    }
+}
+
+fn timeline_items_resident_bytes(items: &[TimelineItem]) -> usize {
+    items
+        .iter()
+        .map(timeline_item_resident_bytes)
+        .fold(0_usize, usize::saturating_add)
+}
+
+fn timeline_item_resident_bytes(item: &TimelineItem) -> usize {
+    let option_len = |value: &Option<String>| value.as_ref().map_or(0, String::len);
+    let raw_extension_len = |extension: &Option<vibex_core::AgentEventRawExtension>| {
+        extension.as_ref().map_or(0, |extension| {
+            extension
+                .content_blocks
+                .iter()
+                .map(|block| block.block_type.len().saturating_add(block.summary.len()))
+                .chain(extension.raw_input.iter().map(String::len))
+                .chain(extension.raw_output.iter().map(|output| output.text.len()))
+                .chain(
+                    extension
+                        .locations
+                        .iter()
+                        .map(|location| location.uri.len()),
+                )
+                .chain(
+                    extension
+                        .meta
+                        .iter()
+                        .map(|(key, value)| key.len().saturating_add(value.len())),
+                )
+                .fold(0_usize, usize::saturating_add)
+        })
+    };
+    let payload_bytes = match &item.payload {
+        TimelinePayload::UserMessage(message) => message.text.len().saturating_add(
+            message
+                .attachments
+                .iter()
+                .map(|attachment| {
+                    attachment
+                        .label
+                        .len()
+                        .saturating_add(option_len(&attachment.mime_type))
+                        .saturating_add(option_len(&attachment.uri))
+                })
+                .sum::<usize>(),
+        ),
+        TimelinePayload::AgentMessageDelta(delta) => delta.text_delta.len(),
+        TimelinePayload::AgentMessage(message) => message.text.len(),
+        TimelinePayload::Reasoning(reasoning) => reasoning.text.len(),
+        TimelinePayload::Plan(plan) => plan.title.len().saturating_add(
+            plan.steps
+                .iter()
+                .map(|step| step.title.len())
+                .sum::<usize>(),
+        ),
+        TimelinePayload::ToolCall(tool) => tool
+            .tool_call_id
+            .len()
+            .saturating_add(tool.tool_name.len())
+            .saturating_add(tool.summary.len())
+            .saturating_add(option_len(&tool.input_summary))
+            .saturating_add(option_len(&tool.output_summary))
+            .saturating_add(raw_extension_len(&tool.raw_extension)),
+        TimelinePayload::Command(command) => command
+            .command
+            .len()
+            .saturating_add(option_len(&command.cwd))
+            .saturating_add(option_len(&command.output_summary))
+            .saturating_add(raw_extension_len(&command.raw_extension)),
+        TimelinePayload::FileOperation(operation) => operation
+            .path
+            .len()
+            .saturating_add(operation.summary.len())
+            .saturating_add(option_len(&operation.old_text))
+            .saturating_add(option_len(&operation.new_text))
+            .saturating_add(raw_extension_len(&operation.raw_extension)),
+        TimelinePayload::WebSearch(search) => search
+            .query
+            .len()
+            .saturating_add(option_len(&search.result_summary))
+            .saturating_add(raw_extension_len(&search.raw_extension)),
+        TimelinePayload::TodoUpdate(todo) => todo
+            .title
+            .len()
+            .saturating_add(
+                todo.items
+                    .iter()
+                    .map(|item| item.title.len())
+                    .sum::<usize>(),
+            )
+            .saturating_add(raw_extension_len(&todo.raw_extension)),
+        TimelinePayload::Collaboration(collaboration) => collaboration
+            .action
+            .len()
+            .saturating_add(collaboration.summary.len())
+            .saturating_add(option_len(&collaboration.agent_label))
+            .saturating_add(raw_extension_len(&collaboration.raw_extension)),
+        TimelinePayload::ImageGeneration(image) => image
+            .summary
+            .len()
+            .saturating_add(option_len(&image.mime_type))
+            .saturating_add(option_len(&image.image_reference))
+            .saturating_add(raw_extension_len(&image.raw_extension)),
+        TimelinePayload::GitNotice(notice) => notice.summary.len(),
+        TimelinePayload::SystemNotice(notice) => notice.message.len(),
+        TimelinePayload::PermissionRequest(request) => request
+            .id
+            .as_str()
+            .len()
+            .saturating_add(request.session_id.as_str().len())
+            .saturating_add(
+                request
+                    .project_id
+                    .as_ref()
+                    .map_or(0, |id| id.as_str().len()),
+            )
+            .saturating_add(
+                request
+                    .workspace_id
+                    .as_ref()
+                    .map_or(0, |id| id.as_str().len()),
+            )
+            .saturating_add(option_len(&request.provider_request_id))
+            .saturating_add(request.title.len())
+            .saturating_add(
+                request
+                    .details
+                    .iter()
+                    .map(|detail| detail.label.len().saturating_add(detail.value.len()))
+                    .sum::<usize>(),
+            ),
+        TimelinePayload::PermissionResolution(resolution) => resolution
+            .request_id
+            .as_str()
+            .len()
+            .saturating_add(resolution.session_id.as_str().len())
+            .saturating_add(
+                resolution
+                    .responder_device_id
+                    .as_ref()
+                    .map_or(0, |id| id.as_str().len()),
+            )
+            .saturating_add(option_len(&resolution.provider_resolution_id))
+            .saturating_add(option_len(&resolution.note)),
+        TimelinePayload::Error(error) => error.code.len().saturating_add(error.message.len()),
+    };
+    std::mem::size_of::<TimelineItem>()
+        .saturating_add(item.id.as_str().len())
+        .saturating_add(item.session_id.as_str().len())
+        .saturating_add(
+            item.correlation_id
+                .as_ref()
+                .map_or(0, |id| id.as_str().len()),
+        )
+        .saturating_add(option_len(&item.provider_correlation_id))
+        .saturating_add(
+            item.execution_attribution
+                .as_ref()
+                .map_or(0, |attribution| {
+                    attribution
+                        .agent_label
+                        .len()
+                        .saturating_add(attribution.provider_profile_label.len())
+                        .saturating_add(attribution.model_label.len())
+                }),
+        )
+        .saturating_add(payload_bytes)
+}
+
+fn timeline_conversation_turn_resident_bytes(turn: &TimelineConversationTurn) -> usize {
+    let row_bytes = |row: &TimelineRow| {
+        row.id
+            .len()
+            .saturating_add(row.item_ids.iter().map(String::len).sum::<usize>())
+            .saturating_add(row.turn_id.as_ref().map_or(0, String::len))
+            .saturating_add(row.title.len())
+            .saturating_add(row.body.len())
+            .saturating_add(row.runtime_attribution.as_ref().map_or(0, String::len))
+            .saturating_add(row.file_path.as_ref().map_or(0, String::len))
+    };
+    turn.id
+        .len()
+        .saturating_add(turn.runtime_attribution.as_ref().map_or(0, String::len))
+        .saturating_add(turn.user_row.as_ref().map_or(0, row_bytes))
+        .saturating_add(
+            turn.process_rows
+                .iter()
+                .map(row_bytes)
+                .fold(0_usize, usize::saturating_add),
+        )
+        .saturating_add(turn.conclusion_row.as_ref().map_or(0, row_bytes))
+        .saturating_add(
+            turn.process_activity_groups
+                .iter()
+                .map(|group| group.id.len())
+                .sum::<usize>(),
+        )
+}
+
+struct SidebarProjectionCache {
+    revision: u64,
+    groups: Rc<Vec<SidebarProjectProjection>>,
+}
+
+/// Inputs that `conversation_turns` depends on. Timeline identity/content fields
+/// also let the cache prove that a change was append-only before reusing its
+/// completed prefix.
+#[derive(Clone, PartialEq, Eq)]
+struct ConversationTurnsCacheKey {
+    session_id: Option<VibexSessionId>,
+    timeline_revision: u64,
+    item_count: usize,
+    end_sequence: Option<i64>,
+    session_state: Option<AgentSessionState>,
+    agent_turn_pending: bool,
+    pending_edit: Option<(VibexSessionId, i64, i64)>,
+}
+
+fn conversation_turn_start_index(
+    turn: &TimelineConversationTurn,
+    items: &[TimelineItem],
+) -> Option<usize> {
+    if let Some(sequence) = turn.user_row.as_ref().map(|row| row.first_sequence) {
+        return items
+            .binary_search_by_key(&sequence, |item| item.sequence)
+            .ok();
+    }
+
+    if let Some(item_id) = turn.id.strip_prefix("turn:continuation:") {
+        return items.iter().position(|item| item.id.as_str() == item_id);
+    }
+
+    let sequence = turn
+        .process_rows
+        .iter()
+        .chain(turn.conclusion_row.iter())
+        .map(|row| row.first_sequence)
+        .min()?;
+    items
+        .binary_search_by_key(&sequence, |item| item.sequence)
+        .ok()
+}
+
+/// Rebuild only the final real turn after an append-only timeline update. The
+/// prefix is shared by `Rc`, so a GPUI frame holding the previous projection
+/// cannot force a deep clone of the whole conversation.
+fn refresh_conversation_turns_cache_incrementally(
+    cache: &mut Rc<Vec<Rc<TimelineConversationTurn>>>,
+    previous_key: &ConversationTurnsCacheKey,
+    next_key: &ConversationTurnsCacheKey,
+    timeline: &TimelineModel,
+) -> bool {
+    if previous_key.session_id != next_key.session_id
+        || next_key.session_id != timeline.session_id
+        || previous_key.pending_edit.is_some()
+        || next_key.pending_edit.is_some()
+        || previous_key.item_count > next_key.item_count
+        || next_key.item_count != timeline.items.len()
+    {
+        return false;
+    }
+
+    let append_only = if previous_key.item_count < next_key.item_count {
+        previous_key.item_count > 0
+            && previous_key.end_sequence
+                == timeline
+                    .items
+                    .get(previous_key.item_count - 1)
+                    .map(|item| item.sequence)
+    } else {
+        previous_key.item_count == next_key.item_count
+            && previous_key.timeline_revision == next_key.timeline_revision
+    };
+    if !append_only || cache.is_empty() {
+        return false;
+    }
+
+    let Some((turn_index, start_index)) =
+        cache.iter().enumerate().rev().find_map(|(index, turn)| {
+            conversation_turn_start_index(turn, &timeline.items).map(|start| (index, start))
+        })
+    else {
+        return false;
+    };
+    let suffix = timeline_conversation_turns(
+        &timeline.items[start_index..],
+        next_key.session_state,
+        next_key.agent_turn_pending,
+    );
+    let Some(first_suffix) = suffix.first() else {
+        return false;
+    };
+    if first_suffix.id != cache[turn_index].id {
+        return false;
+    }
+
+    let mut turns = cache[..turn_index].to_vec();
+    turns.extend(suffix.into_iter().map(Rc::new));
+    *cache = Rc::new(turns);
+    true
+}
+
+struct AgentStreamingDeltaUpdate {
+    item_id: String,
+    sequence: i64,
+    timestamp_ms: i64,
+    text: String,
+    runtime_attribution: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamingRowTextMetrics {
+    wrapped_lines: usize,
+    trailing_line_chars: usize,
+    has_workspace_link_syntax: bool,
+    ends_with_newline: bool,
+    last_char: Option<char>,
+}
+
+impl StreamingRowTextMetrics {
+    fn from_text(text: &str, chars_per_line: usize) -> Self {
+        let mut metrics = Self {
+            wrapped_lines: 1,
+            trailing_line_chars: 0,
+            has_workspace_link_syntax: false,
+            ends_with_newline: false,
+            last_char: None,
+        };
+        metrics.append(text, chars_per_line);
+        metrics
+    }
+
+    fn append(&mut self, text: &str, chars_per_line: usize) {
+        let chars_per_line = chars_per_line.max(1);
+        for character in text.chars() {
+            if character == '\n' {
+                if self.ends_with_newline {
+                    self.wrapped_lines = self.wrapped_lines.saturating_add(1);
+                }
+                self.trailing_line_chars = 0;
+                self.ends_with_newline = true;
+            } else {
+                if self.ends_with_newline {
+                    self.wrapped_lines = self.wrapped_lines.saturating_add(1);
+                }
+                self.ends_with_newline = false;
+                self.trailing_line_chars = self.trailing_line_chars.saturating_add(1);
+                if self.trailing_line_chars > chars_per_line {
+                    self.wrapped_lines = self.wrapped_lines.saturating_add(1);
+                    self.trailing_line_chars = 1;
+                }
+            }
+            if self.last_char == Some(']') && character == '(' {
+                self.has_workspace_link_syntax = true;
+            }
+            self.last_char = Some(character);
+        }
+    }
+
+    fn estimated_markdown_row_height(self) -> f32 {
+        self.wrapped_lines as f32 * 24.0
+            + 8.0
+            + if self.has_workspace_link_syntax {
+                30.0
+            } else {
+                0.0
+            }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StreamingRowMetricsCache {
+    turn_id: String,
+    row_id: String,
+    body_len: usize,
+    metrics: StreamingRowTextMetrics,
+}
+
+struct AgentStreamingCacheUpdate {
+    turn_id: String,
+    row_id: String,
+    previous_body_len: usize,
+    previous_row_height: f32,
+    row_height: f32,
+}
+
+fn agent_streaming_delta_updates(
+    events: &[TimelineLiveEvent],
+) -> Option<Vec<AgentStreamingDeltaUpdate>> {
+    let mut updates = Vec::with_capacity(events.len());
+    for event in events {
+        if event.sequence != event.item.sequence || event.session_id != event.item.session_id {
+            return None;
+        }
+        let TimelinePayload::AgentMessageDelta(delta) = &event.item.payload else {
+            return None;
+        };
+        if delta.text_delta.contains("Reconnecting... ") {
+            return None;
+        }
+        updates.push(AgentStreamingDeltaUpdate {
+            item_id: event.item.id.to_string(),
+            sequence: event.sequence,
+            timestamp_ms: event.item.timestamp_ms,
+            text: delta.text_delta.clone(),
+            runtime_attribution: event
+                .item
+                .execution_attribution
+                .as_ref()
+                .map(|attribution| {
+                    format!(
+                        "{} · {} · {}",
+                        attribution.agent_label,
+                        attribution.provider_profile_label,
+                        attribution.model_label
+                    )
+                }),
+        });
+    }
+    updates
+        .windows(2)
+        .all(|pair| pair[1].sequence == pair[0].sequence.saturating_add(1))
+        .then_some(updates)
+}
+
+fn record_timeline_row_endpoint(item_ids: &mut Vec<String>, item_id: String) {
+    match item_ids.len() {
+        0 => item_ids.push(item_id),
+        1 if item_ids[0] != item_id => item_ids.push(item_id),
+        1 => {}
+        _ if item_ids.last() != Some(&item_id) => {
+            item_ids.truncate(2);
+            item_ids[1] = item_id;
+        }
+        _ => {}
+    }
+}
+
+fn append_agent_streaming_deltas_to_cache(
+    cache: &mut Rc<Vec<Rc<TimelineConversationTurn>>>,
+    metrics_cache: &mut Option<StreamingRowMetricsCache>,
+    updates: &[AgentStreamingDeltaUpdate],
+) -> Option<AgentStreamingCacheUpdate> {
+    if updates.is_empty() {
+        return None;
+    }
+    let last_turn = cache.last()?;
+    let last_row = last_turn.process_rows.last()?;
+    if last_turn.complete
+        || last_turn.conclusion_row.is_some()
+        || last_row.kind != TimelineRowKind::AgentMessage
+        || !last_row.streaming
+        || updates
+            .iter()
+            .any(|update| update.runtime_attribution != last_row.runtime_attribution)
+        || updates
+            .first()
+            .is_none_or(|update| update.sequence != last_row.last_sequence.saturating_add(1))
+        || updates
+            .windows(2)
+            .any(|pair| pair[1].sequence != pair[0].sequence.saturating_add(1))
+    {
+        return None;
+    }
+
+    let turn_id = last_turn.id.clone();
+    let row_id = last_row.id.clone();
+    let previous_body_len = last_row.body.len();
+    let mut metrics = metrics_cache
+        .as_ref()
+        .filter(|cached| {
+            cached.turn_id == turn_id
+                && cached.row_id == row_id
+                && cached.body_len == previous_body_len
+        })
+        .map(|cached| cached.metrics)
+        .unwrap_or_else(|| StreamingRowTextMetrics::from_text(&last_row.body, 72));
+    let previous_row_height = metrics.estimated_markdown_row_height();
+
+    let turns = Rc::make_mut(cache);
+    let turn = Rc::make_mut(turns.last_mut().expect("cache was checked above"));
+    let body_len = {
+        let row = turn
+            .process_rows
+            .last_mut()
+            .expect("streaming row was checked above");
+        for update in updates {
+            row.body.push_str(&update.text);
+            metrics.append(&update.text, 72);
+            record_timeline_row_endpoint(&mut row.item_ids, update.item_id.clone());
+            row.last_sequence = update.sequence;
+        }
+        row.body.len()
+    };
+    turn.item_count = turn.item_count.saturating_add(updates.len());
+    turn.ended_at_ms = updates.last().map(|update| update.timestamp_ms);
+    for row in turn
+        .user_row
+        .iter_mut()
+        .chain(turn.process_rows.iter_mut())
+        .chain(turn.conclusion_row.iter_mut())
+    {
+        row.turn_item_count = turn.item_count;
+    }
+    *metrics_cache = Some(StreamingRowMetricsCache {
+        turn_id: turn_id.clone(),
+        row_id: row_id.clone(),
+        body_len,
+        metrics,
+    });
+    Some(AgentStreamingCacheUpdate {
+        turn_id,
+        row_id,
+        previous_body_len,
+        previous_row_height,
+        row_height: metrics.estimated_markdown_row_height(),
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentAnswerAction {
@@ -2305,6 +2981,11 @@ pub struct VibexWorkbench {
     settings_title: Entity<SettingsDialogTitle>,
     settings_view: Entity<FoundationSettings>,
     code_workbench: Entity<CodeWorkbench>,
+    preview_fullscreen_active: bool,
+    code_preview_visible: bool,
+    code_files_surface_visible: bool,
+    code_git_surface_visible: bool,
+    right_rail_mode: RightRailMode,
     code_right_rail: Entity<CodeRightRail>,
     management_view: Entity<ManagementCenter>,
     usage_view: Entity<UsageView>,
@@ -2333,6 +3014,8 @@ pub struct VibexWorkbench {
     optimistically_removed_session_ids: BTreeSet<String>,
     optimistic_session_deletion_reconciliation_pending: bool,
     sidebar_state: SidebarState,
+    sidebar_projection_revision: u64,
+    sidebar_projection_cache: Option<SidebarProjectionCache>,
     sidebar_batch_mode: bool,
     sidebar_renaming_session_id: Option<VibexSessionId>,
     sidebar_rename_error: Option<String>,
@@ -2378,11 +3061,12 @@ pub struct VibexWorkbench {
     timeline_measured_turn_heights: BTreeMap<String, f32>,
     timeline_pending_turn_heights: BTreeMap<usize, (String, f32)>,
     timeline_estimated_turn_heights: BTreeMap<String, (u64, f32)>,
-    timeline_markdown_sources: BTreeMap<String, (i64, Arc<str>)>,
+    timeline_markdown_sources: BTreeMap<String, (i64, TimelineMarkdownSourceSnapshot)>,
     timeline_tool_card_projections: BTreeMap<String, (i64, Rc<ToolCardProjection>)>,
-    conversation_turns_cache: Rc<Vec<TimelineConversationTurn>>,
+    conversation_turns_cache: Rc<Vec<Rc<TimelineConversationTurn>>>,
     conversation_turns_cache_key: Option<ConversationTurnsCacheKey>,
     conversation_turns_summary: ConversationTurnsSummary,
+    streaming_row_metrics: Option<StreamingRowMetricsCache>,
     turn_preview_rail_visible: bool,
     turn_preview_active_index: Option<usize>,
     agent_session_view_cache: BTreeMap<String, AgentSessionViewCacheEntry>,
@@ -2429,6 +3113,7 @@ pub struct VibexWorkbench {
     composer_terminal_expanded: bool,
     composer_terminal_drop_target: Option<ComposerTerminalDropTarget>,
     composer_terminal_surfaces: BTreeMap<String, Entity<TerminalSurface>>,
+    active_composer_terminal_surface_id: Option<String>,
     inline_user_message_edit: Option<InlineUserMessageEdit>,
     pending_user_message_edit: Option<PendingUserMessageEdit>,
     startup_loading: bool,
@@ -2743,7 +3428,17 @@ impl VibexWorkbench {
         let code_right_rail = cx.new(|cx| CodeRightRail::new(code_workbench.clone(), window, cx));
         let management_view = cx.new(|cx| ManagementCenter::new(window, cx));
         let usage_view = cx.new(|_| UsageView::new());
-        agent_subscriptions.push(cx.observe(&code_workbench, |_, _, cx| cx.notify()));
+        agent_subscriptions.push(cx.subscribe(
+            &code_workbench,
+            |this, _, event: &CodeWorkbenchEvent, cx| match event {
+                CodeWorkbenchEvent::LayoutChanged { fullscreen } => {
+                    if this.preview_fullscreen_active != *fullscreen {
+                        this.preview_fullscreen_active = *fullscreen;
+                        cx.notify();
+                    }
+                }
+            },
+        ));
         agent_subscriptions.push(cx.subscribe(
             &management_view,
             |this, _, event: &ManagementEvent, cx| match event {
@@ -2810,6 +3505,11 @@ impl VibexWorkbench {
             settings_title,
             settings_view,
             code_workbench,
+            preview_fullscreen_active: false,
+            code_preview_visible: false,
+            code_files_surface_visible: false,
+            code_git_surface_visible: false,
+            right_rail_mode: restored_right_rail_mode,
             code_right_rail,
             management_view,
             usage_view,
@@ -2838,6 +3538,8 @@ impl VibexWorkbench {
             optimistically_removed_session_ids: BTreeSet::new(),
             optimistic_session_deletion_reconciliation_pending: false,
             sidebar_state,
+            sidebar_projection_revision: 0,
+            sidebar_projection_cache: None,
             sidebar_batch_mode: false,
             sidebar_renaming_session_id: None,
             sidebar_rename_error: None,
@@ -2888,6 +3590,7 @@ impl VibexWorkbench {
             conversation_turns_cache: Rc::new(Vec::new()),
             conversation_turns_cache_key: None,
             conversation_turns_summary: ConversationTurnsSummary::default(),
+            streaming_row_metrics: None,
             turn_preview_rail_visible: false,
             turn_preview_active_index: None,
             agent_session_view_cache: BTreeMap::new(),
@@ -2934,6 +3637,7 @@ impl VibexWorkbench {
             composer_terminal_expanded: false,
             composer_terminal_drop_target: None,
             composer_terminal_surfaces: BTreeMap::new(),
+            active_composer_terminal_surface_id: None,
             inline_user_message_edit: None,
             pending_user_message_edit: None,
             startup_loading: true,
@@ -2989,6 +3693,8 @@ impl VibexWorkbench {
                 }
             }));
         this.quit_subscription = Some(cx.on_app_quit(|this, cx| {
+            let code_workbench_state = this.code_workbench.read(cx).persisted_state_for_exit();
+            this.apply_code_workbench_state(code_workbench_state);
             if let Some(writer) = this.ui_writer.as_mut() {
                 writer.queue(this.ui_state.clone(), unix_timestamp_ms());
                 match writer.flush() {
@@ -3185,6 +3891,7 @@ impl VibexWorkbench {
         self.sidebar_state.pinned_ids = self.ui_state.sidebar.pinned_session_ids.clone();
         self.sidebar_state.collapsed_ids = self.ui_state.sidebar.collapsed_project_ids.clone();
         self.sidebar_state.selected_ids.clear();
+        self.invalidate_sidebar_projection_cache();
         self.selected_session_id = selected_session_id;
         self.navigation_history =
             NavigationHistory::new(self.current_workbench_route(), WORKBENCH_NAVIGATION_LIMIT);
@@ -3195,6 +3902,7 @@ impl VibexWorkbench {
         let right_rail_mode = right_rail_mode_from_activity_id(
             self.ui_state.right_rail.selected_activity_id.as_deref(),
         );
+        self.right_rail_mode = right_rail_mode;
         self.code_workbench.update(cx, |workbench, cx| {
             workbench.restore_persisted_state(
                 preview,
@@ -3206,47 +3914,96 @@ impl VibexWorkbench {
             );
             workbench.right_rail_mode = right_rail_mode;
         });
+        self.code_right_rail.update(cx, |right_rail, cx| {
+            right_rail.set_mode(right_rail_mode, cx)
+        });
     }
 
     fn attach_event_stream(&mut self, runtime: Arc<DesktopRuntime>, cx: &mut Context<Self>) {
         let mut events = runtime.subscribe();
-        let (signal_tx, mut signal_rx) = mpsc::unbounded_channel();
+        let (signal_tx, mut signal_rx) = mpsc::channel(RUNTIME_UI_SIGNAL_QUEUE_CAPACITY);
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             while let Ok(event) = events.recv().await {
-                match event {
-                    DesktopEvent::Shutdown => {
-                        let _ = signal_tx.send(RuntimeUiSignal::Shutdown);
-                        break;
-                    }
-                    event => {
-                        let _ = signal_tx.send(RuntimeUiSignal::Event(Box::new(event)));
-                    }
+                let shutdown = matches!(&event, DesktopEvent::Shutdown);
+                let signal = if shutdown {
+                    RuntimeUiSignal::Shutdown
+                } else {
+                    RuntimeUiSignal::Event(Box::new(event))
+                };
+                if signal_tx.send(signal).await.is_err() || shutdown {
+                    break;
                 }
             }
         });
         self.event_task = Some(cx.spawn(
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 while let Some(signal) = signal_rx.recv().await {
-                    let stop = signal == RuntimeUiSignal::Shutdown;
-                    let _ = entity.update(cx, |this, cx| {
-                        let dirty = match signal {
-                            RuntimeUiSignal::Event(event) => this.apply_desktop_event(*event, cx),
-                            RuntimeUiSignal::Shutdown => {
-                                this.runtime_note = Some("Runtime stopped".to_string());
-                                true
-                            }
-                        };
+                    let mut signals = vec![signal];
+                    if !matches!(signals.first(), Some(RuntimeUiSignal::Shutdown)) {
+                        cx.background_executor()
+                            .timer(RUNTIME_UI_SIGNAL_COALESCE_DELAY)
+                            .await;
+                    }
+                    while signals.len() < RUNTIME_UI_SIGNAL_BATCH_LIMIT {
+                        match signal_rx.try_recv() {
+                            Ok(signal) => signals.push(signal),
+                            Err(_) => break,
+                        }
+                    }
+                    let stop = signals
+                        .iter()
+                        .any(|signal| matches!(signal, RuntimeUiSignal::Shutdown));
+                    let stopped = entity.update(cx, |this, cx| {
+                        let dirty = this.apply_runtime_ui_signals(signals, cx);
                         if dirty {
                             cx.notify();
                         }
+                        dirty
                     });
-                    if stop {
+                    if stop || stopped.is_err() {
                         break;
                     }
                 }
+                drop(signal_rx);
                 let _ = runner.await;
             },
         ));
+    }
+
+    fn apply_runtime_ui_signals(
+        &mut self,
+        signals: Vec<RuntimeUiSignal>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut dirty = false;
+        let mut timeline_events = Vec::new();
+        for signal in signals {
+            match signal {
+                RuntimeUiSignal::Event(event) => match *event {
+                    DesktopEvent::Timeline(event) => timeline_events.push(event),
+                    event => {
+                        if !timeline_events.is_empty() {
+                            dirty |= self.apply_live_timeline_batch(
+                                std::mem::take(&mut timeline_events),
+                                cx,
+                            );
+                        }
+                        dirty |= self.apply_desktop_event(event, cx);
+                    }
+                },
+                RuntimeUiSignal::Shutdown => {
+                    if !timeline_events.is_empty() {
+                        self.apply_live_timeline_batch(std::mem::take(&mut timeline_events), cx);
+                    }
+                    self.runtime_note = Some("Runtime stopped".to_string());
+                    dirty = true;
+                }
+            }
+        }
+        if !timeline_events.is_empty() {
+            dirty |= self.apply_live_timeline_batch(timeline_events, cx);
+        }
+        dirty
     }
 
     fn load_agent_configured_catalog(&mut self, cx: &mut Context<Self>) {
@@ -3833,12 +4590,15 @@ impl VibexWorkbench {
         let mode = right_rail_mode_from_activity_id(
             self.ui_state.right_rail.selected_activity_id.as_deref(),
         );
+        self.right_rail_mode = mode;
         self.code_workbench.update(cx, |workbench, cx| {
             if workbench.right_rail_mode != mode {
                 workbench.right_rail_mode = mode;
                 cx.notify();
             }
         });
+        self.code_right_rail
+            .update(cx, |right_rail, cx| right_rail.set_mode(mode, cx));
     }
 
     fn reconcile_sidebar_state(&mut self) {
@@ -3931,6 +4691,7 @@ impl VibexWorkbench {
             self.sidebar_renaming_session_id = None;
             self.sidebar_rename_error = None;
         }
+        self.invalidate_sidebar_projection_cache();
     }
 
     fn upsert_session_snapshot(&mut self, session: AgentSession) {
@@ -4219,16 +4980,36 @@ impl VibexWorkbench {
         }
     }
 
-    fn sidebar_workspace_groups(&self, query: &str) -> Vec<SidebarProjectProjection> {
-        sidebar_project_projections(
+    fn invalidate_sidebar_projection_cache(&mut self) {
+        self.sidebar_projection_revision = self.sidebar_projection_revision.wrapping_add(1);
+        self.sidebar_projection_cache = None;
+    }
+
+    fn sidebar_workspace_groups(&mut self, query: &str) -> Rc<Vec<SidebarProjectProjection>> {
+        let normalized_query = query.trim().to_lowercase();
+        if normalized_query.is_empty()
+            && let Some(cache) = self.sidebar_projection_cache.as_ref()
+            && cache.revision == self.sidebar_projection_revision
+        {
+            return cache.groups.clone();
+        }
+
+        let groups = Rc::new(sidebar_project_projections(
             &self.workspaces,
             &self.sessions,
             &self.workspace_contexts,
             &self.ui_state.sidebar.project_order,
             &self.sidebar_state.row_order,
             &self.sidebar_state.pinned_ids,
-            query,
-        )
+            &normalized_query,
+        ));
+        if normalized_query.is_empty() {
+            self.sidebar_projection_cache = Some(SidebarProjectionCache {
+                revision: self.sidebar_projection_revision,
+                groups: groups.clone(),
+            });
+        }
+        groups
     }
 
     fn toggle_sidebar_batch_mode(&mut self, cx: &mut Context<Self>) {
@@ -4598,9 +5379,9 @@ impl VibexWorkbench {
         after: bool,
         cx: &mut Context<Self>,
     ) {
-        let ids = self
-            .sidebar_workspace_groups("")
-            .into_iter()
+        let groups = self.sidebar_workspace_groups("");
+        let ids = groups
+            .iter()
             .map(|group| group.project.id.as_str().to_string())
             .collect::<Vec<_>>();
         complete_string_order(&mut self.ui_state.sidebar.project_order, ids);
@@ -4612,6 +5393,7 @@ impl VibexWorkbench {
         ) {
             self.queue_ui_state();
         }
+        self.invalidate_sidebar_projection_cache();
         cx.notify();
     }
 
@@ -4623,15 +5405,15 @@ impl VibexWorkbench {
         after: bool,
         cx: &mut Context<Self>,
     ) {
-        let ids = self
-            .sidebar_workspace_groups("")
-            .into_iter()
-            .flat_map(|group| group.workspaces)
+        let groups = self.sidebar_workspace_groups("");
+        let ids = groups
+            .iter()
+            .flat_map(|group| group.workspaces.iter())
             .find(|workspace| workspace.workspace.id.as_str() == workspace_id)
             .map(|workspace| {
                 workspace
                     .sessions
-                    .into_iter()
+                    .iter()
                     .map(|session| session.id.as_str().to_string())
                     .collect::<Vec<_>>()
             })
@@ -4643,6 +5425,7 @@ impl VibexWorkbench {
         {
             self.queue_agent_ui_state();
         }
+        self.invalidate_sidebar_projection_cache();
         cx.notify();
     }
 
@@ -4685,7 +5468,8 @@ impl VibexWorkbench {
         {
             return;
         }
-        let entry = AgentSessionViewCacheEntry {
+        let mut entry = AgentSessionViewCacheEntry {
+            estimated_resident_bytes: 0,
             timeline: std::mem::take(&mut self.timeline),
             runtime_selection: self.runtime_selection.take(),
             token_usage: self.token_usage.take(),
@@ -4704,21 +5488,21 @@ impl VibexWorkbench {
             timeline_estimated_turn_heights: std::mem::take(
                 &mut self.timeline_estimated_turn_heights,
             ),
-            timeline_markdown_sources: std::mem::take(&mut self.timeline_markdown_sources),
-            timeline_tool_card_projections: std::mem::take(
-                &mut self.timeline_tool_card_projections,
-            ),
             conversation_turns_cache: std::mem::replace(
                 &mut self.conversation_turns_cache,
                 Rc::new(Vec::new()),
             ),
             conversation_turns_cache_key: self.conversation_turns_cache_key.take(),
             conversation_turns_summary: std::mem::take(&mut self.conversation_turns_summary),
+            streaming_row_metrics: self.streaming_row_metrics.take(),
             content_width: self.ui_state.session.content_width,
             collapsed_timeline_rows: std::mem::take(&mut self.collapsed_timeline_rows),
             timeline_process_expansion: std::mem::take(&mut self.timeline_process_expansion),
             timeline_command_expansion: std::mem::take(&mut self.timeline_command_expansion),
         };
+        entry.estimated_resident_bytes = entry.calculate_estimated_resident_bytes();
+        self.timeline_markdown_sources.clear();
+        self.timeline_tool_card_projections.clear();
         self.store_agent_session_view(session_id, entry);
     }
 
@@ -4734,6 +5518,8 @@ impl VibexWorkbench {
             key,
             entry,
             AGENT_SESSION_VIEW_CACHE_LIMIT,
+            AGENT_SESSION_VIEW_CACHE_BYTES,
+            |entry| entry.estimated_resident_bytes,
         );
     }
 
@@ -4752,11 +5538,12 @@ impl VibexWorkbench {
         self.timeline_row_sizes = entry.timeline_row_sizes;
         self.timeline_measured_turn_heights = entry.timeline_measured_turn_heights;
         self.timeline_estimated_turn_heights = entry.timeline_estimated_turn_heights;
-        self.timeline_markdown_sources = entry.timeline_markdown_sources;
-        self.timeline_tool_card_projections = entry.timeline_tool_card_projections;
+        self.timeline_markdown_sources.clear();
+        self.timeline_tool_card_projections.clear();
         self.conversation_turns_cache = entry.conversation_turns_cache;
         self.conversation_turns_cache_key = entry.conversation_turns_cache_key;
         self.conversation_turns_summary = entry.conversation_turns_summary;
+        self.streaming_row_metrics = entry.streaming_row_metrics;
         self.collapsed_timeline_rows = entry.collapsed_timeline_rows;
         self.timeline_process_expansion = entry.timeline_process_expansion;
         self.timeline_command_expansion = entry.timeline_command_expansion;
@@ -4813,25 +5600,40 @@ impl VibexWorkbench {
     }
 
     fn current_conversation_turns_cache_key(&self) -> ConversationTurnsCacheKey {
-        (
-            self.timeline.session_id.clone(),
-            self.timeline.revision,
-            self.timeline.items.len(),
-            self.timeline.authoritative_end_sequence,
-            self.selected_agent_session_state(),
-            self.agent_turn_pending,
-            self.pending_user_message_edit
+        ConversationTurnsCacheKey {
+            session_id: self.timeline.session_id.clone(),
+            timeline_revision: self.timeline.revision,
+            item_count: self.timeline.items.len(),
+            end_sequence: self.timeline.authoritative_end_sequence,
+            session_state: self.selected_agent_session_state(),
+            agent_turn_pending: self.agent_turn_pending,
+            pending_edit: self
+                .pending_user_message_edit
                 .as_ref()
                 .map(PendingUserMessageEdit::cache_key),
-        )
+        }
     }
 
-    fn conversation_turns_cached(&mut self) -> Rc<Vec<TimelineConversationTurn>> {
+    fn conversation_turns_cached(&mut self) -> Rc<Vec<Rc<TimelineConversationTurn>>> {
         let key = self.current_conversation_turns_cache_key();
         if self.conversation_turns_cache_key.as_ref() != Some(&key) {
-            let turns = self.conversation_turns();
-            self.conversation_turns_summary = ConversationTurnsSummary::from_turns(&turns);
-            self.conversation_turns_cache = Rc::new(turns);
+            let incrementally_refreshed =
+                self.conversation_turns_cache_key
+                    .as_ref()
+                    .is_some_and(|previous_key| {
+                        refresh_conversation_turns_cache_incrementally(
+                            &mut self.conversation_turns_cache,
+                            previous_key,
+                            &key,
+                            &self.timeline,
+                        )
+                    });
+            if !incrementally_refreshed {
+                self.conversation_turns_cache =
+                    Rc::new(self.conversation_turns().into_iter().map(Rc::new).collect());
+            }
+            let turns = self.conversation_turns_cache.as_slice();
+            self.conversation_turns_summary = ConversationTurnsSummary::from_turns(turns);
             self.conversation_turns_cache_key = Some(key);
         }
         self.conversation_turns_cache.clone()
@@ -4926,6 +5728,8 @@ impl VibexWorkbench {
         self.composer_terminal_mode = false;
         self.composer_terminal_expanded = false;
         self.composer_terminal_drop_target = None;
+        self.composer_terminal_surfaces.clear();
+        self.active_composer_terminal_surface_id = None;
         let restored_cached_view = self.restore_agent_session_view(&session_id);
         if restored_cached_view {
             self.agent_loading = false;
@@ -5229,14 +6033,17 @@ impl VibexWorkbench {
                     {
                         return;
                     }
-                    match outcome {
+                    let dirty = match outcome {
                         Ok(terminals) => this.sync_terminal_sessions(terminals, cx),
                         Err(error) => {
                             this.runtime_note =
                                 Some(format!("session terminal task failed: {error}"));
+                            true
                         }
+                    };
+                    if dirty {
+                        cx.notify();
                     }
-                    cx.notify();
                 });
             },
         ));
@@ -5330,14 +6137,16 @@ impl VibexWorkbench {
         let (signal_tx, mut signal_rx) = mpsc::unbounded_channel();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             let mut after_sequence = after_sequence;
-            let mut tick = 0_u64;
-            let runtime_every = (policy.runtime_events_ms / policy.timeline_fallback_ms).max(1);
-            let terminal_every = policy
-                .terminal_list_ms
-                .div_ceil(policy.timeline_fallback_ms)
-                .max(1);
+            let mut idle_poll_count = 0_u16;
+            let mut last_runtime_poll = Instant::now();
+            let mut last_terminal_poll = Instant::now();
             loop {
-                tokio::time::sleep(Duration::from_millis(policy.timeline_fallback_ms)).await;
+                tokio::time::sleep(agent_timeline_poll_interval(
+                    policy.timeline_fallback_ms,
+                    idle_poll_count,
+                ))
+                .await;
+                let mut received_items = false;
                 if let Ok(page) = runtime
                     .agent()
                     .fetch_timeline(FetchTimelineRequest {
@@ -5349,11 +6158,20 @@ impl VibexWorkbench {
                 {
                     after_sequence = page.end_sequence.or(after_sequence);
                     if !page.items.is_empty() {
+                        received_items = true;
                         let _ = signal_tx.send(AgentPollSignal::Timeline(page));
                     }
                 }
-                tick = tick.saturating_add(1);
-                if tick.is_multiple_of(runtime_every) {
+                idle_poll_count = if received_items {
+                    0
+                } else {
+                    idle_poll_count.saturating_add(1)
+                };
+                let now = Instant::now();
+                if now.duration_since(last_runtime_poll)
+                    >= Duration::from_millis(policy.runtime_events_ms)
+                {
+                    last_runtime_poll = now;
                     if let Ok(state) = runtime
                         .agent()
                         .runtime_selection()
@@ -5368,10 +6186,12 @@ impl VibexWorkbench {
                         });
                     }
                 }
-                if tick.is_multiple_of(terminal_every)
+                if now.duration_since(last_terminal_poll)
+                    >= Duration::from_millis(policy.terminal_list_ms)
                     && let Some(workspace_id) = workspace_id.as_ref()
                     && let Ok(terminals) = runtime.list_terminals(workspace_id)
                 {
+                    last_terminal_poll = now;
                     let _ = signal_tx.send(AgentPollSignal::Terminals(running_terminal_sessions(
                         terminals,
                     )));
@@ -5387,53 +6207,17 @@ impl VibexWorkbench {
                                 return false;
                             }
                             let dirty = match signal {
-                                AgentPollSignal::Timeline(page) => {
-                                    let previous_end_sequence =
-                                        this.timeline.authoritative_end_sequence;
-                                    let previous_plan = current_agent_plan(&this.timeline.items);
-                                    let updates_existing_item = this
-                                        .timeline
-                                        .authoritative_end_sequence
-                                        .is_some_and(|end| {
-                                            page.items.iter().any(|item| item.sequence <= end)
-                                        });
-                                    let changed = this.timeline.apply_live_batch(
-                                        page.items.into_iter().map(|item| TimelineLiveEvent {
+                                AgentPollSignal::Timeline(page) => this.apply_live_timeline_batch(
+                                    page.items
+                                        .into_iter()
+                                        .map(|item| TimelineLiveEvent {
                                             session_id: page.session_id.clone(),
                                             sequence: item.sequence,
                                             item,
-                                        }),
-                                    );
-                                    if changed > 0 {
-                                        this.sync_composer_plan_completion(
-                                            previous_plan,
-                                            previous_end_sequence,
-                                            cx,
-                                        );
-                                        if updates_existing_item {
-                                            this.invalidate_timeline_render_caches();
-                                        }
-                                        if !this.timeline_follow.following_bottom {
-                                            let appended_messages =
-                                                timeline_agent_message_count_after_sequence(
-                                                    &this.timeline.items,
-                                                    previous_end_sequence,
-                                                );
-                                            this.timeline_follow
-                                                .content_appended(appended_messages);
-                                        }
-                                        let content_extent_changed = this.rebuild_timeline_sizes();
-                                        if timeline_should_auto_follow_content(
-                                            this.timeline_follow.following_bottom,
-                                            this.timeline_scroll_wheel_idle_task.is_some(),
-                                            this.timeline_scrollbar_interaction_active,
-                                            content_extent_changed,
-                                        ) {
-                                            this.request_timeline_scroll_to_latest();
-                                        }
-                                    }
-                                    changed > 0
-                                }
+                                        })
+                                        .collect(),
+                                    cx,
+                                ),
                                 AgentPollSignal::RuntimeSelection(state) => {
                                     if this.runtime_selection.as_ref() == Some(state.as_ref()) {
                                         false
@@ -5457,8 +6241,7 @@ impl VibexWorkbench {
                                     }
                                 }
                                 AgentPollSignal::Terminals(terminals) => {
-                                    this.sync_terminal_sessions(terminals, cx);
-                                    true
+                                    this.sync_terminal_sessions(terminals, cx)
                                 }
                             };
                             if dirty {
@@ -5476,47 +6259,86 @@ impl VibexWorkbench {
         ));
     }
 
+    fn apply_live_timeline_batch(
+        &mut self,
+        events: Vec<TimelineLiveEvent>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(selected_session_id) = self.selected_session_id.as_ref() else {
+            return false;
+        };
+        let events = events
+            .into_iter()
+            .filter(|event| &event.session_id == selected_session_id)
+            .collect::<Vec<_>>();
+        if events.is_empty() {
+            return false;
+        }
+
+        let previous_end_sequence = self.timeline.authoritative_end_sequence;
+        let updates_existing_item = previous_end_sequence
+            .is_some_and(|end| events.iter().any(|event| event.sequence <= end));
+        let streaming_updates = (!updates_existing_item)
+            .then(|| agent_streaming_delta_updates(&events))
+            .flatten();
+        let previous_plan = streaming_updates
+            .is_none()
+            .then(|| current_agent_plan(&self.timeline.items))
+            .flatten();
+        let changed = self.timeline.apply_live_batch(events);
+        if changed > 0 {
+            let mut streaming_cache_update = None;
+            if streaming_updates.is_none() {
+                self.sync_composer_plan_completion(previous_plan, previous_end_sequence, cx);
+            }
+            if updates_existing_item {
+                self.invalidate_timeline_render_caches();
+            } else if !self.timeline.needs_authoritative_refetch
+                && let Some(updates) = streaming_updates.as_deref()
+                && let Some(update) = append_agent_streaming_deltas_to_cache(
+                    &mut self.conversation_turns_cache,
+                    &mut self.streaming_row_metrics,
+                    updates,
+                )
+            {
+                self.conversation_turns_cache_key =
+                    Some(self.current_conversation_turns_cache_key());
+                self.conversation_turns_summary =
+                    ConversationTurnsSummary::from_turns(&self.conversation_turns_cache);
+                streaming_cache_update = Some(update);
+            }
+            if !self.timeline_follow.following_bottom {
+                let appended_messages = timeline_agent_message_count_after_sequence(
+                    &self.timeline.items,
+                    previous_end_sequence,
+                );
+                self.timeline_follow.content_appended(appended_messages);
+            }
+            let content_extent_changed = if let Some(update) = streaming_cache_update.as_ref() {
+                self.refresh_last_timeline_size_incrementally(update)
+            } else {
+                self.streaming_row_metrics = None;
+                self.rebuild_timeline_sizes()
+            };
+            if timeline_should_auto_follow_content(
+                self.timeline_follow.following_bottom,
+                self.timeline_scroll_wheel_idle_task.is_some(),
+                self.timeline_scrollbar_interaction_active,
+                content_extent_changed,
+            ) {
+                self.request_timeline_scroll_to_latest();
+            }
+        }
+        let needs_refetch = self.timeline.needs_authoritative_refetch;
+        if needs_refetch {
+            self.refresh_selected_agent_timeline(cx);
+        }
+        changed > 0 || needs_refetch
+    }
+
     fn apply_desktop_event(&mut self, event: DesktopEvent, cx: &mut Context<Self>) -> bool {
         match event {
-            DesktopEvent::Timeline(event) => {
-                if self.selected_session_id.as_ref() != Some(&event.session_id) {
-                    return false;
-                }
-                let previous_end_sequence = self.timeline.authoritative_end_sequence;
-                let previous_plan = current_agent_plan(&self.timeline.items);
-                let updates_existing_item = self
-                    .timeline
-                    .authoritative_end_sequence
-                    .is_some_and(|end| event.sequence <= end);
-                let changed = self.timeline.apply_live(event);
-                if changed {
-                    self.sync_composer_plan_completion(previous_plan, previous_end_sequence, cx);
-                    if updates_existing_item {
-                        self.invalidate_timeline_render_caches();
-                    }
-                    if !self.timeline_follow.following_bottom {
-                        let appended_messages = timeline_agent_message_count_after_sequence(
-                            &self.timeline.items,
-                            previous_end_sequence,
-                        );
-                        self.timeline_follow.content_appended(appended_messages);
-                    }
-                    let content_extent_changed = self.rebuild_timeline_sizes();
-                    if timeline_should_auto_follow_content(
-                        self.timeline_follow.following_bottom,
-                        self.timeline_scroll_wheel_idle_task.is_some(),
-                        self.timeline_scrollbar_interaction_active,
-                        content_extent_changed,
-                    ) {
-                        self.request_timeline_scroll_to_latest();
-                    }
-                }
-                let needs_refetch = self.timeline.needs_authoritative_refetch;
-                if needs_refetch {
-                    self.refresh_selected_agent_timeline(cx);
-                }
-                changed || needs_refetch
-            }
+            DesktopEvent::Timeline(event) => self.apply_live_timeline_batch(vec![event], cx),
             DesktopEvent::Runtime(event) => {
                 self.selected_session_id
                     .as_ref()
@@ -5622,6 +6444,84 @@ impl VibexWorkbench {
         true
     }
 
+    fn refresh_last_timeline_size(&mut self) -> bool {
+        self.timeline_pending_turn_heights.clear();
+        let Some(turn) = self.conversation_turns_cache.last().cloned() else {
+            return self.rebuild_timeline_sizes();
+        };
+        if self.timeline_row_sizes.len() != self.conversation_turns_cache.len() {
+            return self.rebuild_timeline_sizes();
+        }
+        self.timeline_measured_turn_heights.remove(&turn.id);
+        let process_expansion = self.timeline_process_expansion.get(&turn.id).copied();
+        let signature = self.timeline_turn_estimate_signature(&turn, process_expansion);
+        let height = self.estimated_timeline_turn_height_projected(&turn, process_expansion);
+        self.timeline_estimated_turn_heights
+            .insert(turn.id.clone(), (signature, height));
+        let content_width = session_content_max_width(self.ui_state.session.content_width)
+            .unwrap_or(AGENT_CONTENT_STANDARD_MAX_WIDTH);
+        let row_size = size(px(content_width), px(height));
+        let row_sizes = Rc::make_mut(&mut self.timeline_row_sizes);
+        let Some(previous) = row_sizes.last_mut() else {
+            return false;
+        };
+        if *previous == row_size {
+            return false;
+        }
+        *previous = row_size;
+        true
+    }
+
+    fn refresh_last_timeline_size_incrementally(
+        &mut self,
+        update: &AgentStreamingCacheUpdate,
+    ) -> bool {
+        self.timeline_pending_turn_heights.clear();
+        let Some(turn) = self.conversation_turns_cache.last().cloned() else {
+            return self.rebuild_timeline_sizes();
+        };
+        let Some(row) = turn.process_rows.last() else {
+            return self.rebuild_timeline_sizes();
+        };
+        if turn.id != update.turn_id
+            || row.id != update.row_id
+            || row.body.len() < update.previous_body_len
+            || self.timeline_row_sizes.len() != self.conversation_turns_cache.len()
+        {
+            return self.rebuild_timeline_sizes();
+        }
+
+        self.timeline_measured_turn_heights.remove(&turn.id);
+        let Some(previous_height) = self
+            .timeline_row_sizes
+            .last()
+            .map(|row_size| f32::from(row_size.height))
+        else {
+            return self.refresh_last_timeline_size();
+        };
+        // The live fast path only appends the final streaming Agent row. Reuse
+        // the prior measured/estimated Turn extent and apply the O(new text)
+        // row delta; visible prepaint will converge this approximation again.
+        let height = (previous_height - update.previous_row_height + update.row_height).max(72.0);
+
+        let process_expansion = self.timeline_process_expansion.get(&turn.id).copied();
+        let signature = self.timeline_turn_estimate_signature(&turn, process_expansion);
+        self.timeline_estimated_turn_heights
+            .insert(turn.id.clone(), (signature, height));
+        let content_width = session_content_max_width(self.ui_state.session.content_width)
+            .unwrap_or(AGENT_CONTENT_STANDARD_MAX_WIDTH);
+        let row_size = size(px(content_width), px(height));
+        let row_sizes = Rc::make_mut(&mut self.timeline_row_sizes);
+        let Some(previous) = row_sizes.last_mut() else {
+            return false;
+        };
+        if *previous == row_size {
+            return false;
+        }
+        *previous = row_size;
+        true
+    }
+
     fn invalidate_timeline_render_caches(&mut self) {
         self.timeline_item_index.get_mut().invalidate();
         self.timeline_measured_turn_heights.clear();
@@ -5632,6 +6532,7 @@ impl VibexWorkbench {
         self.conversation_turns_cache = Rc::new(Vec::new());
         self.conversation_turns_cache_key = None;
         self.conversation_turns_summary = ConversationTurnsSummary::default();
+        self.streaming_row_metrics = None;
     }
 
     fn invalidate_timeline_turn_measurement(&mut self, turn_id: &str) {
@@ -7591,7 +8492,11 @@ impl VibexWorkbench {
         }
     }
 
-    fn sync_terminal_sessions(&mut self, terminals: Vec<TerminalSession>, cx: &mut Context<Self>) {
+    fn sync_terminal_sessions(
+        &mut self,
+        terminals: Vec<TerminalSession>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let (composer_terminals, workbench_terminals) =
             partition_terminal_sessions(terminals, &self.ui_state.composer.terminal_ids);
         let composer_ids = composer_terminals
@@ -7602,6 +8507,7 @@ impl VibexWorkbench {
         complete_string_order(&mut self.ui_state.terminal.tab_order, composer_ids);
         let composer_terminals =
             order_terminal_sessions(composer_terminals, &self.ui_state.terminal.tab_order);
+        let previous_selection = self.selected_composer_terminal_id.clone();
         if self
             .selected_composer_terminal_id
             .as_ref()
@@ -7619,13 +8525,24 @@ impl VibexWorkbench {
                 .first()
                 .map(|terminal| terminal.id.clone());
         }
+        let composer_changed = self.composer_terminals != composer_terminals;
         self.composer_terminals = composer_terminals;
+        self.composer_terminal_surfaces.retain(|terminal_id, _| {
+            self.composer_terminals
+                .iter()
+                .any(|terminal| terminal.id.as_str() == terminal_id)
+        });
+        self.sync_composer_terminal_surface_activity(cx);
         if self.ui_state.terminal.tab_order != previous_order {
             self.queue_ui_state();
         }
-        self.code_workbench.update(cx, |workbench, cx| {
+        let workbench_changed = self.code_workbench.update(cx, |workbench, cx| {
             workbench.sync_terminals(workbench_terminals, cx)
         });
+        composer_changed
+            || self.selected_composer_terminal_id != previous_selection
+            || self.ui_state.terminal.tab_order != previous_order
+            || workbench_changed
     }
 
     fn move_composer_terminal_relative(
@@ -7670,22 +8587,76 @@ impl VibexWorkbench {
             .filter(|session| session.workspace_id == terminal.workspace_id)
             .map(|session| std::path::PathBuf::from(&session.workspace_root))
             .unwrap_or_else(|| std::path::PathBuf::from(&terminal.cwd));
-        Some(
-            self.composer_terminal_surfaces
-                .entry(terminal_id)
-                .or_insert_with(|| {
-                    cx.new(|cx| {
-                        TerminalSurface::from_embedded_shared_session(
-                            runtime.terminals().manager(),
-                            workspace_root,
-                            terminal,
-                            window,
-                            cx,
-                        )
-                    })
+        let surface = self
+            .composer_terminal_surfaces
+            .entry(terminal_id)
+            .or_insert_with(|| {
+                cx.new(|cx| {
+                    TerminalSurface::from_embedded_shared_session(
+                        runtime.terminals().manager(),
+                        workspace_root,
+                        terminal,
+                        window,
+                        cx,
+                    )
                 })
-                .clone(),
-        )
+            })
+            .clone();
+        self.sync_composer_terminal_surface_activity(cx);
+        Some(surface)
+    }
+
+    fn sync_composer_terminal_surface_activity(&mut self, cx: &mut Context<Self>) {
+        let desired = (self.ui_state.workbench.active_tab == "agent"
+            && !self.new_session_open
+            && self.composer_terminal_mode)
+            .then_some(self.selected_composer_terminal_id.as_ref())
+            .flatten()
+            .map(|terminal_id| terminal_id.as_str().to_string())
+            .filter(|terminal_id| self.composer_terminal_surfaces.contains_key(terminal_id));
+        if desired == self.active_composer_terminal_surface_id {
+            return;
+        }
+
+        if let Some(active_id) = self.active_composer_terminal_surface_id.take()
+            && let Some(surface) = self.composer_terminal_surfaces.get(&active_id)
+        {
+            surface.update(cx, |surface, cx| surface.set_active(false, cx));
+        }
+        if let Some(desired_id) = desired {
+            if let Some(surface) = self.composer_terminal_surfaces.get(&desired_id) {
+                surface.update(cx, |surface, cx| surface.set_active(true, cx));
+            }
+            self.active_composer_terminal_surface_id = Some(desired_id);
+        }
+    }
+
+    fn set_code_preview_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.code_preview_visible == visible {
+            return;
+        }
+        self.code_preview_visible = visible;
+        self.code_workbench.update(cx, |workbench, cx| {
+            workbench.set_preview_visible(visible, cx)
+        });
+    }
+
+    fn set_code_workspace_surface_visibility(
+        &mut self,
+        files_visible: bool,
+        git_visible: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.code_files_surface_visible == files_visible
+            && self.code_git_surface_visible == git_visible
+        {
+            return;
+        }
+        self.code_files_surface_visible = files_visible;
+        self.code_git_surface_visible = git_visible;
+        self.code_workbench.update(cx, |workbench, cx| {
+            workbench.set_workspace_surface_visibility(files_visible, git_visible, cx)
+        });
     }
 
     fn select_composer_terminal(
@@ -7712,6 +8683,7 @@ impl VibexWorkbench {
         if let Some(terminal) = terminal
             && let Some(surface) = self.ensure_composer_terminal_surface(terminal, window, cx)
         {
+            self.sync_composer_terminal_surface_activity(cx);
             surface.update(cx, |surface, cx| surface.focus_input(window, cx));
         }
         cx.notify();
@@ -7842,6 +8814,7 @@ impl VibexWorkbench {
                                 this.queue_ui_state();
                             }
                             this.ensure_composer_terminal_surface(terminal, window, cx);
+                            this.sync_composer_terminal_surface_activity(cx);
                         }
                         Ok(Err(error)) => {
                             this.agent_error = Some(format!(
@@ -8020,6 +8993,7 @@ impl VibexWorkbench {
                             this.composer_terminal_mode = false;
                             this.composer_terminal_expanded = false;
                         }
+                        this.sync_composer_terminal_surface_activity(cx);
                         if !errors.is_empty() {
                             this.agent_error =
                                 Some(format!("terminal close failed: {}", errors.join("; ")));
@@ -10814,6 +11788,7 @@ impl VibexWorkbench {
         self.session_search_generation = self.session_search_generation.saturating_add(1);
         self.session_search_index_task = None;
         self.session_search_index_loading = false;
+        self.session_search_index.clear();
         self.focus_handle.focus(window, cx);
         cx.notify();
     }
@@ -11100,6 +12075,7 @@ impl VibexWorkbench {
                 .pinned_ids
                 .insert(session_id.as_str().to_string());
         }
+        self.invalidate_sidebar_projection_cache();
         self.queue_agent_ui_state();
         cx.notify();
     }
@@ -11153,14 +12129,23 @@ impl VibexWorkbench {
         state: CodeWorkbenchPersistedState,
         cx: &mut Context<Self>,
     ) {
+        self.apply_code_workbench_state(state);
+        let previous_note = self.persistence_note.clone();
+        self.queue_ui_state();
+        if self.persistence_note != previous_note {
+            cx.notify();
+        }
+    }
+
+    fn apply_code_workbench_state(&mut self, state: CodeWorkbenchPersistedState) {
         self.ui_state.preview.layout = state.preview;
-        self.ui_state.preview.editor_recovery = state.recovery;
+        if let Some(recovery) = state.recovery {
+            self.ui_state.preview.editor_recovery = recovery;
+        }
         self.ui_state.workbench.selected_workspace_id = state.workspace_id;
         self.ui_state.workbench.selected_file_path = state.selected_file_path;
         self.ui_state.workbench.selected_git_path = state.selected_git_path;
         self.ui_state.terminal.selected_terminal_id = state.selected_terminal_id;
-        self.queue_ui_state();
-        cx.notify();
     }
 
     fn current_workbench_route(&self) -> WorkbenchRoute {
@@ -11212,10 +12197,13 @@ impl VibexWorkbench {
         if let Some(activity_id) = right_rail_activity_id {
             let mode = right_rail_mode_from_activity_id(Some(&activity_id));
             self.ui_state.right_rail.selected_activity_id = Some(activity_id);
+            self.right_rail_mode = mode;
             self.code_workbench.update(cx, |workbench, cx| {
                 workbench.right_rail_mode = mode;
                 cx.notify();
             });
+            self.code_right_rail
+                .update(cx, |right_rail, cx| right_rail.set_mode(mode, cx));
         }
 
         if let Some(session_id) = route
@@ -11324,11 +12312,10 @@ impl VibexWorkbench {
     fn workbench_auto_collapse(
         &self,
         visibility: WorkbenchVisibility,
-        cx: &Context<Self>,
+        _cx: &Context<Self>,
     ) -> WorkbenchAutoCollapseState {
         let new_session_open = self.new_session_open;
-        let preview_fullscreen =
-            !new_session_open && self.code_workbench.read(cx).fullscreen_active();
+        let preview_fullscreen = !new_session_open && self.preview_fullscreen_active;
         let agent_workbench_active = self.ui_state.workbench.active_tab == "agent";
         let management_open = self.ui_state.workbench.active_tab == "management";
         let usage_open = self.ui_state.workbench.active_tab == "usage";
@@ -11356,7 +12343,7 @@ impl VibexWorkbench {
         )
     }
 
-    fn right_rail_docks_when_open(&self, cx: &Context<Self>) -> bool {
+    fn right_rail_docks_when_open(&self, _cx: &Context<Self>) -> bool {
         let visibility = WorkbenchVisibility::resolve(
             self.last_visibility.layout.viewport_width,
             self.last_visibility.layout.viewport_height,
@@ -11365,8 +12352,7 @@ impl VibexWorkbench {
             return false;
         }
         let new_session_open = self.new_session_open;
-        let preview_fullscreen =
-            !new_session_open && self.code_workbench.read(cx).fullscreen_active();
+        let preview_fullscreen = !new_session_open && self.preview_fullscreen_active;
         if self.ui_state.workbench.active_tab != "agent" || preview_fullscreen || new_session_open {
             return false;
         }
@@ -11454,7 +12440,7 @@ impl VibexWorkbench {
         &self,
         panel: RightPanelKind,
         visibility: WorkbenchVisibility,
-        cx: &Context<Self>,
+        _cx: &Context<Self>,
     ) -> Option<(f32, f32)> {
         let panel_visible = match panel {
             RightPanelKind::Preview => {
@@ -11465,10 +12451,7 @@ impl VibexWorkbench {
                     || (!visibility.right_rail_docked && self.right_rail_overlay_open)
             }
         };
-        if !panel_visible
-            || self.new_session_open
-            || self.code_workbench.read(cx).fullscreen_active()
-        {
+        if !panel_visible || self.new_session_open || self.preview_fullscreen_active {
             return None;
         }
         match panel {
@@ -11737,10 +12720,13 @@ impl VibexWorkbench {
         let activity_id = right_rail_activity_id(mode).to_string();
         let mode_changed =
             self.ui_state.right_rail.selected_activity_id.as_ref() != Some(&activity_id);
+        self.right_rail_mode = mode;
         self.code_workbench.update(cx, |workbench, cx| {
             workbench.right_rail_mode = mode;
             cx.notify();
         });
+        self.code_right_rail
+            .update(cx, |right_rail, cx| right_rail.set_mode(mode, cx));
         self.ui_state.right_rail.selected_activity_id = Some(activity_id);
         let visibility_changed = !self.ui_state.workbench.right_rail_visible;
         self.ui_state.workbench.right_rail_visible = true;
@@ -11757,7 +12743,7 @@ impl VibexWorkbench {
     }
 
     fn toggle_right_rail_mode(&mut self, mode: RightRailMode, cx: &mut Context<Self>) {
-        let current_mode = self.code_workbench.read(cx).right_rail_mode;
+        let current_mode = self.right_rail_mode;
         let panel_open = if self.last_visibility.right_rail_docked {
             self.ui_state.workbench.right_rail_visible
         } else {
@@ -11780,7 +12766,7 @@ impl VibexWorkbench {
             self.close_right_rail(cx);
             return;
         }
-        let mode = self.code_workbench.read(cx).right_rail_mode;
+        let mode = self.right_rail_mode;
         self.open_right_rail_mode(mode, cx);
     }
 
@@ -11974,7 +12960,10 @@ impl VibexWorkbench {
         if let Some(plugin) = self.selected_right_rail_web_plugin() {
             self.render_right_rail_web_plugin(plugin, cx)
         } else {
-            self.code_right_rail.clone().into_any_element()
+            self.code_right_rail
+                .clone()
+                .cached(StyleRefinement::default().size_full())
+                .into_any_element()
         }
     }
 
@@ -12102,7 +13091,7 @@ impl VibexWorkbench {
     }
 
     fn render_right_rail_activity_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let active_mode = self.code_workbench.read(cx).right_rail_mode;
+        let active_mode = self.right_rail_mode;
         let panel_open = self.right_rail_panel_open();
         let preview_open = if self.last_visibility.preview_docked {
             self.ui_state.workbench.preview_visible
@@ -12951,7 +13940,7 @@ impl VibexWorkbench {
                     .map(|session| session.workspace_id.as_str().to_string())
             });
         let mut group_elements = Vec::with_capacity(groups.len());
-        for group in groups {
+        for group in groups.iter() {
             let active = group.workspaces.iter().any(|workspace| {
                 sidebar_project_is_active(
                     selected_workspace_id.as_deref(),
@@ -13301,7 +14290,7 @@ impl VibexWorkbench {
 
     fn render_sidebar_project(
         &mut self,
-        group: SidebarProjectProjection,
+        group: &SidebarProjectProjection,
         active: bool,
         reorder_enabled: bool,
         strings: Strings,
@@ -13543,7 +14532,7 @@ impl VibexWorkbench {
                     if group.compact_sessions.is_empty() {
                         session_elements.push(sidebar_empty_sessions(strings, cx));
                     } else {
-                        for session in group.compact_sessions {
+                        for session in &group.compact_sessions {
                             session_elements.push(self.render_sidebar_session(
                                 session,
                                 reorder_enabled,
@@ -13555,7 +14544,7 @@ impl VibexWorkbench {
                     }
                 }
                 SidebarHierarchyMode::Detailed => {
-                    for workspace in group.workspaces {
+                    for workspace in &group.workspaces {
                         session_elements.push(self.render_sidebar_workspace(
                             workspace,
                             reorder_enabled,
@@ -13656,7 +14645,7 @@ impl VibexWorkbench {
 
     fn render_sidebar_workspace(
         &mut self,
-        projection: SidebarWorkspaceProjection,
+        projection: &SidebarWorkspaceProjection,
         reorder_enabled: bool,
         strings: Strings,
         cx: &mut Context<Self>,
@@ -13790,7 +14779,7 @@ impl VibexWorkbench {
         } else {
             projection
                 .sessions
-                .into_iter()
+                .iter()
                 .map(|session| {
                     self.render_sidebar_session(session, reorder_enabled, false, strings, cx)
                 })
@@ -13817,7 +14806,7 @@ impl VibexWorkbench {
 
     fn render_sidebar_session(
         &mut self,
-        session: AgentSession,
+        session: &AgentSession,
         reorder_enabled: bool,
         show_worktree_identity: bool,
         strings: Strings,
@@ -15290,13 +16279,12 @@ impl VibexWorkbench {
             .value()
             .trim()
             .to_lowercase();
-        let project_rows = self
-            .sidebar_workspace_groups(&project_query)
-            .into_iter()
+        let project_groups = self.sidebar_workspace_groups(&project_query);
+        let project_rows = project_groups
+            .iter()
             .map(|projection| {
-                let project = projection.project;
-                let project_name = project.name;
-                let project_id = project.id;
+                let project_name = projection.project.name.clone();
+                let project_id = projection.project.id.clone();
                 let project_id_string = project_id.as_str().to_string();
                 let selected = active_project_id.as_ref() == Some(&project_id);
                 button_with_aria_label(
@@ -16304,7 +17292,7 @@ impl VibexWorkbench {
 
     fn render_agent_turn_preview_rail(
         &mut self,
-        turns: &[TimelineConversationTurn],
+        turns: &[Rc<TimelineConversationTurn>],
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let locale = self.resolved_locale();
@@ -16341,7 +17329,7 @@ impl VibexWorkbench {
         // The rail only mounts its list while hovered, so building a preview card
         // per turn on every frame would scale the frame cost with conversation
         // length for something that is not on screen.
-        let rail_turns: &[TimelineConversationTurn] = if self.turn_preview_rail_visible {
+        let rail_turns: &[Rc<TimelineConversationTurn>] = if self.turn_preview_rail_visible {
             turns
         } else {
             &[]
@@ -17959,6 +18947,7 @@ impl VibexWorkbench {
                                     ))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.composer_terminal_mode = false;
+                                        this.sync_composer_terminal_surface_activity(cx);
                                         cx.notify();
                                     })),
                             )
@@ -18008,7 +18997,8 @@ impl VibexWorkbench {
                             .min_h_0()
                             .min_w_0()
                             .when_some(selected_surface, |surface, terminal| {
-                                surface.child(terminal)
+                                surface
+                                    .child(terminal.cached(StyleRefinement::default().size_full()))
                             })
                             .when(selected_terminal.is_none(), |surface| {
                                 surface.child(
@@ -18815,8 +19805,15 @@ impl VibexWorkbench {
             let payload = self.timeline_row_latest_item(row).map(|item| &item.payload);
             Rc::new(tool_card_projection(row, payload))
         };
-        self.timeline_tool_card_projections
-            .insert(row.id.clone(), (row.last_sequence, projection.clone()));
+        insert_bounded_timeline_projection(
+            &mut self.timeline_tool_card_projections,
+            row.id.clone(),
+            row.last_sequence,
+            projection.clone(),
+            TIMELINE_TOOL_PROJECTION_CACHE_LIMIT,
+            TIMELINE_TOOL_PROJECTION_CACHE_BYTES,
+            |projection| projection.approximate_bytes(),
+        );
         projection
     }
 
@@ -18826,17 +19823,17 @@ impl VibexWorkbench {
     /// copies the whole message twice per frame per visible row. Reusing one
     /// allocation also lets the markdown view settle on a pointer comparison
     /// instead of a full memcmp when nothing changed.
-    fn timeline_markdown_source(&mut self, row: &TimelineRow) -> Arc<str> {
-        if let Some((sequence, source)) = self.timeline_markdown_sources.get(&row.id)
-            && *sequence == row.last_sequence
-            && source.len() == row.body.len()
-        {
-            return source.clone();
-        }
-        let source: Arc<str> = Arc::from(row.body.as_str());
-        self.timeline_markdown_sources
-            .insert(row.id.clone(), (row.last_sequence, source.clone()));
-        source
+    fn timeline_markdown_source(&mut self, row: &TimelineRow) -> (Arc<str>, i64) {
+        let allow_throttle = self
+            .streaming_row_metrics
+            .as_ref()
+            .is_some_and(|metrics| metrics.row_id == row.id && metrics.body_len == row.body.len());
+        timeline_markdown_source_snapshot(
+            &mut self.timeline_markdown_sources,
+            row,
+            Instant::now(),
+            allow_throttle,
+        )
     }
 
     /// Refresh the id → position lookup when the timeline identity moved on.
@@ -19316,14 +20313,14 @@ impl VibexWorkbench {
         let search_query = self
             .session_search_highlight_query_for_rows(std::slice::from_ref(row))
             .map(str::to_string);
-        let markdown_source = self.timeline_markdown_source(row);
+        let (markdown_source, markdown_sequence) = self.timeline_markdown_source(row);
         let markdown_entity = cx.weak_entity();
         let markdown_view = MarkdownView::new(
             format!("markdown:{}", row.id),
             MarkdownInput::new(
                 markdown_source.clone(),
                 "",
-                u64::try_from(row.last_sequence).unwrap_or_default(),
+                u64::try_from(markdown_sequence).unwrap_or_default(),
             )
             .surface(MarkdownSurface::Agent),
         )
@@ -19433,13 +20430,14 @@ impl VibexWorkbench {
         let search_query = self
             .session_search_highlight_query_for_rows(std::slice::from_ref(row))
             .map(str::to_string);
+        let (markdown_source, markdown_sequence) = self.timeline_markdown_source(row);
         let markdown_entity = cx.weak_entity();
         let markdown_view = MarkdownView::new(
             format!("thought:{}", row.id),
             MarkdownInput::new(
-                self.timeline_markdown_source(row),
+                markdown_source,
                 "",
-                u64::try_from(row.last_sequence).unwrap_or_default(),
+                u64::try_from(markdown_sequence).unwrap_or_default(),
             )
             .surface(MarkdownSurface::Agent),
         )
@@ -22420,8 +23418,7 @@ impl VibexWorkbench {
         let agent_open = self.ui_state.workbench.active_tab == "agent";
         let sidebar_docked = visibility.sidebar_docked && self.ui_state.workbench.sidebar_visible;
         let new_session_open = self.new_session_open;
-        let preview_fullscreen =
-            agent_open && !new_session_open && self.code_workbench.read(cx).fullscreen_active();
+        let preview_fullscreen = agent_open && !new_session_open && self.preview_fullscreen_active;
         let preview_docked = visibility.preview_docked
             && self.ui_state.workbench.preview_visible
             && agent_open
@@ -22466,7 +23463,11 @@ impl VibexWorkbench {
                         .size_full()
                         .min_w_0()
                         .min_h_0()
-                        .child(self.management_view.clone())
+                        .child(
+                            self.management_view
+                                .clone()
+                                .cached(StyleRefinement::default().size_full()),
+                        )
                         .into_any_element()
                 } else if usage_open {
                     div()
@@ -22474,7 +23475,11 @@ impl VibexWorkbench {
                         .size_full()
                         .min_w_0()
                         .min_h_0()
-                        .child(self.usage_view.clone())
+                        .child(
+                            self.usage_view
+                                .clone()
+                                .cached(StyleRefinement::default().size_full()),
+                        )
                         .into_any_element()
                 } else if new_session_open {
                     self.render_new_session_panel(strings, window, cx)
@@ -22497,7 +23502,11 @@ impl VibexWorkbench {
                     .flex_none()
                     .border_l_1()
                     .border_color(cx.theme().border)
-                    .child(self.code_workbench.clone())
+                    .child(
+                        self.code_workbench
+                            .clone()
+                            .cached(StyleRefinement::default().size_full()),
+                    )
                     .child(resize_handle),
             );
         }
@@ -22571,18 +23580,22 @@ impl VibexWorkbench {
                             .border_l_1()
                             .border_color(cx.theme().border)
                             .shadow_lg()
-                            .child(self.code_workbench.clone()),
+                            .child(
+                                self.code_workbench
+                                    .clone()
+                                    .cached(StyleRefinement::default().size_full()),
+                            ),
                     )
                 },
             )
             .when_some(floating_right_rail, |this, panel| this.child(panel))
             .when(preview_fullscreen, |this| {
                 this.child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .bg(cx.theme().background)
-                        .child(self.code_workbench.clone()),
+                    div().absolute().inset_0().bg(cx.theme().background).child(
+                        self.code_workbench
+                            .clone()
+                            .cached(StyleRefinement::default().size_full()),
+                    ),
                 )
             })
             .into_any_element()
@@ -22599,18 +23612,35 @@ fn timeline_row_preview_text(row: &TimelineRow) -> Option<&str> {
 }
 
 fn compact_agent_turn_preview_message(value: &str) -> String {
-    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.chars().count() <= AGENT_TURN_PREVIEW_MESSAGE_MAX_CHARS {
-        return normalized;
+    let mut normalized = Vec::with_capacity(AGENT_TURN_PREVIEW_MESSAGE_MAX_CHARS + 1);
+    let mut pending_space = false;
+    for character in value.chars() {
+        if character.is_whitespace() {
+            pending_space = !normalized.is_empty();
+            continue;
+        }
+        if pending_space {
+            normalized.push(' ');
+            pending_space = false;
+        }
+        normalized.push(character);
+        if normalized.len() > AGENT_TURN_PREVIEW_MESSAGE_MAX_CHARS {
+            break;
+        }
+    }
+    if normalized.len() <= AGENT_TURN_PREVIEW_MESSAGE_MAX_CHARS {
+        return normalized.into_iter().collect();
     }
 
-    let mut truncated = normalized
-        .chars()
-        .take(AGENT_TURN_PREVIEW_MESSAGE_MAX_CHARS - 3)
-        .collect::<String>();
-    truncated.truncate(truncated.trim_end().len());
-    truncated.push_str("...");
-    truncated
+    normalized.truncate(AGENT_TURN_PREVIEW_MESSAGE_MAX_CHARS - 3);
+    while normalized
+        .last()
+        .is_some_and(|character| character.is_whitespace())
+    {
+        normalized.pop();
+    }
+    normalized.extend(['.', '.', '.']);
+    normalized.into_iter().collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22734,6 +23764,17 @@ struct ToolCardProjection {
     title: String,
     details: Vec<(String, String)>,
     failed: bool,
+}
+
+impl ToolCardProjection {
+    fn approximate_bytes(&self) -> usize {
+        self.title.len()
+            + self
+                .details
+                .iter()
+                .map(|(label, value)| label.len().saturating_add(value.len()))
+                .sum::<usize>()
+    }
 }
 
 fn process_activity_icon(kind: TimelineRowKind) -> Icon {
@@ -27524,8 +28565,7 @@ impl Render for VibexWorkbench {
         let auto_collapse = self.workbench_auto_collapse(visibility, cx);
         visibility.sidebar_docked &= !auto_collapse.sidebar;
         visibility.right_rail_docked &= !auto_collapse.right_rail;
-        let preview_fullscreen =
-            !self.new_session_open && self.code_workbench.read(cx).fullscreen_active();
+        let preview_fullscreen = !self.new_session_open && self.preview_fullscreen_active;
         let right_rail_suppressed = self.ui_state.workbench.active_tab != "agent"
             || self.new_session_open
             || preview_fullscreen;
@@ -27544,6 +28584,21 @@ impl Render for VibexWorkbench {
             self.close_sidebar_hover_preview();
         }
         self.last_visibility = visibility;
+        let preview_visible = self.ui_state.workbench.active_tab == "agent"
+            && !self.new_session_open
+            && (self.preview_fullscreen_active
+                || (visibility.preview_docked && self.ui_state.workbench.preview_visible)
+                || (!visibility.preview_docked && self.preview_overlay_open));
+        self.set_code_preview_visible(preview_visible, cx);
+        let right_rail_visible = !right_rail_suppressed
+            && self.right_rail_panel_open()
+            && self.selected_right_rail_web_plugin().is_none();
+        self.set_code_workspace_surface_visibility(
+            right_rail_visible && self.right_rail_mode == RightRailMode::Files,
+            right_rail_visible && self.right_rail_mode == RightRailMode::Git,
+            cx,
+        );
+        self.sync_composer_terminal_surface_activity(cx);
         let strings = self.strings();
         let content = match self.runtime_status.clone() {
             RuntimeStatus::Failed { code, message } => {
@@ -27947,8 +29002,17 @@ fn decode_html_data_image(html: &str) -> Option<(gpui::ImageFormat, Vec<u8>)> {
 }
 
 fn agent_markdown_summary(source: &str) -> (String, Vec<String>) {
-    let document =
-        parse_markdown(MarkdownInput::new(source, "", 0).surface(MarkdownSurface::Agent));
+    let source = utf8_prefix(source, AGENT_TURN_PREVIEW_MARKDOWN_MAX_BYTES);
+    let limits = MarkdownLimits {
+        max_source_bytes: AGENT_TURN_PREVIEW_MARKDOWN_MAX_BYTES,
+        max_nodes: AGENT_TURN_PREVIEW_MARKDOWN_MAX_NODES,
+        max_resources: AGENT_TURN_PREVIEW_MARKDOWN_MAX_RESOURCES,
+        ..MarkdownLimits::default()
+    };
+    let document = parse_markdown_with_limits(
+        MarkdownInput::new(source, "", 0).surface(MarkdownSurface::Agent),
+        limits,
+    );
     let mut seen = BTreeSet::new();
     let paths = document
         .resources
@@ -28005,11 +29069,12 @@ mod tests {
     use crate::assets::{AgentBrandAsset, agent_brand_asset};
     use gpui::TestAppContext;
     use vibex_core::{
-        AgentCommandExecutionBehavior, AgentCommandSelectionBehavior, AgentId, AgentMessagePayload,
-        GitWorktreeConflictFile, GitWorktreeMergeStrategy, GitWorktreeOperationDetail,
-        GitWorktreeOperationKind, PlanPayload, PlanStepPayload, ProviderProfileId,
-        RuntimeOptionAvailability, SessionConfigValue, SessionRuntimeOption, TimelineItemId,
-        TimelineRedactionState, TimelineSource, TodoUpdatePayload, UserMessagePayload, WorkspaceId,
+        AgentCommandExecutionBehavior, AgentCommandSelectionBehavior, AgentId,
+        AgentMessageDeltaPayload, AgentMessagePayload, GitWorktreeConflictFile,
+        GitWorktreeMergeStrategy, GitWorktreeOperationDetail, GitWorktreeOperationKind,
+        PlanPayload, PlanStepPayload, ProviderProfileId, RuntimeOptionAvailability,
+        SessionConfigValue, SessionRuntimeOption, TimelineItemId, TimelineRedactionState,
+        TimelineSource, TodoUpdatePayload, UserMessagePayload, WorkspaceId,
     };
 
     #[test]
@@ -28074,16 +29139,29 @@ mod tests {
         sequence: i64,
         text: &str,
     ) -> TimelineItem {
-        let payload = TimelinePayload::AgentMessage(AgentMessagePayload {
-            text: text.into(),
-            is_final: true,
-        });
+        timeline_item_with_payload(
+            session_id,
+            sequence,
+            TimelineSource::Agent,
+            TimelinePayload::AgentMessage(AgentMessagePayload {
+                text: text.into(),
+                is_final: true,
+            }),
+        )
+    }
+
+    fn timeline_item_with_payload(
+        session_id: &VibexSessionId,
+        sequence: i64,
+        source: TimelineSource,
+        payload: TimelinePayload,
+    ) -> TimelineItem {
         TimelineItem {
             id: TimelineItemId::new(),
             session_id: session_id.clone(),
             sequence,
             timestamp_ms: sequence,
-            source: TimelineSource::Agent,
+            source,
             kind: payload.kind(),
             correlation_id: None,
             provider_correlation_id: None,
@@ -28091,6 +29169,205 @@ mod tests {
             execution_attribution: None,
             payload,
         }
+    }
+
+    fn streaming_timeline_fixture() -> (TimelineModel, Rc<Vec<Rc<TimelineConversationTurn>>>) {
+        let session_id = VibexSessionId::parse("session_streaming_cache").unwrap();
+        let items = [
+            timeline_item_with_payload(
+                &session_id,
+                1,
+                TimelineSource::User,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "first question".into(),
+                    attachments: Vec::new(),
+                }),
+            ),
+            indexed_timeline_item(&session_id, 2, "first answer"),
+            timeline_item_with_payload(
+                &session_id,
+                3,
+                TimelineSource::User,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "second question".into(),
+                    attachments: Vec::new(),
+                }),
+            ),
+            timeline_item_with_payload(
+                &session_id,
+                4,
+                TimelineSource::Agent,
+                TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                    text_delta: "stream".into(),
+                    chunk_index: 0,
+                }),
+            ),
+        ];
+        let mut timeline = TimelineModel::default();
+        timeline.replace_authoritative(session_id, items);
+        let turns =
+            timeline_conversation_turns(&timeline.items, Some(AgentSessionState::Running), false);
+        (timeline, Rc::new(turns.into_iter().map(Rc::new).collect()))
+    }
+
+    #[test]
+    fn append_only_turn_projection_reuses_the_historical_prefix() {
+        let (mut timeline, mut cache) = streaming_timeline_fixture();
+        let historical_turn = cache[0].clone();
+        let active_turn = cache[1].clone();
+        let previous_key = ConversationTurnsCacheKey {
+            session_id: timeline.session_id.clone(),
+            timeline_revision: timeline.revision,
+            item_count: timeline.items.len(),
+            end_sequence: timeline.authoritative_end_sequence,
+            session_state: Some(AgentSessionState::Running),
+            agent_turn_pending: false,
+            pending_edit: None,
+        };
+        let session_id = timeline.session_id.clone().unwrap();
+        let item = timeline_item_with_payload(
+            &session_id,
+            5,
+            TimelineSource::Agent,
+            TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                text_delta: "ing".into(),
+                chunk_index: 1,
+            }),
+        );
+        assert!(timeline.apply_live(TimelineLiveEvent {
+            session_id,
+            sequence: 5,
+            item,
+        }));
+        let next_key = ConversationTurnsCacheKey {
+            session_id: timeline.session_id.clone(),
+            timeline_revision: timeline.revision,
+            item_count: timeline.items.len(),
+            end_sequence: timeline.authoritative_end_sequence,
+            session_state: Some(AgentSessionState::Running),
+            agent_turn_pending: false,
+            pending_edit: None,
+        };
+
+        assert!(refresh_conversation_turns_cache_incrementally(
+            &mut cache,
+            &previous_key,
+            &next_key,
+            &timeline,
+        ));
+        assert!(Rc::ptr_eq(&cache[0], &historical_turn));
+        assert!(!Rc::ptr_eq(&cache[1], &active_turn));
+        assert_eq!(cache[1].process_rows.last().unwrap().body, "streaming");
+    }
+
+    #[test]
+    fn pure_streaming_delta_updates_only_the_tail_and_rejects_sequence_gaps() {
+        let (_, mut cache) = streaming_timeline_fixture();
+        let historical_turn = cache[0].clone();
+        let active_turn = cache[1].clone();
+        let mut metrics_cache = None;
+        let updates = [AgentStreamingDeltaUpdate {
+            item_id: "timeline_streaming_5".into(),
+            sequence: 5,
+            timestamp_ms: 5,
+            text: "ing".into(),
+            runtime_attribution: None,
+        }];
+
+        let update =
+            append_agent_streaming_deltas_to_cache(&mut cache, &mut metrics_cache, &updates)
+                .expect("contiguous delta should use the tail fast path");
+        assert!(Rc::ptr_eq(&cache[0], &historical_turn));
+        assert!(!Rc::ptr_eq(&cache[1], &active_turn));
+        assert_eq!(cache[1].process_rows.last().unwrap().body, "streaming");
+        assert_eq!(update.previous_body_len, "stream".len());
+
+        let body_before_gap = cache[1].process_rows.last().unwrap().body.clone();
+        let gap = [AgentStreamingDeltaUpdate {
+            item_id: "timeline_streaming_7".into(),
+            sequence: 7,
+            timestamp_ms: 7,
+            text: "gap".into(),
+            runtime_attribution: None,
+        }];
+        assert!(
+            append_agent_streaming_deltas_to_cache(&mut cache, &mut metrics_cache, &gap).is_none()
+        );
+        assert_eq!(cache[1].process_rows.last().unwrap().body, body_before_gap);
+    }
+
+    #[test]
+    fn streaming_markdown_snapshot_keeps_source_and_revision_in_sync() {
+        let mut cache = BTreeMap::new();
+        let mut row = TimelineRow {
+            id: "agent:streaming-markdown".into(),
+            kind: TimelineRowKind::AgentMessage,
+            item_ids: vec!["timeline_1".into()],
+            turn_id: Some("turn:streaming-markdown".into()),
+            turn_item_count: 1,
+            turn_failed: false,
+            turn_pending_permission: false,
+            conclusion: false,
+            first_sequence: 1,
+            last_sequence: 1,
+            title: "Agent".into(),
+            body: "first".into(),
+            streaming: true,
+            collapsible: false,
+            pending_permission: false,
+            failed: false,
+            runtime_attribution: None,
+            file_path: None,
+        };
+        let started_at = Instant::now();
+        let (first_source, first_sequence) =
+            timeline_markdown_source_snapshot(&mut cache, &row, started_at, false);
+        assert_eq!(first_source.as_ref(), "first");
+        assert_eq!(first_sequence, 1);
+
+        row.body.push_str(" chunk");
+        row.last_sequence = 2;
+        let (throttled_source, throttled_sequence) = timeline_markdown_source_snapshot(
+            &mut cache,
+            &row,
+            started_at + TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL / 2,
+            true,
+        );
+        assert!(Arc::ptr_eq(&first_source, &throttled_source));
+        assert_eq!(throttled_sequence, first_sequence);
+
+        let (refreshed_source, refreshed_sequence) = timeline_markdown_source_snapshot(
+            &mut cache,
+            &row,
+            started_at + TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL,
+            true,
+        );
+        assert_eq!(refreshed_source.as_ref(), "first chunk");
+        assert_eq!(refreshed_sequence, 2);
+
+        row.body.push_str(" final");
+        row.last_sequence = 3;
+        row.streaming = false;
+        let (final_source, final_sequence) = timeline_markdown_source_snapshot(
+            &mut cache,
+            &row,
+            started_at + TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL,
+            false,
+        );
+        assert_eq!(final_source.as_ref(), "first chunk final");
+        assert_eq!(final_sequence, 3);
+
+        row.body = "replacement".into();
+        row.last_sequence = 4;
+        row.streaming = true;
+        let (replacement_source, replacement_sequence) = timeline_markdown_source_snapshot(
+            &mut cache,
+            &row,
+            started_at + TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL,
+            false,
+        );
+        assert_eq!(replacement_source.as_ref(), "replacement");
+        assert_eq!(replacement_sequence, 4);
     }
 
     #[test]
@@ -29435,7 +30712,7 @@ mod tests {
             events
                 .matches("self.refresh_selected_agent_timeline(cx);")
                 .count(),
-            3
+            2
         );
     }
 
@@ -29552,7 +30829,7 @@ mod tests {
             .expect("session view cache should remain inspectable");
         assert!(cache_entry.contains("timeline_row_sizes: Rc<Vec<Size<gpui::Pixels>>>"));
         assert!(
-            cache_entry.contains("conversation_turns_cache: Rc<Vec<TimelineConversationTurn>>")
+            cache_entry.contains("conversation_turns_cache: Rc<Vec<Rc<TimelineConversationTurn>>>")
         );
 
         let stash = source
@@ -29563,6 +30840,8 @@ mod tests {
         assert!(stash.contains("timeline: std::mem::take(&mut self.timeline)"));
         assert!(stash.contains("&mut self.timeline_row_sizes"));
         assert!(stash.contains("&mut self.conversation_turns_cache"));
+        assert!(stash.contains("self.timeline_markdown_sources.clear();"));
+        assert!(stash.contains("self.timeline_tool_card_projections.clear();"));
         assert!(!stash.contains("self.timeline.clone()"));
 
         let restore = source
@@ -29594,8 +30873,25 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn load_agent_overview("))
             .map(|(body, _)| body)
             .expect("desktop event bridge should remain inspectable");
-        assert!(event_bridge.contains("let dirty = match signal"));
+        assert!(event_bridge.contains("mpsc::channel(RUNTIME_UI_SIGNAL_QUEUE_CAPACITY)"));
+        assert!(event_bridge.contains("signal_tx.send(signal).await"));
+        assert!(!event_bridge.contains("mpsc::unbounded_channel()"));
+        assert!(event_bridge.contains("while signals.len() < RUNTIME_UI_SIGNAL_BATCH_LIMIT"));
+        assert!(event_bridge.contains("drop(signal_rx);"));
+        assert!(event_bridge.contains("signal_rx.try_recv()"));
+        assert!(event_bridge.contains("this.apply_runtime_ui_signals(signals, cx)"));
         assert!(event_bridge.contains("if dirty {\n                            cx.notify();"));
+
+        let timeline_batch = source
+            .split_once("    fn apply_live_timeline_batch(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn apply_desktop_event("))
+            .map(|(body, _)| body)
+            .expect("timeline event batching should remain inspectable");
+        assert!(timeline_batch.contains("self.timeline.apply_live_batch(events)"));
+        assert!(
+            timeline_batch.contains(".filter(|event| &event.session_id == selected_session_id)")
+        );
+        assert!(!timeline_batch.contains("cx.notify();"));
 
         let event_handler = source
             .split_once("    fn apply_desktop_event(")
@@ -29604,7 +30900,7 @@ mod tests {
             .expect("desktop event handling should remain inspectable");
         assert!(event_handler.contains(") -> bool {"));
         assert!(event_handler.contains(
-            "if self.selected_session_id.as_ref() != Some(&event.session_id) {\n                    return false;"
+            "DesktopEvent::Timeline(event) => self.apply_live_timeline_batch(vec![event], cx)"
         ));
         assert!(!event_handler.contains("cx.notify();"));
     }
@@ -32546,6 +33842,46 @@ mod tests {
     }
 
     #[test]
+    fn streaming_height_metrics_match_full_estimation_across_chunk_boundaries() {
+        let prefix = format!("{}\n]", "x".repeat(145));
+        let suffix = "(src/app.rs)\nfinal line";
+        let mut incremental = StreamingRowTextMetrics::from_text(&prefix, 72);
+        incremental.append(suffix, 72);
+        let complete = StreamingRowTextMetrics::from_text(&format!("{prefix}{suffix}"), 72);
+
+        assert_eq!(incremental, complete);
+        assert_eq!(
+            complete.wrapped_lines,
+            estimated_wrapped_lines(&format!("{prefix}{suffix}"), 72)
+        );
+        assert!(complete.has_workspace_link_syntax);
+    }
+
+    #[test]
+    fn agent_timeline_polling_backs_off_and_recovers_after_content() {
+        assert_eq!(
+            agent_timeline_poll_interval(300, 0),
+            Duration::from_millis(300)
+        );
+        assert_eq!(
+            agent_timeline_poll_interval(300, 4),
+            Duration::from_millis(300)
+        );
+        assert_eq!(
+            agent_timeline_poll_interval(300, 5),
+            Duration::from_millis(600)
+        );
+        assert_eq!(
+            agent_timeline_poll_interval(300, 20),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            agent_timeline_poll_interval(300, 0),
+            Duration::from_millis(300)
+        );
+    }
+
+    #[test]
     fn agent_message_markdown_uses_the_timeline_scroll_without_an_inner_height_cap() {
         let source = include_str!("app.rs");
         let renderer = source
@@ -32699,10 +34035,34 @@ mod tests {
     fn opened_session_view_cache_is_bounded_and_refreshes_recency() {
         let mut cache = BTreeMap::new();
         let mut lru = VecDeque::new();
-        insert_bounded_session_view(&mut cache, &mut lru, "session_a".into(), 1, 2);
-        insert_bounded_session_view(&mut cache, &mut lru, "session_b".into(), 2, 2);
+        insert_bounded_session_view(
+            &mut cache,
+            &mut lru,
+            "session_a".into(),
+            1,
+            2,
+            usize::MAX,
+            |_| 1,
+        );
+        insert_bounded_session_view(
+            &mut cache,
+            &mut lru,
+            "session_b".into(),
+            2,
+            2,
+            usize::MAX,
+            |_| 1,
+        );
         touch_session_view_lru(&mut lru, "session_a");
-        insert_bounded_session_view(&mut cache, &mut lru, "session_c".into(), 3, 2);
+        insert_bounded_session_view(
+            &mut cache,
+            &mut lru,
+            "session_c".into(),
+            3,
+            2,
+            usize::MAX,
+            |_| 1,
+        );
 
         assert_eq!(
             lru.into_iter().collect::<Vec<_>>(),
@@ -32711,6 +34071,70 @@ mod tests {
         assert_eq!(cache.get("session_a"), Some(&1));
         assert_eq!(cache.get("session_b"), None);
         assert_eq!(cache.get("session_c"), Some(&3));
+    }
+
+    #[test]
+    fn opened_session_view_cache_enforces_a_total_byte_budget() {
+        let mut cache = BTreeMap::new();
+        let mut lru = VecDeque::new();
+        for (key, bytes) in [("session_a", 4_usize), ("session_b", 4), ("session_c", 7)] {
+            insert_bounded_session_view(&mut cache, &mut lru, key.into(), bytes, 6, 10, |bytes| {
+                *bytes
+            });
+        }
+        assert_eq!(
+            lru.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["session_c"]
+        );
+        assert_eq!(cache.get("session_c"), Some(&7));
+
+        insert_bounded_session_view(
+            &mut cache,
+            &mut lru,
+            "session_oversized".into(),
+            11,
+            6,
+            10,
+            |bytes| *bytes,
+        );
+        assert!(!cache.contains_key("session_oversized"));
+        assert_eq!(cache.get("session_c"), Some(&7));
+    }
+
+    #[test]
+    fn timeline_projection_cache_enforces_entry_and_byte_limits() {
+        let mut cache = BTreeMap::new();
+        insert_bounded_timeline_projection(
+            &mut cache,
+            "near".into(),
+            10,
+            "aaaa".to_string(),
+            2,
+            6,
+            String::len,
+        );
+        insert_bounded_timeline_projection(
+            &mut cache,
+            "far".into(),
+            1,
+            "bb".to_string(),
+            2,
+            6,
+            String::len,
+        );
+        insert_bounded_timeline_projection(
+            &mut cache,
+            "current".into(),
+            11,
+            "ccc".to_string(),
+            2,
+            6,
+            String::len,
+        );
+
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key("current"));
+        assert!(cache.values().map(|(_, value)| value.len()).sum::<usize>() <= 6);
     }
 
     #[test]
@@ -32788,5 +34212,31 @@ mod tests {
         )
         .1;
         assert_eq!(paths, ["src/editor.rs"]);
+    }
+
+    #[test]
+    fn agent_turn_preview_markdown_does_not_parse_past_its_source_budget() {
+        let source = format!(
+            "[early](src/early.rs){}[late](src/late.rs)",
+            "x".repeat(AGENT_TURN_PREVIEW_MARKDOWN_MAX_BYTES)
+        );
+        let paths = agent_markdown_summary(&source).1;
+
+        assert_eq!(paths, ["src/early.rs"]);
+        assert!(!paths.iter().any(|path| path == "src/late.rs"));
+    }
+
+    #[test]
+    fn closing_session_search_releases_the_full_text_index() {
+        let source = include_str!("app.rs");
+        let close = source
+            .split_once("    fn close_session_search(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn clear_session_search_highlight("))
+            .map(|(body, _)| body)
+            .expect("session search close handler should remain inspectable");
+
+        assert!(close.contains("self.session_search_generation"));
+        assert!(close.contains("self.session_search_index_task = None;"));
+        assert!(close.contains("self.session_search_index.clear();"));
     }
 }

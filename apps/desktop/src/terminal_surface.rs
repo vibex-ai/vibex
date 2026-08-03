@@ -44,7 +44,9 @@ const TERMINAL_VERTICAL_PADDING: f32 = 12.0;
 // terminal does not gain standalone chrome or lose the expected content edge.
 const PREVIEW_TERMINAL_PADDING: f32 = 8.0;
 const COMPOSER_TERMINAL_PADDING: f32 = 4.0;
-const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const TERMINAL_ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const TERMINAL_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const TERMINAL_IDLE_POLL_THRESHOLD: u16 = 4;
 const TERMINAL_RESIZE_DEBOUNCE: Duration = Duration::from_millis(80);
 const TERMINAL_CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 const PHYSICAL_MARKER_COMMAND: &str = "printf vibex-native-content-ok";
@@ -122,6 +124,14 @@ struct TerminalPollResult {
     result: Result<Option<(TerminalSyncOutcome, TerminalFrameSnapshot)>, String>,
 }
 
+fn terminal_poll_interval(idle_poll_count: u16) -> Duration {
+    if idle_poll_count >= TERMINAL_IDLE_POLL_THRESHOLD {
+        TERMINAL_IDLE_POLL_INTERVAL
+    } else {
+        TERMINAL_ACTIVE_POLL_INTERVAL
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalPhysicalObservation {
     pub tab_count: usize,
@@ -165,6 +175,8 @@ pub struct TerminalSurface {
     last_grid_bounds: Option<(String, u32, u32)>,
     poll_task: Option<Task<()>>,
     blink_task: Option<Task<()>>,
+    foreground_active: bool,
+    idle_poll_count: u16,
     cursor_visible: bool,
     note: String,
     physical_marker_shortcut: bool,
@@ -368,6 +380,8 @@ impl TerminalSurface {
             last_grid_bounds: None,
             poll_task: None,
             blink_task: None,
+            foreground_active: mode == TerminalSurfaceMode::Standalone,
+            idle_poll_count: 0,
             cursor_visible: true,
             note,
             physical_marker_shortcut,
@@ -382,12 +396,16 @@ impl TerminalSurface {
             input_log: Vec::new(),
         };
         this.install_search_subscription(window, cx);
-        this.start_polling(cx);
-        this.start_cursor_blink(cx);
-        let focus = this.focus.clone();
-        cx.on_next_frame(window, move |_, window, cx| {
-            focus.focus(window, cx);
-        });
+        if this.foreground_active {
+            this.start_polling(cx);
+            this.start_cursor_blink(cx);
+        }
+        if this.foreground_active {
+            let focus = this.focus.clone();
+            cx.on_next_frame(window, move |_, window, cx| {
+                focus.focus(window, cx);
+            });
+        }
         this
     }
 
@@ -411,6 +429,26 @@ impl TerminalSurface {
     #[allow(dead_code)]
     pub(crate) fn focus_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus.focus(window, cx);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        if self.foreground_active == active {
+            return;
+        }
+        self.foreground_active = active;
+        self.idle_poll_count = 0;
+        if active {
+            self.start_polling(cx);
+            self.start_cursor_blink(cx);
+        } else {
+            self.poll_task = None;
+            self.blink_task = None;
+            if !self.cursor_visible {
+                self.cursor_visible = true;
+                cx.notify();
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -488,36 +526,63 @@ impl TerminalSurface {
     }
 
     fn start_polling(&mut self, cx: &mut Context<Self>) {
+        if self.poll_task.is_some() || !self.foreground_active {
+            return;
+        }
         let background = cx.background_executor().clone();
         self.poll_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            background.timer(TERMINAL_ACTIVE_POLL_INTERVAL).await;
             loop {
-                background.timer(TERMINAL_POLL_INTERVAL).await;
-                let Ok(work) = entity.update(cx, |this, _| this.poll_work()) else {
+                let Ok(work) = entity.update(cx, |this, _| {
+                    this.foreground_active.then(|| this.poll_work())
+                }) else {
+                    break;
+                };
+                let Some(work) = work else {
                     break;
                 };
                 if work.is_empty() {
+                    background.timer(TERMINAL_IDLE_POLL_INTERVAL).await;
                     continue;
                 }
                 let results = background
                     .spawn(async move { work.into_iter().map(run_poll_work).collect::<Vec<_>>() })
                     .await;
-                if entity
-                    .update(cx, |this, cx| this.apply_poll_results(results, cx))
-                    .is_err()
-                {
+                let Ok(interval) = entity.update(cx, |this, cx| {
+                    if !this.foreground_active {
+                        return None;
+                    }
+                    let changed = this.apply_poll_results(results, cx);
+                    if changed {
+                        this.idle_poll_count = 0;
+                    } else {
+                        this.idle_poll_count = this.idle_poll_count.saturating_add(1);
+                    }
+                    Some(terminal_poll_interval(this.idle_poll_count))
+                }) else {
                     break;
-                }
+                };
+                let Some(interval) = interval else {
+                    break;
+                };
+                background.timer(interval).await;
             }
         }));
     }
 
     fn start_cursor_blink(&mut self, cx: &mut Context<Self>) {
+        if self.blink_task.is_some() || !self.foreground_active {
+            return;
+        }
         let background = cx.background_executor().clone();
         self.blink_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             loop {
                 background.timer(TERMINAL_CURSOR_BLINK_INTERVAL).await;
                 if entity
                     .update(cx, |this, cx| {
+                        if !this.foreground_active {
+                            return;
+                        }
                         let blinking = this
                             .active_tab
                             .and_then(|index| this.tabs.get(index))
@@ -554,7 +619,11 @@ impl TerminalSurface {
             .collect()
     }
 
-    fn apply_poll_results(&mut self, results: Vec<TerminalPollResult>, cx: &mut Context<Self>) {
+    fn apply_poll_results(
+        &mut self,
+        results: Vec<TerminalPollResult>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let mut changed = false;
         for result in results {
             let Some(tab) = self
@@ -586,9 +655,12 @@ impl TerminalSurface {
                 }
                 Ok(None) => {}
                 Err(message) => {
-                    self.note = message;
-                    self.last_error_code = Some("terminal_poll_failed");
-                    changed = true;
+                    if self.note != message || self.last_error_code != Some("terminal_poll_failed")
+                    {
+                        self.note = message;
+                        self.last_error_code = Some("terminal_poll_failed");
+                        changed = true;
+                    }
                 }
             }
         }
@@ -599,6 +671,7 @@ impl TerminalSurface {
             }
             cx.notify();
         }
+        changed
     }
 
     fn refresh_marker_observation(&mut self) {
@@ -1969,6 +2042,17 @@ mod tests {
         assert!(!TerminalSurfaceMode::Composer.shows_chrome());
         assert_eq!(TerminalSurfaceMode::Composer.horizontal_padding(), 4.0);
         assert!(TerminalSurfaceMode::Standalone.shows_chrome());
+    }
+
+    #[test]
+    fn terminal_polling_backs_off_after_consecutive_idle_frames() {
+        assert_eq!(terminal_poll_interval(0), TERMINAL_ACTIVE_POLL_INTERVAL);
+        assert_eq!(terminal_poll_interval(3), TERMINAL_ACTIVE_POLL_INTERVAL);
+        assert_eq!(terminal_poll_interval(4), TERMINAL_IDLE_POLL_INTERVAL);
+        assert_eq!(
+            terminal_poll_interval(u16::MAX),
+            TERMINAL_IDLE_POLL_INTERVAL
+        );
     }
 
     #[test]

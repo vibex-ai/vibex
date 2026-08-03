@@ -139,40 +139,72 @@ impl TimelineModel {
 }
 
 pub fn timeline_turns(items: &[TimelineItem]) -> Vec<TimelineTurn> {
+    timeline_turn_refs(items.iter())
+        .into_iter()
+        .map(Into::into)
+        .collect()
+}
+
+pub(crate) struct TimelineTurnRef<'a> {
+    pub(crate) user_item: Option<&'a TimelineItem>,
+    pub(crate) response_items: Vec<&'a TimelineItem>,
+    pub(crate) conclusion_item_id: Option<String>,
+    pub(crate) pending_permission_ids: Vec<String>,
+    pub(crate) failed: bool,
+}
+
+impl From<TimelineTurnRef<'_>> for TimelineTurn {
+    fn from(turn: TimelineTurnRef<'_>) -> Self {
+        Self {
+            user_item: turn.user_item.cloned(),
+            response_items: turn.response_items.into_iter().cloned().collect(),
+            conclusion_item_id: turn.conclusion_item_id,
+            pending_permission_ids: turn.pending_permission_ids,
+            failed: turn.failed,
+        }
+    }
+}
+
+/// Groups timeline items without cloning their payloads. Presentation builders
+/// call this on every streaming update, while the public `timeline_turns`
+/// adapter above preserves the existing owned/serializable contract.
+pub(crate) fn timeline_turn_refs<'a>(
+    items: impl IntoIterator<Item = &'a TimelineItem>,
+) -> Vec<TimelineTurnRef<'a>> {
     let mut turns = Vec::new();
-    let mut current = empty_turn();
+    let mut current = empty_turn_ref();
     for item in items {
         if item.kind == TimelineItemKind::UserMessage {
             if current.user_item.is_some() || !current.response_items.is_empty() {
-                finish_turn(&mut current);
+                finish_turn_ref(&mut current);
                 turns.push(current);
-                current = empty_turn();
+                current = empty_turn_ref();
             }
-            current.user_item = Some(item.clone());
+            current.user_item = Some(item);
         } else {
-            if turn_has_error(&current)
+            if turn_ref_has_error(&current)
                 && item.kind != TimelineItemKind::Error
                 && matches!(
                     item.source,
                     vibex_core::TimelineSource::Agent | vibex_core::TimelineSource::Provider
                 )
             {
-                finish_turn(&mut current);
+                finish_turn_ref(&mut current);
                 turns.push(current);
-                current = empty_turn();
+                current = empty_turn_ref();
             }
-            current.response_items.push(item.clone());
+            current.response_items.push(item);
         }
     }
     if current.user_item.is_some() || !current.response_items.is_empty() {
-        finish_turn(&mut current);
+        finish_turn_ref(&mut current);
         turns.push(current);
     }
     turns
 }
 
-fn empty_turn() -> TimelineTurn {
-    TimelineTurn {
+fn empty_turn_ref<'a>() -> TimelineTurnRef<'a> {
+    TimelineTurnRef {
         user_item: None,
         response_items: Vec::new(),
         conclusion_item_id: None,
@@ -194,7 +226,7 @@ fn normalize_items(
     by_sequence.into_values().collect()
 }
 
-fn finish_turn(turn: &mut TimelineTurn) {
+fn finish_turn_ref(turn: &mut TimelineTurnRef<'_>) {
     let mut pending_permission_ids = BTreeSet::new();
     for item in &turn.response_items {
         match &item.payload {
@@ -210,7 +242,10 @@ fn finish_turn(turn: &mut TimelineTurn) {
         }
     }
     turn.pending_permission_ids = pending_permission_ids.into_iter().collect();
-    turn.failed = turn.response_items.iter().any(is_turn_boundary_error);
+    turn.failed = turn
+        .response_items
+        .iter()
+        .any(|item| is_turn_boundary_error(item));
     turn.conclusion_item_id = turn
         .response_items
         .iter()
@@ -219,8 +254,10 @@ fn finish_turn(turn: &mut TimelineTurn) {
         .map(|item| item.id.to_string());
 }
 
-fn turn_has_error(turn: &TimelineTurn) -> bool {
-    turn.response_items.iter().any(is_turn_boundary_error)
+fn turn_ref_has_error(turn: &TimelineTurnRef<'_>) -> bool {
+    turn.response_items
+        .iter()
+        .any(|item| is_turn_boundary_error(item))
 }
 
 fn is_turn_boundary_error(item: &TimelineItem) -> bool {

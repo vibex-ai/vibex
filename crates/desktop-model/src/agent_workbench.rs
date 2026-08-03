@@ -2,9 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use vibex_core::{
-    AgentSession, AgentSessionState, FileOperationPayload, PermissionRequestStatus,
-    PlanStepPayload, PlanStepStatus, TimelineItem, TimelineItemKind, TimelinePayload,
-    VibexSessionId,
+    AgentSession, AgentSessionState, PermissionRequestStatus, PlanStepPayload, PlanStepStatus,
+    TimelineItem, TimelineItemKind, TimelinePayload, VibexSessionId,
 };
 
 use crate::SidebarState;
@@ -306,15 +305,14 @@ pub fn timeline_conversation_turns(
     let visible_items = items
         .iter()
         .filter(|item| item.kind != TimelineItemKind::SystemNotice)
-        .map(timeline_presentation_item)
         .collect::<Vec<_>>();
     let mut rows_by_turn = BTreeMap::<String, Vec<TimelineRow>>::new();
-    for row in timeline_rows(&visible_items) {
+    for row in timeline_rows_from_refs(&visible_items) {
         if let Some(turn_id) = row.turn_id.clone() {
             rows_by_turn.entry(turn_id).or_default().push(row);
         }
     }
-    let grouped_turns = crate::timeline_turns(&visible_items);
+    let grouped_turns = crate::timeline::timeline_turn_refs(visible_items.iter().copied());
     let last_turn_index = grouped_turns.len().checked_sub(1);
     let provider_turn_finished = matches!(
         session_state,
@@ -424,7 +422,7 @@ pub fn timeline_conversation_turns(
         && (turns.is_empty()
             || (pending_turn_active && last_turn.is_some_and(|turn| turn.complete && turn.failed)));
     if should_show_pending_turn {
-        let last_item = visible_items.last();
+        let last_item = visible_items.last().copied();
         turns.push(TimelineConversationTurn {
             id: format!(
                 "turn:pending:{}",
@@ -446,39 +444,6 @@ pub fn timeline_conversation_turns(
         });
     }
     turns
-}
-
-fn timeline_presentation_item(item: &TimelineItem) -> TimelineItem {
-    let payload = match &item.payload {
-        TimelinePayload::FileOperation(operation) => {
-            TimelinePayload::FileOperation(FileOperationPayload {
-                operation: operation.operation,
-                path: operation.path.clone(),
-                summary: operation.summary.clone(),
-                // Full before/after snapshots remain durable authority in the
-                // TimelineItem. The workbench row renders only path/summary, so
-                // carrying multi-megabyte file copies into every derived Turn
-                // would multiply memory and block the GPUI thread.
-                old_text: None,
-                new_text: None,
-                raw_extension: None,
-            })
-        }
-        payload => payload.clone(),
-    };
-    TimelineItem {
-        id: item.id.clone(),
-        session_id: item.session_id.clone(),
-        sequence: item.sequence,
-        timestamp_ms: item.timestamp_ms,
-        source: item.source,
-        kind: item.kind,
-        correlation_id: item.correlation_id.clone(),
-        provider_correlation_id: item.provider_correlation_id.clone(),
-        redaction_state: item.redaction_state,
-        execution_attribution: item.execution_attribution.clone(),
-        payload,
-    }
 }
 
 pub fn timeline_process_activity_groups(rows: &[TimelineRow]) -> Vec<TimelineProcessActivityGroup> {
@@ -546,10 +511,11 @@ fn consistent_row_runtime_attribution(rows: &[TimelineRow]) -> Option<String> {
 
 fn compact_conversation_process_rows(
     rows: Vec<TimelineRow>,
-    items: &[TimelineItem],
+    items: &[&TimelineItem],
 ) -> Vec<TimelineRow> {
     let items_by_id = items
         .iter()
+        .copied()
         .map(|item| (item.id.to_string(), item))
         .collect::<BTreeMap<_, _>>();
     let mut compacted = Vec::<TimelineRow>::new();
@@ -571,7 +537,9 @@ fn compact_conversation_process_rows(
         };
         let existing = &mut compacted[existing_index];
         let mut item_ids = std::mem::take(&mut existing.item_ids);
-        item_ids.append(&mut row.item_ids);
+        for item_id in std::mem::take(&mut row.item_ids) {
+            record_row_item_id(&mut item_ids, item_id);
+        }
         row.id = existing.id.clone();
         row.item_ids = item_ids;
         row.first_sequence = existing.first_sequence;
@@ -606,12 +574,13 @@ fn process_compaction_key(item: &TimelineItem) -> Option<String> {
     }
 }
 
-fn find_conversation_turn_conclusion(
-    items: &[TimelineItem],
+fn find_conversation_turn_conclusion<'a>(
+    items: &[&'a TimelineItem],
     provider_turn_finished: bool,
-) -> Option<&TimelineItem> {
+) -> Option<&'a TimelineItem> {
     let latest_error = items
         .iter()
+        .copied()
         .enumerate()
         .rev()
         .find(|(_, item)| is_turn_boundary_error(item));
@@ -630,12 +599,13 @@ fn find_conversation_turn_conclusion(
     }
 }
 
-fn select_agent_message(
-    items: &[TimelineItem],
+fn select_agent_message<'a>(
+    items: &[&'a TimelineItem],
     final_only: bool,
-) -> Option<(usize, &TimelineItem)> {
+) -> Option<(usize, &'a TimelineItem)> {
     let candidates = items
         .iter()
+        .copied()
         .enumerate()
         .filter_map(|(index, item)| {
             let text = agent_message_text(item)?;
@@ -717,9 +687,29 @@ fn is_reconnect_progress_paragraph(paragraph: &str) -> bool {
     attempt > 0 && attempt <= total
 }
 
+/// A merged row only needs stable endpoints. The inclusive sequence range
+/// represents intermediate chunks without retaining one heap String per token.
+fn record_row_item_id(item_ids: &mut Vec<String>, item_id: String) {
+    match item_ids.len() {
+        0 => item_ids.push(item_id),
+        1 if item_ids[0] != item_id => item_ids.push(item_id),
+        1 => {}
+        _ if item_ids.last() != Some(&item_id) => {
+            item_ids.truncate(2);
+            item_ids[1] = item_id;
+        }
+        _ => {}
+    }
+}
+
 pub fn timeline_rows(items: &[TimelineItem]) -> Vec<TimelineRow> {
+    let item_refs = items.iter().collect::<Vec<_>>();
+    timeline_rows_from_refs(&item_refs)
+}
+
+fn timeline_rows_from_refs(items: &[&TimelineItem]) -> Vec<TimelineRow> {
     let mut rows = Vec::<TimelineRow>::new();
-    for item in items {
+    for item in items.iter().copied() {
         let correlation = item
             .correlation_id
             .as_ref()
@@ -740,7 +730,7 @@ pub fn timeline_rows(items: &[TimelineItem]) -> Vec<TimelineRow> {
                     if delta.text_delta.contains(RECONNECT_PROGRESS_PREFIX) {
                         previous.body = compact_reconnect_progress_text(&previous.body);
                     }
-                    previous.item_ids.push(item.id.to_string());
+                    record_row_item_id(&mut previous.item_ids, item.id.to_string());
                     previous.last_sequence = item.sequence;
                     merge_runtime_attribution(previous, item);
                 } else {
@@ -778,7 +768,7 @@ pub fn timeline_rows(items: &[TimelineItem]) -> Vec<TimelineRow> {
                         && runtime_attribution_is_compatible(row, item)
                 }) {
                     previous.body = message_text;
-                    previous.item_ids.push(item.id.to_string());
+                    record_row_item_id(&mut previous.item_ids, item.id.to_string());
                     previous.last_sequence = item.sequence;
                     previous.streaming = !message.is_final;
                     merge_runtime_attribution(previous, item);
@@ -812,7 +802,7 @@ pub fn timeline_rows(items: &[TimelineItem]) -> Vec<TimelineRow> {
                     })
                 {
                     previous.body.push_str(&reasoning.text);
-                    previous.item_ids.push(item.id.to_string());
+                    record_row_item_id(&mut previous.item_ids, item.id.to_string());
                     previous.last_sequence = item.sequence;
                     merge_runtime_attribution(previous, item);
                 } else {
@@ -997,7 +987,14 @@ pub fn timeline_agent_message_count_after_sequence(
     items: &[TimelineItem],
     previous_end_sequence: Option<i64>,
 ) -> usize {
-    timeline_rows(items)
+    let start = previous_end_sequence
+        .map(|sequence| {
+            items
+                .partition_point(|item| item.sequence <= sequence)
+                .saturating_sub(1)
+        })
+        .unwrap_or(0);
+    timeline_rows(&items[start..])
         .into_iter()
         .filter(|row| {
             row.kind == TimelineRowKind::AgentMessage
@@ -1015,11 +1012,14 @@ struct TurnRowMetadata {
     conclusion_item_id: Option<String>,
 }
 
-fn decorate_turn_metadata(rows: &mut [TimelineRow], items: &[TimelineItem]) {
+fn decorate_turn_metadata(rows: &mut [TimelineRow], items: &[&TimelineItem]) {
     let mut item_to_turn = BTreeMap::<String, String>::new();
     let mut turn_metadata = BTreeMap::<String, TurnRowMetadata>::new();
 
-    for (index, turn) in crate::timeline_turns(items).into_iter().enumerate() {
+    for (index, turn) in crate::timeline::timeline_turn_refs(items.iter().copied())
+        .into_iter()
+        .enumerate()
+    {
         let turn_id = turn
             .user_item
             .as_ref()
@@ -1200,10 +1200,10 @@ mod tests {
     use super::*;
     use serde_json::json;
     use vibex_core::{
-        AgentId, AgentMessageDeltaPayload, AgentMessagePayload, AgentSessionSafety, PlanPayload,
-        ProjectId, ReasoningPayload, TimelineItemId, TimelineRedactionState, TimelineSource,
-        TodoUpdatePayload, ToolCallPayload, ToolCallStatus, TurnExecutionAttributionView,
-        UserMessagePayload, WorkspaceId, WorkspaceMode,
+        AgentId, AgentMessageDeltaPayload, AgentMessagePayload, AgentSessionSafety,
+        FileOperationPayload, PlanPayload, ProjectId, ReasoningPayload, TimelineItemId,
+        TimelineRedactionState, TimelineSource, TodoUpdatePayload, ToolCallPayload, ToolCallStatus,
+        TurnExecutionAttributionView, UserMessagePayload, WorkspaceId, WorkspaceMode,
     };
 
     fn session(id: &str, project: &str, title: &str, updated_at_ms: i64) -> AgentSession {
@@ -1241,7 +1241,7 @@ mod tests {
     }
 
     #[test]
-    fn timeline_presentation_does_not_copy_lossless_file_snapshots() {
+    fn timeline_presentation_borrows_lossless_file_snapshots() {
         let original = item(
             1,
             None,
@@ -1262,12 +1262,13 @@ mod tests {
             }),
         );
 
-        let projected = timeline_presentation_item(&original);
+        let projected = timeline_conversation_turns(
+            std::slice::from_ref(&original),
+            Some(AgentSessionState::Idle),
+            false,
+        );
         let TimelinePayload::FileOperation(original_file) = &original.payload else {
             panic!("expected original file operation");
-        };
-        let TimelinePayload::FileOperation(projected_file) = projected.payload else {
-            panic!("expected projected file operation");
         };
         assert_eq!(
             original_file.old_text.as_ref().map(String::len),
@@ -1277,11 +1278,12 @@ mod tests {
             original_file.new_text.as_ref().map(String::len),
             Some(1_000_000)
         );
-        assert_eq!(projected_file.path, original_file.path);
-        assert_eq!(projected_file.summary, original_file.summary);
-        assert!(projected_file.old_text.is_none());
-        assert!(projected_file.new_text.is_none());
-        assert!(projected_file.raw_extension.is_none());
+        let projected_file = &projected[0].process_rows[0];
+        assert_eq!(
+            projected_file.file_path.as_deref(),
+            Some(original_file.path.as_str())
+        );
+        assert_eq!(projected_file.body, original_file.summary);
     }
 
     #[test]
@@ -1331,7 +1333,7 @@ mod tests {
         assert_eq!(rows[0].id, "agent:correlation_turn_a");
         assert_eq!(rows[0].body, "hello");
         assert!(!rows[0].streaming);
-        assert_eq!(rows[0].item_ids.len(), 3);
+        assert_eq!(rows[0].item_ids.len(), 2);
         assert!(rows[0].conclusion);
         assert_eq!(rows[0].turn_item_count, 3);
     }
@@ -1427,7 +1429,8 @@ mod tests {
         let rows = timeline_rows(&items);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].body, "Reconnecting... 5/5\n\n");
-        assert_eq!(rows[0].item_ids.len(), 5);
+        assert_eq!(rows[0].item_ids.len(), 2);
+        assert_eq!(rows[0].turn_item_count, 5);
 
         items.push(item(
             6,
@@ -1452,7 +1455,8 @@ mod tests {
             rows[0].body,
             "Reconnecting... 5/5\n\nunexpected status 404 Not Found\n\n"
         );
-        assert_eq!(rows[0].item_ids.len(), 6);
+        assert_eq!(rows[0].item_ids.len(), 2);
+        assert_eq!(rows[0].turn_item_count, 6);
         assert!(!rows[0].streaming);
     }
 
@@ -1496,7 +1500,8 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "agent-delta:timeline_1");
         assert_eq!(rows[0].body, "I am Codex");
-        assert_eq!(rows[0].item_ids.len(), 4);
+        assert_eq!(rows[0].item_ids.len(), 2);
+        assert_eq!(rows[0].turn_item_count, 4);
         assert_eq!(rows[0].first_sequence, 1);
         assert_eq!(rows[0].last_sequence, 4);
         assert!(!rows[0].streaming);
@@ -1629,7 +1634,8 @@ mod tests {
         assert!(turns[0].process_rows.is_empty());
         let conclusion = turns[0].conclusion_row.as_ref().unwrap();
         assert_eq!(conclusion.body, "I am Codex");
-        assert_eq!(conclusion.item_ids.len(), 3);
+        assert_eq!(conclusion.item_ids.len(), 2);
+        assert_eq!(conclusion.turn_item_count, 4);
         assert!(turns[0].complete);
     }
 
@@ -2198,7 +2204,11 @@ mod tests {
         let rows = timeline_rows(&streaming);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].body.len(), 1_800);
-        assert_eq!(rows[0].item_ids.len(), 1_800);
+        assert_eq!(rows[0].item_ids.len(), 2);
+        assert_eq!(rows[0].item_ids[0], streaming[0].id.as_str());
+        assert_eq!(rows[0].item_ids[1], streaming[1_799].id.as_str());
+        assert_eq!(rows[0].first_sequence, 1);
+        assert_eq!(rows[0].last_sequence, 1_800);
     }
 
     #[test]

@@ -10,8 +10,8 @@ use gpui::{
     Image, ImageFormat, InteractiveElement as _, IntoElement, KeyDownEvent, ListAlignment,
     ListHorizontalSizingBehavior, ListOffset, ListState, MouseButton, ParentElement as _, Render,
     Role, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, canvas, div, img,
-    list, point, prelude::*, px, relative, uniform_list,
+    StyleRefinement, Styled as _, Subscription, Task, UniformListScrollHandle, WeakEntity, Window,
+    canvas, div, img, list, point, prelude::*, px, relative, uniform_list,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
@@ -32,9 +32,10 @@ use vibex_content::{
 };
 use vibex_core::{
     FileEncoding, FileEntryKind, FileLineEnding, FileMutationRequest, FilePreviewKind,
-    FileReadRequest, FileReadResponse, FileTreeEntry, FileTreeRequest, FileWriteRequest, GitChange,
-    GitChangeKind, GitCommitDetailRequest, GitCommitRequest, GitDiffRequest, GitDiffResponse,
-    GitHistoryRequest, GitManagedWorktreeStatus, GitRemoteActionKind, GitRemoteActionRequest,
+    FileReadRequest, FileReadResponse, FileTreeEntry, FileTreeRequest, FileWriteRequest,
+    GitBranchSummary, GitChange, GitChangeKind, GitCommitDetailRequest, GitCommitRequest,
+    GitCommitSummary, GitDiffRequest, GitDiffResponse, GitHistoryAuthor, GitHistoryRequest,
+    GitManagedWorktreeStatus, GitRemoteActionKind, GitRemoteActionRequest, GitRemoteSummary,
     GitStageRequest, GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeConflictFile,
     GitWorktreeConflictKind, GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest,
     GitWorktreeConflictVersion, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
@@ -95,6 +96,8 @@ const IMAGE_SOURCE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const MARKDOWN_LOCAL_IMAGE_LIMIT: usize = 32;
 const MARKDOWN_LOCAL_IMAGE_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 const GIT_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const HIDDEN_WORKSPACE_POLL_INTERVAL: Duration = Duration::from_secs(30);
+const EDITOR_RECOVERY_PERSIST_DELAY: Duration = Duration::from_millis(200);
 const WORKTREE_CONFLICT_RENDER_LIMIT: usize = 256;
 pub const CODE_WORKBENCH_MAX_EAGER_ROWS: usize = 5_000;
 pub const CODE_WORKBENCH_INITIAL_DIFF_ROWS: usize = 500;
@@ -157,11 +160,16 @@ pub enum CodeWorkbenchFixtureKind {
 
 pub(crate) struct CodeWorkbenchPersistedState {
     pub preview: PreviewState,
-    pub recovery: EditorRecoverySnapshot,
+    pub recovery: Option<EditorRecoverySnapshot>,
     pub workspace_id: Option<String>,
     pub selected_file_path: Option<String>,
     pub selected_git_path: Option<String>,
     pub selected_terminal_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodeWorkbenchEvent {
+    LayoutChanged { fullscreen: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -360,6 +368,270 @@ enum WorktreeLifecycleConfirmation {
     Abort(GitWorktreeOperationRequest),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodeRightRailRevision {
+    file_tree: u64,
+    git: u64,
+    workspace_generation: u64,
+    workspace_available: bool,
+    tree_loading: bool,
+    file_mutation_pending: bool,
+    status_loading: bool,
+    history_loading: bool,
+    lifecycle_snapshot: Option<String>,
+    lifecycle_confirmation: u64,
+    lifecycle_loading: bool,
+    lifecycle_action_pending: bool,
+    lifecycle_mutations_available: bool,
+    mode: RightRailMode,
+    commit_type: String,
+    amend_commit: bool,
+    selected_git_path: Option<String>,
+    error: Option<String>,
+    note: Option<String>,
+}
+
+#[derive(Clone)]
+struct CodeRightRailFileProjection {
+    workspace_available: bool,
+    workspace_root: Option<PathBuf>,
+    rows: Arc<Vec<FileExplorerRow>>,
+    expanded_paths: Arc<BTreeSet<String>>,
+    selected_directory_path: Option<String>,
+    root_name: String,
+    loading: bool,
+    mutation_pending: bool,
+    scroll: UniformListScrollHandle,
+}
+
+impl CodeRightRailFileProjection {
+    fn row_position(&self, path: &str) -> Option<usize> {
+        self.rows
+            .iter()
+            .position(|row| row.path_chain.iter().any(|candidate| candidate == path))
+    }
+
+    fn is_expanded(&self, path: &str) -> bool {
+        path.is_empty() || self.expanded_paths.contains(path)
+    }
+}
+
+#[derive(Clone)]
+struct CodeRightRailGitTreeRow {
+    row: GitTreeRow,
+    change: Option<GitChange>,
+}
+
+#[derive(Clone)]
+struct CodeRightRailGitProjection {
+    mode: GitWorkbenchMode,
+    pending: bool,
+    selected_count: usize,
+    root_selection: GitPathSelectionState,
+    selection_states: Arc<BTreeMap<String, GitPathSelectionState>>,
+    has_directories: bool,
+    all_directories_expanded: bool,
+    change_count: usize,
+    additions: u32,
+    deletions: u32,
+    change_rows: Arc<Vec<CodeRightRailGitTreeRow>>,
+    history: Arc<Vec<GitCommitSummary>>,
+    branches: Arc<Vec<GitBranchSummary>>,
+    remotes: Arc<Vec<GitRemoteSummary>>,
+    authors: Arc<Vec<GitHistoryAuthor>>,
+    selected_branch: Option<String>,
+    selected_author: Option<String>,
+    selected_hash: Option<String>,
+    selected_commit: Option<GitCommitSummary>,
+    commit_detail_loaded: bool,
+    commit_file_count: usize,
+    commit_additions: u32,
+    commit_deletions: u32,
+    commit_rows: Arc<Vec<CodeRightRailGitTreeRow>>,
+    status_loading: bool,
+    history_loading: bool,
+    scroll: UniformListScrollHandle,
+}
+
+impl CodeRightRailGitProjection {
+    fn selection_state(&self, path: &str) -> GitPathSelectionState {
+        self.selection_states
+            .get(path)
+            .copied()
+            .unwrap_or(GitPathSelectionState::Unchecked)
+    }
+}
+
+#[derive(Clone)]
+struct CodeRightRailProjection {
+    revision: CodeRightRailRevision,
+    mode: RightRailMode,
+    error: Option<String>,
+    note: Option<String>,
+    files: CodeRightRailFileProjection,
+    git: CodeRightRailGitProjection,
+    workspace_name: String,
+    commit_message: Entity<InputState>,
+    commit_type: String,
+    amend_commit: bool,
+    selected_git_path: Option<String>,
+    lifecycle_view: Option<WorktreeLifecycleView>,
+    lifecycle_confirmation: Option<WorktreeLifecycleConfirmation>,
+    lifecycle_loading: bool,
+    lifecycle_action_pending: bool,
+    lifecycle_mutations_available: bool,
+}
+
+fn right_rail_git_projection(
+    git: &GitWorkbenchState,
+    status_loading: bool,
+    history_loading: bool,
+    scroll: UniformListScrollHandle,
+) -> CodeRightRailGitProjection {
+    let change_rows = (0..git.change_tree_row_count())
+        .filter_map(|index| {
+            git.change_tree_row(index)
+                .map(|(row, change)| CodeRightRailGitTreeRow {
+                    row: row.clone(),
+                    change: change.cloned(),
+                })
+        })
+        .collect::<Vec<_>>();
+    let selection_states = right_rail_git_selection_states(git, &change_rows);
+    let root_selection = selection_states
+        .get("")
+        .copied()
+        .unwrap_or(GitPathSelectionState::Unchecked);
+    let (change_count, additions, deletions) = git
+        .status
+        .as_ref()
+        .map(|status| {
+            let (additions, deletions) =
+                status
+                    .changes
+                    .iter()
+                    .fold((0_u32, 0_u32), |summary, change| {
+                        (
+                            summary.0.saturating_add(change.additions),
+                            summary.1.saturating_add(change.deletions),
+                        )
+                    });
+            (status.changes.len(), additions, deletions)
+        })
+        .unwrap_or_default();
+    let (branches, remotes) = git
+        .branches
+        .as_ref()
+        .map(|response| (response.branches.clone(), response.remotes.clone()))
+        .unwrap_or_default();
+    let selected_hash = git.selected_commit_hash.clone();
+    let selected_commit = selected_hash.as_ref().and_then(|hash| {
+        git.history
+            .iter()
+            .find(|commit| &commit.hash == hash)
+            .cloned()
+    });
+    let selected_detail = selected_hash.as_ref().and_then(|hash| {
+        git.commit_detail
+            .as_ref()
+            .filter(|detail| &detail.summary.hash == hash)
+    });
+    let (commit_file_count, commit_additions, commit_deletions) = selected_detail
+        .map(|detail| {
+            let (additions, deletions) =
+                detail.files.iter().fold((0_u32, 0_u32), |summary, file| {
+                    (
+                        summary.0.saturating_add(file.additions),
+                        summary.1.saturating_add(file.deletions),
+                    )
+                });
+            (detail.files.len(), additions, deletions)
+        })
+        .unwrap_or_default();
+    let commit_rows = (0..git.commit_tree_row_count())
+        .filter_map(|index| {
+            git.commit_tree_row(index)
+                .map(|(row, change)| CodeRightRailGitTreeRow {
+                    row: row.clone(),
+                    change: change.cloned(),
+                })
+        })
+        .collect::<Vec<_>>();
+
+    CodeRightRailGitProjection {
+        mode: git.mode,
+        pending: git.pending_mutation.is_some(),
+        selected_count: git.selected_path_count(),
+        root_selection,
+        selection_states: Arc::new(selection_states),
+        has_directories: git.has_change_directories(),
+        all_directories_expanded: git.all_change_directories_expanded(),
+        change_count,
+        additions,
+        deletions,
+        change_rows: Arc::new(change_rows),
+        history: Arc::new(git.history.clone()),
+        branches: Arc::new(branches),
+        remotes: Arc::new(remotes),
+        authors: Arc::new(git.history_authors.clone()),
+        selected_branch: git.history_filter.ref_name.clone(),
+        selected_author: git.history_filter.author.clone(),
+        selected_hash,
+        selected_commit,
+        commit_detail_loaded: selected_detail.is_some(),
+        commit_file_count,
+        commit_additions,
+        commit_deletions,
+        commit_rows: Arc::new(commit_rows),
+        status_loading,
+        history_loading,
+        scroll,
+    }
+}
+
+fn right_rail_git_selection_states(
+    git: &GitWorkbenchState,
+    rows: &[CodeRightRailGitTreeRow],
+) -> BTreeMap<String, GitPathSelectionState> {
+    let selected = git
+        .selected_change_paths()
+        .into_iter()
+        .filter_map(|path| normalized_relative_path(&path))
+        .collect::<BTreeSet<_>>();
+    let available = rows
+        .iter()
+        .filter(|row| row.change.is_some())
+        .filter_map(|row| normalized_relative_path(&row.row.path))
+        .collect::<BTreeSet<_>>();
+    let mut counts = BTreeMap::<String, (usize, usize)>::new();
+    for path in available {
+        let is_selected = selected.contains(&path);
+        let mut current = path.as_str();
+        loop {
+            let count = counts.entry(current.to_string()).or_default();
+            count.0 = count.0.saturating_add(1);
+            count.1 = count.1.saturating_add(usize::from(is_selected));
+            if current.is_empty() {
+                break;
+            }
+            current = relative_parent_path(current);
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(path, (available, selected))| {
+            let state = if selected == 0 {
+                GitPathSelectionState::Unchecked
+            } else if selected == available {
+                GitPathSelectionState::Checked
+            } else {
+                GitPathSelectionState::Indeterminate
+            };
+            (path, state)
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorktreeLifecyclePrimaryAction {
     ReviewChanges,
@@ -407,6 +679,9 @@ pub struct CodeWorkbench {
     pub(crate) git: GitWorkbenchState,
     pub(crate) preview: PreviewState,
     preview_panel_fullscreen: bool,
+    preview_visible: bool,
+    files_surface_visible: bool,
+    git_surface_visible: bool,
     pub(crate) editors: EditorBufferRegistry,
     editor_bindings: BTreeMap<String, EditorBinding>,
     web_address_inputs: BTreeMap<String, Entity<InputState>>,
@@ -419,6 +694,7 @@ pub struct CodeWorkbench {
     activation_generation: u64,
     terminals: Vec<TerminalSession>,
     terminal_surfaces: BTreeMap<String, Entity<TerminalSurface>>,
+    active_terminal_surface_ids: BTreeSet<String>,
     selected_file_path: Option<String>,
     selected_git_path: Option<String>,
     selected_terminal_id: Option<String>,
@@ -448,6 +724,7 @@ pub struct CodeWorkbench {
     mutation_task: Option<Task<()>>,
     lifecycle_snapshot: Option<GitWorktreeLifecycleSnapshot>,
     lifecycle_confirmation: Option<WorktreeLifecycleConfirmation>,
+    lifecycle_confirmation_revision: u64,
     lifecycle_loading: bool,
     lifecycle_reload_requested: bool,
     lifecycle_action_pending: bool,
@@ -463,9 +740,13 @@ pub struct CodeWorkbench {
     preview_tab_drop_target: Option<PreviewTabDropTarget>,
     preview_pane_drop_target: Option<PreviewPaneDropTarget>,
     restore_hydration_scheduled: bool,
+    recovery_persist_generation: u64,
+    recovery_persist_task: Option<Task<()>>,
     code_font_family: String,
     code_font_size: u16,
 }
+
+impl gpui::EventEmitter<CodeWorkbenchEvent> for CodeWorkbench {}
 
 impl CodeWorkbench {
     #[allow(clippy::too_many_arguments)]
@@ -534,6 +815,9 @@ impl CodeWorkbench {
             git: GitWorkbenchState::default(),
             preview,
             preview_panel_fullscreen: false,
+            preview_visible: false,
+            files_surface_visible: false,
+            git_surface_visible: false,
             editors,
             editor_bindings: BTreeMap::new(),
             web_address_inputs: BTreeMap::new(),
@@ -546,6 +830,7 @@ impl CodeWorkbench {
             activation_generation: 0,
             terminals: Vec::new(),
             terminal_surfaces: BTreeMap::new(),
+            active_terminal_surface_ids: BTreeSet::new(),
             selected_file_path,
             selected_git_path,
             selected_terminal_id,
@@ -575,6 +860,7 @@ impl CodeWorkbench {
             mutation_task: None,
             lifecycle_snapshot: None,
             lifecycle_confirmation: None,
+            lifecycle_confirmation_revision: 0,
             lifecycle_loading: false,
             lifecycle_reload_requested: false,
             lifecycle_action_pending: false,
@@ -590,6 +876,8 @@ impl CodeWorkbench {
             preview_tab_drop_target: None,
             preview_pane_drop_target: None,
             restore_hydration_scheduled: false,
+            recovery_persist_generation: 0,
+            recovery_persist_task: None,
             code_font_family,
             code_font_size,
         }
@@ -803,14 +1091,208 @@ impl CodeWorkbench {
         self.preview_panel_fullscreen
     }
 
+    fn right_rail_revision(&self) -> CodeRightRailRevision {
+        CodeRightRailRevision {
+            file_tree: self.file_tree.presentation_revision(),
+            git: self.git.presentation_revision(),
+            workspace_generation: self.workspace_generation,
+            workspace_available: self.workspace.is_some(),
+            tree_loading: self.tree_loading,
+            file_mutation_pending: self.file_mutation_pending,
+            status_loading: self.status_loading,
+            history_loading: self.history_loading,
+            lifecycle_snapshot: self
+                .lifecycle_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.revision.clone()),
+            lifecycle_confirmation: self.lifecycle_confirmation_revision,
+            lifecycle_loading: self.lifecycle_loading,
+            lifecycle_action_pending: self.lifecycle_action_pending,
+            lifecycle_mutations_available: self.backend.as_ref().is_some_and(|backend| {
+                backend
+                    .capabilities()
+                    .git
+                    .supports(BackendOperation::GitWorktreeLifecycleMutate)
+            }),
+            mode: self.right_rail_mode,
+            commit_type: self.commit_type.clone(),
+            amend_commit: self.amend_commit,
+            selected_git_path: self.selected_git_path.clone(),
+            error: self.error.clone(),
+            note: self.note.clone(),
+        }
+    }
+
+    fn right_rail_projection(&self) -> CodeRightRailProjection {
+        let revision = self.right_rail_revision();
+        let workspace_name = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.root.file_name())
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("Changes")
+            .to_string();
+        CodeRightRailProjection {
+            revision,
+            mode: self.right_rail_mode,
+            error: self.error.clone(),
+            note: self.note.clone(),
+            files: CodeRightRailFileProjection {
+                workspace_available: self.workspace.is_some(),
+                workspace_root: self
+                    .workspace
+                    .as_ref()
+                    .map(|workspace| workspace.root.clone()),
+                rows: self.file_tree.visible_rows_snapshot(),
+                expanded_paths: self.file_tree.expanded_paths_snapshot(),
+                selected_directory_path: self
+                    .file_tree
+                    .selected_directory_path()
+                    .map(str::to_string),
+                root_name: self.file_tree.root_name().to_string(),
+                loading: self.tree_loading,
+                mutation_pending: self.file_mutation_pending,
+                scroll: self.file_scroll.clone(),
+            },
+            git: right_rail_git_projection(
+                &self.git,
+                self.status_loading,
+                self.history_loading,
+                self.git_scroll.clone(),
+            ),
+            workspace_name,
+            commit_message: self.commit_message.clone(),
+            commit_type: self.commit_type.clone(),
+            amend_commit: self.amend_commit,
+            selected_git_path: self.selected_git_path.clone(),
+            lifecycle_view: self.worktree_lifecycle_view(),
+            lifecycle_confirmation: self.lifecycle_confirmation.clone(),
+            lifecycle_loading: self.lifecycle_loading,
+            lifecycle_action_pending: self.lifecycle_action_pending,
+            lifecycle_mutations_available: self.backend.as_ref().is_some_and(|backend| {
+                backend
+                    .capabilities()
+                    .git
+                    .supports(BackendOperation::GitWorktreeLifecycleMutate)
+            }),
+        }
+    }
+
+    fn set_lifecycle_confirmation(&mut self, confirmation: Option<WorktreeLifecycleConfirmation>) {
+        self.lifecycle_confirmation = confirmation;
+        self.lifecycle_confirmation_revision = self
+            .lifecycle_confirmation_revision
+            .saturating_add(1)
+            .max(1);
+    }
+
+    fn take_lifecycle_confirmation(&mut self) -> Option<WorktreeLifecycleConfirmation> {
+        let confirmation = self.lifecycle_confirmation.take();
+        if confirmation.is_some() {
+            self.lifecycle_confirmation_revision = self
+                .lifecycle_confirmation_revision
+                .saturating_add(1)
+                .max(1);
+        }
+        confirmation
+    }
+
+    fn set_preview_panel_fullscreen(&mut self, fullscreen: bool, cx: &mut Context<Self>) {
+        if self.preview_panel_fullscreen == fullscreen {
+            return;
+        }
+        self.preview_panel_fullscreen = fullscreen;
+        cx.emit(CodeWorkbenchEvent::LayoutChanged { fullscreen });
+    }
+
+    pub(crate) fn set_preview_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.preview_visible == visible {
+            return;
+        }
+        self.preview_visible = visible;
+        self.sync_terminal_surface_activity(cx);
+    }
+
+    pub(crate) fn set_workspace_surface_visibility(
+        &mut self,
+        files_visible: bool,
+        git_visible: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let files_became_visible = files_visible && !self.files_surface_visible;
+        let git_became_visible = git_visible && !self.git_surface_visible;
+        self.files_surface_visible = files_visible;
+        self.git_surface_visible = git_visible;
+        if files_became_visible {
+            self.refresh_file_tree(cx);
+        }
+        if git_became_visible {
+            self.refresh_git(cx);
+        }
+    }
+
+    fn sync_terminal_surface_activity(&mut self, cx: &mut Context<Self>) {
+        let desired = if self.preview_visible {
+            self.preview
+                .pane_ids()
+                .into_iter()
+                .filter_map(|pane_id| self.preview.active_tab_id(pane_id))
+                .filter_map(|tab_id| self.preview.tabs.get(tab_id))
+                .filter_map(|tab| match &tab.target {
+                    PreviewTarget::Terminal { terminal_id }
+                        if self.terminal_surfaces.contains_key(terminal_id) =>
+                    {
+                        Some(terminal_id.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        };
+        if desired == self.active_terminal_surface_ids {
+            return;
+        }
+
+        let deactivated = self
+            .active_terminal_surface_ids
+            .difference(&desired)
+            .filter_map(|terminal_id| self.terminal_surfaces.get(terminal_id).cloned())
+            .collect::<Vec<_>>();
+        let activated = desired
+            .difference(&self.active_terminal_surface_ids)
+            .filter_map(|terminal_id| self.terminal_surfaces.get(terminal_id).cloned())
+            .collect::<Vec<_>>();
+        self.active_terminal_surface_ids = desired;
+
+        for surface in deactivated {
+            surface.update(cx, |surface, cx| surface.set_active(false, cx));
+        }
+        for surface in activated {
+            surface.update(cx, |surface, cx| surface.set_active(true, cx));
+        }
+    }
+
     pub(crate) fn persisted_state(&self) -> CodeWorkbenchPersistedState {
+        self.persisted_state_with_recovery(None)
+    }
+
+    pub(crate) fn persisted_state_for_exit(&self) -> CodeWorkbenchPersistedState {
+        self.persisted_state_with_recovery(Some(self.editors.recovery_snapshot()))
+    }
+
+    fn persisted_state_with_recovery(
+        &self,
+        recovery: Option<EditorRecoverySnapshot>,
+    ) -> CodeWorkbenchPersistedState {
         let mut preview = self.preview.clone();
         // Fullscreen is a session-local view state in the Tauri workbench.
         preview.fullscreen_tab_id = None;
         preview.normalize();
         CodeWorkbenchPersistedState {
             preview,
-            recovery: self.editors.recovery_snapshot(),
+            recovery,
             workspace_id: self
                 .workspace
                 .as_ref()
@@ -871,7 +1353,7 @@ impl CodeWorkbench {
         let mut editors = EditorBufferRegistry::default();
         editors.restore_recovery(recovery);
         self.preview = preview;
-        self.preview_panel_fullscreen = false;
+        self.set_preview_panel_fullscreen(false, cx);
         self.preview_tab_scrolls.clear();
         self.markdown_scrolls.clear();
         self.preview_revealed_tab_ids.clear();
@@ -883,10 +1365,13 @@ impl CodeWorkbench {
         self.editor_bindings.clear();
         self.web_address_inputs.clear();
         self.editor_subscriptions.clear();
+        self.recovery_persist_generation = self.recovery_persist_generation.wrapping_add(1);
+        self.recovery_persist_task = None;
         self.restored_workspace_id = workspace_id;
         self.restore_hydration_scheduled = false;
         self.code_font_family = code_font_family;
         self.code_font_size = code_font_size.clamp(10, 24);
+        self.sync_terminal_surface_activity(cx);
         cx.notify();
     }
 
@@ -935,7 +1420,7 @@ impl CodeWorkbench {
         self.lifecycle_loading = false;
         self.lifecycle_reload_requested = false;
         self.lifecycle_action_pending = false;
-        self.lifecycle_confirmation = None;
+        self.set_lifecycle_confirmation(None);
         cx.notify();
     }
 
@@ -959,7 +1444,7 @@ impl CodeWorkbench {
             && self.restored_workspace_id.as_deref() == Some(workspace_id.as_str());
         if !preserve_restored {
             self.preview = PreviewState::default();
-            self.preview_panel_fullscreen = false;
+            self.set_preview_panel_fullscreen(false, cx);
             self.editors = EditorBufferRegistry::default();
             self.editor_bindings.clear();
             self.web_address_inputs.clear();
@@ -990,6 +1475,7 @@ impl CodeWorkbench {
             .collect();
         self.reconcile_terminal_selection();
         self.terminal_surfaces.clear();
+        self.active_terminal_surface_ids.clear();
         self.runtime = Some(runtime);
         self.pending_workspace = None;
         self.presentations.clear();
@@ -1004,7 +1490,7 @@ impl CodeWorkbench {
         self.lifecycle_task = None;
         self.lifecycle_action_task = None;
         self.lifecycle_snapshot = None;
-        self.lifecycle_confirmation = None;
+        self.set_lifecycle_confirmation(None);
         self.lifecycle_loading = false;
         self.lifecycle_reload_requested = false;
         self.lifecycle_action_pending = false;
@@ -1027,6 +1513,7 @@ impl CodeWorkbench {
         self.refresh_git(cx);
         self.start_workspace_polling(cx);
         self.persist(cx);
+        self.persist_editor_recovery(cx);
         cx.notify();
     }
 
@@ -1088,7 +1575,7 @@ impl CodeWorkbench {
                 && self.ensure_terminal_surface(&terminal_id, window, cx)
             {
                 self.preview.focus(&tab_id);
-                self.activate_tab(&tab_id);
+                self.activate_tab(&tab_id, cx);
             }
         }
         self.persist(cx);
@@ -1097,6 +1584,27 @@ impl CodeWorkbench {
 
     fn persist(&mut self, cx: &mut Context<Self>) {
         let state = self.persisted_state();
+        self.send_persisted_state(state, cx);
+    }
+
+    fn persist_editor_recovery(&mut self, cx: &mut Context<Self>) {
+        self.recovery_persist_generation = self.recovery_persist_generation.wrapping_add(1);
+        let generation = self.recovery_persist_generation;
+        let background = cx.background_executor().clone();
+        self.recovery_persist_task = Some(cx.spawn(async move |entity, cx| {
+            background.timer(EDITOR_RECOVERY_PERSIST_DELAY).await;
+            let _ = entity.update(cx, |this, cx| {
+                if this.recovery_persist_generation != generation {
+                    return;
+                }
+                this.recovery_persist_task = None;
+                let state = this.persisted_state_for_exit();
+                this.send_persisted_state(state, cx);
+            });
+        }));
+    }
+
+    fn send_persisted_state(&self, state: CodeWorkbenchPersistedState, cx: &mut Context<Self>) {
         if let Some(parent) = self.parent.as_ref() {
             let parent = parent.clone();
             cx.defer(move |cx| {
@@ -1151,7 +1659,7 @@ impl CodeWorkbench {
         if !self.preview.tabs.is_empty() {
             return;
         }
-        self.preview_panel_fullscreen = false;
+        self.set_preview_panel_fullscreen(false, cx);
         self.preview.set_fullscreen(None);
         let Some(parent) = self.parent.clone() else {
             return;
@@ -1262,7 +1770,7 @@ impl CodeWorkbench {
                 }
                 if let Some(active_tab) = active_tab {
                     this.preview.focus(&active_tab);
-                    this.activate_tab(&active_tab);
+                    this.activate_tab(&active_tab, cx);
                 }
                 cx.notify();
             });
@@ -1281,13 +1789,24 @@ impl CodeWorkbench {
         let background = cx.background_executor().clone();
         self.workspace_poll_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             loop {
-                background.timer(file_tree_interval).await;
+                let interval = entity
+                    .read_with(cx, |this, _| {
+                        if this.files_surface_visible {
+                            file_tree_interval
+                        } else {
+                            HIDDEN_WORKSPACE_POLL_INTERVAL
+                        }
+                    })
+                    .unwrap_or(HIDDEN_WORKSPACE_POLL_INTERVAL);
+                background.timer(interval).await;
                 let active = entity
                     .update(cx, |this, cx| {
                         if this.workspace.is_none() {
                             return false;
                         }
-                        this.refresh_file_tree(cx);
+                        if this.files_surface_visible {
+                            this.refresh_file_tree(cx);
+                        }
                         true
                     })
                     .unwrap_or(false);
@@ -1300,13 +1819,25 @@ impl CodeWorkbench {
         let background = cx.background_executor().clone();
         self.git_status_poll_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             loop {
-                background.timer(GIT_STATUS_POLL_INTERVAL).await;
+                let interval = entity
+                    .read_with(cx, |this, _| {
+                        if this.git_surface_visible {
+                            GIT_STATUS_POLL_INTERVAL
+                        } else {
+                            HIDDEN_WORKSPACE_POLL_INTERVAL
+                        }
+                    })
+                    .unwrap_or(HIDDEN_WORKSPACE_POLL_INTERVAL);
+                background.timer(interval).await;
                 let active = entity
                     .update(cx, |this, cx| {
                         if this.workspace.is_none() {
                             return false;
                         }
-                        if !this.status_loading && !this.file_mutation_pending {
+                        if this.git_surface_visible
+                            && !this.status_loading
+                            && !this.file_mutation_pending
+                        {
                             this.load_git_status(cx);
                             this.load_worktree_lifecycle(cx);
                         }
@@ -1722,7 +2253,7 @@ impl CodeWorkbench {
             return;
         };
         self.lifecycle_action_pending = true;
-        self.lifecycle_confirmation = None;
+        self.set_lifecycle_confirmation(None);
         self.error = None;
         self.note = Some("Worktree lifecycle action is running".to_string());
         let runner = gpui_tokio::Tokio::spawn(cx, operation(backend));
@@ -1742,18 +2273,19 @@ impl CodeWorkbench {
                         this.request_parent_lifecycle_refresh(cx);
                     }
                     Ok(Err(error)) => {
-                        this.lifecycle_confirmation =
+                        this.set_lifecycle_confirmation(
                             if worktree_plan_error_requires_refresh(&error.code) {
                                 None
                             } else {
                                 retry_confirmation.clone()
-                            };
+                            },
+                        );
                         this.note = None;
                         this.error = Some(format!("{}: {}", error.code, error.message));
                         this.load_worktree_lifecycle(cx);
                     }
                     Err(error) => {
-                        this.lifecycle_confirmation = retry_confirmation.clone();
+                        this.set_lifecycle_confirmation(retry_confirmation.clone());
                         this.note = None;
                         this.error = Some(format!("Worktree lifecycle task failed: {error}"));
                         this.load_worktree_lifecycle(cx);
@@ -1791,7 +2323,7 @@ impl CodeWorkbench {
             return;
         };
         self.lifecycle_action_pending = true;
-        self.lifecycle_confirmation = None;
+        self.set_lifecycle_confirmation(None);
         self.error = None;
         let runner = gpui_tokio::Tokio::spawn(cx, operation(backend));
         self.lifecycle_action_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
@@ -1803,7 +2335,7 @@ impl CodeWorkbench {
                 this.lifecycle_action_pending = false;
                 match outcome {
                     Ok(Ok(value)) => {
-                        this.lifecycle_confirmation = Some(build(value));
+                        this.set_lifecycle_confirmation(Some(build(value)));
                     }
                     Ok(Err(error)) => {
                         this.error = Some(format!("{}: {}", error.code, error.message));
@@ -2039,12 +2571,12 @@ impl CodeWorkbench {
         let Some(operation) = view.operation else {
             return;
         };
-        self.lifecycle_confirmation = Some(WorktreeLifecycleConfirmation::Abort(
+        self.set_lifecycle_confirmation(Some(WorktreeLifecycleConfirmation::Abort(
             GitWorktreeOperationRequest {
                 operation_id: operation.operation_id,
                 workspace_id: view.workspace_id,
             },
-        ));
+        )));
         cx.notify();
     }
 
@@ -2055,28 +2587,28 @@ impl CodeWorkbench {
         let Some(operation) = view.operation else {
             return;
         };
-        self.lifecycle_confirmation = Some(WorktreeLifecycleConfirmation::Continue(
+        self.set_lifecycle_confirmation(Some(WorktreeLifecycleConfirmation::Continue(
             GitWorktreeOperationRequest {
                 operation_id: operation.operation_id,
                 workspace_id: view.workspace_id,
             },
-        ));
+        )));
         cx.notify();
     }
 
     pub(crate) fn cancel_worktree_lifecycle_confirmation(&mut self, cx: &mut Context<Self>) {
-        self.lifecycle_confirmation = None;
+        self.set_lifecycle_confirmation(None);
         cx.notify();
     }
 
     pub(crate) fn confirm_worktree_lifecycle_action(&mut self, cx: &mut Context<Self>) {
-        let Some(confirmation) = self.lifecycle_confirmation.take() else {
+        let Some(confirmation) = self.take_lifecycle_confirmation() else {
             return;
         };
         match confirmation.clone() {
             WorktreeLifecycleConfirmation::Merge { plan, strategy } => {
                 if !plan.preflight.allowed {
-                    self.lifecycle_confirmation = Some(confirmation);
+                    self.set_lifecycle_confirmation(Some(confirmation));
                     self.error = Some("worktree_preflight_blocked".to_string());
                     cx.notify();
                     return;
@@ -2103,7 +2635,7 @@ impl CodeWorkbench {
             }
             WorktreeLifecycleConfirmation::Archive { request, preflight } => {
                 if !preflight.allowed {
-                    self.lifecycle_confirmation = Some(confirmation);
+                    self.set_lifecycle_confirmation(Some(confirmation));
                     self.error = Some("worktree_preflight_blocked".to_string());
                     cx.notify();
                     return;
@@ -2121,7 +2653,7 @@ impl CodeWorkbench {
             }
             WorktreeLifecycleConfirmation::Restore { request, preflight } => {
                 if !preflight.allowed {
-                    self.lifecycle_confirmation = Some(confirmation);
+                    self.set_lifecycle_confirmation(Some(confirmation));
                     self.error = Some("worktree_preflight_blocked".to_string());
                     cx.notify();
                     return;
@@ -2139,7 +2671,7 @@ impl CodeWorkbench {
             }
             WorktreeLifecycleConfirmation::Discard { request, preflight } => {
                 if !preflight.allowed {
-                    self.lifecycle_confirmation = Some(confirmation);
+                    self.set_lifecycle_confirmation(Some(confirmation));
                     self.error = Some("worktree_preflight_blocked".to_string());
                     cx.notify();
                     return;
@@ -2437,7 +2969,7 @@ impl CodeWorkbench {
         let Some(tab_id) = tab_id else {
             return;
         };
-        self.activate_tab(&tab_id);
+        self.activate_tab(&tab_id, cx);
         if self.presentations.contains_key(&path) || self.editor_bindings.contains_key(&path) {
             self.persist(cx);
             cx.notify();
@@ -2478,15 +3010,19 @@ impl CodeWorkbench {
         ) else {
             return;
         };
-        self.activate_tab(&tab_id);
+        self.activate_tab(&tab_id, cx);
         self.persist(cx);
         self.request_preview_panel(cx);
         cx.notify();
     }
 
-    pub fn sync_terminals(&mut self, terminals: Vec<TerminalSession>, cx: &mut Context<Self>) {
+    pub fn sync_terminals(
+        &mut self,
+        terminals: Vec<TerminalSession>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.terminals == terminals {
-            return;
+            return false;
         }
         let previous_selection = self.selected_terminal_id.clone();
         self.terminals = terminals;
@@ -2496,10 +3032,12 @@ impl CodeWorkbench {
                 .iter()
                 .any(|terminal| terminal.id.as_str() == terminal_id)
         });
+        self.sync_terminal_surface_activity(cx);
         if self.selected_terminal_id != previous_selection {
             self.persist(cx);
         }
         cx.notify();
+        true
     }
 
     fn ensure_terminal_surface(
@@ -2543,6 +3081,7 @@ impl CodeWorkbench {
                 )
             }),
         );
+        self.sync_terminal_surface_activity(cx);
         true
     }
 
@@ -2575,7 +3114,7 @@ impl CodeWorkbench {
         );
         if let Some(id) = id {
             self.selected_terminal_id = Some(terminal_id.as_str().to_string());
-            self.activate_tab(&id);
+            self.activate_tab(&id, cx);
             self.persist(cx);
             self.request_preview_panel(cx);
             cx.notify();
@@ -2669,7 +3208,7 @@ impl CodeWorkbench {
                 .get_mut(&path)
                 .is_some_and(|buffer| buffer.update_content(value))
             {
-                this.persist(cx);
+                this.persist_editor_recovery(cx);
                 cx.notify();
             }
         });
@@ -3114,7 +3653,7 @@ impl CodeWorkbench {
         self.file_tasks.insert(path, task);
     }
 
-    fn activate_tab(&mut self, tab_id: &str) {
+    fn activate_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
         self.activation_generation = self.activation_generation.saturating_add(1).max(1);
         let generation = self.activation_generation;
         for lifecycle in self.lifecycles.values_mut() {
@@ -3138,6 +3677,7 @@ impl CodeWorkbench {
             let _ = lifecycle.finish_load(generation);
             let _ = lifecycle.focus_entered(generation);
         }
+        self.sync_terminal_surface_activity(cx);
     }
 
     fn update_lifecycle_bounds(
@@ -3243,7 +3783,7 @@ impl CodeWorkbench {
             {
                 self.selected_terminal_id = Some(terminal_id.clone());
             }
-            self.activate_tab(&tab_id);
+            self.activate_tab(&tab_id, cx);
             self.persist(cx);
             cx.notify();
         }
@@ -3304,6 +3844,7 @@ impl CodeWorkbench {
                     }
                 }
                 this.persist(cx);
+                this.persist_editor_recovery(cx);
                 cx.notify();
             });
         });
@@ -3346,7 +3887,9 @@ impl CodeWorkbench {
         match disposition {
             PreviewCloseDisposition::Closed => {
                 self.cleanup_closed_tab(&tab_id, force);
+                self.sync_terminal_surface_activity(cx);
                 self.persist(cx);
+                self.persist_editor_recovery(cx);
                 self.close_preview_panel_if_empty(cx);
             }
             PreviewCloseDisposition::Pinned => {
@@ -3385,7 +3928,9 @@ impl CodeWorkbench {
         }) {
             self.error = Some("Pinned or dirty tabs were kept open".into());
         }
+        self.sync_terminal_surface_activity(cx);
         self.persist(cx);
+        self.persist_editor_recovery(cx);
         self.close_preview_panel_if_empty(cx);
         cx.notify();
     }
@@ -3403,7 +3948,9 @@ impl CodeWorkbench {
         }) {
             self.error = Some("Pinned or dirty tabs were kept open".into());
         }
+        self.sync_terminal_surface_activity(cx);
         self.persist(cx);
+        self.persist_editor_recovery(cx);
         self.close_preview_panel_if_empty(cx);
         cx.notify();
     }
@@ -3437,13 +3984,14 @@ impl CodeWorkbench {
                 .split(&tab_id, &pane_id, position, &new_pane_id, &new_split_id)
         };
         if split {
+            self.sync_terminal_surface_activity(cx);
             self.persist(cx);
             cx.notify();
         }
     }
 
     pub(crate) fn toggle_fullscreen(&mut self, cx: &mut Context<Self>) {
-        self.preview_panel_fullscreen = !self.preview_panel_fullscreen;
+        self.set_preview_panel_fullscreen(!self.preview_panel_fullscreen, cx);
         self.preview.set_fullscreen(None);
         self.persist(cx);
         cx.notify();
@@ -3451,7 +3999,7 @@ impl CodeWorkbench {
 
     pub(crate) fn exit_fullscreen(&mut self, cx: &mut Context<Self>) {
         if self.preview_panel_fullscreen || self.preview.fullscreen_tab_id.is_some() {
-            self.preview_panel_fullscreen = false;
+            self.set_preview_panel_fullscreen(false, cx);
             self.preview.set_fullscreen(None);
             self.persist(cx);
             cx.notify();
@@ -3466,10 +4014,12 @@ impl CodeWorkbench {
                 self.cleanup_closed_tab(&tab_id, true);
             }
         }
-        self.preview_panel_fullscreen = false;
+        self.set_preview_panel_fullscreen(false, cx);
         self.preview.set_fullscreen(None);
         self.preview.set_side_preview(None);
+        self.sync_terminal_surface_activity(cx);
         self.persist(cx);
+        self.persist_editor_recovery(cx);
         cx.notify();
     }
 
@@ -3722,10 +4272,12 @@ impl CodeWorkbench {
                 match outcome {
                     Ok(Ok(())) => {
                         apply(this);
+                        this.sync_terminal_surface_activity(cx);
                         this.note = Some("File operation completed".into());
                         this.load_tree(cx);
                         this.load_git_status(cx);
                         this.persist(cx);
+                        this.persist_editor_recovery(cx);
                     }
                     Ok(Err(error)) => {
                         this.error = Some(format!("{}: {}", error.code, error.message));
@@ -3818,7 +4370,7 @@ impl CodeWorkbench {
             unix_timestamp_ms(),
         );
         if let Some(tab_id) = tab_id {
-            self.activate_tab(&tab_id);
+            self.activate_tab(&tab_id, cx);
         }
         self.load_diff(key, cx);
         self.persist(cx);
@@ -3901,7 +4453,7 @@ impl CodeWorkbench {
             unix_timestamp_ms(),
         );
         if let Some(tab_id) = tab_id {
-            self.activate_tab(&tab_id);
+            self.activate_tab(&tab_id, cx);
         }
         self.load_commit_detail(hash, cx);
         self.persist(cx);
@@ -3993,7 +4545,7 @@ impl CodeWorkbench {
             opened_at_ms,
         );
         if let Some(tab_id) = tab_id {
-            self.activate_tab(&tab_id);
+            self.activate_tab(&tab_id, cx);
         }
         self.load_commit_detail(hash, cx);
         self.persist(cx);
@@ -4359,6 +4911,7 @@ impl CodeWorkbench {
                 match target.region {
                     PreviewPaneDropRegion::TabGroup | PreviewPaneDropRegion::Content => {
                         if this.preview.move_to_pane(&drag.tab_id, &drop_pane_id) {
+                            this.sync_terminal_surface_activity(cx);
                             this.persist(cx);
                         }
                     }
@@ -4833,6 +5386,7 @@ impl CodeWorkbench {
                     }
                     this.preview.move_to_pane(&drag.tab_id, &pane_id);
                     this.preview.reorder_pane_tabs(&pane_id, &order);
+                    this.sync_terminal_surface_activity(cx);
                     this.persist(cx);
                     cx.notify();
                 }
@@ -5228,7 +5782,11 @@ impl CodeWorkbench {
                 .terminal_surfaces
                 .get(&terminal_id)
                 .cloned()
-                .map(Entity::into_any_element)
+                .map(|surface| {
+                    surface
+                        .cached(StyleRefinement::default().size_full())
+                        .into_any_element()
+                })
                 .unwrap_or_else(|| {
                     self.render_native_boundary(
                         IconName::SquareTerminal,
@@ -5607,8 +6165,14 @@ impl CodeWorkbench {
                 ),
                 cx,
             ),
-            Some(FilePresentation::Pdf(surface)) => surface.clone().into_any_element(),
-            Some(FilePresentation::Office(surface)) => surface.clone().into_any_element(),
+            Some(FilePresentation::Pdf(surface)) => surface
+                .clone()
+                .cached(StyleRefinement::default().size_full())
+                .into_any_element(),
+            Some(FilePresentation::Office(surface)) => surface
+                .clone()
+                .cached(StyleRefinement::default().size_full())
+                .into_any_element(),
             Some(FilePresentation::Unsupported(message)) => self.render_native_boundary(
                 IconName::TriangleAlert,
                 locale::text("Unsupported file", "不支持的文件", "不支援的檔案"),
@@ -6275,6 +6839,7 @@ impl Render for CodeWorkbench {
 
 pub struct CodeRightRail {
     workbench: Entity<CodeWorkbench>,
+    projection: CodeRightRailProjection,
     inline_path_input: Entity<InputState>,
     inline_file_action: Option<InlineFileAction>,
     inline_file_error: Option<String>,
@@ -6285,6 +6850,8 @@ pub struct CodeRightRail {
     file_drop_target_path: Option<String>,
     selected_open_tool_id: Option<String>,
     _subscriptions: Vec<Subscription>,
+    #[cfg(test)]
+    render_count: usize,
 }
 
 impl CodeRightRail {
@@ -6296,7 +6863,19 @@ impl CodeRightRail {
         let inline_path_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(inline_path_placeholder(None)));
         let file_tree_focus = cx.focus_handle().tab_stop(true);
-        let workbench_subscription = cx.observe(&workbench, |_, _, cx| cx.notify());
+        let projection = workbench.read(cx).right_rail_projection();
+        let workbench_subscription = cx.observe(&workbench, |this, workbench, cx| {
+            let next = {
+                let workbench = workbench.read(cx);
+                let revision = workbench.right_rail_revision();
+                if revision == this.projection.revision {
+                    return;
+                }
+                workbench.right_rail_projection()
+            };
+            this.projection = next;
+            cx.notify();
+        });
         let input_subscription = cx.subscribe_in(
             &inline_path_input,
             window,
@@ -6313,6 +6892,7 @@ impl CodeRightRail {
             cx.on_blur(&file_tree_focus, window, Self::on_file_tree_blur);
         Self {
             workbench,
+            projection,
             inline_path_input,
             inline_file_action: None,
             inline_file_error: None,
@@ -6327,7 +6907,18 @@ impl CodeRightRail {
                 input_subscription,
                 file_tree_blur_subscription,
             ],
+            #[cfg(test)]
+            render_count: 0,
         }
+    }
+
+    pub(crate) fn set_mode(&mut self, mode: RightRailMode, cx: &mut Context<Self>) {
+        if self.projection.mode == mode {
+            return;
+        }
+        self.projection.mode = mode;
+        self.projection.revision.mode = mode;
+        cx.notify();
     }
 
     pub fn sync_locale(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -7043,8 +7634,7 @@ impl CodeRightRail {
     }
 
     fn render_files(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let workbench = self.workbench.read(cx);
-        if workbench.workspace.is_none() {
+        if !self.projection.files.workspace_available {
             return rail_empty(
                 locale::text(
                     "Select an Agent session to load workspace files",
@@ -7054,26 +7644,22 @@ impl CodeRightRail {
                 cx,
             );
         }
-        let row_count = workbench.file_tree.visible_row_count();
-        let loading = workbench.tree_loading;
-        let mutation_pending = workbench.file_mutation_pending;
+        let rows = self.projection.files.rows.clone();
+        let row_count = rows.len();
+        let loading = self.projection.files.loading;
+        let mutation_pending = self.projection.files.mutation_pending;
         let create_insertion = self.inline_file_action.as_ref().and_then(|action| {
             let parent = match action {
                 InlineFileAction::CreateFile { parent }
                 | InlineFileAction::CreateDirectory { parent } => parent,
                 InlineFileAction::Rename { .. } => return None,
             };
-            let index = workbench.file_tree.visible_row_position(parent)?;
-            let depth = workbench
-                .file_tree
-                .visible_row(index)
-                .map(|row| row.depth.saturating_add(1))?;
+            let index = self.projection.files.row_position(parent)?;
+            let depth = rows.get(index).map(|row| row.depth.saturating_add(1))?;
             Some((index.saturating_add(1), depth))
         });
         let item_count = row_count.saturating_add(usize::from(create_insertion.is_some()));
-        let widest_row = workbench
-            .file_tree
-            .all_visible_rows()
+        let widest_row = rows
             .iter()
             .enumerate()
             .max_by_key(|(_, row)| file_tree_row_width_score(row));
@@ -7094,11 +7680,9 @@ impl CodeRightRail {
         let blank_context_view = cx.weak_entity();
         let typeahead = self.file_typeahead.clone();
         let inline_error = self.inline_file_error.clone();
-        let workspace_root = workbench
-            .workspace
-            .as_ref()
-            .map(|workspace| workspace.root.clone());
-        let root_name = workbench.file_tree.root_name().to_string();
+        let workspace_root = self.projection.files.workspace_root.clone();
+        let root_name = self.projection.files.root_name.clone();
+        let scroll = self.projection.files.scroll.clone();
         let clipboard_available = self.file_clipboard.is_some();
         let root_controller = self.workbench.downgrade();
         v_flex()
@@ -7155,12 +7739,8 @@ impl CodeRightRail {
                                         } else {
                                             index
                                         };
-                                        let row = this
-                                            .workbench
-                                            .read(cx)
-                                            .file_tree
-                                            .visible_row(row_index)
-                                            .cloned()?;
+                                        let row =
+                                            this.projection.files.rows.get(row_index).cloned()?;
                                         Some(this.render_file_row(row, cx))
                                     })
                                     .collect::<Vec<_>>()
@@ -7170,7 +7750,7 @@ impl CodeRightRail {
                         .with_horizontal_sizing_behavior(
                             ListHorizontalSizingBehavior::Unconstrained,
                         )
-                        .track_scroll(&workbench.file_scroll)
+                        .track_scroll(&scroll)
                         .size_full()
                         .into_any_element()
                     })
@@ -7344,12 +7924,7 @@ impl CodeRightRail {
         let typeahead_active = segments
             .iter()
             .any(|segment| file_name_match_range(&segment.name, &typeahead).is_some());
-        let selected_directory = self
-            .workbench
-            .read(cx)
-            .file_tree
-            .selected_directory_path()
-            .map(str::to_string);
+        let selected_directory = self.projection.files.selected_directory_path.clone();
         let text_color = file_tree_text_color(&row, cx);
         let row_view = cx.weak_entity();
         let controller = self.workbench.downgrade();
@@ -7393,7 +7968,7 @@ impl CodeRightRail {
         let row_drop_active = is_directory && active_drop_target.as_deref() == Some(path.as_str());
         let row_drop_scope_active = active_drop_target.as_deref().is_some_and(|target| {
             !path_chain.iter().any(|candidate| candidate == target)
-                && self.workbench.read(cx).file_tree.is_expanded(target)
+                && self.projection.files.is_expanded(target)
                 && path_chain
                     .iter()
                     .any(|candidate| path_is_equal_or_descendant(candidate, target))
@@ -7540,13 +8115,8 @@ impl CodeRightRail {
         let context_controller = controller.clone();
         let context_view = row_view.clone();
         let clipboard_available = self.file_clipboard.is_some();
-        let mutation_pending = self.workbench.read(cx).file_mutation_pending;
-        let workspace_root = self
-            .workbench
-            .read(cx)
-            .workspace
-            .as_ref()
-            .map(|workspace| workspace.root.clone());
+        let mutation_pending = self.projection.files.mutation_pending;
+        let workspace_root = self.projection.files.workspace_root.clone();
         let row_drag_view = row_view.clone();
         let row_drop_view = row_view.clone();
         let row_move_directory = drop_directory.clone();
@@ -8456,6 +9026,7 @@ impl CodeRightRail {
     }
 
     fn render_git(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let git = &self.projection.git;
         let (
             workspace_available,
             mode,
@@ -8465,45 +9036,28 @@ impl CodeRightRail {
             root_selection,
             has_directories,
             all_directories_expanded,
-            status,
             workspace_name,
             lifecycle_view,
             lifecycle_confirmation,
             lifecycle_loading,
             lifecycle_action_pending,
             lifecycle_mutations_available,
-        ) = {
-            let workbench = self.workbench.read(cx);
-            (
-                workbench.workspace.is_some(),
-                workbench.git.mode,
-                workbench.git.pending_mutation.is_some(),
-                workbench.status_loading,
-                workbench.git.selected_path_count(),
-                workbench.git.path_selection_state(""),
-                workbench.git.has_change_directories(),
-                workbench.git.all_change_directories_expanded(),
-                workbench.git.status.clone(),
-                workbench
-                    .workspace
-                    .as_ref()
-                    .and_then(|workspace| workspace.root.file_name())
-                    .and_then(|name| name.to_str())
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or("Changes")
-                    .to_string(),
-                workbench.worktree_lifecycle_view(),
-                workbench.lifecycle_confirmation.clone(),
-                workbench.lifecycle_loading,
-                workbench.lifecycle_action_pending,
-                workbench.backend.as_ref().is_some_and(|backend| {
-                    backend
-                        .capabilities()
-                        .git
-                        .supports(BackendOperation::GitWorktreeLifecycleMutate)
-                }),
-            )
-        };
+        ) = (
+            self.projection.files.workspace_available,
+            git.mode,
+            git.pending,
+            git.status_loading,
+            git.selected_count,
+            git.root_selection,
+            git.has_directories,
+            git.all_directories_expanded,
+            self.projection.workspace_name.clone(),
+            self.projection.lifecycle_view.clone(),
+            self.projection.lifecycle_confirmation.clone(),
+            self.projection.lifecycle_loading,
+            self.projection.lifecycle_action_pending,
+            self.projection.lifecycle_mutations_available,
+        );
         if !workspace_available {
             return rail_empty_card(
                 locale::text("No Git status", "没有 Git 状态", "沒有 Git 狀態"),
@@ -8528,17 +9082,9 @@ impl CodeRightRail {
                     )
                 })
         });
-        let changes = status
-            .as_ref()
-            .map(|status| status.changes.as_slice())
-            .unwrap_or_default();
-        let (additions, deletions) = changes.iter().fold((0_u32, 0_u32), |summary, change| {
-            (
-                summary.0.saturating_add(change.additions),
-                summary.1.saturating_add(change.deletions),
-            )
-        });
-        let change_count = changes.len();
+        let additions = git.additions;
+        let deletions = git.deletions;
+        let change_count = git.change_count;
 
         v_flex()
             .size_full()
@@ -8888,56 +9434,37 @@ impl CodeRightRail {
     }
 
     fn render_git_changes(&mut self, pending: bool, cx: &mut Context<Self>) -> AnyElement {
-        let (
-            change_row_count,
-            commit_message,
-            commit_type,
-            amend,
-            selected_count,
-            scroll_handle,
-            conflict_context,
-            lifecycle_pending,
-            lifecycle_mutations_available,
-        ) = {
-            let workbench = self.workbench.read(cx);
-            let conflict_context = workbench
-                .worktree_lifecycle_view()
-                .filter(|view| view.target_owned)
-                .and_then(|view| view.operation)
-                .filter(|operation| {
-                    matches!(
-                        operation.status,
-                        GitWorktreeOperationStatus::NeedsResolution
-                            | GitWorktreeOperationStatus::NeedsAttention
-                    )
-                })
-                .map(|operation| {
-                    (
-                        operation.detail.conflicts,
-                        operation.branch.unwrap_or_else(|| "source".to_string()),
-                        operation
-                            .detail
-                            .target_branch
-                            .unwrap_or_else(|| "target".to_string()),
-                    )
-                });
-            (
-                workbench.git.change_tree_row_count(),
-                workbench.commit_message.clone(),
-                workbench.commit_type.clone(),
-                workbench.amend_commit,
-                workbench.git.selected_path_count(),
-                workbench.git_scroll.clone(),
-                conflict_context,
-                workbench.lifecycle_action_pending,
-                workbench.backend.as_ref().is_some_and(|backend| {
-                    backend
-                        .capabilities()
-                        .git
-                        .supports(BackendOperation::GitWorktreeLifecycleMutate)
-                }),
-            )
-        };
+        let change_row_count = self.projection.git.change_rows.len();
+        let commit_message = self.projection.commit_message.clone();
+        let commit_type = self.projection.commit_type.clone();
+        let amend = self.projection.amend_commit;
+        let selected_count = self.projection.git.selected_count;
+        let scroll_handle = self.projection.git.scroll.clone();
+        let conflict_context = self
+            .projection
+            .lifecycle_view
+            .clone()
+            .filter(|view| view.target_owned)
+            .and_then(|view| view.operation)
+            .filter(|operation| {
+                matches!(
+                    operation.status,
+                    GitWorktreeOperationStatus::NeedsResolution
+                        | GitWorktreeOperationStatus::NeedsAttention
+                )
+            })
+            .map(|operation| {
+                (
+                    operation.detail.conflicts,
+                    operation.branch.unwrap_or_else(|| "source".to_string()),
+                    operation
+                        .detail
+                        .target_branch
+                        .unwrap_or_else(|| "target".to_string()),
+                )
+            });
+        let lifecycle_pending = self.projection.lifecycle_action_pending;
+        let lifecycle_mutations_available = self.projection.lifecycle_mutations_available;
         let type_workbench = self.workbench.downgrade();
         let active_type = commit_type.clone();
         let push_workbench = self.workbench.downgrade();
@@ -8999,22 +9526,16 @@ impl CodeRightRail {
                                     change_row_count,
                                     CODE_WORKBENCH_MAX_EAGER_ROWS,
                                 );
-                                let rows = {
-                                    let workbench = this.workbench.read(cx);
-                                    range
-                                        .filter_map(|index| {
-                                            workbench
-                                                .git
-                                                .change_tree_row(index)
-                                                .map(|(row, change)| (row.clone(), change.cloned()))
-                                        })
-                                        .collect::<Vec<_>>()
-                                };
+                                let rows = range
+                                    .filter_map(|index| {
+                                        this.projection.git.change_rows.get(index).cloned()
+                                    })
+                                    .collect::<Vec<_>>();
                                 rows.into_iter()
-                                    .map(|(row, change)| {
+                                    .map(|entry| {
                                         this.render_git_tree_row(
-                                            row,
-                                            change,
+                                            entry.row,
+                                            entry.change,
                                             GitTreeInteraction::Changes,
                                             cx,
                                         )
@@ -9232,18 +9753,11 @@ impl CodeRightRail {
         interaction: GitTreeInteraction,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (selection, selected_path) = {
-            let workbench = self.workbench.read(cx);
-            (
-                match interaction {
-                    GitTreeInteraction::Changes => {
-                        Some(workbench.git.path_selection_state(&row.path))
-                    }
-                    GitTreeInteraction::Commit { .. } => None,
-                },
-                workbench.selected_git_path.as_deref() == Some(row.path.as_str()),
-            )
+        let selection = match interaction {
+            GitTreeInteraction::Changes => Some(self.projection.git.selection_state(&row.path)),
+            GitTreeInteraction::Commit { .. } => None,
         };
+        let selected_path = self.projection.selected_git_path.as_deref() == Some(row.path.as_str());
         let path = row.path.clone();
         let path_chain = row
             .segments
@@ -9531,37 +10045,17 @@ impl CodeRightRail {
     }
 
     fn render_git_history(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let (
-            history_row_count,
-            branches,
-            remotes,
-            authors,
-            selected_branch,
-            selected_author,
-            selected_hash,
-            loading,
-            scroll_handle,
-        ) = {
-            let workbench = self.workbench.read(cx);
-            let branch_response = workbench.git.branches.clone();
-            (
-                workbench.git.history_row_count(),
-                branch_response
-                    .as_ref()
-                    .map(|response| response.branches.clone())
-                    .unwrap_or_default(),
-                branch_response
-                    .as_ref()
-                    .map(|response| response.remotes.clone())
-                    .unwrap_or_default(),
-                workbench.git.history_authors.clone(),
-                workbench.git.history_filter.ref_name.clone(),
-                workbench.git.history_filter.author.clone(),
-                workbench.git.selected_commit_hash.clone(),
-                workbench.history_loading,
-                workbench.git_scroll.clone(),
-            )
-        };
+        let git = &self.projection.git;
+        let history_row_count = git.history.len();
+        let branches = git.branches.clone();
+        let remotes = git.remotes.clone();
+        let authors = git.authors.clone();
+        let selected_branch = git.selected_branch.clone();
+        let selected_author = git.selected_author.clone();
+        let selected_hash = git.selected_hash.clone();
+        let loading = git.history_loading;
+        let scroll_handle = git.scroll.clone();
+        let history = git.history.clone();
         let remote_names = remotes
             .iter()
             .map(|remote| remote.name.as_str())
@@ -9622,28 +10116,22 @@ impl CodeRightRail {
                                 history_row_count,
                                 CODE_WORKBENCH_MAX_EAGER_ROWS,
                             );
-                            let rows = {
-                                let workbench = this.workbench.read(cx);
-                                range
-                                    .filter_map(|index| {
-                                        let commit = workbench.git.history_row(index)?.clone();
-                                        let previous_date = index
-                                            .checked_sub(1)
-                                            .and_then(|previous| {
-                                                workbench.git.history_row(previous)
-                                            })
-                                            .map(|previous| {
-                                                git_history_date_key(previous.authored_at_ms)
-                                            });
-                                        let current_date =
-                                            git_history_date_key(commit.authored_at_ms);
-                                        Some((
-                                            commit,
-                                            previous_date.as_deref() != Some(current_date.as_str()),
-                                        ))
-                                    })
-                                    .collect::<Vec<_>>()
-                            };
+                            let rows = range
+                                .filter_map(|index| {
+                                    let commit = history.get(index)?.clone();
+                                    let previous_date = index
+                                        .checked_sub(1)
+                                        .and_then(|previous| history.get(previous))
+                                        .map(|previous| {
+                                            git_history_date_key(previous.authored_at_ms)
+                                        });
+                                    let current_date = git_history_date_key(commit.authored_at_ms);
+                                    Some((
+                                        commit,
+                                        previous_date.as_deref() != Some(current_date.as_str()),
+                                    ))
+                                })
+                                .collect::<Vec<_>>();
                             rows.into_iter()
                                 .map(|(commit, show_date)| {
                                     this.render_git_history_row(
@@ -9811,7 +10299,7 @@ impl CodeRightRail {
                                                     });
                                             }),
                                         );
-                                    for author in &authors {
+                                    for author in authors.iter() {
                                         let workbench = author_workbench.clone();
                                         let value = format!("{} <{}>", author.name, author.email);
                                         let label = value.clone();
@@ -9977,31 +10465,20 @@ impl CodeRightRail {
         selected_hash: String,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (commit, detail, rows, total_rows) = {
-            let workbench = self.workbench.read(cx);
-            let commit = workbench
-                .git
-                .history
-                .iter()
-                .find(|commit| commit.hash == selected_hash)
-                .cloned();
-            let detail = workbench
-                .git
-                .commit_detail
-                .as_ref()
-                .filter(|detail| detail.summary.hash == selected_hash)
-                .cloned();
-            let total_rows = workbench.git.commit_tree_row_count();
-            let rows = (0..total_rows.min(200))
-                .filter_map(|index| {
-                    workbench
-                        .git
-                        .commit_tree_row(index)
-                        .map(|(row, change)| (row.clone(), change.cloned()))
-                })
-                .collect::<Vec<_>>();
-            (commit, detail, rows, total_rows)
-        };
+        let git = &self.projection.git;
+        let commit = git
+            .selected_commit
+            .clone()
+            .filter(|commit| commit.hash == selected_hash);
+        let detail_loaded = git.commit_detail_loaded
+            && git.selected_hash.as_deref() == Some(selected_hash.as_str());
+        let total_rows = git.commit_rows.len();
+        let rows = git
+            .commit_rows
+            .iter()
+            .take(200)
+            .map(|entry| (entry.row.clone(), entry.change.clone()))
+            .collect::<Vec<_>>();
         let subject = commit
             .as_ref()
             .map(|commit| commit.subject.clone())
@@ -10010,19 +10487,21 @@ impl CodeRightRail {
             .as_ref()
             .map(|commit| commit.short_hash.clone())
             .unwrap_or_default();
-        let (file_count, additions, deletions) = detail
-            .as_ref()
-            .map(|detail| {
-                let (additions, deletions) =
-                    detail.files.iter().fold((0_u32, 0_u32), |summary, file| {
-                        (
-                            summary.0.saturating_add(file.additions),
-                            summary.1.saturating_add(file.deletions),
-                        )
-                    });
-                (detail.files.len(), additions, deletions)
-            })
-            .unwrap_or_default();
+        let file_count = if detail_loaded {
+            git.commit_file_count
+        } else {
+            0
+        };
+        let additions = if detail_loaded {
+            git.commit_additions
+        } else {
+            0
+        };
+        let deletions = if detail_loaded {
+            git.commit_deletions
+        } else {
+            0
+        };
         let context = GitTreeInteraction::Commit {
             hash: selected_hash,
             subject: subject.clone(),
@@ -10148,7 +10627,7 @@ impl CodeRightRail {
                             .child(subject),
                     ),
             )
-            .child(if detail.is_none() {
+            .child(if !detail_loaded {
                 rail_empty(
                     locale::text(
                         "Loading changed files",
@@ -10202,7 +10681,7 @@ impl CodeRightRail {
     }
 
     fn render_file_header_actions(&self, cx: &mut Context<Self>) -> AnyElement {
-        let workspace_available = self.workbench.read(cx).workspace.is_some();
+        let workspace_available = self.projection.files.workspace_available;
         let tools = available_external_tools();
         let selected_tool_id = self.selected_open_tool_id.as_deref().filter(|selected| {
             matches!(
@@ -10350,14 +10829,13 @@ impl CodeRightRail {
 
 impl Render for CodeRightRail {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (mode, error, note) = {
-            let workbench = self.workbench.read(cx);
-            (
-                workbench.right_rail_mode,
-                workbench.error.clone(),
-                workbench.note.clone(),
-            )
-        };
+        #[cfg(test)]
+        {
+            self.render_count = self.render_count.saturating_add(1);
+        }
+        let mode = self.projection.mode;
+        let error = self.projection.error.clone();
+        let note = self.projection.note.clone();
         v_flex()
             .id("code-workbench-right-rail")
             .size_full()
@@ -10464,7 +10942,11 @@ impl Render for CodeWorkbenchFixture {
                     .size_full()
                     .min_w_0()
                     .min_h_0()
-                    .child(self.right_rail.clone())
+                    .child(
+                        self.right_rail
+                            .clone()
+                            .cached(StyleRefinement::default().size_full()),
+                    )
                     .into_any_element(),
                 CodeWorkbenchFixtureKind::Diff | CodeWorkbenchFixtureKind::Markdown => div()
                     .size_full()
@@ -10493,7 +10975,11 @@ impl Render for CodeWorkbenchFixture {
                         .flex_none()
                         .border_l_1()
                         .border_color(cx.theme().border)
-                        .child(self.right_rail.clone()),
+                        .child(
+                            self.right_rail
+                                .clone()
+                                .cached(StyleRefinement::default().size_full()),
+                        ),
                 )
                 .into_any_element()
         };
@@ -12140,6 +12626,40 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    fn right_rail_cached_view_ignores_unrelated_workbench_notifications(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (fixture, cx) = cx.add_window_view(|window, cx| {
+            CodeWorkbenchFixture::new(CodeWorkbenchFixtureKind::Files, window, cx)
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let (workbench, right_rail) = fixture.read_with(cx, |fixture, _| {
+            (fixture.workbench.clone(), fixture.right_rail.clone())
+        });
+        let initial = right_rail.read_with(cx, |right_rail, _| right_rail.render_count);
+
+        workbench.update(cx, |_, cx| cx.notify());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let after_unrelated = right_rail.read_with(cx, |right_rail, _| right_rail.render_count);
+        assert_eq!(after_unrelated, initial);
+
+        right_rail.update(cx, |right_rail, cx| {
+            right_rail.set_mode(RightRailMode::Git, cx)
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let after_relevant = right_rail.read_with(cx, |right_rail, _| right_rail.render_count);
+        assert!(after_relevant > after_unrelated);
+    }
+
     #[test]
     fn workspace_generation_fence_requires_the_exact_workspace_generation() {
         let workspace_id = WorkspaceId::new();
@@ -12390,5 +12910,28 @@ mod tests {
             FileEntryKind::File
         ));
         assert!(!file_can_open_in_editor("src", FileEntryKind::Directory));
+    }
+
+    #[test]
+    fn workspace_polling_is_gated_by_real_surface_visibility() {
+        let source = include_str!("code_workbench.rs");
+        let polling = source
+            .split_once("    fn start_workspace_polling(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn refresh_file_tree("))
+            .map(|(body, _)| body)
+            .expect("workspace polling should remain inspectable");
+        assert!(polling.contains("if this.files_surface_visible"));
+        assert!(polling.contains("if this.git_surface_visible"));
+        assert!(polling.matches("HIDDEN_WORKSPACE_POLL_INTERVAL").count() >= 4);
+
+        let visibility = source
+            .split_once("    pub(crate) fn set_workspace_surface_visibility(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn sync_terminal_surface_activity("))
+            .map(|(body, _)| body)
+            .expect("workspace visibility setter should remain inspectable");
+        assert!(visibility.contains("files_became_visible"));
+        assert!(visibility.contains("git_became_visible"));
+        assert!(visibility.contains("self.refresh_file_tree(cx);"));
+        assert!(visibility.contains("self.refresh_git(cx);"));
     }
 }
