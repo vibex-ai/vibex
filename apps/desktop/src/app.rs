@@ -8905,12 +8905,30 @@ impl VibexWorkbench {
     }
 
     fn clear_submitted_new_session_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.new_session_attachments.clear();
+        self.clear_new_session_message_draft(window, cx);
         self.new_session_draft_initialized = false;
+        self.new_session_workspace.reset_after_success();
+    }
+
+    fn clear_new_session_message_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_session_attachments.clear();
         self.new_session_command_entry = None;
         self.new_session_input
             .update(cx, |input, cx| input.set_value("", window, cx));
-        self.new_session_workspace.reset_after_success();
+    }
+
+    fn restore_new_session_message_draft(
+        &mut self,
+        text: String,
+        attachments: Vec<InlineComposerAttachment>,
+        command_entry: Option<AgentCommandEntry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.new_session_input
+            .update(cx, |input, cx| input.set_value(text, window, cx));
+        self.new_session_attachments = attachments;
+        self.new_session_command_entry = command_entry;
     }
 
     fn current_checkout_for_project(
@@ -9441,6 +9459,7 @@ impl VibexWorkbench {
         self.new_session_workspace.begin_submission();
         self.agent_action_pending = true;
         self.new_session_error = None;
+        self.clear_new_session_message_draft(window, cx);
         self.clear_suggestions();
         let generation = self.session_generation;
         let backend = self.backend.clone();
@@ -9681,6 +9700,13 @@ impl VibexWorkbench {
                     }
                     Ok(Err(error)) => {
                         if this.session_generation == generation && this.new_session_open {
+                            this.restore_new_session_message_draft(
+                                draft_raw_text.clone(),
+                                draft_attachments.clone(),
+                                draft_command_entry.clone(),
+                                window,
+                                cx,
+                            );
                             this.new_session_workspace.mark_failed(error.code.clone());
                             this.new_session_error =
                                 Some(format!("{}: {}", error.code, error.message));
@@ -9688,6 +9714,13 @@ impl VibexWorkbench {
                     }
                     Err(error) => {
                         if this.session_generation == generation && this.new_session_open {
+                            this.restore_new_session_message_draft(
+                                draft_raw_text,
+                                draft_attachments,
+                                draft_command_entry,
+                                window,
+                                cx,
+                            );
                             this.new_session_workspace
                                 .mark_failed("new_session_task_failed");
                             this.new_session_error =
@@ -30206,16 +30239,40 @@ mod tests {
         assert!(session_ready < clear && clear < turn_completion);
         assert!(!submit[turn_completion..].contains("clear_submitted_new_session_draft"));
 
+        let immediate_clear = submit
+            .find("self.clear_new_session_message_draft(window, cx);")
+            .expect("submission should clear the captured message draft immediately");
+        let dispatch = submit
+            .find("let runner = gpui_tokio::Tokio::spawn")
+            .expect("session creation should remain asynchronous");
+        assert!(immediate_clear < dispatch);
+        assert_eq!(
+            submit
+                .matches("self.clear_new_session_message_draft(window, cx);")
+                .count(),
+            1
+        );
+        assert_eq!(
+            submit
+                .matches("this.restore_new_session_message_draft(")
+                .count(),
+            2,
+            "both session-creation failure paths should restore the draft"
+        );
+
         let clear_draft = source
             .split_once("    fn clear_submitted_new_session_draft(")
             .and_then(|(_, tail)| tail.split_once("\n    fn current_checkout_for_project("))
             .map(|(body, _)| body)
             .expect("submitted draft cleanup should remain inspectable");
-        assert!(clear_draft.contains("self.new_session_attachments.clear();"));
+        assert!(clear_draft.contains("self.clear_new_session_message_draft(window, cx);"));
         assert!(clear_draft.contains("self.new_session_draft_initialized = false;"));
+        assert!(clear_draft.contains("self.new_session_workspace.reset_after_success();"));
+        assert!(clear_draft.contains("self.new_session_attachments.clear();"));
         assert!(clear_draft.contains("self.new_session_command_entry = None;"));
         assert!(clear_draft.contains("input.set_value(\"\", window, cx)"));
-        assert!(clear_draft.contains("self.new_session_workspace.reset_after_success();"));
+        assert!(clear_draft.contains("self.new_session_attachments = attachments;"));
+        assert!(clear_draft.contains("self.new_session_command_entry = command_entry;"));
     }
 
     #[test]
