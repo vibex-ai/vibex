@@ -59,6 +59,11 @@ Optimistic user turns need client message ids so replayed cross-device echoes
 can deduplicate them. Streaming buffers must be bounded and replaceable by the
 persisted item when the authoritative timeline catches up.
 
+When the reader is not following the timeline bottom, the unread badge counts
+new non-empty Agent message rows only. Streaming deltas that reconcile into the
+same row count once; reasoning, plans, tools, permissions, and other activity
+rows do not increment the badge.
+
 When a new-session draft includes an initial message, await session creation
 only long enough to obtain the authoritative session record. Commit and select
 that session immediately, attach its timeline view, and submit the initial

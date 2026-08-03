@@ -917,6 +917,20 @@ pub fn timeline_rows(items: &[TimelineItem]) -> Vec<TimelineRow> {
     rows
 }
 
+pub fn timeline_agent_message_count_after_sequence(
+    items: &[TimelineItem],
+    previous_end_sequence: Option<i64>,
+) -> usize {
+    timeline_rows(items)
+        .into_iter()
+        .filter(|row| {
+            row.kind == TimelineRowKind::AgentMessage
+                && !row.body.trim().is_empty()
+                && previous_end_sequence.is_none_or(|sequence| row.first_sequence > sequence)
+        })
+        .count()
+}
+
 #[derive(Default)]
 struct TurnRowMetadata {
     item_count: usize,
@@ -1244,6 +1258,79 @@ mod tests {
         assert_eq!(rows[0].item_ids.len(), 3);
         assert!(rows[0].conclusion);
         assert_eq!(rows[0].turn_item_count, 3);
+    }
+
+    #[test]
+    fn unread_message_count_tracks_agent_rows_instead_of_timeline_items() {
+        let mut items = vec![item(
+            1,
+            None,
+            TimelinePayload::Reasoning(ReasoningPayload {
+                text: "thinking".into(),
+                is_final: false,
+            }),
+        )];
+        assert_eq!(timeline_agent_message_count_after_sequence(&items, None), 0);
+
+        items.push(item(
+            2,
+            Some("correlation_turn_a"),
+            TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                text_delta: "hel".into(),
+                chunk_index: 0,
+            }),
+        ));
+        assert_eq!(
+            timeline_agent_message_count_after_sequence(&items, Some(1)),
+            1
+        );
+
+        items.push(item(
+            3,
+            Some("correlation_turn_a"),
+            TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                text_delta: "lo".into(),
+                chunk_index: 1,
+            }),
+        ));
+        items.push(item(
+            4,
+            Some("correlation_turn_a"),
+            TimelinePayload::AgentMessage(AgentMessagePayload {
+                text: "hello".into(),
+                is_final: true,
+            }),
+        ));
+        assert_eq!(
+            timeline_agent_message_count_after_sequence(&items, Some(2)),
+            0
+        );
+
+        items.push(item(
+            5,
+            None,
+            TimelinePayload::Reasoning(ReasoningPayload {
+                text: "more thinking".into(),
+                is_final: true,
+            }),
+        ));
+        assert_eq!(
+            timeline_agent_message_count_after_sequence(&items, Some(4)),
+            0
+        );
+
+        items.push(item(
+            6,
+            Some("correlation_turn_b"),
+            TimelinePayload::AgentMessage(AgentMessagePayload {
+                text: "done".into(),
+                is_final: true,
+            }),
+        ));
+        assert_eq!(
+            timeline_agent_message_count_after_sequence(&items, Some(5)),
+            1
+        );
     }
 
     #[test]
