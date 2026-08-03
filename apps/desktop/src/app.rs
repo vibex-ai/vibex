@@ -23856,7 +23856,7 @@ fn render_agent_thinking_indicator(label: &'static str, cx: &App) -> AnyElement 
                     };
                     div().child(character.to_string()).with_animation(
                         format!("agent-thinking-glow-{index}"),
-                        Animation::new(Duration::from_millis(1_800)).repeat(),
+                        Animation::new(Duration::from_millis(1_200)).repeat(),
                         move |this, delta| {
                             let scan_position = -0.35 + delta * 1.7;
                             let intensity =
