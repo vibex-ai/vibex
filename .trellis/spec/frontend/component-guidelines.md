@@ -533,6 +533,25 @@ Primary approve/deny actions must be reachable by thumb on mobile. Dangerous
 actions need clear confirmation, especially terminal commands, file deletion,
 Git revert, push, and native config export.
 
+In the conversation timeline, an adjacent `Command` and command-risk
+`PermissionRequest` from the same turn form one interaction. Render the command
+once, put the approval actions in its footer, and let the pending permission
+override any provisional `Running` label. Do not stack a second permission card
+that repeats the same command.
+
+Permission presentation is a user-facing projection, not a dump of provider
+transport details. Parse structured input to recover actionable fields such as
+the command, arguments, and working directory, while suppressing correlation,
+routing, and response-option fields such as `requestId`, `toolCallId`, `tool`,
+and `options`. A standalone permission card may retain additional clearly
+user-facing details, but raw JSON and provider bookkeeping do not belong in the
+message body.
+
+When a turn is blocked on approval, both the command card and the pending-turn
+footer must say that confirmation is awaited; neither may imply that execution
+is already running. Resolved historical permissions keep their outcome and no
+longer render response buttons.
+
 ## Provider Components
 
 Provider UI must show Vibex Provider Profiles, not raw config files. Components

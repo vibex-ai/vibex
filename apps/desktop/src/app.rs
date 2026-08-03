@@ -19438,10 +19438,12 @@ impl VibexWorkbench {
                 response =
                     response.child(self.render_timeline_row(conclusion_row, true, window, cx));
             } else if !turn.complete {
-                response = response.child(render_agent_thinking_indicator(
-                    strings.agent_pending_response,
-                    cx,
-                ));
+                let pending_label = if turn.pending_permission {
+                    strings.agent_waiting_confirmation
+                } else {
+                    strings.agent_pending_response
+                };
+                response = response.child(render_agent_thinking_indicator(pending_label, cx));
             }
             content = content.child(response);
         }
@@ -19537,6 +19539,18 @@ impl VibexWorkbench {
             {
                 group_index += 1;
             }
+            if let (Some(command_row), Some(permission_row)) = (
+                turn.process_rows.get(row_index),
+                turn.process_rows.get(row_index + 1),
+            ) && self.command_permission_rows_are_linked(command_row, permission_row)
+            {
+                let pair_rows = &turn.process_rows[row_index..row_index + 2];
+                let element =
+                    self.render_command_execution_card(command_row, Some(permission_row), cx);
+                elements.push(self.highlight_session_search_rows(pair_rows, element, cx));
+                row_index += 2;
+                continue;
+            }
             let group = turn
                 .process_activity_groups
                 .get(group_index)
@@ -19565,6 +19579,33 @@ impl VibexWorkbench {
         elements
     }
 
+    fn command_permission_rows_are_linked(
+        &self,
+        command_row: &TimelineRow,
+        permission_row: &TimelineRow,
+    ) -> bool {
+        command_row.kind == TimelineRowKind::Command
+            && permission_row.kind == TimelineRowKind::PermissionRequest
+            && command_row.turn_id.is_some()
+            && command_row.turn_id == permission_row.turn_id
+            && self
+                .permission_request_for_row(permission_row)
+                .is_some_and(|request| {
+                    request.risk_category == vibex_core::PermissionRiskCategory::Command
+                })
+    }
+
+    fn permission_request_for_row(
+        &self,
+        row: &TimelineRow,
+    ) -> Option<vibex_core::PermissionRequest> {
+        self.timeline_row_latest_item(row)
+            .and_then(|item| match &item.payload {
+                vibex_core::TimelinePayload::PermissionRequest(request) => Some(request.clone()),
+                _ => None,
+            })
+    }
+
     fn render_timeline_row(
         &mut self,
         row: &TimelineRow,
@@ -19587,7 +19628,7 @@ impl VibexWorkbench {
             }
             TimelineRowKind::Error => self.render_error_row(row, conversation_conclusion, cx),
             TimelineRowKind::PermissionRequest => self.render_permission_request_card(row, cx),
-            TimelineRowKind::Command => self.render_command_execution_card(row, cx),
+            TimelineRowKind::Command => self.render_command_execution_card(row, None, cx),
             TimelineRowKind::FileOperation => self.render_file_operation_card(row, cx),
             TimelineRowKind::ImageGeneration => self.render_image_generation_card(row, cx),
             TimelineRowKind::ToolCall
@@ -19938,6 +19979,27 @@ impl VibexWorkbench {
                 .is_some_and(|group| group.end_row <= row_index)
             {
                 group_index += 1;
+            }
+            if let (Some(command_row), Some(permission_row)) = (
+                turn.process_rows.get(row_index),
+                turn.process_rows.get(row_index + 1),
+            ) && self.command_permission_rows_are_linked(command_row, permission_row)
+            {
+                let permission_height = self
+                    .permission_request_for_row(permission_row)
+                    .map(|request| {
+                        if permission_request_is_pending(permission_row, &request) {
+                            92.0
+                        } else {
+                            48.0
+                        }
+                    })
+                    .unwrap_or(48.0);
+                height += self.estimated_timeline_row_height_projected(command_row, false)
+                    + permission_height
+                    + 12.0;
+                row_index += 2;
+                continue;
             }
             let group = turn
                 .process_activity_groups
@@ -20575,6 +20637,7 @@ impl VibexWorkbench {
     fn render_command_execution_card(
         &mut self,
         row: &TimelineRow,
+        permission_row: Option<&TimelineRow>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some(command) =
@@ -20600,6 +20663,22 @@ impl VibexWorkbench {
         let measured_turn_id = row.turn_id.clone();
         let failed = command.status == vibex_core::CommandStatus::Failed;
         let in_progress = command.status == vibex_core::CommandStatus::Started;
+        let linked_permission = permission_row.and_then(|permission_row| {
+            self.permission_request_for_row(permission_row)
+                .map(|request| (permission_row, request))
+        });
+        let waiting_for_confirmation =
+            linked_permission
+                .as_ref()
+                .is_some_and(|(permission_row, request)| {
+                    permission_request_is_pending(permission_row, request)
+                });
+        let permission_panel = linked_permission.as_ref().map(|(permission_row, request)| {
+            self.render_permission_request_panel(permission_row, request, true, cx)
+        });
+        let output_summary = (!waiting_for_confirmation)
+            .then(|| command.output_summary.clone())
+            .flatten();
         let command_title = if command.command.trim().is_empty() {
             locale::text("Command", "命令", "命令").to_string()
         } else {
@@ -20617,6 +20696,8 @@ impl VibexWorkbench {
             .border_1()
             .border_color(if failed {
                 cx.theme().danger.opacity(0.38)
+            } else if waiting_for_confirmation {
+                cx.theme().warning.opacity(0.42)
             } else {
                 cx.theme().border
             })
@@ -20653,6 +20734,8 @@ impl VibexWorkbench {
                             .flex_none()
                             .text_color(if failed {
                                 cx.theme().danger
+                            } else if waiting_for_confirmation {
+                                cx.theme().warning
                             } else {
                                 cx.theme().muted_foreground
                             }),
@@ -20667,9 +20750,13 @@ impl VibexWorkbench {
                             .child(command_title),
                     )
                     .child(Self::render_process_status_badge(
-                        command_status_label(command.status).to_string(),
+                        if waiting_for_confirmation {
+                            self.strings().agent_waiting_confirmation.to_string()
+                        } else {
+                            command_status_label(command.status).to_string()
+                        },
                         failed,
-                        in_progress,
+                        in_progress || waiting_for_confirmation,
                         cx,
                     ))
                     .when(has_details, |this| {
@@ -20719,7 +20806,7 @@ impl VibexWorkbench {
                         .child(
                             self.render_process_detail_value(format!("$ {}", command.command), cx),
                         )
-                        .when_some(command.output_summary.clone(), |this, output| {
+                        .when_some(output_summary, |this, output| {
                             this.child(self.render_process_detail(
                                 locale::text("Output", "输出", "輸出").to_string(),
                                 output,
@@ -20743,6 +20830,7 @@ impl VibexWorkbench {
                         }),
                 )
             })
+            .when_some(permission_panel, |this, panel| this.child(panel))
             .into_any_element()
     }
 
@@ -21354,160 +21442,238 @@ impl VibexWorkbench {
         row: &TimelineRow,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let request = self
-            .timeline_row_latest_item(row)
-            .and_then(|item| match &item.payload {
-                vibex_core::TimelinePayload::PermissionRequest(request) => Some(request.clone()),
-                _ => None,
-            });
-        let is_dark = cx.theme().is_dark();
-        let card_bg = theme::semantic_color("card", is_dark);
-        let Some(request) = request else {
+        let Some(request) = self.permission_request_for_row(row) else {
             return self.render_fallback_process_row(row, cx);
         };
-        let pending = row.pending_permission
-            && request.status == vibex_core::PermissionRequestStatus::Pending;
-        let risk_label = permission_risk_label(request.risk_category);
-        let risk_is_command = request.risk_category == vibex_core::PermissionRiskCategory::Command;
-        let command_detail = request
-            .details
-            .iter()
-            .find(|detail| {
-                matches!(
-                    detail.label.to_ascii_lowercase().as_str(),
-                    "command" | "cmd" | "args" | "cwd"
+        self.render_permission_request_panel(row, &request, false, cx)
+    }
+
+    fn render_permission_request_panel(
+        &mut self,
+        row: &TimelineRow,
+        request: &vibex_core::PermissionRequest,
+        embedded: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pending = permission_request_is_pending(row, request);
+        let projection = permission_card_projection(request);
+        let status_label = permission_request_status_label(request.status, pending);
+        let status_color = match (pending, request.status) {
+            (true, _) => cx.theme().warning,
+            (false, vibex_core::PermissionRequestStatus::Approved) => cx.theme().success,
+            (false, vibex_core::PermissionRequestStatus::Denied) => cx.theme().danger,
+            (false, _) => cx.theme().muted_foreground,
+        };
+        let actions = pending.then(|| self.render_permission_response_actions(request, cx));
+
+        if embedded {
+            let message = if pending {
+                permission_embedded_description(request.risk_category).to_string()
+            } else {
+                format!(
+                    "{} · {status_label}",
+                    permission_risk_label(request.risk_category)
                 )
-            })
-            .cloned();
-        let env_detail = request
-            .details
-            .iter()
-            .find(|detail| detail.label.to_ascii_lowercase().contains("env"))
-            .cloned();
-        let request_id = request.id.as_str().to_string();
+            };
+            return v_flex()
+                .id(format!("embedded-permission:{}", row.id))
+                .w_full()
+                .min_w_0()
+                .flex_none()
+                .gap_2()
+                .border_t_1()
+                .border_color(if pending {
+                    cx.theme().warning.opacity(0.38)
+                } else {
+                    cx.theme().border.opacity(0.72)
+                })
+                .bg(if pending {
+                    cx.theme()
+                        .warning
+                        .opacity(if cx.theme().is_dark() { 0.08 } else { 0.05 })
+                } else {
+                    cx.theme().muted.opacity(0.20)
+                })
+                .px_3()
+                .py(px(10.0))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Icon::default()
+                                .path("icons/vibex/shield-alert.svg")
+                                .size(px(15.0))
+                                .flex_none()
+                                .text_color(status_color),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .text_sm()
+                                .font_medium()
+                                .text_color(cx.theme().foreground)
+                                .child(message),
+                        ),
+                )
+                .when_some(actions, |this, actions| this.child(actions))
+                .into_any_element();
+        }
+
+        let card_bg = theme::semantic_color("card", cx.theme().is_dark());
+        let description = permission_request_display_title(request);
         v_flex()
             .id(row.id.clone())
             .w_full()
             .min_w_0()
+            .flex_none()
             .overflow_hidden()
             .rounded_lg()
             .border_1()
-            .border_color(cx.theme().border)
-            .bg(card_bg.opacity(0.70))
-            .shadow_sm()
+            .border_color(if pending {
+                cx.theme().warning.opacity(0.42)
+            } else {
+                cx.theme().border
+            })
+            .bg(card_bg.opacity(0.72))
             .text_size(px(12.0))
             .line_height(px(20.0))
             .child(
                 h_flex()
+                    .w_full()
                     .min_w_0()
                     .items_center()
                     .gap_2()
                     .border_b_1()
-                    .border_color(cx.theme().border)
-                    .bg(cx.theme().muted.opacity(0.40))
+                    .border_color(cx.theme().border.opacity(0.72))
+                    .bg(if pending {
+                        cx.theme()
+                            .warning
+                            .opacity(if cx.theme().is_dark() { 0.08 } else { 0.05 })
+                    } else {
+                        cx.theme().muted.opacity(0.28)
+                    })
                     .px_3()
                     .py_2()
                     .child(
                         Icon::default()
                             .path("icons/vibex/shield-alert.svg")
-                            .size(px(14.0))
-                            .text_color(cx.theme().muted_foreground),
+                            .size(px(15.0))
+                            .flex_none()
+                            .text_color(status_color),
                     )
                     .child(
                         div()
                             .min_w_0()
                             .flex_1()
-                            .truncate()
                             .font_medium()
                             .text_color(cx.theme().foreground)
-                            .child(request.title.clone()),
+                            .child(permission_risk_label(request.risk_category)),
                     )
-                    .child(Self::render_process_status_badge(
-                        risk_label.to_string(),
-                        risk_is_command,
-                        false,
-                        cx,
-                    )),
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(status_color)
+                            .child(status_label),
+                    ),
             )
             .child(
                 v_flex()
+                    .w_full()
                     .min_w_0()
+                    .gap_2()
                     .px_3()
-                    .py(px(10.0))
-                    .when_some(command_detail, |this, detail| {
-                        this.child(
-                            div()
-                                .mb_2()
-                                .child(self.render_process_detail_value(detail.value, cx)),
-                        )
+                    .py_3()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_medium()
+                            .text_color(cx.theme().foreground)
+                            .child(description),
+                    )
+                    .when_some(projection.action, |this, action| {
+                        this.child(self.render_process_detail_value(action, cx))
                     })
-                    .when_some(env_detail, |this, detail| {
-                        this.child(
-                            div()
-                                .mb_2()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(cx.theme().border.opacity(0.70))
-                                .bg(cx.theme().muted.opacity(0.25))
-                                .px(px(10.0))
-                                .py_2()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(detail.value),
-                        )
-                    })
-                    .when(!request.details.is_empty(), |this| {
+                    .when(!projection.details.is_empty(), |this| {
                         this.child(
                             v_flex()
-                                .mt_2()
                                 .gap(px(6.0))
                                 .text_color(cx.theme().muted_foreground)
-                                .children(request.details.iter().map(|detail| {
+                                .children(projection.details.iter().map(|(label, value)| {
                                     h_flex()
                                         .min_w_0()
                                         .items_start()
                                         .gap_2()
                                         .child(
                                             div()
+                                                .w(px(88.0))
                                                 .flex_none()
-                                                .w(px(96.0))
-                                                .child(detail.label.clone()),
+                                                .text_xs()
+                                                .child(permission_detail_label(label)),
                                         )
                                         .child(
                                             div()
                                                 .min_w_0()
                                                 .flex_1()
-                                                .text_color(cx.theme().foreground.opacity(0.80))
-                                                .child(detail.value.clone()),
+                                                .text_xs()
+                                                .text_color(cx.theme().foreground.opacity(0.82))
+                                                .child(value.clone()),
                                         )
                                 })),
                         )
                     })
-                    .when(pending, |this| {
-                        this.child(h_flex().mt_3().flex_wrap().gap_2().children(
-                            request.allowed_responses.iter().map(|response| {
-                                let response = *response;
-                                let resolve_id = request_id.clone();
-                                let label = permission_response_label(response);
-                                let button = Button::new(format!(
-                                    "permission-response:{request_id}:{label}"
-                                ))
-                                .small()
-                                .label(label)
-                                .disabled(self.agent_action_pending)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.resolve_permission(resolve_id.clone(), response, cx)
-                                }));
-                                if response == PermissionResponseKind::Deny {
-                                    button.danger()
-                                } else {
-                                    button.with_variant(
-                                        gpui_component::button::ButtonVariant::Secondary,
-                                    )
-                                }
-                            }),
-                        ))
+                    .when_some(actions, |this, actions| {
+                        this.child(
+                            div()
+                                .w_full()
+                                .mt_1()
+                                .border_t_1()
+                                .border_color(cx.theme().border.opacity(0.72))
+                                .pt_3()
+                                .child(actions),
+                        )
                     }),
             )
+            .into_any_element()
+    }
+
+    fn render_permission_response_actions(
+        &mut self,
+        request: &vibex_core::PermissionRequest,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let request_id = request.id.as_str().to_string();
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .flex_wrap()
+            .items_center()
+            .justify_end()
+            .gap_2()
+            .children(request.allowed_responses.iter().map(|response| {
+                let response = *response;
+                let resolve_id = request_id.clone();
+                let label = permission_response_label(response);
+                let button = Button::new(format!("permission-response:{request_id}:{label}"))
+                    .small()
+                    .label(label)
+                    .disabled(self.agent_action_pending)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.resolve_permission(resolve_id.clone(), response, cx)
+                    }));
+                match response {
+                    PermissionResponseKind::Approve => button.primary().icon(IconName::Check),
+                    PermissionResponseKind::Deny => button.danger().icon(IconName::Close),
+                    PermissionResponseKind::AlwaysAllowForSession => button
+                        .with_variant(gpui_component::button::ButtonVariant::Secondary)
+                        .icon(IconName::Check),
+                }
+            }))
             .into_any_element()
     }
 
@@ -24652,16 +24818,234 @@ fn file_operation_verb(operation: vibex_core::FileOperationKind) -> &'static str
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PermissionCardProjection {
+    action: Option<String>,
+    details: Vec<(String, String)>,
+}
+
+fn permission_request_is_pending(
+    row: &TimelineRow,
+    request: &vibex_core::PermissionRequest,
+) -> bool {
+    row.pending_permission
+        && row.turn_pending_permission
+        && request.status == vibex_core::PermissionRequestStatus::Pending
+}
+
+fn permission_request_status_label(
+    status: vibex_core::PermissionRequestStatus,
+    pending: bool,
+) -> &'static str {
+    if pending {
+        return locale::text("Waiting for confirmation", "等待确认", "等待確認");
+    }
+    match status {
+        vibex_core::PermissionRequestStatus::Pending => {
+            locale::text("Processed", "已处理", "已處理")
+        }
+        vibex_core::PermissionRequestStatus::Approved => {
+            locale::text("Approved", "已允许", "已允許")
+        }
+        vibex_core::PermissionRequestStatus::Denied => locale::text("Denied", "已拒绝", "已拒絕"),
+        vibex_core::PermissionRequestStatus::Expired => locale::text("Expired", "已过期", "已過期"),
+    }
+}
+
 fn permission_risk_label(risk: vibex_core::PermissionRiskCategory) -> &'static str {
     match risk {
-        vibex_core::PermissionRiskCategory::Command => "command",
-        vibex_core::PermissionRiskCategory::FileReadSensitive => "file_read_sensitive",
-        vibex_core::PermissionRiskCategory::FileWrite => "file_write",
-        vibex_core::PermissionRiskCategory::FileDeleteOrMove => "file_delete_or_move",
-        vibex_core::PermissionRiskCategory::Network => "network",
-        vibex_core::PermissionRiskCategory::GitDestructive => "git_destructive",
-        vibex_core::PermissionRiskCategory::ProviderConfigExport => "provider_config_export",
-        vibex_core::PermissionRiskCategory::CustomTool => "custom_tool",
+        vibex_core::PermissionRiskCategory::Command => {
+            locale::text("Command execution", "命令执行", "命令執行")
+        }
+        vibex_core::PermissionRiskCategory::FileReadSensitive => {
+            locale::text("Sensitive file access", "敏感文件访问", "敏感檔案存取")
+        }
+        vibex_core::PermissionRiskCategory::FileWrite => {
+            locale::text("File change", "文件修改", "檔案修改")
+        }
+        vibex_core::PermissionRiskCategory::FileDeleteOrMove => {
+            locale::text("Delete or move", "删除或移动", "刪除或移動")
+        }
+        vibex_core::PermissionRiskCategory::Network => {
+            locale::text("Network access", "网络访问", "網路存取")
+        }
+        vibex_core::PermissionRiskCategory::GitDestructive => {
+            locale::text("Git destructive action", "Git 危险操作", "Git 危險操作")
+        }
+        vibex_core::PermissionRiskCategory::ProviderConfigExport => {
+            locale::text("Configuration export", "配置导出", "設定匯出")
+        }
+        vibex_core::PermissionRiskCategory::CustomTool => {
+            locale::text("Tool action", "工具操作", "工具操作")
+        }
+    }
+}
+
+fn permission_embedded_description(risk: vibex_core::PermissionRiskCategory) -> &'static str {
+    match risk {
+        vibex_core::PermissionRiskCategory::Command => locale::text(
+            "Confirm whether the Agent may run this command.",
+            "请确认是否允许 Agent 执行此命令。",
+            "請確認是否允許 Agent 執行此命令。",
+        ),
+        _ => locale::text(
+            "Confirm this action before the Agent continues.",
+            "请确认此操作，确认后 Agent 将继续。",
+            "請確認此操作，確認後 Agent 將繼續。",
+        ),
+    }
+}
+
+fn permission_request_display_title(request: &vibex_core::PermissionRequest) -> String {
+    let normalized = normalize_permission_detail_label(&request.title);
+    if matches!(
+        normalized.as_str(),
+        "execute" | "command" | "run" | "terminal" | "permission" | "allow"
+    ) {
+        return match request.risk_category {
+            vibex_core::PermissionRiskCategory::Command => locale::text(
+                "The Agent is requesting permission to run a command.",
+                "Agent 请求运行一条命令。",
+                "Agent 請求執行一條命令。",
+            ),
+            vibex_core::PermissionRiskCategory::FileReadSensitive => locale::text(
+                "The Agent is requesting access to a sensitive file.",
+                "Agent 请求访问敏感文件。",
+                "Agent 請求存取敏感檔案。",
+            ),
+            vibex_core::PermissionRiskCategory::FileWrite => locale::text(
+                "The Agent is requesting permission to change a file.",
+                "Agent 请求修改文件。",
+                "Agent 請求修改檔案。",
+            ),
+            vibex_core::PermissionRiskCategory::FileDeleteOrMove => locale::text(
+                "The Agent is requesting permission to delete or move a file.",
+                "Agent 请求删除或移动文件。",
+                "Agent 請求刪除或移動檔案。",
+            ),
+            vibex_core::PermissionRiskCategory::Network => locale::text(
+                "The Agent is requesting network access.",
+                "Agent 请求访问网络。",
+                "Agent 請求存取網路。",
+            ),
+            vibex_core::PermissionRiskCategory::GitDestructive => locale::text(
+                "The Agent is requesting a destructive Git action.",
+                "Agent 请求执行 Git 危险操作。",
+                "Agent 請求執行 Git 危險操作。",
+            ),
+            vibex_core::PermissionRiskCategory::ProviderConfigExport => locale::text(
+                "The Agent is requesting permission to export configuration.",
+                "Agent 请求导出配置。",
+                "Agent 請求匯出設定。",
+            ),
+            vibex_core::PermissionRiskCategory::CustomTool => locale::text(
+                "The Agent is requesting permission to use a tool.",
+                "Agent 请求执行工具操作。",
+                "Agent 請求執行工具操作。",
+            ),
+        }
+        .to_string();
+    }
+    request.title.clone()
+}
+
+fn permission_card_projection(request: &vibex_core::PermissionRequest) -> PermissionCardProjection {
+    let mut projection = PermissionCardProjection {
+        action: None,
+        details: Vec::new(),
+    };
+    for detail in &request.details {
+        let value = detail.value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        let label = normalize_permission_detail_label(&detail.label);
+        match label.as_str() {
+            "command" | "cmd" | "shellcommand" => {
+                projection.action.get_or_insert_with(|| value.to_string());
+            }
+            "input" | "rawinput" => {
+                project_permission_input(value, &mut projection);
+            }
+            "cwd" | "workdir" | "workingdirectory" => {
+                push_permission_detail(&mut projection.details, "cwd", value);
+            }
+            "args" | "arguments" => {
+                push_permission_detail(&mut projection.details, "args", value);
+            }
+            label if label.contains("env") => {
+                push_permission_detail(&mut projection.details, "env", value);
+            }
+            "tool" | "toolcallid" | "requestid" | "providerrequestid" | "source" => {}
+            label if label.starts_with("option") => {}
+            _ => push_permission_detail(&mut projection.details, &detail.label, value),
+        }
+    }
+    projection
+}
+
+fn project_permission_input(value: &str, projection: &mut PermissionCardProjection) {
+    let Ok(input) = serde_json::from_str::<serde_json::Value>(value) else {
+        projection.action.get_or_insert_with(|| value.to_string());
+        return;
+    };
+    let Some(object) = input.as_object() else {
+        if let Some(value) = input.as_str() {
+            projection.action.get_or_insert_with(|| value.to_string());
+        }
+        return;
+    };
+    if let Some(command) = ["command", "cmd", "shellCommand"]
+        .iter()
+        .find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
+    {
+        projection.action.get_or_insert_with(|| command.to_string());
+    }
+    if let Some(cwd) = ["cwd", "workdir", "workingDirectory"]
+        .iter()
+        .find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
+    {
+        push_permission_detail(&mut projection.details, "cwd", cwd);
+    }
+    if let Some(args) = object.get("args").and_then(serde_json::Value::as_array) {
+        let args = args
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !args.is_empty() {
+            push_permission_detail(&mut projection.details, "args", &args);
+        }
+    }
+}
+
+fn push_permission_detail(details: &mut Vec<(String, String)>, label: &str, value: &str) {
+    if !details
+        .iter()
+        .any(|(existing_label, existing_value)| existing_label == label && existing_value == value)
+    {
+        details.push((label.to_string(), value.to_string()));
+    }
+}
+
+fn normalize_permission_detail_label(label: &str) -> String {
+    label
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn permission_detail_label(label: &str) -> String {
+    match normalize_permission_detail_label(label).as_str() {
+        "cwd" | "workdir" | "workingdirectory" => {
+            locale::text("Working directory", "工作目录", "工作目錄").to_string()
+        }
+        "args" | "arguments" => locale::text("Arguments", "参数", "參數").to_string(),
+        label if label.contains("env") => {
+            locale::text("Environment", "环境变量", "環境變數").to_string()
+        }
+        _ => label.to_string(),
     }
 }
 
@@ -32624,6 +33008,10 @@ mod tests {
                 "render_agent_file_diff_preview",
             ),
             ("render_image_generation_card", "render_error_row"),
+            (
+                "render_permission_request_panel",
+                "render_permission_response_actions",
+            ),
         ] {
             let card = source
                 .split_once(&format!("    fn {renderer}("))
@@ -32634,6 +33022,107 @@ mod tests {
                 card.contains(".flex_none()"),
                 "{renderer} must not shrink inside an estimated timeline turn"
             );
+        }
+    }
+
+    #[test]
+    fn pending_command_permissions_render_as_one_blocked_command_card() {
+        let source = include_str!("app.rs");
+        let process_rows = source
+            .split_once("    fn render_timeline_process_rows(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn command_permission_rows_are_linked("))
+            .map(|(body, _)| body)
+            .expect("timeline process renderer should remain inspectable");
+        assert!(process_rows.contains("Some(permission_row)"));
+        assert!(process_rows.contains("row_index += 2"));
+
+        let command_card = source
+            .split_once("    fn render_command_execution_card(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_file_operation_card("))
+            .map(|(body, _)| body)
+            .expect("command renderer should remain inspectable");
+        assert!(command_card.contains("permission_request_is_pending"));
+        assert!(command_card.contains("agent_waiting_confirmation"));
+        assert!(command_card.contains("!waiting_for_confirmation"));
+        assert!(command_card.contains("render_permission_request_panel"));
+
+        let turn = source
+            .split_once("    fn render_timeline_turn(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn timeline_turn_execution_attribution("))
+            .map(|(body, _)| body)
+            .expect("timeline turn renderer should remain inspectable");
+        assert!(turn.contains("if turn.pending_permission"));
+        assert!(turn.contains("strings.agent_waiting_confirmation"));
+        assert_eq!(
+            locale::strings(locale::ResolvedLocale::ZhCn).agent_waiting_confirmation,
+            "等待确认中"
+        );
+    }
+
+    #[test]
+    fn permission_projection_keeps_action_context_and_hides_transport_metadata() {
+        let request = vibex_core::PermissionRequest {
+            id: RequestId::new(),
+            session_id: VibexSessionId::parse("session_permission_projection").unwrap(),
+            project_id: None,
+            workspace_id: None,
+            provider_request_id: Some("provider-request-7".into()),
+            risk_category: vibex_core::PermissionRiskCategory::Command,
+            title: "execute".into(),
+            details: vec![
+                vibex_core::PermissionActionDetail {
+                    label: "tool".into(),
+                    value: "terminal".into(),
+                },
+                vibex_core::PermissionActionDetail {
+                    label: "toolCallId".into(),
+                    value: "tool-call-7".into(),
+                },
+                vibex_core::PermissionActionDetail {
+                    label: "requestId".into(),
+                    value: "request-7".into(),
+                },
+                vibex_core::PermissionActionDetail {
+                    label: "input".into(),
+                    value: serde_json::json!({
+                        "cmd": "date '+ACP permission preview'",
+                        "workdir": "/repo"
+                    })
+                    .to_string(),
+                },
+                vibex_core::PermissionActionDetail {
+                    label: "options".into(),
+                    value: "allow_once,reject_once".into(),
+                },
+                vibex_core::PermissionActionDetail {
+                    label: "optionKinds".into(),
+                    value: "allow_once,reject_once".into(),
+                },
+            ],
+            allowed_responses: vec![
+                PermissionResponseKind::Approve,
+                PermissionResponseKind::Deny,
+            ],
+            status: vibex_core::PermissionRequestStatus::Pending,
+            requested_at_ms: 1,
+            expires_at_ms: None,
+        };
+
+        let projection = permission_card_projection(&request);
+        assert_eq!(
+            projection.action.as_deref(),
+            Some("date '+ACP permission preview'")
+        );
+        assert_eq!(projection.details, vec![("cwd".into(), "/repo".into())]);
+        let projection_debug = format!("{projection:?}");
+        for internal_value in [
+            "terminal",
+            "tool-call-7",
+            "request-7",
+            "allow_once",
+            "provider-request-7",
+        ] {
+            assert!(!projection_debug.contains(internal_value));
         }
     }
 
