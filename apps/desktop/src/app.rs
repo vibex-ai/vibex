@@ -39,6 +39,7 @@ use gpui_component::{
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
     notification::Notification,
     popover::Popover,
+    progress::ProgressCircle,
     scroll::{ScrollableElement as _, ScrollbarAxis},
     searchable_list::SearchableListItem,
     select::{Select, SelectEvent, SelectState},
@@ -68,10 +69,10 @@ use vibex_core::{
     GitProjectIneligibleReason, GitWorktreeAssistanceSessionRequest, GitWorktreeConflictKind,
     GitWorktreeOperationRecord, GitWorktreeOperationStatus, MessageAttachment,
     MessageSubmissionState, MessageSubmissionStatus, OpenWorkspaceRequest, PermissionResolution,
-    PermissionResponseKind, ProjectId, ProjectRecord, PromptId, ProviderBindingMetadata,
-    ProviderKind, ProviderProfileId, ProviderProfileStatus, ProviderProfileSummary,
-    RenameAgentSessionRequest, RequestId, ResolvePermissionRequest, RightRailPlugin,
-    RightRailPluginCreateRequest, RightRailPluginDeleteRequest, RightRailPluginId,
+    PermissionResponseKind, PlanStepStatus, ProjectId, ProjectRecord, PromptId,
+    ProviderBindingMetadata, ProviderKind, ProviderProfileId, ProviderProfileStatus,
+    ProviderProfileSummary, RenameAgentSessionRequest, RequestId, ResolvePermissionRequest,
+    RightRailPlugin, RightRailPluginCreateRequest, RightRailPluginDeleteRequest, RightRailPluginId,
     RightRailPluginKind, RightRailPluginReorderRequest, RightRailPluginStatus,
     RightRailPluginUpdateRequest, RightRailSystemPluginKey, RightRailWebPluginUaMode,
     RuntimeClientId, RuntimeLeaseRole, RuntimeSelectionInteraction, SendAgentMessageRequest,
@@ -82,17 +83,17 @@ use vibex_core::{
     TimelinePayload, VibexSessionId, WorkspaceMode, WorkspaceRecord, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
-    AppearanceUiState, ComposerAttachment, ComposerSuggestionSelection, ComposerTrigger,
-    DesktopUiStateV1, LocaleMode, NavigationHistory, NewSessionLocation, NewSessionProjectTicket,
-    NewSessionSubmissionStage, NewSessionWorkspaceState, RUNTIME_SELECTION_PREFERENCE_LIMIT,
-    RuntimeCascadeChoice, RuntimeCascadeProjection, SessionContentWidthMode, SessionUiState,
-    SidebarHierarchyMode, SidebarProjectProjection, SidebarState, SidebarWorkspaceProjection,
-    ThemeMode as ModelThemeMode, ThrottledUiStateWriter, TimelineConversationTurn,
-    TimelineFollowState, TimelineModel, TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
-    UiStateStore, WorkbenchRoute, WorkspaceAgentSummary, WorkspaceContextProjection,
-    WorktreeLifecycleDisplayState, composer_trigger_at, custom_worktree_path_is_absolute,
-    sidebar_project_projections, timeline_agent_message_count_after_sequence,
-    timeline_conversation_turns,
+    AgentPlanProjection, AppearanceUiState, ComposerAttachment, ComposerSuggestionSelection,
+    ComposerTrigger, DesktopUiStateV1, LocaleMode, NavigationHistory, NewSessionLocation,
+    NewSessionProjectTicket, NewSessionSubmissionStage, NewSessionWorkspaceState,
+    RUNTIME_SELECTION_PREFERENCE_LIMIT, RuntimeCascadeChoice, RuntimeCascadeProjection,
+    SessionContentWidthMode, SessionUiState, SidebarHierarchyMode, SidebarProjectProjection,
+    SidebarState, SidebarWorkspaceProjection, ThemeMode as ModelThemeMode, ThrottledUiStateWriter,
+    TimelineConversationTurn, TimelineFollowState, TimelineModel, TimelineProcessActivityGroup,
+    TimelineRow, TimelineRowKind, UiStateStore, WorkbenchRoute, WorkspaceAgentSummary,
+    WorkspaceContextProjection, WorktreeLifecycleDisplayState, composer_trigger_at,
+    current_agent_plan, custom_worktree_path_is_absolute, sidebar_project_projections,
+    timeline_agent_message_count_after_sequence, timeline_conversation_turns,
 };
 use vibex_desktop_runtime::{
     DesktopEvent, DesktopRuntime, DesktopRuntimeConfig, DesktopRuntimeFacade, PREVIEW_APP_ID,
@@ -226,6 +227,9 @@ const COMPOSER_QUEUE_HORIZONTAL_INSET: f32 = 20.0;
 const COMPOSER_QUEUE_EDIT_ROW_HEIGHT: f32 = 38.0;
 const COMPOSER_QUEUE_HEADER_HEIGHT: f32 = 36.0;
 const COMPOSER_QUEUE_ROW_HEIGHT: f32 = 28.0;
+const COMPOSER_PLAN_TOOLTIP_WIDTH: f32 = 360.0;
+const COMPOSER_PLAN_TOOLTIP_MAX_HEIGHT: f32 = 420.0;
+const COMPOSER_PLAN_COMPLETION_DURATION: Duration = Duration::from_millis(1_100);
 const COMPOSER_SURFACE_MIN_HEIGHT: f32 = 96.0;
 const COMPOSER_TEXT_AREA_MIN_HEIGHT: f32 = 52.0;
 const COMPOSER_SURFACE_RADIUS: f32 = 20.0;
@@ -724,6 +728,83 @@ fn composer_surface_background(is_dark: bool) -> Hsla {
 
 fn composer_queue_surface_background(is_dark: bool) -> Hsla {
     theme::semantic_color("composer-queue", is_dark)
+}
+
+fn composer_plan_progress_label(
+    locale: locale::ResolvedLocale,
+    current_step: usize,
+    total_steps: usize,
+) -> String {
+    match locale {
+        locale::ResolvedLocale::En => format!("Step {current_step} / {total_steps}"),
+        locale::ResolvedLocale::ZhCn => format!("步骤 {current_step} / {total_steps}"),
+        locale::ResolvedLocale::ZhTw => format!("步驟 {current_step} / {total_steps}"),
+    }
+}
+
+fn composer_plan_completed_steps_label(
+    locale: locale::ResolvedLocale,
+    completed_steps: usize,
+    total_steps: usize,
+) -> String {
+    match locale {
+        locale::ResolvedLocale::En => format!("{completed_steps} of {total_steps} completed"),
+        locale::ResolvedLocale::ZhCn => format!("已完成 {completed_steps} / {total_steps}"),
+        locale::ResolvedLocale::ZhTw => format!("已完成 {completed_steps} / {total_steps}"),
+    }
+}
+
+fn composer_plan_step_status_label(status: PlanStepStatus) -> &'static str {
+    match status {
+        PlanStepStatus::Pending => locale::text("Pending", "待处理", "待處理"),
+        PlanStepStatus::Running => locale::text("Running", "进行中", "進行中"),
+        PlanStepStatus::Completed => locale::text("Completed", "已完成", "已完成"),
+        PlanStepStatus::Failed => locale::text("Failed", "失败", "失敗"),
+    }
+}
+
+fn composer_plan_completed_after(
+    previous: Option<&AgentPlanProjection>,
+    current: Option<&AgentPlanProjection>,
+    items: &[TimelineItem],
+    previous_end_sequence: Option<i64>,
+) -> bool {
+    let Some(current) = current.filter(|plan| plan.is_complete()) else {
+        return false;
+    };
+    if previous.is_some_and(|plan| {
+        plan.turn_anchor_sequence == current.turn_anchor_sequence && !plan.is_complete()
+    }) {
+        return true;
+    }
+
+    let previous_end_sequence = previous_end_sequence.unwrap_or_default();
+    let mut saw_incomplete_snapshot = false;
+    for item in items.iter().filter(|item| {
+        item.sequence > previous_end_sequence
+            && item.sequence > current.turn_anchor_sequence
+            && item.sequence <= current.sequence
+    }) {
+        let steps = match &item.payload {
+            TimelinePayload::Plan(plan) => &plan.steps,
+            TimelinePayload::TodoUpdate(todo) => &todo.items,
+            _ => continue,
+        };
+        if steps.is_empty() {
+            continue;
+        }
+        if steps
+            .iter()
+            .all(|step| step.status == PlanStepStatus::Completed)
+        {
+            if saw_incomplete_snapshot {
+                return true;
+            }
+        } else {
+            saw_incomplete_snapshot = true;
+        }
+    }
+    false
 }
 
 fn partition_terminal_sessions(
@@ -1952,6 +2033,13 @@ struct ComposerQueueDropTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ComposerPlanCompletion {
+    session_id: VibexSessionId,
+    sequence: i64,
+    turn_anchor_sequence: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum NewSessionOpenTarget {
     Project(ProjectId),
     Workspace(vibex_core::WorkspaceId),
@@ -2162,6 +2250,8 @@ pub struct VibexWorkbench {
     composer_queue_steering_session_ids: BTreeSet<String>,
     composer_queue_editing_id: Option<u64>,
     composer_queue_drop_target: Option<ComposerQueueDropTarget>,
+    composer_plan_completion: Option<ComposerPlanCompletion>,
+    composer_plan_completion_task: Option<Task<()>>,
     attachment_image_preview: Option<AttachmentImagePreviewState>,
     composer_expanded: bool,
     composer_terminals: Vec<TerminalSession>,
@@ -2663,6 +2753,8 @@ impl VibexWorkbench {
             composer_queue_steering_session_ids: BTreeSet::new(),
             composer_queue_editing_id: None,
             composer_queue_drop_target: None,
+            composer_plan_completion: None,
+            composer_plan_completion_task: None,
             attachment_image_preview: None,
             composer_expanded: false,
             composer_terminals: Vec::new(),
@@ -4652,6 +4744,8 @@ impl VibexWorkbench {
         self.agent_action_pending = false;
         self.agent_turn_pending = self.session_turn_pending(&session_id);
         self.agent_error = None;
+        self.composer_plan_completion = None;
+        self.composer_plan_completion_task = None;
         self.timeline_scroll_to_latest_pending = false;
         self.timeline_scroll_wheel_idle_task = None;
         self.timeline_duration_tick_task = None;
@@ -4762,6 +4856,14 @@ impl VibexWorkbench {
                     this.finish_startup_loading();
                     match outcome {
                         Ok(Ok(items)) => {
+                            let timeline_was_loaded =
+                                this.timeline.session_id.as_ref() == Some(&session_id);
+                            let previous_plan = timeline_was_loaded
+                                .then(|| current_agent_plan(&this.timeline.items))
+                                .flatten();
+                            let previous_end_sequence = timeline_was_loaded
+                                .then_some(this.timeline.authoritative_end_sequence)
+                                .flatten();
                             let content_changed = this.timeline.session_id.as_ref()
                                 != Some(&session_id)
                                 || this.timeline.items != items;
@@ -4770,6 +4872,13 @@ impl VibexWorkbench {
                             }
                             this.timeline
                                 .replace_authoritative(session_id.clone(), items);
+                            if timeline_was_loaded {
+                                this.sync_composer_plan_completion(
+                                    previous_plan,
+                                    previous_end_sequence,
+                                    cx,
+                                );
+                            }
                             this.rebuild_timeline_sizes();
                             this.start_agent_poll(
                                 poll_runtime.clone(),
@@ -4816,6 +4925,68 @@ impl VibexWorkbench {
             self.session_generation,
             cx,
         );
+    }
+
+    fn sync_composer_plan_completion(
+        &mut self,
+        previous_plan: Option<AgentPlanProjection>,
+        previous_end_sequence: Option<i64>,
+        cx: &mut Context<Self>,
+    ) {
+        let current_plan = current_agent_plan(&self.timeline.items);
+        let newly_completed = composer_plan_completed_after(
+            previous_plan.as_ref(),
+            current_plan.as_ref(),
+            &self.timeline.items,
+            previous_end_sequence,
+        );
+
+        if !newly_completed {
+            let completion_is_current =
+                self.composer_plan_completion
+                    .as_ref()
+                    .is_some_and(|completion| {
+                        self.selected_session_id.as_ref() == Some(&completion.session_id)
+                            && current_plan.as_ref().is_some_and(|plan| {
+                                plan.is_complete()
+                                    && plan.turn_anchor_sequence == completion.turn_anchor_sequence
+                            })
+                    });
+            if !completion_is_current {
+                self.composer_plan_completion = None;
+                self.composer_plan_completion_task = None;
+            }
+            return;
+        }
+
+        let (Some(session_id), Some(plan)) =
+            (self.selected_session_id.clone(), current_plan.as_ref())
+        else {
+            return;
+        };
+        let completion = ComposerPlanCompletion {
+            session_id,
+            sequence: plan.sequence,
+            turn_anchor_sequence: plan.turn_anchor_sequence,
+        };
+        if self.composer_plan_completion.as_ref() == Some(&completion) {
+            return;
+        }
+
+        self.composer_plan_completion = Some(completion.clone());
+        self.composer_plan_completion_task = None;
+        self.composer_plan_completion_task = Some(cx.spawn(async move |entity, cx| {
+            cx.background_executor()
+                .timer(COMPOSER_PLAN_COMPLETION_DURATION)
+                .await;
+            let _ = entity.update(cx, |this, cx| {
+                this.composer_plan_completion_task = None;
+                if this.composer_plan_completion.as_ref() == Some(&completion) {
+                    this.composer_plan_completion = None;
+                    cx.notify();
+                }
+            });
+        }));
     }
 
     fn load_agent_session_projection(
@@ -5048,6 +5219,7 @@ impl VibexWorkbench {
                                 AgentPollSignal::Timeline(page) => {
                                     let previous_end_sequence =
                                         this.timeline.authoritative_end_sequence;
+                                    let previous_plan = current_agent_plan(&this.timeline.items);
                                     let updates_existing_item = this
                                         .timeline
                                         .authoritative_end_sequence
@@ -5062,6 +5234,11 @@ impl VibexWorkbench {
                                         }),
                                     );
                                     if changed > 0 {
+                                        this.sync_composer_plan_completion(
+                                            previous_plan,
+                                            previous_end_sequence,
+                                            cx,
+                                        );
                                         if updates_existing_item {
                                             this.invalidate_timeline_render_caches();
                                         }
@@ -5135,12 +5312,14 @@ impl VibexWorkbench {
                     return false;
                 }
                 let previous_end_sequence = self.timeline.authoritative_end_sequence;
+                let previous_plan = current_agent_plan(&self.timeline.items);
                 let updates_existing_item = self
                     .timeline
                     .authoritative_end_sequence
                     .is_some_and(|end| event.sequence <= end);
                 let changed = self.timeline.apply_live(event);
                 if changed {
+                    self.sync_composer_plan_completion(previous_plan, previous_end_sequence, cx);
                     if updates_existing_item {
                         self.invalidate_timeline_render_caches();
                     }
@@ -20006,6 +20185,270 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
+    fn render_composer_plan(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let session_id = self.selected_session_id.as_ref()?;
+        let plan = current_agent_plan(&self.timeline.items)?;
+        let completion = self.composer_plan_completion.as_ref().filter(|completion| {
+            &completion.session_id == session_id
+                && completion.turn_anchor_sequence == plan.turn_anchor_sequence
+                && plan.is_complete()
+        });
+
+        if let Some(completion) = completion {
+            let completed = h_flex()
+                .id("composer-plan-completed")
+                .w_full()
+                .h(px(40.0))
+                .items_center()
+                .justify_center()
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(cx.theme().success.opacity(0.42))
+                .bg(cx.theme().success.opacity(0.08))
+                .role(Role::Group)
+                .aria_label(locale::text("Plan completed", "计划已完成", "計劃已完成"))
+                .child(
+                    Icon::new(IconName::Check)
+                        .size(px(24.0))
+                        .text_color(cx.theme().success),
+                );
+            if self.ui_state.appearance.reduced_motion {
+                return Some(completed.into_any_element());
+            }
+            let animation_id = format!(
+                "composer-plan-completed-{}-{}",
+                completion.turn_anchor_sequence, completion.sequence
+            );
+            return Some(
+                completed
+                    .with_animation(
+                        animation_id,
+                        Animation::new(COMPOSER_PLAN_COMPLETION_DURATION),
+                        |this, delta| {
+                            let opacity = if delta < 0.16 {
+                                delta / 0.16
+                            } else if delta < 0.66 {
+                                1.0
+                            } else {
+                                1.0 - ((delta - 0.66) / 0.34).clamp(0.0, 1.0)
+                            };
+                            this.relative()
+                                .top(px(-2.0 * (1.0 - opacity)))
+                                .opacity(opacity)
+                        },
+                    )
+                    .into_any_element(),
+            );
+        }
+        if plan.is_complete() {
+            return None;
+        }
+
+        let locale = self.resolved_locale();
+        let current_step_number = plan.current_step_number();
+        let total_steps = plan.steps.len();
+        let completed_steps = plan.completed_step_count();
+        let progress = completed_steps as f32 / total_steps as f32 * 100.0;
+        let current_step = plan.steps.get(current_step_number.saturating_sub(1));
+        let failed = current_step.is_some_and(|step| step.status == PlanStepStatus::Failed);
+        let accent = if failed {
+            cx.theme().danger
+        } else {
+            cx.theme().primary
+        };
+        let plan_title = if plan.title.trim().is_empty() {
+            locale::text("Current plan", "当前计划", "目前計劃").to_string()
+        } else {
+            plan.title.clone()
+        };
+        let current_step_title = current_step
+            .map(|step| step.title.trim())
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| locale::text("Plan in progress", "计划进行中", "計劃進行中"));
+        let progress_label = composer_plan_progress_label(locale, current_step_number, total_steps);
+        let completed_label =
+            composer_plan_completed_steps_label(locale, completed_steps, total_steps);
+        let aria_label = format!("{plan_title}: {current_step_title}; {progress_label}");
+        let tooltip_plan = plan.clone();
+        let tooltip_title = plan_title.clone();
+        let tooltip_completed_label = completed_label.clone();
+
+        Some(
+            h_flex()
+                .id("composer-plan-status")
+                .w_full()
+                .min_w_0()
+                .h(px(40.0))
+                .items_center()
+                .gap_2()
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(cx.theme().border)
+                .bg(composer_queue_surface_background(cx.theme().is_dark()))
+                .px_3()
+                .role(Role::Group)
+                .aria_label(aria_label)
+                .hover(|style| {
+                    style
+                        .bg(cx.theme().accent)
+                        .border_color(accent.opacity(0.38))
+                })
+                .child(
+                    ProgressCircle::new(format!(
+                        "composer-plan-progress-{}",
+                        plan.turn_anchor_sequence
+                    ))
+                    .value(progress)
+                    .color(accent)
+                    .size(px(24.0)),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_sm()
+                        .font_medium()
+                        .child(format!("{plan_title} · {current_step_title}")),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(if failed {
+                            cx.theme().danger
+                        } else {
+                            cx.theme().muted_foreground
+                        })
+                        .child(progress_label),
+                )
+                .tooltip(move |window, cx| {
+                    let plan = tooltip_plan.clone();
+                    let title = tooltip_title.clone();
+                    let completed_label = tooltip_completed_label.clone();
+                    Tooltip::element(move |_, cx| {
+                        let mut steps = v_flex()
+                            .w_full()
+                            .max_h(px(COMPOSER_PLAN_TOOLTIP_MAX_HEIGHT - 74.0))
+                            .overflow_y_scrollbar();
+                        for (index, step) in plan.steps.iter().enumerate() {
+                            let icon = match step.status {
+                                PlanStepStatus::Pending => div()
+                                    .size(px(14.0))
+                                    .rounded_full()
+                                    .border_1()
+                                    .border_color(cx.theme().muted_foreground.opacity(0.50))
+                                    .into_any_element(),
+                                PlanStepStatus::Running => ProgressCircle::new(format!(
+                                    "composer-plan-tooltip-running-{}-{index}",
+                                    plan.turn_anchor_sequence
+                                ))
+                                .loading(true)
+                                .color(cx.theme().primary)
+                                .size(px(22.0))
+                                .into_any_element(),
+                                PlanStepStatus::Completed => Icon::new(IconName::CircleCheck)
+                                    .size(px(17.0))
+                                    .text_color(cx.theme().success)
+                                    .into_any_element(),
+                                PlanStepStatus::Failed => Icon::new(IconName::CircleX)
+                                    .size(px(17.0))
+                                    .text_color(cx.theme().danger)
+                                    .into_any_element(),
+                            };
+                            steps = steps.child(
+                                h_flex()
+                                    .w_full()
+                                    .min_w_0()
+                                    .min_h(px(34.0))
+                                    .items_start()
+                                    .gap_2()
+                                    .py_1()
+                                    .child(
+                                        div()
+                                            .w(px(18.0))
+                                            .h(px(20.0))
+                                            .flex_none()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(icon),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .whitespace_normal()
+                                            .text_sm()
+                                            .line_height(px(20.0))
+                                            .text_color(if step.status == PlanStepStatus::Pending {
+                                                cx.theme().muted_foreground
+                                            } else {
+                                                cx.theme().popover_foreground
+                                            })
+                                            .child(step.title.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .pt(px(2.0))
+                                            .text_xs()
+                                            .text_color(match step.status {
+                                                PlanStepStatus::Running => cx.theme().primary,
+                                                PlanStepStatus::Completed => cx.theme().success,
+                                                PlanStepStatus::Failed => cx.theme().danger,
+                                                PlanStepStatus::Pending => {
+                                                    cx.theme().muted_foreground
+                                                }
+                                            })
+                                            .child(composer_plan_step_status_label(step.status)),
+                                    ),
+                            );
+                        }
+                        v_flex()
+                            .w(px(COMPOSER_PLAN_TOOLTIP_WIDTH))
+                            .max_h(px(COMPOSER_PLAN_TOOLTIP_MAX_HEIGHT))
+                            .gap_2()
+                            .p_2()
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .min_w_0()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        Icon::default()
+                                            .path("icons/vibex/list-checks.svg")
+                                            .size(px(16.0))
+                                            .text_color(cx.theme().primary),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .truncate()
+                                            .font_medium()
+                                            .child(title.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(completed_label.clone()),
+                                    ),
+                            )
+                            .child(div().w_full().h(px(1.0)).bg(cx.theme().border))
+                            .child(steps)
+                    })
+                    .m_0()
+                    .p_0()
+                    .build(window, cx)
+                })
+                .into_any_element(),
+        )
+    }
+
     fn render_composer_queue(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let session_id = self.selected_session_id.clone()?;
         let messages = self
@@ -20438,6 +20881,7 @@ impl VibexWorkbench {
         let content_max_width = session_content_max_width(self.ui_state.session.content_width);
         let is_dark = cx.theme().is_dark();
         let composer_background = composer_surface_background(is_dark);
+        let composer_plan = self.render_composer_plan(cx);
         let composer_queue = self.render_composer_queue(cx);
         let composer_queue_visible = composer_queue.is_some();
         let input_geometry_entity = cx.weak_entity();
@@ -20696,6 +21140,16 @@ impl VibexWorkbench {
                         this.max_w(px(max_width))
                     })
                     .min_w_0()
+                    .when_some(composer_plan, |this, plan| {
+                        this.child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .px(px(COMPOSER_QUEUE_HORIZONTAL_INSET))
+                                .pb_2()
+                                .child(plan),
+                        )
+                    })
                     .when_some(composer_queue, |this, queue| {
                         this.child(
                             div()
@@ -27401,9 +27855,9 @@ mod tests {
     use vibex_core::{
         AgentCommandExecutionBehavior, AgentCommandSelectionBehavior, AgentId, AgentMessagePayload,
         GitWorktreeConflictFile, GitWorktreeMergeStrategy, GitWorktreeOperationDetail,
-        GitWorktreeOperationKind, ProviderProfileId, RuntimeOptionAvailability, SessionConfigValue,
-        SessionRuntimeOption, TimelineItemId, TimelineRedactionState, TimelineSource,
-        UserMessagePayload, WorkspaceId,
+        GitWorktreeOperationKind, PlanPayload, PlanStepPayload, ProviderProfileId,
+        RuntimeOptionAvailability, SessionConfigValue, SessionRuntimeOption, TimelineItemId,
+        TimelineRedactionState, TimelineSource, TodoUpdatePayload, UserMessagePayload, WorkspaceId,
     };
 
     #[test]
@@ -27530,6 +27984,104 @@ mod tests {
         index.sync(&timeline);
         assert_eq!(index.positions.len(), 1);
         assert_eq!(index.positions.get(&next_id), Some(&0));
+    }
+
+    #[test]
+    fn composer_plan_completion_requires_an_observed_transition() {
+        let step = |status| PlanStepPayload {
+            title: "Implement".into(),
+            status,
+        };
+        let previous = AgentPlanProjection {
+            sequence: 2,
+            turn_anchor_sequence: 1,
+            title: "Plan".into(),
+            steps: vec![step(PlanStepStatus::Running)],
+        };
+        let completed = AgentPlanProjection {
+            sequence: 3,
+            turn_anchor_sequence: 1,
+            title: "Plan".into(),
+            steps: vec![step(PlanStepStatus::Completed)],
+        };
+
+        assert!(composer_plan_completed_after(
+            Some(&previous),
+            Some(&completed),
+            &[],
+            Some(2),
+        ));
+        assert!(!composer_plan_completed_after(
+            None,
+            Some(&completed),
+            &[],
+            None,
+        ));
+        assert!(!composer_plan_completed_after(
+            Some(&previous),
+            None,
+            &[],
+            Some(2),
+        ));
+    }
+
+    #[test]
+    fn composer_plan_completion_detects_a_batched_snapshot_transition() {
+        let session_id = VibexSessionId::parse("session_plan_batch").unwrap();
+        let item = |sequence, payload: TimelinePayload, source| TimelineItem {
+            id: TimelineItemId::new(),
+            session_id: session_id.clone(),
+            sequence,
+            timestamp_ms: sequence,
+            source,
+            kind: payload.kind(),
+            correlation_id: None,
+            provider_correlation_id: None,
+            redaction_state: TimelineRedactionState::None,
+            execution_attribution: None,
+            payload,
+        };
+        let items = vec![
+            item(
+                1,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "Implement".into(),
+                    attachments: Vec::new(),
+                }),
+                TimelineSource::User,
+            ),
+            item(
+                2,
+                TimelinePayload::Plan(PlanPayload {
+                    title: "Plan".into(),
+                    steps: vec![PlanStepPayload {
+                        title: "Implement".into(),
+                        status: PlanStepStatus::Running,
+                    }],
+                }),
+                TimelineSource::Agent,
+            ),
+            item(
+                3,
+                TimelinePayload::TodoUpdate(TodoUpdatePayload {
+                    title: "Plan".into(),
+                    items: vec![PlanStepPayload {
+                        title: "Implement".into(),
+                        status: PlanStepStatus::Completed,
+                    }],
+                    raw_extension: None,
+                }),
+                TimelineSource::Agent,
+            ),
+        ];
+        let completed = current_agent_plan(&items).unwrap();
+
+        assert!(composer_plan_completed_after(
+            None,
+            Some(&completed),
+            &items,
+            Some(1),
+        ));
     }
 
     #[test]
@@ -30156,6 +30708,25 @@ mod tests {
         assert!(composer.contains("px(-2.0)"));
         assert!(composer.contains(".blur_radius(px(6.0))"));
         assert!(composer.contains(".px(px(COMPOSER_QUEUE_HORIZONTAL_INSET))"));
+        let plan_position = composer
+            .find(".when_some(composer_plan, |this, plan|")
+            .expect("the active plan should render above the composer");
+        let queue_position = composer
+            .find(".when_some(composer_queue, |this, queue|")
+            .expect("the queued messages should remain attached to the composer");
+        assert!(plan_position < queue_position);
+
+        let plan = source
+            .split_once("    fn render_composer_plan(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_queue("))
+            .map(|(body, _)| body)
+            .expect("composer plan renderer should remain inspectable");
+        assert!(plan.contains("current_agent_plan(&self.timeline.items)"));
+        assert!(plan.contains("ProgressCircle::new"));
+        assert!(plan.contains("Tooltip::element"));
+        assert!(plan.contains("composer_plan_step_status_label"));
+        assert!(plan.contains("COMPOSER_PLAN_COMPLETION_DURATION"));
+        assert!(plan.contains("IconName::Check"));
 
         let queue = source
             .split_once("    fn render_composer_queue(")

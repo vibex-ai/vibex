@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use vibex_core::{
-    AgentSession, AgentSessionState, FileOperationPayload, PermissionRequestStatus, TimelineItem,
-    TimelineItemKind, TimelinePayload, VibexSessionId,
+    AgentSession, AgentSessionState, FileOperationPayload, PermissionRequestStatus,
+    PlanStepPayload, PlanStepStatus, TimelineItem, TimelineItemKind, TimelinePayload,
+    VibexSessionId,
 };
 
 use crate::SidebarState;
@@ -226,6 +227,77 @@ pub struct TimelineProcessActivityGroup {
     pub end_row: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPlanProjection {
+    pub sequence: i64,
+    pub turn_anchor_sequence: i64,
+    pub title: String,
+    pub steps: Vec<PlanStepPayload>,
+}
+
+impl AgentPlanProjection {
+    pub fn completed_step_count(&self) -> usize {
+        self.steps
+            .iter()
+            .filter(|step| step.status == PlanStepStatus::Completed)
+            .count()
+    }
+
+    pub fn current_step_number(&self) -> usize {
+        self.steps
+            .iter()
+            .position(|step| step.status == PlanStepStatus::Running)
+            .or_else(|| {
+                self.steps
+                    .iter()
+                    .position(|step| step.status == PlanStepStatus::Failed)
+            })
+            .or_else(|| {
+                self.steps
+                    .iter()
+                    .position(|step| step.status == PlanStepStatus::Pending)
+            })
+            .map(|index| index + 1)
+            .unwrap_or(self.steps.len())
+    }
+
+    pub fn is_complete(&self) -> bool {
+        !self.steps.is_empty()
+            && self
+                .steps
+                .iter()
+                .all(|step| step.status == PlanStepStatus::Completed)
+    }
+}
+
+pub fn current_agent_plan(items: &[TimelineItem]) -> Option<AgentPlanProjection> {
+    let turn_anchor_sequence = items
+        .iter()
+        .rev()
+        .find(|item| item.kind == TimelineItemKind::UserMessage)
+        .map(|item| item.sequence)
+        .unwrap_or_default();
+
+    items
+        .iter()
+        .rev()
+        .take_while(|item| item.sequence > turn_anchor_sequence)
+        .find_map(|item| {
+            let (title, steps) = match &item.payload {
+                TimelinePayload::Plan(plan) => (&plan.title, &plan.steps),
+                TimelinePayload::TodoUpdate(todo) => (&todo.title, &todo.items),
+                _ => return None,
+            };
+            (!steps.is_empty()).then(|| AgentPlanProjection {
+                sequence: item.sequence,
+                turn_anchor_sequence,
+                title: title.clone(),
+                steps: steps.clone(),
+            })
+        })
+}
+
 pub fn timeline_conversation_turns(
     items: &[TimelineItem],
     session_state: Option<AgentSessionState>,
@@ -297,6 +369,10 @@ pub fn timeline_conversation_turns(
                 .collect::<BTreeSet<_>>();
             turn_rows.retain(|row| {
                 row.kind != TimelineRowKind::PermissionResolution
+                    && !matches!(
+                        row.kind,
+                        TimelineRowKind::Plan | TimelineRowKind::TodoUpdate
+                    )
                     && !row
                         .item_ids
                         .iter()
@@ -1124,10 +1200,10 @@ mod tests {
     use super::*;
     use serde_json::json;
     use vibex_core::{
-        AgentId, AgentMessageDeltaPayload, AgentMessagePayload, AgentSessionSafety, ProjectId,
-        ReasoningPayload, TimelineItemId, TimelineRedactionState, TimelineSource, ToolCallPayload,
-        ToolCallStatus, TurnExecutionAttributionView, UserMessagePayload, WorkspaceId,
-        WorkspaceMode,
+        AgentId, AgentMessageDeltaPayload, AgentMessagePayload, AgentSessionSafety, PlanPayload,
+        ProjectId, ReasoningPayload, TimelineItemId, TimelineRedactionState, TimelineSource,
+        TodoUpdatePayload, ToolCallPayload, ToolCallStatus, TurnExecutionAttributionView,
+        UserMessagePayload, WorkspaceId, WorkspaceMode,
     };
 
     fn session(id: &str, project: &str, title: &str, updated_at_ms: i64) -> AgentSession {
@@ -1555,6 +1631,147 @@ mod tests {
         assert_eq!(conclusion.body, "I am Codex");
         assert_eq!(conclusion.item_ids.len(), 3);
         assert!(turns[0].complete);
+    }
+
+    #[test]
+    fn current_plan_uses_the_latest_provider_neutral_snapshot_in_the_active_turn() {
+        let items = [
+            item(
+                1,
+                None,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "Implement the feature".into(),
+                    attachments: Vec::new(),
+                }),
+            ),
+            item(
+                2,
+                None,
+                TimelinePayload::Plan(PlanPayload {
+                    title: "Plan".into(),
+                    steps: vec![
+                        PlanStepPayload {
+                            title: "Inspect".into(),
+                            status: PlanStepStatus::Running,
+                        },
+                        PlanStepPayload {
+                            title: "Implement".into(),
+                            status: PlanStepStatus::Pending,
+                        },
+                    ],
+                }),
+            ),
+            item(
+                3,
+                None,
+                TimelinePayload::TodoUpdate(TodoUpdatePayload {
+                    title: "Implementation tasks".into(),
+                    items: vec![
+                        PlanStepPayload {
+                            title: "Inspect".into(),
+                            status: PlanStepStatus::Completed,
+                        },
+                        PlanStepPayload {
+                            title: "Implement".into(),
+                            status: PlanStepStatus::Running,
+                        },
+                    ],
+                    raw_extension: None,
+                }),
+            ),
+        ];
+
+        let plan = current_agent_plan(&items).unwrap();
+
+        assert_eq!(plan.sequence, 3);
+        assert_eq!(plan.turn_anchor_sequence, 1);
+        assert_eq!(plan.title, "Implementation tasks");
+        assert_eq!(plan.completed_step_count(), 1);
+        assert_eq!(plan.current_step_number(), 2);
+        assert!(!plan.is_complete());
+    }
+
+    #[test]
+    fn current_plan_resets_when_a_new_user_turn_starts() {
+        let items = [
+            item(
+                1,
+                None,
+                TimelinePayload::Plan(PlanPayload {
+                    title: "Old plan".into(),
+                    steps: vec![PlanStepPayload {
+                        title: "Old step".into(),
+                        status: PlanStepStatus::Running,
+                    }],
+                }),
+            ),
+            item(
+                2,
+                None,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "Start something else".into(),
+                    attachments: Vec::new(),
+                }),
+            ),
+        ];
+
+        assert!(current_agent_plan(&items).is_none());
+    }
+
+    #[test]
+    fn conversation_turn_projection_moves_plan_rows_out_of_the_chat_flow() {
+        let items = [
+            item(
+                1,
+                None,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "Implement".into(),
+                    attachments: Vec::new(),
+                }),
+            ),
+            item(
+                2,
+                None,
+                TimelinePayload::Plan(PlanPayload {
+                    title: "Plan".into(),
+                    steps: vec![PlanStepPayload {
+                        title: "Inspect".into(),
+                        status: PlanStepStatus::Running,
+                    }],
+                }),
+            ),
+            item(
+                3,
+                None,
+                TimelinePayload::TodoUpdate(TodoUpdatePayload {
+                    title: "Todo".into(),
+                    items: vec![PlanStepPayload {
+                        title: "Inspect".into(),
+                        status: PlanStepStatus::Completed,
+                    }],
+                    raw_extension: None,
+                }),
+            ),
+            item(
+                4,
+                None,
+                TimelinePayload::ToolCall(ToolCallPayload {
+                    tool_call_id: "tool_read".into(),
+                    tool_name: "read".into(),
+                    status: ToolCallStatus::Completed,
+                    summary: "Read files".into(),
+                    input_summary: Some("src/lib.rs".into()),
+                    output_summary: None,
+                    raw_extension: None,
+                }),
+            ),
+        ];
+
+        let turns = timeline_conversation_turns(&items, Some(AgentSessionState::Running), false);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].process_rows.len(), 1);
+        assert_eq!(turns[0].process_rows[0].kind, TimelineRowKind::ToolCall);
     }
 
     #[test]
