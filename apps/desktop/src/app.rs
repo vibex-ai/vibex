@@ -247,7 +247,6 @@ const COMPOSER_PLAN_TOOLTIP_WIDTH: f32 = 360.0;
 const COMPOSER_PLAN_TOOLTIP_MAX_HEIGHT: f32 = 420.0;
 const COMPOSER_PLAN_EXPANDED_MAX_HEIGHT: f32 = 320.0;
 const COMPOSER_PLAN_TOOLTIP_DELAY: Duration = Duration::from_secs(2);
-const COMPOSER_PLAN_COMPLETION_DURATION: Duration = Duration::from_millis(1_100);
 const COMPOSER_SURFACE_MIN_HEIGHT: f32 = 96.0;
 const COMPOSER_TEXT_AREA_MIN_HEIGHT: f32 = 52.0;
 const COMPOSER_SURFACE_RADIUS: f32 = 20.0;
@@ -1046,50 +1045,6 @@ fn render_composer_plan_details(
         .child(div().w_full().h(px(1.0)).bg(cx.theme().border))
         .child(steps)
         .into_any_element()
-}
-
-fn composer_plan_completed_after(
-    previous: Option<&AgentPlanProjection>,
-    current: Option<&AgentPlanProjection>,
-    items: &[TimelineItem],
-    previous_end_sequence: Option<i64>,
-) -> bool {
-    let Some(current) = current.filter(|plan| plan.is_complete()) else {
-        return false;
-    };
-    if previous.is_some_and(|plan| {
-        plan.turn_anchor_sequence == current.turn_anchor_sequence && !plan.is_complete()
-    }) {
-        return true;
-    }
-
-    let previous_end_sequence = previous_end_sequence.unwrap_or_default();
-    let mut saw_incomplete_snapshot = false;
-    for item in items.iter().filter(|item| {
-        item.sequence > previous_end_sequence
-            && item.sequence > current.turn_anchor_sequence
-            && item.sequence <= current.sequence
-    }) {
-        let steps = match &item.payload {
-            TimelinePayload::Plan(plan) => &plan.steps,
-            TimelinePayload::TodoUpdate(todo) => &todo.items,
-            _ => continue,
-        };
-        if steps.is_empty() {
-            continue;
-        }
-        if steps
-            .iter()
-            .all(|step| step.status == PlanStepStatus::Completed)
-        {
-            if saw_incomplete_snapshot {
-                return true;
-            }
-        } else {
-            saw_incomplete_snapshot = true;
-        }
-    }
-    false
 }
 
 fn partition_terminal_sessions(
@@ -2870,13 +2825,6 @@ struct ComposerQueueDropTarget {
     after: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ComposerPlanCompletion {
-    session_id: VibexSessionId,
-    sequence: i64,
-    turn_anchor_sequence: i64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ComposerPlanIdentity {
     session_id: String,
@@ -3104,8 +3052,6 @@ pub struct VibexWorkbench {
     composer_queue_drop_target: Option<ComposerQueueDropTarget>,
     composer_plan_expanded: Option<ComposerPlanIdentity>,
     dismissed_composer_plans: BTreeSet<ComposerPlanIdentity>,
-    composer_plan_completion: Option<ComposerPlanCompletion>,
-    composer_plan_completion_task: Option<Task<()>>,
     attachment_image_preview: Option<AttachmentImagePreviewState>,
     composer_expanded: bool,
     composer_terminals: Vec<TerminalSession>,
@@ -3628,8 +3574,6 @@ impl VibexWorkbench {
             composer_queue_drop_target: None,
             composer_plan_expanded: None,
             dismissed_composer_plans: BTreeSet::new(),
-            composer_plan_completion: None,
-            composer_plan_completion_task: None,
             attachment_image_preview: None,
             composer_expanded: false,
             composer_terminals: Vec::new(),
@@ -5718,8 +5662,6 @@ impl VibexWorkbench {
         self.agent_action_pending = false;
         self.agent_turn_pending = self.session_turn_pending(&session_id);
         self.agent_error = None;
-        self.composer_plan_completion = None;
-        self.composer_plan_completion_task = None;
         self.timeline_scroll_to_latest_pending = false;
         self.timeline_scroll_wheel_idle_task = None;
         self.timeline_duration_tick_task = None;
@@ -5832,14 +5774,6 @@ impl VibexWorkbench {
                     this.finish_startup_loading();
                     match outcome {
                         Ok(Ok(items)) => {
-                            let timeline_was_loaded =
-                                this.timeline.session_id.as_ref() == Some(&session_id);
-                            let previous_plan = timeline_was_loaded
-                                .then(|| current_agent_plan(&this.timeline.items))
-                                .flatten();
-                            let previous_end_sequence = timeline_was_loaded
-                                .then_some(this.timeline.authoritative_end_sequence)
-                                .flatten();
                             let content_changed = this.timeline.session_id.as_ref()
                                 != Some(&session_id)
                                 || this.timeline.items != items;
@@ -5848,13 +5782,6 @@ impl VibexWorkbench {
                             }
                             this.timeline
                                 .replace_authoritative(session_id.clone(), items);
-                            if timeline_was_loaded {
-                                this.sync_composer_plan_completion(
-                                    previous_plan,
-                                    previous_end_sequence,
-                                    cx,
-                                );
-                            }
                             this.rebuild_timeline_sizes();
                             this.start_agent_poll(
                                 poll_runtime.clone(),
@@ -5901,68 +5828,6 @@ impl VibexWorkbench {
             self.session_generation,
             cx,
         );
-    }
-
-    fn sync_composer_plan_completion(
-        &mut self,
-        previous_plan: Option<AgentPlanProjection>,
-        previous_end_sequence: Option<i64>,
-        cx: &mut Context<Self>,
-    ) {
-        let current_plan = current_agent_plan(&self.timeline.items);
-        let newly_completed = composer_plan_completed_after(
-            previous_plan.as_ref(),
-            current_plan.as_ref(),
-            &self.timeline.items,
-            previous_end_sequence,
-        );
-
-        if !newly_completed {
-            let completion_is_current =
-                self.composer_plan_completion
-                    .as_ref()
-                    .is_some_and(|completion| {
-                        self.selected_session_id.as_ref() == Some(&completion.session_id)
-                            && current_plan.as_ref().is_some_and(|plan| {
-                                plan.is_complete()
-                                    && plan.turn_anchor_sequence == completion.turn_anchor_sequence
-                            })
-                    });
-            if !completion_is_current {
-                self.composer_plan_completion = None;
-                self.composer_plan_completion_task = None;
-            }
-            return;
-        }
-
-        let (Some(session_id), Some(plan)) =
-            (self.selected_session_id.clone(), current_plan.as_ref())
-        else {
-            return;
-        };
-        let completion = ComposerPlanCompletion {
-            session_id,
-            sequence: plan.sequence,
-            turn_anchor_sequence: plan.turn_anchor_sequence,
-        };
-        if self.composer_plan_completion.as_ref() == Some(&completion) {
-            return;
-        }
-
-        self.composer_plan_completion = Some(completion.clone());
-        self.composer_plan_completion_task = None;
-        self.composer_plan_completion_task = Some(cx.spawn(async move |entity, cx| {
-            cx.background_executor()
-                .timer(COMPOSER_PLAN_COMPLETION_DURATION)
-                .await;
-            let _ = entity.update(cx, |this, cx| {
-                this.composer_plan_completion_task = None;
-                if this.composer_plan_completion.as_ref() == Some(&completion) {
-                    this.composer_plan_completion = None;
-                    cx.notify();
-                }
-            });
-        }));
     }
 
     fn load_agent_session_projection(
@@ -6282,16 +6147,9 @@ impl VibexWorkbench {
         let streaming_updates = (!updates_existing_item)
             .then(|| agent_streaming_delta_updates(&events))
             .flatten();
-        let previous_plan = streaming_updates
-            .is_none()
-            .then(|| current_agent_plan(&self.timeline.items))
-            .flatten();
         let changed = self.timeline.apply_live_batch(events);
         if changed > 0 {
             let mut streaming_cache_update = None;
-            if streaming_updates.is_none() {
-                self.sync_composer_plan_completion(previous_plan, previous_end_sequence, cx);
-            }
             if updates_existing_item {
                 self.invalidate_timeline_render_caches();
             } else if !self.timeline.needs_authoritative_refetch
@@ -6319,7 +6177,7 @@ impl VibexWorkbench {
                 self.refresh_last_timeline_size_incrementally(update)
             } else {
                 self.streaming_row_metrics = None;
-                self.rebuild_timeline_sizes()
+                self.refresh_last_timeline_size()
             };
             if timeline_should_auto_follow_content(
                 self.timeline_follow.following_bottom,
@@ -6447,10 +6305,11 @@ impl VibexWorkbench {
 
     fn refresh_last_timeline_size(&mut self) -> bool {
         self.timeline_pending_turn_heights.clear();
-        let Some(turn) = self.conversation_turns_cache.last().cloned() else {
+        let turns = self.conversation_turns_cached();
+        let Some(turn) = turns.last().cloned() else {
             return self.rebuild_timeline_sizes();
         };
-        if self.timeline_row_sizes.len() != self.conversation_turns_cache.len() {
+        if self.timeline_row_sizes.len() != turns.len() {
             return self.rebuild_timeline_sizes();
         }
         self.timeline_measured_turn_heights.remove(&turn.id);
@@ -20752,6 +20611,7 @@ impl VibexWorkbench {
             .id(row.id.clone())
             .w_full()
             .min_w_0()
+            .flex_none()
             .overflow_hidden()
             .rounded_lg()
             .border_1()
@@ -20925,6 +20785,7 @@ impl VibexWorkbench {
             .id(row.id.clone())
             .w_full()
             .min_w_0()
+            .flex_none()
             .overflow_hidden()
             .rounded_lg()
             .border_1()
@@ -21148,6 +21009,7 @@ impl VibexWorkbench {
             .id(row.id.clone())
             .w_full()
             .min_w_0()
+            .flex_none()
             .overflow_hidden()
             .rounded_lg()
             .border_1()
@@ -22178,70 +22040,18 @@ impl VibexWorkbench {
         if self.dismissed_composer_plans.contains(&identity) {
             return None;
         }
-        let completion = self.composer_plan_completion.as_ref().filter(|completion| {
-            &completion.session_id == session_id
-                && completion.turn_anchor_sequence == plan.turn_anchor_sequence
-                && plan.is_complete()
-        });
-
-        if let Some(completion) = completion {
-            let completed = h_flex()
-                .id("composer-plan-completed")
-                .w_full()
-                .h(px(40.0))
-                .items_center()
-                .justify_center()
-                .rounded(px(8.0))
-                .border_1()
-                .border_color(cx.theme().success.opacity(0.42))
-                .bg(cx.theme().success.opacity(0.08))
-                .role(Role::Group)
-                .aria_label(locale::text("Plan completed", "计划已完成", "計劃已完成"))
-                .child(
-                    Icon::new(IconName::Check)
-                        .size(px(24.0))
-                        .text_color(cx.theme().success),
-                );
-            if self.ui_state.appearance.reduced_motion {
-                return Some(completed.into_any_element());
-            }
-            let animation_id = format!(
-                "composer-plan-completed-{}-{}",
-                completion.turn_anchor_sequence, completion.sequence
-            );
-            return Some(
-                completed
-                    .with_animation(
-                        animation_id,
-                        Animation::new(COMPOSER_PLAN_COMPLETION_DURATION),
-                        |this, delta| {
-                            let opacity = if delta < 0.16 {
-                                delta / 0.16
-                            } else if delta < 0.66 {
-                                1.0
-                            } else {
-                                1.0 - ((delta - 0.66) / 0.34).clamp(0.0, 1.0)
-                            };
-                            this.relative()
-                                .top(px(-2.0 * (1.0 - opacity)))
-                                .opacity(opacity)
-                        },
-                    )
-                    .into_any_element(),
-            );
-        }
-        if plan.is_complete() {
-            return None;
-        }
 
         let locale = self.resolved_locale();
+        let complete = plan.is_complete();
         let current_step_number = plan.current_step_number();
         let total_steps = plan.steps.len();
         let completed_steps = plan.completed_step_count();
         let progress = completed_steps as f32 / total_steps as f32 * 100.0;
         let current_step = plan.steps.get(current_step_number.saturating_sub(1));
         let failed = current_step.is_some_and(|step| step.status == PlanStepStatus::Failed);
-        let accent = if failed {
+        let accent = if complete {
+            cx.theme().success
+        } else if failed {
             cx.theme().danger
         } else {
             cx.theme().primary
@@ -22300,15 +22110,21 @@ impl VibexWorkbench {
                 }
                 cx.notify();
             }))
-            .child(
+            .child(if complete {
+                Icon::new(IconName::CircleCheck)
+                    .size(px(24.0))
+                    .text_color(cx.theme().success)
+                    .into_any_element()
+            } else {
                 ProgressCircle::new(format!(
                     "composer-plan-progress-{}",
                     plan.turn_anchor_sequence
                 ))
                 .value(progress)
                 .color(accent)
-                .size(px(24.0)),
-            )
+                .size(px(24.0))
+                .into_any_element()
+            })
             .child(
                 div()
                     .min_w_0()
@@ -30443,45 +30259,6 @@ mod tests {
     }
 
     #[test]
-    fn composer_plan_completion_requires_an_observed_transition() {
-        let step = |status| PlanStepPayload {
-            title: "Implement".into(),
-            status,
-        };
-        let previous = AgentPlanProjection {
-            sequence: 2,
-            turn_anchor_sequence: 1,
-            title: "Plan".into(),
-            steps: vec![step(PlanStepStatus::Running)],
-        };
-        let completed = AgentPlanProjection {
-            sequence: 3,
-            turn_anchor_sequence: 1,
-            title: "Plan".into(),
-            steps: vec![step(PlanStepStatus::Completed)],
-        };
-
-        assert!(composer_plan_completed_after(
-            Some(&previous),
-            Some(&completed),
-            &[],
-            Some(2),
-        ));
-        assert!(!composer_plan_completed_after(
-            None,
-            Some(&completed),
-            &[],
-            None,
-        ));
-        assert!(!composer_plan_completed_after(
-            Some(&previous),
-            None,
-            &[],
-            Some(2),
-        ));
-    }
-
-    #[test]
     fn composer_plan_identity_survives_updates_and_changes_for_a_new_plan() {
         let session_id = VibexSessionId::parse("session_plan_identity").unwrap();
         let item = |sequence, payload: TimelinePayload, source| TimelineItem {
@@ -30545,65 +30322,6 @@ mod tests {
 
         assert_eq!(new_identity.plan_sequence, 4);
         assert_ne!(dismissed_identity, new_identity);
-    }
-
-    #[test]
-    fn composer_plan_completion_detects_a_batched_snapshot_transition() {
-        let session_id = VibexSessionId::parse("session_plan_batch").unwrap();
-        let item = |sequence, payload: TimelinePayload, source| TimelineItem {
-            id: TimelineItemId::new(),
-            session_id: session_id.clone(),
-            sequence,
-            timestamp_ms: sequence,
-            source,
-            kind: payload.kind(),
-            correlation_id: None,
-            provider_correlation_id: None,
-            redaction_state: TimelineRedactionState::None,
-            execution_attribution: None,
-            payload,
-        };
-        let items = vec![
-            item(
-                1,
-                TimelinePayload::UserMessage(UserMessagePayload {
-                    text: "Implement".into(),
-                    attachments: Vec::new(),
-                }),
-                TimelineSource::User,
-            ),
-            item(
-                2,
-                TimelinePayload::Plan(PlanPayload {
-                    title: "Plan".into(),
-                    steps: vec![PlanStepPayload {
-                        title: "Implement".into(),
-                        status: PlanStepStatus::Running,
-                    }],
-                }),
-                TimelineSource::Agent,
-            ),
-            item(
-                3,
-                TimelinePayload::TodoUpdate(TodoUpdatePayload {
-                    title: "Plan".into(),
-                    items: vec![PlanStepPayload {
-                        title: "Implement".into(),
-                        status: PlanStepStatus::Completed,
-                    }],
-                    raw_extension: None,
-                }),
-                TimelineSource::Agent,
-            ),
-        ];
-        let completed = current_agent_plan(&items).unwrap();
-
-        assert!(composer_plan_completed_after(
-            None,
-            Some(&completed),
-            &items,
-            Some(1),
-        ));
     }
 
     #[test]
@@ -32877,6 +32595,41 @@ mod tests {
     }
 
     #[test]
+    fn appended_structured_timeline_cards_refresh_and_preserve_their_height() {
+        let source = include_str!("app.rs");
+        let live_batch = source
+            .split_once("    fn apply_live_timeline_batch(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn apply_desktop_event("))
+            .map(|(body, _)| body)
+            .expect("timeline event batching should remain inspectable");
+        assert!(live_batch.contains("self.refresh_last_timeline_size()"));
+
+        let refresh = source
+            .split_once("    fn refresh_last_timeline_size(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn refresh_last_timeline_size_incrementally("))
+            .map(|(body, _)| body)
+            .expect("last-turn height refresh should remain inspectable");
+        assert!(refresh.contains("let turns = self.conversation_turns_cached();"));
+        assert!(refresh.contains("self.timeline_measured_turn_heights.remove(&turn.id);"));
+
+        for (renderer, next_renderer) in [
+            ("render_command_execution_card", "render_file_operation_card"),
+            ("render_file_operation_card", "render_agent_file_diff_preview"),
+            ("render_image_generation_card", "render_error_row"),
+        ] {
+            let card = source
+                .split_once(&format!("    fn {renderer}("))
+                .and_then(|(_, tail)| tail.split_once(&format!("\n    fn {next_renderer}(")))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("{renderer} should remain inspectable"));
+            assert!(
+                card.contains(".flex_none()"),
+                "{renderer} must not shrink inside an estimated timeline turn"
+            );
+        }
+    }
+
+    #[test]
     fn agent_errors_render_above_the_composer_instead_of_the_page_header() {
         let source = include_str!("app.rs");
         let workbench = source
@@ -33265,8 +33018,10 @@ mod tests {
         assert!(plan.contains("current_agent_plan(&self.timeline.items)"));
         assert!(plan.contains("ProgressCircle::new"));
         assert!(plan.contains("Tooltip::element"));
-        assert!(plan.contains("COMPOSER_PLAN_COMPLETION_DURATION"));
-        assert!(plan.contains("IconName::Check"));
+        assert!(plan.contains("let complete = plan.is_complete()"));
+        assert!(plan.contains("IconName::CircleCheck"));
+        assert!(!plan.contains("with_animation"));
+        assert!(!plan.contains("if plan.is_complete()"));
         assert!(plan.contains("toggle-composer-plan-expanded"));
         assert!(plan.contains("dismiss-composer-plan"));
         assert!(plan.contains("tooltip_show_delay(COMPOSER_PLAN_TOOLTIP_DELAY)"));
@@ -33274,7 +33029,7 @@ mod tests {
 
         let plan_details = source
             .split_once("fn render_composer_plan_details(")
-            .and_then(|(_, tail)| tail.split_once("\nfn composer_plan_completed_after("))
+            .and_then(|(_, tail)| tail.split_once("\nfn partition_terminal_sessions("))
             .map(|(body, _)| body)
             .expect("shared composer plan details should remain inspectable");
         assert!(plan_details.contains("composer_plan_step_status_label"));
