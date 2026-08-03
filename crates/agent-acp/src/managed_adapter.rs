@@ -247,11 +247,9 @@ impl ManagedAcpAdapterStore {
         let mut runtime_versions = BTreeMap::new();
         for dependency in &descriptor.distribution.runtime_dependencies {
             verify_declared_runtime_dependency(&adapter_manifest, dependency)?;
-            verify_locked_package(
+            verify_locked_runtime_dependency(
                 &lock,
-                &dependency.package,
-                &dependency.managed_pin,
-                &dependency.integrity,
+                dependency,
                 &descriptor.distribution.registry_origin,
             )?;
             let dependency_dir = package_directory(install_root, &dependency.package)?;
@@ -265,9 +263,10 @@ impl ManagedAcpAdapterStore {
             if descriptor.distribution.node_requirement_package == dependency.package {
                 observed_node_requirement = dependency_manifest.engines.node.clone();
             }
-            if !dependency
-                .declared_requirement
-                .matches(&dependency_manifest.version)
+            if !dependency.override_declared_requirement
+                && !dependency
+                    .declared_requirement
+                    .matches(&dependency_manifest.version)
             {
                 return Err(VibexError::validation(
                     "acp_managed_dependency_requirement_mismatch",
@@ -927,6 +926,51 @@ fn verify_locked_package(
         )
         .with_diagnostic("package", package)
     })?;
+    verify_locked_package_entry(locked, package, version, integrity, registry_origin)
+}
+
+fn verify_locked_runtime_dependency(
+    lock: &PackageLock,
+    dependency: &ManagedRuntimeDependency,
+    registry_origin: &str,
+) -> VibexResult<()> {
+    let package_suffix = format!("node_modules/{}", dependency.package);
+    verify_locked_package(
+        lock,
+        &dependency.package,
+        &dependency.managed_pin,
+        &dependency.integrity,
+        registry_origin,
+    )?;
+    let nested_entries = lock
+        .packages
+        .iter()
+        .filter(|(path, _)| {
+            path.as_str() != package_suffix
+                && path
+                    .strip_suffix(&package_suffix)
+                    .is_some_and(|prefix| prefix.ends_with('/'))
+        })
+        .collect::<Vec<_>>();
+    for (_, locked) in nested_entries {
+        verify_locked_package_entry(
+            locked,
+            &dependency.package,
+            &dependency.managed_pin,
+            &dependency.integrity,
+            registry_origin,
+        )?;
+    }
+    Ok(())
+}
+
+fn verify_locked_package_entry(
+    locked: &LockedPackage,
+    package: &str,
+    version: &Version,
+    integrity: &str,
+    registry_origin: &str,
+) -> VibexResult<()> {
     if locked.version.as_ref() != Some(version) {
         return Err(VibexError::validation(
             "acp_managed_package_lock_version_mismatch",
@@ -1063,11 +1107,31 @@ fn write_managed_package_manifest(
             Value::String(dependency.managed_pin.to_string()),
         );
     }
+    let runtime_overrides = descriptor
+        .distribution
+        .runtime_dependencies
+        .iter()
+        .filter(|dependency| dependency.override_declared_requirement)
+        .map(|dependency| {
+            (
+                dependency.package.clone(),
+                Value::String(dependency.managed_pin.to_string()),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let mut overrides = serde_json::Map::new();
+    if !runtime_overrides.is_empty() {
+        overrides.insert(
+            descriptor.distribution.package.clone(),
+            Value::Object(runtime_overrides),
+        );
+    }
     let manifest = json!({
         "name": format!("vibex-managed-{}", descriptor.adapter_id),
         "version": "0.0.0",
         "private": true,
         "dependencies": dependencies,
+        "overrides": overrides,
     });
     let bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| {
         VibexError::validation(
@@ -1221,8 +1285,9 @@ impl NpmInstallExecutor for SystemNpmInstallExecutor {
 mod tests {
     use super::*;
     use crate::registry::{
-        AcpCompatibilityRegistry, CLAUDE_AGENT_ID, CODEX_ADAPTER_INTEGRITY, CODEX_AGENT_ID,
-        CODEX_RUNTIME_INTEGRITY,
+        AcpCompatibilityRegistry, CLAUDE_ADAPTER_VERSION, CLAUDE_AGENT_ID, CODEX_ADAPTER_INTEGRITY,
+        CODEX_ADAPTER_VERSION, CODEX_AGENT_ID, CODEX_RUNTIME_DECLARED_REQUIREMENT,
+        CODEX_RUNTIME_INTEGRITY, CODEX_RUNTIME_PACKAGE, CODEX_RUNTIME_PIN,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
@@ -1392,7 +1457,7 @@ mod tests {
     const HEALTHY_SCRIPT: &str = r#"
 import readline from 'node:readline';
 if (process.argv.includes('--version')) {
-  console.log('0.58.1');
+  console.log('0.64.2');
   process.exit(0);
 }
 const rl = readline.createInterface({ input: process.stdin });
@@ -1402,7 +1467,7 @@ rl.once('line', (line) => {
     jsonrpc: '2.0', id: request.id,
     result: {
       protocolVersion: 1,
-      agentInfo: { name: '@agentclientprotocol/claude-agent-acp', version: '0.58.1' },
+      agentInfo: { name: '@agentclientprotocol/claude-agent-acp', version: '0.64.2' },
       agentCapabilities: {}
     }
   }));
@@ -1418,11 +1483,19 @@ rl.once('line', (line) => {
         assert_eq!(installer.calls.load(Ordering::Relaxed), 1);
         assert_eq!(
             installed.runtime_versions.get("@openai/codex"),
-            Some(&Version::parse("0.144.1").unwrap())
+            Some(&Version::parse(CODEX_RUNTIME_PIN).unwrap())
         );
         assert_eq!(
             installed.compatibility_identity.as_str(),
-            "adapter=codex-acp@1.1.2;runtime=@openai/codex@0.144.1"
+            descriptor.expected_compatibility_identity().as_str()
+        );
+        let managed_manifest: Value =
+            serde_json::from_slice(&fs::read(installed.install_root.join("package.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            managed_manifest["overrides"][descriptor.distribution.package.as_str()]
+                [CODEX_RUNTIME_PACKAGE],
+            CODEX_RUNTIME_PIN
         );
         assert!(installed.binary_identity.starts_with("sha256:"));
         assert!(installed.install_root.is_dir());
@@ -1494,14 +1567,31 @@ rl.once('line', (line) => {
                 &descriptor.distribution.package,
                 &descriptor.distribution.exact_version,
             ));
-        lock["packages"]["node_modules/@openai/codex"]["version"] = json!("0.144.0");
+        lock["packages"]["node_modules/@openai/codex"]["version"] = json!("0.145.0");
         lock["packages"]["node_modules/@openai/codex"]["integrity"] =
             json!(CODEX_RUNTIME_INTEGRITY);
         fs::write(&lock_path, serde_json::to_vec(&lock).unwrap()).unwrap();
         let err = store.inspect(&descriptor).unwrap_err();
         assert_eq!(err.code, "acp_managed_package_lock_version_mismatch");
 
-        lock["packages"]["node_modules/@openai/codex"]["version"] = json!("0.144.1");
+        lock["packages"]["node_modules/@openai/codex"]["version"] = json!(CODEX_RUNTIME_PIN);
+        lock["packages"]["node_modules/@agentclientprotocol/codex-acp/node_modules/@openai/codex"] = json!({
+            "version": "0.145.0",
+            "integrity": CODEX_RUNTIME_INTEGRITY,
+            "resolved": fixture_resolved_url(
+                &descriptor.distribution.registry_origin,
+                CODEX_RUNTIME_PACKAGE,
+                &Version::parse("0.145.0").unwrap(),
+            ),
+        });
+        fs::write(&lock_path, serde_json::to_vec(&lock).unwrap()).unwrap();
+        let err = store.inspect(&descriptor).unwrap_err();
+        assert_eq!(err.code, "acp_managed_package_lock_version_mismatch");
+
+        lock["packages"]
+            .as_object_mut()
+            .unwrap()
+            .remove("node_modules/@agentclientprotocol/codex-acp/node_modules/@openai/codex");
         fs::write(&lock_path, serde_json::to_vec(&lock).unwrap()).unwrap();
         let adapter_dir = package_directory(&root, &descriptor.distribution.package).unwrap();
         let adapter_manifest_path = adapter_dir.join("package.json");
@@ -1516,7 +1606,8 @@ rl.once('line', (line) => {
         let err = store.inspect(&descriptor).unwrap_err();
         assert_eq!(err.code, "acp_managed_dependency_declaration_mismatch");
 
-        adapter_manifest["dependencies"]["@openai/codex"] = json!("^0.144.0");
+        adapter_manifest["dependencies"]["@openai/codex"] =
+            json!(CODEX_RUNTIME_DECLARED_REQUIREMENT);
         fs::write(
             &adapter_manifest_path,
             serde_json::to_vec(&adapter_manifest).unwrap(),
@@ -1566,15 +1657,18 @@ rl.once('line', (line) => {
         let descriptor = descriptor(CLAUDE_AGENT_ID);
         store.install(&descriptor).await.unwrap();
         let report = store.health_probe(&descriptor).await.unwrap();
-        assert_eq!(report.adapter_version, "0.58.1");
-        assert_eq!(report.reported_adapter_version, "0.58.1");
+        assert_eq!(report.adapter_version, CLAUDE_ADAPTER_VERSION);
+        assert_eq!(report.reported_adapter_version, CLAUDE_ADAPTER_VERSION);
         assert_eq!(report.protocol_version.as_deref(), Some("1"));
-        assert_eq!(report.agent_version.as_deref(), Some("0.58.1"));
+        assert_eq!(
+            report.agent_version.as_deref(),
+            Some(CLAUDE_ADAPTER_VERSION)
+        );
     }
 
     #[tokio::test]
     async fn health_probe_rejects_wrong_version_and_timeout() {
-        let wrong_version_script = HEALTHY_SCRIPT.replace("0.58.1", "0.58.0");
+        let wrong_version_script = HEALTHY_SCRIPT.replace("0.64.2", "0.64.1");
         let temp = TempDir::new().unwrap();
         let (store, _) = fixture_store(&temp, &wrong_version_script, Duration::from_secs(2));
         let descriptor = descriptor(CLAUDE_AGENT_ID);
@@ -1583,7 +1677,7 @@ rl.once('line', (line) => {
         assert_eq!(err.code, "acp_managed_adapter_version_mismatch");
 
         let hanging_script = r#"
-if (process.argv.includes('--version')) { console.log('0.58.1'); process.exit(0); }
+if (process.argv.includes('--version')) { console.log('0.64.2'); process.exit(0); }
 process.stdin.resume();
 "#;
         let temp = TempDir::new().unwrap();
@@ -1596,7 +1690,7 @@ process.stdin.resume();
     #[tokio::test]
     async fn health_probe_reports_early_exit_and_redacts_sensitive_stderr() {
         let script = r#"
-if (process.argv.includes('--version')) { console.log('0.58.1'); process.exit(0); }
+if (process.argv.includes('--version')) { console.log('0.64.2'); process.exit(0); }
 console.error('token=must-not-leak');
 process.exit(7);
 "#;
@@ -1615,7 +1709,7 @@ process.exit(7);
     async fn health_probe_rejects_malformed_initialize_metadata() {
         let malformed_script = r#"
 import readline from 'node:readline';
-if (process.argv.includes('--version')) { console.log('0.58.1'); process.exit(0); }
+if (process.argv.includes('--version')) { console.log('0.64.2'); process.exit(0); }
 const rl = readline.createInterface({ input: process.stdin });
 rl.once('line', (line) => {
   const request = JSON.parse(line);
@@ -1623,7 +1717,7 @@ rl.once('line', (line) => {
     jsonrpc: '2.0', id: request.id,
     result: {
       protocolVersion: 1,
-      agentInfo: { name: '@agentclientprotocol/claude-agent-acp', version: '0.58.1' },
+      agentInfo: { name: '@agentclientprotocol/claude-agent-acp', version: '0.64.2' },
       agentCapabilities: []
     }
   }));
@@ -1644,8 +1738,10 @@ rl.once('line', (line) => {
             Some(Version::parse("26.4.0").unwrap())
         );
         assert_eq!(
-            parse_version_output("@agentclientprotocol/codex-acp 1.1.2"),
-            Some(Version::parse("1.1.2").unwrap())
+            parse_version_output(&format!(
+                "@agentclientprotocol/codex-acp {CODEX_ADAPTER_VERSION}"
+            )),
+            Some(Version::parse(CODEX_ADAPTER_VERSION).unwrap())
         );
     }
 

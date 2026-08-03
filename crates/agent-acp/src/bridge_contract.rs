@@ -1091,7 +1091,6 @@ fn contract_lock_error() -> VibexError {
 mod tests {
     use super::*;
     use crate::registry::{AcpCompatibilityRegistry, CLAUDE_AGENT_ID};
-    use semver::Version;
     use tempfile::TempDir;
     use vibex_core::{AcpAdapterId, AgentId};
 
@@ -1133,7 +1132,7 @@ mod tests {
             .clone();
         let installation = VerifiedAcpAdapterInstallation {
             adapter_id: AcpAdapterId::parse("claude-agent-acp").unwrap(),
-            adapter_version: Version::parse("0.58.1").unwrap(),
+            adapter_version: descriptor.distribution.exact_version.clone(),
             compatibility_identity: descriptor.expected_compatibility_identity(),
             binary_identity: "sha256:test".to_string(),
             runtime_versions: BTreeMap::new(),

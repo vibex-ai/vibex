@@ -122,7 +122,8 @@ use crate::{
 };
 
 /// Frozen wire expectation for tests; production initialize params carry the
-/// version through the typed schema (`sacp::schema::ProtocolVersion::V1`).
+/// version through the official typed schema
+/// (`agent_client_protocol_schema::ProtocolVersion::V1`).
 #[cfg(test)]
 const ACP_PROTOCOL_VERSION: i64 = 1;
 const ACP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -8268,8 +8269,8 @@ impl AcpRuntimeClient {
                 SessionConfigOperationEvidence {
                     support: CapabilitySupport::Supported,
                     source: CapabilitySource::NegotiatedRuntime,
-                    encoding: AcpWireEncoding::VersionedRaw,
-                    stability: AcpOperationStability::VersionedUnstable,
+                    encoding: AcpWireEncoding::Typed,
+                    stability: AcpOperationStability::CapabilityGated,
                     compatibility_identity: process.compatibility_identity.clone(),
                     activation_generation: 0,
                 },
@@ -13480,7 +13481,7 @@ mod tests {
         let raw_output = AgentEventRawOutput::new(AgentEventRawOutputMode::Append, "ok").0;
         let codex = normalize_tool_call_snapshot(
             AgentEventEnricherKind::Codex,
-            "adapter=codex-acp@1.1.2",
+            "adapter=codex-acp@1.1.9",
             "native-command-id".to_string(),
             ToolCallStatus::Completed,
             snapshot.clone(),
@@ -14743,7 +14744,7 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
 
     #[test]
     fn extracts_probe_reasoning_efforts_from_thought_level_config_option() {
-        // Shape emitted by claude-agent-acp 0.58.1: id "effort", category
+        // Shape emitted by claude-agent-acp: id "effort", category
         // "thought_level", options carrying a "default" sentinel first.
         let response = json!({
             "sessionId": "s1",

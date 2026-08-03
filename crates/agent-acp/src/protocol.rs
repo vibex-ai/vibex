@@ -5,8 +5,8 @@
 //!
 //! Design rules enforced here:
 //! - Stable-core outbound messages (`initialize`, `session/new`,
-//!   `session/prompt`, `session/cancel`) are built through typed `sacp`
-//!   schema types instead of hand-written field strings.
+//!   `session/load`, `session/prompt`, `session/cancel`) are built through the
+//!   official typed ACP v1 schema instead of hand-written field strings.
 //! - Method name strings are centralized in [`AcpOperation::method`].
 //! - Inbound traffic is classified through [`decode_incoming`], which keeps a
 //!   redacted, bounded [`BoundedRawAcpEnvelope`] next to the typed
@@ -14,28 +14,23 @@
 //! - `method-not-found` maps to a single-operation downgrade signal
 //!   ([`AcpProtocolError::MethodNotFound`]), never a connection failure.
 //!
-//! ## Known quirks between the fixed `sacp = 11.0.0` schema and the current
-//! Vibex wire behavior (wire behavior wins; do NOT change the wire to match
-//! the SDK):
+//! ## Known quirks between the fixed official schema and the current Vibex
+//! wire behavior (wire behavior wins; do NOT change the wire to match the
+//! schema):
 //!
 //! 1. `initialize.clientCapabilities` on the current wire carries the
 //!    adapter-extension keys `auth`, `mcpServers` and `meta` (plain `meta`,
-//!    not the spec's `_meta`). `sacp::schema::ClientCapabilities` cannot
-//!    represent them (its `auth` is feature-gated with a different shape),
-//!    so [`build_initialize_params`] serializes the typed base and then
-//!    splices these extension keys back in.
-//! 2. `sacp::schema::Implementation.title: Option<String>` has no
-//!    `skip_serializing_if`, so a typed `clientInfo` would emit
-//!    `"title": null`, which the current wire never sends. The builder
-//!    strips the null `title` after serialization.
-//! 3. `session/new.mcpServers` on the current wire uses the Vibex descriptor
+//!    not the spec's `_meta`). The stable
+//!    [`agent_client_protocol_schema::v1::ClientCapabilities`] surface cannot
+//!    represent them, so [`build_initialize_params`] serializes the typed base
+//!    and then splices these extension keys back in.
+//! 2. `session/new.mcpServers` on the current wire uses the Vibex descriptor
 //!    shape `{id, name, transport, command|url, args}` while
-//!    `sacp::schema::McpServer` is a `type`-tagged enum without `id` or
-//!    `transport`. The builder keeps the local descriptor serialization and
-//!    splices it into the typed `NewSessionRequest` base.
-//! 4. `session/load` params (`sessionId` + `cwd` + `mcpServers`) reuse the
-//!    same local `mcpServers` quirk (3).
-//! 5. Inbound decoding is deliberately tolerant: the runtime accepts looser
+//!    the official [`agent_client_protocol_schema::v1::McpServer`] wire shape
+//!    is different. The builder keeps the local descriptor serialization and
+//!    splices it into the typed request base.
+//! 3. `session/load` reuses the same local `mcpServers` quirk (2).
+//! 4. Inbound decoding is deliberately tolerant: the runtime accepts looser
 //!    shapes than the fixed schema (e.g. permissive permission-request and
 //!    `session/update` payloads from real adapters). [`decode_incoming`]
 //!    therefore classifies by method through the operation matrix and keeps
@@ -45,10 +40,13 @@
 use std::fmt;
 use std::path::Path;
 
-use sacp::schema::{
-    CancelNotification, ClientCapabilities, ContentBlock, FileSystemCapabilities, Implementation,
-    InitializeRequest, NewSessionRequest, PromptRequest, ProtocolVersion, SessionId,
-    SetSessionConfigOptionRequest, SetSessionModeRequest,
+use agent_client_protocol_schema::{
+    ProtocolVersion,
+    v1::{
+        CancelNotification, ClientCapabilities, ContentBlock, FileSystemCapabilities,
+        Implementation, InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest,
+        ResumeSessionRequest, SessionId, SetSessionConfigOptionRequest, SetSessionModeRequest,
+    },
 };
 use serde_json::{Value, json};
 
@@ -259,11 +257,11 @@ pub fn baseline_operation_matrix() -> Vec<AcpOperationSupport> {
         // Capability-gated standard: initialize must declare support;
         // method-not-found downgrades only this capability.
         support(Op::SessionLoad, St::CapabilityGated, Enc::Typed),
+        support(Op::SessionResume, St::CapabilityGated, Enc::Typed),
         support(Op::SessionSetMode, St::CapabilityGated, Enc::Typed),
         support(Op::SessionList, St::CapabilityGated, Enc::Typed),
         // Versioned / unstable: typed preferred, versioned raw fallback; the
         // actual encoding choice is negotiated (P3-02/P3-03).
-        support(Op::SessionResume, St::VersionedUnstable, Enc::VersionedRaw),
         support(Op::SessionFork, St::VersionedUnstable, Enc::VersionedRaw),
         support(
             Op::SessionSetConfigOption,
@@ -698,7 +696,7 @@ pub(crate) fn decode_incoming(message: &Value) -> DecodedAcpMessage {
 // ---------------------------------------------------------------------------
 
 /// Build `initialize` params through the typed schema, then re-apply the
-/// adapter-extension capability keys the current wire requires (quirks 1-2).
+/// adapter-extension capability keys the current wire requires (quirk 1).
 pub(crate) fn build_initialize_params(
     read_text_file: bool,
     write_text_file: bool,
@@ -717,14 +715,15 @@ pub(crate) fn build_initialize_params(
     request.client_info = Some(Implementation::new("vibex", env!("CARGO_PKG_VERSION")));
 
     let mut params = serde_json::to_value(&request).unwrap_or_else(|_| json!({}));
-    // Quirk 2: strip the `"title": null` the schema type would emit.
+    // Keep this defensive normalization so a schema serialization change
+    // cannot silently add a nullable field to Vibex's frozen wire contract.
     if let Some(client_info) = params.get_mut("clientInfo").and_then(Value::as_object_mut)
         && client_info.get("title") == Some(&Value::Null)
     {
         client_info.remove("title");
     }
-    // Quirk 1: adapter-extension capability keys not representable in the
-    // fixed schema's ClientCapabilities.
+    // Adapter-extension capability keys not representable in the stable
+    // schema's ClientCapabilities.
     if let Some(capabilities) = params
         .get_mut("clientCapabilities")
         .and_then(Value::as_object_mut)
@@ -744,7 +743,7 @@ pub(crate) fn build_initialize_params(
 }
 
 /// Build `session/new` params: typed base (`cwd`) plus the local
-/// `mcpServers` descriptor serialization (quirk 3).
+/// `mcpServers` descriptor serialization (quirk 2).
 pub(crate) fn build_session_new_params(cwd: &Path, mcp_servers: Value) -> Value {
     let request = NewSessionRequest::new(cwd.display().to_string());
     let mut params = serde_json::to_value(&request).unwrap_or_else(|_| json!({}));
@@ -761,26 +760,29 @@ pub(crate) fn build_session_load_params(
     cwd: &Path,
     mcp_servers: Value,
 ) -> Value {
-    json!({
-        "sessionId": native_session_id,
-        "cwd": cwd.display().to_string(),
-        "mcpServers": mcp_servers
-    })
+    let request =
+        LoadSessionRequest::new(SessionId::new(native_session_id), cwd.display().to_string());
+    let mut params = serde_json::to_value(&request).unwrap_or_else(|_| json!({}));
+    if let Some(object) = params.as_object_mut() {
+        object.insert("mcpServers".to_string(), mcp_servers);
+    }
+    params
 }
 
-/// Versioned raw `session/resume` request. The pinned stable schema does not
-/// expose this unstable surface, so the runtime must only call it when the
-/// current generation has negotiated the operation.
+/// Build `session/resume` through the official v1 schema while retaining the
+/// existing exact-version/current-generation capability gate at the caller.
 pub(crate) fn build_session_resume_params(
     native_session_id: &str,
     cwd: &Path,
     mcp_servers: Value,
 ) -> Value {
-    json!({
-        "sessionId": native_session_id,
-        "cwd": cwd.display().to_string(),
-        "mcpServers": mcp_servers
-    })
+    let request =
+        ResumeSessionRequest::new(SessionId::new(native_session_id), cwd.display().to_string());
+    let mut params = serde_json::to_value(&request).unwrap_or_else(|_| json!({}));
+    if let Some(object) = params.as_object_mut() {
+        object.insert("mcpServers".to_string(), mcp_servers);
+    }
+    params
 }
 
 /// Build `session/prompt` params through the typed `PromptRequest`.
@@ -843,7 +845,7 @@ pub(crate) fn build_session_set_config_option_params(
     serde_json::to_value(SetSessionConfigOptionRequest::new(
         native_session_id.to_string(),
         config_id.to_string(),
-        value.to_string(),
+        value,
     ))
     .expect("ACP set_config_option request is serializable")
 }
@@ -915,6 +917,26 @@ mod tests {
         assert_eq!(
             build_session_resume_params("native-1", Path::new("/tmp/w"), servers.clone()),
             json!({ "sessionId": "native-1", "cwd": "/tmp/w", "mcpServers": servers })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typed_session_paths_preserve_the_existing_lossy_wire_encoding() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::path::PathBuf;
+
+        let cwd = PathBuf::from(OsString::from_vec(b"/tmp/non-utf8-\xff".to_vec()));
+        let expected = cwd.display().to_string();
+        assert_eq!(build_session_new_params(&cwd, json!([]))["cwd"], expected);
+        assert_eq!(
+            build_session_load_params("native-1", &cwd, json!([]))["cwd"],
+            expected
+        );
+        assert_eq!(
+            build_session_resume_params("native-1", &cwd, json!([]))["cwd"],
+            expected
         );
     }
 
@@ -1002,11 +1024,14 @@ mod tests {
             AcpOperationStability::CapabilityGated
         );
         assert_eq!(
+            stability(&AcpOperation::SessionResume),
+            AcpOperationStability::CapabilityGated
+        );
+        assert_eq!(
             stability(&AcpOperation::SessionSetMode),
             AcpOperationStability::CapabilityGated
         );
         for operation in [
-            AcpOperation::SessionResume,
             AcpOperation::SessionFork,
             AcpOperation::SessionSetConfigOption,
             AcpOperation::SessionSetModel,

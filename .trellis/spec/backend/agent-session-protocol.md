@@ -1975,6 +1975,15 @@ crates/agent-acp
 - `crates/agent-acp` owns ACP-specific event/client mapping. `crates/agent`
   remains provider-neutral and must not depend on ACP protocol or CLI
   dependencies.
+- `crates/agent-acp` depends directly on the official
+  `agent-client-protocol-schema = 1.6.0` crate and uses its explicit `v1`
+  module for stable outbound request types. Do not reintroduce `sacp` as an
+  indirect schema source.
+- Schema upgrades preserve Vibex's frozen wire contract:
+  `initialize.clientCapabilities` retains the adapter extension keys `auth`,
+  `mcpServers`, and plain `meta`; session MCP descriptors retain the Vibex
+  shape; unknown prompt content blocks and tolerant inbound raw envelopes are
+  never discarded.
 - ACP is registered as an `AgentProvider` under an exact ACP
   `AgentRuntimeRouteKey`; the manager continues to own Vibex session state,
   durable RuntimeBinding authority, timeline append, permission persistence,
@@ -2575,8 +2584,8 @@ RuntimeSwitchRepository::compare_and_set_restore_compatibility_result(...)
 - `Compatible` requires current-generation `NegotiatedRuntime` or
   `ObservedRuntime` support. Static descriptors and unknown evidence produce
   `ProbeRequired` only.
-- The candidate order is `session/resume` (versioned raw), then `session/load`
-  (typed), inside the attachment acquire closure. Only method-not-found,
+- The candidate order is typed `session/resume`, then typed `session/load`,
+  inside the attachment acquire closure. Only method-not-found,
   explicit unsupported, or stable not-found can advance or use explicit fresh.
 - The native session id in a `session/resume` or `session/load` request is the
   authoritative restored identity. Standard ACP restore responses are objects
@@ -2644,7 +2653,7 @@ RuntimeSwitchRepository::compare_and_set_restore_compatibility_result(...)
   seven outcomes, and raw-id redaction.
 - Resolver tests cover negotiated Compatible, static/unknown ProbeRequired,
   identity mismatches, generation scoping, and deterministic order.
-- ACP mock tests cover typed load, versioned resume, fallback, not-found/
+- ACP mock tests cover typed resume/load, fallback, not-found/
   unsupported fresh, auth/timeout/provider/invalid no-fallback, native-id
   mismatch, an omitted optional response `sessionId`, and same-key at-most-once
   effects. Include the exact Codex
@@ -2668,7 +2677,7 @@ session/load error (any category) -> warn -> session/new -> replace route
 
 ```text
 exact key + current evidence
-  -> resume (versioned raw) -> load (typed)
+  -> resume (typed) -> load (typed)
   -> keep requestedNativeId; validate response.sessionId only when present
   -> inspect bounded JSON-RPC error.data before dropping provider detail
   -> expose only a stable redacted error kind

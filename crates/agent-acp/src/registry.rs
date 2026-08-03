@@ -23,18 +23,18 @@ use crate::protocol::{
 pub const CLAUDE_AGENT_ID: &str = "claude";
 pub const CLAUDE_ADAPTER_ID: &str = "claude-agent-acp";
 pub const CLAUDE_ADAPTER_PACKAGE: &str = "@agentclientprotocol/claude-agent-acp";
-pub const CLAUDE_ADAPTER_VERSION: &str = "0.58.1";
-pub const CLAUDE_ADAPTER_INTEGRITY: &str = "sha512-F1/W6EJdoYbrEUluRUknx0Nn0MAKDOkn2C/9YcP/joVkmdFUGTAxlGDpwdYu239TOkpc8Qm4+ffGsQjPZdryTg==";
+pub const CLAUDE_ADAPTER_VERSION: &str = "0.64.2";
+pub const CLAUDE_ADAPTER_INTEGRITY: &str = "sha512-REZ6FxfUF//GqGMqCEHfHLuuzd2ZJwupgfBmIQIm5gcMrkppuhrRlThwbn2RNasCWoMSnqRMHvnXDpl/HctM/g==";
 
 pub const CODEX_AGENT_ID: &str = "codex";
 pub const CODEX_ADAPTER_ID: &str = "codex-acp";
 pub const CODEX_ADAPTER_PACKAGE: &str = "@agentclientprotocol/codex-acp";
-pub const CODEX_ADAPTER_VERSION: &str = "1.1.2";
-pub const CODEX_ADAPTER_INTEGRITY: &str = "sha512-qE/R1WdqJJ9OFHsHGvbmVmS2j9iCMZzpWT3g2XIViXrGHu1fLOALLINBIlW+WzKDllCh131aB6cqcIWSt0otbw==";
+pub const CODEX_ADAPTER_VERSION: &str = "1.1.9";
+pub const CODEX_ADAPTER_INTEGRITY: &str = "sha512-T78vetAQJ+XpP+0zT18ceEPTD10tqYvouDh0ht7mpCQjXuW3Vm5MzcuMRJMVBA2MwfCvGFXfOhGA7ogMSeOpFQ==";
 pub const CODEX_RUNTIME_PACKAGE: &str = "@openai/codex";
-pub const CODEX_RUNTIME_DECLARED_REQUIREMENT: &str = "^0.144.0";
-pub const CODEX_RUNTIME_PIN: &str = "0.144.1";
-pub const CODEX_RUNTIME_INTEGRITY: &str = "sha512-Xir1zqPfpenhdoAoshN53uonzbBXj18COyzRkFlVZpSNyEl5XtkuYu9oddELePFN7K/0sXUcSO34Ad5IeCXPbw==";
+pub const CODEX_RUNTIME_DECLARED_REQUIREMENT: &str = "^0.145.0";
+pub const CODEX_RUNTIME_PIN: &str = "0.146.0";
+pub const CODEX_RUNTIME_INTEGRITY: &str = "sha512-yG3sPWNda/2YAIQIDq9MrrjoCTIQ7rxYM5IasrG3VBcuhCLTkgeg/JzqmJq1V98RE4MJ5jCxDXXQlOjrditFRw==";
 pub const NPM_REGISTRY_ORIGIN: &str = "https://registry.npmjs.org";
 
 /// Three-state support value used before runtime negotiation is complete.
@@ -82,6 +82,9 @@ pub struct ManagedRuntimeDependency {
     pub declared_requirement: VersionReq,
     pub managed_pin: Version,
     pub integrity: String,
+    /// Force the managed pin through npm `overrides` when the newest runtime
+    /// falls outside the adapter's published dependency requirement.
+    pub override_declared_requirement: bool,
     pub include_in_compatibility_identity: bool,
 }
 
@@ -451,13 +454,21 @@ impl AcpAgentCompatibility {
                 .with_diagnostic("adapterId", self.adapter_id.to_string())
                 .with_diagnostic("package", dependency.package.clone()));
             }
-            if !dependency
+            let pin_matches = dependency
                 .declared_requirement
-                .matches(&dependency.managed_pin)
-            {
+                .matches(&dependency.managed_pin);
+            if !pin_matches && !dependency.override_declared_requirement {
                 return Err(VibexError::validation(
                     "acp_registry_runtime_dependency_pin_invalid",
                     "ACP managed runtime pin does not satisfy the adapter requirement",
+                )
+                .with_diagnostic("adapterId", self.adapter_id.to_string())
+                .with_diagnostic("package", dependency.package.clone()));
+            }
+            if pin_matches && dependency.override_declared_requirement {
+                return Err(VibexError::validation(
+                    "acp_registry_runtime_dependency_override_unnecessary",
+                    "ACP managed runtime override is only valid outside the adapter requirement",
                 )
                 .with_diagnostic("adapterId", self.adapter_id.to_string())
                 .with_diagnostic("package", dependency.package.clone()));
@@ -827,7 +838,7 @@ fn claude_descriptor() -> VibexResult<AcpAgentCompatibility> {
             version_args: vec!["--version".to_string()],
         }],
         mcp_forwarding: CompatibilitySupport::supported(
-            "real bridge contract schema v2: claude-agent-acp@0.58.1",
+            "real bridge contract schema v2: claude-agent-acp@0.64.2",
         ),
         safe_multi_session: CompatibilitySupport::unsupported(
             "no exact-version multi-session contract evidence",
@@ -866,6 +877,7 @@ fn codex_descriptor() -> VibexResult<AcpAgentCompatibility> {
         )?,
         managed_pin: parse_version(CODEX_RUNTIME_PIN, CODEX_RUNTIME_PACKAGE)?,
         integrity: CODEX_RUNTIME_INTEGRITY.to_string(),
+        override_declared_requirement: true,
         include_in_compatibility_identity: true,
     };
     let runtime_versions = BTreeMap::from([(
@@ -894,7 +906,7 @@ fn codex_descriptor() -> VibexResult<AcpAgentCompatibility> {
             version_args: vec!["--version".to_string()],
         }],
         mcp_forwarding: CompatibilitySupport::supported(
-            "real bridge contract schema v2: codex-acp@1.1.2 + @openai/codex@0.144.1",
+            "real bridge contract schema v2: codex-acp@1.1.9 + @openai/codex@0.146.0",
         ),
         safe_multi_session: CompatibilitySupport::unsupported(
             "no exact-version multi-session contract evidence",
@@ -1114,6 +1126,10 @@ mod tests {
             format!("{CODEX_ADAPTER_PACKAGE}@{CODEX_ADAPTER_VERSION}")
         );
         assert_eq!(codex.route_key().adapter_id.as_str(), CODEX_ADAPTER_ID);
+        let runtime = &codex.distribution.runtime_dependencies[0];
+        assert_eq!(runtime.declared_requirement.to_string(), "^0.145.0");
+        assert_eq!(runtime.managed_pin, Version::parse("0.146.0").unwrap());
+        assert!(runtime.override_declared_requirement);
         assert_eq!(
             registry
                 .route_key(&AgentId::parse(CLAUDE_AGENT_ID).unwrap())
@@ -1140,6 +1156,17 @@ mod tests {
             let error = descriptor.validate().unwrap_err();
             assert_eq!(error.code, "acp_registry_origin_invalid");
         }
+    }
+
+    #[test]
+    fn out_of_range_runtime_pin_requires_an_explicit_override() {
+        let mut descriptor = registry()
+            .for_agent(&AgentId::parse(CODEX_AGENT_ID).unwrap())
+            .unwrap()
+            .clone();
+        descriptor.distribution.runtime_dependencies[0].override_declared_requirement = false;
+        let error = descriptor.validate().unwrap_err();
+        assert_eq!(error.code, "acp_registry_runtime_dependency_pin_invalid");
     }
 
     #[test]
@@ -1174,7 +1201,7 @@ mod tests {
             .clone();
         assert_eq!(
             codex.expected_compatibility_identity().as_str(),
-            "adapter=codex-acp@1.1.2;runtime=@openai/codex@0.144.1"
+            "adapter=codex-acp@1.1.9;runtime=@openai/codex@0.146.0"
         );
 
         let changed = AdapterCompatibilityIdentity::new(

@@ -292,11 +292,7 @@ mod tests {
             RestoreCapabilityEvidence {
                 support,
                 source: CapabilitySource::NegotiatedRuntime,
-                encoding: if method == AgentSessionRestoreMethod::Load {
-                    AcpWireEncoding::Typed
-                } else {
-                    AcpWireEncoding::VersionedRaw
-                },
+                encoding: AcpWireEncoding::Typed,
                 stability: AcpOperationStability::CapabilityGated,
                 compatibility_identity: "codex-acp@v1".to_string(),
                 activation_generation: 3,
@@ -423,8 +419,8 @@ mod tests {
         let static_evidence = RestoreCapabilityEvidence {
             support: CapabilitySupport::Supported,
             source: CapabilitySource::VersionedRegistry,
-            encoding: AcpWireEncoding::VersionedRaw,
-            stability: AcpOperationStability::VersionedUnstable,
+            encoding: AcpWireEncoding::Typed,
+            stability: AcpOperationStability::CapabilityGated,
             compatibility_identity: "codex-acp@v1".to_string(),
             activation_generation: 3,
         };

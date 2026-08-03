@@ -822,7 +822,7 @@ mod tests {
     fn input(kind: &str, raw_input: Value) -> AgentEventInput {
         AgentEventInput {
             source: AgentEventInputSource::Live,
-            compatibility_identity: "adapter=codex-acp@1.1.2".to_string(),
+            compatibility_identity: "adapter=codex-acp@1.1.9".to_string(),
             native_event_id: "native-event-secret".to_string(),
             tool_name: kind.to_string(),
             title: "Safe event".to_string(),

@@ -1,5 +1,5 @@
 {
-  "compatibilityIdentity": "adapter=codex-acp@1.1.2;runtime=@openai/codex@fixture",
+  "compatibilityIdentity": "adapter=codex-acp@1.1.9;runtime=@openai/codex@fixture",
   "enricher": "codex",
   "nativeBaselineReferences": [
     "crates/agent-codex/tests/fixtures/parity/command_execution",

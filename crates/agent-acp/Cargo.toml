@@ -10,9 +10,9 @@ repository.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 command-group.workspace = true
-# Fixed typed ACP schema version; upgrades go through the Compatibility
-# Registry process (P2-02+). Same version combination validated by Codeg.
-sacp = "=11.0.0"
+# Official typed ACP wire schema. Pin upgrades so the Compatibility Registry
+# and frozen serialization contract move together.
+agent-client-protocol-schema = "=1.6.0"
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true

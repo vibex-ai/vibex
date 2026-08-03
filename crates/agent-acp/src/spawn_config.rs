@@ -384,7 +384,7 @@ mod tests {
         ProcessSpawnConfigSnapshot {
             agent_id: AgentId::parse("codex").unwrap(),
             adapter_id: AcpAdapterId::parse("codex-acp").unwrap(),
-            adapter_version: "1.1.2".to_string(),
+            adapter_version: "1.1.9".to_string(),
             adapter_binary_identity: "sha256:adapter".to_string(),
             provider_profile_id: ProviderProfileId::parse("provider_codex").unwrap(),
             profile_revision: 0,

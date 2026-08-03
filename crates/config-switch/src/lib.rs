@@ -3831,7 +3831,7 @@ fn claude_acp_preset() -> AcpProviderCatalogPreset {
     let mut preset = acp_catalog_preset(
         "claude-agent-acp",
         "Claude Code (ACP)",
-        "Claude Code through the fixed @agentclientprotocol/claude-agent-acp@0.58.1 Adapter managed by the Compatibility Registry.",
+        "Claude Code through the fixed @agentclientprotocol/claude-agent-acp@0.64.2 Adapter managed by the Compatibility Registry.",
         "claude-agent-acp",
         &[],
         &["local", "acp", "claude"],
@@ -3850,7 +3850,7 @@ fn codex_acp_preset() -> AcpProviderCatalogPreset {
     let mut preset = acp_catalog_preset(
         "codex-acp",
         "Codex (ACP)",
-        "Codex through the fixed @agentclientprotocol/codex-acp@1.1.2 Adapter managed by the Compatibility Registry.",
+        "Codex through the fixed @agentclientprotocol/codex-acp@1.1.9 Adapter managed by the Compatibility Registry.",
         "codex-acp",
         &[],
         &["local", "acp", "codex"],
