@@ -91,7 +91,8 @@ use vibex_desktop_model::{
     TimelineFollowState, TimelineModel, TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
     UiStateStore, WorkbenchRoute, WorkspaceAgentSummary, WorkspaceContextProjection,
     WorktreeLifecycleDisplayState, composer_trigger_at, custom_worktree_path_is_absolute,
-    sidebar_project_projections, timeline_conversation_turns,
+    sidebar_project_projections, timeline_agent_message_count_after_sequence,
+    timeline_conversation_turns,
 };
 use vibex_desktop_runtime::{
     DesktopEvent, DesktopRuntime, DesktopRuntimeConfig, DesktopRuntimeFacade, PREVIEW_APP_ID,
@@ -5045,7 +5046,8 @@ impl VibexWorkbench {
                             }
                             let dirty = match signal {
                                 AgentPollSignal::Timeline(page) => {
-                                    let previous_item_count = this.timeline.items.len();
+                                    let previous_end_sequence =
+                                        this.timeline.authoritative_end_sequence;
                                     let updates_existing_item = this
                                         .timeline
                                         .authoritative_end_sequence
@@ -5063,13 +5065,14 @@ impl VibexWorkbench {
                                         if updates_existing_item {
                                             this.invalidate_timeline_render_caches();
                                         }
-                                        let appended = this
-                                            .timeline
-                                            .items
-                                            .len()
-                                            .saturating_sub(previous_item_count);
-                                        if appended > 0 {
-                                            this.timeline_follow.content_appended(appended);
+                                        if !this.timeline_follow.following_bottom {
+                                            let appended_messages =
+                                                timeline_agent_message_count_after_sequence(
+                                                    &this.timeline.items,
+                                                    previous_end_sequence,
+                                                );
+                                            this.timeline_follow
+                                                .content_appended(appended_messages);
                                         }
                                         let content_extent_changed = this.rebuild_timeline_sizes();
                                         if timeline_should_auto_follow_content(
@@ -5131,7 +5134,7 @@ impl VibexWorkbench {
                 if self.selected_session_id.as_ref() != Some(&event.session_id) {
                     return false;
                 }
-                let previous_item_count = self.timeline.items.len();
+                let previous_end_sequence = self.timeline.authoritative_end_sequence;
                 let updates_existing_item = self
                     .timeline
                     .authoritative_end_sequence
@@ -5141,13 +5144,12 @@ impl VibexWorkbench {
                     if updates_existing_item {
                         self.invalidate_timeline_render_caches();
                     }
-                    let appended = self
-                        .timeline
-                        .items
-                        .len()
-                        .saturating_sub(previous_item_count);
-                    if appended > 0 {
-                        self.timeline_follow.content_appended(appended);
+                    if !self.timeline_follow.following_bottom {
+                        let appended_messages = timeline_agent_message_count_after_sequence(
+                            &self.timeline.items,
+                            previous_end_sequence,
+                        );
+                        self.timeline_follow.content_appended(appended_messages);
                     }
                     let content_extent_changed = self.rebuild_timeline_sizes();
                     if timeline_should_auto_follow_content(
