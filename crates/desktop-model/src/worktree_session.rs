@@ -725,12 +725,49 @@ pub fn sidebar_project_projections(
         .enumerate()
         .map(|(index, id)| (id.as_str(), index))
         .collect::<BTreeMap<_, _>>();
+    let checkout_project_ids = workspaces
+        .iter()
+        .filter(|(_, workspace)| workspace.mode == WorkspaceMode::CurrentCheckout)
+        .map(|(project, _)| project.id.as_str().to_string())
+        .collect::<BTreeSet<_>>();
+    let mut workspace_identity_groups =
+        BTreeMap::<(String, u8), Vec<&(ProjectRecord, WorkspaceRecord)>>::new();
+    for pair in workspaces {
+        let mode_key = match pair.1.mode {
+            WorkspaceMode::CurrentCheckout => 0,
+            WorkspaceMode::VibexWorktree => 1,
+        };
+        workspace_identity_groups
+            .entry((pair.1.root_path.clone(), mode_key))
+            .or_default()
+            .push(pair);
+    }
+    let mut canonical_workspaces = Vec::new();
+    let mut workspace_aliases = BTreeMap::<String, BTreeSet<String>>::new();
+    for mut candidates in workspace_identity_groups.into_values() {
+        candidates.sort_by_key(|(project, workspace)| {
+            (
+                !checkout_project_ids.contains(project.id.as_str()),
+                workspace.created_at_ms,
+                workspace.id.as_str().to_string(),
+            )
+        });
+        let (project, workspace) = candidates[0];
+        workspace_aliases.insert(
+            workspace.id.as_str().to_string(),
+            candidates
+                .iter()
+                .map(|(_, candidate)| candidate.id.as_str().to_string())
+                .collect(),
+        );
+        canonical_workspaces.push((project.clone(), workspace.clone()));
+    }
     let mut grouped = BTreeMap::<String, (ProjectRecord, Vec<WorkspaceRecord>)>::new();
-    for (project, workspace) in workspaces {
+    for (project, workspace) in canonical_workspaces {
         let entry = grouped
             .entry(project.id.as_str().to_string())
             .or_insert_with(|| (project.clone(), Vec::new()));
-        entry.1.push(workspace.clone());
+        entry.1.push(workspace);
     }
     let mut grouped = grouped.into_values().collect::<Vec<_>>();
     grouped.sort_by_key(|(project, _)| {
@@ -764,10 +801,15 @@ pub fn sidebar_project_projections(
                     .any(|value| value.to_lowercase().contains(&query));
             let mut workspace_rows = Vec::new();
             for workspace in project_workspaces {
+                let aliases = workspace_aliases.get(workspace.id.as_str());
                 let mut workspace_sessions = sessions
                     .iter()
                     .filter(|session| {
-                        session.deleted_at_ms.is_none() && session.workspace_id == workspace.id
+                        session.deleted_at_ms.is_none()
+                            && (aliases.is_some_and(|aliases| {
+                                aliases.contains(session.workspace_id.as_str())
+                            }) || (session.workspace_root == workspace.root_path
+                                && session.workspace_mode == workspace.mode))
                     })
                     .cloned()
                     .collect::<Vec<_>>();
@@ -1097,6 +1139,50 @@ mod tests {
         assert_eq!(projects[0].workspaces.len(), 2);
         assert_eq!(projects[0].compact_sessions.len(), 2);
         assert_eq!(projects[0].workspaces[1].agent_summary.running, 1);
+    }
+
+    #[test]
+    fn sidebar_projection_folds_legacy_worktree_projects_into_the_origin_project() {
+        let project = project();
+        let checkout = workspace(&project, WorkspaceMode::CurrentCheckout, "/repo");
+        let registered_worktree = workspace(&project, WorkspaceMode::VibexWorktree, "/wt");
+        let duplicate_project = ProjectRecord {
+            id: ProjectId::new(),
+            name: "wt".into(),
+            root_path: "/wt".into(),
+            created_at_ms: 2,
+            updated_at_ms: 2,
+        };
+        let mut duplicate_worktree =
+            workspace(&duplicate_project, WorkspaceMode::VibexWorktree, "/wt");
+        duplicate_worktree.created_at_ms = 2;
+        let legacy_session = session(&duplicate_worktree, "Feature", AgentSessionState::Running);
+
+        let projects = sidebar_project_projections(
+            &[
+                (project.clone(), checkout),
+                (project.clone(), registered_worktree.clone()),
+                (duplicate_project, duplicate_worktree),
+            ],
+            std::slice::from_ref(&legacy_session),
+            &BTreeMap::new(),
+            &[],
+            &[],
+            &BTreeSet::new(),
+            "",
+        );
+
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].project.id, project.id);
+        assert_eq!(projects[0].workspaces.len(), 2);
+        let projected_worktree = projects[0]
+            .workspaces
+            .iter()
+            .find(|row| row.workspace.mode == WorkspaceMode::VibexWorktree)
+            .unwrap();
+        assert_eq!(projected_worktree.workspace.id, registered_worktree.id);
+        assert_eq!(projected_worktree.sessions, vec![legacy_session]);
+        assert_eq!(projected_worktree.agent_summary.running, 1);
     }
 
     #[test]

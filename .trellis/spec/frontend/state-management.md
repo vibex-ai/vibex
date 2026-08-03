@@ -1193,6 +1193,13 @@ if form.apply_eligibility(&ticket, eligibility) {
 }
 ```
 
+The Project sidebar groups a registered Worktree beneath the Project that owns
+its authoritative Workspace. Legacy databases may contain a second Project and
+Workspace for the same normalized Worktree root and mode; presentation may
+fold those aliases into the Workspace owned by a Project with a current
+checkout and aggregate their Sessions there. This compatibility projection is
+non-destructive and must not delete or rewrite stored Workspace references.
+
 ## Scenario: GPUI Management Section Lifetime
 
 ### 1. Scope / Trigger

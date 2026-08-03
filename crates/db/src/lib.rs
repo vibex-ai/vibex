@@ -1625,6 +1625,19 @@ impl WorkspaceRepository {
         mode: WorkspaceMode,
     ) -> VibexResult<(ProjectRecord, WorkspaceRecord)> {
         let root_path = normalize_path(workspace_root.as_ref());
+        let mode_text = enum_to_db(&mode)?;
+        if let Some(workspace) =
+            Self::find_active_workspace_by_root_and_mode(conn, &root_path, &mode_text)?
+        {
+            let project = Self::get_project(conn, &workspace.project_id)?.ok_or_else(|| {
+                VibexError::storage(
+                    "workspace_project_missing",
+                    "workspace project was not found",
+                )
+                .with_diagnostic("workspaceId", workspace.id.as_str())
+            })?;
+            return Ok((project, workspace));
+        }
         let now = unix_timestamp_ms();
         let project_name = workspace_root
             .as_ref()
@@ -1683,7 +1696,6 @@ impl WorkspaceRepository {
             }
         };
 
-        let mode_text = enum_to_db(&mode)?;
         let workspace = match Self::find_workspace(conn, &project.id, &root_path, &mode_text)? {
             Some(mut workspace) => {
                 if workspace.deleted_at_ms.is_some() {
@@ -1956,6 +1968,51 @@ impl WorkspaceRepository {
             ",
             params![project_id.as_str(), root_path, mode],
             map_workspace_lookup,
+        )
+        .optional()
+        .map_err(storage_err(
+            "workspace_lookup_failed",
+            "failed to lookup workspace",
+        ))
+    }
+
+    fn find_active_workspace_by_root_and_mode(
+        conn: &Connection,
+        root_path: &str,
+        mode: &str,
+    ) -> VibexResult<Option<WorkspaceRecord>> {
+        conn.query_row(
+            "
+            SELECT
+                w.workspace_id, w.project_id, w.root_path, w.mode,
+                w.created_at_ms, w.updated_at_ms
+            FROM workspaces w
+            JOIN projects p ON p.project_id = w.project_id
+            WHERE w.root_path = ?1
+                AND w.mode = ?2
+                AND w.deleted_at_ms IS NULL
+                AND p.deleted_at_ms IS NULL
+            ORDER BY
+                EXISTS (
+                    SELECT 1
+                    FROM git_managed_worktrees managed
+                    WHERE managed.workspace_id = w.workspace_id
+                ) DESC,
+                w.created_at_ms ASC,
+                w.workspace_id ASC
+            LIMIT 1
+            ",
+            params![root_path, mode],
+            |row| {
+                Ok(WorkspaceRecord {
+                    id: parse_id_sql(row.get(0)?, WorkspaceId::parse)?,
+                    project_id: parse_id_sql(row.get(1)?, ProjectId::parse)?,
+                    root_path: row.get(2)?,
+                    mode: enum_from_db_sql(row.get(3)?)?,
+                    created_at_ms: row.get(4)?,
+                    updated_at_ms: row.get(5)?,
+                })
+            },
         )
         .optional()
         .map_err(storage_err(
@@ -11927,6 +11984,38 @@ mod tests {
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].id, step.id);
         assert_eq!(steps[0].redacted_diagnostics[0].key, "state");
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn workspace_ensure_reuses_a_worktree_registered_under_its_origin_project() {
+        let temp = temp_db_path("workspace-ensure-registered-worktree");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let (project, checkout) = WorkspaceRepository::ensure(
+            &conn,
+            "/tmp/vibex-db-worktree-origin",
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let worktree = WorkspaceRepository::ensure_for_project(
+            &conn,
+            &project.id,
+            "/tmp/vibex-db-worktree-linked",
+            WorkspaceMode::VibexWorktree,
+        )
+        .unwrap();
+
+        let (resolved_project, resolved_workspace) =
+            WorkspaceRepository::ensure(&conn, &worktree.root_path, WorkspaceMode::VibexWorktree)
+                .unwrap();
+
+        assert_eq!(resolved_project.id, project.id);
+        assert_eq!(resolved_workspace.id, worktree.id);
+        assert_eq!(resolved_workspace.project_id, checkout.project_id);
+        assert_eq!(WorkspaceRepository::list(&conn).unwrap().len(), 2);
 
         cleanup_db(temp);
     }

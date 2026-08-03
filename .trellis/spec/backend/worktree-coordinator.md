@@ -101,6 +101,11 @@ but an unexpired `Running` lease returns busy.
 - A managed record fixes `originWorkspaceId`, `baseRef`, `baseHead`,
   `targetWorkspaceId`, and `targetBranch` at creation. `base*` means where the
   branch started; `target*` means where Merge Back goes.
+- Generic Session creation must resolve an active Workspace by normalized root
+  path and mode before applying the new-directory Project creation path. A
+  registered `VibexWorktree` keeps the Project identity assigned by the
+  coordinator; its directory must never become a second Project merely because
+  an Agent Session is opened there.
 - Merge must use the stored target. A caller may omit the target or repeat the
   stored target, but may not redirect an existing managed Worktree.
 - Old rows remain readable. If origin/base/target identity cannot be proven,
