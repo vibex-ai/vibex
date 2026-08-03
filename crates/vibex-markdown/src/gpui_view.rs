@@ -6,15 +6,14 @@ use std::time::Duration;
 
 use ::gpui::prelude::FluentBuilder as _;
 use ::gpui::{
-    AnyElement, App, AppContext as _, AvailableSpace, BorderStyle, Bounds, ClipboardItem, Context,
-    Edges, Element, ElementId, Entity, FocusHandle, FontStyle, FontWeight, GlobalElementId,
-    HighlightStyle, Hitbox, HitboxBehavior, Image, ImageFormat, ImageSource, InspectorElementId,
-    InteractiveElement as _, InteractiveText, IntoElement, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point, Render,
-    RenderImage, ScrollAnchor, ScrollHandle, SharedString, StatefulInteractiveElement as _,
-    StrikethroughStyle, StyleRefinement, Styled as _, StyledImage as _, StyledText, Task,
-    TextLayout, UnderlineStyle, WeakEntity, Window, combine_highlights, div, img, point, px, quad,
-    size, transparent_black,
+    AnyElement, App, AppContext as _, AvailableSpace, Bounds, ClipboardItem, Context, Element,
+    ElementId, Entity, FocusHandle, FontStyle, FontWeight, GlobalElementId, HighlightStyle, Hitbox,
+    HitboxBehavior, Image, ImageFormat, ImageSource, InspectorElementId, InteractiveElement as _,
+    InteractiveText, IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point, Render, RenderImage, ScrollAnchor,
+    ScrollHandle, SharedString, StatefulInteractiveElement as _, StrikethroughStyle,
+    StyleRefinement, Styled as _, StyledImage as _, StyledText, Task, TextLayout, UnderlineStyle,
+    WeakEntity, Window, combine_highlights, div, img, point, px, size,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use gpui_component::{
@@ -138,6 +137,36 @@ impl MarkdownView {
         let mut view = Self::new(id, input);
         view.document = Some(document);
         view
+    }
+
+    /// Render user-authored plain text with native selection without interpreting Markdown.
+    pub fn plain_text(id: impl Into<ElementId>, input: MarkdownInput) -> Self {
+        let source = input.source.clone();
+        let range = crate::model::SourceRange::new(0, source.len());
+        let document = Arc::new(MarkdownDocument {
+            source: source.clone(),
+            base_path: input.base_path.clone(),
+            revision: input.revision,
+            blocks: (!source.is_empty())
+                .then(|| BlockNode {
+                    id: NodeId(0),
+                    range,
+                    kind: Block::Paragraph(vec![InlineNode {
+                        id: NodeId(1),
+                        range,
+                        kind: Inline::Text(source.to_string()),
+                    }]),
+                })
+                .into_iter()
+                .collect::<Vec<_>>()
+                .into(),
+            outline: Arc::default(),
+            footnotes: Default::default(),
+            resources: Arc::default(),
+            diagnostics: Arc::default(),
+            truncated: false,
+        });
+        Self::from_document(id, document)
     }
 
     pub fn presentation(mut self, presentation: MarkdownPresentation) -> Self {
@@ -1211,6 +1240,19 @@ impl MarkdownViewState {
         let start = self.selection_text.len();
         self.selection_text.push_str(&text);
         let text_range = start..self.selection_text.len();
+        let selection = self.text_selection.range();
+        let selection_start = selection.start.max(text_range.start);
+        let selection_end = selection.end.min(text_range.end);
+        let highlights = if selection_start < selection_end {
+            overlay_selection_highlight(
+                text.len(),
+                highlights,
+                selection_start - text_range.start..selection_end - text_range.start,
+                cx.theme().selection,
+            )
+        } else {
+            highlights
+        };
         let segment = self.selection_next_segment;
         self.selection_next_segment = self.selection_next_segment.saturating_add(1);
         MarkdownSelectableText::new(
@@ -1559,19 +1601,6 @@ impl Element for MarkdownSelectableText {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let local_selection = self.owner.upgrade().and_then(|owner| {
-            let state = owner.read(cx);
-            if state.selection_frame != self.frame {
-                return None;
-            }
-            let selection = state.text_selection.range();
-            let start = selection.start.max(self.text_range.start);
-            let end = selection.end.min(self.text_range.end);
-            (start < end).then(|| start - self.text_range.start..end - self.text_range.start)
-        });
-        if let Some(selection) = local_selection {
-            paint_text_selection(&selection, &self.layout, bounds, window, cx);
-        }
         self.interactive_text.paint(
             id,
             inspector_id,
@@ -1584,63 +1613,54 @@ impl Element for MarkdownSelectableText {
     }
 }
 
-fn paint_text_selection(
-    selection: &Range<usize>,
-    layout: &TextLayout,
-    bounds: Bounds<Pixels>,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let Some(start) = layout.position_for_index(selection.start) else {
-        return;
+fn overlay_selection_highlight(
+    text_len: usize,
+    highlights: Vec<(Range<usize>, HighlightStyle)>,
+    selection: Range<usize>,
+    selection_background: ::gpui::Hsla,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    let selection = selection.start.min(text_len)..selection.end.min(text_len);
+    let selection_style = HighlightStyle {
+        background_color: Some(selection_background),
+        ..Default::default()
     };
-    let Some(end) = layout.position_for_index(selection.end) else {
-        return;
-    };
-    let line_height = layout.line_height();
-    if start.y == end.y {
-        window.paint_quad(quad(
-            Bounds::from_corners(start, point(end.x, end.y + line_height)),
-            px(0.0),
-            cx.theme().selection,
-            Edges::default(),
-            transparent_black(),
-            BorderStyle::default(),
-        ));
-        return;
+    let highlights = combine_highlights(std::iter::empty(), highlights).collect::<Vec<_>>();
+    let mut boundaries = vec![selection.start, selection.end];
+    for (range, _) in &highlights {
+        boundaries.extend([range.start, range.end]);
     }
-    window.paint_quad(quad(
-        Bounds::from_corners(start, point(bounds.right(), start.y + line_height)),
-        px(0.0),
-        cx.theme().selection,
-        Edges::default(),
-        transparent_black(),
-        BorderStyle::default(),
-    ));
-    if end.y > start.y + line_height {
-        window.paint_quad(quad(
-            Bounds::from_corners(
-                point(bounds.left(), start.y + line_height),
-                point(bounds.right(), end.y),
-            ),
-            px(0.0),
-            cx.theme().selection,
-            Edges::default(),
-            transparent_black(),
-            BorderStyle::default(),
-        ));
-    }
-    window.paint_quad(quad(
-        Bounds::from_corners(
-            point(bounds.left(), end.y),
-            point(end.x, end.y + line_height),
-        ),
-        px(0.0),
-        cx.theme().selection,
-        Edges::default(),
-        transparent_black(),
-        BorderStyle::default(),
-    ));
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    let mut highlight_index = 0;
+    boundaries
+        .windows(2)
+        .filter_map(move |bounds| {
+            let range = bounds[0]..bounds[1];
+            if range.is_empty() {
+                return None;
+            }
+            while highlights
+                .get(highlight_index)
+                .is_some_and(|(highlight_range, _)| highlight_range.end <= range.start)
+            {
+                highlight_index += 1;
+            }
+            let semantic = highlights
+                .get(highlight_index)
+                .filter(|(highlight_range, _)| {
+                    highlight_range.start <= range.start && highlight_range.end >= range.end
+                })
+                .map(|(_, style)| *style);
+            let selected = selection.start <= range.start && selection.end >= range.end;
+            match (semantic, selected) {
+                (Some(style), true) => Some((range, style.highlight(selection_style))),
+                (Some(style), false) => Some((range, style)),
+                (None, true) => Some((range, selection_style)),
+                (None, false) => None,
+            }
+        })
+        .collect()
 }
 
 fn text_boundary_at_or_before(text: &str, mut index: usize) -> usize {
@@ -3593,6 +3613,54 @@ mod tests {
                 && style.underline.is_some()
                 && style.strikethrough.is_some()
         }));
+    }
+
+    #[test]
+    fn selection_background_overrides_semantic_background_without_losing_text_style() {
+        let semantic_background = ::gpui::hsla(0.0, 0.0, 0.25, 1.0);
+        let selection_background = ::gpui::hsla(0.58, 0.8, 0.5, 0.65);
+        let highlights = overlay_selection_highlight(
+            12,
+            vec![(
+                4..10,
+                HighlightStyle {
+                    background_color: Some(semantic_background),
+                    font_weight: Some(FontWeight::BOLD),
+                    ..Default::default()
+                },
+            )],
+            2..7,
+            selection_background,
+        );
+
+        assert_eq!(highlights.len(), 3);
+        assert_eq!(highlights[0].0, 2..4);
+        assert_eq!(highlights[0].1.background_color, Some(selection_background));
+        assert_eq!(highlights[1].0, 4..7);
+        assert_eq!(highlights[1].1.background_color, Some(selection_background));
+        assert_eq!(highlights[1].1.font_weight, Some(FontWeight::BOLD));
+        assert_eq!(highlights[2].0, 7..10);
+        assert_eq!(highlights[2].1.background_color, Some(semantic_background));
+    }
+
+    #[test]
+    fn plain_text_view_keeps_markdown_syntax_in_one_selectable_text_flow() {
+        let source = "# heading **bold** `code` [link](https://example.com)";
+        let view =
+            MarkdownView::plain_text("plain-text-contract", MarkdownInput::new(source, "", 1));
+        let document = view.document.expect("plain text document");
+        let [block] = document.blocks.as_ref() else {
+            panic!("plain text should render as one block");
+        };
+        let Block::Paragraph(inlines) = &block.kind else {
+            panic!("plain text should render as one paragraph");
+        };
+        let [inline] = inlines.as_slice() else {
+            panic!("plain text should render as one inline segment");
+        };
+        assert_eq!(inline.kind, Inline::Text(source.to_string()));
+        assert_eq!(document.plain_text(), source);
+        assert!(document.resources.is_empty());
     }
 
     #[::gpui::test]

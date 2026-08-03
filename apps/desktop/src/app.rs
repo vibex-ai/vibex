@@ -19675,10 +19675,13 @@ impl VibexWorkbench {
         highlight_query: Option<&str>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let search_highlight = cx.theme().warning.opacity(0.42);
         if attachments.is_empty() {
-            return render_user_message_text_segment(text, highlight_query, search_highlight)
-                .into_any_element();
+            return render_user_message_text_segment(
+                format!("user-message-text:{message_id}"),
+                text,
+                highlight_query,
+            )
+            .into_any_element();
         }
 
         let (preview_width, preview_height) = composer_image_hover_preview_max_size(
@@ -19701,9 +19704,9 @@ impl VibexWorkbench {
                 UserMessageInlineSegment::Text(value) => {
                     if !value.is_empty() {
                         content = content.child(render_user_message_text_segment(
+                            format!("user-message-text:{message_id}:{index}"),
                             value,
                             highlight_query,
-                            search_highlight,
                         ));
                     }
                 }
@@ -27350,28 +27353,18 @@ fn agent_markdown_summary(source: &str) -> (String, Vec<String>) {
 }
 
 fn render_user_message_text_segment(
+    id: impl Into<ElementId>,
     value: String,
     highlight_query: Option<&str>,
-    highlight_background: Hsla,
-) -> gpui::Div {
-    let text = div()
+) -> MarkdownView {
+    MarkdownView::plain_text(id, MarkdownInput::new(value, "", 0))
+        .presentation(MarkdownPresentation::Agent)
+        .search_query(highlight_query.map(Arc::<str>::from))
+        .w_auto()
         .min_w_0()
         .max_w_full()
         .flex_shrink(1.0)
-        .whitespace_normal();
-    if let Some(query) = highlight_query {
-        text.child(session_search_highlighted_text(
-            value,
-            query,
-            HighlightStyle {
-                background_color: Some(highlight_background),
-                font_weight: Some(FontWeight::BOLD),
-                ..Default::default()
-            },
-        ))
-    } else {
-        text.child(value)
-    }
+        .whitespace_normal()
 }
 
 fn render_user_message_bubble(
@@ -27792,9 +27785,9 @@ mod tests {
                     .child(
                         render_user_message_bubble(
                             render_user_message_text_segment(
+                                "user-message-layout-probe",
                                 self.body.clone(),
                                 None,
-                                theme::semantic_color("warning", true),
                             )
                             .into_any_element(),
                             theme::semantic_color("muted", true),
@@ -31461,6 +31454,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("user message renderer should remain inspectable");
         assert!(renderer.contains("render_inline_user_message_editor"));
+        assert!(source.contains("MarkdownView::plain_text(id"));
         let timestamp_index = renderer
             .find(".when_some(timestamp")
             .expect("timestamp should be rendered for the user message actions");
