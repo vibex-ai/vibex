@@ -22796,50 +22796,40 @@ fn permission_response_label(kind: PermissionResponseKind) -> &'static str {
 }
 
 fn render_agent_thinking_indicator(label: &'static str, cx: &App) -> AnyElement {
-    // Codex-parity: "Thinking" with a shimmer — a bright window sweeping across the
-    // muted label every 1.6s. Painted over the text as a moving highlight.
-    let shimmer = cx.theme().foreground;
+    let base = cx.theme().muted_foreground.opacity(0.75);
+    let glow = cx.theme().foreground;
+    let character_count = label.chars().count();
     h_flex()
         .w_full()
         .min_w_0()
         .justify_start()
         .py_1()
         .child(
-            div()
-                .relative()
-                .overflow_hidden()
-                .rounded_sm()
+            h_flex()
                 .text_sm()
-                .text_color(cx.theme().muted_foreground.opacity(0.75))
-                .child(div().child(label))
-                .child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .bottom_0()
-                        .w(relative(0.45))
-                        .child(
-                            h_flex()
-                                .size_full()
-                                .child(div().w(relative(0.5)).h_full().bg(linear_gradient(
-                                    90.0,
-                                    linear_color_stop(shimmer.opacity(0.0), 0.0),
-                                    linear_color_stop(shimmer.opacity(0.30), 1.0),
-                                )))
-                                .child(div().w(relative(0.5)).h_full().bg(linear_gradient(
-                                    90.0,
-                                    linear_color_stop(shimmer.opacity(0.30), 0.0),
-                                    linear_color_stop(shimmer.opacity(0.0), 1.0),
-                                ))),
-                        )
-                        .with_animation(
-                            "agent-thinking-glow",
-                            Animation::new(Duration::from_millis(1_600))
-                                .repeat()
-                                .with_easing(gpui::ease_in_out),
-                            move |this, delta| this.left(relative(-1.2 + delta * 3.4)),
-                        ),
-                ),
+                .children(label.chars().enumerate().map(|(index, character)| {
+                    let position = if character_count > 1 {
+                        index as f32 / (character_count - 1) as f32
+                    } else {
+                        0.5
+                    };
+                    div().child(character.to_string()).with_animation(
+                        format!("agent-thinking-glow-{index}"),
+                        Animation::new(Duration::from_millis(1_800)).repeat(),
+                        move |this, delta| {
+                            let scan_position = -0.35 + delta * 1.7;
+                            let intensity =
+                                (1.0 - (position - scan_position).abs() / 0.42).clamp(0.0, 1.0);
+                            let intensity = intensity * intensity * (3.0 - 2.0 * intensity);
+                            this.text_color(Hsla {
+                                h: base.h + (glow.h - base.h) * intensity,
+                                s: base.s + (glow.s - base.s) * intensity,
+                                l: base.l + (glow.l - base.l) * intensity,
+                                a: base.a + (glow.a - base.a) * intensity,
+                            })
+                        },
+                    )
+                })),
         )
         .into_any_element()
 }
