@@ -153,6 +153,7 @@ const OPENCODE_MODEL_API_ERROR_CODE: &str = "opencode_model_api_error";
 const OPENCODE_MODEL_API_RETRYING_CODE: &str = "opencode_model_api_retrying";
 const CODEX_STREAM_RECONNECTING_CODE: &str = "codex_stream_reconnecting";
 const CODEX_STREAM_RECONNECT_EXHAUSTED_CODE: &str = "codex_stream_reconnect_exhausted";
+const CODEX_HTTP_STATUS_ERROR_CODE: &str = "codex_http_status_error";
 const CODEX_RECONNECT_PROGRESS_PREFIX: &str = "Reconnecting... ";
 // OpenCode retries transient model failures with a 2/4/8/16/30-second backoff.
 // Eight consecutive failures preserve a roughly two-minute recovery window.
@@ -833,6 +834,7 @@ struct ActiveTurn {
     usage: Option<ActiveUsageTurn>,
     chunk_index: u32,
     codex_reconnect: Option<CodexReconnectState>,
+    codex_terminal_error: Option<VibexError>,
     opencode_stream_error_count: u8,
     opencode_stream_error_epoch: u64,
     latest_opencode_stream_error: Option<String>,
@@ -930,6 +932,24 @@ fn parse_codex_reconnect_progress(text: &str) -> Option<CodexReconnectProgress> 
     let total = total.parse::<u32>().ok()?;
     (attempt > 0 && total > 0 && attempt <= total)
         .then_some(CodexReconnectProgress { attempt, total })
+}
+
+fn codex_terminal_http_status(text: &str) -> Option<u16> {
+    let line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let status_text = line
+        .strip_prefix("unexpected status ")
+        .or_else(|| line.strip_prefix("http status "))
+        .or_else(|| line.strip_prefix("status "))
+        .unwrap_or(line);
+    let mut parts = status_text.split_ascii_whitespace();
+    let first = parts.next()?;
+    let status = if first.starts_with("HTTP/") {
+        parts.next()?.parse::<u16>().ok()?
+    } else {
+        first.parse::<u16>().ok()?
+    };
+    parts.next()?;
+    (400..=599).contains(&status).then_some(status)
 }
 
 fn append_bounded_assistant_text(buffer: &mut String, truncated: &mut bool, text: &str) {
@@ -1432,6 +1452,7 @@ impl AcpSessionAttachment {
             ),
             chunk_index: 0,
             codex_reconnect: None,
+            codex_terminal_error: None,
             opencode_stream_error_count: 0,
             opencode_stream_error_epoch: 0,
             latest_opencode_stream_error: None,
@@ -1666,6 +1687,7 @@ impl AcpSessionAttachment {
         let Some(turn) = state.active_turn.as_mut() else {
             return;
         };
+        turn.codex_terminal_error = None;
         turn.codex_reconnect = Some(CodexReconnectState {
             progress,
             terminal_message: None,
@@ -1693,31 +1715,57 @@ impl AcpSessionAttachment {
             && let Some(turn) = state.active_turn.as_mut()
         {
             turn.codex_reconnect = None;
+            turn.codex_terminal_error = None;
         }
     }
 
-    fn codex_reconnect_exhausted_error(&self) -> Option<VibexError> {
+    fn record_codex_terminal_http_error(&self, text: &str) -> bool {
+        let Some(http_status) = codex_terminal_http_status(text) else {
+            return false;
+        };
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let Some(turn) = state.active_turn.as_mut() else {
+            return false;
+        };
+        turn.codex_terminal_error = Some(
+            VibexError::provider(
+                CODEX_HTTP_STATUS_ERROR_CODE,
+                format!("Codex model request failed with HTTP {http_status}"),
+            )
+            .with_recovery_hint("Continue the session to retry from the failed turn")
+            .with_diagnostic("httpStatus", http_status.to_string()),
+        );
+        true
+    }
+
+    fn codex_terminal_error(&self) -> Option<VibexError> {
         let state = self.state.lock().ok()?;
-        let reconnect = state.active_turn.as_ref()?.codex_reconnect.as_ref()?;
-        (reconnect.progress.attempt == reconnect.progress.total).then(|| {
-            let message = reconnect.terminal_message.as_deref().map_or_else(
-                || {
-                    format!(
-                        "Codex model stream failed after {} reconnect attempts",
-                        reconnect.progress.total
-                    )
-                },
-                |detail| {
-                    format!(
-                        "Codex model stream failed after {} reconnect attempts: {detail}",
-                        reconnect.progress.total
-                    )
-                },
-            );
-            VibexError::provider(CODEX_STREAM_RECONNECT_EXHAUSTED_CODE, message)
-                .with_recovery_hint("Continue the session to retry from the failed turn")
-                .with_diagnostic("reconnectAttempts", reconnect.progress.total.to_string())
-        })
+        let turn = state.active_turn.as_ref()?;
+        turn.codex_reconnect
+            .as_ref()
+            .filter(|reconnect| reconnect.progress.attempt == reconnect.progress.total)
+            .map(|reconnect| {
+                let message = reconnect.terminal_message.as_deref().map_or_else(
+                    || {
+                        format!(
+                            "Codex model stream failed after {} reconnect attempts",
+                            reconnect.progress.total
+                        )
+                    },
+                    |detail| {
+                        format!(
+                            "Codex model stream failed after {} reconnect attempts: {detail}",
+                            reconnect.progress.total
+                        )
+                    },
+                );
+                VibexError::provider(CODEX_STREAM_RECONNECT_EXHAUSTED_CODE, message)
+                    .with_recovery_hint("Continue the session to retry from the failed turn")
+                    .with_diagnostic("reconnectAttempts", reconnect.progress.total.to_string())
+            })
+            .or_else(|| turn.codex_terminal_error.clone())
     }
 
     fn record_opencode_stream_error(
@@ -2229,6 +2277,9 @@ impl AcpSessionAttachment {
                             return;
                         }
                         if self.record_codex_reconnect_terminal_message(&text) {
+                            return;
+                        }
+                        if self.record_codex_terminal_http_error(&text) {
                             return;
                         }
                     } else if is_codex {
@@ -11773,7 +11824,7 @@ impl AcpClient for AcpRuntimeClient {
         }
         if stop_reason == "end_turn"
             && !has_pending_permissions
-            && let Some(error) = payload.codex_reconnect_exhausted_error()
+            && let Some(error) = payload.codex_terminal_error()
         {
             turn_guard.abort(false, AgentUsageExecutionStatus::Failed);
             return Err(error);
@@ -13200,6 +13251,24 @@ mod tests {
         ] {
             assert_eq!(parse_codex_reconnect_progress(invalid), None, "{invalid}");
         }
+    }
+
+    #[test]
+    fn codex_terminal_http_status_accepts_provider_and_proxy_error_shapes() {
+        assert_eq!(
+            codex_terminal_http_status("400 Bad Request\n\nnginx"),
+            Some(400)
+        );
+        assert_eq!(
+            codex_terminal_http_status("unexpected status 404 Not Found\n\n"),
+            Some(404)
+        );
+        assert_eq!(
+            codex_terminal_http_status("HTTP/1.1 503 Service Unavailable"),
+            Some(503)
+        );
+        assert_eq!(codex_terminal_http_status("200 OK"), None);
+        assert_eq!(codex_terminal_http_status("model stream recovered"), None);
     }
 
     #[test]
@@ -15855,6 +15924,23 @@ for line in sys.stdin:
                         },
                     },
                 })
+            send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
+            continue
+        if prompt_mode == "codex_http_error":
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {
+                            "type": "text",
+                            "text": "400 Bad Request\\n\\nnginx\\n",
+                        },
+                    },
+                },
+            })
             send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
             continue
         if prompt_mode == "stream_error":
@@ -19682,6 +19768,77 @@ for line in sys.stdin:
                 AcpEvent::AssistantDelta { text_delta, .. }
                     if text_delta.contains(CODEX_RECONNECT_PROGRESS_PREFIX)
                         || text_delta.contains("unexpected status")
+            )
+        }));
+        assert_eq!(
+            logged_request_count(&fixture.request_log(), "session/cancel"),
+            0
+        );
+
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn codex_http_status_error_returns_a_terminal_provider_error() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "codex-http-status-error",
+            Some(AgentId::parse("codex").unwrap()),
+        ) else {
+            return;
+        };
+        fixture.set_prompt_mode("codex_http_error");
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let error = prepare_and_send_turn(
+            &client,
+            AcpSendTurnRequest {
+                session_id: session_id.clone(),
+                message_submission_id: None,
+                required_runtime: None,
+                text: "trigger Codex HTTP failure".to_string(),
+                attachments: Vec::new(),
+                workspace_root: fixture.workspace.display().to_string(),
+                binding: binding.clone(),
+                runtime_resources: ProviderRuntimeResources::default(),
+                execution_identity: None,
+                event_sender: Some(event_tx),
+                usage_execution_context: None,
+                usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                usage_event_sender: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.category, vibex_core::ErrorCategory::Provider);
+        assert_eq!(error.code, CODEX_HTTP_STATUS_ERROR_CODE);
+        assert_eq!(error.message, "Codex model request failed with HTTP 400");
+        assert!(
+            error
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.key == "httpStatus" && diagnostic.value == "400")
+        );
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(!events.iter().any(|event| {
+            matches!(
+                event,
+                AcpEvent::AssistantDelta { text_delta, .. }
+                    if text_delta.contains("400 Bad Request") || text_delta.contains("nginx")
             )
         }));
         assert_eq!(
