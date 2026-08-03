@@ -15,8 +15,8 @@ use vibex_core::{
     GitRemoteActionResult, GitRemoteSummary, GitStageRequest, GitStatusSummary,
     GitWorktreeChangeSummary, GitWorktreeConflictFile, GitWorktreeConflictKind,
     GitWorktreeConflictVersion, GitWorktreeCreateRequest, GitWorktreeDiscardRequest,
-    GitWorktreeListResponse, GitWorktreeMergeRequest, GitWorktreeSummary, VibexError, VibexResult,
-    WorkspaceId, unix_timestamp_ms,
+    GitWorktreeListResponse, GitWorktreeMergeRequest, GitWorktreeMergeStrategy, GitWorktreeSummary,
+    VibexError, VibexResult, WorkspaceId, unix_timestamp_ms,
 };
 
 mod identity;
@@ -590,6 +590,205 @@ pub fn worktree_merge(
     Ok(output.trim().to_string())
 }
 
+pub fn worktree_rebase_source(
+    source_repo_path: impl AsRef<Path>,
+    target_repo_path: impl AsRef<Path>,
+    source_branch: &str,
+    expected_source_head: &str,
+    expected_target_branch: &str,
+    expected_target_head: &str,
+) -> VibexResult<String> {
+    let source_root = repo_root(source_repo_path.as_ref())?;
+    let target_root = repo_root(target_repo_path.as_ref())?;
+    let _mutation = GitMutationGuard::claim(&source_root)?;
+    verify_rebase_start(
+        &source_root,
+        &target_root,
+        source_branch,
+        expected_source_head,
+        expected_target_branch,
+        expected_target_head,
+    )?;
+    run_git_owned(
+        &source_root,
+        &[
+            "-c".to_string(),
+            "rebase.updateRefs=false".to_string(),
+            "rebase".to_string(),
+            "--no-autostash".to_string(),
+            "--no-rebase-merges".to_string(),
+            expected_target_head.to_string(),
+        ],
+    )?;
+    verify_rebase_completed_source(
+        &source_root,
+        &target_root,
+        source_branch,
+        expected_target_branch,
+        expected_target_head,
+    )
+}
+
+pub fn worktree_rebase_continue(
+    source_repo_path: impl AsRef<Path>,
+    target_repo_path: impl AsRef<Path>,
+    source_branch: &str,
+    expected_source_head: &str,
+    expected_target_branch: &str,
+    expected_target_head: &str,
+) -> VibexResult<String> {
+    let source_root = repo_root(source_repo_path.as_ref())?;
+    let target_root = repo_root(target_repo_path.as_ref())?;
+    let _mutation = GitMutationGuard::claim(&source_root)?;
+    verify_rebase_scene(
+        &source_root,
+        &target_root,
+        source_branch,
+        expected_source_head,
+        expected_target_branch,
+        expected_target_head,
+    )?;
+    if !worktree_conflicts(&source_root)?.is_empty() {
+        return Err(VibexError::conflict(
+            "worktree_conflicts_unresolved",
+            "all rebase conflicts must be staged before continuing",
+        ));
+    }
+    run_git_owned(
+        &source_root,
+        &[
+            "-c".to_string(),
+            "core.editor=true".to_string(),
+            "-c".to_string(),
+            "rebase.updateRefs=false".to_string(),
+            "rebase".to_string(),
+            "--continue".to_string(),
+        ],
+    )?;
+    verify_rebase_completed_source(
+        &source_root,
+        &target_root,
+        source_branch,
+        expected_target_branch,
+        expected_target_head,
+    )
+}
+
+pub fn worktree_rebase_finish(
+    source_repo_path: impl AsRef<Path>,
+    target_repo_path: impl AsRef<Path>,
+    source_branch: &str,
+    rebased_source_head: &str,
+    expected_target_branch: &str,
+    expected_target_head: &str,
+) -> VibexResult<String> {
+    let source_root = repo_root(source_repo_path.as_ref())?;
+    let target_root = repo_root(target_repo_path.as_ref())?;
+    let _mutation = GitMutationGuard::claim(&source_root)?;
+    validate_ref_arg(source_branch)?;
+    validate_commitish(rebased_source_head)?;
+    validate_ref_arg(expected_target_branch)?;
+    validate_commitish(expected_target_head)?;
+    verify_same_repository(&source_root, &target_root)?;
+    if current_branch(&source_root)?.as_deref() != Some(source_branch)
+        || resolve_head(&source_root)? != rebased_source_head
+        || resolve_ref_head(&source_root, source_branch)? != rebased_source_head
+        || status(WorkspaceId::new(), &source_root)?.dirty
+    {
+        return Err(VibexError::conflict(
+            "worktree_rebased_source_changed",
+            "rebased source no longer matches the recorded head",
+        ));
+    }
+    verify_target_for_rebase(&target_root, expected_target_branch, expected_target_head)?;
+    run_git_owned(
+        &target_root,
+        &[
+            "merge".to_string(),
+            "--ff-only".to_string(),
+            "--no-edit".to_string(),
+            rebased_source_head.to_string(),
+        ],
+    )?;
+    let head_after = resolve_head(&target_root)?;
+    if head_after != rebased_source_head {
+        return Err(VibexError::conflict(
+            "worktree_rebase_fast_forward_unproven",
+            "target did not reach the exact rebased source head",
+        ));
+    }
+    Ok(head_after)
+}
+
+pub fn worktree_rebase_abort(
+    source_repo_path: impl AsRef<Path>,
+    target_repo_path: impl AsRef<Path>,
+    source_branch: &str,
+    expected_source_head: &str,
+    expected_target_branch: &str,
+    expected_target_head: &str,
+) -> VibexResult<()> {
+    let source_root = repo_root(source_repo_path.as_ref())?;
+    let target_root = repo_root(target_repo_path.as_ref())?;
+    let _mutation = GitMutationGuard::claim(&source_root)?;
+    verify_rebase_scene(
+        &source_root,
+        &target_root,
+        source_branch,
+        expected_source_head,
+        expected_target_branch,
+        expected_target_head,
+    )?;
+    run_git_owned(&source_root, &["rebase".to_string(), "--abort".to_string()])?;
+    if current_branch(&source_root)?.as_deref() != Some(source_branch)
+        || resolve_head(&source_root)? != expected_source_head
+        || resolve_ref_head(&source_root, source_branch)? != expected_source_head
+        || status(WorkspaceId::new(), &source_root)?.dirty
+    {
+        return Err(VibexError::conflict(
+            "worktree_rebase_abort_unproven",
+            "rebase abort did not restore the exact clean source state",
+        ));
+    }
+    verify_target_for_rebase(&target_root, expected_target_branch, expected_target_head)?;
+    Ok(())
+}
+
+pub fn worktree_rebase_scene_matches(
+    source_repo_path: impl AsRef<Path>,
+    target_repo_path: impl AsRef<Path>,
+    source_branch: &str,
+    expected_source_head: &str,
+    expected_target_branch: &str,
+    expected_target_head: &str,
+) -> VibexResult<bool> {
+    let source_root = repo_root(source_repo_path.as_ref())?;
+    let target_root = repo_root(target_repo_path.as_ref())?;
+    match verify_rebase_scene(
+        &source_root,
+        &target_root,
+        source_branch,
+        expected_source_head,
+        expected_target_branch,
+        expected_target_head,
+    ) {
+        Ok(()) => Ok(true),
+        Err(error)
+            if matches!(
+                error.code.as_str(),
+                "worktree_rebase_resolution_scene_changed"
+                    | "worktree_target_branch_changed"
+                    | "worktree_target_head_changed"
+                    | "worktree_merge_dirty_target"
+                    | "worktree_repository_identity_mismatch"
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub fn worktree_dirty_fingerprint(repo_path: impl AsRef<Path>) -> VibexResult<String> {
     let root = repo_root(repo_path.as_ref())?;
     let head = resolve_head(&root)?;
@@ -794,13 +993,34 @@ pub fn worktree_select_conflict_version(
     path: &str,
     version: GitWorktreeConflictVersion,
 ) -> VibexResult<Vec<GitWorktreeConflictFile>> {
+    worktree_select_conflict_version_for_strategy(
+        repo_path,
+        path,
+        version,
+        GitWorktreeMergeStrategy::NoFfMerge,
+    )
+}
+
+pub fn worktree_select_conflict_version_for_strategy(
+    repo_path: impl AsRef<Path>,
+    path: &str,
+    version: GitWorktreeConflictVersion,
+    strategy: GitWorktreeMergeStrategy,
+) -> VibexResult<Vec<GitWorktreeConflictFile>> {
     let root = repo_root(repo_path.as_ref())?;
     let _mutation = GitMutationGuard::claim(&root)?;
     validate_git_path(path)?;
-    if merge_head(&root)?.is_none() {
+    let operation_matches = match strategy {
+        GitWorktreeMergeStrategy::NoFfMerge => merge_head(&root)?.is_some(),
+        GitWorktreeMergeStrategy::RebaseAndMerge => {
+            active_git_operation(&root)?.as_deref() == Some("rebase")
+        }
+        GitWorktreeMergeStrategy::Unknown => false,
+    };
+    if !operation_matches {
         return Err(VibexError::conflict(
             "worktree_merge_scene_missing",
-            "target workspace no longer has an active merge",
+            "workspace no longer has the expected integration operation",
         ));
     }
     let conflicts = worktree_conflicts(&root)?;
@@ -1431,6 +1651,177 @@ fn verify_merge_scene(
         ));
     }
     Ok(())
+}
+
+fn verify_rebase_start(
+    source_root: &Path,
+    target_root: &Path,
+    source_branch: &str,
+    expected_source_head: &str,
+    expected_target_branch: &str,
+    expected_target_head: &str,
+) -> VibexResult<()> {
+    validate_ref_arg(source_branch)?;
+    validate_commitish(expected_source_head)?;
+    validate_ref_arg(expected_target_branch)?;
+    validate_commitish(expected_target_head)?;
+    verify_same_repository(source_root, target_root)?;
+    if current_branch(source_root)?.as_deref() != Some(source_branch)
+        || resolve_head(source_root)? != expected_source_head
+        || resolve_ref_head(source_root, source_branch)? != expected_source_head
+    {
+        return Err(VibexError::conflict(
+            "worktree_source_head_changed",
+            "source branch changed before rebase",
+        ));
+    }
+    if status(WorkspaceId::new(), source_root)?.dirty {
+        return Err(VibexError::conflict(
+            "worktree_rebase_dirty_source",
+            "source worktree has uncommitted changes",
+        ));
+    }
+    verify_target_for_rebase(target_root, expected_target_branch, expected_target_head)
+}
+
+fn verify_rebase_completed_source(
+    source_root: &Path,
+    target_root: &Path,
+    source_branch: &str,
+    expected_target_branch: &str,
+    expected_target_head: &str,
+) -> VibexResult<String> {
+    if active_git_operation(source_root)?.is_some() {
+        return Err(VibexError::conflict(
+            "worktree_rebase_incomplete",
+            "source worktree still has an active Git operation",
+        ));
+    }
+    let rebased_head = resolve_head(source_root)?;
+    if current_branch(source_root)?.as_deref() != Some(source_branch)
+        || resolve_ref_head(source_root, source_branch)? != rebased_head
+        || status(WorkspaceId::new(), source_root)?.dirty
+    {
+        return Err(VibexError::conflict(
+            "worktree_rebased_source_changed",
+            "rebased source does not have the expected clean branch identity",
+        ));
+    }
+    verify_target_for_rebase(target_root, expected_target_branch, expected_target_head)?;
+    if !is_ancestor(target_root, expected_target_head, &rebased_head)? {
+        return Err(VibexError::conflict(
+            "worktree_rebase_result_invalid",
+            "rebased source is not based on the fixed target head",
+        ));
+    }
+    Ok(rebased_head)
+}
+
+fn verify_rebase_scene(
+    source_root: &Path,
+    target_root: &Path,
+    source_branch: &str,
+    expected_source_head: &str,
+    expected_target_branch: &str,
+    expected_target_head: &str,
+) -> VibexResult<()> {
+    validate_ref_arg(source_branch)?;
+    validate_commitish(expected_source_head)?;
+    validate_ref_arg(expected_target_branch)?;
+    validate_commitish(expected_target_head)?;
+    verify_same_repository(source_root, target_root)?;
+    if active_git_operation(source_root)?.as_deref() != Some("rebase")
+        || resolve_ref_head(source_root, source_branch)? != expected_source_head
+        || rebase_state_value(source_root, "orig-head")?.as_deref() != Some(expected_source_head)
+        || rebase_state_value(source_root, "onto")?.as_deref() != Some(expected_target_head)
+        || rebase_state_value(source_root, "head-name")?.as_deref()
+            != Some(format!("refs/heads/{source_branch}").as_str())
+    {
+        return Err(VibexError::conflict(
+            "worktree_rebase_resolution_scene_changed",
+            "source Git scene no longer matches the durable rebase operation",
+        ));
+    }
+    verify_target_for_rebase(target_root, expected_target_branch, expected_target_head)
+}
+
+fn verify_target_for_rebase(
+    target_root: &Path,
+    expected_target_branch: &str,
+    expected_target_head: &str,
+) -> VibexResult<()> {
+    if current_branch(target_root)?.as_deref() != Some(expected_target_branch) {
+        return Err(VibexError::conflict(
+            "worktree_target_branch_changed",
+            "target branch changed during rebase integration",
+        ));
+    }
+    if resolve_head(target_root)? != expected_target_head {
+        return Err(VibexError::conflict(
+            "worktree_target_head_changed",
+            "target head changed during rebase integration",
+        ));
+    }
+    if status(WorkspaceId::new(), target_root)?.dirty {
+        return Err(VibexError::conflict(
+            "worktree_merge_dirty_target",
+            "target checkout has uncommitted changes",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_same_repository(left: &Path, right: &Path) -> VibexResult<()> {
+    if repository_identity(left)?.comparison_key != repository_identity(right)?.comparison_key {
+        return Err(VibexError::conflict(
+            "worktree_repository_identity_mismatch",
+            "source and target belong to different Git repositories",
+        ));
+    }
+    Ok(())
+}
+
+fn rebase_state_value(root: &Path, name: &str) -> VibexResult<Option<String>> {
+    let git_dir = PathBuf::from(run_git(root, &["rev-parse", "--absolute-git-dir"])?.trim());
+    for directory in ["rebase-merge", "rebase-apply"] {
+        let path = git_dir.join(directory).join(name);
+        match std::fs::read_to_string(&path) {
+            Ok(value) => return Ok(Some(value.trim().to_string())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(VibexError::storage(
+                    "worktree_rebase_state_read_failed",
+                    "failed to inspect the active rebase state",
+                )
+                .with_diagnostic("path", path.display().to_string())
+                .with_diagnostic("error", error.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> VibexResult<bool> {
+    validate_commitish(ancestor)?;
+    validate_commitish(descendant)?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .output()
+        .map_err(|error| {
+            VibexError::process("git_spawn_failed", "failed to spawn git")
+                .with_diagnostic("error", error.to_string())
+        })?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(git_command_error(
+            "git_command_failed",
+            "git merge-base failed",
+            &output,
+        )),
+    }
 }
 
 fn is_untracked(root: &Path, path: &str) -> VibexResult<bool> {
@@ -2836,6 +3227,207 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(worktree_path);
+    }
+
+    #[test]
+    fn worktree_rebase_and_merge_rewrites_source_then_fast_forwards_target() {
+        let root = temp_repo("worktree-rebase-main");
+        std::fs::create_dir_all(&root).unwrap();
+        init_repo_with_commit(&root, "README.md", "base\n", "base");
+        let source_path = temp_repo("worktree-rebase-source");
+        let source_branch = "feature/rebase";
+        worktree_add(
+            &root,
+            &source_path,
+            &GitWorktreeCreateRequest {
+                workspace_id: WorkspaceId::new(),
+                branch_name: source_branch.to_string(),
+                base_ref: Some("HEAD".to_string()),
+                name: None,
+                worktree_path: None,
+                target_workspace_id: None,
+                target_branch: None,
+            },
+        )
+        .unwrap();
+        std::fs::write(source_path.join("source.txt"), "source\n").unwrap();
+        run_raw(&source_path, &["add", "source.txt"]).unwrap();
+        run_raw(&source_path, &["commit", "-m", "source"]).unwrap();
+        let source_head = resolve_head(&source_path).unwrap();
+        std::fs::write(root.join("target.txt"), "target\n").unwrap();
+        run_raw(&root, &["add", "target.txt"]).unwrap();
+        run_raw(&root, &["commit", "-m", "target"]).unwrap();
+        let target_branch = current_branch(&root).unwrap().unwrap();
+        let target_head = resolve_head(&root).unwrap();
+
+        let rebased_head = worktree_rebase_source(
+            &source_path,
+            &root,
+            source_branch,
+            &source_head,
+            &target_branch,
+            &target_head,
+        )
+        .unwrap();
+        assert_ne!(rebased_head, source_head);
+        assert_eq!(resolve_head(&root).unwrap(), target_head);
+        let head_after = worktree_rebase_finish(
+            &source_path,
+            &root,
+            source_branch,
+            &rebased_head,
+            &target_branch,
+            &target_head,
+        )
+        .unwrap();
+        assert_eq!(head_after, rebased_head);
+        let parents = run_git(&root, &["rev-list", "--parents", "-n", "1", &head_after]).unwrap();
+        assert_eq!(parents.split_whitespace().count(), 2);
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(source_path);
+    }
+
+    #[test]
+    fn worktree_rebase_conflicts_can_continue_or_abort_exactly() {
+        let root = temp_repo("worktree-rebase-conflict-main");
+        std::fs::create_dir_all(&root).unwrap();
+        init_repo_with_commit(&root, "conflict.txt", "base\n", "base");
+        let source_path = temp_repo("worktree-rebase-conflict-source");
+        let source_branch = "feature/rebase-conflict";
+        worktree_add(
+            &root,
+            &source_path,
+            &GitWorktreeCreateRequest {
+                workspace_id: WorkspaceId::new(),
+                branch_name: source_branch.to_string(),
+                base_ref: Some("HEAD".to_string()),
+                name: None,
+                worktree_path: None,
+                target_workspace_id: None,
+                target_branch: None,
+            },
+        )
+        .unwrap();
+        std::fs::write(source_path.join("conflict.txt"), "source\n").unwrap();
+        run_raw(&source_path, &["add", "conflict.txt"]).unwrap();
+        run_raw(&source_path, &["commit", "-m", "source"]).unwrap();
+        let source_head = resolve_head(&source_path).unwrap();
+        std::fs::write(root.join("conflict.txt"), "target\n").unwrap();
+        run_raw(&root, &["add", "conflict.txt"]).unwrap();
+        run_raw(&root, &["commit", "-m", "target"]).unwrap();
+        let target_branch = current_branch(&root).unwrap().unwrap();
+        let target_head = resolve_head(&root).unwrap();
+
+        worktree_rebase_source(
+            &source_path,
+            &root,
+            source_branch,
+            &source_head,
+            &target_branch,
+            &target_head,
+        )
+        .unwrap_err();
+        assert!(
+            worktree_rebase_scene_matches(
+                &source_path,
+                &root,
+                source_branch,
+                &source_head,
+                &target_branch,
+                &target_head,
+            )
+            .unwrap()
+        );
+        worktree_select_conflict_version_for_strategy(
+            &source_path,
+            "conflict.txt",
+            GitWorktreeConflictVersion::Source,
+            GitWorktreeMergeStrategy::RebaseAndMerge,
+        )
+        .unwrap();
+        worktree_stage_conflicts(
+            WorkspaceId::new(),
+            &source_path,
+            &["conflict.txt".to_string()],
+        )
+        .unwrap();
+        let rebased_head = worktree_rebase_continue(
+            &source_path,
+            &root,
+            source_branch,
+            &source_head,
+            &target_branch,
+            &target_head,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(source_path.join("conflict.txt")).unwrap(),
+            "source\n"
+        );
+        worktree_rebase_finish(
+            &source_path,
+            &root,
+            source_branch,
+            &rebased_head,
+            &target_branch,
+            &target_head,
+        )
+        .unwrap();
+
+        let abort_root = temp_repo("worktree-rebase-abort-main");
+        std::fs::create_dir_all(&abort_root).unwrap();
+        init_repo_with_commit(&abort_root, "conflict.txt", "base\n", "base");
+        let abort_source = temp_repo("worktree-rebase-abort-source");
+        let abort_branch = "feature/rebase-abort";
+        worktree_add(
+            &abort_root,
+            &abort_source,
+            &GitWorktreeCreateRequest {
+                workspace_id: WorkspaceId::new(),
+                branch_name: abort_branch.to_string(),
+                base_ref: Some("HEAD".to_string()),
+                name: None,
+                worktree_path: None,
+                target_workspace_id: None,
+                target_branch: None,
+            },
+        )
+        .unwrap();
+        std::fs::write(abort_source.join("conflict.txt"), "source\n").unwrap();
+        run_raw(&abort_source, &["add", "conflict.txt"]).unwrap();
+        run_raw(&abort_source, &["commit", "-m", "source"]).unwrap();
+        let abort_source_head = resolve_head(&abort_source).unwrap();
+        std::fs::write(abort_root.join("conflict.txt"), "target\n").unwrap();
+        run_raw(&abort_root, &["add", "conflict.txt"]).unwrap();
+        run_raw(&abort_root, &["commit", "-m", "target"]).unwrap();
+        let abort_target_branch = current_branch(&abort_root).unwrap().unwrap();
+        let abort_target_head = resolve_head(&abort_root).unwrap();
+        worktree_rebase_source(
+            &abort_source,
+            &abort_root,
+            abort_branch,
+            &abort_source_head,
+            &abort_target_branch,
+            &abort_target_head,
+        )
+        .unwrap_err();
+        worktree_rebase_abort(
+            &abort_source,
+            &abort_root,
+            abort_branch,
+            &abort_source_head,
+            &abort_target_branch,
+            &abort_target_head,
+        )
+        .unwrap();
+        assert_eq!(resolve_head(&abort_source).unwrap(), abort_source_head);
+        assert_eq!(resolve_head(&abort_root).unwrap(), abort_target_head);
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(source_path);
+        let _ = std::fs::remove_dir_all(abort_root);
+        let _ = std::fs::remove_dir_all(abort_source);
     }
 
     #[test]

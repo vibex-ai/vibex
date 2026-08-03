@@ -545,6 +545,20 @@ impl WorktreeLifecycleView {
             state,
         })
     }
+
+    pub fn owns_conflict_resolution(&self) -> bool {
+        let Some(operation) = self.operation.as_ref() else {
+            return false;
+        };
+        match operation.detail.merge_strategy.unwrap_or_default() {
+            vibex_core::GitWorktreeMergeStrategy::RebaseAndMerge => operation
+                .source_workspace_id
+                .as_ref()
+                .is_some_and(|workspace_id| workspace_id == &self.workspace_id),
+            vibex_core::GitWorktreeMergeStrategy::NoFfMerge
+            | vibex_core::GitWorktreeMergeStrategy::Unknown => self.target_owned,
+        }
+    }
 }
 
 fn lifecycle_operation_is_visible(status: GitWorktreeOperationStatus) -> bool {
@@ -1319,7 +1333,7 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 2,
         };
-        let snapshot = GitWorktreeLifecycleSnapshot {
+        let mut snapshot = GitWorktreeLifecycleSnapshot {
             workspace_id: target.id.clone(),
             eligibility: eligibility(&project, "/repo", "r1"),
             managed_worktrees: vec![managed],
@@ -1331,6 +1345,7 @@ mod tests {
 
         let source_view = WorktreeLifecycleView::from_snapshot(&source.id, &snapshot).unwrap();
         assert!(!source_view.target_owned);
+        assert!(!source_view.owns_conflict_resolution());
         assert_eq!(
             source_view.readiness.as_ref().map(|value| value.state),
             Some(GitWorktreeReadinessState::ReadyToMerge)
@@ -1341,10 +1356,18 @@ mod tests {
         );
         let target_view = WorktreeLifecycleView::from_snapshot(&target.id, &snapshot).unwrap();
         assert!(target_view.target_owned);
+        assert!(target_view.owns_conflict_resolution());
         assert_eq!(
             target_view.state,
             WorktreeLifecycleDisplayState::NeedsResolution
         );
+
+        snapshot.operations[0].detail.merge_strategy =
+            Some(vibex_core::GitWorktreeMergeStrategy::RebaseAndMerge);
+        let source_view = WorktreeLifecycleView::from_snapshot(&source.id, &snapshot).unwrap();
+        let target_view = WorktreeLifecycleView::from_snapshot(&target.id, &snapshot).unwrap();
+        assert!(source_view.owns_conflict_resolution());
+        assert!(!target_view.owns_conflict_resolution());
     }
 
     #[test]

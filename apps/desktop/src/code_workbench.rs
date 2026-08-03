@@ -14,8 +14,8 @@ use gpui::{
     list, point, prelude::*, px, relative, uniform_list,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _,
-    WindowExt as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
+    StyledExt as _, WindowExt as _,
     button::{Button, ButtonRounded, ButtonVariants as _},
     dialog::{DialogAction, DialogClose, DialogFooter},
     h_flex,
@@ -39,10 +39,10 @@ use vibex_core::{
     GitWorktreeConflictKind, GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest,
     GitWorktreeConflictVersion, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
     GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
-    GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeOperationStatus,
-    GitWorktreeReadinessRequest, GitWorktreeReadinessState, GitWorktreeRestoreRequest,
-    GitWorktreeRisk, GitWorktreeRiskKind, RequestId, TerminalId, TerminalSession, TerminalStatus,
-    VibexError, VibexResult, WorkspaceId, unix_timestamp_ms,
+    GitWorktreeMergeStrategy, GitWorktreeOperationRecord, GitWorktreeOperationRequest,
+    GitWorktreeOperationStatus, GitWorktreeReadinessRequest, GitWorktreeReadinessState,
+    GitWorktreeRestoreRequest, GitWorktreeRisk, GitWorktreeRiskKind, RequestId, TerminalId,
+    TerminalSession, TerminalStatus, VibexError, VibexResult, WorkspaceId, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     BoundedImageCache, ContentPreviewKind, EditorBufferAvailability, EditorBufferRegistry,
@@ -340,7 +340,10 @@ enum GitTreeInteraction {
 
 #[derive(Clone)]
 enum WorktreeLifecycleConfirmation {
-    Merge(GitWorktreeMergePlan),
+    Merge {
+        plan: GitWorktreeMergePlan,
+        strategy: GitWorktreeMergeStrategy,
+    },
     Archive {
         request: GitWorktreeArchiveRequest,
         preflight: GitWorktreeDestructivePreflight,
@@ -1575,7 +1578,7 @@ impl CodeWorkbench {
             return;
         }
         let conflict_paths = WorktreeLifecycleView::from_snapshot(&workspace.id, &snapshot)
-            .filter(|view| view.target_owned)
+            .filter(WorktreeLifecycleView::owns_conflict_resolution)
             .and_then(|view| view.operation)
             .filter(|operation| {
                 matches!(
@@ -1891,6 +1894,12 @@ impl CodeWorkbench {
         let Some(view) = self.worktree_lifecycle_view() else {
             return;
         };
+        let strategy = view
+            .operation
+            .as_ref()
+            .and_then(|operation| operation.detail.merge_strategy)
+            .filter(|strategy| *strategy != GitWorktreeMergeStrategy::Unknown)
+            .unwrap_or_default();
         let Some(managed) = view.managed else {
             return;
         };
@@ -1898,15 +1907,36 @@ impl CodeWorkbench {
             workspace_id: view.workspace_id,
             source_path: managed.worktree_path,
             target_workspace_id: managed.target_workspace_id,
+            strategy: (strategy == GitWorktreeMergeStrategy::RebaseAndMerge).then_some(strategy),
             expected_source_head: None,
             expected_target_head: None,
             preflight_revision: None,
         };
         self.run_lifecycle_confirmation_query(
             move |backend| async move { backend.git().git_worktree_merge_plan(request).await },
-            WorktreeLifecycleConfirmation::Merge,
+            move |plan| WorktreeLifecycleConfirmation::Merge { plan, strategy },
             cx,
         );
+    }
+
+    pub(crate) fn set_worktree_merge_strategy(
+        &mut self,
+        strategy: GitWorktreeMergeStrategy,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(WorktreeLifecycleConfirmation::Merge {
+            strategy: selected, ..
+        }) = self.lifecycle_confirmation.as_mut()
+        else {
+            return;
+        };
+        if matches!(
+            strategy,
+            GitWorktreeMergeStrategy::NoFfMerge | GitWorktreeMergeStrategy::RebaseAndMerge
+        ) {
+            *selected = strategy;
+            cx.notify();
+        }
     }
 
     pub(crate) fn request_worktree_archive_confirmation(&mut self, cx: &mut Context<Self>) {
@@ -2044,7 +2074,7 @@ impl CodeWorkbench {
             return;
         };
         match confirmation.clone() {
-            WorktreeLifecycleConfirmation::Merge(plan) => {
+            WorktreeLifecycleConfirmation::Merge { plan, strategy } => {
                 if !plan.preflight.allowed {
                     self.lifecycle_confirmation = Some(confirmation);
                     self.error = Some("worktree_preflight_blocked".to_string());
@@ -2055,6 +2085,7 @@ impl CodeWorkbench {
                     workspace_id: plan.source_workspace_id,
                     source_path: plan.source_path,
                     target_workspace_id: Some(plan.target_workspace_id),
+                    strategy: Some(strategy),
                     expected_source_head: Some(plan.source_head),
                     expected_target_head: Some(plan.target_head),
                     preflight_revision: Some(plan.preflight.revision),
@@ -7920,7 +7951,7 @@ impl CodeRightRail {
             );
         }
 
-        if view.target_owned
+        if view.owns_conflict_resolution()
             && let Some(operation) = view.operation.clone()
         {
             let source_branch = operation
@@ -7939,6 +7970,8 @@ impl CodeRightRail {
                 .filter(|conflict| !conflict.resolved)
                 .count();
             let needs_resolution = operation.status == GitWorktreeOperationStatus::NeedsResolution;
+            let rebase =
+                operation.detail.merge_strategy == Some(GitWorktreeMergeStrategy::RebaseAndMerge);
             surface = surface.child(
                 v_flex()
                     .w_full()
@@ -7976,6 +8009,7 @@ impl CodeRightRail {
                                                 localized_conflict_title(
                                                     source_branch,
                                                     target_branch,
+                                                    rebase,
                                                 )
                                             } else {
                                                 localized_attention_title(
@@ -8051,7 +8085,15 @@ impl CodeRightRail {
                                     Button::new("worktree-abort-merge")
                                         .small()
                                         .danger()
-                                        .label(locale::text("Abort merge", "中止合并", "中止合併"))
+                                        .label(if rebase {
+                                            locale::text(
+                                                "Abort rebase",
+                                                "中止 Rebase",
+                                                "中止 Rebase",
+                                            )
+                                        } else {
+                                            locale::text("Abort merge", "中止合并", "中止合併")
+                                        })
                                         .disabled(pending)
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.update_workbench(cx, |workbench, cx| {
@@ -8063,11 +8105,15 @@ impl CodeRightRail {
                                     Button::new("worktree-complete-merge")
                                         .small()
                                         .primary()
-                                        .label(locale::text(
-                                            "Complete merge",
-                                            "完成合并",
-                                            "完成合併",
-                                        ))
+                                        .label(if rebase {
+                                            locale::text(
+                                                "Continue rebase",
+                                                "继续 Rebase",
+                                                "繼續 Rebase",
+                                            )
+                                        } else {
+                                            locale::text("Complete merge", "完成合并", "完成合併")
+                                        })
                                         .disabled(pending || unresolved > 0)
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.update_workbench(cx, |workbench, cx| {
@@ -8103,6 +8149,10 @@ impl CodeRightRail {
         } else {
             confirm_button.primary()
         };
+        let merge_strategy = match &confirmation {
+            WorktreeLifecycleConfirmation::Merge { strategy, .. } => Some(*strategy),
+            _ => None,
+        };
         v_flex()
             .w_full()
             .min_w_0()
@@ -8121,6 +8171,51 @@ impl CodeRightRail {
                     .text_color(cx.theme().muted_foreground)
                     .child(summary),
             )
+            .when_some(merge_strategy, |this, strategy| {
+                this.child(
+                    h_flex()
+                        .w_full()
+                        .rounded(px(7.0))
+                        .bg(cx.theme().muted.opacity(0.55))
+                        .p(px(2.0))
+                        .child(
+                            Button::new("worktree-merge-strategy-merge")
+                                .small()
+                                .ghost()
+                                .flex_1()
+                                .justify_center()
+                                .selected(strategy == GitWorktreeMergeStrategy::NoFfMerge)
+                                .label(locale::text("Merge", "合并", "合併"))
+                                .disabled(pending)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.update_workbench(cx, |workbench, cx| {
+                                        workbench.set_worktree_merge_strategy(
+                                            GitWorktreeMergeStrategy::NoFfMerge,
+                                            cx,
+                                        )
+                                    })
+                                })),
+                        )
+                        .child(
+                            Button::new("worktree-merge-strategy-rebase")
+                                .small()
+                                .ghost()
+                                .flex_1()
+                                .justify_center()
+                                .selected(strategy == GitWorktreeMergeStrategy::RebaseAndMerge)
+                                .label(locale::text("Rebase", "Rebase", "Rebase"))
+                                .disabled(pending)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.update_workbench(cx, |workbench, cx| {
+                                        workbench.set_worktree_merge_strategy(
+                                            GitWorktreeMergeStrategy::RebaseAndMerge,
+                                            cx,
+                                        )
+                                    })
+                                })),
+                        ),
+                )
+            })
             .children(risks.into_iter().map(|risk| {
                 div()
                     .min_w_0()
@@ -11690,7 +11785,47 @@ fn localized_merge_action_label(target: &str) -> String {
     }
 }
 
-fn localized_conflict_title(source: &str, target: &str) -> String {
+fn localized_integration_action_label(target: &str, strategy: GitWorktreeMergeStrategy) -> String {
+    if strategy == GitWorktreeMergeStrategy::RebaseAndMerge {
+        return match locale::current_locale() {
+            locale::ResolvedLocale::En => format!("Rebase into {}", bounded_ref_label(target)),
+            locale::ResolvedLocale::ZhCn => {
+                format!("Rebase 到 {}", bounded_ref_label(target))
+            }
+            locale::ResolvedLocale::ZhTw => {
+                format!("Rebase 到 {}", bounded_ref_label(target))
+            }
+        };
+    }
+    localized_merge_action_label(target)
+}
+
+fn merge_strategy_summary(strategy: GitWorktreeMergeStrategy) -> &'static str {
+    match strategy {
+        GitWorktreeMergeStrategy::NoFfMerge => locale::text(
+            "Creates a merge commit.",
+            "将创建 merge commit。",
+            "將建立 merge commit。",
+        ),
+        GitWorktreeMergeStrategy::RebaseAndMerge => locale::text(
+            "Rewrites the source commits onto the target, then fast-forwards without a merge commit.",
+            "将源提交 rebase 到目标后快进，不产生 merge commit。",
+            "將來源提交 rebase 到目標後快進，不產生 merge commit。",
+        ),
+        GitWorktreeMergeStrategy::Unknown => {
+            locale::text("Unknown strategy.", "未知策略。", "未知策略。")
+        }
+    }
+}
+
+fn localized_conflict_title(source: &str, target: &str, rebase: bool) -> String {
+    if rebase {
+        return match locale::current_locale() {
+            locale::ResolvedLocale::En => format!("Rebase paused: {source} -> {target}"),
+            locale::ResolvedLocale::ZhCn => format!("Rebase 已暂停：{source} -> {target}"),
+            locale::ResolvedLocale::ZhTw => format!("Rebase 已暫停：{source} -> {target}"),
+        };
+    }
     match locale::current_locale() {
         locale::ResolvedLocale::En => format!("Merge paused: {source} -> {target}"),
         locale::ResolvedLocale::ZhCn => format!("合并已暂停：{source} -> {target}"),
@@ -11782,10 +11917,10 @@ fn worktree_confirmation_copy(
     confirmation: &WorktreeLifecycleConfirmation,
 ) -> (String, String, String, bool, bool, Vec<GitWorktreeRisk>) {
     match confirmation {
-        WorktreeLifecycleConfirmation::Merge(plan) => {
+        WorktreeLifecycleConfirmation::Merge { plan, strategy } => {
             let summary = match locale::current_locale() {
                 locale::ResolvedLocale::En => format!(
-                    "{} -> {} at exact heads. {} commit(s), {} file(s), +{} / -{}. {} Agent(s) and {} terminal(s) remain independent.",
+                    "{} -> {} at exact heads. {} commit(s), {} file(s), +{} / -{}. {} Agent(s) and {} terminal(s) remain independent. {}",
                     plan.source_branch,
                     plan.target_branch,
                     plan.summary.commit_count,
@@ -11794,9 +11929,10 @@ fn worktree_confirmation_copy(
                     plan.summary.deletions,
                     plan.running_consumers.agent_count,
                     plan.running_consumers.terminal_count,
+                    merge_strategy_summary(*strategy),
                 ),
                 locale::ResolvedLocale::ZhCn => format!(
-                    "{} -> {}，按固定提交合并。{} 个提交、{} 个文件、+{} / -{}。{} 个 Agent 和 {} 个终端保持独立运行。",
+                    "{} -> {}，按固定提交集成。{} 个提交、{} 个文件、+{} / -{}。{} 个 Agent 和 {} 个终端保持独立运行。{}",
                     plan.source_branch,
                     plan.target_branch,
                     plan.summary.commit_count,
@@ -11805,9 +11941,10 @@ fn worktree_confirmation_copy(
                     plan.summary.deletions,
                     plan.running_consumers.agent_count,
                     plan.running_consumers.terminal_count,
+                    merge_strategy_summary(*strategy),
                 ),
                 locale::ResolvedLocale::ZhTw => format!(
-                    "{} -> {}，依固定提交合併。{} 個提交、{} 個檔案、+{} / -{}。{} 個 Agent 和 {} 個終端機保持獨立執行。",
+                    "{} -> {}，依固定提交整合。{} 個提交、{} 個檔案、+{} / -{}。{} 個 Agent 和 {} 個終端機保持獨立執行。{}",
                     plan.source_branch,
                     plan.target_branch,
                     plan.summary.commit_count,
@@ -11816,12 +11953,18 @@ fn worktree_confirmation_copy(
                     plan.summary.deletions,
                     plan.running_consumers.agent_count,
                     plan.running_consumers.terminal_count,
+                    merge_strategy_summary(*strategy),
                 ),
             };
+            let title = if *strategy == GitWorktreeMergeStrategy::RebaseAndMerge {
+                locale::text("Rebase Worktree", "Rebase Worktree", "Rebase Worktree")
+            } else {
+                locale::text("Merge Worktree", "合并 Worktree", "合併 Worktree")
+            };
             (
-                locale::text("Merge Worktree", "合并 Worktree", "合併 Worktree").to_string(),
+                title.to_string(),
                 summary,
-                localized_merge_action_label(&plan.target_branch),
+                localized_integration_action_label(&plan.target_branch, *strategy),
                 plan.preflight.allowed,
                 false,
                 plan.preflight.risks.clone(),
@@ -11867,27 +12010,27 @@ fn worktree_confirmation_copy(
             preflight.risks.clone(),
         ),
         WorktreeLifecycleConfirmation::Continue(_) => (
-            locale::text("Complete merge", "完成合并", "完成合併").to_string(),
+            locale::text("Continue integration", "继续集成", "繼續整合").to_string(),
             locale::text(
-                "Create the merge commit after revalidating the target, MERGE_HEAD, and index.",
-                "重新校验目标、MERGE_HEAD 和索引后创建合并提交。",
-                "重新驗證目標、MERGE_HEAD 和索引後建立合併提交。",
+                "Continue the active Git integration after revalidating its durable source and target state.",
+                "重新校验持久化的源与目标状态后继续当前 Git 集成。",
+                "重新驗證持久化的來源與目標狀態後繼續目前 Git 整合。",
             )
             .to_string(),
-            locale::text("Complete merge", "完成合并", "完成合併").to_string(),
+            locale::text("Continue integration", "继续集成", "繼續整合").to_string(),
             true,
             false,
             Vec::new(),
         ),
         WorktreeLifecycleConfirmation::Abort(_) => (
-            locale::text("Abort merge", "中止合并", "中止合併").to_string(),
+            locale::text("Abort integration", "中止集成", "中止整合").to_string(),
             locale::text(
-                "Discard only this target conflict-resolution scene. The source Worktree is unchanged.",
-                "仅丢弃本次目标冲突解决改动，不改变源 Worktree。",
-                "僅捨棄本次目標衝突解決變更，不改變來源 Worktree。",
+                "Abort the active Git integration and restore the exact preflight source and target state.",
+                "中止当前 Git 集成，并恢复预检时的精确源与目标状态。",
+                "中止目前 Git 整合，並還原預檢時的精確來源與目標狀態。",
             )
             .to_string(),
-            locale::text("Abort merge", "中止合并", "中止合併").to_string(),
+            locale::text("Abort integration", "中止集成", "中止整合").to_string(),
             true,
             true,
             Vec::new(),
@@ -12042,6 +12185,8 @@ mod tests {
             "worktree-agent-assistance",
             "worktree-abort-merge",
             "worktree-complete-merge",
+            "worktree-merge-strategy-merge",
+            "worktree-merge-strategy-rebase",
             "use-target-conflict-",
             "use-source-conflict-",
             "stage-worktree-conflict-",

@@ -23477,7 +23477,7 @@ fn worktree_assistance_prompt(operation: &GitWorktreeOperationRecord) -> String 
         .as_deref()
         .unwrap_or("unknown");
     let mut lines = vec![
-        "Help resolve the active Vibex-managed Git merge in this target Workspace.".to_string(),
+        "Help resolve the active Vibex-managed Git integration in this Workspace.".to_string(),
         format!("Operation: {}", operation.operation_id.as_str()),
         format!("Source: {source_branch} at {source_head}"),
         format!("Target: {target_branch} at {target_head}"),
@@ -23485,6 +23485,9 @@ fn worktree_assistance_prompt(operation: &GitWorktreeOperationRecord) -> String 
             "Strategy: {}",
             match operation.detail.merge_strategy {
                 Some(vibex_core::GitWorktreeMergeStrategy::NoFfMerge) => "no-ff merge",
+                Some(vibex_core::GitWorktreeMergeStrategy::RebaseAndMerge) => {
+                    "rebase and fast-forward"
+                }
                 Some(vibex_core::GitWorktreeMergeStrategy::Unknown) | None => "unknown",
             }
         ),

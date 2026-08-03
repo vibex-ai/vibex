@@ -414,6 +414,10 @@ pub enum GitWorktreeOperationCheckpoint {
     ManagedRecordPersisted,
     DatabaseCommitted,
     MergeStarted,
+    RebaseStarted,
+    RebaseCompleted,
+    FastForwardStarted,
+    FastForwarded,
     ConflictDetected,
     ContinueStarted,
     AbortStarted,
@@ -529,8 +533,15 @@ impl Default for GitWorktreeOperationDetail {
 #[serde(rename_all = "snake_case")]
 pub enum GitWorktreeMergeStrategy {
     NoFfMerge,
+    RebaseAndMerge,
     #[serde(other)]
     Unknown,
+}
+
+impl Default for GitWorktreeMergeStrategy {
+    fn default() -> Self {
+        Self::NoFfMerge
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -722,6 +733,8 @@ pub struct GitWorktreeMergeRequest {
     pub workspace_id: WorkspaceId,
     pub source_path: String,
     pub target_workspace_id: Option<WorkspaceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<GitWorktreeMergeStrategy>,
     #[serde(default)]
     pub expected_source_head: Option<String>,
     #[serde(default)]
@@ -982,6 +995,25 @@ mod worktree_contract_tests {
     }
 
     #[test]
+    fn absent_merge_strategy_preserves_the_legacy_request_shape() {
+        let mut request = GitWorktreeMergeRequest {
+            workspace_id: WorkspaceId::new(),
+            source_path: "/tmp/worktree".to_string(),
+            target_workspace_id: None,
+            strategy: None,
+            expected_source_head: None,
+            expected_target_head: None,
+            preflight_revision: None,
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert!(encoded.get("strategy").is_none());
+
+        request.strategy = Some(GitWorktreeMergeStrategy::RebaseAndMerge);
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["strategy"], "rebase_and_merge");
+    }
+
+    #[test]
     fn managed_identity_and_fixed_target_round_trip() {
         let origin_workspace_id = WorkspaceId::new();
         let target_workspace_id = WorkspaceId::new();
@@ -1022,10 +1054,13 @@ mod worktree_contract_tests {
         let checkpoint: GitWorktreeOperationCheckpoint =
             serde_json::from_str("\"future_checkpoint\"").unwrap();
         let lock_kind: GitWorktreeLockKind = serde_json::from_str("\"future_lock_kind\"").unwrap();
+        let strategy: GitWorktreeMergeStrategy =
+            serde_json::from_str("\"future_strategy\"").unwrap();
         assert_eq!(status, GitWorktreeOperationStatus::Unknown);
         assert_eq!(managed, GitManagedWorktreeStatus::Unknown);
         assert_eq!(checkpoint, GitWorktreeOperationCheckpoint::Unknown);
         assert_eq!(lock_kind, GitWorktreeLockKind::Unknown);
+        assert_eq!(strategy, GitWorktreeMergeStrategy::Unknown);
     }
 
     #[test]

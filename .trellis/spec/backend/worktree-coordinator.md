@@ -25,6 +25,10 @@ crates/git
     -> GitWorktreeSummary
   worktree_merge(target_path, source_ref, expected_source_head,
     expected_target_branch, expected_target_head) -> String
+  worktree_rebase_source(source_path, target_path, source_branch,
+    expected_source_head, expected_target_branch, expected_target_head) -> String
+  worktree_rebase_finish(source_path, target_path, source_branch,
+    rebased_source_head, expected_target_branch, expected_target_head) -> String
   worktree_remove(repo_path, GitWorktreeDiscardRequest { expectedHead, ... })
     -> String
 
@@ -42,9 +46,11 @@ GitWorktreeCreateRequest {
 GitWorktreeCreateResult { worktree, workspace, managed, operation }
 
 GitWorktreeMergeRequest {
-  workspaceId, sourcePath, targetWorkspaceId?, expectedSourceHead?,
+  workspaceId, sourcePath, targetWorkspaceId?, strategy?, expectedSourceHead?,
   expectedTargetHead?, preflightRevision?
 }
+
+GitWorktreeMergeStrategy { no_ff_merge, rebase_and_merge, unknown }
 
 GitWorktreeDiscardRequest {
   workspaceId, worktreePath, force, expectedHead?, preflightRevision?
@@ -108,6 +114,10 @@ but an unexpired `Running` lease returns busy.
   an Agent Session is opened there.
 - Merge must use the stored target. A caller may omit the target or repeat the
   stored target, but may not redirect an existing managed Worktree.
+- An absent merge strategy preserves the legacy `no_ff_merge` behavior. Unknown
+  strategies fail closed. `rebase_and_merge` rebases the managed source branch
+  onto the fixed target HEAD, records the rewritten source HEAD, then advances
+  the fixed target with `--ff-only`; it never creates a merge commit.
 - Old rows remain readable. If origin/base/target identity cannot be proven,
   reconciliation sets `NeedsAttention`; it never guesses a branch.
 - Unknown serialized enum values decode to `Unknown` and are non-actionable.
@@ -166,6 +176,16 @@ IntentRecorded -> LocksAcquired -> GitAddStarted -> GitAdded
   verify source HEAD, target branch, target HEAD, and target dirty state before
   merge, or the registered source HEAD before remove. Do not split this final
   check from the Git side effect.
+- Rebase conflict resolution is owned by the source Workspace; no-ff merge
+  conflict resolution is owned by the target Workspace. Rebase continue and
+  abort must verify the durable source branch/original HEAD and target
+  branch/HEAD. Abort restores the exact clean source and leaves the target
+  unchanged.
+- Rebase completion is checkpointed before target fast-forward. Startup may
+  finish a recorded exact rebased HEAD when the target still equals the fixed
+  preflight HEAD, or recognize an already completed exact fast-forward. A
+  rewritten source without a recorded rebased HEAD is uncertain and becomes
+  `NeedsAttention`; recovery must not guess from topology alone.
 - Startup reconciliation joins operation checkpoints, managed rows, Workspace
   rows, `git worktree list --porcelain`, branch heads, and filesystem presence.
 - Proven exact state may be completed or resumed. Missing directories, stale or
@@ -256,6 +276,9 @@ values, file contents, or unbounded Git output.
   resolution, Windows case/separators, symlink aliases, macOS `/var` aliases,
   recoverable add exact branch/head verification, and merge/remove head
   revalidation while the common-dir mutation lock is held.
+- Git and coordinator tests cover no-ff and rebase-and-merge selection, linear
+  target history, source-owned rebase conflicts, continue/abort, stale target
+  rejection, and recovery between rebase completion and target fast-forward.
 - Coordinator tests inject every create checkpoint, assert explicit retry
   uniqueness, simulate process loss and restart a fresh coordinator after every
   checkpoint, and run reconciliation twice. An unknown durable checkpoint must
