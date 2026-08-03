@@ -158,6 +158,11 @@ keep the icon, no-wrap label, and chevron non-shrinking. Wrap the `Popover` in a
 before any trigger is compressed. Applying `flex_none` directly to `Popover`
 styles its overlay content rather than its rendered trigger wrapper.
 
+When the composer runtime-selector row is narrower than its contents, keep it
+horizontally scrollable without rendering a scrollbar. GPUI's x-only overflow
+maps a regular mouse wheel's vertical delta onto the horizontal axis, so users
+can move through the choices by scrolling directly over the row.
+
 ```rust
 // Wrong: short values waste space and long values are clipped.
 Button::new("runtime-selector").w(px(112.0)).child(truncated_label);

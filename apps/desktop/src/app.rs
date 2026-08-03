@@ -20919,11 +20919,12 @@ impl VibexWorkbench {
                                     .pb_3()
                                     .child(
                                         h_flex()
+                                            .id("composer-runtime-controls-scroll")
                                             .min_w_0()
                                             .flex_1()
                                             .items_center()
                                             .gap_1()
-                                            .overflow_x_scrollbar()
+                                            .overflow_x_scroll()
                                             .child(
                                                 Button::new("choose-composer-images")
                                                     .ghost()
@@ -27830,6 +27831,22 @@ mod tests {
         long_width: Rc<Cell<f32>>,
     }
 
+    struct RuntimeSelectorScrollProbe {
+        scroll: gpui::ScrollHandle,
+    }
+
+    impl Render for RuntimeSelectorScrollProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            h_flex()
+                .id("runtime-selector-scroll-probe")
+                .w(px(160.0))
+                .h(px(40.0))
+                .overflow_x_scroll()
+                .track_scroll(&self.scroll)
+                .child(div().w(px(640.0)).h_full().flex_none())
+        }
+    }
+
     impl Render for RuntimeSelectorWidthProbe {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let short_width = self.short_width.clone();
@@ -30669,6 +30686,39 @@ mod tests {
             long_width > short_width + 100.0,
             "short selector width: {short_width}, long selector width: {long_width}"
         );
+    }
+
+    #[gpui::test]
+    fn runtime_selector_row_maps_mouse_wheel_to_hidden_horizontal_scroll(cx: &mut TestAppContext) {
+        let scroll = gpui::ScrollHandle::new();
+        let observed_scroll = scroll.clone();
+        let (_, cx) = cx.add_window_view(|_, _| RuntimeSelectorScrollProbe { scroll });
+
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(80.0), px(20.0)),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+
+        assert!(
+            observed_scroll.offset().x < px(0.0),
+            "horizontal offset: {:?}",
+            observed_scroll.offset().x
+        );
+
+        let source = include_str!("app.rs");
+        let composer = source
+            .split_once("    fn render_composer(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
+            .map(|(body, _)| body)
+            .expect("composer renderer should remain inspectable");
+        assert!(composer.contains(".overflow_x_scroll()"));
+        assert!(!composer.contains(".overflow_x_scrollbar()"));
     }
 
     #[gpui::test]
