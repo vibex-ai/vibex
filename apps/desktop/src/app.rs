@@ -32606,15 +32606,23 @@ mod tests {
 
         let refresh = source
             .split_once("    fn refresh_last_timeline_size(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn refresh_last_timeline_size_incrementally("))
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn refresh_last_timeline_size_incrementally(")
+            })
             .map(|(body, _)| body)
             .expect("last-turn height refresh should remain inspectable");
         assert!(refresh.contains("let turns = self.conversation_turns_cached();"));
         assert!(refresh.contains("self.timeline_measured_turn_heights.remove(&turn.id);"));
 
         for (renderer, next_renderer) in [
-            ("render_command_execution_card", "render_file_operation_card"),
-            ("render_file_operation_card", "render_agent_file_diff_preview"),
+            (
+                "render_command_execution_card",
+                "render_file_operation_card",
+            ),
+            (
+                "render_file_operation_card",
+                "render_agent_file_diff_preview",
+            ),
             ("render_image_generation_card", "render_error_row"),
         ] {
             let card = source

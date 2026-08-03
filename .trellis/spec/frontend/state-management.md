@@ -64,6 +64,16 @@ new non-empty Agent message rows only. Streaming deltas that reconcile into the
 same row count once; reasoning, plans, tools, permissions, and other activity
 rows do not increment the badge.
 
+Timeline virtualization caches are presentation state, not authoritative
+content. When a non-stream event appends structured content to the latest
+projected turn, rebuild that projection before sizing, invalidate the turn's
+previous measured height, and recompute its estimated row size. Reusing a
+measurement from the turn's earlier structure can clip newly added command,
+file-operation, image-generation, or collaboration cards. Structured timeline
+cards whose outer containers clip overflow must also opt out of flex shrinking
+until intrinsic measurement converges. Regression coverage for this path must
+assert both last-turn height invalidation and the non-shrinking card container.
+
 When a new-session draft includes an initial message, await session creation
 only long enough to obtain the authoritative session record. Commit and select
 that session immediately, attach its timeline view, and submit the initial
