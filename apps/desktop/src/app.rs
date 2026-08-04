@@ -13440,6 +13440,13 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    fn set_enhanced_command_execution_display(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.ui_state.session.enhanced_command_execution_display = enabled;
+        self.rebuild_timeline_sizes();
+        self.queue_ui_state();
+        cx.notify();
+    }
+
     fn restore_settings_defaults(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.ui_state.appearance = AppearanceUiState::default();
         self.ui_state.session = SessionUiState::default();
@@ -19569,19 +19576,26 @@ impl VibexWorkbench {
         let mut elements = Vec::new();
         let mut row_index = 0;
         let mut group_index = 0;
+        let enhanced_command_display = self.ui_state.session.enhanced_command_execution_display;
+        let process_activity_groups = if enhanced_command_display {
+            &turn.process_activity_groups
+        } else {
+            &turn.process_activity_groups_with_commands
+        };
 
         while row_index < turn.process_rows.len() {
-            while turn
-                .process_activity_groups
+            while process_activity_groups
                 .get(group_index)
                 .is_some_and(|group| group.end_row <= row_index)
             {
                 group_index += 1;
             }
-            if let (Some(command_row), Some(permission_row)) = (
-                turn.process_rows.get(row_index),
-                turn.process_rows.get(row_index + 1),
-            ) && self.command_permission_rows_are_linked(command_row, permission_row)
+            if enhanced_command_display
+                && let (Some(command_row), Some(permission_row)) = (
+                    turn.process_rows.get(row_index),
+                    turn.process_rows.get(row_index + 1),
+                )
+                && self.command_permission_rows_are_linked(command_row, permission_row)
             {
                 let pair_rows = &turn.process_rows[row_index..row_index + 2];
                 let element =
@@ -19590,14 +19604,11 @@ impl VibexWorkbench {
                 row_index += 2;
                 continue;
             }
-            let group = turn
-                .process_activity_groups
-                .get(group_index)
-                .filter(|group| {
-                    group.start_row == row_index
-                        && group.end_row <= turn.process_rows.len()
-                        && group.end_row > group.start_row
-                });
+            let group = process_activity_groups.get(group_index).filter(|group| {
+                group.start_row == row_index
+                    && group.end_row <= turn.process_rows.len()
+                    && group.end_row > group.start_row
+            });
             if let Some(group) = group {
                 let group_rows = &turn.process_rows[group.start_row..group.end_row];
                 let group_element = self.render_process_activity_group(group, group_rows, cx);
@@ -19652,9 +19663,9 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // Keep prose in the document flow, lightweight activity on compact lines,
-        // and structured command, file, image, permission, and error payloads in
-        // dedicated cards.
+        // Keep prose in the document flow and lightweight activity on compact
+        // lines. Structured commands use cards only when the session preference
+        // enables their enhanced display.
         let element = match row.kind {
             TimelineRowKind::UserMessage => {
                 self.render_user_message_row(row, None, false, false, window, cx)
@@ -19667,7 +19678,12 @@ impl VibexWorkbench {
             }
             TimelineRowKind::Error => self.render_error_row(row, conversation_conclusion, cx),
             TimelineRowKind::PermissionRequest => self.render_permission_request_card(row, cx),
-            TimelineRowKind::Command => self.render_command_execution_card(row, None, cx),
+            TimelineRowKind::Command
+                if self.ui_state.session.enhanced_command_execution_display =>
+            {
+                self.render_command_execution_card(row, None, cx)
+            }
+            TimelineRowKind::Command => self.render_process_activity_line(row, cx),
             TimelineRowKind::FileOperation => self.render_file_operation_card(row, cx),
             TimelineRowKind::ImageGeneration => self.render_image_generation_card(row, cx),
             TimelineRowKind::ToolCall
@@ -19892,7 +19908,9 @@ impl VibexWorkbench {
                 }
                 height
             }
-            TimelineRowKind::Command => {
+            TimelineRowKind::Command
+                if self.ui_state.session.enhanced_command_execution_display =>
+            {
                 let Some(vibex_core::TimelinePayload::Command(command)) = payload else {
                     return 40.0;
                 };
@@ -19949,7 +19967,8 @@ impl VibexWorkbench {
                     .unwrap_or(in_progress || image.image_reference.is_some());
                 if expanded { 312.0 } else { 40.0 }
             }
-            TimelineRowKind::ToolCall
+            TimelineRowKind::Command
+            | TimelineRowKind::ToolCall
             | TimelineRowKind::WebSearch
             | TimelineRowKind::TodoUpdate
             | TimelineRowKind::Collaboration => {
@@ -20010,19 +20029,26 @@ impl VibexWorkbench {
         let mut height = 0.0;
         let mut row_index = 0;
         let mut group_index = 0;
+        let enhanced_command_display = self.ui_state.session.enhanced_command_execution_display;
+        let process_activity_groups = if enhanced_command_display {
+            &turn.process_activity_groups
+        } else {
+            &turn.process_activity_groups_with_commands
+        };
 
         while row_index < turn.process_rows.len() {
-            while turn
-                .process_activity_groups
+            while process_activity_groups
                 .get(group_index)
                 .is_some_and(|group| group.end_row <= row_index)
             {
                 group_index += 1;
             }
-            if let (Some(command_row), Some(permission_row)) = (
-                turn.process_rows.get(row_index),
-                turn.process_rows.get(row_index + 1),
-            ) && self.command_permission_rows_are_linked(command_row, permission_row)
+            if enhanced_command_display
+                && let (Some(command_row), Some(permission_row)) = (
+                    turn.process_rows.get(row_index),
+                    turn.process_rows.get(row_index + 1),
+                )
+                && self.command_permission_rows_are_linked(command_row, permission_row)
             {
                 let permission_height = self
                     .permission_request_for_row(permission_row)
@@ -20040,14 +20066,11 @@ impl VibexWorkbench {
                 row_index += 2;
                 continue;
             }
-            let group = turn
-                .process_activity_groups
-                .get(group_index)
-                .filter(|group| {
-                    group.start_row == row_index
-                        && group.end_row <= turn.process_rows.len()
-                        && group.end_row > group.start_row
-                });
+            let group = process_activity_groups.get(group_index).filter(|group| {
+                group.start_row == row_index
+                    && group.end_row <= turn.process_rows.len()
+                    && group.end_row > group.start_row
+            });
             if let Some(group) = group {
                 height += self.estimated_process_activity_group_height(turn, group) + 12.0;
                 row_index = group.end_row;
@@ -20585,8 +20608,8 @@ impl VibexWorkbench {
         row: &TimelineRow,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // Lightweight tool activity is a single muted line. Structured command,
-        // file, and image payloads use their dedicated renderers instead.
+        // Lightweight tool activity is a single muted line. Commands also use
+        // this projection when enhanced command display is disabled.
         let projection = self.tool_card_projection_cached(row);
         let icon = process_activity_icon(projection.icon);
         let has_details = !projection.details.is_empty();
@@ -29086,6 +29109,7 @@ impl Render for SettingsDialogTitle {
 enum SettingsSection {
     General,
     Appearance,
+    Session,
 }
 
 #[derive(Clone)]
@@ -29352,6 +29376,13 @@ impl FoundationSettings {
         cx.notify();
     }
 
+    fn set_enhanced_command_execution_display(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.set_enhanced_command_execution_display(enabled, cx)
+        });
+        cx.notify();
+    }
+
     fn request_restore_defaults(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let strings = locale::strings(locale::resolve_locale(
             self.appearance(cx).locale,
@@ -29423,6 +29454,7 @@ impl FoundationSettings {
         };
         let general_active = self.active_section == SettingsSection::General;
         let appearance_active = self.active_section == SettingsSection::Appearance;
+        let session_active = self.active_section == SettingsSection::Session;
 
         div()
             .flex()
@@ -29451,7 +29483,6 @@ impl FoundationSettings {
                         inactive_foreground
                     })
                     .when(general_active, |this| this.bg(active_background))
-                    .hover(move |style| style.bg(background).text_color(foreground))
                     .when(wide, |this| this.w_full())
                     .when(!wide, |this| this.flex_1())
                     .tooltip(strings.general)
@@ -29488,7 +29519,6 @@ impl FoundationSettings {
                         inactive_foreground
                     })
                     .when(appearance_active, |this| this.bg(active_background))
-                    .hover(move |style| style.bg(background).text_color(foreground))
                     .when(wide, |this| this.w_full())
                     .when(!wide, |this| this.flex_1())
                     .tooltip(strings.appearance)
@@ -29502,6 +29532,42 @@ impl FoundationSettings {
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.active_section = SettingsSection::Appearance;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("settings-session")
+                    .small()
+                    .ghost()
+                    .h(px(26.0))
+                    .px(px(6.0))
+                    .rounded(px(8.0))
+                    .selected(session_active)
+                    .border_1()
+                    .border_color(if session_active && is_dark {
+                        input
+                    } else {
+                        cx.theme().transparent
+                    })
+                    .text_color(if session_active {
+                        foreground
+                    } else {
+                        inactive_foreground
+                    })
+                    .when(session_active, |this| this.bg(active_background))
+                    .when(wide, |this| this.w_full())
+                    .when(!wide, |this| this.flex_1())
+                    .tooltip(strings.session_settings)
+                    .child(
+                        div()
+                            .w_full()
+                            .text_left()
+                            .text_xs()
+                            .font_medium()
+                            .child(strings.session_settings),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.active_section = SettingsSection::Session;
                         cx.notify();
                     })),
             )
@@ -29544,7 +29610,6 @@ impl FoundationSettings {
     fn render_appearance_page(
         &self,
         appearance: &AppearanceUiState,
-        session: &SessionUiState,
         stacked: bool,
         strings: Strings,
         cx: &mut Context<Self>,
@@ -29580,7 +29645,6 @@ impl FoundationSettings {
                         muted_foreground
                     })
                     .when(system_selected, |this| this.bg(muted))
-                    .hover(move |style| style.bg(muted).text_color(foreground))
                     .child(
                         Icon::default()
                             .path("icons/vibex/monitor.svg")
@@ -29606,7 +29670,6 @@ impl FoundationSettings {
                         muted_foreground
                     })
                     .when(light_selected, |this| this.bg(muted))
-                    .hover(move |style| style.bg(muted).text_color(foreground))
                     .child(Icon::new(IconName::Sun).size(px(12.0)))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.set_theme(ModelThemeMode::Light, window, cx)
@@ -29628,7 +29691,6 @@ impl FoundationSettings {
                         muted_foreground
                     })
                     .when(dark_selected, |this| this.bg(muted))
-                    .hover(move |style| style.bg(muted).text_color(foreground))
                     .child(Icon::new(IconName::Moon).size(px(12.0)))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.set_theme(ModelThemeMode::Dark, window, cx)
@@ -29662,25 +29724,6 @@ impl FoundationSettings {
                     .text_xs()
                     .placeholder(strings.choose_code_font),
             );
-        let turn_preview_rail_switch =
-            Switch::new("session-turn-preview-rail")
-                .small()
-                .checked(session.turn_preview_rail)
-                .tooltip(strings.session_turn_preview_rail)
-                .on_click(cx.listener(|this, enabled, _, cx| {
-                    this.set_session_turn_preview_rail(*enabled, cx)
-                }));
-        let session_content_width_select = div().h(px(28.0)).w(px(144.0)).child(
-            Select::new(&self.session_content_widths)
-                .small()
-                .h(px(28.0))
-                .rounded(px(8.0))
-                .border_color(input)
-                .bg(input_background)
-                .text_xs()
-                .placeholder(strings.session_content_width_standard),
-        );
-
         settings_page(
             strings.appearance,
             strings.appearance_description,
@@ -29778,6 +29821,51 @@ impl FoundationSettings {
                     stacked,
                     cx,
                 ),
+            ],
+            cx,
+        )
+    }
+
+    fn render_session_page(
+        &self,
+        session: &SessionUiState,
+        stacked: bool,
+        strings: Strings,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let is_dark = cx.theme().is_dark();
+        let input = theme::semantic_color("input", is_dark);
+        let input_background = input.opacity(if is_dark { 0.30 } else { 0.20 });
+        let turn_preview_rail_switch =
+            Switch::new("session-turn-preview-rail")
+                .small()
+                .checked(session.turn_preview_rail)
+                .tooltip(strings.session_turn_preview_rail)
+                .on_click(cx.listener(|this, enabled, _, cx| {
+                    this.set_session_turn_preview_rail(*enabled, cx)
+                }));
+        let session_content_width_select = div().h(px(28.0)).w(px(144.0)).child(
+            Select::new(&self.session_content_widths)
+                .small()
+                .h(px(28.0))
+                .rounded(px(8.0))
+                .border_color(input)
+                .bg(input_background)
+                .text_xs()
+                .placeholder(strings.session_content_width_standard),
+        );
+        let enhanced_command_execution_switch = Switch::new("enhanced-command-execution-display")
+            .small()
+            .checked(session.enhanced_command_execution_display)
+            .tooltip(strings.enhanced_command_execution_display)
+            .on_click(cx.listener(|this, enabled, _, cx| {
+                this.set_enhanced_command_execution_display(*enabled, cx)
+            }));
+
+        settings_page(
+            strings.session_settings,
+            strings.session_settings_description,
+            vec![
                 setting_row(
                     strings.session_turn_preview_rail,
                     strings.session_turn_preview_rail_description,
@@ -29789,6 +29877,13 @@ impl FoundationSettings {
                     strings.session_content_width,
                     strings.session_content_width_description,
                     session_content_width_select,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    strings.enhanced_command_execution_display,
+                    strings.enhanced_command_execution_display_description,
+                    enhanced_command_execution_switch,
                     stacked,
                     cx,
                 ),
@@ -29813,7 +29908,10 @@ impl Render for FoundationSettings {
         let page = match self.active_section {
             SettingsSection::General => self.render_general_page(stacked_rows, strings, cx),
             SettingsSection::Appearance => {
-                self.render_appearance_page(&appearance, &session, stacked_rows, strings, cx)
+                self.render_appearance_page(&appearance, stacked_rows, strings, cx)
+            }
+            SettingsSection::Session => {
+                self.render_session_page(&session, stacked_rows, strings, cx)
             }
         };
 
@@ -30934,6 +31032,7 @@ mod tests {
             user_row: None,
             process_rows: Vec::new(),
             process_activity_groups: Vec::new(),
+            process_activity_groups_with_commands: Vec::new(),
             live_status: None,
             conclusion_row: None,
             runtime_attribution: None,
@@ -30959,6 +31058,7 @@ mod tests {
             user_row: None,
             process_rows: Vec::new(),
             process_activity_groups: Vec::new(),
+            process_activity_groups_with_commands: Vec::new(),
             live_status: None,
             conclusion_row: Some(TimelineRow {
                 id: "agent:streaming-conclusion".into(),
@@ -34961,6 +35061,62 @@ mod tests {
         appearance = AppearanceUiState::default();
         session.turn_preview_rail = false;
         assert!(!settings_defaults_restored(&appearance, &session));
+
+        session = SessionUiState::default();
+        session.enhanced_command_execution_display = false;
+        assert!(!settings_defaults_restored(&appearance, &session));
+    }
+
+    #[test]
+    fn session_settings_own_session_layout_and_command_display_controls() {
+        let source = include_str!("app.rs");
+        let navigation = source
+            .split_once("    fn render_navigation(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_general_page("))
+            .map(|(body, _)| body)
+            .expect("settings navigation should remain inspectable");
+        assert!(navigation.contains("SettingsSection::Session"));
+        assert!(navigation.contains("strings.session_settings"));
+
+        let appearance = source
+            .split_once("    fn render_appearance_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_session_page("))
+            .map(|(body, _)| body)
+            .expect("appearance settings should remain inspectable");
+        assert!(!appearance.contains("session_turn_preview_rail"));
+        assert!(!appearance.contains("session_content_width"));
+
+        let session = source
+            .split_once("    fn render_session_page(")
+            .and_then(|(_, tail)| tail.split_once("\n}\n\nimpl Render for FoundationSettings"))
+            .map(|(body, _)| body)
+            .expect("session settings should remain inspectable");
+        assert!(session.contains("session_turn_preview_rail"));
+        assert!(session.contains("session_content_width"));
+        assert!(session.contains("enhanced_command_execution_display"));
+        assert!(session.contains("set_enhanced_command_execution_display"));
+    }
+
+    #[test]
+    fn command_display_preference_switches_between_cards_and_tool_activity_groups() {
+        let source = include_str!("app.rs");
+        let process_rows = source
+            .split_once("    fn render_timeline_process_rows(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn command_permission_rows_are_linked("))
+            .map(|(body, _)| body)
+            .expect("timeline process rendering should remain inspectable");
+        assert!(process_rows.contains("enhanced_command_execution_display"));
+        assert!(process_rows.contains("process_activity_groups_with_commands"));
+
+        let row_renderer = source
+            .split_once("    fn render_timeline_row(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn highlight_session_search_rows("))
+            .map(|(body, _)| body)
+            .expect("timeline row rendering should remain inspectable");
+        assert!(row_renderer.contains("render_command_execution_card(row, None, cx)"));
+        assert!(
+            row_renderer.contains("TimelineRowKind::Command => self.render_process_activity_line")
+        );
     }
 
     #[test]
@@ -35052,6 +35208,7 @@ mod tests {
                 ),
             ],
             process_activity_groups: Vec::new(),
+            process_activity_groups_with_commands: Vec::new(),
             live_status: None,
             conclusion_row: Some(row(
                 "conclusion",

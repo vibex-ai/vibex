@@ -208,6 +208,8 @@ pub struct TimelineConversationTurn {
     pub process_rows: Vec<TimelineRow>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub process_activity_groups: Vec<TimelineProcessActivityGroup>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub process_activity_groups_with_commands: Vec<TimelineProcessActivityGroup>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_status: Option<String>,
     pub conclusion_row: Option<TimelineRow>,
@@ -442,6 +444,8 @@ pub fn timeline_conversation_turns(
             });
             turn_rows = compact_conversation_process_rows(turn_rows, &turn.response_items);
             let process_activity_groups = timeline_process_activity_groups(&turn_rows);
+            let process_activity_groups_with_commands =
+                timeline_process_activity_groups_with_commands(&turn_rows);
             let has_terminal_response = turn
                 .response_items
                 .iter()
@@ -469,6 +473,7 @@ pub fn timeline_conversation_turns(
                 user_row,
                 process_rows: turn_rows,
                 process_activity_groups,
+                process_activity_groups_with_commands,
                 live_status,
                 conclusion_row,
                 runtime_attribution,
@@ -498,6 +503,7 @@ pub fn timeline_conversation_turns(
             user_row: None,
             process_rows: Vec::new(),
             process_activity_groups: Vec::new(),
+            process_activity_groups_with_commands: Vec::new(),
             live_status: None,
             conclusion_row: None,
             runtime_attribution: None,
@@ -513,11 +519,26 @@ pub fn timeline_conversation_turns(
 }
 
 pub fn timeline_process_activity_groups(rows: &[TimelineRow]) -> Vec<TimelineProcessActivityGroup> {
+    timeline_process_activity_groups_matching(rows, false)
+}
+
+pub fn timeline_process_activity_groups_with_commands(
+    rows: &[TimelineRow],
+) -> Vec<TimelineProcessActivityGroup> {
+    timeline_process_activity_groups_matching(rows, true)
+}
+
+fn timeline_process_activity_groups_matching(
+    rows: &[TimelineRow],
+    include_commands: bool,
+) -> Vec<TimelineProcessActivityGroup> {
     let mut groups = Vec::new();
     let mut group_start = None;
 
     for (index, row) in rows.iter().enumerate() {
-        if is_process_activity_row(row.kind) {
+        if is_process_activity_row(row.kind)
+            || (include_commands && row.kind == TimelineRowKind::Command)
+        {
             group_start.get_or_insert(index);
             continue;
         }
@@ -1994,6 +2015,45 @@ mod tests {
         assert!(!is_process_activity_row(TimelineRowKind::Command));
         assert!(!is_process_activity_row(TimelineRowKind::FileOperation));
         assert!(!is_process_activity_row(TimelineRowKind::ImageGeneration));
+    }
+
+    #[test]
+    fn compact_activity_groups_can_include_commands() {
+        let row = |id: &str, kind: TimelineRowKind| TimelineRow {
+            id: id.into(),
+            kind,
+            item_ids: vec![id.into()],
+            turn_id: Some("turn:compact-tools".into()),
+            turn_item_count: 3,
+            turn_failed: false,
+            turn_pending_permission: false,
+            conclusion: false,
+            first_sequence: 1,
+            last_sequence: 1,
+            title: id.into(),
+            body: String::new(),
+            streaming: false,
+            collapsible: false,
+            pending_permission: false,
+            failed: false,
+            runtime_attribution: None,
+            file_path: None,
+        };
+        let rows = vec![
+            row("tool:read", TimelineRowKind::ToolCall),
+            row("command:check", TimelineRowKind::Command),
+            row("tool:search", TimelineRowKind::WebSearch),
+        ];
+
+        assert!(timeline_process_activity_groups(&rows).is_empty());
+        assert_eq!(
+            timeline_process_activity_groups_with_commands(&rows),
+            vec![TimelineProcessActivityGroup {
+                id: "activity-group:tool:read".into(),
+                start_row: 0,
+                end_row: 3,
+            }]
+        );
     }
 
     #[test]

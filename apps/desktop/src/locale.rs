@@ -85,6 +85,8 @@ pub struct Strings {
     pub general_description: &'static str,
     pub appearance: &'static str,
     pub appearance_description: &'static str,
+    pub session_settings: &'static str,
+    pub session_settings_description: &'static str,
     pub theme: &'static str,
     pub theme_description: &'static str,
     pub light: &'static str,
@@ -119,6 +121,8 @@ pub struct Strings {
     pub session_content_width_narrow: &'static str,
     pub session_content_width_standard: &'static str,
     pub session_content_width_full: &'static str,
+    pub enhanced_command_execution_display: &'static str,
+    pub enhanced_command_execution_display_description: &'static str,
     pub decrease_font_size: &'static str,
     pub increase_font_size: &'static str,
     pub decrease_font_weight: &'static str,
@@ -249,13 +253,15 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             settings: "Settings",
             settings_description: "Manage desktop preferences for this Vibex workbench.",
             restore_defaults: "Restore defaults",
-            restore_defaults_description: "Reset language, theme, typography, code typography, session width, and preview rail to Vibex defaults.",
+            restore_defaults_description: "Reset language, theme, typography, and session display preferences to Vibex defaults.",
             restore_defaults_confirm_title: "Restore default settings?",
-            restore_defaults_confirm_description: "This resets language, theme, interface typography, code typography, session content width, and session preview rail.",
+            restore_defaults_confirm_description: "This resets language, theme, interface typography, code typography, and all session display preferences.",
             general: "General",
             general_description: "Configure default behavior for the desktop shell.",
             appearance: "Appearance",
             appearance_description: "Choose how the desktop shell resolves light and dark mode.",
+            session_settings: "Session",
+            session_settings_description: "Configure how Agent sessions and command activity are displayed.",
             theme: "Theme",
             theme_description: "Applies immediately and persists locally on this device.",
             light: "Light",
@@ -290,6 +296,8 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             session_content_width_narrow: "Narrow",
             session_content_width_standard: "Standard",
             session_content_width_full: "Full width",
+            enhanced_command_execution_display: "Enhanced command execution display",
+            enhanced_command_execution_display_description: "Render command executions as standalone detail cards. When off, include them in the collapsible tool activity display.",
             decrease_font_size: "Decrease font size",
             increase_font_size: "Increase font size",
             decrease_font_weight: "Decrease font weight",
@@ -391,13 +399,15 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             settings: "设置",
             settings_description: "管理此 Vibex 工作台的桌面偏好。",
             restore_defaults: "恢复默认设置",
-            restore_defaults_description: "将语言、主题、界面字体、代码字体、会话宽度和预览条恢复为 Vibex 默认值。",
+            restore_defaults_description: "将语言、主题、字体和会话显示偏好恢复为 Vibex 默认值。",
             restore_defaults_confirm_title: "恢复默认设置？",
-            restore_defaults_confirm_description: "这会重置语言、主题、界面字体、代码字体、会话内容宽度和会话预览条。",
+            restore_defaults_confirm_description: "这会重置语言、主题、界面字体、代码字体和全部会话显示偏好。",
             general: "常规",
             general_description: "配置桌面端的默认行为。",
             appearance: "外观",
             appearance_description: "选择桌面端如何使用浅色和深色模式。",
+            session_settings: "会话",
+            session_settings_description: "配置 Agent 会话及命令活动的显示方式。",
             theme: "主题",
             theme_description: "立即生效，并保存在此设备上。",
             light: "浅色",
@@ -432,6 +442,8 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             session_content_width_narrow: "窄屏",
             session_content_width_standard: "标准",
             session_content_width_full: "全屏",
+            enhanced_command_execution_display: "命令执行增强显示",
+            enhanced_command_execution_display_description: "将命令执行渲染为独立详情卡片；关闭后，命令会合入可折叠的工具活动显示。",
             decrease_font_size: "减小字体",
             increase_font_size: "增大字体",
             decrease_font_weight: "减小字重",
@@ -533,13 +545,15 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             settings: "設定",
             settings_description: "管理此 Vibex 工作台的桌面偏好。",
             restore_defaults: "恢復預設設定",
-            restore_defaults_description: "將語言、主題、介面字體、程式碼字體、會話寬度和預覽條恢復為 Vibex 預設值。",
+            restore_defaults_description: "將語言、主題、字體和會話顯示偏好恢復為 Vibex 預設值。",
             restore_defaults_confirm_title: "恢復預設設定？",
-            restore_defaults_confirm_description: "這會重設語言、主題、介面字體、程式碼字體、會話內容寬度和會話預覽條。",
+            restore_defaults_confirm_description: "這會重設語言、主題、介面字體、程式碼字體和全部會話顯示偏好。",
             general: "一般",
             general_description: "設定桌面端的預設行為。",
             appearance: "外觀",
             appearance_description: "選擇桌面端如何使用淺色和深色模式。",
+            session_settings: "會話",
+            session_settings_description: "設定 Agent 會話及命令活動的顯示方式。",
             theme: "主題",
             theme_description: "立即生效，並儲存在此裝置上。",
             light: "淺色",
@@ -574,6 +588,8 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             session_content_width_narrow: "窄屏",
             session_content_width_standard: "標準",
             session_content_width_full: "全屏",
+            enhanced_command_execution_display: "命令執行增強顯示",
+            enhanced_command_execution_display_description: "將命令執行渲染為獨立詳情卡片；關閉後，命令會合入可折疊的工具活動顯示。",
             decrease_font_size: "縮小字體",
             increase_font_size: "放大字體",
             decrease_font_weight: "減小字重",
@@ -1483,6 +1499,7 @@ mod tests {
             "让 Vibex 检查、编辑、测试或解释此工作区..."
         );
         assert_eq!(strings(ResolvedLocale::ZhTw).appearance, "外觀");
+        assert_eq!(strings(ResolvedLocale::ZhCn).session_settings, "会话");
         assert_eq!(
             strings(ResolvedLocale::ZhCn).session_turn_preview_rail,
             "会话预览条"
@@ -1494,6 +1511,10 @@ mod tests {
         assert_eq!(
             strings(ResolvedLocale::En).session_content_width_full,
             "Full width"
+        );
+        assert_eq!(
+            strings(ResolvedLocale::ZhTw).enhanced_command_execution_display,
+            "命令執行增強顯示"
         );
         assert_eq!(
             strings(ResolvedLocale::En).new_session_prompt_placeholder,

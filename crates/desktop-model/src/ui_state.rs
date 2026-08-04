@@ -235,6 +235,8 @@ pub struct ComposerUiState {
 pub struct SessionUiState {
     pub content_width: SessionContentWidthMode,
     pub turn_preview_rail: bool,
+    #[serde(default = "default_enhanced_command_execution_display")]
+    pub enhanced_command_execution_display: bool,
 }
 
 impl Default for SessionUiState {
@@ -242,8 +244,13 @@ impl Default for SessionUiState {
         Self {
             content_width: SessionContentWidthMode::Standard,
             turn_preview_rail: true,
+            enhanced_command_execution_display: true,
         }
     }
+}
+
+const fn default_enhanced_command_execution_display() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1033,6 +1040,20 @@ mod tests {
         );
         assert!(decoded.sidebar.project_location_preferences.is_empty());
         assert!(decoded.sidebar.collapsed_workspace_ids.is_empty());
+    }
+
+    #[test]
+    fn session_display_preferences_are_backward_compatible() {
+        let mut value = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
+        let session = value
+            .get_mut("session")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        session.remove("enhancedCommandExecutionDisplay");
+
+        let decoded = decode_and_migrate(&serde_json::to_vec(&value).unwrap()).unwrap();
+
+        assert!(decoded.session.enhanced_command_execution_display);
     }
 
     #[test]
