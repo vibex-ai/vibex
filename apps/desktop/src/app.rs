@@ -25417,39 +25417,35 @@ fn agent_progress_label(label: &str, fallback: &str) -> String {
 fn render_agent_thinking_indicator(label: &str, cx: &App) -> AnyElement {
     let base = cx.theme().muted_foreground.opacity(0.75);
     let glow = cx.theme().foreground;
+    let label = label.to_string();
     let character_count = label.chars().count();
     h_flex()
         .w_full()
         .min_w_0()
         .justify_start()
         .py_1()
-        .child(
-            h_flex()
-                .text_sm()
-                .children(label.chars().enumerate().map(|(index, character)| {
+        .child(h_flex().text_sm().with_animation(
+            "agent-thinking-glow",
+            Animation::new(Duration::from_millis(1_200)).repeat(),
+            move |this, delta| {
+                let scan_position = -0.35 + delta * 1.7;
+                this.children(label.chars().enumerate().map(|(index, character)| {
                     let position = if character_count > 1 {
                         index as f32 / (character_count - 1) as f32
                     } else {
                         0.5
                     };
-                    div().child(character.to_string()).with_animation(
-                        format!("agent-thinking-glow-{index}"),
-                        Animation::new(Duration::from_millis(1_200)).repeat(),
-                        move |this, delta| {
-                            let scan_position = -0.35 + delta * 1.7;
-                            let intensity =
-                                (1.0 - (position - scan_position).abs() / 0.42).clamp(0.0, 1.0);
-                            let intensity = intensity * intensity * (3.0 - 2.0 * intensity);
-                            this.text_color(Hsla {
-                                h: base.h + (glow.h - base.h) * intensity,
-                                s: base.s + (glow.s - base.s) * intensity,
-                                l: base.l + (glow.l - base.l) * intensity,
-                                a: base.a + (glow.a - base.a) * intensity,
-                            })
-                        },
-                    )
-                })),
-        )
+                    let intensity = (1.0 - (position - scan_position).abs() / 0.42).clamp(0.0, 1.0);
+                    let intensity = intensity * intensity * (3.0 - 2.0 * intensity);
+                    div().child(character.to_string()).text_color(Hsla {
+                        h: base.h + (glow.h - base.h) * intensity,
+                        s: base.s + (glow.s - base.s) * intensity,
+                        l: base.l + (glow.l - base.l) * intensity,
+                        a: base.a + (glow.a - base.a) * intensity,
+                    })
+                }))
+            },
+        ))
         .into_any_element()
 }
 
@@ -31287,6 +31283,23 @@ mod tests {
         );
         assert_eq!(agent_progress_label("**", "思考中..."), "思考中...");
         assert_eq!(agent_progress_label("   ", "思考中..."), "思考中...");
+    }
+
+    #[test]
+    fn agent_thinking_indicator_uses_one_shared_animation_clock() {
+        let source = include_str!("app.rs");
+        let renderer = source
+            .split_once("fn render_agent_thinking_indicator(")
+            .and_then(|(_, tail)| tail.split_once("\nfn tool_card_projection("))
+            .map(|(body, _)| body)
+            .expect("thinking indicator renderer should remain inspectable");
+
+        assert_eq!(renderer.matches(".with_animation(").count(), 1);
+        assert!(
+            renderer.find(".with_animation(").unwrap()
+                < renderer.find(".children(label.chars()").unwrap()
+        );
+        assert!(!renderer.contains("agent-thinking-glow-{index}"));
     }
 
     #[test]
