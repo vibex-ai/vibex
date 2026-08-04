@@ -1,10 +1,16 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
-  <rect width="100" height="100" rx="22" fill="#E11D48"/>
-  <svg x="14" y="14" width="72" height="72" viewBox="0 0 1024 1024">
+<?xml version="1.0" standalone="no" ?>
+<svg
+    version="1.0"
+    xmlns="http://www.w3.org/2000/svg"
+    width="16"
+    height="16"
+    viewBox="0 0 1024 1024"
+    preserveAspectRatio="xMidYMid meet"
+>
 
 <g
         transform="translate(0,1024) scale(0.1,-0.1)"
-        fill="#FFFFFF"
+        fill="currentColor"
         stroke="none"
     >
 <path
@@ -89,5 +95,4 @@ l-1330 0 0 -25z"
 -5 -10 -11z"
         />
 </g>
-</svg>
 </svg>

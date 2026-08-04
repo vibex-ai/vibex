@@ -4983,25 +4983,27 @@ impl ManagementCenter {
                                     })),
                                 )
                             })
-                            .child(
+                            .child(button_with_aria_label(
                                 Button::new(SharedString::from(format!(
                                     "management-agent-remove-{remove_id}"
                                 )))
-                                .xsmall()
+                                .small()
                                 .ghost()
-                                .icon(IconName::Delete)
-                                .label(copy.remove)
+                                .size(px(32.0))
+                                .icon(IconName::CircleX)
+                                .tooltip(copy.remove)
                                 .disabled(pending)
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
                                         this.set_agent_added(remove_id.clone(), false, cx)
                                     },
                                 )),
-                            ),
+                                copy.remove,
+                            )),
                     )
                     .child(
                         div()
-                            .pl(px(36.0))
+                            .pl(px(40.0))
                             .truncate()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
@@ -5042,11 +5044,13 @@ impl ManagementCenter {
                             .font_medium()
                             .child(agent.label),
                     )
-                    .child(
+                    .child(button_with_aria_label(
                         Button::new(SharedString::from(format!("management-agent-add-{add_id}")))
-                            .xsmall()
+                            .small()
                             .outline()
-                            .label(management_add_label())
+                            .size(px(32.0))
+                            .icon(IconName::Plus)
+                            .tooltip(management_add_label())
                             .loading(matches!(
                                 &self.mutation,
                                 Some(ManagementMutation::AgentToggle(action))
@@ -5056,7 +5060,8 @@ impl ManagementCenter {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.set_agent_added(add_id.clone(), true, cx)
                             })),
-                    ),
+                        management_add_label(),
+                    )),
             );
         }
         if !has_available_agents {
@@ -11229,7 +11234,7 @@ fn management_agent_icon(identity: &str, label: &str, active: bool, cx: &App) ->
     let identity = format!("{identity} {label}").to_ascii_lowercase();
     agent_brand_icon(
         &identity,
-        px(20.0),
+        px(28.0),
         Some(
             cx.theme()
                 .foreground
@@ -11240,15 +11245,11 @@ fn management_agent_icon(identity: &str, label: &str, active: bool, cx: &App) ->
 
 fn management_agent_glyph(identity: &str, label: &str, active: bool, cx: &App) -> AnyElement {
     div()
-        .size(px(32.0))
+        .size(px(36.0))
         .flex_none()
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(6.0))
-        .border_1()
-        .border_color(cx.theme().border.opacity(0.70))
-        .bg(cx.theme().background.opacity(0.85))
         .child(management_agent_icon(identity, label, active, cx))
         .into_any_element()
 }

@@ -576,7 +576,6 @@ mod tests {
             "codewhale",
             "copilot",
             "cortex-code",
-            "corust-agent",
             "crow-cli",
             "cursor",
             "deepagents",

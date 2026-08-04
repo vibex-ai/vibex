@@ -37678,18 +37678,18 @@
     },
     {
       "type": "file",
-      "bom-ref": "asset:vibex-desktop-reviewed-icons:630d227f29cee7cd",
+      "bom-ref": "asset:vibex-desktop-reviewed-icons:c8d0b5c8e37627d4",
       "name": "Vibex Desktop GPUI reviewed icon bundle",
       "version": "0.1.0-rc.1",
       "licenses": [
         {
-          "expression": "AGPL-3.0-or-later AND ISC AND MIT AND CC0-1.0"
+          "expression": "AGPL-3.0-or-later AND ISC AND MIT AND CC0-1.0 AND LicenseRef-Third-Party-Brand-Marks"
         }
       ],
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "630d227f29cee7cde8064e2e3d52ad75a78ddb0dea6fc21d36b41c600653ea1d"
+          "content": "c8d0b5c8e37627d49e3a7fa9d358856a08454ef1fefc3fc004127a72061ee3c8"
         }
       ],
       "externalReferences": [
@@ -37709,11 +37709,11 @@
         },
         {
           "name": "vibex:file-count",
-          "value": "73"
+          "value": "105"
         },
         {
           "name": "vibex:selected-license",
-          "value": "(AGPL-3.0-or-later AND (ISC AND (MIT AND CC0-1.0)))"
+          "value": "(AGPL-3.0-or-later AND (ISC AND (MIT AND (CC0-1.0 AND LicenseRef-Third-Party-Brand-Marks))))"
         }
       ]
     },
@@ -38105,7 +38105,7 @@
       "dependsOn": []
     },
     {
-      "ref": "asset:vibex-desktop-reviewed-icons:630d227f29cee7cd",
+      "ref": "asset:vibex-desktop-reviewed-icons:c8d0b5c8e37627d4",
       "dependsOn": []
     },
     {
@@ -44998,7 +44998,7 @@
       "ref": "cargo:vibex-desktop@0.1.0-rc.1:8be20e5fa4f9b6f0",
       "dependsOn": [
         "asset:vibex-desktop-application-icons:0d76eae3f16fa4d5",
-        "asset:vibex-desktop-reviewed-icons:630d227f29cee7cd",
+        "asset:vibex-desktop-reviewed-icons:c8d0b5c8e37627d4",
         "cargo:base64@0.22.1:c19b7c6f923b580a",
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
         "cargo:gpui-component-assets@0.5.1:4d9608b0b417550c",

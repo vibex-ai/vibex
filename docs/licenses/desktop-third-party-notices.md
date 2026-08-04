@@ -1064,7 +1064,7 @@ This inventory records source and license provenance. The corresponding license 
 | Input | Files | Source | Declared license | Policy selection |
 | --- | ---: | --- | --- | --- |
 | gpui-component bundled Lucide icon set | 99 | https://github.com/longbridge/gpui-component/tree/main/crates/assets/assets/icons | Apache-2.0 AND ISC | (Apache-2.0 AND ISC) |
-| Vibex Desktop GPUI reviewed icon bundle | 73 | https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/icons | AGPL-3.0-or-later AND ISC AND MIT AND CC0-1.0 | (AGPL-3.0-or-later AND (ISC AND (MIT AND CC0-1.0))) |
+| Vibex Desktop GPUI reviewed icon bundle | 105 | https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/icons | AGPL-3.0-or-later AND ISC AND MIT AND CC0-1.0 AND LicenseRef-Third-Party-Brand-Marks | (AGPL-3.0-or-later AND (ISC AND (MIT AND (CC0-1.0 AND LicenseRef-Third-Party-Brand-Marks)))) |
 | Vibex desktop application and tray icons | 3 | https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/app-icons | AGPL-3.0-or-later | AGPL-3.0-or-later |
 | Vibex GPUI-WASM Web application icon | 1 | https://github.com/vibex-ai/vibex/blob/main/apps/web/web/icon.svg | AGPL-3.0-or-later | AGPL-3.0-or-later |
 | Inter variable Web runtime fonts | 4 | https://www.npmjs.com/package/@fontsource-variable/inter/v/5.2.8 | OFL-1.1 | OFL-1.1 |

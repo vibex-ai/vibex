@@ -68,7 +68,7 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
     ),
     AcpAgentCatalogEntry::new(
         "auggie",
-        "Auggie CLI",
+        "Augment CLI",
         "Augment Code's powerful software agent, backed by industry-leading context engine",
         "0.30.0",
         "https://www.augmentcode.com/",
@@ -127,14 +127,6 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "1.0.73",
         "https://docs.snowflake.com/en/user-guide/cortex-code/cortex-code-cli",
         &["cortex", "acp", "serve"],
-    ),
-    AcpAgentCatalogEntry::new(
-        "corust-agent",
-        "Corust Agent",
-        "Co-building with a seasoned Rust partner.",
-        "0.5.1",
-        "https://github.com/Corust-ai/corust-agent-release/releases",
-        &["corust-agent-acp"],
     ),
     AcpAgentCatalogEntry::new(
         "crow-cli",
@@ -391,7 +383,7 @@ mod tests {
     #[test]
     fn catalog_ids_and_presets_are_unique_and_commands_are_complete() {
         let entries = acp_agent_catalog_entries();
-        assert_eq!(entries.len(), 36);
+        assert_eq!(entries.len(), 35);
 
         let ids = entries
             .iter()
@@ -404,5 +396,14 @@ mod tests {
         assert_eq!(ids.len(), entries.len());
         assert_eq!(presets.len(), entries.len());
         assert!(entries.iter().all(|entry| !entry.command.is_empty()));
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.id == "auggie")
+                .unwrap()
+                .label,
+            "Augment CLI"
+        );
+        assert!(!entries.iter().any(|entry| entry.id == "corust-agent"));
     }
 }

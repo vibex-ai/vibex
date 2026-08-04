@@ -67,6 +67,10 @@
       "rationale": "PDFium Anti-Grain Geometry 2.3 component license; the permissive notice permits redistribution when retained."
     },
     {
+      "id": "LicenseRef-Third-Party-Brand-Marks",
+      "rationale": "Third-party product marks are redistributed solely as nominative identifiers for supported integrations; ownership and trademark rights remain with their respective holders."
+    },
+    {
       "id": "Libpng",
       "rationale": "PDFium PNG runtime license; origin and copyright notices remain in the distributed license bundle."
     },
@@ -161,11 +165,11 @@
       "extensions": [
         ".svg"
       ],
-      "expectedFileCount": 73,
-      "treeSha256": "630d227f29cee7cde8064e2e3d52ad75a78ddb0dea6fc21d36b41c600653ea1d",
-      "licenseExpression": "AGPL-3.0-or-later AND ISC AND MIT AND CC0-1.0",
+      "expectedFileCount": 105,
+      "treeSha256": "c8d0b5c8e37627d49e3a7fa9d358856a08454ef1fefc3fc004127a72061ee3c8",
+      "licenseExpression": "AGPL-3.0-or-later AND ISC AND MIT AND CC0-1.0 AND LicenseRef-Third-Party-Brand-Marks",
       "source": "https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/icons",
-      "licenseEvidence": "52 Lucide SVGs (ISC); 15 SVG Logos and 3 Simple Icons SVGs (CC0-1.0); 1 Material Icon Theme and 1 VSCode Icons SVG (MIT); 1 Vibex mark (AGPL-3.0-or-later). Brand names and marks remain the property of their respective owners.",
+      "licenseEvidence": "52 Lucide SVGs (ISC); 15 SVG Logos and 3 Simple Icons SVGs (CC0-1.0); 1 Material Icon Theme and 1 VSCode Icons SVG (MIT); 1 Vibex mark (AGPL-3.0-or-later); 32 Agent brand SVGs from the Agent Client Protocol registry and official vendor sources (third-party brand marks). Brand names and marks remain the property of their respective owners.",
       "sourceComponents": [
         {
           "name": "Lucide",
@@ -202,6 +206,12 @@
           "fileCount": 1,
           "licenseExpression": "AGPL-3.0-or-later",
           "source": "https://github.com/vibex-ai/vibex"
+        },
+        {
+          "name": "Agent brand marks",
+          "fileCount": 32,
+          "licenseExpression": "LicenseRef-Third-Party-Brand-Marks",
+          "source": "https://agentclientprotocol.com/get-started/registry#available-agents"
         }
       ]
     },
