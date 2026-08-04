@@ -24389,6 +24389,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:similar@3.1.1:c19b7c6f923b580a",
+      "name": "similar",
+      "version": "3.1.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/similar@3.1.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mitsuhiko/similar"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:simplecss@0.2.2:c19b7c6f923b580a",
       "name": "simplecss",
       "version": "0.2.2",
@@ -43575,6 +43611,12 @@
       "dependsOn": []
     },
     {
+      "ref": "cargo:similar@3.1.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:bstr@1.12.3:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:simplecss@0.2.2:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:log@0.4.33:c19b7c6f923b580a"
@@ -44971,6 +45013,7 @@
         "cargo:serde@1.0.228:c19b7c6f923b580a",
         "cargo:serde_json@1.0.150:c19b7c6f923b580a",
         "cargo:sha2@0.10.9:c19b7c6f923b580a",
+        "cargo:similar@3.1.1:c19b7c6f923b580a",
         "cargo:tokio@1.52.3:c19b7c6f923b580a",
         "cargo:url@2.5.8:c19b7c6f923b580a",
         "cargo:vibex-agent-acp@0.1.0-rc.1:a2bd4049efbf7469",

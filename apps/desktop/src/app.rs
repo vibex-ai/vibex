@@ -49,6 +49,7 @@ use gpui_component::{
     v_flex, v_virtual_list,
 };
 use sha2::{Digest as _, Sha256};
+use similar::{ChangeTag, TextDiff};
 use tokio::sync::mpsc;
 use vibex_agent_acp::build_runtime_option_catalog;
 use vibex_agent_claude::{ClaudeSessionImportPreviewRequest, preview_claude_external_sessions};
@@ -204,6 +205,9 @@ const TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL: Duration = Duration::from_mi
 const TIMELINE_STREAMING_MARKDOWN_REFRESH_BYTES: usize = 8 * 1024;
 const TIMELINE_TOOL_PROJECTION_CACHE_LIMIT: usize = 128;
 const TIMELINE_TOOL_PROJECTION_CACHE_BYTES: usize = 2 * 1024 * 1024;
+const TIMELINE_FILE_DIFF_PREVIEW_CACHE_LIMIT: usize = 64;
+const TIMELINE_FILE_DIFF_PREVIEW_CACHE_BYTES: usize = 4 * 1024 * 1024;
+const TIMELINE_FILE_DIFF_SCROLL_CACHE_LIMIT: usize = 128;
 const AGENT_TIMELINE_IDLE_POLL_THRESHOLD: u16 = 4;
 const AGENT_TIMELINE_IDLE_POLL_MAX_MS: u64 = 2_000;
 const AGENT_TURN_PREVIEW_EDGE_TRIGGER_WIDTH: f32 = 18.0;
@@ -3031,6 +3035,8 @@ pub struct VibexWorkbench {
     timeline_estimated_turn_heights: BTreeMap<String, (u64, f32)>,
     timeline_markdown_sources: BTreeMap<String, (i64, TimelineMarkdownSourceSnapshot)>,
     timeline_tool_card_projections: BTreeMap<String, (i64, Rc<ToolCardProjection>)>,
+    timeline_file_diff_previews: BTreeMap<String, (i64, Rc<AgentFileDiffPreview>)>,
+    timeline_file_diff_scrolls: BTreeMap<String, gpui::ScrollHandle>,
     conversation_turns_cache: Rc<Vec<Rc<TimelineConversationTurn>>>,
     conversation_turns_cache_key: Option<ConversationTurnsCacheKey>,
     conversation_turns_summary: ConversationTurnsSummary,
@@ -3555,6 +3561,8 @@ impl VibexWorkbench {
             timeline_estimated_turn_heights: BTreeMap::new(),
             timeline_markdown_sources: BTreeMap::new(),
             timeline_tool_card_projections: BTreeMap::new(),
+            timeline_file_diff_previews: BTreeMap::new(),
+            timeline_file_diff_scrolls: BTreeMap::new(),
             conversation_turns_cache: Rc::new(Vec::new()),
             conversation_turns_cache_key: None,
             conversation_turns_summary: ConversationTurnsSummary::default(),
@@ -5467,6 +5475,8 @@ impl VibexWorkbench {
         entry.estimated_resident_bytes = entry.calculate_estimated_resident_bytes();
         self.timeline_markdown_sources.clear();
         self.timeline_tool_card_projections.clear();
+        self.timeline_file_diff_previews.clear();
+        self.timeline_file_diff_scrolls.clear();
         self.store_agent_session_view(session_id, entry);
     }
 
@@ -5504,6 +5514,8 @@ impl VibexWorkbench {
         self.timeline_estimated_turn_heights = entry.timeline_estimated_turn_heights;
         self.timeline_markdown_sources.clear();
         self.timeline_tool_card_projections.clear();
+        self.timeline_file_diff_previews.clear();
+        self.timeline_file_diff_scrolls.clear();
         self.conversation_turns_cache = entry.conversation_turns_cache;
         self.conversation_turns_cache_key = entry.conversation_turns_cache_key;
         self.conversation_turns_summary = entry.conversation_turns_summary;
@@ -6407,6 +6419,8 @@ impl VibexWorkbench {
         self.timeline_estimated_turn_heights.clear();
         self.timeline_markdown_sources.clear();
         self.timeline_tool_card_projections.clear();
+        self.timeline_file_diff_previews.clear();
+        self.timeline_file_diff_scrolls.clear();
         self.conversation_turns_cache = Rc::new(Vec::new());
         self.conversation_turns_cache_key = None;
         self.conversation_turns_summary = ConversationTurnsSummary::default();
@@ -19775,6 +19789,49 @@ impl VibexWorkbench {
         projection
     }
 
+    /// File snapshots can be large, and a line diff is substantially more expensive than
+    /// rendering its bounded preview. Reuse the projection until the timeline row changes.
+    fn agent_file_diff_preview_cached(
+        &mut self,
+        row: &TimelineRow,
+        operation: &vibex_core::FileOperationPayload,
+    ) -> Rc<AgentFileDiffPreview> {
+        if let Some((sequence, preview)) = self.timeline_file_diff_previews.get(&row.id)
+            && *sequence == row.last_sequence
+        {
+            return preview.clone();
+        }
+        let preview = Rc::new(agent_file_diff_preview(
+            operation.old_text.as_deref(),
+            operation.new_text.as_deref(),
+        ));
+        insert_bounded_timeline_projection(
+            &mut self.timeline_file_diff_previews,
+            row.id.clone(),
+            row.last_sequence,
+            preview.clone(),
+            TIMELINE_FILE_DIFF_PREVIEW_CACHE_LIMIT,
+            TIMELINE_FILE_DIFF_PREVIEW_CACHE_BYTES,
+            |preview| preview.approximate_bytes(),
+        );
+        preview
+    }
+
+    fn agent_file_diff_scroll_handle(&mut self, row_id: &str) -> gpui::ScrollHandle {
+        if let Some(scroll) = self.timeline_file_diff_scrolls.get(row_id) {
+            return scroll.clone();
+        }
+        if self.timeline_file_diff_scrolls.len() >= TIMELINE_FILE_DIFF_SCROLL_CACHE_LIMIT
+            && let Some(evicted) = self.timeline_file_diff_scrolls.keys().next().cloned()
+        {
+            self.timeline_file_diff_scrolls.remove(&evicted);
+        }
+        let scroll = gpui::ScrollHandle::new();
+        self.timeline_file_diff_scrolls
+            .insert(row_id.to_string(), scroll.clone());
+        scroll
+    }
+
     /// Shared body text for a markdown row.
     ///
     /// `MarkdownInput` takes an `Arc<str>`, so handing it `row.body.clone()`
@@ -19937,7 +19994,7 @@ impl VibexWorkbench {
                 height
             }
             TimelineRowKind::FileOperation => {
-                let Some(vibex_core::TimelinePayload::FileOperation(operation)) = payload else {
+                let Some(vibex_core::TimelinePayload::FileOperation(_)) = payload else {
                     return 40.0;
                 };
                 let expanded = self
@@ -19948,11 +20005,8 @@ impl VibexWorkbench {
                 if !expanded {
                     return 40.0;
                 }
-                let preview = agent_file_diff_preview(
-                    operation.old_text.as_deref(),
-                    operation.new_text.as_deref(),
-                );
-                40.0 + (preview.lines.len().max(1) as f32 * 20.0).min(320.0)
+                // Visible turns replace this conservative first layout with their measured height.
+                360.0
             }
             TimelineRowKind::ImageGeneration => {
                 let Some(vibex_core::TimelinePayload::ImageGeneration(image)) = payload else {
@@ -20915,8 +20969,8 @@ impl VibexWorkbench {
         else {
             return self.render_process_activity_line(row, cx);
         };
-        let preview =
-            agent_file_diff_preview(operation.old_text.as_deref(), operation.new_text.as_deref());
+        let preview = self.agent_file_diff_preview_cached(row, &operation);
+        let preview_scroll = self.agent_file_diff_scroll_handle(&row.id);
         let has_diff = operation.old_text.is_some() || operation.new_text.is_some();
         let expanded = has_diff
             && self
@@ -21033,7 +21087,7 @@ impl VibexWorkbench {
                     }),
             )
             .when(expanded, |this| {
-                this.child(self.render_agent_file_diff_preview(&preview, cx))
+                this.child(self.render_agent_file_diff_preview(&preview, &preview_scroll, cx))
             })
             .into_any_element()
     }
@@ -21041,6 +21095,7 @@ impl VibexWorkbench {
     fn render_agent_file_diff_preview(
         &self,
         preview: &AgentFileDiffPreview,
+        scroll: &gpui::ScrollHandle,
         cx: &App,
     ) -> AnyElement {
         if preview.lines.is_empty() {
@@ -21082,6 +21137,7 @@ impl VibexWorkbench {
                 };
                 h_flex()
                     .min_w_full()
+                    .flex_none()
                     .items_start()
                     .bg(background)
                     .px_2()
@@ -21091,17 +21147,10 @@ impl VibexWorkbench {
                     .text_color(foreground)
                     .child(div().w(px(18.0)).flex_none().child(prefix))
                     .child(div().whitespace_nowrap().child(line.text.clone()))
+                    .into_any_element()
             })
             .collect::<Vec<_>>();
-        v_flex()
-            .w_full()
-            .min_w_0()
-            .max_h(px(320.0))
-            .border_t_1()
-            .border_color(cx.theme().border.opacity(0.72))
-            .overflow_scrollbar()
-            .children(rows)
-            .into_any_element()
+        render_agent_file_diff_scroll_area(rows, scroll, cx)
     }
 
     fn render_image_generation_card(
@@ -24653,8 +24702,9 @@ fn format_compact_duration(started_at_ms: i64, ended_at_ms: Option<i64>) -> Stri
 }
 
 const AGENT_FILE_DIFF_CONTEXT_LINES: usize = 3;
-const AGENT_FILE_DIFF_MAX_CHANGED_LINES: usize = 160;
+const AGENT_FILE_DIFF_MAX_PREVIEW_LINES: usize = 160;
 const AGENT_FILE_DIFF_MAX_LINE_BYTES: usize = 2_048;
+const AGENT_FILE_DIFF_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentFileDiffLineKind {
@@ -24678,16 +24728,54 @@ struct AgentFileDiffPreview {
     omitted_lines: usize,
 }
 
+impl AgentFileDiffPreview {
+    fn approximate_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.lines
+                    .len()
+                    .saturating_mul(std::mem::size_of::<AgentFileDiffLine>()),
+            )
+            .saturating_add(self.lines.iter().map(|line| line.text.len()).sum::<usize>())
+    }
+}
+
+fn render_agent_file_diff_scroll_area(
+    rows: Vec<AnyElement>,
+    scroll: &gpui::ScrollHandle,
+    cx: &App,
+) -> AnyElement {
+    let viewport_height = (rows.len().max(1) as f32 * 20.0).min(320.0);
+    v_flex()
+        .w_full()
+        .min_w_0()
+        .h(px(viewport_height))
+        .flex_none()
+        .overflow_hidden()
+        .border_t_1()
+        .border_color(cx.theme().border.opacity(0.72))
+        .child(
+            v_flex().flex_1().min_h_0().overflow_hidden().child(
+                div().flex_1().min_h_0().overflow_hidden().child(
+                    v_flex()
+                        .id("agent-file-diff-scroll-area")
+                        .size_full()
+                        .min_w_0()
+                        .relative()
+                        .track_scroll(scroll)
+                        .overflow_scroll()
+                        .children(rows)
+                        .scrollbar(scroll, ScrollbarAxis::Both),
+                ),
+            ),
+        )
+        .into_any_element()
+}
+
 fn agent_file_diff_preview(old_text: Option<&str>, new_text: Option<&str>) -> AgentFileDiffPreview {
-    let old_lines = old_text
-        .filter(|text| !text.is_empty())
-        .map(|text| text.lines().collect::<Vec<_>>())
-        .unwrap_or_default();
-    let new_lines = new_text
-        .filter(|text| !text.is_empty())
-        .map(|text| text.lines().collect::<Vec<_>>())
-        .unwrap_or_default();
-    if old_lines == new_lines {
+    let old_text = old_text.unwrap_or_default();
+    let new_text = new_text.unwrap_or_default();
+    if old_text == new_text {
         return AgentFileDiffPreview {
             lines: Vec::new(),
             added_lines: 0,
@@ -24695,84 +24783,92 @@ fn agent_file_diff_preview(old_text: Option<&str>, new_text: Option<&str>) -> Ag
             omitted_lines: 0,
         };
     }
-    let common_prefix = old_lines
-        .iter()
-        .zip(&new_lines)
-        .take_while(|(old, new)| old == new)
-        .count();
-    let remaining_old = old_lines.len().saturating_sub(common_prefix);
-    let remaining_new = new_lines.len().saturating_sub(common_prefix);
-    let common_suffix = old_lines[..remaining_old + common_prefix]
-        .iter()
-        .rev()
-        .zip(new_lines[..remaining_new + common_prefix].iter().rev())
-        .take_while(|(old, new)| old == new)
-        .count()
-        .min(remaining_old)
-        .min(remaining_new);
-    let old_change_end = old_lines.len().saturating_sub(common_suffix);
-    let new_change_end = new_lines.len().saturating_sub(common_suffix);
-    let removed_lines = old_change_end.saturating_sub(common_prefix);
-    let added_lines = new_change_end.saturating_sub(common_prefix);
 
-    let prefix_start = common_prefix.saturating_sub(AGENT_FILE_DIFF_CONTEXT_LINES);
-    let mut lines = old_lines[prefix_start..common_prefix]
-        .iter()
-        .map(|line| AgentFileDiffLine {
-            kind: AgentFileDiffLineKind::Context,
-            text: bounded_agent_diff_line(line),
-        })
-        .collect::<Vec<_>>();
-    let changed_lines = old_lines[common_prefix..old_change_end]
-        .iter()
-        .map(|line| AgentFileDiffLine {
-            kind: AgentFileDiffLineKind::Delete,
-            text: bounded_agent_diff_line(line),
-        })
-        .chain(
-            new_lines[common_prefix..new_change_end]
-                .iter()
-                .map(|line| AgentFileDiffLine {
-                    kind: AgentFileDiffLineKind::Add,
-                    text: bounded_agent_diff_line(line),
-                }),
-        )
-        .collect::<Vec<_>>();
-    let omitted_lines = changed_lines
-        .len()
-        .saturating_sub(AGENT_FILE_DIFF_MAX_CHANGED_LINES);
-    if omitted_lines == 0 {
-        lines.extend(changed_lines);
-    } else {
-        let head = AGENT_FILE_DIFF_MAX_CHANGED_LINES / 2;
-        let tail = AGENT_FILE_DIFF_MAX_CHANGED_LINES.saturating_sub(head);
-        lines.extend(changed_lines.iter().take(head).cloned());
+    let diff = TextDiff::configure()
+        .timeout(AGENT_FILE_DIFF_TIMEOUT)
+        .diff_lines(old_text, new_text);
+    let head_limit = AGENT_FILE_DIFF_MAX_PREVIEW_LINES / 2;
+    let tail_limit = AGENT_FILE_DIFF_MAX_PREVIEW_LINES.saturating_sub(head_limit);
+    let mut head = Vec::with_capacity(head_limit);
+    let mut tail = VecDeque::with_capacity(tail_limit);
+    let mut total_preview_lines = 0_usize;
+    let mut added_lines = 0_usize;
+    let mut removed_lines = 0_usize;
+    {
+        let mut push_line = |kind, text: &str| {
+            let line = AgentFileDiffLine {
+                kind,
+                text: bounded_agent_diff_line(text),
+            };
+            total_preview_lines = total_preview_lines.saturating_add(1);
+            if head.len() < head_limit {
+                head.push(line);
+            } else {
+                if tail.len() == tail_limit {
+                    tail.pop_front();
+                }
+                tail.push_back(line);
+            }
+        };
+
+        let groups = diff.grouped_ops(AGENT_FILE_DIFF_CONTEXT_LINES);
+        let mut previous_group_end = None;
+        for group in groups {
+            if let (Some((previous_old_end, previous_new_end)), Some(first)) =
+                (previous_group_end, group.first())
+            {
+                let skipped = first
+                    .old_range()
+                    .start
+                    .saturating_sub(previous_old_end)
+                    .max(first.new_range().start.saturating_sub(previous_new_end));
+                if skipped > 0 {
+                    let marker = format!("{skipped} unchanged lines omitted");
+                    push_line(AgentFileDiffLineKind::Omitted, &marker);
+                }
+            }
+            for operation in &group {
+                for change in diff.iter_changes(operation) {
+                    let kind = match change.tag() {
+                        ChangeTag::Equal => AgentFileDiffLineKind::Context,
+                        ChangeTag::Insert => {
+                            added_lines = added_lines.saturating_add(1);
+                            AgentFileDiffLineKind::Add
+                        }
+                        ChangeTag::Delete => {
+                            removed_lines = removed_lines.saturating_add(1);
+                            AgentFileDiffLineKind::Delete
+                        }
+                    };
+                    push_line(kind, agent_diff_line_text(change.value()));
+                }
+            }
+            previous_group_end = group
+                .last()
+                .map(|operation| (operation.old_range().end, operation.new_range().end));
+        }
+    }
+
+    let omitted_lines = total_preview_lines.saturating_sub(head.len().saturating_add(tail.len()));
+    let mut lines = head;
+    if omitted_lines > 0 {
         lines.push(AgentFileDiffLine {
             kind: AgentFileDiffLineKind::Omitted,
-            text: format!("{omitted_lines} changed lines omitted"),
+            text: format!("{omitted_lines} diff lines omitted"),
         });
-        lines.extend(
-            changed_lines
-                .iter()
-                .skip(changed_lines.len().saturating_sub(tail))
-                .cloned(),
-        );
     }
-    lines.extend(
-        new_lines[new_change_end..]
-            .iter()
-            .take(AGENT_FILE_DIFF_CONTEXT_LINES)
-            .map(|line| AgentFileDiffLine {
-                kind: AgentFileDiffLineKind::Context,
-                text: bounded_agent_diff_line(line),
-            }),
-    );
+    lines.extend(tail);
     AgentFileDiffPreview {
         lines,
         added_lines,
         removed_lines,
         omitted_lines,
     }
+}
+
+fn agent_diff_line_text(line: &str) -> &str {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    line.strip_suffix('\r').unwrap_or(line)
 }
 
 fn bounded_agent_diff_line(line: &str) -> String {
@@ -31374,6 +31470,28 @@ mod tests {
         measured_height: Rc<Cell<f32>>,
     }
 
+    struct AgentFileDiffScrollProbe {
+        scroll: gpui::ScrollHandle,
+    }
+
+    impl Render for AgentFileDiffScrollProbe {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let rows = (0..40)
+                .map(|index| {
+                    div()
+                        .w(px(1_600.0))
+                        .h(px(20.0))
+                        .flex_none()
+                        .when(index == 39, |this| {
+                            this.debug_selector(|| "agent-file-diff-last-row".to_string())
+                        })
+                        .into_any_element()
+                })
+                .collect();
+            render_agent_file_diff_scroll_area(rows, &self.scroll, cx)
+        }
+    }
+
     impl Render for LongMarkdownLayoutProbe {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let measured_height = self.measured_height.clone();
@@ -36095,21 +36213,92 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(bounded.lines.len(), AGENT_FILE_DIFF_MAX_CHANGED_LINES + 1);
+        assert_eq!(bounded.lines.len(), AGENT_FILE_DIFF_MAX_PREVIEW_LINES + 1);
     }
 
     #[test]
-    fn agent_file_diff_preview_uses_one_scroll_area_for_both_axes() {
-        let source = include_str!("app.rs");
-        let renderer = source
-            .split_once("    fn render_agent_file_diff_preview(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_image_generation_card("))
-            .map(|(body, _)| body)
-            .expect("agent file diff renderer should remain inspectable");
+    fn agent_file_diff_preview_counts_distant_edits_independently() {
+        let old_lines = (0..220)
+            .map(|index| format!("line-{index}"))
+            .collect::<Vec<_>>();
+        let mut new_lines = old_lines.clone();
+        new_lines[12] = "edited-near-start".into();
+        new_lines[207] = "edited-near-end".into();
 
-        assert!(renderer.contains(".overflow_scrollbar()"));
-        assert!(!renderer.contains(".overflow_x_scrollbar()"));
-        assert!(!renderer.contains(".overflow_y_scrollbar()"));
+        let preview =
+            agent_file_diff_preview(Some(&old_lines.join("\n")), Some(&new_lines.join("\n")));
+
+        assert_eq!(preview.removed_lines, 2);
+        assert_eq!(preview.added_lines, 2);
+        assert_eq!(
+            preview
+                .lines
+                .iter()
+                .filter(|line| line.kind == AgentFileDiffLineKind::Delete)
+                .count(),
+            2
+        );
+        assert_eq!(
+            preview
+                .lines
+                .iter()
+                .filter(|line| line.kind == AgentFileDiffLineKind::Add)
+                .count(),
+            2
+        );
+        assert!(preview.lines.iter().any(|line| {
+            line.kind == AgentFileDiffLineKind::Omitted
+                && line.text.contains("unchanged lines omitted")
+        }));
+    }
+
+    #[gpui::test]
+    fn agent_file_diff_preview_scrolls_past_its_height_cap(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let scroll = gpui::ScrollHandle::new();
+        let observed_scroll = scroll.clone();
+        let (_, cx) = cx.add_window_view(|_, _| AgentFileDiffScrollProbe { scroll });
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let initial_y = cx
+            .debug_bounds("agent-file-diff-last-row")
+            .expect("last diff row should be laid out")
+            .origin
+            .y;
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(20.0), px(20.0)),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let scrolled_y = cx
+            .debug_bounds("agent-file-diff-last-row")
+            .expect("last diff row should remain laid out")
+            .origin
+            .y;
+        assert!(
+            scrolled_y < initial_y,
+            "initial: {initial_y:?}, scrolled: {scrolled_y:?}"
+        );
+        assert!(observed_scroll.offset().y < px(0.0));
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(20.0), px(20.0)),
+            delta: ScrollDelta::Pixels(point(px(-120.0), px(0.0))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        assert!(observed_scroll.offset().x < px(0.0));
     }
 
     #[test]

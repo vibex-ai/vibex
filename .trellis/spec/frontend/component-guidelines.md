@@ -231,6 +231,24 @@ and dark themes. Do not use light-only text classes such as `text-*-100` unless
 they are guarded by a `dark:` variant; in light theme, added/deleted/hunk text
 should use darker foregrounds while the background carries the status tint.
 
+Diff summary counts must come from the same line-level edit script used to
+render the preview. Do not treat everything between a shared prefix and suffix
+as changed: separate edits with unchanged lines between them would inflate both
+the added and removed counts. Preview context and truncation may bound rendered
+rows, but must not change the full edit-script totals.
+
+A height-capped GPUI diff must resolve that cap into a definite scroll viewport.
+Give the stateful node that tracks the persistent `ScrollHandle` an explicit
+bounded size, use GPUI overflow on that node, and attach both-axis scrollbars to
+the same handle. Content-sized descendants inside an ancestor with only a
+maximum height are not sufficient evidence that vertical wheel scrolling works.
+
+Cover both axes with a real GPUI layout test: render content taller and wider
+than the viewport, dispatch vertical and horizontal `ScrollWheelEvent` values
+inside it, and assert the handle offsets (plus a late row's changed bounds for
+the vertical path). Compile-only checks and source-string assertions do not
+exercise GPUI layout or wheel routing.
+
 ### File Tree Icons
 
 Desktop file trees, including the right rail file preview panel, should keep
