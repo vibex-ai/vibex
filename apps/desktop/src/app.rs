@@ -247,6 +247,7 @@ const COMPOSER_QUEUE_HORIZONTAL_INSET: f32 = 20.0;
 const COMPOSER_QUEUE_EDIT_ROW_HEIGHT: f32 = 38.0;
 const COMPOSER_QUEUE_HEADER_HEIGHT: f32 = 36.0;
 const COMPOSER_QUEUE_ROW_HEIGHT: f32 = 28.0;
+const COMPOSER_EXTENSION_SURFACE_OPACITY: f32 = 0.90;
 const COMPOSER_PLAN_TOOLTIP_WIDTH: f32 = 360.0;
 const COMPOSER_PLAN_TOOLTIP_MAX_HEIGHT: f32 = 420.0;
 const COMPOSER_PLAN_EXPANDED_MAX_HEIGHT: f32 = 320.0;
@@ -375,6 +376,7 @@ enum ComposerQueueInterruptBehavior {
 enum ComposerQueueDispatchBehavior {
     Automatic,
     ForceNext,
+    AfterInterrupt,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -856,7 +858,7 @@ fn composer_surface_background(is_dark: bool) -> Hsla {
 }
 
 fn composer_queue_surface_background(is_dark: bool) -> Hsla {
-    theme::semantic_color("composer-queue", is_dark)
+    theme::semantic_color("composer-queue", is_dark).opacity(COMPOSER_EXTENSION_SURFACE_OPACITY)
 }
 
 fn composer_plan_progress_label(
@@ -2643,8 +2645,21 @@ fn composer_queue_dispatch_enabled(
     session_id: &VibexSessionId,
     behavior: ComposerQueueDispatchBehavior,
 ) -> bool {
-    behavior == ComposerQueueDispatchBehavior::ForceNext
+    behavior != ComposerQueueDispatchBehavior::Automatic
         || composer_queue_auto_send_enabled(manual_session_ids, session_id)
+}
+
+fn composer_queue_session_blocks_dispatch(
+    behavior: ComposerQueueDispatchBehavior,
+    local_turn_pending: bool,
+    session_state: Option<AgentSessionState>,
+) -> bool {
+    local_turn_pending
+        || (behavior != ComposerQueueDispatchBehavior::AfterInterrupt
+            && matches!(
+                session_state,
+                Some(AgentSessionState::Running | AgentSessionState::NeedsInput)
+            ))
 }
 
 fn auto_continue_should_start(
@@ -7201,7 +7216,12 @@ impl VibexWorkbench {
             }
             return;
         }
-        self.dispatch_composer_message(message, window, cx);
+        self.dispatch_composer_message(
+            message,
+            ComposerQueueDispatchBehavior::Automatic,
+            window,
+            cx,
+        );
     }
 
     fn take_composer_message(
@@ -7283,11 +7303,21 @@ impl VibexWorkbench {
     fn dispatch_composer_message(
         &mut self,
         message: ComposerQueueMessage,
+        behavior: ComposerQueueDispatchBehavior,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let session_id = message.session_id.clone();
-        if self.agent_session_is_active(&session_id) {
+        let session_state = self
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .map(|session| session.state);
+        if composer_queue_session_blocks_dispatch(
+            behavior,
+            self.session_turn_pending(&session_id),
+            session_state,
+        ) {
             let insert_at = self
                 .composer_queue
                 .iter()
@@ -7449,7 +7479,7 @@ impl VibexWorkbench {
                     this.maybe_dispatch_next_composer_queue_message(
                         &submitted_session_id,
                         if steering {
-                            ComposerQueueDispatchBehavior::ForceNext
+                            ComposerQueueDispatchBehavior::AfterInterrupt
                         } else {
                             ComposerQueueDispatchBehavior::Automatic
                         },
@@ -7478,7 +7508,14 @@ impl VibexWorkbench {
             session_id,
             behavior,
         ) || self.agent_action_pending
-            || self.agent_session_is_active(session_id)
+            || composer_queue_session_blocks_dispatch(
+                behavior,
+                self.session_turn_pending(session_id),
+                self.sessions
+                    .iter()
+                    .find(|session| &session.id == session_id)
+                    .map(|session| session.state),
+            )
             || self
                 .composer_queue_paused_session_ids
                 .contains(session_id.as_str())
@@ -7493,7 +7530,7 @@ impl VibexWorkbench {
             return;
         };
         let message = self.composer_queue.remove(index);
-        self.dispatch_composer_message(message, window, cx);
+        self.dispatch_composer_message(message, behavior, window, cx);
     }
 
     fn begin_composer_queue_edit(
@@ -9511,7 +9548,7 @@ impl VibexWorkbench {
                                     .remove(interrupted_session_id.as_str());
                                 this.maybe_dispatch_next_composer_queue_message(
                                     &interrupted_session_id,
-                                    ComposerQueueDispatchBehavior::ForceNext,
+                                    ComposerQueueDispatchBehavior::AfterInterrupt,
                                     window,
                                     cx,
                                 );
@@ -23065,7 +23102,6 @@ impl VibexWorkbench {
             .flex_none()
             .gap_2()
             .items_center()
-            .bg(cx.theme().background)
             .px_4()
             .py_2()
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
@@ -34051,8 +34087,13 @@ mod tests {
             let composer = composer_surface_background(is_dark);
             let queue = composer_queue_surface_background(is_dark);
             assert_eq!(composer, theme::semantic_color("composer-surface", is_dark));
-            assert_eq!(queue, theme::semantic_color("composer-queue", is_dark));
             assert_eq!(composer.a, 1.0);
+            assert_eq!(queue.a, COMPOSER_EXTENSION_SURFACE_OPACITY);
+            assert_eq!(
+                queue,
+                theme::semantic_color("composer-queue", is_dark)
+                    .opacity(COMPOSER_EXTENSION_SURFACE_OPACITY)
+            );
             assert_ne!(composer, queue);
         }
         assert!(theme::semantic_token("composer-backdrop", true).is_none());
@@ -34087,7 +34128,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("composer renderer should remain inspectable");
         assert!(composer.contains(".bg(composer_background)"));
-        assert!(composer.contains(".bg(cx.theme().background)"));
+        assert!(!composer.contains(".bg(cx.theme().background)"));
         assert!(composer.contains("session_content_max_width"));
         assert!(!composer.contains("COMPOSER_MAX_WIDTH"));
         assert!(composer.contains("toggle-composer-expanded"));
@@ -34212,6 +34253,35 @@ mod tests {
             &manual_session_ids,
             &session,
             ComposerQueueDispatchBehavior::ForceNext,
+        ));
+        assert!(composer_queue_dispatch_enabled(
+            &manual_session_ids,
+            &session,
+            ComposerQueueDispatchBehavior::AfterInterrupt,
+        ));
+    }
+
+    #[test]
+    fn composer_queue_dispatch_after_interrupt_ignores_only_the_stale_session_snapshot() {
+        assert!(composer_queue_session_blocks_dispatch(
+            ComposerQueueDispatchBehavior::AfterInterrupt,
+            true,
+            Some(AgentSessionState::Running),
+        ));
+        assert!(!composer_queue_session_blocks_dispatch(
+            ComposerQueueDispatchBehavior::AfterInterrupt,
+            false,
+            Some(AgentSessionState::Running),
+        ));
+        assert!(composer_queue_session_blocks_dispatch(
+            ComposerQueueDispatchBehavior::ForceNext,
+            false,
+            Some(AgentSessionState::Running),
+        ));
+        assert!(!composer_queue_session_blocks_dispatch(
+            ComposerQueueDispatchBehavior::Automatic,
+            false,
+            Some(AgentSessionState::Idle),
         ));
     }
 
@@ -34524,6 +34594,7 @@ mod tests {
         assert!(interrupt.contains("ComposerQueueInterruptBehavior::Steer"));
         assert!(interrupt.contains("turn_was_locally_pending"));
         assert!(interrupt.contains("composer_queue_steering_session_ids"));
+        assert!(interrupt.contains("ComposerQueueDispatchBehavior::AfterInterrupt"));
     }
 
     #[test]
