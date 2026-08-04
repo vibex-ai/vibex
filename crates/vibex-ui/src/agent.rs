@@ -913,9 +913,9 @@ mod tests {
     use vibex_core::{
         AgentId, AgentMessagePayload, AgentSessionSafety, AgentSessionState, CorrelationId,
         PermissionActionDetail, PermissionRequest, PermissionResolution, PermissionResponseKind,
-        PermissionRiskCategory, ProjectId, ProviderProfileId, RequestId, SessionRuntimeSelection,
-        TimelineItemId, TimelineRedactionState, TimelineSource, UserMessagePayload, WorkspaceId,
-        WorkspaceMode,
+        PermissionResponseOption, PermissionRiskCategory, ProjectId, ProviderProfileId, RequestId,
+        SessionRuntimeSelection, TimelineItemId, TimelineRedactionState, TimelineSource,
+        UserMessagePayload, WorkspaceId, WorkspaceMode,
     };
 
     #[derive(Clone)]
@@ -1186,6 +1186,23 @@ mod tests {
                 PermissionResponseKind::Approve,
                 PermissionResponseKind::Deny,
             ],
+            response_options: vec![
+                PermissionResponseOption {
+                    option_id: "allow-once".into(),
+                    label: "Allow".into(),
+                    response: PermissionResponseKind::Approve,
+                },
+                PermissionResponseOption {
+                    option_id: "allow-cargo-prefix".into(),
+                    label: "Allow commands starting with cargo".into(),
+                    response: PermissionResponseKind::AlwaysAllowForSession,
+                },
+                PermissionResponseOption {
+                    option_id: "reject-once".into(),
+                    label: "Reject".into(),
+                    response: PermissionResponseKind::Deny,
+                },
+            ],
             status: PermissionRequestStatus::Pending,
             requested_at_ms: 1,
             expires_at_ms: None,
@@ -1214,6 +1231,7 @@ mod tests {
         assert!(surfaces[0].high_priority);
         assert!(surfaces[0].is_touch_discoverable());
         assert_eq!(surfaces[0].presentation, crate::ApprovalPresentation::Sheet);
+        assert_eq!(surfaces[0].response_options, request.response_options);
 
         let resolution = ResolvePermissionRequest {
             session_id: session.id.clone(),

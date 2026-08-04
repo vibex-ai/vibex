@@ -688,6 +688,7 @@ mod tests {
                                 vibex_core::PermissionResponseKind::Approve,
                                 vibex_core::PermissionResponseKind::Deny,
                             ],
+                            response_options: Vec::new(),
                             status: vibex_core::PermissionRequestStatus::Pending,
                             requested_at_ms: unix_timestamp_ms(),
                             expires_at_ms: None,

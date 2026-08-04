@@ -1734,6 +1734,17 @@ impl AgentManager {
                 TimelineRedactionState::None,
             );
         }
+        if let Some(provider_resolution_id) = request.resolution.provider_resolution_id.as_deref()
+            && !existing_permission.response_options.iter().any(|option| {
+                option.option_id == provider_resolution_id
+                    && option.response == request.resolution.response
+            })
+        {
+            return Err(VibexError::validation(
+                "permission_response_option_invalid",
+                "the selected permission response option is not available for this request",
+            ));
+        }
         PermissionRepository::resolve(&conn, &request.resolution)?;
         let item = self.append_timeline_item(
             &mut conn,

@@ -501,6 +501,7 @@ mod tests {
                             vibex_core::PermissionResponseKind::Approve,
                             vibex_core::PermissionResponseKind::Deny,
                         ],
+                        response_options: Vec::new(),
                         status: PermissionRequestStatus::Pending,
                         requested_at_ms: 2,
                         expires_at_ms: None,

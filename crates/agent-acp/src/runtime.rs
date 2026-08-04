@@ -63,8 +63,8 @@ use vibex_core::{
     ExternalSessionContinuationStatus, ExternalSessionImportCandidate,
     ExternalSessionImportCandidateStatus, ExternalSessionImportSource, MAX_AGENT_USAGE_TOKEN_VALUE,
     NativeStateHomeId, PermissionActionDetail, PermissionRequest, PermissionRequestStatus,
-    PermissionResponseKind, PermissionRiskCategory, PlanStepPayload, PlanStepStatus,
-    ProviderBinding, ProviderBindingMetadata, ProviderKind, ProviderModelWireApi,
+    PermissionResponseKind, PermissionResponseOption, PermissionRiskCategory, PlanStepPayload,
+    PlanStepStatus, ProviderBinding, ProviderBindingMetadata, ProviderKind, ProviderModelWireApi,
     ProviderNativeBinding, ProviderProfile, ProviderProfileId, ProviderProfileStatus,
     ProviderSecretBackend, ProviderSessionConfigOption, ProviderSessionConfigOptionKind,
     ProviderSessionConfigState, ProviderSessionConfigValue, RequestId, RuntimeAttachmentSnapshot,
@@ -985,6 +985,7 @@ struct PendingTerminalCreate {
 #[derive(Debug, Clone)]
 struct PermissionOptionSummary {
     option_id: String,
+    label: String,
     kind: String,
 }
 
@@ -2059,15 +2060,9 @@ impl AcpSessionAttachment {
                     allowed_responses: pending
                         .options
                         .iter()
-                        .filter_map(|option| match option.kind.as_str() {
-                            "approve" => Some(PermissionResponseKind::Approve),
-                            "always_allow" | "alwaysAllow" => {
-                                Some(PermissionResponseKind::AlwaysAllowForSession)
-                            }
-                            "deny" => Some(PermissionResponseKind::Deny),
-                            _ => None,
-                        })
+                        .filter_map(permission_option_response)
                         .collect(),
+                    response_options: permission_response_options(&pending.options),
                     status: PermissionRequestStatus::Pending,
                     requested_at_ms: unix_timestamp_ms(),
                     expires_at_ms: None,
@@ -3517,6 +3512,7 @@ impl AcpProcess {
                 if details.is_empty() {
                     push_detail(&mut details, "source", "ACP agent");
                 }
+                let response_options = permission_response_options(&options);
                 if !attachment.insert_pending_permission(
                     &request_id,
                     PendingPermission {
@@ -3535,6 +3531,7 @@ impl AcpProcess {
                     risk_category: infer_permission_risk_category(&risk_source),
                     title,
                     details,
+                    options: response_options,
                 });
                 if !delivered {
                     attachment.remove_pending_permission(request_id.as_str());
@@ -3655,6 +3652,7 @@ impl AcpProcess {
                     ),
                     title: terminal_permission_title(&request),
                     details: terminal_permission_details(&request),
+                    options: Vec::new(),
                 });
                 if !delivered {
                     attachment.remove_pending_terminal_create(request_id.as_str());
@@ -11890,6 +11888,7 @@ impl AcpClient for AcpRuntimeClient {
         let response = match select_resolution_permission_option(
             &pending.options,
             request.resolution.response,
+            request.resolution.provider_resolution_id.as_deref(),
         ) {
             Some(option_id) => json!({
                 "outcome": {
@@ -12205,7 +12204,17 @@ fn permission_cancelled_response() -> Value {
 fn select_resolution_permission_option(
     options: &[PermissionOptionSummary],
     response: PermissionResponseKind,
+    provider_resolution_id: Option<&str>,
 ) -> Option<String> {
+    if let Some(option_id) = provider_resolution_id {
+        return options
+            .iter()
+            .find(|option| {
+                option.option_id == option_id
+                    && permission_option_response(option) == Some(response)
+            })
+            .map(|option| option.option_id.clone());
+    }
     match response {
         PermissionResponseKind::Approve => {
             select_permission_option(options, &["allow_once", "allow_always", "approve"])
@@ -12271,11 +12280,57 @@ fn parse_permission_options(value: Option<&Value>) -> Vec<PermissionOptionSummar
                         .and_then(Value::as_str)
                         .map(normalize_permission_option_kind)
                         .unwrap_or_else(|| "unknown".to_string());
-                    Some(PermissionOptionSummary { option_id, kind })
+                    let label = option
+                        .get("name")
+                        .or_else(|| option.get("label"))
+                        .and_then(Value::as_str)
+                        .map(redact_summary)
+                        .filter(|label| !label.trim().is_empty())
+                        .unwrap_or_else(|| permission_option_fallback_label(&kind).to_string());
+                    Some(PermissionOptionSummary {
+                        option_id,
+                        label,
+                        kind,
+                    })
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn permission_option_response(option: &PermissionOptionSummary) -> Option<PermissionResponseKind> {
+    match option.kind.as_str() {
+        "allow_once" | "approve" => Some(PermissionResponseKind::Approve),
+        "allow_always" | "always_allow" | "alwaysAllow" => {
+            Some(PermissionResponseKind::AlwaysAllowForSession)
+        }
+        "reject_once" | "reject_always" | "deny" | "reject" => Some(PermissionResponseKind::Deny),
+        _ => None,
+    }
+}
+
+fn permission_response_options(
+    options: &[PermissionOptionSummary],
+) -> Vec<PermissionResponseOption> {
+    options
+        .iter()
+        .filter_map(|option| {
+            Some(PermissionResponseOption {
+                option_id: option.option_id.clone(),
+                label: option.label.clone(),
+                response: permission_option_response(option)?,
+            })
+        })
+        .collect()
+}
+
+fn permission_option_fallback_label(kind: &str) -> &'static str {
+    match kind {
+        "allow_once" | "approve" => "Allow",
+        "allow_always" | "always_allow" | "alwaysAllow" => "Always allow for session",
+        "reject_once" | "reject_always" | "deny" | "reject" => "Reject",
+        _ => "Permission option",
+    }
 }
 
 fn normalize_permission_option_kind(kind: &str) -> String {
@@ -15224,10 +15279,12 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
         let options = vec![
             PermissionOptionSummary {
                 option_id: "allow-1".to_string(),
+                label: "Allow".to_string(),
                 kind: "allow_once".to_string(),
             },
             PermissionOptionSummary {
                 option_id: "reject-1".to_string(),
+                label: "Reject".to_string(),
                 kind: "reject_once".to_string(),
             },
         ];
@@ -15253,15 +15310,61 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
         assert_eq!(
             select_resolution_permission_option(
                 &normalized,
-                PermissionResponseKind::AlwaysAllowForSession
+                PermissionResponseKind::AlwaysAllowForSession,
+                None,
             )
             .as_deref(),
             Some("allow-kind")
         );
         assert_eq!(
-            select_resolution_permission_option(&normalized, PermissionResponseKind::Deny)
+            select_resolution_permission_option(&normalized, PermissionResponseKind::Deny, None)
                 .as_deref(),
             Some("reject-type")
+        );
+
+        let scoped = parse_permission_options(Some(&json!([
+            {
+                "optionId": "allow-session",
+                "kind": "allow_always",
+                "name": "Allow for session"
+            },
+            {
+                "optionId": "allow-prefix",
+                "kind": "allow_always",
+                "name": "Allow commands starting with cargo test"
+            }
+        ])));
+        assert_eq!(
+            permission_response_options(&scoped),
+            vec![
+                PermissionResponseOption {
+                    option_id: "allow-session".to_string(),
+                    label: "Allow for session".to_string(),
+                    response: PermissionResponseKind::AlwaysAllowForSession,
+                },
+                PermissionResponseOption {
+                    option_id: "allow-prefix".to_string(),
+                    label: "Allow commands starting with cargo test".to_string(),
+                    response: PermissionResponseKind::AlwaysAllowForSession,
+                },
+            ]
+        );
+        assert_eq!(
+            select_resolution_permission_option(
+                &scoped,
+                PermissionResponseKind::AlwaysAllowForSession,
+                Some("allow-prefix"),
+            )
+            .as_deref(),
+            Some("allow-prefix")
+        );
+        assert_eq!(
+            select_resolution_permission_option(
+                &scoped,
+                PermissionResponseKind::Deny,
+                Some("allow-prefix"),
+            ),
+            None
         );
     }
 
@@ -18815,9 +18918,17 @@ for line in sys.stdin:
             tokio::select! {
                 event = event_rx.recv() => {
                     match event {
-                        Some(AcpEvent::PermissionRequest { request_id, provider_request_id, details, .. }) => {
+                        Some(AcpEvent::PermissionRequest {
+                            request_id,
+                            provider_request_id,
+                            details,
+                            options,
+                            ..
+                        }) => {
                             assert!(provider_request_id.is_some());
                             assert!(details.iter().any(|detail| detail.label == "tool"));
+                            assert_eq!(options.len(), 2);
+                            assert_eq!(options[0].label, "Allow");
                             permission_request_id = request_id;
                             break;
                         }

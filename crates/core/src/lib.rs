@@ -120,7 +120,7 @@ pub use ids::{
 };
 pub use permission::{
     PermissionActionDetail, PermissionMode, PermissionRequest, PermissionRequestStatus,
-    PermissionResolution, PermissionResponseKind, PermissionRiskCategory,
+    PermissionResolution, PermissionResponseKind, PermissionResponseOption, PermissionRiskCategory,
 };
 pub use provider::{
     AcpProcessStrategy, AcpProviderCatalogListResponse, AcpProviderCatalogPreset,

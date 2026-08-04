@@ -922,6 +922,7 @@ mod tests {
                 title: "allow".to_string(),
                 details: Vec::new(),
                 allowed_responses: vec![vibex_core::PermissionResponseKind::Deny],
+                response_options: Vec::new(),
                 status: vibex_core::PermissionRequestStatus::Pending,
                 requested_at_ms: 0,
                 expires_at_ms: None,

@@ -1156,6 +1156,7 @@ mod tests {
                     title: "permission-private-marker".to_string(),
                     details: Vec::new(),
                     allowed_responses: vec![PermissionResponseKind::Deny],
+                    response_options: Vec::new(),
                     status: PermissionRequestStatus::Pending,
                     requested_at_ms: 8,
                     expires_at_ms: None,

@@ -721,6 +721,7 @@ impl WorkflowWorkbenchView {
                     } else {
                         PermissionResponseKind::Deny
                     },
+                    None,
                     cx,
                 )?;
             }
@@ -1179,6 +1180,7 @@ impl WorkflowWorkbenchView {
         &mut self,
         request_id: RequestId,
         response: PermissionResponseKind,
+        provider_resolution_id: Option<String>,
         cx: &mut Context<Self>,
     ) -> BackendResult<()> {
         let session_id = self
@@ -1199,7 +1201,7 @@ impl WorkflowWorkbenchView {
                 session_id,
                 response,
                 responder_device_id: None,
-                provider_resolution_id: None,
+                provider_resolution_id,
                 note: None,
                 resolved_at_ms: unix_timestamp_ms(),
             },
@@ -2188,8 +2190,37 @@ impl WorkflowWorkbenchView {
             .into_iter()
             .enumerate()
             .map(|(index, approval)| {
-                let approve_id = approval.request_id.clone();
-                let deny_id = approval.request_id.clone();
+                let response_options = if approval.response_options.is_empty() {
+                    approval
+                        .allowed_responses
+                        .iter()
+                        .map(|response| {
+                            (
+                                None,
+                                match response {
+                                    PermissionResponseKind::Approve => "Allow".to_string(),
+                                    PermissionResponseKind::AlwaysAllowForSession => {
+                                        "Always allow for session".to_string()
+                                    }
+                                    PermissionResponseKind::Deny => "Deny".to_string(),
+                                },
+                                *response,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    approval
+                        .response_options
+                        .iter()
+                        .map(|option| {
+                            (
+                                Some(option.option_id.clone()),
+                                option.label.clone(),
+                                option.response,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                };
                 v_flex()
                     .id(("agent-approval", index))
                     .gap_2()
@@ -2202,36 +2233,31 @@ impl WorkflowWorkbenchView {
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .child(approval.title),
                     )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                Button::new(("agent-approval-deny", index))
-                                    .outline()
-                                    .label("Deny")
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        let result = this.resolve_approval(
-                                            deny_id.clone(),
-                                            PermissionResponseKind::Deny,
-                                            cx,
-                                        );
-                                        this.record_action_result(result, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new(("agent-approval-allow", index))
-                                    .primary()
-                                    .label("Allow")
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        let result = this.resolve_approval(
-                                            approve_id.clone(),
-                                            PermissionResponseKind::Approve,
-                                            cx,
-                                        );
-                                        this.record_action_result(result, cx);
-                                    })),
-                            ),
-                    )
+                    .child(h_flex().gap_2().flex_wrap().children(
+                        response_options.into_iter().enumerate().map(
+                            |(option_index, (option_id, label, response))| {
+                                let request_id = approval.request_id.clone();
+                                let button = Button::new(format!(
+                                    "agent-approval-response:{index}:{option_index}"
+                                ))
+                                .label(label)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let result = this.resolve_approval(
+                                        request_id.clone(),
+                                        response,
+                                        option_id.clone(),
+                                        cx,
+                                    );
+                                    this.record_action_result(result, cx);
+                                }));
+                                match response {
+                                    PermissionResponseKind::Approve => button.primary(),
+                                    PermissionResponseKind::Deny => button.outline(),
+                                    PermissionResponseKind::AlwaysAllowForSession => button,
+                                }
+                            },
+                        ),
+                    ))
             });
         let session_list = v_flex()
             .w(if self.layout.kind == ShellKind::Wide {

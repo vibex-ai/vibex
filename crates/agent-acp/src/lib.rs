@@ -36,13 +36,14 @@ use vibex_core::{
     AgentReasoningEffort, AgentSessionConfigProbe, AgentSessionSafety, AgentUsageCounterOrigin,
     AgentUsageExecutionContext, ExternalSessionImportCandidate, MessageSubmissionId,
     PermissionActionDetail, PermissionRequest, PermissionRequestStatus, PermissionResponseKind,
-    PermissionRiskCategory, PlanPayload, PlanStepPayload, ProviderBinding, ProviderBindingMetadata,
-    ProviderCapabilities, ProviderCapabilitySummary, ProviderKind, ProviderNativeBinding,
-    ProviderProfileId, ProviderRunCapabilityProbesRequest, ProviderSessionConfigOption,
-    ProviderSessionConfigValue, ReasoningPayload, RequestId, SessionRuntimeConfigMutationRequest,
-    SessionRuntimeConfigMutationResult, SessionRuntimeSelection, SystemNoticeLevel,
-    SystemNoticePayload, TimelineErrorPayload, TimelinePayload, TimelineRedactionState,
-    ToolCallPayload, ToolCallStatus, VibexError, VibexResult, VibexSessionId, unix_timestamp_ms,
+    PermissionResponseOption, PermissionRiskCategory, PlanPayload, PlanStepPayload,
+    ProviderBinding, ProviderBindingMetadata, ProviderCapabilities, ProviderCapabilitySummary,
+    ProviderKind, ProviderNativeBinding, ProviderProfileId, ProviderRunCapabilityProbesRequest,
+    ProviderSessionConfigOption, ProviderSessionConfigValue, ReasoningPayload, RequestId,
+    SessionRuntimeConfigMutationRequest, SessionRuntimeConfigMutationResult,
+    SessionRuntimeSelection, SystemNoticeLevel, SystemNoticePayload, TimelineErrorPayload,
+    TimelinePayload, TimelineRedactionState, ToolCallPayload, ToolCallStatus, VibexError,
+    VibexResult, VibexSessionId, unix_timestamp_ms,
 };
 
 mod adapter_activation;
@@ -286,6 +287,7 @@ pub enum AcpEvent {
         risk_category: PermissionRiskCategory,
         title: String,
         details: Vec<PermissionActionDetail>,
+        options: Vec<PermissionResponseOption>,
     },
     SystemNotice {
         level: SystemNoticeLevel,
@@ -781,6 +783,7 @@ impl AcpClient for OpenCodeAcpClient {
                     risk_category: request.risk_category,
                     title: request.title,
                     details: request.details,
+                    options: Vec::new(),
                 }),
         );
         if !prompt_result.reasoning_text.trim().is_empty() {
@@ -2870,6 +2873,7 @@ fn map_acp_event(session_id: vibex_core::VibexSessionId, event: AcpEvent) -> Pro
             risk_category,
             title,
             details,
+            options,
         } => ProviderEvent {
             source: vibex_core::TimelineSource::Provider,
             payload: TimelinePayload::PermissionRequest(PermissionRequest {
@@ -2881,10 +2885,15 @@ fn map_acp_event(session_id: vibex_core::VibexSessionId, event: AcpEvent) -> Pro
                 risk_category,
                 title,
                 details,
-                allowed_responses: vec![
-                    PermissionResponseKind::Approve,
-                    PermissionResponseKind::Deny,
-                ],
+                allowed_responses: if options.is_empty() {
+                    vec![
+                        PermissionResponseKind::Approve,
+                        PermissionResponseKind::Deny,
+                    ]
+                } else {
+                    options.iter().map(|option| option.response).collect()
+                },
+                response_options: options,
                 status: PermissionRequestStatus::Pending,
                 requested_at_ms: unix_timestamp_ms(),
                 expires_at_ms: None,
@@ -3710,6 +3719,7 @@ mod tests {
                             label: "command".to_string(),
                             value: "echo acp".to_string(),
                         }],
+                        options: Vec::new(),
                     },
                     AcpEvent::Unknown {
                         event_kind: "future_event".to_string(),

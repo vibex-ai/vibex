@@ -22,12 +22,13 @@ use vibex_core::{
     HookInstallState, McpServer, McpServerAgentMatrix, McpServerCreateRequest, McpServerId,
     McpServerProviderMatrix, McpServerSecretReference, McpServerStatus, PermissionActionDetail,
     PermissionRequest, PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
-    ProjectId, ProjectRecord, Prompt, PromptCreateRequest, PromptId, PromptStatus,
-    ProviderCapabilityProbeResult, ProviderHealthProbeResult, ProviderInjectionPreview,
-    ProviderInjectionPreviewRequest, ProviderKind, ProviderNativeExportApplyResult,
-    ProviderNativeExportFilePlan, ProviderNativeExportListRequest, ProviderNativeExportPreview,
-    ProviderNativeExportRecordSummary, ProviderNativeExportRollbackResult, ProviderNetworkDefaults,
-    ProviderOptions, ProviderPermissionDefaults, ProviderProfile, ProviderProfileCreateRequest,
+    PermissionResponseOption, ProjectId, ProjectRecord, Prompt, PromptCreateRequest, PromptId,
+    PromptStatus, ProviderCapabilityProbeResult, ProviderHealthProbeResult,
+    ProviderInjectionPreview, ProviderInjectionPreviewRequest, ProviderKind,
+    ProviderNativeExportApplyResult, ProviderNativeExportFilePlan, ProviderNativeExportListRequest,
+    ProviderNativeExportPreview, ProviderNativeExportRecordSummary,
+    ProviderNativeExportRollbackResult, ProviderNetworkDefaults, ProviderOptions,
+    ProviderPermissionDefaults, ProviderProfile, ProviderProfileCreateRequest,
     ProviderProfileDefaultScope, ProviderProfileDefaultSelection, ProviderProfileId,
     ProviderProfileSetDefaultRequest, ProviderProfileStatus, ProviderSandboxDefaults,
     ProviderSecretReference, ProviderUsageRecord, ProviderUsageWindow, RedactedDiagnostic,
@@ -66,7 +67,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 34;
+pub const CURRENT_SCHEMA_VERSION: i64 = 35;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -1486,6 +1487,14 @@ const MIGRATIONS: &[Migration] = &[
             );
             CREATE INDEX IF NOT EXISTS idx_git_worktree_readiness_workspace
                 ON git_worktree_readiness(workspace_id, updated_at_ms);
+        ",
+    },
+    Migration {
+        version: 35,
+        name: "permission_response_options",
+        sql: "
+            ALTER TABLE permission_requests
+                ADD COLUMN response_options_json TEXT NOT NULL DEFAULT '[]';
         ",
     },
 ];
@@ -6662,9 +6671,9 @@ impl PermissionRepository {
             INSERT INTO permission_requests (
                 request_id, session_id, project_id, workspace_id, provider_request_id,
                 risk_category, title, details_json, allowed_responses_json, status,
-                requested_at_ms, expires_at_ms
+                requested_at_ms, expires_at_ms, response_options_json
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             ",
             params![
                 request.id.as_str(),
@@ -6678,7 +6687,8 @@ impl PermissionRepository {
                 json_to_db(&request.allowed_responses)?,
                 enum_to_db(&request.status)?,
                 request.requested_at_ms,
-                request.expires_at_ms
+                request.expires_at_ms,
+                json_to_db(&request.response_options)?,
             ],
         )
         .map_err(storage_err(
@@ -6697,7 +6707,7 @@ impl PermissionRepository {
                 "
                 SELECT request_id, session_id, project_id, workspace_id, provider_request_id,
                     risk_category, title, details_json, allowed_responses_json, status,
-                    requested_at_ms, expires_at_ms
+                    requested_at_ms, expires_at_ms, response_options_json
                 FROM permission_requests
                 WHERE request_id = ?1
                 ",
@@ -6752,7 +6762,7 @@ impl PermissionRepository {
                 "
                 SELECT request_id, session_id, project_id, workspace_id, provider_request_id,
                     risk_category, title, details_json, allowed_responses_json, status,
-                    requested_at_ms, expires_at_ms
+                    requested_at_ms, expires_at_ms, response_options_json
                 FROM permission_requests
                 WHERE session_id = ?1 AND status = ?2
                 ORDER BY requested_at_ms ASC
@@ -10803,6 +10813,7 @@ fn map_permission_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<Permissio
         title: row.get(6)?,
         details: json_from_db_sql::<Vec<PermissionActionDetail>>(row.get(7)?)?,
         allowed_responses: json_from_db_sql::<Vec<PermissionResponseKind>>(row.get(8)?)?,
+        response_options: json_from_db_sql::<Vec<PermissionResponseOption>>(row.get(12)?)?,
         status: enum_from_db_sql(row.get(9)?)?,
         requested_at_ms: row.get(10)?,
         expires_at_ms: row.get(11)?,
@@ -11058,7 +11069,8 @@ mod tests {
             vec![
                 "32:agent_usage_zero_baseline_fence",
                 "33:managed_worktree_recovery_foundation",
-                "34:worktree_merge_lifecycle"
+                "34:worktree_merge_lifecycle",
+                "35:permission_response_options"
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -11195,7 +11207,8 @@ mod tests {
                 "31:agent_usage_statistics",
                 "32:agent_usage_zero_baseline_fence",
                 "33:managed_worktree_recovery_foundation",
-                "34:worktree_merge_lifecycle"
+                "34:worktree_merge_lifecycle",
+                "35:permission_response_options"
             ]
         );
         assert_eq!(
@@ -12738,7 +12751,8 @@ mod tests {
             apply_migrations(&mut conn).unwrap(),
             vec![
                 "33:managed_worktree_recovery_foundation",
-                "34:worktree_merge_lifecycle"
+                "34:worktree_merge_lifecycle",
+                "35:permission_response_options"
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
@@ -14070,17 +14084,19 @@ mod tests {
                 PermissionResponseKind::Approve,
                 PermissionResponseKind::Deny,
             ],
+            response_options: vec![PermissionResponseOption {
+                option_id: "allow-command-prefix".to_string(),
+                label: "Allow commands starting with echo".to_string(),
+                response: PermissionResponseKind::AlwaysAllowForSession,
+            }],
             status: PermissionRequestStatus::Pending,
             requested_at_ms: unix_timestamp_ms(),
             expires_at_ms: None,
         };
         PermissionRepository::insert_request(&conn, &request).unwrap();
-        assert_eq!(
-            PermissionRepository::pending_for_session(&conn, &session.id)
-                .unwrap()
-                .len(),
-            1
-        );
+        let pending = PermissionRepository::pending_for_session(&conn, &session.id).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].response_options, request.response_options);
         PermissionRepository::resolve(
             &conn,
             &PermissionResolution {

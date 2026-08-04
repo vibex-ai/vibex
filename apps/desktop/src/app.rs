@@ -9329,6 +9329,7 @@ impl VibexWorkbench {
         &mut self,
         request_id: String,
         response: PermissionResponseKind,
+        provider_resolution_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
         if self.agent_action_pending {
@@ -9357,7 +9358,7 @@ impl VibexWorkbench {
                         session_id,
                         response,
                         responder_device_id: None,
-                        provider_resolution_id: None,
+                        provider_resolution_id,
                         note: None,
                         resolved_at_ms: unix_timestamp_ms(),
                     },
@@ -21648,6 +21649,31 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let request_id = request.id.as_str().to_string();
+        let options = if request.response_options.is_empty() {
+            request
+                .allowed_responses
+                .iter()
+                .map(|response| {
+                    (
+                        None,
+                        permission_response_label(*response).to_string(),
+                        *response,
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            request
+                .response_options
+                .iter()
+                .map(|option| {
+                    (
+                        Some(option.option_id.clone()),
+                        option.label.clone(),
+                        option.response,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
         h_flex()
             .w_full()
             .min_w_0()
@@ -21655,16 +21681,14 @@ impl VibexWorkbench {
             .items_center()
             .justify_end()
             .gap_2()
-            .children(request.allowed_responses.iter().map(|response| {
-                let response = *response;
+            .children(options.into_iter().map(|(option_id, label, response)| {
                 let resolve_id = request_id.clone();
-                let label = permission_response_label(response);
                 let button = Button::new(format!("permission-response:{request_id}:{label}"))
                     .small()
                     .label(label)
                     .disabled(self.agent_action_pending)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.resolve_permission(resolve_id.clone(), response, cx)
+                        this.resolve_permission(resolve_id.clone(), response, option_id.clone(), cx)
                     }));
                 match response {
                     PermissionResponseKind::Approve => button.primary().icon(IconName::Check),
@@ -33103,6 +33127,7 @@ mod tests {
                 PermissionResponseKind::Approve,
                 PermissionResponseKind::Deny,
             ],
+            response_options: Vec::new(),
             status: vibex_core::PermissionRequestStatus::Pending,
             requested_at_ms: 1,
             expires_at_ms: None,

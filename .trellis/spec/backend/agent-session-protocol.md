@@ -510,7 +510,7 @@ session/request_permission {
   params: {
     sessionId,
     toolCall?,
-    options?: [{ optionId | id, kind | type | name }]
+    options?: [{ optionId | id, name | label, kind | type }]
   }
 }
 
@@ -539,6 +539,16 @@ PermissionRepository::pending_for_session(VibexSessionId)
 - `AcpSessionAttachment.pending_permissions` owns the native JSON-RPC `id`,
   parsed ACP option summaries, and attachment fence until exactly one
   resolution, cancellation, detach, or process crash drains it.
+- `PermissionRequest.response_options` persists every recognized ACP option as
+  `{ optionId, label, response }` in Agent order. `label` is the bounded,
+  redacted Agent display name; `response` is the provider-neutral semantic kind.
+  `allowed_responses` remains the compatibility fallback for old records and
+  non-ACP permission producers.
+- UI clients render `response_options` when non-empty and return the selected
+  `optionId` as `PermissionResolution.provider_resolution_id`. They must not
+  collapse multiple options with the same semantic response: an Agent may offer
+  both a session-wide allow and a command-prefix allow as distinct
+  `allow_always` options.
 - Timeline permission payloads must include safe details for tool kind,
   tool-call id, raw input summary, option kinds, or source. Secret-like values
   must be redacted before persistence.
@@ -577,6 +587,9 @@ PermissionRepository::pending_for_session(VibexSessionId)
 - Duplicate native resolution after pending state was removed -> no-op success.
 - Missing compatible ACP option for selected Vibex response -> cancelled ACP
   outcome response.
+- Unknown option id, or an option id whose semantic response does not match the
+  submitted response -> `validation/permission_response_option_invalid`; do not
+  resolve the durable request or answer the native callback.
 
 ### 5. Good/Base/Bad Cases
 
@@ -585,6 +598,9 @@ PermissionRepository::pending_for_session(VibexSessionId)
   allow option once; the blocked turn continues and returns to `idle`.
 - Good: User denies; runtime sends selected reject option once and timeline
   state records the denial.
+- Good: ACP offers `Allow for session` and `Allow commands starting with cargo`
+  as separate allow options; the UI preserves both labels and the runtime sends
+  the exact selected option id.
 - Base: User interrupts while permission is pending; runtime replies cancelled,
   sends `session/cancel`, and clears pending native state.
 - Base: UI retries the same resolution due to reconnect or double-click; manager
@@ -607,6 +623,9 @@ PermissionRepository::pending_for_session(VibexSessionId)
   session to `idle`.
 - Regression tests must cover option normalization for `kind`, `type`, and
   `name` fields plus hyphen/space/case variants.
+- Persistence and UI projection tests must assert option id/label/order survive
+  database and timeline round trips. Runtime tests must assert exact-id
+  selection and reject an id/semantic-kind mismatch.
 
 ### 7. Wrong vs Correct
 
@@ -624,7 +643,8 @@ ACP agent.
 ```text
 session/request_permission
   -> pending_permissions[request_id] stores native rpc id + options
-  -> timeline PermissionRequest(provider_request_id=request_id)
+  -> timeline PermissionRequest(provider_request_id=request_id, response_options)
+  -> UI returns the exact option id in provider_resolution_id
   -> AgentManager::resolve_permission
   -> AcpClient::resolve_permission
   -> JSON-RPC response selected/cancelled exactly once

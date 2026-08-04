@@ -31,6 +31,14 @@ pub enum PermissionResponseKind {
     AlwaysAllowForSession,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionResponseOption {
+    pub option_id: String,
+    pub label: String,
+    pub response: PermissionResponseKind,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionRequestStatus {
@@ -59,6 +67,8 @@ pub struct PermissionRequest {
     pub title: String,
     pub details: Vec<PermissionActionDetail>,
     pub allowed_responses: Vec<PermissionResponseKind>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub response_options: Vec<PermissionResponseOption>,
     pub status: PermissionRequestStatus,
     pub requested_at_ms: i64,
     pub expires_at_ms: Option<i64>,

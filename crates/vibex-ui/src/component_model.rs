@@ -3,7 +3,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use vibex_core::{
     AgentSession, FileEntryKind, GitStatusSummary, PermissionRequest, PermissionResponseKind,
-    PermissionRiskCategory, RequestId, TerminalId, TimelineItemId, WorkspaceId,
+    PermissionResponseOption, PermissionRiskCategory, RequestId, TerminalId, TimelineItemId,
+    WorkspaceId,
 };
 use vibex_desktop_model::{
     AgentSidebarRow, FileExplorerRow, TimelineConversationTurn, TimelineRow,
@@ -93,6 +94,7 @@ pub struct ApprovalSurfaceModel {
     pub details: Vec<(String, String)>,
     pub risk_category: PermissionRiskCategory,
     pub allowed_responses: Vec<PermissionResponseKind>,
+    pub response_options: Vec<PermissionResponseOption>,
     pub pending: bool,
     pub presentation: ApprovalPresentation,
     pub high_priority: bool,
@@ -130,6 +132,7 @@ impl ApprovalSurfaceModel {
                 .collect(),
             risk_category: request.risk_category,
             allowed_responses: request.allowed_responses.clone(),
+            response_options: request.response_options.clone(),
             pending: request.status == vibex_core::PermissionRequestStatus::Pending,
             presentation: if shell == ShellKind::Compact {
                 ApprovalPresentation::Sheet
@@ -331,6 +334,7 @@ mod tests {
                 PermissionResponseKind::Approve,
                 PermissionResponseKind::Deny,
             ],
+            response_options: Vec::new(),
             pending: true,
             presentation: ApprovalPresentation::Sheet,
             high_priority: true,
@@ -367,6 +371,7 @@ mod tests {
             details: vec![("secret label".into(), "secret value".into())],
             risk_category: PermissionRiskCategory::FileWrite,
             allowed_responses: vec![PermissionResponseKind::Approve],
+            response_options: Vec::new(),
             pending: true,
             presentation: ApprovalPresentation::ProminentCard,
             high_priority: true,
