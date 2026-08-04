@@ -11,9 +11,9 @@ use ::gpui::{
     HitboxBehavior, Image, ImageFormat, ImageSource, InspectorElementId, InteractiveElement as _,
     InteractiveText, IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point, Render, RenderImage, ScrollAnchor,
-    ScrollHandle, SharedString, StatefulInteractiveElement as _, StrikethroughStyle,
-    StyleRefinement, Styled as _, StyledImage as _, StyledText, Task, TextLayout, UnderlineStyle,
-    WeakEntity, Window, combine_highlights, div, img, point, px, size,
+    ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _,
+    StrikethroughStyle, StyleRefinement, Styled as _, StyledImage as _, StyledText, Task,
+    TextLayout, UnderlineStyle, WeakEntity, Window, combine_highlights, div, img, point, px, size,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use gpui_component::{
@@ -625,6 +625,7 @@ pub struct MarkdownViewState {
     live_nodes: BTreeSet<NodeId>,
     details_open: BTreeMap<NodeId, bool>,
     diagram_source: BTreeSet<NodeId>,
+    table_scrolls: BTreeMap<NodeId, ScrollHandle>,
     outline_open: bool,
     anchors: BTreeMap<NodeId, ScrollAnchor>,
     artifact_specs: Vec<ArtifactSpec>,
@@ -683,6 +684,7 @@ impl MarkdownViewState {
             live_nodes: BTreeSet::new(),
             details_open: BTreeMap::new(),
             diagram_source: BTreeSet::new(),
+            table_scrolls: BTreeMap::new(),
             outline_open: false,
             anchors: BTreeMap::new(),
             artifact_specs: Vec::new(),
@@ -817,6 +819,8 @@ impl MarkdownViewState {
         initialize_details(&self.document.blocks, &mut self.details_open);
         self.diagram_source
             .retain(|node_id| self.live_nodes.contains(node_id));
+        self.table_scrolls
+            .retain(|node_id, _| self.live_nodes.contains(node_id));
         self.artifact_states
             .retain(|node_id, _| self.live_nodes.contains(node_id));
         self.highlight_cache
@@ -2035,7 +2039,7 @@ impl MarkdownViewState {
                 alignments,
                 header,
                 rows,
-            } => self.render_table(alignments, header.as_ref(), rows, window, cx),
+            } => self.render_table(block.id, alignments, header.as_ref(), rows, window, cx),
             Block::ThematicBreak => div()
                 .w_full()
                 .h(px(1.0))
@@ -3148,16 +3152,39 @@ impl MarkdownViewState {
 
     fn render_table(
         &mut self,
+        node_id: NodeId,
         alignments: &[TableAlignment],
         header: Option<&crate::model::TableRow>,
         rows: &[crate::model::TableRow],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let table_scroll = self.table_scrolls.entry(node_id).or_default().clone();
+        let wheel_scroll = table_scroll.clone();
         let mut table = v_flex()
+            .id(format!("markdown-table:{}:{}", self.view_id, node_id.0))
             .w_full()
             .min_w_0()
-            .overflow_x_scrollbar()
+            .relative()
+            .track_scroll(&table_scroll)
+            .overflow_x_scroll()
+            .on_scroll_wheel(cx.listener(move |_, event: &ScrollWheelEvent, window, cx| {
+                let max_x = wheel_scroll.max_offset().x;
+                if max_x <= px(0.0) {
+                    return;
+                }
+                let delta = event.delta.pixel_delta(window.line_height());
+                if delta.y.abs() > delta.x.abs() {
+                    let offset = wheel_scroll.offset();
+                    // GPUI applies delta.x before bubble listeners run.
+                    let next_x = (offset.x - delta.x + delta.y).clamp(-max_x, px(0.0));
+                    if next_x != offset.x {
+                        wheel_scroll.set_offset(point(next_x, offset.y));
+                        cx.notify();
+                    }
+                }
+                cx.stop_propagation();
+            }))
             .rounded(px(6.0))
             .border_1()
             .border_color(cx.theme().border);
@@ -3167,7 +3194,7 @@ impl MarkdownViewState {
         for row in rows {
             table = table.child(self.render_table_row(row, alignments, false, window, cx));
         }
-        table.into_any_element()
+        table.horizontal_scrollbar(&table_scroll).into_any_element()
     }
 
     fn render_table_row(
@@ -3434,8 +3461,8 @@ mod tests {
     use std::rc::Rc;
 
     use ::gpui::{
-        InteractiveElement as _, Modifiers, MouseButton, StatefulInteractiveElement as _,
-        TestAppContext, VisualTestContext,
+        InteractiveElement as _, Modifiers, MouseButton, ScrollDelta,
+        StatefulInteractiveElement as _, TestAppContext, VisualTestContext,
     };
     use gpui_component::{ElementExt as _, Theme, ThemeMode};
 
@@ -3459,6 +3486,12 @@ mod tests {
         input: MarkdownInput,
         state: Entity<MarkdownViewState>,
         scroll: ScrollHandle,
+    }
+
+    struct MarkdownTableScrollProbe {
+        input: MarkdownInput,
+        state: Entity<MarkdownViewState>,
+        parent_scroll: ScrollHandle,
     }
 
     impl MarkdownSelectionProbe {
@@ -3510,6 +3543,26 @@ mod tests {
         }
     }
 
+    impl MarkdownTableScrollProbe {
+        fn new(input: MarkdownInput, cx: &mut Context<Self>) -> Self {
+            let document = Arc::new(parse_markdown(input.clone()));
+            let state = cx.new(|cx| {
+                MarkdownViewState::new(
+                    "table-scroll-probe".into(),
+                    input.clone(),
+                    Some(document),
+                    MarkdownViewOptions::default(),
+                    cx,
+                )
+            });
+            Self {
+                input,
+                state,
+                parent_scroll: ScrollHandle::new(),
+            }
+        }
+    }
+
     impl Render for MarkdownSelectionProbe {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let mut markdown = MarkdownView::new("selection-probe", self.input.clone());
@@ -3531,6 +3584,25 @@ mod tests {
                 .track_scroll(&self.scroll)
                 .overflow_y_scroll()
                 .child(markdown)
+        }
+    }
+
+    impl Render for MarkdownTableScrollProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let mut markdown = MarkdownView::new("table-scroll-probe", self.input.clone());
+            markdown.state = Some(self.state.clone());
+            div()
+                .id("markdown-table-parent-scroll")
+                .w(px(280.0))
+                .h(px(180.0))
+                .track_scroll(&self.parent_scroll)
+                .overflow_y_scroll()
+                .child(
+                    v_flex()
+                        .w_full()
+                        .child(markdown)
+                        .child(div().h(px(800.0)).flex_none()),
+                )
         }
     }
 
@@ -3712,6 +3784,72 @@ mod tests {
         });
         assert!(second_range.start > first_range.start);
         assert!(second_range.len() < block_count / 4);
+    }
+
+    #[::gpui::test]
+    fn overflowing_table_maps_vertical_wheel_to_horizontal_without_scrolling_parent(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let input = MarkdownInput::new(
+            "| First | Second | Third | Fourth |\n| --- | --- | --- | --- |\n| Alpha | Beta | Gamma | Delta |",
+            "",
+            1,
+        );
+        let (probe, cx) = cx.add_window_view(|_, cx| MarkdownTableScrollProbe::new(input, cx));
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let (table_scroll, event_position, parent_scroll) = probe.read_with(cx, |probe, cx| {
+            let state = probe.state.read(cx);
+            let table_scroll = state
+                .table_scrolls
+                .iter()
+                .next()
+                .map(|(_, scroll)| scroll)
+                .expect("table scroll handle should be registered");
+            let header_position = state
+                .selection_segments
+                .values()
+                .find(|segment| {
+                    state.selection_text.get(segment.text_range.clone()) == Some("First")
+                })
+                .map(|segment| segment.bounds.center())
+                .expect("table header should be laid out");
+            (
+                table_scroll.clone(),
+                header_position,
+                probe.parent_scroll.clone(),
+            )
+        });
+        assert!(table_scroll.max_offset().x > px(0.0));
+        assert!(parent_scroll.max_offset().y > px(0.0));
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: event_position,
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+            modifiers: Default::default(),
+            touch_phase: ::gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+
+        assert!(table_scroll.offset().x < px(0.0));
+        assert_eq!(parent_scroll.offset().y, px(0.0));
+
+        table_scroll.set_offset(point(-table_scroll.max_offset().x, px(0.0)));
+        cx.simulate_event(ScrollWheelEvent {
+            position: event_position,
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+            modifiers: Default::default(),
+            touch_phase: ::gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+
+        assert_eq!(table_scroll.offset().x, -table_scroll.max_offset().x);
+        assert_eq!(parent_scroll.offset().y, px(0.0));
     }
 
     #[::gpui::test]

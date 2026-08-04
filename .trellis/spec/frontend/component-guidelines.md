@@ -215,6 +215,22 @@ Mobile/Web previews should stay lightweight: read-only rendering, diff review,
 history inspection, and explicit "ask Agent to modify" flows are preferred over
 large embedded editors.
 
+### Markdown Table Scrolling
+
+When a Markdown table is wider than its viewport, keep a persistent
+`ScrollHandle` for that table node and attach the overflow container and visible
+horizontal scrollbar to the same handle. A predominantly vertical wheel gesture
+over the table must move that handle horizontally and stop propagation while
+the table has horizontal overflow, including at either horizontal edge. This
+prevents the table and its scrollable page or timeline ancestor from moving at
+the same time. If the table has no horizontal overflow, leave the event
+unconsumed so normal page scrolling still works.
+
+Cover this behavior with a real GPUI layout test: place a wide table inside a
+parent with a non-zero vertical scroll range, dispatch a vertical
+`ScrollWheelEvent` over a laid-out table cell, then assert that the table's x
+offset changed and the parent's y offset remained zero.
+
 ### Empty States
 
 Empty-state cards rendered inside right rails, preview tabs, file panels, Git
