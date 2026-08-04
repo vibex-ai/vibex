@@ -21042,14 +21042,8 @@ impl VibexWorkbench {
             .max_h(px(320.0))
             .border_t_1()
             .border_color(cx.theme().border.opacity(0.72))
-            .overflow_y_scrollbar()
-            .child(
-                v_flex()
-                    .w_full()
-                    .min_w_0()
-                    .overflow_x_scrollbar()
-                    .children(rows),
-            )
+            .overflow_scrollbar()
+            .children(rows)
             .into_any_element()
     }
 
@@ -35773,6 +35767,20 @@ mod tests {
             1
         );
         assert_eq!(bounded.lines.len(), AGENT_FILE_DIFF_MAX_CHANGED_LINES + 1);
+    }
+
+    #[test]
+    fn agent_file_diff_preview_uses_one_scroll_area_for_both_axes() {
+        let source = include_str!("app.rs");
+        let renderer = source
+            .split_once("    fn render_agent_file_diff_preview(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_image_generation_card("))
+            .map(|(body, _)| body)
+            .expect("agent file diff renderer should remain inspectable");
+
+        assert!(renderer.contains(".overflow_scrollbar()"));
+        assert!(!renderer.contains(".overflow_x_scrollbar()"));
+        assert!(!renderer.contains(".overflow_y_scrollbar()"));
     }
 
     #[test]
