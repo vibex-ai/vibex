@@ -4904,7 +4904,8 @@ impl ManagementCenter {
         }
         for agent in added_agents {
             let id = agent.id.as_str().to_string();
-            let select_id = id.clone();
+            let row_select_id = id.clone();
+            let button_select_id = id.clone();
             let toggle_id = id.clone();
             let remove_id = id.clone();
             let probe_id = id.clone();
@@ -4948,8 +4949,10 @@ impl ManagementCenter {
                 .count();
             agent_rows = agent_rows.child(
                 v_flex()
+                    .id(SharedString::from(format!("management-agent-row-{id}")))
                     .w_full()
                     .gap_1()
+                    .cursor_pointer()
                     .rounded(px(16.0))
                     .border_1()
                     .border_color(if selected {
@@ -4964,6 +4967,12 @@ impl ManagementCenter {
                     })
                     .px_2()
                     .py_2()
+                    .when(!selected, |row| {
+                        row.hover(|style| style.bg(cx.theme().accent.opacity(0.18)))
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_management_agent(row_select_id.clone(), cx);
+                    }))
                     .child(
                         h_flex()
                             .w_full()
@@ -4978,7 +4987,7 @@ impl ManagementCenter {
                             ))
                             .child(
                                 Button::new(SharedString::from(format!(
-                                    "management-agent-select-{select_id}"
+                                    "management-agent-select-{button_select_id}"
                                 )))
                                 .small()
                                 .ghost()
@@ -4992,7 +5001,8 @@ impl ManagementCenter {
                                 .child(div().flex_1())
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
-                                        this.select_management_agent(select_id.clone(), cx);
+                                        cx.stop_propagation();
+                                        this.select_management_agent(button_select_id.clone(), cx);
                                     },
                                 )),
                             )
@@ -5012,6 +5022,7 @@ impl ManagementCenter {
                                     ))
                                     .disabled(pending)
                                     .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
                                         this.probe_agent(probe_id.clone(), cx)
                                     })),
                                 )
@@ -5026,6 +5037,7 @@ impl ManagementCenter {
                                     .disabled(pending)
                                     .tooltip(management_agent_toggle_selector_label())
                                     .on_click(cx.listener(move |this, checked, _, cx| {
+                                        cx.stop_propagation();
                                         this.toggle_agent(toggle_id.clone(), *checked, cx)
                                     })),
                                 )
@@ -5042,6 +5054,7 @@ impl ManagementCenter {
                                 .disabled(pending)
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
+                                        cx.stop_propagation();
                                         this.set_agent_added(remove_id.clone(), false, cx)
                                     },
                                 )),
@@ -5182,9 +5195,10 @@ impl ManagementCenter {
             .child(management_search_input(&self.agent_search, cx))
             .child(
                 div()
+                    .id("management-agent-list-scroll")
                     .min_h_0()
                     .flex_1()
-                    .overflow_y_scrollbar()
+                    .overflow_y_scroll()
                     .pr_1()
                     .child(
                         v_flex()
@@ -12852,6 +12866,22 @@ mod tests {
         assert!(!duplicate.contains(".refresh_agent("));
         assert!(!save.contains(".refresh_agent("));
         assert!(!acp.contains(".refresh_agent("));
+    }
+
+    #[test]
+    fn agent_sidebar_keeps_hidden_scrollbars_and_full_row_selection() {
+        let source = include_str!("management.rs");
+        let render_agents = source
+            .split_once("    fn render_agents(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_mcp_sidebar("))
+            .map(|(body, _)| body)
+            .expect("Agent sidebar renderer should remain inspectable");
+
+        assert!(render_agents.contains(".id(\"management-agent-list-scroll\")"));
+        assert!(!render_agents.contains(".overflow_y_scrollbar()"));
+        assert!(render_agents.contains("management-agent-row-{id}"));
+        assert!(render_agents.contains("this.select_management_agent(row_select_id.clone(), cx);"));
+        assert!(render_agents.matches("cx.stop_propagation();").count() >= 4);
     }
 
     #[test]
