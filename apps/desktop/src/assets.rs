@@ -370,6 +370,42 @@ const FILE_INTEGRATION_ASSETS: &[(&str, &[u8])] = &[
     bundled_icon_asset!("open-tools/zed.svg"),
 ];
 
+const AGENT_BRAND_ASSETS: &[(&str, &[u8])] = &[
+    bundled_icon_asset!("agents/agoragentic-acp.svg"),
+    bundled_icon_asset!("agents/amp-acp.svg"),
+    bundled_icon_asset!("agents/auggie.svg"),
+    bundled_icon_asset!("agents/autohand.svg"),
+    bundled_icon_asset!("agents/cline.svg"),
+    bundled_icon_asset!("agents/codebuddy-code.svg"),
+    bundled_icon_asset!("agents/codewhale.svg"),
+    bundled_icon_asset!("agents/cortex-code.svg"),
+    bundled_icon_asset!("agents/corust-agent.svg"),
+    bundled_icon_asset!("agents/crow-cli.svg"),
+    bundled_icon_asset!("agents/cursor.svg"),
+    bundled_icon_asset!("agents/deepagents.svg"),
+    bundled_icon_asset!("agents/devin.svg"),
+    bundled_icon_asset!("agents/dimcode.svg"),
+    bundled_icon_asset!("agents/dirac.svg"),
+    bundled_icon_asset!("agents/factory-droid.svg"),
+    bundled_icon_asset!("agents/fast-agent.svg"),
+    bundled_icon_asset!("agents/glm-acp-agent.svg"),
+    bundled_icon_asset!("agents/goose.svg"),
+    bundled_icon_asset!("agents/grok.svg"),
+    bundled_icon_asset!("agents/hermes.png"),
+    bundled_icon_asset!("agents/junie.svg"),
+    bundled_icon_asset!("agents/kilo.svg"),
+    bundled_icon_asset!("agents/kimi.svg"),
+    bundled_icon_asset!("agents/kiro.svg"),
+    bundled_icon_asset!("agents/minion-code.svg"),
+    bundled_icon_asset!("agents/mistral-vibe.svg"),
+    bundled_icon_asset!("agents/nova.svg"),
+    bundled_icon_asset!("agents/poolside.svg"),
+    bundled_icon_asset!("agents/qoder.svg"),
+    bundled_icon_asset!("agents/sigit.svg"),
+    bundled_icon_asset!("agents/stakpak.svg"),
+    bundled_icon_asset!("agents/vtcode.svg"),
+];
+
 pub struct VibexAssets;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -379,6 +415,112 @@ pub(crate) struct AgentBrandAsset {
 }
 
 type BrandAsset = AgentBrandAsset;
+
+const fn colored_agent_asset(path: &'static str) -> BrandAsset {
+    BrandAsset {
+        path,
+        uses_current_color: false,
+    }
+}
+
+const CATALOG_AGENT_BRANDS: &[(&str, BrandAsset)] = &[
+    (
+        "agoragentic-acp",
+        colored_agent_asset("icons/vibex/agents/agoragentic-acp.svg"),
+    ),
+    (
+        "glm-acp-agent",
+        colored_agent_asset("icons/vibex/agents/glm-acp-agent.svg"),
+    ),
+    (
+        "codebuddy-code",
+        colored_agent_asset("icons/vibex/agents/codebuddy-code.svg"),
+    ),
+    (
+        "factory-droid",
+        colored_agent_asset("icons/vibex/agents/factory-droid.svg"),
+    ),
+    (
+        "mistral-vibe",
+        colored_agent_asset("icons/vibex/agents/mistral-vibe.svg"),
+    ),
+    (
+        "minion-code",
+        colored_agent_asset("icons/vibex/agents/minion-code.svg"),
+    ),
+    (
+        "cortex-code",
+        colored_agent_asset("icons/vibex/agents/cortex-code.svg"),
+    ),
+    (
+        "corust-agent",
+        colored_agent_asset("icons/vibex/agents/corust-agent.svg"),
+    ),
+    (
+        "amp-acp",
+        colored_agent_asset("icons/vibex/agents/amp-acp.svg"),
+    ),
+    (
+        "auggie",
+        colored_agent_asset("icons/vibex/agents/auggie.svg"),
+    ),
+    (
+        "autohand",
+        colored_agent_asset("icons/vibex/agents/autohand.svg"),
+    ),
+    ("cline", colored_agent_asset("icons/vibex/agents/cline.svg")),
+    (
+        "codewhale",
+        colored_agent_asset("icons/vibex/agents/codewhale.svg"),
+    ),
+    (
+        "crow-cli",
+        colored_agent_asset("icons/vibex/agents/crow-cli.svg"),
+    ),
+    (
+        "cursor",
+        colored_agent_asset("icons/vibex/agents/cursor.svg"),
+    ),
+    (
+        "deepagents",
+        colored_agent_asset("icons/vibex/agents/deepagents.svg"),
+    ),
+    ("devin", colored_agent_asset("icons/vibex/agents/devin.svg")),
+    (
+        "dimcode",
+        colored_agent_asset("icons/vibex/agents/dimcode.svg"),
+    ),
+    ("dirac", colored_agent_asset("icons/vibex/agents/dirac.svg")),
+    (
+        "fast-agent",
+        colored_agent_asset("icons/vibex/agents/fast-agent.svg"),
+    ),
+    ("goose", colored_agent_asset("icons/vibex/agents/goose.svg")),
+    ("grok", colored_agent_asset("icons/vibex/agents/grok.svg")),
+    (
+        "hermes",
+        colored_agent_asset("icons/vibex/agents/hermes.png"),
+    ),
+    ("junie", colored_agent_asset("icons/vibex/agents/junie.svg")),
+    ("kilo", colored_agent_asset("icons/vibex/agents/kilo.svg")),
+    ("kiro", colored_agent_asset("icons/vibex/agents/kiro.svg")),
+    ("kimi", colored_agent_asset("icons/vibex/agents/kimi.svg")),
+    ("nova", colored_agent_asset("icons/vibex/agents/nova.svg")),
+    (
+        "poolside",
+        colored_agent_asset("icons/vibex/agents/poolside.svg"),
+    ),
+    ("qoder", colored_agent_asset("icons/vibex/agents/qoder.svg")),
+    ("sigit", colored_agent_asset("icons/vibex/agents/sigit.svg")),
+    (
+        "stakpak",
+        colored_agent_asset("icons/vibex/agents/stakpak.svg"),
+    ),
+    (
+        "vtcode",
+        colored_agent_asset("icons/vibex/agents/vtcode.svg"),
+    ),
+];
 
 pub(crate) fn agent_brand_asset(identity: &str) -> Option<BrandAsset> {
     let identity = identity.to_ascii_lowercase();
@@ -419,7 +561,9 @@ pub(crate) fn agent_brand_asset(identity: &str) -> Option<BrandAsset> {
             uses_current_color: true,
         }
     } else {
-        return None;
+        return CATALOG_AGENT_BRANDS
+            .iter()
+            .find_map(|(needle, asset)| identity.contains(needle).then_some(*asset));
     };
     Some(asset)
 }
@@ -576,6 +720,7 @@ impl AssetSource for VibexAssets {
         if let Some((_, bytes)) = VIBEX_ASSETS
             .iter()
             .chain(FILE_INTEGRATION_ASSETS.iter())
+            .chain(AGENT_BRAND_ASSETS.iter())
             .find(|(asset_path, _)| *asset_path == path)
         {
             return Ok(Some(Cow::Borrowed(bytes)));
@@ -589,6 +734,7 @@ impl AssetSource for VibexAssets {
             VIBEX_ASSETS
                 .iter()
                 .chain(FILE_INTEGRATION_ASSETS.iter())
+                .chain(AGENT_BRAND_ASSETS.iter())
                 .filter(|(asset_path, _)| asset_path.starts_with(path))
                 .map(|(asset_path, _)| SharedString::from(*asset_path)),
         );
@@ -639,7 +785,15 @@ mod tests {
 
     #[test]
     fn multicolor_agent_brands_use_polychrome_image_elements() {
-        for identity in ["Claude Code", "Google Gemini", "OpenCode", "Qwen Code"] {
+        for identity in [
+            "Claude Code",
+            "Google Gemini",
+            "OpenCode",
+            "Qwen Code",
+            "Cline",
+            "Devin CLI",
+            "Kiro CLI",
+        ] {
             let mut icon = agent_brand_icon(identity, gpui::px(16.0), None);
             assert!(
                 icon.downcast_mut::<gpui::Img>().is_some(),
@@ -652,6 +806,31 @@ mod tests {
     fn agent_brand_logo_is_optional_for_text_fallbacks() {
         assert!(agent_brand_logo("OpenCode", gpui::px(16.0), None).is_some());
         assert!(agent_brand_logo("custom acp", gpui::px(16.0), None).is_none());
+    }
+
+    #[test]
+    fn every_catalog_agent_has_a_loadable_polychrome_brand_asset() {
+        let assets = VibexAssets;
+
+        for entry in vibex_core::acp_agent_catalog_entries() {
+            let asset = agent_brand_asset(entry.id)
+                .unwrap_or_else(|| panic!("{} is missing a brand asset", entry.id));
+            assert!(
+                assets.load(asset.path).unwrap().is_some(),
+                "{} points to an unregistered brand asset: {}",
+                entry.id,
+                asset.path
+            );
+
+            if entry.id != "copilot" {
+                let mut icon = agent_brand_icon(entry.id, gpui::px(16.0), None);
+                assert!(
+                    icon.downcast_mut::<gpui::Img>().is_some(),
+                    "{} must use the polychrome image renderer",
+                    entry.id
+                );
+            }
+        }
     }
 
     #[test]

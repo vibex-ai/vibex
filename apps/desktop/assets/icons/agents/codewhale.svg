@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <rect width="100" height="100" rx="22" fill="#136DEC"/>
+  <svg x="14" y="14" width="72" height="72" viewBox="0 0 32 32">
+  <rect width="32" height="32" fill="#FFFFFF" opacity="0.18"/>
+  <text x="50%" y="55%" text-anchor="middle" dominant-baseline="middle" font-family="'Noto Serif SC', serif" font-weight="700" font-size="20" fill="#FFFFFF">深</text>
+  <rect x="0" y="29" width="32" height="3" fill="#FFFFFF"/>
+</svg>
+</svg>
