@@ -11,7 +11,8 @@ use std::sync::Arc;
 use gpui::{
     AccessibleAction, AnyElement, AnyWindowHandle, App, Context, DragMoveEvent, Empty, Entity,
     EventEmitter, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Orientation, Render,
-    Role, SharedString, Subscription, Task, Window, div, prelude::*, px,
+    Role, SharedString, StatefulInteractiveElement as _, Subscription, Task, Window, div,
+    prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
@@ -5118,10 +5119,11 @@ impl ManagementCenter {
                         .child(management_search_input(&self.catalog_search, cx))
                         .child(
                             div()
+                                .id("management-agent-catalog-scroll")
                                 .min_h_0()
                                 .flex_1()
                                 .mt_2()
-                                .overflow_y_scrollbar()
+                                .overflow_y_scroll()
                                 .child(catalog_rows),
                         ),
                 )
