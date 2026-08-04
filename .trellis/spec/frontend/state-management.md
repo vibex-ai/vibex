@@ -700,6 +700,10 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   display turn. Later Agent/Provider output starts a continuation turn even
   when the provider used a hidden prompt and no new `user_message` exists.
   Permission resolutions remove their request id from the turn's pending set.
+  Project each permission row's pending state from its own request id and the
+  matching resolution, independently of the turn-level pending flag. The turn
+  flag answers whether any request still blocks the turn; it must not keep an
+  already resolved card actionable while a sibling request remains pending.
 - Timeline rows carry stable turn metadata (`turnId`, item count, failed,
   pending-permission, and conclusion) so virtual cards can expose conclusion
   and failure state without reparsing the full transcript in the renderer.
@@ -1016,6 +1020,9 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   delta/final reconciliation, attribution/event fences, process compaction,
   sequence-gap refetch, collapsed search, follow-bottom/unread, 5,000 rows, and
   bounded streamed-row aggregation.
+- Multiple permission requests in one turn resolve independently: after the
+  first resolution, its row is non-pending while an unresolved sibling and the
+  turn-level pending flag remain pending.
 - Delta-only idle-turn regression tests include hidden system notices, a short
   User message, no final Agent message, and assert both the User row and merged
   fallback conclusion remain visible in the Turn projection.

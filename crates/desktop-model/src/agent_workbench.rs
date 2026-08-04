@@ -776,6 +776,15 @@ pub fn timeline_rows(items: &[TimelineItem]) -> Vec<TimelineRow> {
 }
 
 fn timeline_rows_from_refs(items: &[&TimelineItem]) -> Vec<TimelineRow> {
+    let resolved_permission_ids = items
+        .iter()
+        .filter_map(|item| match &item.payload {
+            TimelinePayload::PermissionResolution(resolution) => {
+                Some(resolution.request_id.as_str())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
     let mut rows = Vec::<TimelineRow>::new();
     for item in items.iter().copied() {
         let correlation = item
@@ -1020,7 +1029,8 @@ fn timeline_rows_from_refs(items: &[&TimelineItem]) -> Vec<TimelineRow> {
                     false,
                     true,
                 );
-                row.pending_permission = request.status == PermissionRequestStatus::Pending;
+                row.pending_permission = request.status == PermissionRequestStatus::Pending
+                    && !resolved_permission_ids.contains(request.id.as_str());
                 rows.push(row);
             }
             TimelinePayload::PermissionResolution(resolution) => rows.push(simple_row(
@@ -2374,6 +2384,68 @@ mod tests {
     }
 
     #[test]
+    fn permission_rows_resolve_independently_within_one_turn() {
+        let session_id = VibexSessionId::parse("session_current").unwrap();
+        let first_request_id = vibex_core::RequestId::parse("request_first").unwrap();
+        let second_request_id = vibex_core::RequestId::parse("request_second").unwrap();
+        let permission_request = |id: vibex_core::RequestId, requested_at_ms| {
+            TimelinePayload::PermissionRequest(vibex_core::PermissionRequest {
+                id,
+                session_id: session_id.clone(),
+                project_id: None,
+                workspace_id: None,
+                provider_request_id: None,
+                risk_category: vibex_core::PermissionRiskCategory::Command,
+                title: "Run command?".into(),
+                details: Vec::new(),
+                allowed_responses: vec![
+                    vibex_core::PermissionResponseKind::Approve,
+                    vibex_core::PermissionResponseKind::Deny,
+                ],
+                response_options: Vec::new(),
+                status: PermissionRequestStatus::Pending,
+                requested_at_ms,
+                expires_at_ms: None,
+            })
+        };
+        let rows = timeline_rows(&[
+            item(
+                1,
+                None,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "run both".into(),
+                    attachments: Vec::new(),
+                }),
+            ),
+            item(2, None, permission_request(first_request_id.clone(), 2)),
+            item(3, None, permission_request(second_request_id, 3)),
+            item(
+                4,
+                None,
+                TimelinePayload::PermissionResolution(vibex_core::PermissionResolution {
+                    request_id: first_request_id,
+                    session_id,
+                    response: vibex_core::PermissionResponseKind::Approve,
+                    responder_device_id: None,
+                    provider_resolution_id: None,
+                    note: None,
+                    resolved_at_ms: 4,
+                }),
+            ),
+        ]);
+        let permission_rows = rows
+            .iter()
+            .filter(|row| row.kind == TimelineRowKind::PermissionRequest)
+            .collect::<Vec<_>>();
+
+        assert_eq!(permission_rows.len(), 2);
+        assert!(!permission_rows[0].pending_permission);
+        assert!(permission_rows[0].turn_pending_permission);
+        assert!(permission_rows[1].pending_permission);
+        assert!(permission_rows[1].turn_pending_permission);
+    }
+
+    #[test]
     fn every_canonical_timeline_kind_has_a_product_row_projection() {
         let payloads = serde_json::from_str::<Vec<serde_json::Value>>(include_str!(
             "../tests/fixtures/agent-timeline-kinds-v1.json"
@@ -2404,7 +2476,9 @@ mod tests {
         let rows = timeline_rows(&items);
         assert_eq!(rows.len(), 16);
         assert_eq!(rows.iter().map(|row| row.item_ids.len()).sum::<usize>(), 17);
-        assert!(rows.iter().any(|row| row.kind == TimelineRowKind::PermissionRequest && row.pending_permission));
+        assert!(rows.iter().any(|row| {
+            row.kind == TimelineRowKind::PermissionRequest && !row.pending_permission
+        }));
         assert!(
             rows.iter()
                 .any(|row| row.kind == TimelineRowKind::Error && row.failed)

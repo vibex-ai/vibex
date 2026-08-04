@@ -24973,9 +24973,7 @@ fn permission_request_is_pending(
     row: &TimelineRow,
     request: &vibex_core::PermissionRequest,
 ) -> bool {
-    row.pending_permission
-        && row.turn_pending_permission
-        && request.status == vibex_core::PermissionRequestStatus::Pending
+    row.pending_permission && request.status == vibex_core::PermissionRequestStatus::Pending
 }
 
 fn permission_request_status_label(
