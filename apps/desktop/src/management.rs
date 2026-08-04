@@ -4905,7 +4905,7 @@ impl ManagementCenter {
         for agent in added_agents {
             let id = agent.id.as_str().to_string();
             let row_select_id = id.clone();
-            let button_select_id = id.clone();
+            let keyboard_select_id = id.clone();
             let toggle_id = id.clone();
             let remove_id = id.clone();
             let probe_id = id.clone();
@@ -4950,6 +4950,10 @@ impl ManagementCenter {
             agent_rows = agent_rows.child(
                 v_flex()
                     .id(SharedString::from(format!("management-agent-row-{id}")))
+                    .role(Role::Button)
+                    .aria_label(agent.label.clone())
+                    .focusable()
+                    .tab_index(0)
                     .w_full()
                     .gap_1()
                     .cursor_pointer()
@@ -4973,6 +4977,12 @@ impl ManagementCenter {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.select_management_agent(row_select_id.clone(), cx);
                     }))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if event.keystroke.key == "enter" || event.keystroke.key == "space" {
+                            this.select_management_agent(keyboard_select_id.clone(), cx);
+                            cx.stop_propagation();
+                        }
+                    }))
                     .child(
                         h_flex()
                             .w_full()
@@ -4986,25 +4996,21 @@ impl ManagementCenter {
                                 cx,
                             ))
                             .child(
-                                Button::new(SharedString::from(format!(
-                                    "management-agent-select-{button_select_id}"
-                                )))
-                                .small()
-                                .ghost()
-                                .flex_1()
-                                .min_w_0()
-                                .h(px(28.0))
-                                .justify_start()
-                                .px_1()
-                                .label(agent.label.clone())
-                                .child(status_indicator)
-                                .child(div().flex_1())
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.select_management_agent(button_select_id.clone(), cx);
-                                    },
-                                )),
+                                h_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h(px(28.0))
+                                    .px_1()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_sm()
+                                            .font_medium()
+                                            .child(agent.label.clone()),
+                                    )
+                                    .child(status_indicator)
+                                    .child(div().flex_1()),
                             )
                             .when(show_install_prompt, |actions| {
                                 actions.child(
@@ -12881,6 +12887,7 @@ mod tests {
         assert!(!render_agents.contains(".overflow_y_scrollbar()"));
         assert!(render_agents.contains("management-agent-row-{id}"));
         assert!(render_agents.contains("this.select_management_agent(row_select_id.clone(), cx);"));
+        assert!(!render_agents.contains("management-agent-select-"));
         assert!(render_agents.matches("cx.stop_propagation();").count() >= 4);
     }
 
