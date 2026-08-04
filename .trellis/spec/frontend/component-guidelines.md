@@ -243,11 +243,20 @@ bounded size, use GPUI overflow on that node, and attach both-axis scrollbars to
 the same handle. Content-sized descendants inside an ancestor with only a
 maximum height are not sufficient evidence that vertical wheel scrolling works.
 
+When that diff viewport is nested inside a scrollable timeline, attach an
+`on_scroll_wheel` handler to the same stateful node and call
+`cx.stop_propagation()` unconditionally. GPUI applies the viewport's overflow
+scroll before bubble listeners run, so the diff still moves while the timeline
+does not. Leaving the event unconsumed makes both scroll handles move; consuming
+it only when the diff is away from an edge introduces unwanted scroll chaining
+at the first or last row.
+
 Cover both axes with a real GPUI layout test: render content taller and wider
-than the viewport, dispatch vertical and horizontal `ScrollWheelEvent` values
-inside it, and assert the handle offsets (plus a late row's changed bounds for
-the vertical path). Compile-only checks and source-string assertions do not
-exercise GPUI layout or wheel routing.
+than the viewport inside a parent with a non-zero scroll range, dispatch
+vertical and horizontal `ScrollWheelEvent` values inside the diff, and assert
+the diff handle offsets, the parent offset remaining zero, and a late row's
+changed bounds for the vertical path. Compile-only checks and source-string
+assertions do not exercise GPUI layout, wheel routing, or event propagation.
 
 ### File Tree Icons
 

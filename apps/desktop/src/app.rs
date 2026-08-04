@@ -24764,6 +24764,7 @@ fn render_agent_file_diff_scroll_area(
                         .relative()
                         .track_scroll(scroll)
                         .overflow_scroll()
+                        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                         .children(rows)
                         .scrollbar(scroll, ScrollbarAxis::Both),
                 ),
@@ -31472,6 +31473,7 @@ mod tests {
 
     struct AgentFileDiffScrollProbe {
         scroll: gpui::ScrollHandle,
+        parent_scroll: gpui::ScrollHandle,
     }
 
     impl Render for AgentFileDiffScrollProbe {
@@ -31488,7 +31490,18 @@ mod tests {
                         .into_any_element()
                 })
                 .collect();
-            render_agent_file_diff_scroll_area(rows, &self.scroll, cx)
+            div()
+                .id("agent-file-diff-parent-scroll-area")
+                .w(px(640.0))
+                .h(px(360.0))
+                .track_scroll(&self.parent_scroll)
+                .overflow_scroll()
+                .child(
+                    v_flex()
+                        .flex_none()
+                        .child(render_agent_file_diff_scroll_area(rows, &self.scroll, cx))
+                        .child(div().h(px(800.0)).flex_none()),
+                )
         }
     }
 
@@ -36253,16 +36266,22 @@ mod tests {
     }
 
     #[gpui::test]
-    fn agent_file_diff_preview_scrolls_past_its_height_cap(cx: &mut TestAppContext) {
+    fn agent_file_diff_preview_scrolls_without_moving_parent(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
         let scroll = gpui::ScrollHandle::new();
         let observed_scroll = scroll.clone();
-        let (_, cx) = cx.add_window_view(|_, _| AgentFileDiffScrollProbe { scroll });
+        let parent_scroll = gpui::ScrollHandle::new();
+        let observed_parent_scroll = parent_scroll.clone();
+        let (_, cx) = cx.add_window_view(|_, _| AgentFileDiffScrollProbe {
+            scroll,
+            parent_scroll,
+        });
 
         cx.run_until_parked();
         cx.update(|window, cx| {
             let _ = window.draw(cx);
         });
+        assert!(observed_parent_scroll.max_offset().y > px(0.0));
         let initial_y = cx
             .debug_bounds("agent-file-diff-last-row")
             .expect("last diff row should be laid out")
@@ -36290,6 +36309,7 @@ mod tests {
             "initial: {initial_y:?}, scrolled: {scrolled_y:?}"
         );
         assert!(observed_scroll.offset().y < px(0.0));
+        assert_eq!(observed_parent_scroll.offset().y, px(0.0));
 
         cx.simulate_event(ScrollWheelEvent {
             position: point(px(20.0), px(20.0)),
