@@ -62,6 +62,7 @@ pub fn map_stream_event(
                         AgentMessageDeltaPayload {
                             text_delta: text.to_string(),
                             chunk_index: *chunk_index,
+                            phase: None,
                         },
                     ));
                     *chunk_index = (*chunk_index).saturating_add(1);

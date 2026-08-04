@@ -60,17 +60,17 @@ use vibex_config_switch::skills::LocalSkillScanRequest;
 use vibex_core::{
     AgentCommandDiscoverRequest, AgentCommandDiscoverResponse, AgentCommandEntry,
     AgentCommandExecuteRequest, AgentCommandExecutionBehavior, AgentCommandSelectionBehavior,
-    AgentCommandSourceKind, AgentCommandTrigger, AgentId, AgentListRequest, AgentSession,
-    AgentSessionRuntimeSelectionState, AgentSessionState, AgentSnapshotEntry, AgentTokenUsage,
-    AttachRuntimeRequest, CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest,
-    CreateAgentSessionRequest, DetachRuntimeRequest, ExternalSessionImportCandidateStatus,
-    ExternalSessionImportRequest, FetchTimelineRequest, FileEntryKind, FileTreeRequest,
-    ForkAgentSessionRequest, GetMessageSubmissionRequest, GitProjectEligibilityState,
-    GitProjectIneligibleReason, GitWorktreeAssistanceSessionRequest, GitWorktreeConflictKind,
-    GitWorktreeOperationRecord, GitWorktreeOperationStatus, MessageAttachment,
-    MessageSubmissionState, MessageSubmissionStatus, OpenWorkspaceRequest, PermissionResolution,
-    PermissionResponseKind, PlanStepStatus, ProjectId, ProjectRecord, PromptId,
-    ProviderBindingMetadata, ProviderKind, ProviderProfileId, ProviderProfileStatus,
+    AgentCommandSourceKind, AgentCommandTrigger, AgentId, AgentListRequest, AgentMessagePhase,
+    AgentSession, AgentSessionRuntimeSelectionState, AgentSessionState, AgentSnapshotEntry,
+    AgentTokenUsage, AttachRuntimeRequest, CancelAgentSessionRuntimeSwitchRequest,
+    ContinueAgentTurnRequest, CreateAgentSessionRequest, DetachRuntimeRequest,
+    ExternalSessionImportCandidateStatus, ExternalSessionImportRequest, FetchTimelineRequest,
+    FileEntryKind, FileTreeRequest, ForkAgentSessionRequest, GetMessageSubmissionRequest,
+    GitProjectEligibilityState, GitProjectIneligibleReason, GitWorktreeAssistanceSessionRequest,
+    GitWorktreeConflictKind, GitWorktreeOperationRecord, GitWorktreeOperationStatus,
+    MessageAttachment, MessageSubmissionState, MessageSubmissionStatus, OpenWorkspaceRequest,
+    PermissionResolution, PermissionResponseKind, PlanStepStatus, ProjectId, ProjectRecord,
+    PromptId, ProviderBindingMetadata, ProviderKind, ProviderProfileId, ProviderProfileStatus,
     ProviderProfileSummary, RenameAgentSessionRequest, RequestId, ResolvePermissionRequest,
     RightRailPlugin, RightRailPluginCreateRequest, RightRailPluginDeleteRequest, RightRailPluginId,
     RightRailPluginKind, RightRailPluginReorderRequest, RightRailPluginStatus,
@@ -2155,7 +2155,9 @@ fn agent_streaming_delta_updates(
         let TimelinePayload::AgentMessageDelta(delta) = &event.item.payload else {
             return None;
         };
-        if delta.text_delta.contains("Reconnecting... ") {
+        if delta.phase != Some(AgentMessagePhase::FinalAnswer)
+            || delta.text_delta.contains("Reconnecting... ")
+        {
             return None;
         }
         updates.push(AgentStreamingDeltaUpdate {
@@ -30741,6 +30743,7 @@ mod tests {
                 TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
                     text_delta: "stream".into(),
                     chunk_index: 0,
+                    phase: Some(AgentMessagePhase::FinalAnswer),
                 }),
             ),
         ];
@@ -30749,6 +30752,28 @@ mod tests {
         let turns =
             timeline_conversation_turns(&timeline.items, Some(AgentSessionState::Running), false);
         (timeline, Rc::new(turns.into_iter().map(Rc::new).collect()))
+    }
+
+    #[test]
+    fn commentary_delta_does_not_enter_the_conclusion_fast_path() {
+        let session_id = VibexSessionId::parse("session_commentary_delta").unwrap();
+        let item = timeline_item_with_payload(
+            &session_id,
+            1,
+            TimelineSource::Agent,
+            TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                text_delta: "I am checking the final state.".into(),
+                chunk_index: 0,
+                phase: Some(AgentMessagePhase::Commentary),
+            }),
+        );
+        let event = TimelineLiveEvent {
+            session_id,
+            sequence: 1,
+            item,
+        };
+
+        assert!(agent_streaming_delta_updates(&[event]).is_none());
     }
 
     #[test]
@@ -30773,6 +30798,7 @@ mod tests {
             TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
                 text_delta: "ing".into(),
                 chunk_index: 1,
+                phase: Some(AgentMessagePhase::FinalAnswer),
             }),
         );
         assert!(timeline.apply_live(TimelineLiveEvent {

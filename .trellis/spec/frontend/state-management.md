@@ -203,21 +203,28 @@ render_agent_thinking_indicator(&agent_progress_label(label), cx)
 
 ## Scenario: Stream The Conclusion After Collapsing Process Activity
 
-- While a turn is running without Agent text at its tail, process activity is
-  expanded by default. When the current tail becomes an `AgentMessageDelta`,
-  project that row as the streaming `conclusion_row` and collapse process
-  activity before rendering the text.
+- `AgentMessageDelta.phase` is the provider-neutral transition signal. Keep
+  `Commentary` and unknown-phase Agent text in process history even when that
+  text is the current turn tail. Do not collapse process activity for status
+  updates, implementation notes, or other intermediate Agent descriptions.
+- When the first `FinalAnswer` delta arrives, project that phase into a separate
+  streaming `conclusion_row` and collapse process activity before rendering the
+  text. Adjacent final-answer deltas append to that row through the bounded
+  streaming cache.
 - Do not wait for `AgentMessage { is_final: true }` to expose the conclusion.
-  The final item reconciles and completes the same row; later deltas append to
-  it through the bounded streaming cache.
-- If tool, plan, permission, or other process activity arrives after an Agent
-  delta, that earlier text remains process history until Agent text becomes the
-  turn tail again. Do not infer the transition from message wording.
+  The final item reconciles and completes the final-answer row. Providers that
+  cannot supply a trustworthy phase retain process presentation until the
+  authoritative final item or completed-turn fallback arrives.
+- Phase transitions fence Agent text compaction. A final-answer row must not
+  include preceding commentary, and the renderer must never infer phase from
+  message wording. Explicit commentary is never promoted by the completed-turn
+  compatibility fallback; when a turn ends without a final answer, keep that
+  text as completed process history and expose no conclusion row.
 - An explicit user expansion overrides the collapsed default. Copy, fork, and
   timestamp actions remain hidden until the conclusion row stops streaming.
-- Model tests cover streaming conclusion projection and the later-process
-  fallback. Desktop tests cover collapse defaults, explicit expansion, and the
-  streaming-cache tail path.
+- Model tests cover commentary-at-tail, commentary-to-final transition, legacy
+  fallback, and later-process behavior. Desktop tests cover collapse defaults,
+  explicit expansion, and rejection of commentary by the conclusion fast path.
 
 ## Provider State
 

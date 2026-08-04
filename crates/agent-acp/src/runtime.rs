@@ -53,9 +53,9 @@ use vibex_config_switch::{
 };
 use vibex_core::{
     AcpProcessStrategy, AcpProviderConfig, AcpProviderEnvSource, ActiveWorkKind,
-    AgentEventRawOutput, AgentEventRawOutputMode, AgentId, AgentModelCapabilities,
-    AgentModelListRequest, AgentModelListSource, AgentReasoningEffort, AgentRuntimeRouteKey,
-    AgentSessionRestoreCompatibility, AgentSessionRestoreCompatibilityKey,
+    AgentEventRawOutput, AgentEventRawOutputMode, AgentId, AgentMessagePhase,
+    AgentModelCapabilities, AgentModelListRequest, AgentModelListSource, AgentReasoningEffort,
+    AgentRuntimeRouteKey, AgentSessionRestoreCompatibility, AgentSessionRestoreCompatibilityKey,
     AgentSessionRestoreMethod, AgentSessionRestoreOutcome, AgentSessionState, AgentTokenUsage,
     AgentUsageCounterOrigin, AgentUsageExecution, AgentUsageExecutionContext,
     AgentUsageExecutionStatus, AgentUsageExecutionStatusUpdate, AgentUsageObservation,
@@ -845,6 +845,7 @@ struct ActiveTurn {
     assistant_text_truncated: bool,
     assistant_segment: String,
     assistant_segment_truncated: bool,
+    assistant_segment_phase: Option<AgentMessagePhase>,
 }
 
 #[derive(Clone)]
@@ -1464,6 +1465,7 @@ impl AcpSessionAttachment {
             assistant_text_truncated: false,
             assistant_segment: String::new(),
             assistant_segment_truncated: false,
+            assistant_segment_phase: None,
         });
         Ok(())
     }
@@ -1549,14 +1551,16 @@ impl AcpSessionAttachment {
                 sink,
                 assistant_segment,
                 assistant_segment_truncated,
+                assistant_segment_phase,
                 ..
             }) => {
-                let final_message = (emit_final_message && !assistant_segment_truncated).then_some(
-                    AcpEvent::AssistantMessage {
-                        text: assistant_segment,
-                        is_final: true,
-                    },
-                );
+                let final_message = (emit_final_message
+                    && !assistant_segment_truncated
+                    && assistant_segment_phase != Some(AgentMessagePhase::Commentary))
+                .then_some(AcpEvent::AssistantMessage {
+                    text: assistant_segment,
+                    is_final: true,
+                });
                 match sink {
                     TurnSink::Buffer(mut events) => {
                         events.extend(final_message);
@@ -1664,7 +1668,7 @@ impl AcpSessionAttachment {
         index
     }
 
-    fn append_assistant_text(&self, text: &str) {
+    fn append_assistant_text(&self, text: &str, phase: Option<AgentMessagePhase>) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
@@ -1676,6 +1680,11 @@ impl AcpSessionAttachment {
             &mut turn.assistant_text_truncated,
             text,
         );
+        if phase.is_some() && turn.assistant_segment_phase != phase {
+            turn.assistant_segment.clear();
+            turn.assistant_segment_truncated = false;
+            turn.assistant_segment_phase = phase;
+        }
         append_bounded_assistant_text(
             &mut turn.assistant_segment,
             &mut turn.assistant_segment_truncated,
@@ -2253,6 +2262,8 @@ impl AcpSessionAttachment {
                 if !text.is_empty() {
                     let process = self.process();
                     let is_codex = process.event_enricher == AgentEventEnricherKind::Codex;
+                    let phase = agent_message_phase(update)
+                        .or_else(|| (!is_codex).then_some(AgentMessagePhase::FinalAnswer));
                     let is_unattributed = update.get("messageId").and_then(Value::as_str).is_none();
                     // codex-acp forwards most Codex errors as unattributed text and
                     // still returns end_turn, so recover the retry boundary here.
@@ -2283,11 +2294,12 @@ impl AcpSessionAttachment {
                         self.clear_codex_reconnect();
                     }
                     self.record_opencode_stream_progress();
-                    self.append_assistant_text(&text);
+                    self.append_assistant_text(&text, phase);
                     let chunk_index = self.next_chunk_index();
                     self.emit_turn_event(AcpEvent::AssistantDelta {
                         text_delta: text,
                         chunk_index,
+                        phase,
                     });
                 }
             }
@@ -2478,6 +2490,7 @@ impl AcpSessionAttachment {
         {
             turn.assistant_segment.clear();
             turn.assistant_segment_truncated = false;
+            turn.assistant_segment_phase = None;
         }
         drop(state);
         let process = self.process();
@@ -12492,6 +12505,14 @@ fn content_block_text(content: Option<&Value>) -> String {
     }
 }
 
+fn agent_message_phase(update: &Value) -> Option<AgentMessagePhase> {
+    match update.pointer("/_meta/codex/phase").and_then(Value::as_str) {
+        Some("commentary") => Some(AgentMessagePhase::Commentary),
+        Some("final_answer") => Some(AgentMessagePhase::FinalAnswer),
+        _ => None,
+    }
+}
+
 fn tool_call_content_summary(content: Option<&Value>) -> Option<String> {
     let items = content?.as_array()?;
     let mut parts = Vec::new();
@@ -15390,6 +15411,32 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
     }
 
     #[test]
+    fn agent_message_phase_accepts_only_codex_message_phase_metadata() {
+        assert_eq!(
+            agent_message_phase(&json!({
+                "_meta": { "codex": { "phase": "commentary" } }
+            })),
+            Some(AgentMessagePhase::Commentary)
+        );
+        assert_eq!(
+            agent_message_phase(&json!({
+                "_meta": { "codex": { "phase": "final_answer" } }
+            })),
+            Some(AgentMessagePhase::FinalAnswer)
+        );
+        assert_eq!(
+            agent_message_phase(&json!({
+                "_meta": { "codex": { "phase": "unknown" } }
+            })),
+            None
+        );
+        assert_eq!(
+            agent_message_phase(&json!({ "meta": { "phase": "final_answer" } })),
+            None
+        );
+    }
+
+    #[test]
     fn runtime_prompt_content_uses_resource_links_for_non_images() {
         let attachment = ProviderTurnAttachment {
             label: "notes.txt".to_string(),
@@ -17108,7 +17155,7 @@ for line in sys.stdin:
         let native_session_id = handle.fence().native_session_id.clone();
         let payload = handle.payload();
         payload.begin_turn(TurnSink::Buffer(Vec::new())).unwrap();
-        payload.append_assistant_text(&"x".repeat(ACP_ACTIVE_MESSAGE_LIMIT + 128));
+        payload.append_assistant_text(&"x".repeat(ACP_ACTIVE_MESSAGE_LIMIT + 128), None);
         assert_eq!(payload.next_chunk_index(), 0);
         {
             let mut state = payload.state.lock().unwrap();
@@ -20428,7 +20475,12 @@ for line in sys.stdin:
                     saw_reasoning = true;
                     assert_eq!(text, "thinking");
                 }
-                AcpEvent::AssistantDelta { text_delta, .. } => streamed_text.push_str(&text_delta),
+                AcpEvent::AssistantDelta {
+                    text_delta, phase, ..
+                } => {
+                    assert_eq!(phase, Some(AgentMessagePhase::FinalAnswer));
+                    streamed_text.push_str(&text_delta);
+                }
                 AcpEvent::AssistantMessage { text, is_final } => {
                     assert!(is_final);
                     final_text = Some(text);
@@ -20478,6 +20530,45 @@ for line in sys.stdin:
                 AcpEvent::AssistantMessage { text, is_final: true } if text == "conclusion"
             )
         }));
+
+        payload.begin_turn(TurnSink::Buffer(Vec::new())).unwrap();
+        payload.handle_session_update(&json!({
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "commentary-message",
+                "content": { "type": "text", "text": "intermediate status" },
+                "_meta": { "codex": { "phase": "commentary" } }
+            }
+        }));
+        payload.handle_session_update(&json!({
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "final-message",
+                "content": { "type": "text", "text": "final answer" },
+                "_meta": { "codex": { "phase": "final_answer" } }
+            }
+        }));
+        let phase_events = payload.finish_turn(true).unwrap();
+        assert!(matches!(
+            &phase_events[0],
+            AcpEvent::AssistantDelta {
+                text_delta,
+                phase: Some(AgentMessagePhase::Commentary),
+                ..
+            } if text_delta == "intermediate status"
+        ));
+        assert!(matches!(
+            &phase_events[1],
+            AcpEvent::AssistantDelta {
+                text_delta,
+                phase: Some(AgentMessagePhase::FinalAnswer),
+                ..
+            } if text_delta == "final answer"
+        ));
+        assert!(matches!(
+            &phase_events[2],
+            AcpEvent::AssistantMessage { text, is_final: true } if text == "final answer"
+        ));
 
         // Session commands announced through available_commands_update.
         let commands = client.list_session_commands(&session_id).await.unwrap();

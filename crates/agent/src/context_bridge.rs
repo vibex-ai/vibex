@@ -1091,6 +1091,7 @@ mod tests {
                 TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
                     text_delta: "streamed secret-value".to_string(),
                     chunk_index: 0,
+                    phase: None,
                 }),
                 TimelineRedactionState::None,
             ),

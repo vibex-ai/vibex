@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use vibex_core::{
-    AgentSession, AgentSessionState, PermissionRequestStatus, PlanStepPayload, PlanStepStatus,
-    TimelineItem, TimelineItemKind, TimelinePayload, VibexSessionId,
+    AgentMessagePhase, AgentSession, AgentSessionState, PermissionRequestStatus, PlanStepPayload,
+    PlanStepStatus, TimelineItem, TimelineItemKind, TimelinePayload, VibexSessionId,
 };
 
 use crate::SidebarState;
@@ -442,6 +442,13 @@ pub fn timeline_conversation_turns(
                         .iter()
                         .any(|item_id| final_agent_item_ids.contains(item_id))
             });
+            if provider_finished_for_turn {
+                for row in &mut turn_rows {
+                    if row.kind == TimelineRowKind::AgentMessage {
+                        row.streaming = false;
+                    }
+                }
+            }
             turn_rows = compact_conversation_process_rows(turn_rows, &turn.response_items);
             let process_activity_groups = timeline_process_activity_groups(&turn_rows);
             let process_activity_groups_with_commands =
@@ -698,7 +705,12 @@ fn select_streaming_agent_message<'a>(
     items: &[&'a TimelineItem],
 ) -> Option<(usize, &'a TimelineItem)> {
     let (index, item) = items.iter().copied().enumerate().next_back()?;
-    matches!(item.payload, TimelinePayload::AgentMessageDelta(_)).then_some((index, item))
+    matches!(
+        item.payload,
+        TimelinePayload::AgentMessageDelta(ref delta)
+            if delta.phase == Some(AgentMessagePhase::FinalAnswer)
+    )
+    .then_some((index, item))
 }
 
 fn select_agent_message<'a>(
@@ -711,7 +723,16 @@ fn select_agent_message<'a>(
         .enumerate()
         .filter_map(|(index, item)| {
             let text = agent_message_text(item)?;
-            if text.trim().is_empty() || (final_only && !is_final_agent_message(item)) {
+            let eligible = if final_only {
+                is_final_agent_message(item)
+            } else {
+                matches!(
+                    item.payload,
+                    TimelinePayload::AgentMessageDelta(ref delta)
+                        if delta.phase != Some(AgentMessagePhase::Commentary)
+                )
+            };
+            if text.trim().is_empty() || !eligible {
                 return None;
             }
             Some((index, item, text))
@@ -828,6 +849,7 @@ fn timeline_rows_from_refs(items: &[&TimelineItem]) -> Vec<TimelineRow> {
             .or_else(|| item.provider_correlation_id.clone());
         match &item.payload {
             TimelinePayload::AgentMessageDelta(delta) => {
+                let final_answer = delta.phase == Some(AgentMessagePhase::FinalAnswer);
                 let key = correlation
                     .as_deref()
                     .map(|value| format!("agent:{value}"))
@@ -835,6 +857,7 @@ fn timeline_rows_from_refs(items: &[&TimelineItem]) -> Vec<TimelineRow> {
                 if let Some(previous) = rows.last_mut().filter(|row| {
                     row.kind == TimelineRowKind::AgentMessage
                         && row.streaming
+                        && row.conclusion == final_answer
                         && runtime_attribution_is_compatible(row, item)
                 }) {
                     previous.body.push_str(&delta.text_delta);
@@ -853,7 +876,7 @@ fn timeline_rows_from_refs(items: &[&TimelineItem]) -> Vec<TimelineRow> {
                         turn_item_count: 0,
                         turn_failed: false,
                         turn_pending_permission: false,
-                        conclusion: false,
+                        conclusion: final_answer,
                         first_sequence: item.sequence,
                         last_sequence: item.sequence,
                         title: "Agent".into(),
@@ -1423,6 +1446,7 @@ mod tests {
                 TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
                     text_delta: "hel".into(),
                     chunk_index: 0,
+                    phase: None,
                 }),
             ),
             item(
@@ -1431,6 +1455,7 @@ mod tests {
                 TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
                     text_delta: "lo".into(),
                     chunk_index: 1,
+                    phase: None,
                 }),
             ),
             item(
@@ -1469,6 +1494,7 @@ mod tests {
             TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
                 text_delta: "hel".into(),
                 chunk_index: 0,
+                phase: None,
             }),
         ));
         assert_eq!(
@@ -1482,6 +1508,7 @@ mod tests {
             TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
                 text_delta: "lo".into(),
                 chunk_index: 1,
+                phase: None,
             }),
         ));
         items.push(item(
@@ -1534,6 +1561,7 @@ mod tests {
                     TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
                         text_delta: format!("Reconnecting... {attempt}/5\n\n"),
                         chunk_index: attempt - 1,
+                        phase: None,
                     }),
                 )
             })
@@ -1582,6 +1610,7 @@ mod tests {
                 TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
                     text_delta: "I am ".into(),
                     chunk_index: 0,
+                    phase: None,
                 }),
             ),
             item(
@@ -1590,6 +1619,7 @@ mod tests {
                 TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
                     text_delta: "Cod".into(),
                     chunk_index: 1,
+                    phase: None,
                 }),
             ),
             item(
@@ -1598,6 +1628,7 @@ mod tests {
                 TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
                     text_delta: "ex".into(),
                     chunk_index: 2,
+                    phase: None,
                 }),
             ),
             item(
@@ -1628,6 +1659,7 @@ mod tests {
             TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
                 text_delta: "first".into(),
                 chunk_index: 0,
+                phase: None,
             }),
         );
         first.execution_attribution = Some(TurnExecutionAttributionView {
@@ -1641,6 +1673,7 @@ mod tests {
             TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
                 text_delta: "second".into(),
                 chunk_index: 1,
+                phase: None,
             }),
         );
         second.execution_attribution = Some(TurnExecutionAttributionView {
@@ -1665,6 +1698,7 @@ mod tests {
                 TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
                     text_delta: "third".into(),
                     chunk_index: 2,
+                    phase: None,
                 }),
             ),
         ]);
@@ -1859,6 +1893,7 @@ mod tests {
                 TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
                     text_delta: "I am ".into(),
                     chunk_index: 0,
+                    phase: None,
                 }),
             ),
             item(
@@ -1867,6 +1902,7 @@ mod tests {
                 TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
                     text_delta: "Codex".into(),
                     chunk_index: 1,
+                    phase: None,
                 }),
             ),
             item(
@@ -2142,6 +2178,7 @@ mod tests {
                 TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
                     text_delta: "Hi. ".into(),
                     chunk_index: 0,
+                    phase: None,
                 }),
             ),
             item(
@@ -2150,6 +2187,7 @@ mod tests {
                 TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
                     text_delta: "What are you working on?".into(),
                     chunk_index: 1,
+                    phase: None,
                 }),
             ),
         ];
@@ -2200,16 +2238,27 @@ mod tests {
                 3,
                 None,
                 TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
-                    text_delta: "work ".into(),
+                    text_delta: "I have applied the code change.".into(),
                     chunk_index: 0,
+                    phase: Some(AgentMessagePhase::Commentary),
                 }),
             ),
             item(
                 4,
                 Some("correlation_chunk_4"),
                 TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
-                    text_delta: "in progress".into(),
+                    text_delta: "work ".into(),
                     chunk_index: 1,
+                    phase: Some(AgentMessagePhase::FinalAnswer),
+                }),
+            ),
+            item(
+                5,
+                Some("correlation_chunk_5"),
+                TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                    text_delta: "in progress".into(),
+                    chunk_index: 2,
+                    phase: Some(AgentMessagePhase::FinalAnswer),
                 }),
             ),
         ];
@@ -2217,8 +2266,12 @@ mod tests {
         let turns = timeline_conversation_turns(&items, Some(AgentSessionState::Running), false);
 
         assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].process_rows.len(), 1);
+        assert_eq!(turns[0].process_rows.len(), 2);
         assert_eq!(turns[0].process_rows[0].kind, TimelineRowKind::ToolCall);
+        assert_eq!(
+            turns[0].process_rows[1].body,
+            "I have applied the code change."
+        );
         let conclusion = turns[0].conclusion_row.as_ref().unwrap();
         assert_eq!(conclusion.body, "work in progress");
         assert!(conclusion.streaming);
@@ -2243,6 +2296,7 @@ mod tests {
                 TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
                     text_delta: "I will inspect first.".into(),
                     chunk_index: 0,
+                    phase: Some(AgentMessagePhase::Commentary),
                 }),
             ),
             item(
@@ -2267,6 +2321,69 @@ mod tests {
         assert_eq!(turns[0].process_rows.len(), 2);
         assert_eq!(turns[0].process_rows[0].kind, TimelineRowKind::AgentMessage);
         assert_eq!(turns[0].process_rows[1].kind, TimelineRowKind::ToolCall);
+    }
+
+    #[test]
+    fn commentary_at_the_running_turn_tail_remains_process_history() {
+        let items = [
+            item(
+                1,
+                None,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "Continue".into(),
+                    attachments: Vec::new(),
+                }),
+            ),
+            item(
+                2,
+                None,
+                TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                    text_delta: "The public commit is complete; I am checking status.".into(),
+                    chunk_index: 0,
+                    phase: Some(AgentMessagePhase::Commentary),
+                }),
+            ),
+        ];
+
+        let turns = timeline_conversation_turns(&items, Some(AgentSessionState::Running), false);
+
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].conclusion_row.is_none());
+        assert_eq!(turns[0].process_rows.len(), 1);
+        assert_eq!(turns[0].process_rows[0].kind, TimelineRowKind::AgentMessage);
+        assert!(turns[0].process_rows[0].streaming);
+    }
+
+    #[test]
+    fn completed_commentary_only_turn_has_no_conclusion() {
+        let items = [
+            item(
+                1,
+                None,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "Continue".into(),
+                    attachments: Vec::new(),
+                }),
+            ),
+            item(
+                2,
+                None,
+                TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                    text_delta: "I am still checking the result.".into(),
+                    chunk_index: 0,
+                    phase: Some(AgentMessagePhase::Commentary),
+                }),
+            ),
+        ];
+
+        let turns = timeline_conversation_turns(&items, Some(AgentSessionState::Idle), false);
+
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].complete);
+        assert!(turns[0].conclusion_row.is_none());
+        assert_eq!(turns[0].process_rows.len(), 1);
+        assert_eq!(turns[0].process_rows[0].kind, TimelineRowKind::AgentMessage);
+        assert!(!turns[0].process_rows[0].streaming);
     }
 
     #[test]
@@ -2652,6 +2769,7 @@ mod tests {
                     TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
                         text_delta: "x".into(),
                         chunk_index: sequence as u32 - 1,
+                        phase: None,
                     }),
                 )
             })
@@ -2742,6 +2860,7 @@ mod tests {
                     TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
                         text_delta: "x".into(),
                         chunk_index: sequence as u32 - 1,
+                        phase: None,
                     }),
                 )
             };
@@ -2758,6 +2877,7 @@ mod tests {
                     TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
                         text_delta: "stale".into(),
                         chunk_index: sequence as u32 - 1,
+                        phase: None,
                     }),
                 )
             };

@@ -316,13 +316,13 @@ pub use terminal::{
 pub use time::unix_timestamp_ms;
 pub use timeline::{
     AgentEventContentBlock, AgentEventLocation, AgentEventRawExtension, AgentEventRawOutput,
-    AgentEventRawOutputMode, AgentMessageDeltaPayload, AgentMessagePayload, CollaborationPayload,
-    CommandPayload, CommandStatus, FileOperationKind, FileOperationPayload, GitNoticePayload,
-    ImageGenerationPayload, MessageAttachment, PlanPayload, PlanStepPayload, PlanStepStatus,
-    ReasoningPayload, SystemNoticeLevel, SystemNoticePayload, TimelineErrorPayload, TimelineItem,
-    TimelineItemKind, TimelineLiveEvent, TimelinePage, TimelinePayload, TimelineRedactionState,
-    TimelineSource, TodoUpdatePayload, ToolCallPayload, ToolCallStatus, TurnExecutionAttribution,
-    TurnExecutionAttributionView, UserMessagePayload, WebSearchPayload,
+    AgentEventRawOutputMode, AgentMessageDeltaPayload, AgentMessagePayload, AgentMessagePhase,
+    CollaborationPayload, CommandPayload, CommandStatus, FileOperationKind, FileOperationPayload,
+    GitNoticePayload, ImageGenerationPayload, MessageAttachment, PlanPayload, PlanStepPayload,
+    PlanStepStatus, ReasoningPayload, SystemNoticeLevel, SystemNoticePayload, TimelineErrorPayload,
+    TimelineItem, TimelineItemKind, TimelineLiveEvent, TimelinePage, TimelinePayload,
+    TimelineRedactionState, TimelineSource, TodoUpdatePayload, ToolCallPayload, ToolCallStatus,
+    TurnExecutionAttribution, TurnExecutionAttributionView, UserMessagePayload, WebSearchPayload,
 };
 pub use usage::{
     AgentTurnUsageFact, AgentUsageAggregate, AgentUsageAnnualDay, AgentUsageAnnualProjection,

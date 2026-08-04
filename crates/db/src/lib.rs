@@ -14035,6 +14035,7 @@ mod tests {
             TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
                 text_delta: "streaming".to_string(),
                 chunk_index: 1,
+                phase: None,
             }),
             "provider-turn-1",
             2,
@@ -14061,6 +14062,7 @@ mod tests {
             TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
                 text_delta: "stale".to_string(),
                 chunk_index: 2,
+                phase: None,
             }),
             "provider-turn-1",
             2,
@@ -14279,6 +14281,7 @@ mod tests {
                 TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
                     text_delta: format!("chunk-{index};"),
                     chunk_index: index,
+                    phase: None,
                 }),
                 None,
                 None,

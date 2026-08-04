@@ -32,18 +32,18 @@ use vibex_core::{
     AgentCommandDiscoverRequest, AgentCommandDiscoverResponse, AgentCommandEntry,
     AgentCommandExecuteRequest, AgentCommandExecutionBehavior, AgentCommandSelectionBehavior,
     AgentCommandSourceKind, AgentCommandTrigger, AgentEventRawExtension, AgentMessageDeltaPayload,
-    AgentMessagePayload, AgentModelCapabilities, AgentModelListResponse, AgentModelListSource,
-    AgentReasoningEffort, AgentSessionConfigProbe, AgentSessionSafety, AgentUsageCounterOrigin,
-    AgentUsageExecutionContext, ExternalSessionImportCandidate, MessageSubmissionId,
-    PermissionActionDetail, PermissionRequest, PermissionRequestStatus, PermissionResponseKind,
-    PermissionResponseOption, PermissionRiskCategory, PlanPayload, PlanStepPayload,
-    ProviderBinding, ProviderBindingMetadata, ProviderCapabilities, ProviderCapabilitySummary,
-    ProviderKind, ProviderNativeBinding, ProviderProfileId, ProviderRunCapabilityProbesRequest,
-    ProviderSessionConfigOption, ProviderSessionConfigValue, ReasoningPayload, RequestId,
-    SessionRuntimeConfigMutationRequest, SessionRuntimeConfigMutationResult,
-    SessionRuntimeSelection, SystemNoticeLevel, SystemNoticePayload, TimelineErrorPayload,
-    TimelinePayload, TimelineRedactionState, ToolCallPayload, ToolCallStatus, VibexError,
-    VibexResult, VibexSessionId, unix_timestamp_ms,
+    AgentMessagePayload, AgentMessagePhase, AgentModelCapabilities, AgentModelListResponse,
+    AgentModelListSource, AgentReasoningEffort, AgentSessionConfigProbe, AgentSessionSafety,
+    AgentUsageCounterOrigin, AgentUsageExecutionContext, ExternalSessionImportCandidate,
+    MessageSubmissionId, PermissionActionDetail, PermissionRequest, PermissionRequestStatus,
+    PermissionResponseKind, PermissionResponseOption, PermissionRiskCategory, PlanPayload,
+    PlanStepPayload, ProviderBinding, ProviderBindingMetadata, ProviderCapabilities,
+    ProviderCapabilitySummary, ProviderKind, ProviderNativeBinding, ProviderProfileId,
+    ProviderRunCapabilityProbesRequest, ProviderSessionConfigOption, ProviderSessionConfigValue,
+    ReasoningPayload, RequestId, SessionRuntimeConfigMutationRequest,
+    SessionRuntimeConfigMutationResult, SessionRuntimeSelection, SystemNoticeLevel,
+    SystemNoticePayload, TimelineErrorPayload, TimelinePayload, TimelineRedactionState,
+    ToolCallPayload, ToolCallStatus, VibexError, VibexResult, VibexSessionId, unix_timestamp_ms,
 };
 
 mod adapter_activation;
@@ -259,6 +259,7 @@ pub enum AcpEvent {
     AssistantDelta {
         text_delta: String,
         chunk_index: u32,
+        phase: Option<AgentMessagePhase>,
     },
     AssistantMessage {
         text: String,
@@ -2813,10 +2814,12 @@ fn map_acp_event(session_id: vibex_core::VibexSessionId, event: AcpEvent) -> Pro
         AcpEvent::AssistantDelta {
             text_delta,
             chunk_index,
+            phase,
         } => ProviderEvent::agent(TimelinePayload::AgentMessageDelta(
             AgentMessageDeltaPayload {
                 text_delta,
                 chunk_index,
+                phase,
             },
         )),
         AcpEvent::AssistantMessage { text, is_final } => {
@@ -3705,6 +3708,7 @@ mod tests {
                     AcpEvent::AssistantDelta {
                         text_delta: "hello".to_string(),
                         chunk_index: 0,
+                        phase: Some(AgentMessagePhase::FinalAnswer),
                     },
                     AcpEvent::ToolCall {
                         tool_call_id: "tool-1".to_string(),
@@ -3769,7 +3773,10 @@ mod tests {
         ));
         assert!(matches!(
             result.events[1].payload,
-            TimelinePayload::AgentMessageDelta(_)
+            TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                phase: Some(AgentMessagePhase::FinalAnswer),
+                ..
+            })
         ));
         let legacy_tool_correlation = result.events[2]
             .provider_correlation_id

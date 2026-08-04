@@ -177,6 +177,15 @@ pub struct UserMessagePayload {
 pub struct AgentMessageDeltaPayload {
     pub text_delta: String,
     pub chunk_index: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<AgentMessagePhase>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMessagePhase {
+    Commentary,
+    FinalAnswer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -918,6 +927,30 @@ mod tests {
             .remove("executionAttribution");
         let decoded: TimelineItem = serde_json::from_value(legacy).unwrap();
         assert_eq!(decoded.execution_attribution, None);
+    }
+
+    #[test]
+    fn agent_message_delta_phase_is_optional_and_uses_provider_neutral_values() {
+        let final_answer = AgentMessageDeltaPayload {
+            text_delta: "done".to_string(),
+            chunk_index: 0,
+            phase: Some(AgentMessagePhase::FinalAnswer),
+        };
+        assert_eq!(
+            serde_json::to_value(&final_answer).unwrap(),
+            serde_json::json!({
+                "textDelta": "done",
+                "chunkIndex": 0,
+                "phase": "final_answer"
+            })
+        );
+
+        let legacy: AgentMessageDeltaPayload = serde_json::from_value(serde_json::json!({
+            "textDelta": "legacy",
+            "chunkIndex": 1
+        }))
+        .unwrap();
+        assert_eq!(legacy.phase, None);
     }
 
     #[test]

@@ -204,6 +204,12 @@ plan_codex_fork(evidence, identity, generation, native_session_id) -> Option<Cod
   hardening remains owned by the application data directory implementation.
 - Diff content maps to `FileOperation` even when `rawInput` is absent. `oldText/newText` are optional lossless fields.
 - WebSearch, TodoUpdate, Collaboration and ImageGeneration stay canonical product types.
+- Codex `agent_message_chunk._meta.codex.phase` is decoded at the ACP boundary
+  into the optional provider-neutral `AgentMessagePhase`. Accept only
+  `commentary` and `final_answer`; missing or unknown metadata remains `None`
+  for backward compatibility. A phase transition starts a new assistant segment
+  so the final authoritative message cannot concatenate commentary into the
+  user-facing answer.
 - Fork requires exact negotiated `VersionedRaw` evidence for the current identity/generation.
 
 ### 4. Validation & Error Matrix
@@ -217,6 +223,8 @@ plan_codex_fork(evidence, identity, generation, native_session_id) -> Option<Cod
 - Create/write/sync/publish/permission failure -> stable `acp_private_*`
   storage error with only the I/O error kind in diagnostics.
 - Unknown `_codex/*` -> bounded diagnostic, no timeline mutation.
+- Missing or unknown Codex message phase -> preserve the text with phase `None`;
+  never guess from wording or mark it as a live final answer.
 - Static/old-generation fork evidence -> unavailable; never send the request.
 - Unsupported image extension -> `mimeType = null` but keep a bounded image reference.
 
@@ -240,6 +248,8 @@ plan_codex_fork(evidence, identity, generation, native_session_id) -> Option<Cod
 - Workspace check and non-Unix compilation must keep the helper API portable.
 - Diff tests assert add/update/delete mapping and old/new text preservation.
 - Parity golden tests assert WebSearch/Todo/Collaboration semantic variants.
+- ACP runtime tests assert `commentary -> final_answer` preserves both streamed
+  phases while the final message contains only the final-answer segment.
 - Fork tests assert exact identity/generation/source/encoding gating.
 
 ### 7. Wrong vs Correct
