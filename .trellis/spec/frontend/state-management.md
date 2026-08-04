@@ -142,9 +142,15 @@ TimelineConversationTurn {
   so multiple adjacent status updates do not accumulate in the loading label.
 - A pending permission label takes precedence over `live_status`; otherwise
   `live_status` replaces the localized default `Thinking...` label.
-- Progress labels render with exactly one ASCII `...` suffix. The projection is
-  cleared when the turn completes, so non-final reasoning does not remain in
-  conversation history.
+- Treat `live_status` as Markdown-formatted provider text and project it through
+  the shared Markdown parser before rendering the loading label. Progress labels
+  render as plain text with exactly one ASCII `...` suffix.
+- Empty, whitespace-only, or formatting-only progress text falls back to the
+  localized `Thinking...` label. An incomplete turn with an empty streaming
+  conclusion row must keep showing that fallback instead of rendering a blank
+  response area.
+- The projection is cleared when the turn completes, so non-final reasoning does
+  not remain in conversation history.
 - `Reasoning { is_final: true }` remains a historical process row. Tool, command,
   file, plan, and final Agent content keep their existing canonical renderers.
 
@@ -152,6 +158,10 @@ TimelineConversationTurn {
 
 - Empty or whitespace-only non-final reasoning -> ignore it and use the default
   loading label.
+- Markdown-decorated or formatting-only reasoning -> render its parsed plain
+  text, or the localized default when parsing produces no visible content.
+- Empty streaming conclusion while the turn is incomplete -> keep the progress
+  indicator visible with the localized default label.
 - Multiple non-final reasoning segments -> show the latest item and
   retain no non-final reasoning process rows.
 - Pending permission plus live reasoning -> show the localized waiting-for-

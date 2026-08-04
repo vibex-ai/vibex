@@ -2415,7 +2415,13 @@ fn timeline_turn_process_expanded(
     turn: &TimelineConversationTurn,
     explicit_expansion: Option<bool>,
 ) -> bool {
-    explicit_expansion.unwrap_or(!turn.complete && turn.conclusion_row.is_none())
+    explicit_expansion.unwrap_or(!turn.complete && timeline_turn_conclusion_row(turn).is_none())
+}
+
+fn timeline_turn_conclusion_row(turn: &TimelineConversationTurn) -> Option<&TimelineRow> {
+    turn.conclusion_row
+        .as_ref()
+        .filter(|row| !row.body.trim().is_empty())
 }
 
 fn show_agent_answer_actions(conversation_conclusion: bool, row: &TimelineRow) -> bool {
@@ -19318,8 +19324,8 @@ impl VibexWorkbench {
             turn,
             self.timeline_process_expansion.get(&turn.id).copied(),
         );
-        let process_collapsible =
-            turn.complete || (turn.conclusion_row.is_some() && !turn.process_rows.is_empty());
+        let process_collapsible = turn.complete
+            || (timeline_turn_conclusion_row(turn).is_some() && !turn.process_rows.is_empty());
         let process_toggle_id = turn.id.clone();
         let duration = format_compact_duration(
             turn.started_at_ms,
@@ -19449,7 +19455,7 @@ impl VibexWorkbench {
                     response = response.child(row);
                 }
             }
-            if let Some(conclusion_row) = turn.conclusion_row.as_ref() {
+            if let Some(conclusion_row) = timeline_turn_conclusion_row(turn) {
                 response =
                     response.child(self.render_timeline_row(conclusion_row, true, window, cx));
             } else if !turn.complete {
@@ -19462,7 +19468,7 @@ impl VibexWorkbench {
                         .to_string()
                 };
                 response = response.child(render_agent_thinking_indicator(
-                    &agent_progress_label(&pending_label),
+                    &agent_progress_label(&pending_label, strings.agent_pending_response),
                     cx,
                 ));
             }
@@ -20063,7 +20069,7 @@ impl VibexWorkbench {
             if process_expanded {
                 height += self.estimated_timeline_process_rows_height(turn);
             }
-            if let Some(conclusion_row) = turn.conclusion_row.as_ref() {
+            if let Some(conclusion_row) = timeline_turn_conclusion_row(turn) {
                 height += self.estimated_timeline_row_height_projected(conclusion_row, true) + 12.0;
             } else if !turn.complete {
                 height += 34.0;
@@ -25222,14 +25228,20 @@ fn permission_response_label(kind: PermissionResponseKind) -> &'static str {
     }
 }
 
-fn agent_progress_label(label: &str) -> String {
-    let compact = compact_agent_turn_preview_message(label);
+fn agent_progress_label(label: &str, fallback: &str) -> String {
+    let (plain_text, _) = agent_markdown_summary(label);
+    let compact = compact_agent_turn_preview_message(&plain_text);
     let stem = compact.trim_end().trim_end_matches(['.', '…']).trim_end();
-    if stem.is_empty() {
-        "...".to_string()
+    let has_visible_content = stem.chars().any(|character| {
+        character.is_alphanumeric()
+            || (!character.is_whitespace() && !character.is_ascii_punctuation())
+    });
+    let stem = if has_visible_content {
+        stem
     } else {
-        format!("{stem}...")
-    }
+        fallback.trim_end().trim_end_matches(['.', '…']).trim_end()
+    };
+    format!("{stem}...")
 }
 
 fn render_agent_thinking_indicator(label: &str, cx: &App) -> AnyElement {
@@ -30930,7 +30942,7 @@ mod tests {
 
     #[test]
     fn process_collapses_by_default_when_conclusion_streaming_starts() {
-        let turn = TimelineConversationTurn {
+        let mut turn = TimelineConversationTurn {
             id: "turn:streaming-conclusion".into(),
             user_row: None,
             process_rows: Vec::new(),
@@ -30971,17 +30983,39 @@ mod tests {
             true,
             turn.conclusion_row.as_ref().unwrap()
         ));
+
+        turn.conclusion_row.as_mut().unwrap().body = "   ".into();
+        assert!(timeline_turn_conclusion_row(&turn).is_none());
+        assert!(timeline_turn_process_expanded(&turn, None));
     }
 
     #[test]
     fn agent_progress_labels_have_one_ascii_ellipsis() {
         assert_eq!(
-            agent_progress_label("Planning targeted guide extraction"),
+            agent_progress_label("Planning targeted guide extraction", "Thinking..."),
             "Planning targeted guide extraction..."
         );
-        assert_eq!(agent_progress_label("等待确认中"), "等待确认中...");
-        assert_eq!(agent_progress_label("Thinking..."), "Thinking...");
-        assert_eq!(agent_progress_label("Inspecting…"), "Inspecting...");
+        assert_eq!(
+            agent_progress_label("等待确认中", "思考中..."),
+            "等待确认中..."
+        );
+        assert_eq!(
+            agent_progress_label("Thinking...", "Thinking..."),
+            "Thinking..."
+        );
+        assert_eq!(
+            agent_progress_label("Inspecting…", "Thinking..."),
+            "Inspecting..."
+        );
+        assert_eq!(
+            agent_progress_label(
+                "**Planning read-only diagnostic without task creation**",
+                "Thinking..."
+            ),
+            "Planning read-only diagnostic without task creation..."
+        );
+        assert_eq!(agent_progress_label("**", "思考中..."), "思考中...");
+        assert_eq!(agent_progress_label("   ", "思考中..."), "思考中...");
     }
 
     #[test]
