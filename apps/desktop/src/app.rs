@@ -35207,7 +35207,7 @@ mod tests {
         assert!(!settings_defaults_restored(&appearance, &session));
 
         session = SessionUiState::default();
-        session.enhanced_command_execution_display = false;
+        session.enhanced_command_execution_display = true;
         assert!(!settings_defaults_restored(&appearance, &session));
     }
 

@@ -296,7 +296,7 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             session_content_width_narrow: "Narrow",
             session_content_width_standard: "Standard",
             session_content_width_full: "Full width",
-            enhanced_command_execution_display: "Enhanced command execution display",
+            enhanced_command_execution_display: "Command card rendering",
             enhanced_command_execution_display_description: "Render command executions as standalone detail cards. When off, include them in the collapsible tool activity display.",
             decrease_font_size: "Decrease font size",
             increase_font_size: "Increase font size",
@@ -442,7 +442,7 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             session_content_width_narrow: "窄屏",
             session_content_width_standard: "标准",
             session_content_width_full: "全屏",
-            enhanced_command_execution_display: "命令执行增强显示",
+            enhanced_command_execution_display: "命令卡片渲染",
             enhanced_command_execution_display_description: "将命令执行渲染为独立详情卡片；关闭后，命令会合入可折叠的工具活动显示。",
             decrease_font_size: "减小字体",
             increase_font_size: "增大字体",
@@ -588,7 +588,7 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             session_content_width_narrow: "窄屏",
             session_content_width_standard: "標準",
             session_content_width_full: "全屏",
-            enhanced_command_execution_display: "命令執行增強顯示",
+            enhanced_command_execution_display: "命令卡片渲染",
             enhanced_command_execution_display_description: "將命令執行渲染為獨立詳情卡片；關閉後，命令會合入可折疊的工具活動顯示。",
             decrease_font_size: "縮小字體",
             increase_font_size: "放大字體",
@@ -1513,8 +1513,16 @@ mod tests {
             "Full width"
         );
         assert_eq!(
+            strings(ResolvedLocale::En).enhanced_command_execution_display,
+            "Command card rendering"
+        );
+        assert_eq!(
+            strings(ResolvedLocale::ZhCn).enhanced_command_execution_display,
+            "命令卡片渲染"
+        );
+        assert_eq!(
             strings(ResolvedLocale::ZhTw).enhanced_command_execution_display,
-            "命令執行增強顯示"
+            "命令卡片渲染"
         );
         assert_eq!(
             strings(ResolvedLocale::En).new_session_prompt_placeholder,

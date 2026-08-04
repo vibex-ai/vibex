@@ -244,13 +244,13 @@ impl Default for SessionUiState {
         Self {
             content_width: SessionContentWidthMode::Standard,
             turn_preview_rail: true,
-            enhanced_command_execution_display: true,
+            enhanced_command_execution_display: false,
         }
     }
 }
 
 const fn default_enhanced_command_execution_display() -> bool {
-    true
+    false
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1053,7 +1053,7 @@ mod tests {
 
         let decoded = decode_and_migrate(&serde_json::to_vec(&value).unwrap()).unwrap();
 
-        assert!(decoded.session.enhanced_command_execution_display);
+        assert!(!decoded.session.enhanced_command_execution_display);
     }
 
     #[test]
