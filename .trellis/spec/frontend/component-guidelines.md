@@ -125,6 +125,27 @@ that expand/collapse sessions or activate a project are internal sidebar
 interactions and must not auto-close a floating Sheet/sidebar; reserve automatic
 drawer closure for explicit navigation actions that intentionally leave the
 sidebar context.
+
+When explicit navigation closes a hover-preview sidebar, suppress hover-driven
+reopening for longer than the sidebar's exit transition. The closing panel stays
+mounted during that transition, and residual pointer events from a slightly
+dragged click can otherwise reverse the animation halfway through. Capture the
+pre-navigation hover state before clearing it and use the shared suppression
+path; docked sidebar navigation must keep its requested-open preference.
+
+```rust
+let hover_preview_was_open = self.sidebar_hover_preview_open;
+// Apply navigation state before clearing the preview.
+if hover_preview_was_open {
+    self.suppress_sidebar_hover_preview();
+} else {
+    self.close_sidebar_hover_preview();
+}
+```
+
+Regression coverage must assert both the requested-open/drawer result and that
+hover-preview navigation enters the suppression path.
+
 Panel resize handles should stay below floating sidebars, drawers, dialogs, and
 other portaled overlays in z-index. The resize hot zone only needs to sit above
 its owning panel content; using overlay-level z-index values can make resize

@@ -12425,14 +12425,19 @@ impl VibexWorkbench {
     }
 
     fn dismiss_sidebar_for_navigation(&mut self) {
+        let hover_preview_was_open = self.sidebar_hover_preview_open;
         let next = sidebar_display_after_navigation(
             self.ui_state.workbench.sidebar_visible,
-            self.sidebar_hover_preview_open,
+            hover_preview_was_open,
         );
         let requested_open_changed = self.ui_state.workbench.sidebar_visible != next.requested_open;
         self.ui_state.workbench.sidebar_visible = next.requested_open;
         self.sidebar_overlay_open = next.drawer_open;
-        self.close_sidebar_hover_preview();
+        if hover_preview_was_open {
+            self.suppress_sidebar_hover_preview();
+        } else {
+            self.close_sidebar_hover_preview();
+        }
         if requested_open_changed {
             self.queue_ui_state();
         }
@@ -32355,6 +32360,15 @@ mod tests {
                 drawer_open: false,
             }
         );
+
+        let source = include_str!("app.rs");
+        let dismissal = source
+            .split_once("    fn dismiss_sidebar_for_navigation(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn suppress_sidebar_hover_preview("))
+            .map(|(body, _)| body)
+            .expect("sidebar navigation dismissal should remain inspectable");
+        assert!(dismissal.contains("if hover_preview_was_open"));
+        assert!(dismissal.contains("self.suppress_sidebar_hover_preview();"));
     }
 
     #[test]
