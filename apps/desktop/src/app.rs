@@ -2205,9 +2205,8 @@ fn append_agent_streaming_deltas_to_cache(
         return None;
     }
     let last_turn = cache.last()?;
-    let last_row = last_turn.process_rows.last()?;
+    let last_row = last_turn.conclusion_row.as_ref()?;
     if last_turn.complete
-        || last_turn.conclusion_row.is_some()
         || last_row.kind != TimelineRowKind::AgentMessage
         || !last_row.streaming
         || updates
@@ -2241,8 +2240,8 @@ fn append_agent_streaming_deltas_to_cache(
     let turn = Rc::make_mut(turns.last_mut().expect("cache was checked above"));
     let body_len = {
         let row = turn
-            .process_rows
-            .last_mut()
+            .conclusion_row
+            .as_mut()
             .expect("streaming row was checked above");
         for update in updates {
             row.body.push_str(&update.text);
@@ -2410,6 +2409,17 @@ fn timeline_should_auto_follow_content(
 
 fn timeline_turn_duration_end(turn_complete: bool, ended_at_ms: Option<i64>) -> Option<i64> {
     turn_complete.then_some(ended_at_ms).flatten()
+}
+
+fn timeline_turn_process_expanded(
+    turn: &TimelineConversationTurn,
+    explicit_expansion: Option<bool>,
+) -> bool {
+    explicit_expansion.unwrap_or(!turn.complete && turn.conclusion_row.is_none())
+}
+
+fn show_agent_answer_actions(conversation_conclusion: bool, row: &TimelineRow) -> bool {
+    conversation_conclusion && !row.streaming && !row.body.is_empty()
 }
 
 fn session_search_documents(items: &[TimelineItem]) -> Vec<SessionSearchDocument> {
@@ -6341,7 +6351,7 @@ impl VibexWorkbench {
         let Some(turn) = self.conversation_turns_cache.last().cloned() else {
             return self.rebuild_timeline_sizes();
         };
-        let Some(row) = turn.process_rows.last() else {
+        let Some(row) = turn.conclusion_row.as_ref() else {
             return self.rebuild_timeline_sizes();
         };
         if turn.id != update.turn_id
@@ -6360,7 +6370,7 @@ impl VibexWorkbench {
         else {
             return self.refresh_last_timeline_size();
         };
-        // The live fast path only appends the final streaming Agent row. Reuse
+        // The live fast path only appends the streaming conclusion row. Reuse
         // the prior measured/estimated Turn extent and apply the O(new text)
         // row delta; visible prepaint will converge this approximation again.
         let height = (previous_height - update.previous_row_height + update.row_height).max(72.0);
@@ -19301,19 +19311,19 @@ impl VibexWorkbench {
             });
             (None, runtime)
         };
-        let process_expanded = self
-            .timeline_process_expansion
-            .get(&turn.id)
-            .copied()
-            .unwrap_or(!turn.complete);
+        let process_expanded = timeline_turn_process_expanded(
+            turn,
+            self.timeline_process_expansion.get(&turn.id).copied(),
+        );
+        let process_collapsible =
+            turn.complete || (turn.conclusion_row.is_some() && !turn.process_rows.is_empty());
         let process_toggle_id = turn.id.clone();
         let duration = format_compact_duration(
             turn.started_at_ms,
             timeline_turn_duration_end(turn.complete, turn.ended_at_ms),
         );
-        // Codex-parity header: "Working for Ns" while running (no chevron),
-        // "Worked for Ns ›" once complete (click toggles the process flow), with a
-        // full-width rule below — turns have no other separator.
+        // Keep the process open while work is in progress, then expose its
+        // collapse toggle as soon as conclusion streaming starts.
         let header_label = if turn.complete {
             format!("{} {duration}", strings.agent_worked_for)
         } else {
@@ -19352,7 +19362,7 @@ impl VibexWorkbench {
                 .min_w_0()
                 .gap_3()
                 .group(runtime_hover_group.clone());
-            let header_left = if turn.complete {
+            let header_left = if process_collapsible {
                 h_flex()
                     .id(format!("turn-process:{}", turn.id))
                     .items_center()
@@ -19431,7 +19441,7 @@ impl VibexWorkbench {
                             }),
                     ),
             );
-            if process_expanded || !turn.complete {
+            if process_expanded {
                 for row in self.render_timeline_process_rows(turn, window, cx) {
                     response = response.child(row);
                 }
@@ -19799,7 +19809,7 @@ impl VibexWorkbench {
                 if row.body.contains("](") {
                     height += 30.0;
                 }
-                if conclusion {
+                if conclusion && !row.streaming {
                     // action icon row
                     height += 32.0;
                 }
@@ -20046,8 +20056,8 @@ impl VibexWorkbench {
         if has_response {
             // header row + rule
             height += 40.0 + 12.0;
-            let process_expanded = explicit_process_expansion.unwrap_or(!turn.complete);
-            if process_expanded || !turn.complete {
+            let process_expanded = timeline_turn_process_expanded(turn, explicit_process_expansion);
+            if process_expanded {
                 height += self.estimated_timeline_process_rows_height(turn);
             }
             if let Some(conclusion_row) = turn.conclusion_row.as_ref() {
@@ -20327,7 +20337,8 @@ impl VibexWorkbench {
         let fork_disabled = self.agent_action_pending
             || self.fork_session_pending
             || self.timeline.needs_authoritative_refetch;
-        let answer_actions = if conversation_conclusion && !row.body.is_empty() {
+        let show_answer_actions = show_agent_answer_actions(conversation_conclusion, row);
+        let answer_actions = if show_answer_actions {
             agent_answer_actions(timestamp.is_some())
                 .filter_map(|action| match action {
                     AgentAnswerAction::Copy => {
@@ -20389,7 +20400,7 @@ impl VibexWorkbench {
             .when(!row.body.is_empty(), |this| {
                 this.child(div().w_full().min_w_0().child(markdown_view))
             })
-            .when(conversation_conclusion && !row.body.is_empty(), |this| {
+            .when(show_answer_actions, |this| {
                 this.child(
                     h_flex()
                         .items_center()
@@ -30660,7 +30671,7 @@ mod tests {
         ));
         assert!(Rc::ptr_eq(&cache[0], &historical_turn));
         assert!(!Rc::ptr_eq(&cache[1], &active_turn));
-        assert_eq!(cache[1].process_rows.last().unwrap().body, "streaming");
+        assert_eq!(cache[1].conclusion_row.as_ref().unwrap().body, "streaming");
     }
 
     #[test]
@@ -30682,10 +30693,10 @@ mod tests {
                 .expect("contiguous delta should use the tail fast path");
         assert!(Rc::ptr_eq(&cache[0], &historical_turn));
         assert!(!Rc::ptr_eq(&cache[1], &active_turn));
-        assert_eq!(cache[1].process_rows.last().unwrap().body, "streaming");
+        assert_eq!(cache[1].conclusion_row.as_ref().unwrap().body, "streaming");
         assert_eq!(update.previous_body_len, "stream".len());
 
-        let body_before_gap = cache[1].process_rows.last().unwrap().body.clone();
+        let body_before_gap = cache[1].conclusion_row.as_ref().unwrap().body.clone();
         let gap = [AgentStreamingDeltaUpdate {
             item_id: "timeline_streaming_7".into(),
             sequence: 7,
@@ -30696,7 +30707,10 @@ mod tests {
         assert!(
             append_agent_streaming_deltas_to_cache(&mut cache, &mut metrics_cache, &gap).is_none()
         );
-        assert_eq!(cache[1].process_rows.last().unwrap().body, body_before_gap);
+        assert_eq!(
+            cache[1].conclusion_row.as_ref().unwrap().body,
+            body_before_gap
+        );
     }
 
     #[test]
@@ -30907,6 +30921,51 @@ mod tests {
 
         assert!(summary.has_incomplete_turn);
         assert!(summary.has_pending_permission);
+    }
+
+    #[test]
+    fn process_collapses_by_default_when_conclusion_streaming_starts() {
+        let turn = TimelineConversationTurn {
+            id: "turn:streaming-conclusion".into(),
+            user_row: None,
+            process_rows: Vec::new(),
+            process_activity_groups: Vec::new(),
+            live_status: None,
+            conclusion_row: Some(TimelineRow {
+                id: "agent:streaming-conclusion".into(),
+                kind: TimelineRowKind::AgentMessage,
+                item_ids: vec!["timeline_1".into()],
+                turn_id: Some("turn:streaming-conclusion".into()),
+                turn_item_count: 1,
+                turn_failed: false,
+                turn_pending_permission: false,
+                conclusion: true,
+                first_sequence: 1,
+                last_sequence: 1,
+                title: "Agent".into(),
+                body: "Streaming".into(),
+                streaming: true,
+                collapsible: false,
+                pending_permission: false,
+                failed: false,
+                runtime_attribution: None,
+                file_path: None,
+            }),
+            runtime_attribution: None,
+            complete: false,
+            failed: false,
+            pending_permission: false,
+            item_count: 1,
+            started_at_ms: 1,
+            ended_at_ms: Some(1),
+        };
+
+        assert!(!timeline_turn_process_expanded(&turn, None));
+        assert!(timeline_turn_process_expanded(&turn, Some(true)));
+        assert!(!show_agent_answer_actions(
+            true,
+            turn.conclusion_row.as_ref().unwrap()
+        ));
     }
 
     #[test]

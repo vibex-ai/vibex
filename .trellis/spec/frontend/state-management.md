@@ -191,6 +191,24 @@ let label = turn.live_status.as_deref().unwrap_or(strings.agent_pending_response
 render_agent_thinking_indicator(&agent_progress_label(label), cx)
 ```
 
+## Scenario: Stream The Conclusion After Collapsing Process Activity
+
+- While a turn is running without Agent text at its tail, process activity is
+  expanded by default. When the current tail becomes an `AgentMessageDelta`,
+  project that row as the streaming `conclusion_row` and collapse process
+  activity before rendering the text.
+- Do not wait for `AgentMessage { is_final: true }` to expose the conclusion.
+  The final item reconciles and completes the same row; later deltas append to
+  it through the bounded streaming cache.
+- If tool, plan, permission, or other process activity arrives after an Agent
+  delta, that earlier text remains process history until Agent text becomes the
+  turn tail again. Do not infer the transition from message wording.
+- An explicit user expansion overrides the collapsed default. Copy, fork, and
+  timestamp actions remain hidden until the conclusion row stops streaming.
+- Model tests cover streaming conclusion projection and the later-process
+  fallback. Desktop tests cover collapse defaults, explicit expansion, and the
+  streaming-cache tail path.
+
 ## Provider State
 
 Provider state displayed in the UI should come from Vibex Provider Profiles,

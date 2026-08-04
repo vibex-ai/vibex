@@ -404,9 +404,11 @@ pub fn timeline_conversation_turns(
             });
             let mut conclusion_row =
                 conclusion_row_index.map(|row_index| turn_rows.remove(row_index));
-            if provider_finished_for_turn && let Some(row) = conclusion_row.as_mut() {
-                row.streaming = false;
+            if let Some(row) = conclusion_row.as_mut() {
                 row.conclusion = true;
+                if provider_finished_for_turn {
+                    row.streaming = false;
+                }
             }
             let live_status = turn
                 .response_items
@@ -653,18 +655,29 @@ fn find_conversation_turn_conclusion<'a>(
         .rev()
         .find(|(_, item)| is_turn_boundary_error(item));
     let final_agent_message = select_agent_message(items, true);
+    let streaming_agent_message = select_streaming_agent_message(items);
     let fallback_agent_message = provider_turn_finished
         .then(|| select_agent_message(items, false))
         .flatten();
+    let agent_message = final_agent_message
+        .or(streaming_agent_message)
+        .or(fallback_agent_message);
 
-    match (latest_error, final_agent_message) {
+    match (latest_error, agent_message) {
         (Some((error_index, error)), Some((message_index, _))) if error_index > message_index => {
             Some(error)
         }
         (_, Some((_, message))) => Some(message),
         (Some((_, error)), None) => Some(error),
-        (None, None) => fallback_agent_message.map(|(_, message)| message),
+        (None, None) => None,
     }
+}
+
+fn select_streaming_agent_message<'a>(
+    items: &[&'a TimelineItem],
+) -> Option<(usize, &'a TimelineItem)> {
+    let (index, item) = items.iter().copied().enumerate().next_back()?;
+    matches!(item.payload, TimelinePayload::AgentMessageDelta(_)).then_some((index, item))
 }
 
 fn select_agent_message<'a>(
@@ -2100,7 +2113,61 @@ mod tests {
     }
 
     #[test]
-    fn conversation_turn_projection_uses_one_stream_process_until_completion() {
+    fn conversation_turn_projection_streams_conclusion_separately_from_process() {
+        let items = [
+            item(
+                1,
+                None,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "Continue".into(),
+                    attachments: Vec::new(),
+                }),
+            ),
+            item(
+                2,
+                None,
+                TimelinePayload::ToolCall(ToolCallPayload {
+                    tool_call_id: "tool_read".into(),
+                    tool_name: "read".into(),
+                    status: ToolCallStatus::Completed,
+                    summary: "Read project files".into(),
+                    input_summary: None,
+                    output_summary: None,
+                    raw_extension: None,
+                }),
+            ),
+            item(
+                3,
+                None,
+                TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                    text_delta: "work ".into(),
+                    chunk_index: 0,
+                }),
+            ),
+            item(
+                4,
+                Some("correlation_chunk_4"),
+                TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                    text_delta: "in progress".into(),
+                    chunk_index: 1,
+                }),
+            ),
+        ];
+
+        let turns = timeline_conversation_turns(&items, Some(AgentSessionState::Running), false);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].process_rows.len(), 1);
+        assert_eq!(turns[0].process_rows[0].kind, TimelineRowKind::ToolCall);
+        let conclusion = turns[0].conclusion_row.as_ref().unwrap();
+        assert_eq!(conclusion.body, "work in progress");
+        assert!(conclusion.streaming);
+        assert!(conclusion.conclusion);
+        assert!(!turns[0].complete);
+    }
+
+    #[test]
+    fn agent_stream_before_later_process_activity_remains_in_process_history() {
         let items = [
             item(
                 1,
@@ -2114,16 +2181,21 @@ mod tests {
                 2,
                 None,
                 TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
-                    text_delta: "work ".into(),
+                    text_delta: "I will inspect first.".into(),
                     chunk_index: 0,
                 }),
             ),
             item(
                 3,
-                Some("correlation_chunk_3"),
-                TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
-                    text_delta: "in progress".into(),
-                    chunk_index: 1,
+                None,
+                TimelinePayload::ToolCall(ToolCallPayload {
+                    tool_call_id: "tool_read".into(),
+                    tool_name: "read".into(),
+                    status: ToolCallStatus::Started,
+                    summary: "Reading project files".into(),
+                    input_summary: None,
+                    output_summary: None,
+                    raw_extension: None,
                 }),
             ),
         ];
@@ -2131,10 +2203,10 @@ mod tests {
         let turns = timeline_conversation_turns(&items, Some(AgentSessionState::Running), false);
 
         assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].process_rows.len(), 1);
-        assert_eq!(turns[0].process_rows[0].body, "work in progress");
         assert!(turns[0].conclusion_row.is_none());
-        assert!(!turns[0].complete);
+        assert_eq!(turns[0].process_rows.len(), 2);
+        assert_eq!(turns[0].process_rows[0].kind, TimelineRowKind::AgentMessage);
+        assert_eq!(turns[0].process_rows[1].kind, TimelineRowKind::ToolCall);
     }
 
     #[test]
