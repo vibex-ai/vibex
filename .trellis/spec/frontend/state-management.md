@@ -77,6 +77,30 @@ command/permission rows must be estimated and measured as one rendered element.
 Regression coverage for this path must assert both last-turn height invalidation
 and the non-shrinking card container.
 
+### Convention: Streaming Markdown height ownership
+
+`MarkdownView` parses streaming input in the background, so the authoritative
+row body can be newer than the document currently laid out on screen. During the
+append-only Agent-message fast path, keep the virtual turn at its current extent
+and preserve any pending intrinsic measurement. Do not resize the virtual row
+from character counts or Markdown syntax in the newer source. Once the parser
+applies that source, the visible turn's prepaint measurement is the sole owner of
+the new extent, and bottom-follow scrolls against that measured extent once.
+
+```rust
+// Wrong: the virtual row expands before MarkdownView renders the new document,
+// then contracts to the old prepaint measurement and visibly bounces.
+virtual_height += estimate_height(delta);
+
+// Correct: source update -> background parse -> intrinsic measurement -> scroll.
+estimated_heights.insert(turn_id, (signature, current_virtual_height));
+```
+
+Regression coverage must assert that the streaming fast path neither clears
+pending turn heights nor invalidates a measured height, and does not mutate the
+virtual row-size vector. Non-stream structured events continue to use the full
+invalidation contract above.
+
 When a new-session draft includes an initial message, await session creation
 only long enough to obtain the authoritative session record. Commit and select
 that session immediately, attach its timeline view, and submit the initial

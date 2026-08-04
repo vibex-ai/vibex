@@ -1711,7 +1711,7 @@ struct AgentSessionViewCacheEntry {
     conversation_turns_cache: Rc<Vec<Rc<TimelineConversationTurn>>>,
     conversation_turns_cache_key: Option<ConversationTurnsCacheKey>,
     conversation_turns_summary: ConversationTurnsSummary,
-    streaming_row_metrics: Option<StreamingRowMetricsCache>,
+    streaming_row_state: Option<StreamingRowStateCache>,
     content_width: SessionContentWidthMode,
     collapsed_timeline_rows: BTreeSet<String>,
     timeline_process_expansion: BTreeMap<String, bool>,
@@ -2074,80 +2074,18 @@ struct AgentStreamingDeltaUpdate {
     runtime_attribution: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct StreamingRowTextMetrics {
-    wrapped_lines: usize,
-    trailing_line_chars: usize,
-    has_workspace_link_syntax: bool,
-    ends_with_newline: bool,
-    last_char: Option<char>,
-}
-
-impl StreamingRowTextMetrics {
-    fn from_text(text: &str, chars_per_line: usize) -> Self {
-        let mut metrics = Self {
-            wrapped_lines: 1,
-            trailing_line_chars: 0,
-            has_workspace_link_syntax: false,
-            ends_with_newline: false,
-            last_char: None,
-        };
-        metrics.append(text, chars_per_line);
-        metrics
-    }
-
-    fn append(&mut self, text: &str, chars_per_line: usize) {
-        let chars_per_line = chars_per_line.max(1);
-        for character in text.chars() {
-            if character == '\n' {
-                if self.ends_with_newline {
-                    self.wrapped_lines = self.wrapped_lines.saturating_add(1);
-                }
-                self.trailing_line_chars = 0;
-                self.ends_with_newline = true;
-            } else {
-                if self.ends_with_newline {
-                    self.wrapped_lines = self.wrapped_lines.saturating_add(1);
-                }
-                self.ends_with_newline = false;
-                self.trailing_line_chars = self.trailing_line_chars.saturating_add(1);
-                if self.trailing_line_chars > chars_per_line {
-                    self.wrapped_lines = self.wrapped_lines.saturating_add(1);
-                    self.trailing_line_chars = 1;
-                }
-            }
-            if self.last_char == Some(']') && character == '(' {
-                self.has_workspace_link_syntax = true;
-            }
-            self.last_char = Some(character);
-        }
-    }
-
-    fn estimated_markdown_row_height(self) -> f32 {
-        self.wrapped_lines as f32 * 24.0
-            + 8.0
-            + if self.has_workspace_link_syntax {
-                30.0
-            } else {
-                0.0
-            }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct StreamingRowMetricsCache {
+struct StreamingRowStateCache {
     turn_id: String,
     row_id: String,
     body_len: usize,
-    metrics: StreamingRowTextMetrics,
 }
 
 struct AgentStreamingCacheUpdate {
     turn_id: String,
     row_id: String,
     previous_body_len: usize,
-    previous_row_height: f32,
-    row_height: f32,
+    body_len: usize,
 }
 
 fn agent_streaming_delta_updates(
@@ -2206,7 +2144,7 @@ fn record_timeline_row_endpoint(item_ids: &mut Vec<String>, item_id: String) {
 
 fn append_agent_streaming_deltas_to_cache(
     cache: &mut Rc<Vec<Rc<TimelineConversationTurn>>>,
-    metrics_cache: &mut Option<StreamingRowMetricsCache>,
+    state_cache: &mut Option<StreamingRowStateCache>,
     updates: &[AgentStreamingDeltaUpdate],
 ) -> Option<AgentStreamingCacheUpdate> {
     if updates.is_empty() {
@@ -2233,16 +2171,6 @@ fn append_agent_streaming_deltas_to_cache(
     let turn_id = last_turn.id.clone();
     let row_id = last_row.id.clone();
     let previous_body_len = last_row.body.len();
-    let mut metrics = metrics_cache
-        .as_ref()
-        .filter(|cached| {
-            cached.turn_id == turn_id
-                && cached.row_id == row_id
-                && cached.body_len == previous_body_len
-        })
-        .map(|cached| cached.metrics)
-        .unwrap_or_else(|| StreamingRowTextMetrics::from_text(&last_row.body, 72));
-    let previous_row_height = metrics.estimated_markdown_row_height();
 
     let turns = Rc::make_mut(cache);
     let turn = Rc::make_mut(turns.last_mut().expect("cache was checked above"));
@@ -2253,7 +2181,6 @@ fn append_agent_streaming_deltas_to_cache(
             .expect("streaming row was checked above");
         for update in updates {
             row.body.push_str(&update.text);
-            metrics.append(&update.text, 72);
             record_timeline_row_endpoint(&mut row.item_ids, update.item_id.clone());
             row.last_sequence = update.sequence;
         }
@@ -2269,18 +2196,16 @@ fn append_agent_streaming_deltas_to_cache(
     {
         row.turn_item_count = turn.item_count;
     }
-    *metrics_cache = Some(StreamingRowMetricsCache {
+    *state_cache = Some(StreamingRowStateCache {
         turn_id: turn_id.clone(),
         row_id: row_id.clone(),
         body_len,
-        metrics,
     });
     Some(AgentStreamingCacheUpdate {
         turn_id,
         row_id,
         previous_body_len,
-        previous_row_height,
-        row_height: metrics.estimated_markdown_row_height(),
+        body_len,
     })
 }
 
@@ -3055,7 +2980,7 @@ pub struct VibexWorkbench {
     conversation_turns_cache: Rc<Vec<Rc<TimelineConversationTurn>>>,
     conversation_turns_cache_key: Option<ConversationTurnsCacheKey>,
     conversation_turns_summary: ConversationTurnsSummary,
-    streaming_row_metrics: Option<StreamingRowMetricsCache>,
+    streaming_row_state: Option<StreamingRowStateCache>,
     turn_preview_rail_visible: bool,
     turn_preview_active_index: Option<usize>,
     agent_session_view_cache: BTreeMap<String, AgentSessionViewCacheEntry>,
@@ -3581,7 +3506,7 @@ impl VibexWorkbench {
             conversation_turns_cache: Rc::new(Vec::new()),
             conversation_turns_cache_key: None,
             conversation_turns_summary: ConversationTurnsSummary::default(),
-            streaming_row_metrics: None,
+            streaming_row_state: None,
             turn_preview_rail_visible: false,
             turn_preview_active_index: None,
             agent_session_view_cache: BTreeMap::new(),
@@ -5481,7 +5406,7 @@ impl VibexWorkbench {
             ),
             conversation_turns_cache_key: self.conversation_turns_cache_key.take(),
             conversation_turns_summary: std::mem::take(&mut self.conversation_turns_summary),
-            streaming_row_metrics: self.streaming_row_metrics.take(),
+            streaming_row_state: self.streaming_row_state.take(),
             content_width: self.ui_state.session.content_width,
             collapsed_timeline_rows: std::mem::take(&mut self.collapsed_timeline_rows),
             timeline_process_expansion: std::mem::take(&mut self.timeline_process_expansion),
@@ -5534,7 +5459,7 @@ impl VibexWorkbench {
         self.conversation_turns_cache = entry.conversation_turns_cache;
         self.conversation_turns_cache_key = entry.conversation_turns_cache_key;
         self.conversation_turns_summary = entry.conversation_turns_summary;
-        self.streaming_row_metrics = entry.streaming_row_metrics;
+        self.streaming_row_state = entry.streaming_row_state;
         self.collapsed_timeline_rows = entry.collapsed_timeline_rows;
         self.timeline_process_expansion = entry.timeline_process_expansion;
         self.timeline_command_expansion = entry.timeline_command_expansion;
@@ -6201,7 +6126,7 @@ impl VibexWorkbench {
                 && let Some(updates) = streaming_updates.as_deref()
                 && let Some(update) = append_agent_streaming_deltas_to_cache(
                     &mut self.conversation_turns_cache,
-                    &mut self.streaming_row_metrics,
+                    &mut self.streaming_row_state,
                     updates,
                 )
             {
@@ -6221,7 +6146,7 @@ impl VibexWorkbench {
             let content_extent_changed = if let Some(update) = streaming_cache_update.as_ref() {
                 self.refresh_last_timeline_size_incrementally(update)
             } else {
-                self.streaming_row_metrics = None;
+                self.streaming_row_state = None;
                 self.refresh_last_timeline_size()
             };
             if timeline_should_auto_follow_content(
@@ -6381,7 +6306,6 @@ impl VibexWorkbench {
         &mut self,
         update: &AgentStreamingCacheUpdate,
     ) -> bool {
-        self.timeline_pending_turn_heights.clear();
         let Some(turn) = self.conversation_turns_cache.last().cloned() else {
             return self.rebuild_timeline_sizes();
         };
@@ -6390,41 +6314,31 @@ impl VibexWorkbench {
         };
         if turn.id != update.turn_id
             || row.id != update.row_id
-            || row.body.len() < update.previous_body_len
+            || update.body_len < update.previous_body_len
+            || row.body.len() != update.body_len
             || self.timeline_row_sizes.len() != self.conversation_turns_cache.len()
         {
             return self.rebuild_timeline_sizes();
         }
 
-        self.timeline_measured_turn_heights.remove(&turn.id);
-        let Some(previous_height) = self
+        let Some(current_height) = self
             .timeline_row_sizes
             .last()
             .map(|row_size| f32::from(row_size.height))
         else {
             return self.refresh_last_timeline_size();
         };
-        // The live fast path only appends the streaming conclusion row. Reuse
-        // the prior measured/estimated Turn extent and apply the O(new text)
-        // row delta; visible prepaint will converge this approximation again.
-        let height = (previous_height - update.previous_row_height + update.row_height).max(72.0);
 
+        // Streaming Markdown is parsed in the background. Keep the virtual row
+        // at the height of the document that is actually on screen; predicting
+        // from newer source would expand the row before parsing and contract it
+        // again when prepaint measures the previous document. The Markdown view
+        // will report its new intrinsic height after the parse is applied.
         let process_expansion = self.timeline_process_expansion.get(&turn.id).copied();
         let signature = self.timeline_turn_estimate_signature(&turn, process_expansion);
         self.timeline_estimated_turn_heights
-            .insert(turn.id.clone(), (signature, height));
-        let content_width = session_content_max_width(self.ui_state.session.content_width)
-            .unwrap_or(AGENT_CONTENT_STANDARD_MAX_WIDTH);
-        let row_size = size(px(content_width), px(height));
-        let row_sizes = Rc::make_mut(&mut self.timeline_row_sizes);
-        let Some(previous) = row_sizes.last_mut() else {
-            return false;
-        };
-        if *previous == row_size {
-            return false;
-        }
-        *previous = row_size;
-        true
+            .insert(turn.id.clone(), (signature, current_height));
+        false
     }
 
     fn invalidate_timeline_render_caches(&mut self) {
@@ -6439,7 +6353,7 @@ impl VibexWorkbench {
         self.conversation_turns_cache = Rc::new(Vec::new());
         self.conversation_turns_cache_key = None;
         self.conversation_turns_summary = ConversationTurnsSummary::default();
-        self.streaming_row_metrics = None;
+        self.streaming_row_state = None;
     }
 
     fn invalidate_timeline_turn_measurement(&mut self, turn_id: &str) {
@@ -19876,10 +19790,11 @@ impl VibexWorkbench {
     /// allocation also lets the markdown view settle on a pointer comparison
     /// instead of a full memcmp when nothing changed.
     fn timeline_markdown_source(&mut self, row: &TimelineRow) -> (Arc<str>, i64) {
-        let allow_throttle = self
-            .streaming_row_metrics
-            .as_ref()
-            .is_some_and(|metrics| metrics.row_id == row.id && metrics.body_len == row.body.len());
+        let allow_throttle = self.streaming_row_state.as_ref().is_some_and(|state| {
+            row.turn_id.as_deref() == Some(state.turn_id.as_str())
+                && state.row_id == row.id
+                && state.body_len == row.body.len()
+        });
         timeline_markdown_source_snapshot(
             &mut self.timeline_markdown_sources,
             row,
@@ -30961,7 +30876,7 @@ mod tests {
         let (_, mut cache) = streaming_timeline_fixture();
         let historical_turn = cache[0].clone();
         let active_turn = cache[1].clone();
-        let mut metrics_cache = None;
+        let mut state_cache = None;
         let updates = [AgentStreamingDeltaUpdate {
             item_id: "timeline_streaming_5".into(),
             sequence: 5,
@@ -30970,13 +30885,14 @@ mod tests {
             runtime_attribution: None,
         }];
 
-        let update =
-            append_agent_streaming_deltas_to_cache(&mut cache, &mut metrics_cache, &updates)
-                .expect("contiguous delta should use the tail fast path");
+        let update = append_agent_streaming_deltas_to_cache(&mut cache, &mut state_cache, &updates)
+            .expect("contiguous delta should use the tail fast path");
         assert!(Rc::ptr_eq(&cache[0], &historical_turn));
         assert!(!Rc::ptr_eq(&cache[1], &active_turn));
         assert_eq!(cache[1].conclusion_row.as_ref().unwrap().body, "streaming");
         assert_eq!(update.previous_body_len, "stream".len());
+        assert_eq!(update.body_len, "streaming".len());
+        assert_eq!(state_cache.as_ref().unwrap().body_len, "streaming".len());
 
         let body_before_gap = cache[1].conclusion_row.as_ref().unwrap().body.clone();
         let gap = [AgentStreamingDeltaUpdate {
@@ -30987,7 +30903,7 @@ mod tests {
             runtime_attribution: None,
         }];
         assert!(
-            append_agent_streaming_deltas_to_cache(&mut cache, &mut metrics_cache, &gap).is_none()
+            append_agent_streaming_deltas_to_cache(&mut cache, &mut state_cache, &gap).is_none()
         );
         assert_eq!(
             cache[1].conclusion_row.as_ref().unwrap().body,
@@ -35889,19 +35805,19 @@ mod tests {
     }
 
     #[test]
-    fn streaming_height_metrics_match_full_estimation_across_chunk_boundaries() {
-        let prefix = format!("{}\n]", "x".repeat(145));
-        let suffix = "(src/app.rs)\nfinal line";
-        let mut incremental = StreamingRowTextMetrics::from_text(&prefix, 72);
-        incremental.append(suffix, 72);
-        let complete = StreamingRowTextMetrics::from_text(&format!("{prefix}{suffix}"), 72);
+    fn streaming_timeline_height_waits_for_rendered_markdown_measurement() {
+        let source = include_str!("app.rs");
+        let refresh = source
+            .split_once("    fn refresh_last_timeline_size_incrementally(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn invalidate_timeline_render_caches("))
+            .map(|(body, _)| body)
+            .expect("streaming height refresh should remain inspectable");
 
-        assert_eq!(incremental, complete);
-        assert_eq!(
-            complete.wrapped_lines,
-            estimated_wrapped_lines(&format!("{prefix}{suffix}"), 72)
-        );
-        assert!(complete.has_workspace_link_syntax);
+        assert!(!refresh.contains("timeline_pending_turn_heights.clear"));
+        assert!(!refresh.contains("timeline_measured_turn_heights.remove"));
+        assert!(!refresh.contains("Rc::make_mut"));
+        assert!(refresh.contains("(signature, current_height)"));
+        assert!(refresh.trim_end().ends_with("false\n    }"));
     }
 
     #[test]
