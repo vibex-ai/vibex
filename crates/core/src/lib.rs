@@ -3,6 +3,7 @@
 //! This crate is intentionally dependency-light. It owns domain ids, structured
 //! errors, protocol channel metadata, and minimal event envelopes only.
 
+mod acp_catalog;
 pub mod agent;
 pub mod agent_config;
 pub mod automation_graph;
@@ -28,6 +29,8 @@ pub mod timeline;
 pub mod usage;
 pub mod workbench;
 pub mod workspace;
+
+pub use acp_catalog::{AcpAgentCatalogEntry, acp_agent_catalog_entries};
 
 pub use agent::{
     AgentCommandDiscoverRequest, AgentCommandDiscoverResponse, AgentCommandEntry,

@@ -4,6 +4,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::acp_catalog::{AcpAgentCatalogEntry, acp_agent_catalog_entries};
 use crate::error::{VibexError, VibexResult};
 use crate::provider::{ProviderBindingMetadata, ProviderKind};
 
@@ -358,7 +359,7 @@ pub fn agent_id_for_provider_kind(provider_kind: ProviderKind) -> AgentId {
 }
 
 pub fn builtin_agent_definitions() -> Vec<AgentDefinition> {
-    vec![
+    let mut definitions = vec![
         AgentDefinition {
             id: AgentId::parse("claude").expect("builtin agent ids are valid"),
             label: "Claude Code".to_string(),
@@ -428,68 +429,49 @@ pub fn builtin_agent_definitions() -> Vec<AgentDefinition> {
                 "acp_connection".to_string(),
             ],
         },
-        acp_catalog_agent_definition(
-            "gemini",
-            "Gemini CLI",
-            "Google Gemini CLI agent connected through ACP",
-            40,
-            "gemini",
-            &["--experimental-acp"],
-            "gemini",
-        ),
-        acp_catalog_agent_definition(
-            "copilot",
-            "GitHub Copilot",
-            "GitHub Copilot CLI agent connected through ACP",
-            50,
-            "copilot",
-            &["--acp"],
-            "copilot",
-        ),
-        acp_catalog_agent_definition(
-            "qwen-code",
-            "Qwen Code",
-            "Qwen Code CLI agent connected through ACP",
-            60,
-            "qwen",
-            &["--experimental-acp"],
-            "qwen-code",
-        ),
-        acp_catalog_agent_definition(
-            "goose",
-            "Goose",
-            "Block Goose CLI agent connected through ACP",
-            70,
-            "goose",
-            &["acp"],
-            "goose",
-        ),
-    ]
+    ];
+    definitions.extend(
+        acp_agent_catalog_entries()
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| acp_catalog_agent_definition(entry, 40 + index as i64 * 10)),
+    );
+    definitions
 }
 
-fn acp_catalog_agent_definition(
-    id: &str,
-    label: &str,
-    description: &str,
-    order_index: i64,
-    command: &str,
-    args: &[&str],
-    preset_id: &str,
-) -> AgentDefinition {
+fn acp_catalog_agent_definition(entry: &AcpAgentCatalogEntry, order_index: i64) -> AgentDefinition {
+    let (command, args) = entry
+        .command
+        .split_first()
+        .expect("bundled ACP Agent commands are non-empty");
+    let mut params = serde_json::json!({
+        "connection": "acp",
+        "preset": entry.preset_id,
+        "version": entry.version,
+        "installUrl": entry.install_url,
+    });
+    if let Some(supports_mcp_servers) = entry.supports_mcp_servers {
+        params["supportsMcpServers"] = serde_json::Value::Bool(supports_mcp_servers);
+    }
+
     AgentDefinition {
-        id: AgentId::parse(id).expect("builtin agent ids are valid"),
-        label: label.to_string(),
-        description: Some(description.to_string()),
+        id: AgentId::parse(entry.id).expect("builtin agent ids are valid"),
+        label: entry.label.to_string(),
+        description: Some(entry.description.to_string()),
         runtime_kind: AgentRuntimeKind::Acp,
         source_kind: AgentSourceKind::Catalog,
         default_enabled: false,
         order_index,
         command: Some(AgentCommandConfig {
-            command: command.to_string(),
+            command: (*command).to_string(),
             args: args.iter().map(ToString::to_string).collect(),
         }),
-        env: BTreeMap::new(),
-        params: serde_json::json!({ "connection": "acp", "preset": preset_id }),
+        env: entry
+            .env
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect(),
+        params,
         modes: vec!["default".to_string()],
         capability_hints: vec![
             "agent_messages".to_string(),
@@ -573,5 +555,101 @@ mod tests {
                 Some(preset)
             );
         }
+    }
+
+    #[test]
+    fn builtin_agent_catalog_contains_all_generic_acp_agents() {
+        let definitions = builtin_agent_definitions();
+        let actual = definitions
+            .iter()
+            .map(|definition| definition.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = [
+            "agoragentic-acp",
+            "amp-acp",
+            "auggie",
+            "autohand",
+            "claude",
+            "cline",
+            "codebuddy-code",
+            "codex",
+            "codewhale",
+            "copilot",
+            "cortex-code",
+            "corust-agent",
+            "crow-cli",
+            "cursor",
+            "deepagents",
+            "devin",
+            "dimcode",
+            "dirac",
+            "factory-droid",
+            "fast-agent",
+            "gemini",
+            "glm-acp-agent",
+            "goose",
+            "grok",
+            "hermes",
+            "junie",
+            "kilo",
+            "kimi",
+            "kiro",
+            "minion-code",
+            "mistral-vibe",
+            "nova",
+            "opencode",
+            "poolside",
+            "qoder",
+            "qwen-code",
+            "sigit",
+            "stakpak",
+            "vtcode",
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn generic_acp_agents_preserve_pinned_commands_and_environment() {
+        let definitions = builtin_agent_definitions();
+        for (agent_id, command, args) in [
+            ("glm-acp-agent", "npx", &["-y", "glm-acp-agent@1.1.4"][..]),
+            (
+                "fast-agent",
+                "uvx",
+                &["--from", "fast-agent-acp==0.7.21", "fast-agent-acp", "-x"][..],
+            ),
+            ("cursor", "cursor-agent", &["acp"][..]),
+        ] {
+            let definition = definitions
+                .iter()
+                .find(|definition| definition.id.as_str() == agent_id)
+                .unwrap();
+            let configured = definition.command.as_ref().unwrap();
+            assert_eq!(configured.command, command);
+            assert_eq!(configured.args, args);
+        }
+
+        let factory = definitions
+            .iter()
+            .find(|definition| definition.id.as_str() == "factory-droid")
+            .unwrap();
+        assert_eq!(
+            factory
+                .env
+                .get("DROID_DISABLE_AUTO_UPDATE")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            factory
+                .env
+                .get("FACTORY_DROID_AUTO_UPDATE_ENABLED")
+                .map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(factory.params["supportsMcpServers"], false);
     }
 }

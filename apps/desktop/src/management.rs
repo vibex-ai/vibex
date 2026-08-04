@@ -10909,7 +10909,16 @@ fn management_agent_matches_search(agent: &AgentSnapshotEntry, query: &str) -> b
         .contains(query)
 }
 
-fn agent_install_url(agent: &AgentSnapshotEntry) -> Option<&'static str> {
+fn agent_install_url(agent: &AgentSnapshotEntry) -> Option<&str> {
+    if let Some(install_url) = agent
+        .params
+        .get("installUrl")
+        .and_then(serde_json::Value::as_str)
+        .filter(|install_url| !install_url.trim().is_empty())
+    {
+        return Some(install_url);
+    }
+
     let identity = format!(
         "{} {} {} {}",
         agent.id,
@@ -12803,6 +12812,14 @@ mod tests {
             .iter()
             .find(|agent| agent.id.as_str() == "gemini")
             .expect("Gemini is present in the built-in catalog");
-        assert_eq!(agent_install_url(gemini), Some("https://geminicli.com/"));
+        assert_eq!(agent_install_url(gemini), Some("https://geminicli.com"));
+        let cursor = snapshots
+            .iter()
+            .find(|agent| agent.id.as_str() == "cursor")
+            .expect("Cursor is present in the built-in catalog");
+        assert_eq!(
+            agent_install_url(cursor),
+            Some("https://docs.cursor.com/en/cli/overview")
+        );
     }
 }

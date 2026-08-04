@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vibex_core::{
-    AcpProcessStrategy, AcpProviderCatalogListResponse, AcpProviderCatalogPreset,
-    AcpProviderConfig, AcpProviderEnvReference, AcpProviderEnvSource,
+    AcpAgentCatalogEntry, AcpProcessStrategy, AcpProviderCatalogListResponse,
+    AcpProviderCatalogPreset, AcpProviderConfig, AcpProviderEnvReference, AcpProviderEnvSource,
     AcpProviderProfileCreateRequest, AcpProviderProfileUpdateRequest, AgentCatalogListResponse,
     AgentCommandConfig, AgentConfig, AgentConfigStatus, AgentDefinition, AgentDiscoveryRecord,
     AgentId, AgentInstallStatus, AgentListRequest, AgentListResponse,
@@ -55,7 +55,7 @@ use vibex_core::{
     SkillImportResult, SkillProviderMatrix, SkillSetAgentMatrixRequest,
     SkillSetProviderMatrixRequest, SkillSourceKind, SkillUpdateRequest, SkillValidateRequest,
     SkillValidationResult, SkillValidationStatus, VibexError, VibexResult,
-    builtin_agent_definitions, unix_timestamp_ms,
+    acp_agent_catalog_entries, builtin_agent_definitions, unix_timestamp_ms,
 };
 use vibex_db::{
     AgentConfigRepository, AgentDefaultModelProviderProfileRepository, AgentDiscoveryRepository,
@@ -3690,59 +3690,17 @@ fn push_existing_path(paths: &mut Vec<String>, seen: &mut HashSet<String>, path:
 }
 
 fn bundled_acp_catalog_presets() -> Vec<AcpProviderCatalogPreset> {
-    vec![
+    let mut presets = vec![
         opencode_acp_preset(),
-        acp_catalog_preset(
-            "gemini",
-            "Gemini CLI",
-            "Google Gemini CLI over ACP (gemini --experimental-acp). Requires the gemini CLI on PATH and a completed gemini login.",
-            "gemini",
-            &["--experimental-acp"],
-            &["local", "acp", "gemini", "google"],
-        ),
         claude_acp_preset(),
         codex_acp_preset(),
-        acp_catalog_preset(
-            "copilot",
-            "GitHub Copilot CLI",
-            "GitHub Copilot CLI over ACP (copilot --acp). Requires the copilot CLI on PATH with an authenticated GitHub account.",
-            "copilot",
-            &["--acp"],
-            &["local", "acp", "copilot", "github"],
-        ),
-        acp_catalog_preset(
-            "cursor",
-            "Cursor Agent",
-            "Cursor CLI over ACP (cursor-agent --acp). Verify the exact ACP flag against your installed cursor-agent version.",
-            "cursor-agent",
-            &["--acp"],
-            &["local", "acp", "cursor"],
-        ),
-        acp_catalog_preset(
-            "qwen-code",
-            "Qwen Code",
-            "Qwen Code CLI over ACP (qwen --experimental-acp). Qwen Code follows the Gemini CLI flag family.",
-            "qwen",
-            &["--experimental-acp"],
-            &["local", "acp", "qwen"],
-        ),
-        acp_catalog_preset(
-            "goose",
-            "Goose",
-            "Block Goose CLI over ACP (goose acp). Verify the subcommand against your installed goose version.",
-            "goose",
-            &["acp"],
-            &["local", "acp", "goose"],
-        ),
-        acp_catalog_preset(
-            "kimi-cli",
-            "Kimi Code CLI",
-            "Kimi Code CLI over ACP (kimi --acp). Verify the exact ACP flag against your installed kimi CLI version.",
-            "kimi",
-            &["--acp"],
-            &["local", "acp", "kimi"],
-        ),
-    ]
+    ];
+    presets.extend(
+        acp_agent_catalog_entries()
+            .iter()
+            .map(generic_acp_catalog_preset),
+    );
+    presets
 }
 
 /// Feature tokens granted to bundled ACP presets. They project onto
@@ -3796,6 +3754,39 @@ fn acp_catalog_preset(
         tags: tags.iter().map(ToString::to_string).collect(),
         editable: true,
     }
+}
+
+fn generic_acp_catalog_preset(entry: &AcpAgentCatalogEntry) -> AcpProviderCatalogPreset {
+    let (command, args) = entry
+        .command
+        .split_first()
+        .expect("bundled ACP Agent commands are non-empty");
+    let mut preset = acp_catalog_preset(
+        entry.preset_id,
+        entry.label,
+        entry.description,
+        command,
+        args,
+        &["local", "acp", entry.id],
+    );
+    preset.default_config.env = entry
+        .env
+        .iter()
+        .map(|(key, value)| AcpProviderEnvReference {
+            key: (*key).to_string(),
+            source: AcpProviderEnvSource::Literal,
+            value: Some((*value).to_string()),
+            secret_lookup_key: None,
+            redacted_hint: "bundled catalog value".to_string(),
+        })
+        .collect();
+    if entry.supports_mcp_servers == Some(false) {
+        preset
+            .default_config
+            .features
+            .retain(|feature| !matches!(feature.as_str(), "mcp" | "mcp_servers"));
+    }
+    preset
 }
 
 fn opencode_acp_preset() -> AcpProviderCatalogPreset {
@@ -6696,7 +6687,14 @@ mod tests {
     fn enabling_acp_catalog_agents_seeds_default_profiles() {
         let dir = tempdir().unwrap();
         let service = ProviderConfigService::new(dir.path().join("vibex.db"));
-        for agent_id in ["gemini", "copilot", "qwen-code", "goose", "opencode"] {
+        for agent_id in [
+            "gemini",
+            "glm-acp-agent",
+            "copilot",
+            "qwen-code",
+            "goose",
+            "opencode",
+        ] {
             let snapshot = service
                 .update_agent_config(AgentUpdateConfigRequest {
                     agent_id: AgentId::parse(agent_id).unwrap(),
@@ -6749,7 +6747,136 @@ mod tests {
                 !config.command.trim().is_empty(),
                 "{agent_id} profile must have a command"
             );
+            if agent_id == "glm-acp-agent" {
+                assert_eq!(config.command, "npx");
+                assert_eq!(config.args, ["-y", "glm-acp-agent@1.1.4"]);
+            }
         }
+    }
+
+    #[test]
+    fn agent_definitions_and_acp_presets_stay_synchronized() {
+        let definition_presets = builtin_agent_definitions()
+            .into_iter()
+            .map(|definition| {
+                definition
+                    .params
+                    .get("preset")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_else(|| panic!("{} is missing an ACP preset", definition.id))
+                    .to_string()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let catalog_presets = bundled_acp_catalog_presets()
+            .into_iter()
+            .map(|preset| preset.preset_id)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(definition_presets.len(), 39);
+        assert_eq!(definition_presets, catalog_presets);
+    }
+
+    #[test]
+    fn generic_acp_presets_preserve_commands_and_literal_environment() {
+        let presets = bundled_acp_catalog_presets();
+        for (preset_id, command, args) in [
+            ("glm-acp-agent", "npx", &["-y", "glm-acp-agent@1.1.4"][..]),
+            (
+                "gemini",
+                "npx",
+                &["-y", "@google/gemini-cli@0.47.0", "--acp"][..],
+            ),
+            (
+                "qwen-code",
+                "npx",
+                &[
+                    "-y",
+                    "@qwen-code/qwen-code@0.18.4",
+                    "--acp",
+                    "--experimental-skills",
+                ][..],
+            ),
+            (
+                "fast-agent",
+                "uvx",
+                &["--from", "fast-agent-acp==0.7.21", "fast-agent-acp", "-x"][..],
+            ),
+            ("cursor", "cursor-agent", &["acp"][..]),
+            ("kimi-cli", "kimi", &["acp"][..]),
+        ] {
+            let config = &presets
+                .iter()
+                .find(|preset| preset.preset_id == preset_id)
+                .unwrap_or_else(|| panic!("missing ACP preset {preset_id}"))
+                .default_config;
+            assert_eq!(config.command, command);
+            assert_eq!(config.args, args);
+            assert_eq!(config.process_strategy, AcpProcessStrategy::PerSession);
+            assert_eq!(config.cwd_template.as_deref(), Some("{workspaceRoot}"));
+        }
+
+        let auggie = presets
+            .iter()
+            .find(|preset| preset.preset_id == "auggie")
+            .unwrap();
+        assert_eq!(
+            auggie
+                .default_config
+                .env
+                .iter()
+                .map(|reference| (reference.key.as_str(), reference.value.as_deref()))
+                .collect::<Vec<_>>(),
+            [("AUGMENT_DISABLE_AUTO_UPDATE", Some("1"))]
+        );
+
+        let factory = presets
+            .iter()
+            .find(|preset| preset.preset_id == "factory-droid")
+            .unwrap();
+        let factory_env = factory
+            .default_config
+            .env
+            .iter()
+            .map(|reference| {
+                (
+                    reference.key.as_str(),
+                    reference.source,
+                    reference.value.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            factory_env,
+            [
+                (
+                    "DROID_DISABLE_AUTO_UPDATE",
+                    AcpProviderEnvSource::Literal,
+                    Some("true")
+                ),
+                (
+                    "FACTORY_DROID_AUTO_UPDATE_ENABLED",
+                    AcpProviderEnvSource::Literal,
+                    Some("false")
+                ),
+            ]
+        );
+
+        let vtcode = presets
+            .iter()
+            .find(|preset| preset.preset_id == "vtcode")
+            .unwrap();
+        assert_eq!(
+            vtcode
+                .default_config
+                .env
+                .iter()
+                .map(|reference| (reference.key.as_str(), reference.value.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                ("VT_ACP_ENABLED", Some("1")),
+                ("VT_ACP_ZED_ENABLED", Some("1")),
+            ]
+        );
     }
     use vibex_core::{
         AcpProcessStrategy, AcpProviderConfig, AcpProviderProfileCreateRequest, AgentId,
