@@ -112,6 +112,85 @@ indicator renders. Do not write this presentation state back to the session
 cache, and only show the continue banner when the latest displayed turn still
 ends in an error.
 
+## Scenario: Live Reasoning As Turn Progress
+
+### 1. Scope / Trigger
+
+- Trigger: an ACP Agent streams non-final reasoning while a conversation turn is
+  running. The authoritative timeline persists that payload, while the turn view
+  needs a replaceable loading label rather than a permanent process row.
+
+### 2. Signatures
+
+```rust
+TimelinePayload::Reasoning(ReasoningPayload { text, is_final })
+
+TimelineConversationTurn {
+    live_status: Option<String>,
+    process_rows: Vec<TimelineRow>,
+    complete: bool,
+}
+```
+
+### 3. Contracts
+
+- `desktop-model` owns this projection. The GPUI renderer must not inspect ACP
+  `session/update` or `agent_thought_chunk` payloads.
+- The latest non-empty `Reasoning { is_final: false }` timeline item becomes
+  `live_status` while the turn is incomplete and is removed from
+  `process_rows`. Select from authoritative items rather than a merged row body,
+  so multiple adjacent status updates do not accumulate in the loading label.
+- A pending permission label takes precedence over `live_status`; otherwise
+  `live_status` replaces the localized default `Thinking...` label.
+- Progress labels render with exactly one ASCII `...` suffix. The projection is
+  cleared when the turn completes, so non-final reasoning does not remain in
+  conversation history.
+- `Reasoning { is_final: true }` remains a historical process row. Tool, command,
+  file, plan, and final Agent content keep their existing canonical renderers.
+
+### 4. Validation & Error Matrix
+
+- Empty or whitespace-only non-final reasoning -> ignore it and use the default
+  loading label.
+- Multiple non-final reasoning segments -> show the latest item and
+  retain no non-final reasoning process rows.
+- Pending permission plus live reasoning -> show the localized waiting-for-
+  confirmation label.
+- Completed turn -> `live_status = None`; keep only final reasoning history.
+- Authoritative last-session state is Idle/Error/Closed/Archived without final
+  Agent text -> complete the turn and clear the loading label.
+
+### 5. Good/Base/Bad Cases
+
+- Good: `Planning targeted extraction` replaces `Thinking...` during the turn,
+  then disappears when the final answer arrives.
+- Base: an Agent that emits no reasoning keeps the localized default loading
+  label.
+- Bad: the View parses `agent_thought_chunk`, or completed history retains every
+  transient reasoning status as a separate row.
+
+### 6. Tests Required
+
+- `vibex-desktop-model` asserts active projection, latest-status selection,
+  process-row filtering, completion cleanup, and final-reasoning retention.
+- `vibex-desktop` asserts progress suffix normalization and localized waiting
+  copy.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+TimelineRowKind::Reasoning => render_process_row(row)
+```
+
+#### Correct
+
+```rust
+let label = turn.live_status.as_deref().unwrap_or(strings.agent_pending_response);
+render_agent_thinking_indicator(&agent_progress_label(label), cx)
+```
+
 ## Provider State
 
 Provider state displayed in the UI should come from Vibex Provider Profiles,

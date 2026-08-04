@@ -1940,6 +1940,7 @@ fn timeline_conversation_turn_resident_bytes(turn: &TimelineConversationTurn) ->
     turn.id
         .len()
         .saturating_add(turn.runtime_attribution.as_ref().map_or(0, String::len))
+        .saturating_add(turn.live_status.as_ref().map_or(0, String::len))
         .saturating_add(turn.user_row.as_ref().map_or(0, row_bytes))
         .saturating_add(
             turn.process_rows
@@ -19440,11 +19441,17 @@ impl VibexWorkbench {
                     response.child(self.render_timeline_row(conclusion_row, true, window, cx));
             } else if !turn.complete {
                 let pending_label = if turn.pending_permission {
-                    strings.agent_waiting_confirmation
+                    strings.agent_waiting_confirmation.to_string()
                 } else {
-                    strings.agent_pending_response
+                    turn.live_status
+                        .as_deref()
+                        .unwrap_or(strings.agent_pending_response)
+                        .to_string()
                 };
-                response = response.child(render_agent_thinking_indicator(pending_label, cx));
+                response = response.child(render_agent_thinking_indicator(
+                    &agent_progress_label(&pending_label),
+                    cx,
+                ));
             }
             content = content.child(response);
         }
@@ -20513,7 +20520,7 @@ impl VibexWorkbench {
                         cx.notify();
                     }))
                     .child(
-                        process_activity_icon(latest_row.kind)
+                        process_activity_icon(projection.icon)
                             .size(px(14.0))
                             .flex_none(),
                     )
@@ -20549,7 +20556,7 @@ impl VibexWorkbench {
         // Lightweight tool activity is a single muted line. Structured command,
         // file, and image payloads use their dedicated renderers instead.
         let projection = self.tool_card_projection_cached(row);
-        let icon = process_activity_icon(row.kind);
+        let icon = process_activity_icon(projection.icon);
         let has_details = !projection.details.is_empty();
         let expanded = has_details
             && self
@@ -24797,6 +24804,7 @@ struct ToolCardProjection {
     title: String,
     details: Vec<(String, String)>,
     failed: bool,
+    icon: ProcessActivityIcon,
 }
 
 impl ToolCardProjection {
@@ -24810,16 +24818,135 @@ impl ToolCardProjection {
     }
 }
 
-fn process_activity_icon(kind: TimelineRowKind) -> Icon {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessActivityIcon {
+    Command,
+    Search,
+    Directory,
+    FileRead,
+    FileEdit,
+    FileCreate,
+    FileDelete,
+    Todo,
+    Collaboration,
+    Image,
+    Integration,
+    Generic,
+}
+
+fn process_activity_icon(kind: ProcessActivityIcon) -> Icon {
     match kind {
-        TimelineRowKind::Command => Icon::new(IconName::SquareTerminal),
-        TimelineRowKind::WebSearch => Icon::new(IconName::Search),
-        TimelineRowKind::FileOperation => Icon::default().path("icons/vibex/file-text.svg"),
-        TimelineRowKind::TodoUpdate => Icon::default().path("icons/vibex/list-checks.svg"),
-        TimelineRowKind::Collaboration => Icon::new(IconName::User),
-        TimelineRowKind::ImageGeneration => Icon::default().path("icons/vibex/image.svg"),
-        _ => Icon::default().path("icons/vibex/zap.svg"),
+        ProcessActivityIcon::Command => Icon::new(IconName::SquareTerminal),
+        ProcessActivityIcon::Search => Icon::new(IconName::Search),
+        ProcessActivityIcon::Directory => Icon::new(IconName::Folder),
+        ProcessActivityIcon::FileRead => Icon::new(IconName::BookOpen),
+        ProcessActivityIcon::FileEdit => Icon::default().path("icons/vibex/pencil.svg"),
+        ProcessActivityIcon::FileCreate => Icon::default().path("icons/vibex/file-plus.svg"),
+        ProcessActivityIcon::FileDelete => Icon::default().path("icons/vibex/trash-2.svg"),
+        ProcessActivityIcon::Todo => Icon::default().path("icons/vibex/list-checks.svg"),
+        ProcessActivityIcon::Collaboration => Icon::new(IconName::User),
+        ProcessActivityIcon::Image => Icon::default().path("icons/vibex/image.svg"),
+        ProcessActivityIcon::Integration => Icon::default().path("icons/vibex/plug-zap.svg"),
+        ProcessActivityIcon::Generic => Icon::default().path("icons/vibex/zap.svg"),
     }
+}
+
+fn generic_tool_activity_icon(tool_name: &str, summary: &str) -> ProcessActivityIcon {
+    semantic_tool_activity_icon(tool_name)
+        .or_else(|| semantic_tool_activity_icon(summary))
+        .unwrap_or(ProcessActivityIcon::Generic)
+}
+
+fn semantic_tool_activity_icon(value: &str) -> Option<ProcessActivityIcon> {
+    let terms = normalized_activity_terms(value);
+    let has_any = |candidates: &[&str]| {
+        terms
+            .split_whitespace()
+            .any(|term| candidates.contains(&term))
+    };
+
+    if has_any(&[
+        "command",
+        "execute",
+        "exec",
+        "shell",
+        "terminal",
+        "bash",
+        "powershell",
+        "run",
+        "ran",
+    ]) {
+        Some(ProcessActivityIcon::Command)
+    } else if has_any(&["search", "searched", "grep", "find", "query", "rg"]) {
+        Some(ProcessActivityIcon::Search)
+    } else if has_any(&[
+        "list",
+        "listed",
+        "glob",
+        "directory",
+        "directories",
+        "folder",
+        "folders",
+        "tree",
+    ]) {
+        Some(ProcessActivityIcon::Directory)
+    } else if has_any(&["delete", "deleted", "remove", "removed", "trash"]) {
+        Some(ProcessActivityIcon::FileDelete)
+    } else if has_any(&["create", "created", "write", "wrote", "add", "added", "new"]) {
+        Some(ProcessActivityIcon::FileCreate)
+    } else if has_any(&[
+        "edit", "edited", "patch", "patched", "replace", "replaced", "update", "updated",
+    ]) {
+        Some(ProcessActivityIcon::FileEdit)
+    } else if has_any(&[
+        "read",
+        "view",
+        "viewed",
+        "open",
+        "opened",
+        "inspect",
+        "inspected",
+        "load",
+        "loaded",
+    ]) {
+        Some(ProcessActivityIcon::FileRead)
+    } else if has_any(&["todo", "plan", "checklist"]) {
+        Some(ProcessActivityIcon::Todo)
+    } else if has_any(&["agent", "collaboration", "delegate", "task"]) {
+        Some(ProcessActivityIcon::Collaboration)
+    } else if has_any(&["image", "picture", "photo"]) {
+        Some(ProcessActivityIcon::Image)
+    } else if has_any(&["mcp", "plugin", "integration", "skill"]) {
+        Some(ProcessActivityIcon::Integration)
+    } else {
+        None
+    }
+}
+
+fn normalized_activity_terms(value: &str) -> String {
+    let mut terms = String::with_capacity(value.len());
+    let mut previous_was_lower_or_digit = false;
+    let mut previous_was_separator = true;
+    for character in value.trim().chars() {
+        if character.is_ascii_alphanumeric() {
+            if character.is_ascii_uppercase()
+                && previous_was_lower_or_digit
+                && !previous_was_separator
+            {
+                terms.push(' ');
+            }
+            terms.push(character.to_ascii_lowercase());
+            previous_was_lower_or_digit =
+                character.is_ascii_lowercase() || character.is_ascii_digit();
+            previous_was_separator = false;
+        } else if !previous_was_separator && !terms.is_empty() {
+            terms.push(' ');
+            previous_was_lower_or_digit = false;
+            previous_was_separator = true;
+        }
+    }
+    terms.truncate(terms.trim_end().len());
+    terms
 }
 
 fn plan_step_status_text(status: vibex_core::PlanStepStatus) -> &'static str {
@@ -25087,7 +25214,17 @@ fn permission_response_label(kind: PermissionResponseKind) -> &'static str {
     }
 }
 
-fn render_agent_thinking_indicator(label: &'static str, cx: &App) -> AnyElement {
+fn agent_progress_label(label: &str) -> String {
+    let compact = compact_agent_turn_preview_message(label);
+    let stem = compact.trim_end().trim_end_matches(['.', '…']).trim_end();
+    if stem.is_empty() {
+        "...".to_string()
+    } else {
+        format!("{stem}...")
+    }
+}
+
+fn render_agent_thinking_indicator(label: &str, cx: &App) -> AnyElement {
     let base = cx.theme().muted_foreground.opacity(0.75);
     let glow = cx.theme().foreground;
     let character_count = label.chars().count();
@@ -25150,6 +25287,7 @@ fn tool_card_projection(
                 title,
                 details,
                 failed: tool.status == Status::Failed,
+                icon: generic_tool_activity_icon(&tool.tool_name, &tool.summary),
             }
         }
         Some(Payload::FileOperation(operation)) => ToolCardProjection {
@@ -25163,6 +25301,14 @@ fn tool_card_projection(
                 ("summary".to_string(), operation.summary.clone()),
             ],
             failed: false,
+            icon: match operation.operation {
+                vibex_core::FileOperationKind::Read => ProcessActivityIcon::FileRead,
+                vibex_core::FileOperationKind::Write => ProcessActivityIcon::FileCreate,
+                vibex_core::FileOperationKind::Edit | vibex_core::FileOperationKind::Move => {
+                    ProcessActivityIcon::FileEdit
+                }
+                vibex_core::FileOperationKind::Delete => ProcessActivityIcon::FileDelete,
+            },
         },
         Some(Payload::WebSearch(search)) => {
             let mut details = vec![("query".to_string(), search.query.clone())];
@@ -25173,6 +25319,7 @@ fn tool_card_projection(
                 title: search.query.clone(),
                 details,
                 failed: search.status == Status::Failed,
+                icon: ProcessActivityIcon::Search,
             }
         }
         Some(Payload::TodoUpdate(todo)) => ToolCardProjection {
@@ -25188,6 +25335,7 @@ fn tool_card_projection(
                 })
                 .collect(),
             failed: false,
+            icon: ProcessActivityIcon::Todo,
         },
         Some(Payload::Collaboration(collaboration)) => {
             let mut details = vec![("action".to_string(), collaboration.action.clone())];
@@ -25203,6 +25351,7 @@ fn tool_card_projection(
                 },
                 details,
                 failed: collaboration.status == Status::Failed,
+                icon: ProcessActivityIcon::Collaboration,
             }
         }
         Some(Payload::Command(command)) => {
@@ -25221,6 +25370,7 @@ fn tool_card_projection(
                 title: command.command.clone(),
                 details,
                 failed: command.status == vibex_core::CommandStatus::Failed,
+                icon: ProcessActivityIcon::Command,
             }
         }
         Some(Payload::ImageGeneration(image)) => {
@@ -25236,6 +25386,7 @@ fn tool_card_projection(
                 title: "Image generation".to_string(),
                 details,
                 failed: image.status == Status::Failed,
+                icon: ProcessActivityIcon::Image,
             }
         }
         _ => ToolCardProjection {
@@ -25246,6 +25397,15 @@ fn tool_card_projection(
                 vec![("summary".to_string(), row.body.clone())]
             },
             failed: row.failed,
+            icon: match row.kind {
+                TimelineRowKind::Command => ProcessActivityIcon::Command,
+                TimelineRowKind::WebSearch => ProcessActivityIcon::Search,
+                TimelineRowKind::FileOperation => ProcessActivityIcon::FileRead,
+                TimelineRowKind::TodoUpdate => ProcessActivityIcon::Todo,
+                TimelineRowKind::Collaboration => ProcessActivityIcon::Collaboration,
+                TimelineRowKind::ImageGeneration => ProcessActivityIcon::Image,
+                _ => ProcessActivityIcon::Generic,
+            },
         },
     }
 }
@@ -30739,6 +30899,7 @@ mod tests {
             user_row: None,
             process_rows: Vec::new(),
             process_activity_groups: Vec::new(),
+            live_status: None,
             conclusion_row: None,
             runtime_attribution: None,
             complete,
@@ -30754,6 +30915,49 @@ mod tests {
 
         assert!(summary.has_incomplete_turn);
         assert!(summary.has_pending_permission);
+    }
+
+    #[test]
+    fn agent_progress_labels_have_one_ascii_ellipsis() {
+        assert_eq!(
+            agent_progress_label("Planning targeted guide extraction"),
+            "Planning targeted guide extraction..."
+        );
+        assert_eq!(agent_progress_label("等待确认中"), "等待确认中...");
+        assert_eq!(agent_progress_label("Thinking..."), "Thinking...");
+        assert_eq!(agent_progress_label("Inspecting…"), "Inspecting...");
+    }
+
+    #[test]
+    fn generic_tool_activity_icons_follow_tool_semantics() {
+        assert_eq!(
+            generic_tool_activity_icon("read_file", "Read files"),
+            ProcessActivityIcon::FileRead
+        );
+        assert_eq!(
+            generic_tool_activity_icon("read_file", "Ran a command while reading"),
+            ProcessActivityIcon::FileRead
+        );
+        assert_eq!(
+            generic_tool_activity_icon("execute", "Ran commands"),
+            ProcessActivityIcon::Command
+        );
+        assert_eq!(
+            generic_tool_activity_icon("list_directory", "Listed files"),
+            ProcessActivityIcon::Directory
+        );
+        assert_eq!(
+            generic_tool_activity_icon("grep", "Searched for ProviderEvent"),
+            ProcessActivityIcon::Search
+        );
+        assert_eq!(
+            generic_tool_activity_icon("apply_patch", "Updated app.rs"),
+            ProcessActivityIcon::FileEdit
+        );
+        assert_eq!(
+            generic_tool_activity_icon("mcp", "Called external integration"),
+            ProcessActivityIcon::Integration
+        );
     }
 
     #[test]
@@ -33079,7 +33283,7 @@ mod tests {
         assert!(turn.contains("strings.agent_waiting_confirmation"));
         assert_eq!(
             locale::strings(locale::ResolvedLocale::ZhCn).agent_waiting_confirmation,
-            "等待确认中"
+            "等待确认中..."
         );
     }
 
@@ -34708,6 +34912,7 @@ mod tests {
                 ),
             ],
             process_activity_groups: Vec::new(),
+            live_status: None,
             conclusion_row: Some(row(
                 "conclusion",
                 TimelineRowKind::AgentMessage,

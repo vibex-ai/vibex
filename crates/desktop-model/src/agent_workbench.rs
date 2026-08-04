@@ -208,6 +208,8 @@ pub struct TimelineConversationTurn {
     pub process_rows: Vec<TimelineRow>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub process_activity_groups: Vec<TimelineProcessActivityGroup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_status: Option<String>,
     pub conclusion_row: Option<TimelineRow>,
     pub runtime_attribution: Option<String>,
     pub complete: bool,
@@ -406,6 +408,18 @@ pub fn timeline_conversation_turns(
                 row.streaming = false;
                 row.conclusion = true;
             }
+            let live_status = turn
+                .response_items
+                .iter()
+                .rev()
+                .find_map(|item| match &item.payload {
+                    TimelinePayload::Reasoning(reasoning) if !reasoning.is_final => {
+                        Some(reasoning.text.trim())
+                    }
+                    _ => None,
+                })
+                .filter(|status| !status.is_empty())
+                .map(str::to_string);
             let final_agent_item_ids = turn
                 .response_items
                 .iter()
@@ -413,7 +427,8 @@ pub fn timeline_conversation_turns(
                 .map(|item| item.id.to_string())
                 .collect::<BTreeSet<_>>();
             turn_rows.retain(|row| {
-                row.kind != TimelineRowKind::PermissionResolution
+                !(row.kind == TimelineRowKind::Reasoning && row.streaming)
+                    && row.kind != TimelineRowKind::PermissionResolution
                     && !matches!(
                         row.kind,
                         TimelineRowKind::Plan | TimelineRowKind::TodoUpdate
@@ -429,8 +444,8 @@ pub fn timeline_conversation_turns(
                 .response_items
                 .iter()
                 .any(|item| is_final_agent_message(item) || is_turn_boundary_error(item));
-            let complete =
-                has_terminal_response || (provider_finished_for_turn && conclusion_row.is_some());
+            let complete = has_terminal_response || provider_finished_for_turn;
+            let live_status = (!complete).then_some(live_status).flatten();
             let started_at_ms = turn
                 .user_item
                 .as_ref()
@@ -452,6 +467,7 @@ pub fn timeline_conversation_turns(
                 user_row,
                 process_rows: turn_rows,
                 process_activity_groups,
+                live_status,
                 conclusion_row,
                 runtime_attribution,
                 complete,
@@ -480,6 +496,7 @@ pub fn timeline_conversation_turns(
             user_row: None,
             process_rows: Vec::new(),
             process_activity_groups: Vec::new(),
+            live_status: None,
             conclusion_row: None,
             runtime_attribution: None,
             complete: false,
@@ -1640,6 +1657,145 @@ mod tests {
         assert_eq!(rows[0].body, "inspect state");
         assert_eq!(rows[0].item_ids.len(), 2);
         assert!(rows[0].streaming);
+    }
+
+    #[test]
+    fn streaming_reasoning_becomes_live_status_instead_of_process_history() {
+        let mut items = vec![
+            item(
+                1,
+                None,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "Inspect the workspace".into(),
+                    attachments: Vec::new(),
+                }),
+            ),
+            item(
+                2,
+                None,
+                TimelinePayload::Reasoning(ReasoningPayload {
+                    text: "Planning targeted extraction".into(),
+                    is_final: false,
+                }),
+            ),
+            item(
+                3,
+                None,
+                TimelinePayload::ToolCall(ToolCallPayload {
+                    tool_call_id: "tool_read".into(),
+                    tool_name: "read".into(),
+                    status: ToolCallStatus::Completed,
+                    summary: "Read files".into(),
+                    input_summary: None,
+                    output_summary: None,
+                    raw_extension: None,
+                }),
+            ),
+            item(
+                4,
+                None,
+                TimelinePayload::Reasoning(ReasoningPayload {
+                    text: "Evaluating ".into(),
+                    is_final: false,
+                }),
+            ),
+            item(
+                5,
+                None,
+                TimelinePayload::Reasoning(ReasoningPayload {
+                    text: "persistence strategy".into(),
+                    is_final: false,
+                }),
+            ),
+        ];
+
+        let active = timeline_conversation_turns(&items, Some(AgentSessionState::Running), false);
+        assert_eq!(active.len(), 1);
+        assert_eq!(
+            active[0].live_status.as_deref(),
+            Some("persistence strategy")
+        );
+        assert_eq!(active[0].process_rows.len(), 1);
+        assert_eq!(active[0].process_rows[0].kind, TimelineRowKind::ToolCall);
+
+        items.push(item(
+            6,
+            None,
+            TimelinePayload::AgentMessage(AgentMessagePayload {
+                text: "Done".into(),
+                is_final: true,
+            }),
+        ));
+        let completed = timeline_conversation_turns(&items, Some(AgentSessionState::Idle), false);
+        assert!(completed[0].complete);
+        assert!(completed[0].live_status.is_none());
+        assert_eq!(completed[0].process_rows.len(), 1);
+        assert_eq!(completed[0].process_rows[0].kind, TimelineRowKind::ToolCall);
+    }
+
+    #[test]
+    fn final_reasoning_keeps_its_historical_process_row() {
+        let items = [
+            item(
+                1,
+                None,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "Explain".into(),
+                    attachments: Vec::new(),
+                }),
+            ),
+            item(
+                2,
+                None,
+                TimelinePayload::Reasoning(ReasoningPayload {
+                    text: "Published reasoning".into(),
+                    is_final: true,
+                }),
+            ),
+            item(
+                3,
+                None,
+                TimelinePayload::AgentMessage(AgentMessagePayload {
+                    text: "Answer".into(),
+                    is_final: true,
+                }),
+            ),
+        ];
+
+        let turns = timeline_conversation_turns(&items, Some(AgentSessionState::Idle), false);
+
+        assert_eq!(turns[0].process_rows.len(), 1);
+        assert_eq!(turns[0].process_rows[0].kind, TimelineRowKind::Reasoning);
+        assert_eq!(turns[0].process_rows[0].body, "Published reasoning");
+    }
+
+    #[test]
+    fn idle_reasoning_only_turn_clears_live_status_and_completes() {
+        let items = [
+            item(
+                1,
+                None,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "Inspect".into(),
+                    attachments: Vec::new(),
+                }),
+            ),
+            item(
+                2,
+                None,
+                TimelinePayload::Reasoning(ReasoningPayload {
+                    text: "Inspecting files".into(),
+                    is_final: false,
+                }),
+            ),
+        ];
+
+        let turns = timeline_conversation_turns(&items, Some(AgentSessionState::Idle), false);
+
+        assert!(turns[0].complete);
+        assert!(turns[0].live_status.is_none());
+        assert!(turns[0].process_rows.is_empty());
+        assert!(turns[0].conclusion_row.is_none());
     }
 
     #[test]
