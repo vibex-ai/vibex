@@ -6378,6 +6378,7 @@ impl TimelineRepository {
         Ok(item)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert_by_provider_correlation(
         conn: &mut Connection,
         session_id: &VibexSessionId,
@@ -9040,6 +9041,7 @@ pub fn run_smoke(path: &Path) -> VibexResult<DatabaseSmokeResult> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_timeline_in_transaction(
     tx: &Transaction<'_>,
     session_id: &VibexSessionId,

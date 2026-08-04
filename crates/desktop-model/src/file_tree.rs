@@ -8,19 +8,17 @@ use vibex_core::{FileEntryKind, FileTreeEntry, GitChange, GitChangeKind, Workspa
 pub const FILE_TREE_MAX_ROWS: usize = 100_000;
 pub const FILE_TREE_DEFAULT_OVERSCAN: usize = 24;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileTreeLoadState {
+    #[default]
     Unloaded,
     Loading,
     Loaded,
-    Error { code: String, retryable: bool },
-}
-
-impl Default for FileTreeLoadState {
-    fn default() -> Self {
-        Self::Unloaded
-    }
+    Error {
+        code: String,
+        retryable: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

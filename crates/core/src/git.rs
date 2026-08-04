@@ -403,9 +403,10 @@ pub struct GitWorktreeLockKey {
     pub key: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GitWorktreeOperationCheckpoint {
+    #[default]
     IntentRecorded,
     LocksAcquired,
     GitAddStarted,
@@ -431,12 +432,6 @@ pub enum GitWorktreeOperationCheckpoint {
     NeedsAttention,
     #[serde(other)]
     Unknown,
-}
-
-impl Default for GitWorktreeOperationCheckpoint {
-    fn default() -> Self {
-        Self::IntentRecorded
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -529,19 +524,14 @@ impl Default for GitWorktreeOperationDetail {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GitWorktreeMergeStrategy {
+    #[default]
     NoFfMerge,
     RebaseAndMerge,
     #[serde(other)]
     Unknown,
-}
-
-impl Default for GitWorktreeMergeStrategy {
-    fn default() -> Self {
-        Self::NoFfMerge
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -612,21 +602,16 @@ pub struct GitWorktreeReadinessRecord {
     pub updated_at_ms: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GitWorktreeReconciliationState {
+    #[default]
     Unverified,
     Consistent,
     Recoverable,
     NeedsAttention,
     #[serde(other)]
     Unknown,
-}
-
-impl Default for GitWorktreeReconciliationState {
-    fn default() -> Self {
-        Self::Unverified
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

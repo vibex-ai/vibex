@@ -976,24 +976,13 @@ pub struct RuntimeEventCursor {
     pub sequence: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeLeaseRoleCounts {
     pub owner: u32,
     pub viewer: u32,
     pub background_worker: u32,
     pub switch_preparation: u32,
-}
-
-impl Default for RuntimeLeaseRoleCounts {
-    fn default() -> Self {
-        Self {
-            owner: 0,
-            viewer: 0,
-            background_worker: 0,
-            switch_preparation: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

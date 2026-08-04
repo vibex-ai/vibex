@@ -84,6 +84,7 @@ use vibex_db::{
     SwitchOperationRecord, apply_migrations, open_database,
 };
 
+use crate::process_environment::sanitize_inherited_appimage_environment;
 use crate::process_registry::{
     AcpProcessCrash, AcpProcessHandle, AcpProcessInstanceId, AcpProcessRegistry, AcpProcessStatus,
     MultiSessionContractEvidence, ProcessAcquireKey, ProcessExitReporter, ProcessLease,
@@ -8056,6 +8057,7 @@ impl AcpRuntimeClient {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        sanitize_inherited_appimage_environment(command.as_std_mut());
         for key in PARENT_SESSION_ENV_KEYS {
             command.env_remove(key);
         }

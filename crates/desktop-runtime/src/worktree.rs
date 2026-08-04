@@ -933,6 +933,7 @@ impl WorktreeCoordinator {
         WorktreeOperationRepository::save(&connection, &operation)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_rebase_and_merge(
         &self,
         connection: &vibex_db::DbConnection,
@@ -1001,6 +1002,7 @@ impl WorktreeCoordinator {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finish_rebase_and_merge(
         &self,
         connection: &vibex_db::DbConnection,
@@ -2140,6 +2142,7 @@ impl WorktreeCoordinator {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_create_intent(
         &self,
         connection: &vibex_db::DbConnection,

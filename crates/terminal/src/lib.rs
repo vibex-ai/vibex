@@ -672,16 +672,18 @@ fn refresh_exit_status(runtime: &mut TerminalRuntime) -> VibexResult<()> {
     if runtime.session.status != TerminalStatus::Running {
         return Ok(());
     }
-    match runtime.child.try_wait().map_err(|err| {
-        VibexError::process("terminal_wait_failed", "failed to inspect terminal process")
-            .with_diagnostic("error", err.to_string())
-    })? {
-        Some(_) => {
-            runtime.session.status = TerminalStatus::Exited;
-            runtime.session.updated_at_ms = unix_timestamp_ms();
-            runtime.session.closed_at_ms = Some(runtime.session.updated_at_ms);
-        }
-        None => {}
+    if runtime
+        .child
+        .try_wait()
+        .map_err(|err| {
+            VibexError::process("terminal_wait_failed", "failed to inspect terminal process")
+                .with_diagnostic("error", err.to_string())
+        })?
+        .is_some()
+    {
+        runtime.session.status = TerminalStatus::Exited;
+        runtime.session.updated_at_ms = unix_timestamp_ms();
+        runtime.session.closed_at_ms = Some(runtime.session.updated_at_ms);
     }
     Ok(())
 }

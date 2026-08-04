@@ -26,6 +26,7 @@ use crate::private_fs::{
     ensure_private_runtime_directory, ensure_private_runtime_file,
     write_private_runtime_file_atomic,
 };
+use crate::process_environment::sanitize_inherited_appimage_environment;
 use crate::protocol::{AcpOperation, build_initialize_params, decode_incoming};
 use crate::registry::{
     AcpAgentCompatibility, AdapterCompatibilityIdentity, ManagedRuntimeDependency,
@@ -493,6 +494,7 @@ async fn probe_initialize(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    sanitize_inherited_appimage_environment(command.as_std_mut());
     for key in PARENT_SESSION_ENV_KEYS {
         command.env_remove(key);
     }
@@ -700,6 +702,7 @@ async fn run_bounded_output(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    sanitize_inherited_appimage_environment(command.as_std_mut());
     for key in PARENT_SESSION_ENV_KEYS {
         command.env_remove(key);
     }
@@ -1242,6 +1245,7 @@ impl NpmInstallExecutor for SystemNpmInstallExecutor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        sanitize_inherited_appimage_environment(command.as_std_mut());
         let output = timeout(self.timeout, command.output())
             .await
             .map_err(|_| {

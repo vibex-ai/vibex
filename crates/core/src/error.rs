@@ -30,7 +30,7 @@ pub struct VibexError {
     pub category: ErrorCategory,
     pub code: String,
     pub message: String,
-    pub recovery_hint: Option<String>,
+    pub recovery_hint: Option<Box<str>>,
     pub correlation_id: Option<CorrelationId>,
     pub diagnostics: Vec<RedactedDiagnostic>,
 }
@@ -78,7 +78,7 @@ impl VibexError {
     }
 
     pub fn with_recovery_hint(mut self, hint: impl Into<String>) -> Self {
-        self.recovery_hint = Some(hint.into());
+        self.recovery_hint = Some(hint.into().into_boxed_str());
         self
     }
 
@@ -110,5 +110,10 @@ mod tests {
         assert_eq!(json["category"], "process");
         assert_eq!(json["code"], "binary_missing");
         assert_eq!(json["recoveryHint"], "Install Codex CLI and retry");
+    }
+
+    #[test]
+    fn error_stays_below_clippy_large_result_threshold() {
+        assert!(std::mem::size_of::<VibexError>() < 128);
     }
 }

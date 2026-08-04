@@ -61,7 +61,7 @@ impl RelayKeypair {
         {
             let secret = StaticSecret::random_from_rng(OsRng);
             let public_key = PublicKey::from(&secret);
-            return Self { secret, public_key };
+            Self { secret, public_key }
         }
         #[cfg(target_family = "wasm")]
         {
@@ -524,6 +524,7 @@ fn random_nonce() -> VibexResult<[u8; NONCE_SIZE]> {
     Ok(nonce)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn relay_transcript_hash(
     protocol_version: RelayProtocolVersion,
     endpoint: &str,
@@ -552,6 +553,7 @@ pub fn relay_transcript_hash(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn relay_transcript_hash_with_ephemeral(
     protocol_version: RelayProtocolVersion,
     endpoint: &str,
@@ -587,6 +589,7 @@ pub fn relay_transcript_hash_with_ephemeral(
 /// Canonical, role-independent handshake transcript used for static identity
 /// authentication and ephemeral key confirmation.  Peer tuples are ordered by
 /// peer id so both sides serialize exactly the same bytes.
+#[allow(clippy::too_many_arguments)]
 pub fn relay_handshake_transcript(
     protocol_version: RelayProtocolVersion,
     endpoint: &str,
@@ -790,6 +793,7 @@ fn derive_direction_key(
     Ok(key)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn derive_ephemeral_direction_key(
     shared_secret: &[u8; KEY_SIZE],
     config: &RelaySessionConfig,

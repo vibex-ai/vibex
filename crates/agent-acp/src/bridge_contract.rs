@@ -18,6 +18,7 @@ use tokio::time::{sleep, timeout};
 use vibex_core::{VibexError, VibexResult};
 
 use crate::managed_adapter::VerifiedAcpAdapterInstallation;
+use crate::process_environment::sanitize_inherited_appimage_environment;
 use crate::protocol::{
     AcpOperation, build_initialize_params, build_session_cancel_params, build_session_load_params,
     build_session_new_params, build_session_prompt_params, decode_incoming,
@@ -634,6 +635,7 @@ impl BridgeConnection {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        sanitize_inherited_appimage_environment(command.as_std_mut());
         for key in PARENT_SESSION_ENV_KEYS {
             command.env_remove(key);
         }

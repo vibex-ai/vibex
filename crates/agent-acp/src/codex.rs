@@ -145,16 +145,16 @@ pub async fn run_codex_agent_acp_smoke(prompt: Option<String>) -> VibexResult<Co
     let workspace_path = crate::resolve_agent_smoke_workspace("codex-acp", "direct")?;
     let command =
         std::env::var("VIBEX_CODEX_ACP_COMMAND").unwrap_or_else(|_| "codex-acp".to_string());
-    let output = Command::new(&command)
-        .arg("--version")
-        .output()
-        .map_err(|error| {
-            VibexError::process(
-                "codex_acp_binary_missing",
-                "Codex ACP adapter was not found",
-            )
-            .with_diagnostic("error", error.to_string())
-        })?;
+    let mut version_command = Command::new(&command);
+    version_command.arg("--version");
+    crate::process_environment::sanitize_inherited_appimage_environment(&mut version_command);
+    let output = version_command.output().map_err(|error| {
+        VibexError::process(
+            "codex_acp_binary_missing",
+            "Codex ACP adapter was not found",
+        )
+        .with_diagnostic("error", error.to_string())
+    })?;
     if !output.status.success() {
         return Err(VibexError::process(
             "codex_acp_version_probe_failed",

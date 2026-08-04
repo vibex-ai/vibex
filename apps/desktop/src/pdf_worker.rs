@@ -144,6 +144,7 @@ impl Drop for PdfWorkerTempDir {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_isolated_pdf_request(
     library_path: &Path,
     document_path: &Path,
@@ -409,6 +410,7 @@ fn reap_child(child: &mut Child, kill: bool) {
     let _ = child.wait();
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_pdf_worker_once(
     library_path: impl AsRef<Path>,
     document_path: impl AsRef<Path>,

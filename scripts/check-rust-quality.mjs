@@ -5,18 +5,8 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const RUST_VERSION = "1.97.0";
-const ALLOWLIST_PATH = "docs/development/rust-clippy-allowlist.json";
 const FUTURE_INCOMPAT_ALLOWLIST_PATH =
   "docs/development/rust-future-incompat-allowlist.json";
-const APPROVED_LINTS = [
-  "result_large_err",
-  "derivable_impls",
-  "single_match",
-  "too_many_arguments",
-  "large_enum_variant",
-  "needless_return",
-  "items_after_test_module"
-];
 
 function fail(message) {
   console.error(message);
@@ -40,26 +30,6 @@ function assertToolchainPin() {
   if (!workflow.includes(`dtolnay/rust-toolchain@${RUST_VERSION}`)) {
     fail(`CI must pin dtolnay/rust-toolchain to ${RUST_VERSION}`);
   }
-}
-
-function loadAllowlist() {
-  const parsed = JSON.parse(read(ALLOWLIST_PATH));
-  if (parsed.schemaVersion !== "vibex-clippy-allowlist.v1") {
-    fail(`${ALLOWLIST_PATH} has an unsupported schemaVersion`);
-  }
-  const names = parsed.lints.map((entry) => entry.name);
-  if (JSON.stringify(names) !== JSON.stringify(APPROVED_LINTS)) {
-    fail(
-      `${ALLOWLIST_PATH} must contain only the reviewed lint list in stable order: ` +
-        APPROVED_LINTS.join(", ")
-    );
-  }
-  for (const entry of parsed.lints) {
-    if (!entry.owner?.trim() || !entry.rationale?.trim() || !entry.removalGate?.trim()) {
-      fail(`Clippy allowlist entry ${entry.name} is missing owner, rationale, or removalGate`);
-    }
-  }
-  return names;
 }
 
 function loadFutureIncompatAllowlist() {
@@ -153,7 +123,6 @@ function runFutureCompatibleCheck(allowedPackages) {
 }
 
 assertToolchainPin();
-const allowedLints = loadAllowlist();
 const allowedFutureIncompatibilities = loadFutureIncompatAllowlist();
 const workspacePackages = workspacePackageNames();
 
@@ -171,7 +140,6 @@ run("cargo", [
   "--locked",
   "--",
   "-D",
-  "warnings",
-  ...allowedLints.flatMap((lint) => ["-A", `clippy::${lint}`])
+  "warnings"
 ]);
 run("cargo", ["test", "--workspace", "--locked"]);

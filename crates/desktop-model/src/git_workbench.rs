@@ -38,17 +38,12 @@ pub struct GitQueryTicket {
     pub key: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GitWorkbenchMode {
+    #[default]
     Changes,
     History,
-}
-
-impl Default for GitWorkbenchMode {
-    fn default() -> Self {
-        Self::Changes
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,20 +119,11 @@ pub struct GitMutationScope {
     pub confirmation_label: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitHistoryFilter {
     pub ref_name: Option<String>,
     pub author: Option<String>,
-}
-
-impl Default for GitHistoryFilter {
-    fn default() -> Self {
-        Self {
-            ref_name: None,
-            author: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

@@ -31,23 +31,12 @@ const CC_SWITCH_PROVIDER_ID_OPTION_KEY: &str = "ccSwitchProviderId";
 const CC_SWITCH_APP_TYPE_OPTION_KEY: &str = "ccSwitchAppType";
 const CC_SWITCH_WEBSITE_URL_OPTION_KEY: &str = "ccSwitchWebsiteUrl";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct NativeImportRoots {
     codex_root: Option<PathBuf>,
     claude_root: Option<PathBuf>,
     claude_mcp_path: Option<PathBuf>,
     cc_switch_db_paths: Option<Vec<PathBuf>>,
-}
-
-impl Default for NativeImportRoots {
-    fn default() -> Self {
-        Self {
-            codex_root: None,
-            claude_root: None,
-            claude_mcp_path: None,
-            cc_switch_db_paths: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

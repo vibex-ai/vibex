@@ -17,6 +17,7 @@ use vibex_agent::{
 };
 use vibex_agent_acp::{
     AcpAgentProvider, AcpRuntimeClient, AcpRuntimeLifecycleBackend, AcpRuntimeSwitchBridge,
+    sanitize_inherited_appimage_environment,
 };
 use vibex_config_switch::ProviderConfigService;
 use vibex_core::{
@@ -99,6 +100,7 @@ pub struct FailureObservation {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 enum Progress {
     Phase(&'static str),
     StreamEvent { kind: &'static str },
@@ -575,16 +577,16 @@ fn find_binary(name: &str) -> VibexResult<PathBuf> {
 }
 
 fn command_version(binary: &Path) -> VibexResult<String> {
-    let output = Command::new(binary)
-        .arg("--version")
-        .output()
-        .map_err(|error| {
-            VibexError::process(
-                "acp_version_probe_failed",
-                "ACP executable version probe failed",
-            )
-            .with_diagnostic("error", error.kind().to_string())
-        })?;
+    let mut command = Command::new(binary);
+    command.arg("--version");
+    sanitize_inherited_appimage_environment(&mut command);
+    let output = command.output().map_err(|error| {
+        VibexError::process(
+            "acp_version_probe_failed",
+            "ACP executable version probe failed",
+        )
+        .with_diagnostic("error", error.kind().to_string())
+    })?;
     if !output.status.success() {
         return Err(VibexError::process(
             "acp_version_probe_failed",

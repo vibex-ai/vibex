@@ -44,19 +44,10 @@ pub struct RuntimeBackendSnapshot {
     pub attachment: Option<RuntimeAttachmentSnapshot>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeSweepReport {
     pub attachments_removed: usize,
     pub processes_removed: usize,
-}
-
-impl Default for RuntimeSweepReport {
-    fn default() -> Self {
-        Self {
-            attachments_removed: 0,
-            processes_removed: 0,
-        }
-    }
 }
 
 /// Backend seam implemented by ACP (and replaceable by deterministic tests).

@@ -282,7 +282,7 @@ pub struct ProviderDraftRedactedSummary {
     pub secret_configured: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProviderCenterSnapshot {
     pub agents: Vec<AgentSnapshotEntry>,
     pub catalog: Option<AgentCatalogListResponse>,
@@ -369,22 +369,6 @@ pub struct RecoveryOperationState {
     pub destination: Option<String>,
     pub rollback_available: bool,
     pub error_code: Option<String>,
-}
-
-impl Default for ProviderCenterSnapshot {
-    fn default() -> Self {
-        Self {
-            agents: Vec::new(),
-            catalog: None,
-            profiles: Vec::new(),
-            mcp_servers: Vec::new(),
-            skills: Vec::new(),
-            prompts: Vec::new(),
-            hooks: Vec::new(),
-            scheduled: Vec::new(),
-            graphs: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

@@ -22,7 +22,7 @@ const CODEX_MARKER_END: &str = "# <<< VIBEX MANAGED PROVIDER EXPORT";
 
 #[derive(Debug)]
 struct ApplyFileError {
-    error: VibexError,
+    error: Box<VibexError>,
     restored: bool,
 }
 
@@ -457,24 +457,28 @@ fn apply_file_plan(file: &ProviderNativeExportFilePlan) -> Result<(), ApplyFileE
     if let Err(err) = fs::write(temp, &file.redacted_after) {
         let restored = restore_from_backup(file).is_ok();
         return Err(ApplyFileError {
-            error: VibexError::storage(
-                "provider_native_export_temp_write_failed",
-                "failed to write native export temp file",
-            )
-            .with_diagnostic("tempPath", temp.clone())
-            .with_diagnostic("error", err.to_string()),
+            error: Box::new(
+                VibexError::storage(
+                    "provider_native_export_temp_write_failed",
+                    "failed to write native export temp file",
+                )
+                .with_diagnostic("tempPath", temp.clone())
+                .with_diagnostic("error", err.to_string()),
+            ),
             restored,
         });
     }
     if let Err(err) = fs::rename(temp, &target) {
         let restored = restore_from_backup(file).is_ok();
         return Err(ApplyFileError {
-            error: VibexError::storage(
-                "provider_native_export_atomic_replace_failed",
-                "failed to atomically replace native config",
-            )
-            .with_diagnostic("targetPath", file.target_path.clone())
-            .with_diagnostic("error", err.to_string()),
+            error: Box::new(
+                VibexError::storage(
+                    "provider_native_export_atomic_replace_failed",
+                    "failed to atomically replace native config",
+                )
+                .with_diagnostic("targetPath", file.target_path.clone())
+                .with_diagnostic("error", err.to_string()),
+            ),
             restored,
         });
     }
@@ -483,7 +487,7 @@ fn apply_file_plan(file: &ProviderNativeExportFilePlan) -> Result<(), ApplyFileE
 
 fn unrestored(error: VibexError) -> ApplyFileError {
     ApplyFileError {
-        error,
+        error: Box::new(error),
         restored: false,
     }
 }

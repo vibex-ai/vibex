@@ -20,7 +20,7 @@ pub struct BackendError {
     pub kind: BackendErrorKind,
     pub code: String,
     pub message: String,
-    pub recovery_hint: Option<String>,
+    pub recovery_hint: Option<Box<str>>,
     pub correlation_id: Option<CorrelationId>,
     pub diagnostics: Vec<RedactedDiagnostic>,
 }
@@ -68,7 +68,7 @@ impl BackendError {
     }
 
     pub fn with_recovery_hint(mut self, hint: impl Into<String>) -> Self {
-        self.recovery_hint = Some(hint.into());
+        self.recovery_hint = Some(hint.into().into_boxed_str());
         self
     }
 }
@@ -127,5 +127,10 @@ mod tests {
             assert_eq!(mapped.kind, expected);
             assert_eq!(mapped.code, code);
         }
+    }
+
+    #[test]
+    fn error_stays_below_clippy_large_result_threshold() {
+        assert!(std::mem::size_of::<BackendError>() < 128);
     }
 }

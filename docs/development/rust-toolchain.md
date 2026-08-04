@@ -9,7 +9,7 @@ The root `pnpm check:rust` command is the review gate. It runs:
 ```text
 cargo fmt <every Vibex workspace package> -- --check
 cargo check --workspace --all-targets --locked --future-incompat-report
-cargo clippy --workspace --all-targets --locked -- -D warnings <reviewed allows>
+cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
@@ -17,12 +17,11 @@ Formatting enumerates Cargo workspace members from locked metadata, so the check
 covers all Vibex crates without treating third-party source checkouts as
 workspace-owned code.
 
-## Clippy Allowlist
+## Clippy Policy
 
-The exact Clippy exceptions live in `docs/development/rust-clippy-allowlist.json`.
-Each entry has an owner and a removal gate; the quality script rejects additions,
-removals, reordering, and incomplete ownership. New code therefore cannot expand
-the allowlist without an explicit policy change.
+The workspace gate passes no global lint exceptions. A reviewed exception that
+is intrinsic to one existing API must stay adjacent to that item as a scoped
+`#[allow(...)]`; new code cannot inherit a workspace-wide exemption.
 
 ## Future-Incompatibility Allowlist
 

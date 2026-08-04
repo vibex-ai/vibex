@@ -429,8 +429,10 @@ pub async fn run_claude_agent_acp_smoke(
         .map_err(|error| ClaudeAcpSmokeError::Workspace(error.to_string()))?;
     let command = std::env::var("VIBEX_CLAUDE_ACP_COMMAND")
         .unwrap_or_else(|_| "claude-agent-acp".to_string());
-    let output = Command::new(&command)
-        .arg("--version")
+    let mut version_command = Command::new(&command);
+    version_command.arg("--version");
+    crate::process_environment::sanitize_inherited_appimage_environment(&mut version_command);
+    let output = version_command
         .output()
         .map_err(|error| ClaudeAcpSmokeError::AdapterUnavailable(error.to_string()))?;
     if !output.status.success() {

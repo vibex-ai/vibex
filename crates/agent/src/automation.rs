@@ -839,6 +839,7 @@ impl<'a> AutomationGraphRunner<'a> {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum NodeExecution {
     Succeeded,
     Waiting,

@@ -1116,6 +1116,13 @@ Normal single-session Agent operation must continue with a capability warning.
   compatibility-scoped capability evidence as authoritative.
 - Model command, args, env, cwd template, models, modes, and disabled tools as
   ACP Provider configuration, not UI-specific settings or Native SDK options.
+- On Linux, every ACP adapter, probe, and managed-install child spawned from an
+  AppImage must remove launcher markers and package-only runtime paths from the
+  inherited environment. Preserve host path-list entries in order, and apply
+  explicit Provider environment overlays after sanitation so a configured
+  value remains authoritative. In particular, AppImage `PYTHONHOME` and
+  `PYTHONPATH` must never prevent host Python from importing its standard
+  library in an Agent shell.
 - ACP-native handles live in durable `RuntimeBinding` records and in-memory
   attachment state. Adapter-local `ProviderBinding` values may be synthesized
   from that exact current fence, but are never persisted as session authority.
@@ -1138,6 +1145,9 @@ Normal single-session Agent operation must continue with a capability warning.
 - Default validation must not start Claude, Codex, OpenCode, or another real
   ACP process. Real managed-Adapter startup belongs to explicit environment and
   login-gated smoke tasks.
+- Unit tests for the ACP process environment boundary must cover mixed
+  AppImage/host path lists, package-only Python overrides, removed launcher
+  markers, and an unrelated inherited sentinel that remains untouched.
 
 ## Permissions
 

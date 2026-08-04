@@ -347,6 +347,7 @@ enum GitTreeInteraction {
 }
 
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 enum WorktreeLifecycleConfirmation {
     Merge {
         plan: GitWorktreeMergePlan,

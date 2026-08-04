@@ -53,6 +53,7 @@ mod codex;
 mod events;
 mod managed_adapter;
 mod private_fs;
+mod process_environment;
 mod process_registry;
 mod protocol;
 mod registry;
@@ -88,6 +89,7 @@ pub use managed_adapter::{
     VerifiedAcpAdapterInstallation,
 };
 pub use private_fs::{ensure_private_runtime_directory, write_private_runtime_file_atomic};
+pub use process_environment::sanitize_inherited_appimage_environment;
 pub use process_registry::{
     AcpProcessCrash, AcpProcessHandle, AcpProcessInstanceId, AcpProcessRegistry,
     AcpProcessSnapshot, AcpProcessStatus, MultiSessionContractEvidence, MultiSessionEvidenceKind,
@@ -903,23 +905,24 @@ struct OpenCodeAcpPermissionRequestSummary {
 
 impl OpenCodeAcpStdioSession {
     fn spawn(command: &Path, args: Vec<String>, workspace_path: &Path) -> VibexResult<Self> {
-        let mut child = Command::new(command)
+        let mut command_builder = Command::new(command);
+        command_builder
             .args(&args)
             .current_dir(workspace_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|err| {
-                VibexError::process(
-                    "process/acp_opencode_spawn_failed",
-                    "OpenCode ACP runtime process could not be started",
-                )
-                .with_diagnostic("command", command.display().to_string())
-                .with_diagnostic("args", redacted_args_summary(&args))
-                .with_diagnostic("cwd", workspace_path.display().to_string())
-                .with_diagnostic("error", err.to_string())
-            })?;
+            .stderr(Stdio::piped());
+        process_environment::sanitize_inherited_appimage_environment(&mut command_builder);
+        let mut child = command_builder.spawn().map_err(|err| {
+            VibexError::process(
+                "process/acp_opencode_spawn_failed",
+                "OpenCode ACP runtime process could not be started",
+            )
+            .with_diagnostic("command", command.display().to_string())
+            .with_diagnostic("args", redacted_args_summary(&args))
+            .with_diagnostic("cwd", workspace_path.display().to_string())
+            .with_diagnostic("error", err.to_string())
+        })?;
 
         let stdin = child.stdin.take().ok_or_else(|| {
             VibexError::process(
@@ -2609,9 +2612,10 @@ fn temp_smoke_db_path() -> PathBuf {
 }
 
 fn probe_opencode_version(binary_path: &Path) -> OpenCodeAcpSmokeRunResult<String> {
-    let output = std::process::Command::new(binary_path)
-        .arg("--version")
-        .stdin(Stdio::null())
+    let mut command = std::process::Command::new(binary_path);
+    command.arg("--version").stdin(Stdio::null());
+    process_environment::sanitize_inherited_appimage_environment(&mut command);
+    let output = command
         .output()
         .map_err(|err| OpenCodeAcpSmokeError::VersionProbe(err.to_string()))?;
     if !output.status.success() {

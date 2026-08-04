@@ -4511,34 +4511,31 @@ impl AutoRemoteTransport {
             .unwrap_or_default();
         if !self.config.direct_candidates.is_empty() {
             let probe = DirectWebSocketTransport::new(self.config.remote.clone())?;
-            match probe
+            if let Ok(candidate) = probe
                 .select_direct_candidate(self.config.direct_candidates.clone())
                 .await
             {
-                Ok(candidate) => {
-                    let mut config = self.config.remote.clone();
-                    config.base_url = candidate.candidate.url;
-                    let transport = Shared::new(DirectWebSocketTransport::new(config)?)
-                        as Shared<dyn RemoteTransport>;
-                    transport.seed_cursors(handoff_cursors.clone());
-                    match transport.connect().await {
-                        Ok(info) => {
-                            return self
-                                .install_selected(ActiveRemoteRoute::Direct, transport, info)
-                                .await;
-                        }
-                        Err(error)
-                            if matches!(
-                                error.code.as_str(),
-                                "remote_device_revoked" | "remote_protocol_incompatible"
-                            ) =>
-                        {
-                            return Err(error);
-                        }
-                        Err(_) => {}
+                let mut config = self.config.remote.clone();
+                config.base_url = candidate.candidate.url;
+                let transport = Shared::new(DirectWebSocketTransport::new(config)?)
+                    as Shared<dyn RemoteTransport>;
+                transport.seed_cursors(handoff_cursors.clone());
+                match transport.connect().await {
+                    Ok(info) => {
+                        return self
+                            .install_selected(ActiveRemoteRoute::Direct, transport, info)
+                            .await;
                     }
+                    Err(error)
+                        if matches!(
+                            error.code.as_str(),
+                            "remote_device_revoked" | "remote_protocol_incompatible"
+                        ) =>
+                    {
+                        return Err(error);
+                    }
+                    Err(_) => {}
                 }
-                Err(_) => {}
             }
         }
         let relay = self.config.relay.clone().ok_or_else(|| {

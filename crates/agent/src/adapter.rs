@@ -131,6 +131,7 @@ impl fmt::Debug for ProviderTurnRequest {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum AgentUsageTelemetryEvent {
     ExecutionDispatched {
         execution: AgentUsageExecution,

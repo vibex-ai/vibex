@@ -10,20 +10,11 @@ use crate::{
 
 pub const DIAGNOSTIC_BUNDLE_SCHEMA_VERSION: &str = "diagnostic_bundle.v2";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiagnosticBundleRequest {
     pub record_limit: Option<u32>,
     pub include_smoke_references: Option<bool>,
-}
-
-impl Default for DiagnosticBundleRequest {
-    fn default() -> Self {
-        Self {
-            record_limit: None,
-            include_smoke_references: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

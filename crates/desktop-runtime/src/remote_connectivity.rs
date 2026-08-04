@@ -76,9 +76,10 @@ impl RemoteConnectivityMethod {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteMethodState {
+    #[default]
     Disabled,
     Checking,
     ConfirmationNeeded,
@@ -91,15 +92,10 @@ pub enum RemoteMethodState {
     Error,
 }
 
-impl Default for RemoteMethodState {
-    fn default() -> Self {
-        Self::Disabled
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteRecoveryAction {
+    #[default]
     None,
     Retry,
     ConfirmPort,
@@ -110,24 +106,13 @@ pub enum RemoteRecoveryAction {
     RePair,
 }
 
-impl Default for RemoteRecoveryAction {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteRouteOwnership {
+    #[default]
     None,
     DesktopCreated,
     External,
-}
-
-impl Default for RemoteRouteOwnership {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]

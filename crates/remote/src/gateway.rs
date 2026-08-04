@@ -1259,6 +1259,7 @@ impl RemoteGateway {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum RelayRemoteOutbound {
     Json(RemoteJsonMessageV2),
     Binary(Vec<u8>),
@@ -2121,6 +2122,7 @@ async fn handle_active_text(
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn acquire_rpc_slot(
     rpc_slots: &Arc<Semaphore>,
     request: &RemoteRpcRequestV2,
@@ -3625,6 +3627,7 @@ async fn security_perimeter(
     response
 }
 
+#[allow(clippy::result_large_err)]
 fn validate_perimeter_request(
     state: &GatewayState,
     request: &Request<Body>,

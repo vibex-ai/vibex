@@ -942,18 +942,13 @@ pub enum AcpProviderEnvSource {
     Literal,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AcpProcessStrategy {
+    #[default]
     PerSession,
     PerProfilePool,
     Auto,
-}
-
-impl Default for AcpProcessStrategy {
-    fn default() -> Self {
-        Self::PerSession
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

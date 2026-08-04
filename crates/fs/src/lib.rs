@@ -474,6 +474,7 @@ impl WorkspaceFileService {
         Ok(results)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn collect_tree(
         &self,
         dir: &Path,

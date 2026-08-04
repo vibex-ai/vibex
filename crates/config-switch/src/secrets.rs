@@ -54,7 +54,7 @@ pub fn store_provider_secret(lookup_key: &str, secret: &str) -> VibexResult<()> 
                 )
             })?
             .insert(lookup_key.to_string(), secret.to_string());
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(test))]
@@ -111,7 +111,7 @@ pub fn delete_provider_secret(lookup_key: &str) -> VibexResult<()> {
                 )
             })?
             .remove(lookup_key);
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(test))]

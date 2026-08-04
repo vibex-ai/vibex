@@ -9784,6 +9784,7 @@ impl VibexWorkbench {
         ));
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn begin_inline_user_message_edit(
         &mut self,
         turn_id: String,
@@ -15297,6 +15298,7 @@ impl VibexWorkbench {
         div().flex_none().child(popover).into_any_element()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_new_session_runtime_choice(
         &mut self,
         id: String,
@@ -17872,6 +17874,7 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_composer_runtime_choice(
         &mut self,
         id: String,

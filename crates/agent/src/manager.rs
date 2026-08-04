@@ -109,6 +109,7 @@ struct ProviderTurnAttemptFailure {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum ProviderTurnAttemptOutcome {
     Success(ProviderTurnAttemptSuccess),
     Failure(ProviderTurnAttemptFailure),
@@ -1446,6 +1447,7 @@ impl AgentManager {
         Ok(appended)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_provider_turn_attempt<F, Fut>(
         &self,
         session: &AgentSession,
@@ -2644,6 +2646,7 @@ impl AgentManager {
         Ok((binding, identity, route_key))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn append_timeline_item(
         &self,
         conn: &mut DbConnection,

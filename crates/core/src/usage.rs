@@ -319,7 +319,7 @@ impl AgentUsageTimeZone {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct AgentUsageStatisticsRequest {
     pub range: AgentUsageRange,
@@ -333,24 +333,6 @@ pub struct AgentUsageStatisticsRequest {
     pub sort_metric: AgentUsageSortMetric,
     pub sort_direction: AgentUsageSortDirection,
     pub time_zone: AgentUsageTimeZone,
-}
-
-impl Default for AgentUsageStatisticsRequest {
-    fn default() -> Self {
-        Self {
-            range: AgentUsageRange::default(),
-            agent_ids: Vec::new(),
-            project_ids: Vec::new(),
-            provider_profile_ids: Vec::new(),
-            model_ids: Vec::new(),
-            session_ids: Vec::new(),
-            dimension: AgentUsageDimension::default(),
-            trend_metric: AgentUsageTrendMetric::default(),
-            sort_metric: AgentUsageSortMetric::default(),
-            sort_direction: AgentUsageSortDirection::default(),
-            time_zone: AgentUsageTimeZone::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

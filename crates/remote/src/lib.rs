@@ -755,6 +755,7 @@ impl RemoteTrustService {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_audit(
         conn: &DbConnection,
         device_id: Option<DeviceId>,
@@ -2382,6 +2383,7 @@ fn git_status_for_workspace(
     Ok(status)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn git_mutation_status<F>(
     runtime: &RemoteWorkbenchRuntime,
     proof: RemoteAuthProof,
@@ -2474,6 +2476,7 @@ fn terminal_session_visible(session: &TerminalSession) -> bool {
     session.status == TerminalStatus::Running
 }
 
+#[allow(clippy::too_many_arguments)]
 fn audit_workbench_mutation(
     runtime: &RemoteWorkbenchRuntime,
     auth: &RemoteAuthContext,
