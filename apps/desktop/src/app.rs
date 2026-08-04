@@ -212,7 +212,7 @@ const AGENT_TIMELINE_IDLE_POLL_THRESHOLD: u16 = 4;
 const AGENT_TIMELINE_IDLE_POLL_MAX_MS: u64 = 2_000;
 const AGENT_TURN_PREVIEW_EDGE_TRIGGER_WIDTH: f32 = 18.0;
 const AGENT_TURN_PREVIEW_RAIL_WIDTH: f32 = 35.2;
-const AGENT_TURN_PREVIEW_COMPACT_MAX_TURNS: usize = 6;
+const AGENT_TURN_PREVIEW_ITEM_MAX_HEIGHT: f32 = 12.0;
 const AGENT_TURN_PREVIEW_MESSAGE_MAX_CHARS: usize = 180;
 const AGENT_TURN_PREVIEW_MARKDOWN_MAX_BYTES: usize = 8 * 1024;
 const AGENT_TURN_PREVIEW_MARKDOWN_MAX_NODES: usize = 4_096;
@@ -17162,7 +17162,6 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let locale = self.resolved_locale();
-        let compact = turns.len() <= AGENT_TURN_PREVIEW_COMPACT_MAX_TURNS;
         let active_index = self
             .turn_preview_active_index
             .filter(|index| *index < turns.len());
@@ -17354,14 +17353,12 @@ impl VibexWorkbench {
                     .min_w_0()
                     .items_center()
                     .justify_start()
-                    .py(px(1.6))
-                    .when(compact && turns.len() == 1, |this| {
-                        this.h(px(32.0)).flex_none()
+                    .when(turns.len() == 1, |this| this.h(px(32.0)).flex_none())
+                    .when(turns.len() > 1, |this| {
+                        this.flex_1()
+                            .min_h_0()
+                            .max_h(px(AGENT_TURN_PREVIEW_ITEM_MAX_HEIGHT))
                     })
-                    .when(compact && turns.len() > 1, |this| {
-                        this.h(px(18.4)).flex_none()
-                    })
-                    .when(!compact, |this| this.flex_1().min_h_0())
                     .cursor_pointer()
                     .focusable()
                     .tab_stop(true)
@@ -17397,7 +17394,8 @@ impl VibexWorkbench {
             .relative()
             .size_full()
             .min_h_0()
-            .when(compact, |this| this.justify_center().gap(px(7.2)))
+            .justify_center()
+            .gap_0()
             .children(items);
         let list = if reduced_motion {
             list.into_any_element()
@@ -35416,6 +35414,10 @@ mod tests {
         assert!(renderer.contains("format!(\"+{remaining_file_count}\")"));
         assert!(renderer.contains("if self.turn_preview_rail_visible"));
         assert!(renderer.contains("let items = rail_turns"));
+        assert!(renderer.contains(".max_h(px(AGENT_TURN_PREVIEW_ITEM_MAX_HEIGHT))"));
+        assert!(renderer.contains(".justify_center()"));
+        assert!(renderer.contains(".gap_0()"));
+        assert!(!renderer.contains("AGENT_TURN_PREVIEW_COMPACT_MAX_TURNS"));
         assert!(!renderer.contains("format_timeline_hover_time(turn.started_at_ms"));
     }
 
