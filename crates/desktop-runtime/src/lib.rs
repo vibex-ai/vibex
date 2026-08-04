@@ -685,7 +685,7 @@ impl DesktopRuntime {
             sender: provider_change_sender,
         });
         let (manager, provider_config_service, acp_runtime) =
-            build_agent_manager(&config, observability.clone(), provider_change_listener).await?;
+            build_agent_manager(&config, observability.clone(), provider_change_listener)?;
         let manager = Arc::new(manager);
         let db_path = manager.database_path().to_path_buf();
         let usage = AgentUsageService::new(db_path.clone())?;
@@ -843,6 +843,7 @@ impl DesktopRuntime {
         runtime.spawn_usage_consumer(usage_receiver)?;
         runtime.spawn_provider_config_consumer(provider_change_receiver)?;
         runtime.activate().await?;
+        runtime.spawn_agent_bootstrap()?;
         Ok(runtime)
     }
 
@@ -857,13 +858,6 @@ impl DesktopRuntime {
         self.agent
             .runtime_lifecycle
             .start(&tokio::runtime::Handle::current())?;
-        if let Err(error) = self.agent.runtime_catalog.refresh_missing().await {
-            tracing::warn!(
-                target: "vibex_desktop",
-                error_code = %error.code,
-                "initial ACP runtime option snapshot probe failed"
-            );
-        }
         if let Err(error) = self.remote.gateway.start().await {
             let _ = self.agent.runtime_lifecycle.stop().await;
             return Err(error);
@@ -893,6 +887,66 @@ impl DesktopRuntime {
                 "message submission startup reconciliation failed"
             );
         }
+        Ok(())
+    }
+
+    fn spawn_agent_bootstrap(&self) -> VibexResult<()> {
+        let mut tasks = self.tasks.lock().map_err(|_| {
+            VibexError::process(
+                "desktop_runtime_task_lock_failed",
+                "desktop runtime task ownership is unavailable",
+            )
+        })?;
+        let install_managed_adapters = self.config.install_managed_adapters;
+        let config_service = self.providers.service.clone();
+        let db_path = self.config.database_path.clone();
+        let catalog = self.agent.runtime_catalog.clone();
+        let events = self.events.clone();
+        let gateway = self.remote.gateway.clone();
+        tasks.push(tokio::spawn(async move {
+            if install_managed_adapters
+                && let Err(error) = prepare_managed_acp_adapters(&config_service, &db_path).await
+            {
+                tracing::warn!(
+                    target: "vibex_desktop",
+                    error_code = %error.code,
+                    "managed ACP adapter background preparation failed"
+                );
+            }
+            match catalog.refresh_missing().await {
+                Ok(result) => {
+                    let provider_profile_ids = result
+                        .refreshed_profile_ids
+                        .into_iter()
+                        .chain(result.failed_profile_ids)
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    if !provider_profile_ids.is_empty() {
+                        let _ = events.send(DesktopEvent::ProviderConfigChanged(
+                            ProviderConfigChangedEvent {
+                                provider_profile_ids,
+                                phase: ProviderConfigChangePhase::RuntimeOptionsChanged,
+                            },
+                        ));
+                        if let Err(error) = gateway.publish_provider_invalidation() {
+                            tracing::warn!(
+                                target: "vibex_desktop",
+                                error_code = %error.code,
+                                "Initial Provider runtime option invalidation failed"
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "vibex_desktop",
+                        error_code = %error.code,
+                        "initial ACP runtime option background snapshot probe failed"
+                    );
+                }
+            }
+        }));
         Ok(())
     }
 
@@ -1441,16 +1495,13 @@ impl Drop for DesktopRuntime {
     }
 }
 
-async fn build_agent_manager(
+fn build_agent_manager(
     config: &DesktopRuntimeConfig,
     observability: Arc<RuntimeObservability>,
     profile_change_listener: Arc<dyn ProviderProfileChangeListener>,
 ) -> VibexResult<(AgentManager, ProviderConfigService, Arc<AcpRuntimeClient>)> {
     let db_path = config.database_path.clone();
     let bootstrap_config_service = ProviderConfigService::new(&db_path);
-    if config.install_managed_adapters {
-        prepare_managed_acp_adapters(&bootstrap_config_service, &db_path).await?;
-    }
     let mut manager = AgentManager::new(&db_path)?;
     let acp_runtime = Arc::new(AcpRuntimeClient::new_with_observability(
         bootstrap_config_service,
@@ -1537,6 +1588,44 @@ mod tests {
         ProviderKind, ProviderOptions, ProviderProfileCreateRequest, ProviderProfileDeleteRequest,
         TerminalStatus, WorkspaceMode,
     };
+
+    #[test]
+    fn managed_agent_bootstrap_stays_off_the_runtime_ready_path() {
+        let source = include_str!("lib.rs");
+        let start = source
+            .split_once("    pub async fn start(config: DesktopRuntimeConfig)")
+            .and_then(|(_, tail)| tail.split_once("\n    async fn activate("))
+            .map(|(body, _)| body)
+            .expect("runtime start should remain inspectable");
+        let activate = source
+            .split_once("    async fn activate(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn spawn_agent_bootstrap("))
+            .map(|(body, _)| body)
+            .expect("runtime activation should remain inspectable");
+        let bootstrap = source
+            .split_once("    fn spawn_agent_bootstrap(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn spawn_event_bridges("))
+            .map(|(body, _)| body)
+            .expect("background Agent bootstrap should remain inspectable");
+        let manager = source
+            .split_once("fn build_agent_manager(")
+            .and_then(|(_, tail)| tail.split_once("\nasync fn prepare_managed_acp_adapters("))
+            .map(|(body, _)| body)
+            .expect("agent manager construction should remain inspectable");
+
+        assert!(start.contains("runtime.activate().await?;"));
+        assert!(start.contains("runtime.spawn_agent_bootstrap()?;"));
+        assert!(
+            start.find("runtime.activate().await?;")
+                < start.find("runtime.spawn_agent_bootstrap()?;")
+        );
+        assert!(!activate.contains("refresh_missing().await"));
+        assert!(!manager.contains("prepare_managed_acp_adapters"));
+        assert!(bootstrap.contains("prepare_managed_acp_adapters"));
+        assert!(bootstrap.contains("catalog.refresh_missing().await"));
+        assert!(bootstrap.contains("ProviderConfigChangePhase::RuntimeOptionsChanged"));
+        assert!(bootstrap.contains("gateway.publish_provider_invalidation()"));
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn isolated_runtime_uses_one_home_lock_and_releases_it_on_shutdown() {

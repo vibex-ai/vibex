@@ -1926,6 +1926,98 @@ provider_capability_probe_records(
 - Real OpenCode session smoke must remain a separate explicit task and must not
   run as part of default capability validation.
 
+## Scenario: Desktop Runtime Background Agent Bootstrap
+
+### 1. Scope / Trigger
+
+- Trigger: desktop startup installs or upgrades managed ACP adapters and probes
+  missing Runtime Option snapshots.
+- This crosses runtime lifecycle, Provider Profile persistence, the Runtime
+  Option Catalog, desktop events, and remote catalog invalidation.
+
+### 2. Signatures
+
+```rust
+DesktopRuntime::start(config) -> Arc<DesktopRuntime>
+DesktopRuntime::spawn_agent_bootstrap() -> VibexResult<()>
+prepare_managed_acp_adapters(config_service, db_path).await
+RuntimeOptionCatalogService::refresh_missing().await
+DesktopEvent::ProviderConfigChanged {
+    phase: ProviderConfigChangePhase::RuntimeOptionsChanged,
+    provider_profile_ids,
+}
+```
+
+### 3. Contracts
+
+- Runtime readiness requires the local authoritative services, lifecycle,
+  gateway, and startup reconciliation, but not network-backed adapter installs
+  or Agent process capability probes.
+- Start managed adapter preparation only after `DesktopRuntime::activate`
+  succeeds. Own the task in `DesktopRuntime.tasks` so shutdown aborts any npm or
+  probe child through its existing kill-on-drop lifecycle.
+- Use the listener-enabled runtime `ProviderConfigService`. Adapter command
+  reconciliation must still invalidate ACP process configuration and publish
+  Provider Profile changes.
+- Probe only missing Runtime Option snapshots. After success or a persisted
+  failure, publish `RuntimeOptionsChanged` for the affected Profile ids and
+  invalidate the remote Provider projection.
+
+### 4. Validation & Error Matrix
+
+- Runtime activation fails -> `DesktopRuntime::start` fails; do not spawn the
+  background bootstrap.
+- Runtime task ownership lock fails -> return
+  `process/desktop_runtime_task_lock_failed` from startup.
+- Managed install/reconciliation fails after readiness -> emit a bounded warning
+  and continue to the missing-snapshot phase.
+- Missing-snapshot refresh fails as a whole -> emit a bounded warning; keep the
+  runtime available.
+- Individual probe failure persisted successfully -> include that Profile id in
+  `RuntimeOptionsChanged` so unavailable evidence replaces provisional data.
+
+### 5. Good/Base/Bad Cases
+
+- Good: a new adapter version downloads slowly while the workbench opens; its
+  completed reconciliation refreshes Profile and Runtime Option projections.
+- Base: exact adapters and all snapshots already exist; the background task
+  performs no external install and emits no redundant Runtime Option event.
+- Bad: `build_agent_manager` or `activate` awaits `npm install`, an ACP probe, or
+  complete catalog enrichment before reporting the runtime ready.
+
+### 6. Tests Required
+
+- `vibex-desktop-runtime` asserts activation precedes background bootstrap and
+  manager construction contains no adapter installation.
+- Runtime catalog tests assert a failed missing snapshot is persisted and is not
+  retried on every application start.
+- Provider mutation tests assert Profile changes publish static invalidation
+  before background Runtime Option invalidation.
+- Desktop tests assert the startup brand overlay is released before overview and
+  authoritative timeline restoration, while its spinner delay remains five
+  seconds.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+prepare_managed_acp_adapters(&config_service, &db_path).await?;
+runtime_catalog.refresh_missing().await?;
+let runtime = DesktopRuntime::ready();
+```
+
+#### Correct
+
+```rust
+runtime.activate().await?;
+runtime.spawn_agent_bootstrap()?;
+Ok(runtime)
+```
+
+The runtime becomes usable first; the owned background task converges managed
+Agent commands and capability evidence without weakening later invalidation.
+
 ## Scenario: Config Center Agent Registry And Selector Gating
 
 ### 1. Scope / Trigger

@@ -698,10 +698,11 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   poll. Sequence gaps, lag, or cursor reset mark the model for authoritative
   refetch; push delivery alone is never correctness proof.
 - The full-window GPUI startup brand overlay is one-shot local UI state, separate
-  from `agent_loading`. Dismiss it when the initial overview establishes that no
-  session can be restored, when overview/runtime startup fails, or when the
-  selected session's authoritative timeline finishes with success or failure.
-  Later session switches must not reopen it.
+  from `agent_loading`. Dismiss it as soon as the authoritative `DesktopRuntime`
+  reaches `Ready`, or when runtime startup fails. Initial overview and complete
+  authoritative timeline restoration continue under their workbench loading and
+  error states; they must not retain or reopen the brand overlay. Later session
+  switches must not reopen it either.
 - Switching sessions detaches the previous Owner and starts the configured
   30-second heartbeat for the selected session. Polling and heartbeat intervals
   come from `DesktopPollingPolicy`, not view-local constants.

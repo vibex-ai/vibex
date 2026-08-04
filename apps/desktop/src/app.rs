@@ -3744,6 +3744,7 @@ impl VibexWorkbench {
                         Ok(Ok((runtime, loaded_state, persistence_note))) => {
                             eprintln!("vibex-foundation: runtime-ready");
                             this.runtime_status = RuntimeStatus::Ready;
+                            this.finish_startup_loading();
                             this.runtime_note =
                                 Some("Authoritative event stream connected".to_string());
                             if let Some(state) = loaded_state {
@@ -4150,7 +4151,6 @@ impl VibexWorkbench {
                                 this.runtime_selection = None;
                                 this.token_usage = None;
                                 this.agent_loading = false;
-                                this.finish_startup_loading();
                             }
                             if this.agent_catalog_generation == catalog_generation {
                                 this.load_agent_runtime_catalog(cx);
@@ -4160,14 +4160,12 @@ impl VibexWorkbench {
                             if this.sessions.is_empty() && this.timeline.session_id.is_none() {
                                 this.agent_loading = false;
                             }
-                            this.finish_startup_loading();
                             this.agent_error = Some(format!("{}: {}", error.code, error.message));
                         }
                         Err(error) => {
                             if this.sessions.is_empty() && this.timeline.session_id.is_none() {
                                 this.agent_loading = false;
                             }
-                            this.finish_startup_loading();
                             this.agent_error = Some(format!("agent overview task failed: {error}"));
                         }
                     }
@@ -5788,7 +5786,6 @@ impl VibexWorkbench {
                         return;
                     }
                     this.agent_loading = false;
-                    this.finish_startup_loading();
                     match outcome {
                         Ok(Ok(items)) => {
                             let content_changed = this.timeline.session_id.as_ref()
@@ -32410,7 +32407,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_loading_overlay_is_one_shot_and_released_by_initial_restore_outcomes() {
+    fn startup_loading_overlay_is_one_shot_and_released_when_runtime_is_ready() {
         let source = include_str!("app.rs");
         let startup_initializer = ["startup_loading:", " true"].concat();
         let startup_reopen_assignment = ["startup_loading", " = true"].concat();
@@ -32422,14 +32419,14 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn load_agent_runtime_catalog("))
             .map(|(body, _)| body)
             .expect("agent overview should remain inspectable");
-        assert_eq!(overview.matches("finish_startup_loading();").count(), 3);
+        assert!(!overview.contains("finish_startup_loading();"));
 
         let timeline = source
             .split_once("    fn load_agent_session_timeline(")
             .and_then(|(_, tail)| tail.split_once("\n    fn load_agent_session_projection("))
             .map(|(body, _)| body)
             .expect("session timeline loader should remain inspectable");
-        assert!(timeline.contains("this.finish_startup_loading();"));
+        assert!(!timeline.contains("finish_startup_loading();"));
 
         let boot = source
             .split_once("    fn begin_runtime_start(")
@@ -32438,6 +32435,16 @@ mod tests {
             .expect("runtime startup should remain inspectable");
         assert!(boot.contains("self.finish_startup_loading();"));
         assert!(boot.contains("this.finish_startup_loading();"));
+        let ready = boot
+            .find("this.runtime_status = RuntimeStatus::Ready;")
+            .expect("runtime ready transition should remain inspectable");
+        let release = boot[ready..]
+            .find("this.finish_startup_loading();")
+            .expect("runtime ready should release the startup overlay");
+        let overview_load = boot[ready..]
+            .find("this.load_agent_overview(cx);")
+            .expect("runtime ready should still restore the agent overview");
+        assert!(release < overview_load);
 
         let selection = source
             .split_once("    fn select_session_with_history(")
