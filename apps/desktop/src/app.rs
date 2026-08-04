@@ -3293,7 +3293,9 @@ impl VibexWorkbench {
                         this.sync_composer_command_entry(ComposerTarget::Session, cx);
                         this.refresh_suggestions(ComposerTarget::Session, window, cx);
                     }
-                    InputEvent::PressEnter { shift: false, .. } => this.submit_composer(window, cx),
+                    InputEvent::PressEnter { shift: false, .. } => {
+                        this.handle_composer_enter(window, cx)
+                    }
                     InputEvent::Focus => {
                         this.refresh_suggestions(ComposerTarget::Session, window, cx)
                     }
@@ -7136,6 +7138,19 @@ impl VibexWorkbench {
         if !composition_active && self.paste_composer_clipboard_to(new_session, window, cx) {
             cx.stop_propagation();
         }
+    }
+
+    fn handle_composer_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.composer_expanded {
+            self.submit_composer(window, cx);
+            return;
+        }
+
+        self.composer_input
+            .update(cx, |input, cx| input.replace("\n", window, cx));
+        self.sync_inline_composer_attachments(false, cx);
+        self.sync_composer_command_entry(ComposerTarget::Session, cx);
+        self.refresh_suggestions(ComposerTarget::Session, window, cx);
     }
 
     fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -33881,6 +33896,34 @@ mod tests {
         assert!(queue.contains(".rounded_tr(px(COMPOSER_SURFACE_RADIUS))"));
         assert!(queue.contains(".border_b_0()"));
         assert!(queue.contains(".border_b_1()"));
+    }
+
+    #[test]
+    fn expanded_composer_enter_inserts_a_newline_and_send_stays_button_driven() {
+        let source = include_str!("app.rs");
+        let subscriptions = source
+            .split_once("        let mut agent_subscriptions =")
+            .and_then(|(_, tail)| tail.split_once("\n        let parent ="))
+            .map(|(body, _)| body)
+            .expect("input subscriptions should remain inspectable");
+        assert!(subscriptions.contains("this.handle_composer_enter(window, cx)"));
+
+        let enter_handler = source
+            .split_once("    fn handle_composer_enter(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn submit_composer("))
+            .map(|(body, _)| body)
+            .expect("composer enter handling should remain inspectable");
+        assert!(enter_handler.contains("if !self.composer_expanded"));
+        assert!(enter_handler.contains("self.submit_composer(window, cx)"));
+        assert!(enter_handler.contains("input.replace(\"\\n\", window, cx)"));
+
+        let composer = source
+            .split_once("    fn render_composer(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
+            .map(|(body, _)| body)
+            .expect("composer renderer should remain inspectable");
+        assert!(composer.contains("Button::new(\"send-agent-message\")"));
+        assert!(composer.contains("this.submit_composer(window, cx)"));
     }
 
     #[test]
