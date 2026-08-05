@@ -89,6 +89,108 @@ impl ProviderManagementFacade {
         self.service.list_profiles()
     }
 
+    pub fn list_model_provider_profiles(
+        &self,
+    ) -> VibexResult<Vec<vibex_core::ModelProviderProfile>> {
+        self.service.list_model_provider_profiles()
+    }
+
+    pub fn create_model_provider_profile(
+        &self,
+        request: vibex_core::ModelProviderProfileCreateRequest,
+    ) -> VibexResult<vibex_core::ModelProviderProfile> {
+        let _claim = self.mutation_guard.claim("provider:model-profile:create")?;
+        self.service.create_model_provider_profile(request)
+    }
+
+    pub fn update_model_provider_profile(
+        &self,
+        request: vibex_core::ModelProviderProfileUpdateRequest,
+    ) -> VibexResult<vibex_core::ModelProviderProfile> {
+        let _claim = self.mutation_guard.claim(format!(
+            "provider:model-profile:update:{}",
+            request.profile.id
+        ))?;
+        self.service.update_model_provider_profile(request)
+    }
+
+    pub fn list_agent_runtime_profiles(
+        &self,
+        agent_id: &vibex_core::AgentId,
+    ) -> VibexResult<Vec<vibex_core::AgentRuntimeProfile>> {
+        self.service.list_agent_runtime_profiles(agent_id)
+    }
+
+    pub fn create_agent_runtime_profile(
+        &self,
+        request: vibex_core::AgentRuntimeProfileCreateRequest,
+    ) -> VibexResult<vibex_core::AgentRuntimeProfile> {
+        let _claim = self.mutation_guard.claim("provider:agent-runtime:create")?;
+        self.service.create_agent_runtime_profile(request)
+    }
+
+    pub fn update_agent_runtime_profile(
+        &self,
+        request: vibex_core::AgentRuntimeProfileUpdateRequest,
+    ) -> VibexResult<vibex_core::AgentRuntimeProfile> {
+        let _claim = self.mutation_guard.claim(format!(
+            "provider:agent-runtime:update:{}",
+            request.profile.id
+        ))?;
+        self.service.update_agent_runtime_profile(request)
+    }
+
+    pub fn list_agent_model_provider_bindings(
+        &self,
+        request: vibex_core::AgentModelProviderBindingListRequest,
+    ) -> VibexResult<Vec<vibex_core::AgentModelProviderBinding>> {
+        self.service.list_agent_model_provider_bindings(request)
+    }
+
+    pub fn create_agent_model_provider_binding(
+        &self,
+        request: vibex_core::AgentModelProviderBindingCreateRequest,
+    ) -> VibexResult<vibex_core::AgentModelProviderBinding> {
+        let _claim = self.mutation_guard.claim("provider:agent-binding:create")?;
+        self.service.create_agent_model_provider_binding(request)
+    }
+
+    pub fn update_agent_model_provider_binding(
+        &self,
+        request: vibex_core::AgentModelProviderBindingUpdateRequest,
+    ) -> VibexResult<vibex_core::AgentModelProviderBinding> {
+        let _claim = self.mutation_guard.claim(format!(
+            "provider:agent-binding:update:{}",
+            request.binding.id
+        ))?;
+        self.service.update_agent_model_provider_binding(request)
+    }
+
+    pub fn agent_provider_projection_capability(
+        &self,
+        request: vibex_core::AgentProviderProjectionCapabilityRequest,
+    ) -> VibexResult<vibex_core::AgentProviderProjectionCapability> {
+        self.service.agent_provider_projection_capability(request)
+    }
+
+    pub fn preview_agent_provider_projection(
+        &self,
+        request: vibex_core::AgentProviderProjectionPreviewRequest,
+    ) -> VibexResult<vibex_core::AgentProviderProjectionPreview> {
+        self.service.preview_agent_provider_projection(request)
+    }
+
+    pub fn mutate_provider_credential_secret(
+        &self,
+        request: vibex_core::ProviderCredentialSecretMutationRequest,
+    ) -> VibexResult<vibex_core::ModelProviderProfile> {
+        let _claim = self.mutation_guard.claim(format!(
+            "provider:credential-secret:{}",
+            request.model_provider_profile_id
+        ))?;
+        self.service.mutate_provider_credential_secret(request)
+    }
+
     pub fn get_profile(
         &self,
         provider_profile_id: &vibex_core::ProviderProfileId,
@@ -1170,5 +1272,78 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.len(), 16);
         assert!(!first.contains("must-not"));
+    }
+
+    #[test]
+    fn provider_facade_exposes_exact_projection_capability_and_preview() {
+        let directory = tempfile::tempdir().unwrap();
+        let facade = ProviderManagementFacade {
+            service: vibex_config_switch::ProviderConfigService::new(
+                directory.path().join("vibex.db"),
+            ),
+            mutation_guard: ManagementMutationGuard::default(),
+        };
+        let agent_id = vibex_core::AgentId::parse("codex").unwrap();
+        let legacy = facade
+            .service
+            .create_profile(vibex_core::ProviderProfileCreateRequest {
+                agent_id: Some(agent_id.clone()),
+                kind: vibex_core::ProviderKind::Codex,
+                display_name: "Facade projection".to_string(),
+                account_alias: None,
+                base_url: Some("https://api.example.invalid/v1".to_string()),
+                default_model: Some("gpt-5-codex".to_string()),
+                small_model: None,
+                large_model: None,
+                configured_models: Vec::new(),
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: Some(vibex_core::ProviderOptions::empty()),
+                secret_references: Vec::new(),
+            })
+            .unwrap();
+        let binding = facade
+            .list_agent_model_provider_bindings(vibex_core::AgentModelProviderBindingListRequest {
+                agent_id: Some(agent_id.clone()),
+                model_provider_profile_id: None,
+            })
+            .unwrap()
+            .into_iter()
+            .find(|binding| binding.legacy_provider_profile_id.as_ref() == Some(&legacy.id))
+            .unwrap();
+        let runtime = facade
+            .list_agent_runtime_profiles(&agent_id)
+            .unwrap()
+            .into_iter()
+            .find(|runtime| runtime.id == binding.runtime_profile_id)
+            .unwrap();
+
+        let capability = facade
+            .agent_provider_projection_capability(
+                vibex_core::AgentProviderProjectionCapabilityRequest {
+                    runtime_profile_id: runtime.id,
+                    binding_id: Some(binding.id.clone()),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            capability.descriptor_id.as_ref().map(|id| id.as_str()),
+            Some(vibex_core::CODEX_PROJECTION_DESCRIPTOR_ID)
+        );
+        assert_eq!(capability.descriptor_version, "1");
+
+        let preview = facade
+            .preview_agent_provider_projection(vibex_core::AgentProviderProjectionPreviewRequest {
+                binding_id: binding.id,
+                workspace_key: "facade-workspace".to_string(),
+            })
+            .unwrap();
+        assert_eq!(
+            preview.descriptor_id.as_str(),
+            vibex_core::CODEX_PROJECTION_DESCRIPTOR_ID
+        );
+        assert_eq!(preview.overlay_files[0].relative_path, "config.toml");
     }
 }

@@ -17,6 +17,7 @@ pub mod git;
 pub mod ids;
 pub mod permission;
 pub mod provider;
+pub mod provider_projection;
 pub mod relay;
 pub mod remote;
 pub mod remote_v2;
@@ -119,13 +120,16 @@ pub use git::{
     managed_worktree_name_slug,
 };
 pub use ids::{
-    AutomationEdgeId, AutomationGraphId, AutomationNodeId, AutomationRunId, AutomationRunStepId,
-    ChannelId, CorrelationId, DeviceId, EventId, HookId, McpServerId, MessageSubmissionId,
-    NativeStateHomeId, ProjectId, PromptId, ProviderProfileId, RelayConnectionId, RelayFrameId,
-    RelayPeerId, RelayRoomId, RelaySessionId, RequestId, RightRailPluginId, RuntimeBindingId,
-    RuntimeClientId, RuntimeLeaseId, RuntimeProcessId, RuntimeStreamId, RuntimeSwitchId,
-    RuntimeSwitchOperationId, ScheduledTaskId, ScheduledTaskRunId, SkillId, TerminalId,
-    TimelineItemId, UsageExecutionId, VibexSessionId, WorkspaceId,
+    AgentConfiguredModelBindingId, AgentModelProviderBindingId,
+    AgentProviderProjectionDescriptorId, AgentRuntimeProfileId, AutomationEdgeId,
+    AutomationGraphId, AutomationNodeId, AutomationRunId, AutomationRunStepId, ChannelId,
+    CorrelationId, DeviceId, EventId, HookId, McpServerId, MessageSubmissionId,
+    ModelProviderProfileId, NativeStateHomeId, ProjectId, PromptId, ProviderProfileId,
+    RelayConnectionId, RelayFrameId, RelayPeerId, RelayRoomId, RelaySessionId, RequestId,
+    RightRailPluginId, RuntimeBindingId, RuntimeClientId, RuntimeLeaseId, RuntimeProcessId,
+    RuntimeStreamId, RuntimeSwitchId, RuntimeSwitchOperationId, ScheduledTaskId,
+    ScheduledTaskRunId, SkillId, TerminalId, TimelineItemId, UsageExecutionId, VibexSessionId,
+    WorkspaceId,
 };
 pub use permission::{
     PermissionActionDetail, PermissionMode, PermissionRequest, PermissionRequestStatus,
@@ -196,6 +200,7 @@ pub use provider::{
     SkillSetProviderMatrixRequest, SkillSourceKind, SkillStatus, SkillSummary, SkillUpdateRequest,
     SkillValidateRequest, SkillValidationResult, SkillValidationStatus,
 };
+pub use provider_projection::*;
 pub use relay::{
     RelayBridgeMessage, RelayControlMessage, RelayDeepLink, RelayEncryptedFrame, RelayError,
     RelayErrorCode, RelayFrameKind, RelayHandshakeHello, RelayHandshakeReady, RelayHeartbeat,
@@ -212,7 +217,9 @@ pub use remote::{
     RemoteAgentDeepLinkResolveResponse, RemoteAgentDetachRuntimeRequest,
     RemoteAgentDetachRuntimeResponse, RemoteAgentInterruptRequest, RemoteAgentInterruptResponse,
     RemoteAgentMessageSubmissionRequest, RemoteAgentMessageSubmissionResponse,
-    RemoteAgentOperationKind, RemoteAgentRequest, RemoteAgentResolveElicitationRequest,
+    RemoteAgentOperationKind, RemoteAgentProjectionCapabilityRequest,
+    RemoteAgentProjectionCapabilityResponse, RemoteAgentProjectionPreviewRequest,
+    RemoteAgentProjectionPreviewResponse, RemoteAgentRequest, RemoteAgentResolveElicitationRequest,
     RemoteAgentResolveElicitationResponse, RemoteAgentResolvePermissionRequest,
     RemoteAgentResolvePermissionResponse, RemoteAgentRuntimeEventsRequest,
     RemoteAgentRuntimeEventsResponse, RemoteAgentRuntimeOptionsRequest,

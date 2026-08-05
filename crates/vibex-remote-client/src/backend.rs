@@ -1634,6 +1634,155 @@ impl ManagementBackend for WebRemoteBackend {
         )
     }
 
+    fn list_model_provider_profiles(
+        &self,
+    ) -> BackendFuture<'_, Vec<vibex_core::ModelProviderProfile>> {
+        self.unsupported(
+            "remote_model_provider_profiles_private",
+            "remote clients receive projection capabilities instead of provider storage records",
+        )
+    }
+
+    fn create_model_provider_profile(
+        &self,
+        _request: MutationRequest<vibex_core::ModelProviderProfileCreateRequest>,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderProfile> {
+        self.unsupported(
+            "remote_model_provider_mutation_unavailable",
+            "model provider mutations must be performed by the authoritative desktop",
+        )
+    }
+
+    fn update_model_provider_profile(
+        &self,
+        _request: MutationRequest<vibex_core::ModelProviderProfileUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderProfile> {
+        self.unsupported(
+            "remote_model_provider_mutation_unavailable",
+            "model provider mutations must be performed by the authoritative desktop",
+        )
+    }
+
+    fn list_agent_runtime_profiles(
+        &self,
+        _agent_id: vibex_core::AgentId,
+    ) -> BackendFuture<'_, Vec<vibex_core::AgentRuntimeProfile>> {
+        self.unsupported(
+            "remote_agent_runtime_profiles_private",
+            "remote clients do not receive native Agent command or runtime-home records",
+        )
+    }
+
+    fn create_agent_runtime_profile(
+        &self,
+        _request: MutationRequest<vibex_core::AgentRuntimeProfileCreateRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentRuntimeProfile> {
+        self.unsupported(
+            "remote_agent_runtime_mutation_unavailable",
+            "Agent runtime mutations must be performed by the authoritative desktop",
+        )
+    }
+
+    fn update_agent_runtime_profile(
+        &self,
+        _request: MutationRequest<vibex_core::AgentRuntimeProfileUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentRuntimeProfile> {
+        self.unsupported(
+            "remote_agent_runtime_mutation_unavailable",
+            "Agent runtime mutations must be performed by the authoritative desktop",
+        )
+    }
+
+    fn list_agent_model_provider_bindings(
+        &self,
+        _request: vibex_core::AgentModelProviderBindingListRequest,
+    ) -> BackendFuture<'_, Vec<vibex_core::AgentModelProviderBinding>> {
+        self.unsupported(
+            "remote_agent_provider_bindings_private",
+            "remote clients receive projection capabilities instead of binding storage records",
+        )
+    }
+
+    fn create_agent_model_provider_binding(
+        &self,
+        _request: MutationRequest<vibex_core::AgentModelProviderBindingCreateRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentModelProviderBinding> {
+        self.unsupported(
+            "remote_agent_provider_binding_mutation_unavailable",
+            "Agent provider binding mutations must be performed by the authoritative desktop",
+        )
+    }
+
+    fn update_agent_model_provider_binding(
+        &self,
+        _request: MutationRequest<vibex_core::AgentModelProviderBindingUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentModelProviderBinding> {
+        self.unsupported(
+            "remote_agent_provider_binding_mutation_unavailable",
+            "Agent provider binding mutations must be performed by the authoritative desktop",
+        )
+    }
+
+    fn agent_provider_projection_capability(
+        &self,
+        request: vibex_core::AgentProviderProjectionCapabilityRequest,
+    ) -> BackendFuture<'_, vibex_core::AgentProviderProjectionCapability> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::ProjectionCapability(
+                vibex_core::RemoteAgentProjectionCapabilityRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentProjectionCapabilityResponse>(value)?.capability)
+        })
+    }
+
+    fn preview_agent_provider_projection(
+        &self,
+        request: vibex_core::AgentProviderProjectionPreviewRequest,
+    ) -> BackendFuture<'_, vibex_core::AgentProviderProjectionPreview> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::ProjectionPreview(
+                vibex_core::RemoteAgentProjectionPreviewRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentProjectionPreviewResponse>(value)?.preview)
+        })
+    }
+
+    fn mutate_provider_credential_secret(
+        &self,
+        _request: MutationRequest<vibex_core::ProviderCredentialSecretMutationRequest>,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderProfile> {
+        self.unsupported(
+            "remote_provider_secret_mutation_unavailable",
+            "Secret values never cross the Remote provider protocol",
+        )
+    }
+
     fn health_summaries(&self) -> BackendFuture<'_, Vec<ProviderHealthSummary>> {
         let this = self.clone();
         Box::pin(async move {
@@ -2003,6 +2152,10 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
                     permits(RemoteActionClass::ReadProviderSettings),
                 ),
                 (
+                    BackendOperation::ManagementProviderProjectionRead,
+                    permits(RemoteActionClass::ReadProviderSettings),
+                ),
+                (
                     BackendOperation::ManagementHealth,
                     permits(RemoteActionClass::ReadProviderSettings),
                 ),
@@ -2323,6 +2476,63 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code, "remote_worktree_mutation_unsupported");
+    }
+
+    #[tokio::test]
+    async fn remote_provider_projection_keeps_entities_and_secret_mutation_private() {
+        let backend = WebRemoteBackend::new(
+            Arc::new(MockTransport::new([])),
+            RemoteAuthProof {
+                device_id: vibex_core::DeviceId::new(),
+                auth_token: "test-token".to_string(),
+            },
+        );
+
+        assert_eq!(
+            backend
+                .list_model_provider_profiles()
+                .await
+                .unwrap_err()
+                .code,
+            "remote_model_provider_profiles_private"
+        );
+        assert_eq!(
+            backend
+                .list_agent_runtime_profiles(vibex_core::AgentId::parse("codex").unwrap())
+                .await
+                .unwrap_err()
+                .code,
+            "remote_agent_runtime_profiles_private"
+        );
+        assert_eq!(
+            backend
+                .list_agent_model_provider_bindings(
+                    vibex_core::AgentModelProviderBindingListRequest {
+                        agent_id: Some(vibex_core::AgentId::parse("codex").unwrap()),
+                        model_provider_profile_id: None,
+                    },
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "remote_agent_provider_bindings_private"
+        );
+
+        let secret = "remote-secret-must-stay-local";
+        let error = backend
+            .mutate_provider_credential_secret(MutationRequest::new(
+                vibex_core::ProviderCredentialSecretMutationRequest {
+                    model_provider_profile_id: vibex_core::ModelProviderProfileId::new(),
+                    credential_id: vibex_core::RequestId::new(),
+                    touched: true,
+                    clear: false,
+                    value: Some(secret.to_string()),
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "remote_provider_secret_mutation_unavailable");
+        assert!(!format!("{error:?}").contains(secret));
     }
 
     #[test]

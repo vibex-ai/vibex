@@ -456,6 +456,89 @@ impl ManagementBackend for DisconnectedBackend {
         disconnected_future!()
     }
 
+    fn list_model_provider_profiles(
+        &self,
+    ) -> BackendFuture<'_, Vec<vibex_core::ModelProviderProfile>> {
+        disconnected_future!()
+    }
+
+    fn create_model_provider_profile(
+        &self,
+        _request: MutationRequest<vibex_core::ModelProviderProfileCreateRequest>,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderProfile> {
+        disconnected_future!()
+    }
+
+    fn update_model_provider_profile(
+        &self,
+        _request: MutationRequest<vibex_core::ModelProviderProfileUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderProfile> {
+        disconnected_future!()
+    }
+
+    fn list_agent_runtime_profiles(
+        &self,
+        _agent_id: vibex_core::AgentId,
+    ) -> BackendFuture<'_, Vec<vibex_core::AgentRuntimeProfile>> {
+        disconnected_future!()
+    }
+
+    fn create_agent_runtime_profile(
+        &self,
+        _request: MutationRequest<vibex_core::AgentRuntimeProfileCreateRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentRuntimeProfile> {
+        disconnected_future!()
+    }
+
+    fn update_agent_runtime_profile(
+        &self,
+        _request: MutationRequest<vibex_core::AgentRuntimeProfileUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentRuntimeProfile> {
+        disconnected_future!()
+    }
+
+    fn list_agent_model_provider_bindings(
+        &self,
+        _request: vibex_core::AgentModelProviderBindingListRequest,
+    ) -> BackendFuture<'_, Vec<vibex_core::AgentModelProviderBinding>> {
+        disconnected_future!()
+    }
+
+    fn create_agent_model_provider_binding(
+        &self,
+        _request: MutationRequest<vibex_core::AgentModelProviderBindingCreateRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentModelProviderBinding> {
+        disconnected_future!()
+    }
+
+    fn update_agent_model_provider_binding(
+        &self,
+        _request: MutationRequest<vibex_core::AgentModelProviderBindingUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentModelProviderBinding> {
+        disconnected_future!()
+    }
+
+    fn agent_provider_projection_capability(
+        &self,
+        _request: vibex_core::AgentProviderProjectionCapabilityRequest,
+    ) -> BackendFuture<'_, vibex_core::AgentProviderProjectionCapability> {
+        disconnected_future!()
+    }
+
+    fn preview_agent_provider_projection(
+        &self,
+        _request: vibex_core::AgentProviderProjectionPreviewRequest,
+    ) -> BackendFuture<'_, vibex_core::AgentProviderProjectionPreview> {
+        disconnected_future!()
+    }
+
+    fn mutate_provider_credential_secret(
+        &self,
+        _request: MutationRequest<vibex_core::ProviderCredentialSecretMutationRequest>,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderProfile> {
+        disconnected_future!()
+    }
+
     fn health_summaries(&self) -> BackendFuture<'_, Vec<ProviderHealthSummary>> {
         disconnected_future!()
     }

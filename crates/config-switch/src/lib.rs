@@ -68,6 +68,8 @@ use vibex_db::{
 
 mod native_export;
 mod native_import;
+mod provider_projection;
+pub use provider_projection::*;
 pub mod secrets;
 pub mod skills;
 
@@ -327,6 +329,7 @@ impl ProviderConfigService {
                     "failed to read ACP provider profile after runtime reconciliation",
                 )
             })?;
+            self.sync_legacy_projection(&conn, &updated)?;
             reconciled.push(updated);
         }
         drop(conn);
@@ -472,6 +475,11 @@ impl ProviderConfigService {
     ) -> VibexResult<ProviderProfile> {
         validate_display_name(&request.display_name)?;
         require_agent_definition(&request.agent_id)?;
+        validate_agent_model_interfaces(
+            &request.agent_id,
+            &request.configured_models,
+            request.provider_options.as_ref(),
+        )?;
         let provider_kind = agent_configuration_provider_kind(&request.agent_id);
         let conn = self.open_connection()?;
         let configured_acp_models =
@@ -511,6 +519,7 @@ impl ProviderConfigService {
                 "failed to read agent model provider profile after create",
             )
         })?;
+        self.sync_legacy_projection(&conn, &created)?;
         self.notify_profile_saved(&created);
         Ok(created)
     }
@@ -549,6 +558,16 @@ impl ProviderConfigService {
             }
             (_, options) => options,
         };
+        validate_agent_model_interfaces(
+            &request.agent_id,
+            request
+                .configured_models
+                .as_deref()
+                .unwrap_or(&profile.configured_models),
+            provider_options
+                .as_ref()
+                .or(Some(&profile.provider_options)),
+        )?;
         drop(conn);
         self.update_profile(ProviderProfileUpdateRequest {
             provider_profile_id: profile.id,
@@ -694,6 +713,12 @@ impl ProviderConfigService {
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
 
+        // Empty controls are the normal representation of an untouched
+        // Secret field. Clearing is a separate, explicit operation.
+        if !request.clear && next_value.is_none() {
+            return build_agent_model_provider_secret_value_response(request.agent_id, &profile);
+        }
+
         let matching_secrets: Vec<_> = profile
             .secrets
             .iter()
@@ -713,7 +738,7 @@ impl ProviderConfigService {
             .map(|secret| secret.lookup_key.clone())
             .filter(|lookup_key| !lookup_key.trim().is_empty());
 
-        let replacement = if request.clear || next_value.is_none() {
+        let replacement = if request.clear {
             None
         } else {
             let lookup_key = reusable_lookup_key
@@ -770,6 +795,7 @@ impl ProviderConfigService {
                 "failed to read provider profile after secret update",
             )
         })?;
+        self.sync_legacy_projection(&conn, &updated)?;
         self.notify_profile_saved(&updated);
         build_agent_model_provider_secret_value_response(request.agent_id, &updated)
     }
@@ -873,6 +899,13 @@ impl ProviderConfigService {
     ) -> VibexResult<ProviderProfile> {
         validate_display_name(&request.display_name)?;
         validate_profile_agent_kind(request.agent_id.as_ref(), request.kind)?;
+        if let Some(agent_id) = request.agent_id.as_ref() {
+            validate_agent_model_interfaces(
+                agent_id,
+                &request.configured_models,
+                request.provider_options.as_ref(),
+            )?;
+        }
         if request.kind == ProviderKind::Acp {
             validate_acp_profile_options(request.provider_options.as_ref())?;
         }
@@ -885,6 +918,7 @@ impl ProviderConfigService {
                 "failed to read provider profile after create",
             )
         })?;
+        self.sync_legacy_projection(&conn, &created)?;
         self.notify_profile_saved(&created);
         Ok(created)
     }
@@ -946,6 +980,11 @@ impl ProviderConfigService {
             }
             profile.provider_options = provider_options;
         }
+        validate_agent_model_interfaces(
+            &profile.agent_id,
+            &profile.configured_models,
+            Some(&profile.provider_options),
+        )?;
         profile.updated_at_ms = unix_timestamp_ms();
 
         ProviderProfileRepository::update(&conn, &profile)?;
@@ -955,6 +994,7 @@ impl ProviderConfigService {
                 "failed to read provider profile after update",
             )
         })?;
+        self.sync_legacy_projection(&conn, &updated)?;
         self.notify_profile_saved(&updated);
         Ok(updated)
     }
@@ -1153,6 +1193,7 @@ impl ProviderConfigService {
                 "failed to read provider profile after duplicate",
             )
         })?;
+        self.sync_legacy_projection(&conn, &created)?;
         self.notify_profile_saved(&created);
         Ok(created)
     }
@@ -1167,6 +1208,11 @@ impl ProviderConfigService {
         }
         let mut conn = self.open_connection()?;
         ProviderProfileRepository::soft_delete(&mut conn, &request.provider_profile_id)?;
+        self.mark_legacy_projection_deleted(
+            &conn,
+            &request.provider_profile_id,
+            unix_timestamp_ms(),
+        )?;
         drop(conn);
         self.notify_profile_deleted(&request.provider_profile_id);
         Ok(())
@@ -4095,6 +4141,9 @@ pub fn codex_runtime_config_from_profile(
                 .as_deref()
                 .and_then(codex_provider_toml_wire_api)
         });
+    if let Some(wire_api) = wire_api.as_deref() {
+        validate_codex_wire_api(wire_api)?;
+    }
     let api_key = secrets::preferred_api_key_reference(&profile.secrets, &api_key_env_key)
         .map(secrets::resolve_provider_secret)
         .transpose()?
@@ -4115,6 +4164,73 @@ pub fn codex_runtime_config_from_profile(
         api_key_env_key,
         api_key,
     })
+}
+
+fn validate_agent_model_interfaces(
+    agent_id: &AgentId,
+    models: &[ProviderConfiguredModel],
+    options: Option<&ProviderOptions>,
+) -> VibexResult<()> {
+    match agent_id.as_str() {
+        "codex" => {
+            for model in models {
+                if let Some(wire_api) = model.wire_api
+                    && wire_api != vibex_core::ProviderModelWireApi::OpenaiResponses
+                {
+                    return Err(unsupported_model_interface(
+                        agent_id,
+                        &format!("{wire_api:?}"),
+                    ));
+                }
+            }
+            if let Some(options) = options {
+                if let Some(wire_api) = provider_runtime_option_value(options, "wireApi")? {
+                    validate_codex_wire_api(&wire_api)?;
+                }
+                if let Some(fragment) = provider_runtime_option_value(
+                    options,
+                    CODEX_MODEL_PROVIDER_CONFIG_TOML_OPTION_KEY,
+                )? && let Some(wire_api) = codex_provider_toml_wire_api(&fragment)
+                {
+                    validate_codex_wire_api(&wire_api)?;
+                }
+            }
+        }
+        "claude" => {
+            for model in models {
+                if let Some(wire_api) = model.wire_api
+                    && wire_api != vibex_core::ProviderModelWireApi::AnthropicMessages
+                {
+                    return Err(unsupported_model_interface(
+                        agent_id,
+                        &format!("{wire_api:?}"),
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_codex_wire_api(value: &str) -> VibexResult<()> {
+    let normalized = value.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    if matches!(normalized.as_str(), "responses" | "openai_responses") {
+        return Ok(());
+    }
+    Err(unsupported_model_interface(
+        &AgentId::parse("codex")?,
+        value,
+    ))
+}
+
+fn unsupported_model_interface(agent_id: &AgentId, wire_api: &str) -> VibexError {
+    VibexError::validation(
+        "agent_model_interface_unsupported",
+        "model interface is not supported by the exact Agent projection descriptor",
+    )
+    .with_diagnostic("agentId", agent_id.as_str())
+    .with_diagnostic("wireProtocolId", wire_api)
 }
 
 pub fn provider_option_value(options: &ProviderOptions, key: &str) -> Option<String> {
@@ -6775,7 +6891,10 @@ mod tests {
             .map(|preset| preset.preset_id)
             .collect::<std::collections::BTreeSet<_>>();
 
-        assert_eq!(definition_presets.len(), 39);
+        assert_eq!(
+            definition_presets.len(),
+            acp_agent_catalog_entries().len() + 3
+        );
         assert_eq!(definition_presets, catalog_presets);
     }
 
@@ -7232,6 +7351,92 @@ mod tests {
         };
 
         assert_eq!(error.code, "provider_option_key_conflict");
+    }
+
+    #[test]
+    fn codex_chat_is_rejected_with_one_stable_error_at_create_update_and_projection() {
+        let dir = tempdir().unwrap();
+        let service = ProviderConfigService::new(dir.path().join("vibex.db"));
+        let agent_id = AgentId::parse("codex").unwrap();
+        let chat_model = ProviderConfiguredModel {
+            id: "gpt-test".to_string(),
+            display_name: None,
+            enabled: true,
+            wire_api: Some(vibex_core::ProviderModelWireApi::OpenaiChatCompletions),
+        };
+
+        let create_error = service
+            .create_agent_model_provider_profile(AgentModelProviderProfileCreateRequest {
+                agent_id: agent_id.clone(),
+                display_name: "Rejected Codex Chat".to_string(),
+                account_alias: None,
+                base_url: Some("https://api.example.invalid/v1".to_string()),
+                default_model: Some("gpt-test".to_string()),
+                small_model: None,
+                large_model: None,
+                configured_models: vec![chat_model.clone()],
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: None,
+                secret_references: Vec::new(),
+            })
+            .unwrap_err();
+        assert_eq!(create_error.code, "agent_model_interface_unsupported");
+
+        let profile = service
+            .create_agent_model_provider_profile(AgentModelProviderProfileCreateRequest {
+                agent_id: agent_id.clone(),
+                display_name: "Valid Codex Responses".to_string(),
+                account_alias: None,
+                base_url: Some("https://api.example.invalid/v1".to_string()),
+                default_model: Some("gpt-test".to_string()),
+                small_model: None,
+                large_model: None,
+                configured_models: vec![ProviderConfiguredModel {
+                    wire_api: Some(vibex_core::ProviderModelWireApi::OpenaiResponses),
+                    ..chat_model.clone()
+                }],
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: None,
+                secret_references: Vec::new(),
+            })
+            .unwrap();
+        let update_error = service
+            .update_agent_model_provider_profile(AgentModelProviderProfileUpdateRequest {
+                agent_id: agent_id.clone(),
+                provider_profile_id: profile.id.clone(),
+                display_name: None,
+                status: None,
+                account_alias: None,
+                base_url: None,
+                default_model: Some("gpt-test".to_string()),
+                small_model: None,
+                large_model: None,
+                configured_models: Some(vec![chat_model]),
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: None,
+            })
+            .unwrap_err();
+        assert_eq!(update_error.code, "agent_model_interface_unsupported");
+
+        let mut projector_profile = profile;
+        projector_profile.provider_options = ProviderOptions {
+            schema_version: 1,
+            entries: vec![option_entry("wireApi", "chat_completions")],
+        };
+        let projection_error = match codex_runtime_config_from_profile(&projector_profile, None) {
+            Ok(_) => panic!("Codex Chat must not reach runtime projection"),
+            Err(error) => error,
+        };
+        assert_eq!(projection_error.code, "agent_model_interface_unsupported");
     }
 
     #[test]
@@ -7705,6 +7910,20 @@ mod tests {
         assert_eq!(updated.value.as_deref(), Some("sk-visible-local"));
         assert_eq!(updated.setup_state, ProviderSecretSetupState::Available);
         assert_eq!(updated.backend, ProviderSecretBackend::OsKeychain);
+        assert_eq!(listener.calls.lock().unwrap().len(), 2);
+
+        let untouched = service
+            .update_agent_model_provider_profile_secret_value(
+                AgentModelProviderProfileSecretValueUpdateRequest {
+                    agent_id: agent_id.clone(),
+                    provider_profile_id: profile.id.clone(),
+                    value: Some("   ".to_string()),
+                    clear: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(untouched.value.as_deref(), Some("sk-visible-local"));
+        assert_eq!(untouched.setup_state, ProviderSecretSetupState::Available);
         assert_eq!(listener.calls.lock().unwrap().len(), 2);
 
         let test_result = service

@@ -52,6 +52,8 @@ use vibex_core::{
 
 mod remote_v2;
 pub use remote_v2::*;
+mod provider_projection;
+pub use provider_projection::*;
 mod usage;
 pub use usage::*;
 
@@ -68,7 +70,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 36;
+pub const CURRENT_SCHEMA_VERSION: i64 = 37;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -1514,6 +1516,99 @@ const MIGRATIONS: &[Migration] = &[
             );
             CREATE INDEX IF NOT EXISTS idx_elicitation_requests_session_status
                 ON elicitation_requests(session_id, status, requested_at_ms);
+        ",
+    },
+    Migration {
+        version: 37,
+        name: "agent_provider_projection_platform",
+        sql: "
+            CREATE TABLE IF NOT EXISTS model_provider_profiles (
+                model_provider_profile_id TEXT PRIMARY KEY,
+                legacy_provider_profile_id TEXT NULL UNIQUE,
+                display_name TEXT NOT NULL,
+                vendor_hint TEXT NULL,
+                endpoints_json TEXT NOT NULL,
+                proxy_policy_json TEXT NOT NULL,
+                credentials_json TEXT NOT NULL,
+                configured_models_json TEXT NOT NULL,
+                default_model_id TEXT NULL,
+                headers_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK(revision > 0),
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                deleted_at_ms INTEGER NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_model_provider_profiles_active
+                ON model_provider_profiles(deleted_at_ms, updated_at_ms);
+
+            CREATE TABLE IF NOT EXISTS agent_runtime_profiles (
+                agent_runtime_profile_id TEXT PRIMARY KEY,
+                legacy_provider_profile_id TEXT NULL UNIQUE,
+                agent_id TEXT NOT NULL,
+                adapter_id TEXT NOT NULL,
+                version_identity_json TEXT NOT NULL,
+                command TEXT NOT NULL,
+                args_json TEXT NOT NULL,
+                safe_env_references_json TEXT NOT NULL,
+                cwd_template TEXT NULL,
+                process_strategy TEXT NOT NULL,
+                runtime_home_strategy TEXT NOT NULL,
+                host_capabilities_json TEXT NOT NULL,
+                resource_policy_json TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK(revision > 0),
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                deleted_at_ms INTEGER NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_runtime_profiles_agent
+                ON agent_runtime_profiles(agent_id, deleted_at_ms, updated_at_ms);
+
+            CREATE TABLE IF NOT EXISTS agent_model_provider_bindings_v2 (
+                agent_model_provider_binding_id TEXT PRIMARY KEY,
+                legacy_provider_profile_id TEXT NULL UNIQUE,
+                agent_id TEXT NOT NULL,
+                agent_runtime_profile_id TEXT NOT NULL
+                    REFERENCES agent_runtime_profiles(agent_runtime_profile_id),
+                model_provider_profile_id TEXT NOT NULL
+                    REFERENCES model_provider_profiles(model_provider_profile_id),
+                projection_descriptor_id TEXT NOT NULL,
+                projection_overrides_json TEXT NOT NULL,
+                projection_fingerprint TEXT NULL,
+                status TEXT NOT NULL,
+                verification_json TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK(revision > 0),
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                deleted_at_ms INTEGER NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_model_provider_bindings_agent
+                ON agent_model_provider_bindings_v2(agent_id, deleted_at_ms, updated_at_ms);
+            CREATE INDEX IF NOT EXISTS idx_agent_model_provider_bindings_provider
+                ON agent_model_provider_bindings_v2(
+                    model_provider_profile_id, deleted_at_ms, updated_at_ms
+                );
+
+            CREATE TABLE IF NOT EXISTS agent_configured_model_bindings (
+                agent_configured_model_binding_id TEXT PRIMARY KEY,
+                agent_model_provider_binding_id TEXT NOT NULL
+                    REFERENCES agent_model_provider_bindings_v2(
+                        agent_model_provider_binding_id
+                    ) ON DELETE CASCADE,
+                provider_model_id TEXT NOT NULL,
+                agent_model_id TEXT NOT NULL,
+                wire_protocol_id TEXT NOT NULL,
+                sdk_adapter_id TEXT NULL,
+                deployment TEXT NULL,
+                enabled INTEGER NOT NULL,
+                process_scoped INTEGER NOT NULL DEFAULT 0,
+                order_index INTEGER NOT NULL,
+                UNIQUE(agent_model_provider_binding_id, agent_model_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_configured_model_bindings_binding
+                ON agent_configured_model_bindings(
+                    agent_model_provider_binding_id, order_index
+                );
         ",
     },
 ];
@@ -9120,6 +9215,11 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
         applied.push(format!("{}:{}", migration.version, migration.name));
     }
 
+    // Seed compatibility Profiles before the v37 backfill while no caller
+    // transaction is active. Repository reads may run inside a transaction and
+    // must not start the backfill's own transaction.
+    ProviderProfileRepository::ensure_local_defaults(conn)?;
+    ProviderProjectionCompatibilityRepository::backfill_legacy_profiles(conn)?;
     Ok(applied)
 }
 
@@ -11221,7 +11321,8 @@ mod tests {
                 "33:managed_worktree_recovery_foundation",
                 "34:worktree_merge_lifecycle",
                 "35:permission_response_options",
-                "36:agent_elicitation_requests"
+                "36:agent_elicitation_requests",
+                "37:agent_provider_projection_platform"
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -11360,7 +11461,8 @@ mod tests {
                 "33:managed_worktree_recovery_foundation",
                 "34:worktree_merge_lifecycle",
                 "35:permission_response_options",
-                "36:agent_elicitation_requests"
+                "36:agent_elicitation_requests",
+                "37:agent_provider_projection_platform"
             ]
         );
         assert_eq!(
@@ -12905,7 +13007,8 @@ mod tests {
                 "33:managed_worktree_recovery_foundation",
                 "34:worktree_merge_lifecycle",
                 "35:permission_response_options",
-                "36:agent_elicitation_requests"
+                "36:agent_elicitation_requests",
+                "37:agent_provider_projection_platform"
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)

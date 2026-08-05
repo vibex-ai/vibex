@@ -73,16 +73,29 @@ pub fn store_provider_secret(lookup_key: &str, secret: &str) -> VibexResult<()> 
 }
 
 pub fn resolve_provider_secret(reference: &ProviderSecretReference) -> VibexResult<Option<String>> {
-    if reference.setup_state == ProviderSecretSetupState::Missing
-        || reference.backend == ProviderSecretBackend::Placeholder
+    resolve_provider_secret_reference(
+        reference.backend,
+        reference.setup_state,
+        &reference.lookup_key,
+    )
+    .map_err(|error| error.with_diagnostic("secretKind", format!("{:?}", reference.secret_kind)))
+}
+
+pub fn resolve_provider_secret_reference(
+    backend: ProviderSecretBackend,
+    setup_state: ProviderSecretSetupState,
+    lookup_key: &str,
+) -> VibexResult<Option<String>> {
+    if setup_state == ProviderSecretSetupState::Missing
+        || backend == ProviderSecretBackend::Placeholder
     {
         return Ok(None);
     }
 
-    match reference.backend {
-        ProviderSecretBackend::OsKeychain => load_os_secret(&reference.lookup_key),
+    match backend {
+        ProviderSecretBackend::OsKeychain => load_os_secret(lookup_key),
         ProviderSecretBackend::Environment => {
-            let lookup_key = validate_lookup_key(&reference.lookup_key)?;
+            let lookup_key = validate_lookup_key(lookup_key)?;
             Ok(std::env::var(lookup_key)
                 .ok()
                 .map(|value| value.trim().to_string())
@@ -91,8 +104,7 @@ pub fn resolve_provider_secret(reference: &ProviderSecretReference) -> VibexResu
         ProviderSecretBackend::External => Err(VibexError::capability(
             "provider_secret_external_unsupported",
             "external provider secret backends are not supported by the local runtime yet",
-        )
-        .with_diagnostic("secretKind", format!("{:?}", reference.secret_kind))),
+        )),
         ProviderSecretBackend::Placeholder => Ok(None),
     }
 }

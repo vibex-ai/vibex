@@ -887,3 +887,122 @@ JOIN scheduled_tasks t ON t.scheduled_task_id = r.scheduled_task_id
 The projection keeps run history authoritative and references the run id
 without copying prompt/provider-native payloads into the attention or audit
 surface.
+
+## Scenario: Provider Projection Compatibility Initialization
+
+### 1. Scope / Trigger
+
+- Trigger: opening or migrating a database that contains legacy
+  `provider_profiles`, including a fresh database whose local defaults have not
+  been seeded yet.
+- The v37 projection backfill opens its own transaction, so its initialization
+  boundary must remain outside repository reads and caller-owned transactions.
+
+### 2. Signatures
+
+```rust
+CURRENT_SCHEMA_VERSION = 37
+
+model_provider_profiles
+agent_runtime_profiles
+agent_model_provider_bindings_v2
+agent_configured_model_bindings
+
+apply_migrations(&mut Connection) -> VibexResult<Vec<String>>
+ProviderProfileRepository::ensure_local_defaults(&Connection) -> VibexResult<()>
+ProviderProjectionCompatibilityRepository::backfill_legacy_profiles(&Connection)
+    -> VibexResult<usize>
+ProviderProjectionCompatibilityRepository::sync_legacy_profile(
+    &Connection,
+    &ProviderProfile,
+) -> VibexResult<LegacyProviderProjectionRecords>
+```
+
+### 3. Contracts
+
+- Migration 37 is additive. It preserves legacy Profile ids in nullable unique
+  `legacy_provider_profile_id` columns and never rewrites session/default/
+  failover identities or touches an Agent process/home.
+- `apply_migrations` completes each schema transaction, then calls
+  `ensure_local_defaults`, then performs the compatibility backfill while the
+  connection is in autocommit mode. Fresh and upgraded databases therefore
+  converge on the same three-entity state.
+- `ensure_local_defaults` only performs its `INSERT OR IGNORE` seed writes. It
+  must not start projection backfill because legacy repository reads are allowed
+  inside caller transactions.
+- `backfill_legacy_profiles` is deterministic and idempotent. Each Profile sync
+  upserts provider, runtime, binding, and configured-model rows in one
+  transaction; a repeated migration returns no newly created binding.
+- Legacy facade mutations explicitly call compatibility sync after a successful
+  old-record write. Soft deletion marks the three compatibility records deleted
+  without deleting historical selection ids.
+- Backfill stores Secret references and revision/status metadata only. It never
+  resolves keychain/environment values or materializes overlay files.
+
+### 4. Validation & Error Matrix
+
+- Cannot begin/commit compatibility transaction ->
+  `provider_projection_backfill_transaction_failed` /
+  `provider_projection_backfill_commit_failed`.
+- Legacy row or JSON cannot decode ->
+  `provider_projection_legacy_decode_failed`; do not publish partial records.
+- Missing legacy identity on a compatibility record ->
+  `provider_projection_legacy_identity_missing`.
+- Entity revision is non-positive or stale -> matching
+  `*_revision_invalid` / `*_revision_conflict`.
+- `ProviderProfileRepository::get` inside an existing transaction -> succeeds
+  without attempting a nested compatibility transaction.
+
+### 5. Good/Base/Bad Cases
+
+- Good: a v36 database with configured Profiles migrates once; a second
+  `apply_migrations` preserves exactly one provider/runtime/binding set per
+  legacy id.
+- Good: a fresh database seeds all local defaults and projects them during the
+  same initialization call.
+- Base: a catalog snapshot CAS transaction reads a legacy Profile and performs
+  only its own snapshot writes.
+- Bad: call `backfill_legacy_profiles` from `ensure_local_defaults`; any
+  repository read inside a SQLite transaction can then fail with "cannot start
+  a transaction within a transaction".
+- Bad: swallow the nested-transaction error and continue with partially missing
+  compatibility rows.
+
+### 6. Tests Required
+
+- `fresh_migration_seeds_and_projects_local_defaults` asserts every seeded
+  Profile has all three compatibility entities.
+- `migration_37_backfills_v36_profiles_idempotently` asserts one v37 migration,
+  preserved Secret references, and zero new rows on repeated backfill.
+- `legacy_repository_reads_are_safe_inside_a_transaction` opens a transaction,
+  calls the legacy repository, and commits successfully.
+- Desktop Runtime catalog tests assert success/failure snapshot CAS paths do not
+  attempt a nested projection transaction.
+- Run the full `vibex-db` and `vibex-desktop-runtime` library suites after any
+  initialization-order change.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+fn ensure_local_defaults(conn: &Connection) -> VibexResult<()> {
+    seed_defaults(conn)?;
+    ProviderProjectionCompatibilityRepository::backfill_legacy_profiles(conn)?;
+    Ok(())
+}
+```
+
+#### Correct
+
+```rust
+fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
+    let applied = apply_schema_transactions(conn)?;
+    ProviderProfileRepository::ensure_local_defaults(conn)?;
+    ProviderProjectionCompatibilityRepository::backfill_legacy_profiles(conn)?;
+    Ok(applied)
+}
+```
+
+The compatibility transaction begins only after migration transactions finish
+and before a caller starts its own application transaction.

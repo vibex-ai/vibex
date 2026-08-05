@@ -10,10 +10,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    AccessibleAction, Animation, AnimationExt as _, AnyElement, AnyWindowHandle, App, Context,
-    DragMoveEvent, Empty, Entity, EventEmitter, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, Orientation, Render, Role, SharedString, StatefulInteractiveElement as _,
-    Subscription, Task, Window, div, prelude::*, px,
+    AccessibleAction, Animation, AnimationExt as _, AnyElement, App, Context, DragMoveEvent, Empty,
+    Entity, EventEmitter, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Orientation,
+    Render, Role, SharedString, StatefulInteractiveElement as _, Subscription, Task, Window, div,
+    prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
@@ -46,6 +46,7 @@ use vibex_desktop_runtime::{
     DesktopRuntime, ManagementHandle, RuntimeOptionRefreshResult, RuntimeOptionSnapshotSummary,
     validate_external_open_url,
 };
+use vibex_ui::{AgentProviderBindingEditorState, ProjectionCredentialSurface};
 
 use crate::assets::agent_brand_icon;
 use crate::gpui_ext::button_with_aria_label;
@@ -281,6 +282,7 @@ struct ManagementSnapshot {
     acp_configs: Vec<(String, vibex_core::AcpProviderConfig)>,
     native_import_preview: Option<vibex_core::ProviderNativeImportPreview>,
     agent_profile_states: Vec<AgentProviderProfileState>,
+    projection_states: Vec<AgentProviderProjectionState>,
     health_summaries: Vec<vibex_core::ProviderHealthSummary>,
     capability_summaries: Vec<vibex_core::ProviderCapabilitySummary>,
     runtime_option_snapshots: Vec<RuntimeOptionSnapshotSummary>,
@@ -305,6 +307,15 @@ struct AgentProviderProfileState {
     is_default: bool,
     failover_order_index: Option<i64>,
     in_failover_queue: bool,
+}
+
+#[derive(Clone)]
+struct AgentProviderProjectionState {
+    agent_id: String,
+    legacy_profile_id: Option<String>,
+    binding: Option<vibex_core::AgentModelProviderBinding>,
+    capability: vibex_core::AgentProviderProjectionCapability,
+    preview: Option<vibex_core::AgentProviderProjectionPreview>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -411,6 +422,8 @@ pub struct ManagementCenter {
     acp_configs: Vec<(String, vibex_core::AcpProviderConfig)>,
     native_import_preview: Option<vibex_core::ProviderNativeImportPreview>,
     agent_profile_states: Vec<AgentProviderProfileState>,
+    projection_states: Vec<AgentProviderProjectionState>,
+    projection_editor: AgentProviderBindingEditorState,
     health_summaries: Vec<vibex_core::ProviderHealthSummary>,
     capability_summaries: Vec<vibex_core::ProviderCapabilitySummary>,
     runtime_option_snapshots: Vec<RuntimeOptionSnapshotSummary>,
@@ -441,7 +454,6 @@ pub struct ManagementCenter {
     generation: u64,
     refresh_task: Option<Task<()>>,
     mutation_task: Option<Task<()>>,
-    profile_secret_task: Option<Task<()>>,
     discover_agents_after_refresh: bool,
     mcp_import_open: bool,
     skill_import_open: bool,
@@ -664,35 +676,45 @@ impl ManagementCenter {
             cx.subscribe(&mcp_search, |_, _, _: &InputEvent, cx| cx.notify()),
             cx.subscribe(&skill_search, |_, _, _: &InputEvent, cx| cx.notify()),
             cx.subscribe(&profile_name, |this, _, _: &InputEvent, cx| {
+                this.projection_editor.mark_draft_changed();
                 this.navigation.mark_dirty(ManagementSection::Agents, true);
                 cx.notify();
             }),
             cx.subscribe(&profile_note, |this, _, _: &InputEvent, cx| {
+                this.projection_editor.mark_draft_changed();
                 this.navigation.mark_dirty(ManagementSection::Agents, true);
                 cx.notify();
             }),
             cx.subscribe(&profile_website_url, |this, _, _: &InputEvent, cx| {
+                this.projection_editor.mark_draft_changed();
                 this.navigation.mark_dirty(ManagementSection::Agents, true);
                 cx.notify();
             }),
             cx.subscribe(&profile_base_url, |this, _, _: &InputEvent, cx| {
+                this.projection_editor.mark_draft_changed();
                 this.navigation.mark_dirty(ManagementSection::Agents, true);
                 cx.notify();
             }),
             cx.subscribe(&profile_model_draft, |this, _, _: &InputEvent, cx| {
+                this.projection_editor.mark_draft_changed();
                 this.navigation.mark_dirty(ManagementSection::Agents, true);
                 cx.notify();
             }),
             cx.subscribe(&profile_model_edit_id, |this, _, _: &InputEvent, cx| {
+                this.projection_editor.mark_draft_changed();
                 this.navigation.mark_dirty(ManagementSection::Agents, true);
                 cx.notify();
             }),
             cx.subscribe(&profile_model_edit_name, |this, _, _: &InputEvent, cx| {
+                this.projection_editor.mark_draft_changed();
                 this.navigation.mark_dirty(ManagementSection::Agents, true);
                 cx.notify();
             }),
             cx.subscribe(&profile_api_key, |this, _, _: &InputEvent, cx| {
                 this.profile_secret_touched = true;
+                let clear = this.profile_api_key.read(cx).value().trim().is_empty();
+                this.projection_editor.set_secret_intent(true, clear);
+                this.projection_editor.mark_draft_changed();
                 this.navigation.mark_dirty(ManagementSection::Agents, true);
                 cx.notify();
             }),
@@ -775,6 +797,8 @@ impl ManagementCenter {
             acp_configs: Vec::new(),
             native_import_preview: None,
             agent_profile_states: Vec::new(),
+            projection_states: Vec::new(),
+            projection_editor: AgentProviderBindingEditorState::default(),
             health_summaries: Vec::new(),
             capability_summaries: Vec::new(),
             runtime_option_snapshots: Vec::new(),
@@ -805,7 +829,6 @@ impl ManagementCenter {
             generation: 0,
             refresh_task: None,
             mutation_task: None,
-            profile_secret_task: None,
             discover_agents_after_refresh: false,
             mcp_import_open: false,
             skill_import_open: false,
@@ -1055,6 +1078,7 @@ impl ManagementCenter {
         self.selected_acp_profile_id = None;
         self.acp_config_draft = None;
         self.native_export_preview = None;
+        self.sync_projection_editor();
         cx.notify();
     }
 
@@ -1066,7 +1090,34 @@ impl ManagementCenter {
         self.selected_acp_profile_id = None;
         self.acp_config_draft = None;
         self.native_export_preview = None;
+        self.sync_projection_editor();
         cx.notify();
+    }
+
+    fn sync_projection_editor(&mut self) {
+        let selected_profile_id = self.selected_provider_profile_id.as_deref();
+        let selected_agent_id = self.selected_agent_id.as_deref();
+        let projection = selected_profile_id
+            .and_then(|profile_id| {
+                self.projection_states
+                    .iter()
+                    .find(|projection| projection.legacy_profile_id.as_deref() == Some(profile_id))
+            })
+            .or_else(|| {
+                selected_agent_id.and_then(|agent_id| {
+                    self.projection_states
+                        .iter()
+                        .find(|projection| projection.agent_id == agent_id)
+                })
+            });
+        if let Some(projection) = projection {
+            self.projection_editor
+                .replace_capability(projection.capability.clone());
+            self.projection_editor.preview = projection.preview.clone();
+        } else {
+            self.projection_editor.capability = None;
+            self.projection_editor.preview = None;
+        }
     }
 
     pub fn active_section(&self) -> ManagementSection {
@@ -1217,6 +1268,7 @@ impl ManagementCenter {
         self.acp_configs = snapshot.acp_configs;
         self.native_import_preview = snapshot.native_import_preview;
         self.agent_profile_states = snapshot.agent_profile_states;
+        self.projection_states = snapshot.projection_states;
         if !self.snapshot.agents.iter().any(|agent| {
             agent.added && self.selected_agent_id.as_deref() == Some(agent.id.as_str())
         }) {
@@ -1305,6 +1357,7 @@ impl ManagementCenter {
         self.automation_runs = snapshot.automation_runs;
         self.automation_steps = snapshot.automation_steps;
         self.devices = snapshot.devices;
+        self.sync_projection_editor();
         if self.graph_draft.graph_id.is_none() {
             if let Some(graph) = self.snapshot.graphs.first() {
                 self.graph_draft = AutomationGraphDraft::from_graph(graph);
@@ -1395,6 +1448,8 @@ impl ManagementCenter {
     }
 
     fn open_profile_creator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_projection_editor();
+        self.projection_editor.preview = None;
         self.profile_name.update(cx, |state, cx| {
             state.set_value(
                 management_locale_text(
@@ -1423,7 +1478,9 @@ impl ManagementCenter {
             state.set_value("", window, cx);
         });
         self.editing_profile_id = None;
+        self.projection_editor.draft_revision = 0;
         self.profile_secret_touched = false;
+        self.projection_editor.set_secret_intent(false, false);
         self.profile_secret_loading = false;
         self.profile_configured_models.clear();
         self.profile_model_edit_index = None;
@@ -1494,82 +1551,15 @@ impl ManagementCenter {
             .map(|profile| profile.provider_options)
             .unwrap_or_else(vibex_core::ProviderOptions::empty);
         self.editing_profile_id = Some(profile.id.clone());
+        self.projection_editor.draft_revision = 0;
         self.profile_secret_touched = false;
-        self.profile_secret_loading = true;
+        self.projection_editor.set_secret_intent(false, false);
+        self.profile_secret_loading = false;
         self.profile_editor_open = true;
         self.error = None;
         self.navigation.mark_dirty(ManagementSection::Agents, false);
         self.present_profile_editor_dialog(window, cx);
-        if let (Ok(agent_id), Ok(provider_profile_id)) = (
-            AgentId::parse(profile.agent_id),
-            vibex_core::ProviderProfileId::parse(profile.id),
-        ) {
-            self.load_profile_secret(agent_id, provider_profile_id, window.window_handle(), cx);
-        } else {
-            self.profile_secret_loading = false;
-        }
         cx.notify();
-    }
-
-    fn load_profile_secret(
-        &mut self,
-        agent_id: AgentId,
-        provider_profile_id: vibex_core::ProviderProfileId,
-        window_handle: AnyWindowHandle,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(runtime) = self.runtime.clone() else {
-            self.profile_secret_loading = false;
-            return;
-        };
-        let expected_profile_id = provider_profile_id.as_str().to_string();
-        let entity = cx.weak_entity();
-        let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
-                .management()
-                .providers()
-                .management()
-                .get_agent_model_provider_profile_secret_value(
-                    vibex_core::AgentModelProviderProfileSecretValueRequest {
-                        agent_id,
-                        provider_profile_id,
-                    },
-                )
-        });
-        self.profile_secret_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = runner.await;
-            let _ = cx.update_window(window_handle, |_, window, cx| {
-                let _ = entity.update(cx, |this, cx| {
-                    if this.editing_profile_id.as_deref() != Some(expected_profile_id.as_str()) {
-                        return;
-                    }
-                    this.profile_secret_loading = false;
-                    match outcome {
-                        Ok(Ok(secret)) => {
-                            this.profile_api_key.update(cx, |state, cx| {
-                                state.set_value(secret.value.unwrap_or_default(), window, cx)
-                            });
-                            this.profile_secret_touched = false;
-                            this.navigation.mark_dirty(ManagementSection::Agents, false);
-                        }
-                        Ok(Err(error)) => {
-                            this.error = Some(format!("{}: {}", error.code, error.message));
-                        }
-                        Err(error) => {
-                            this.error = Some(format!(
-                                "{}: {error}",
-                                management_error_text(
-                                    "API Key loading failed",
-                                    "API Key 加载失败",
-                                    "API Key 載入失敗",
-                                )
-                            ));
-                        }
-                    }
-                    cx.notify();
-                });
-            });
-        }));
     }
 
     fn close_profile_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1584,7 +1574,9 @@ impl ManagementCenter {
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.profile_editor_open = false;
         self.editing_profile_id = None;
+        self.projection_editor.draft_revision = 0;
         self.profile_secret_touched = false;
+        self.projection_editor.set_secret_intent(false, false);
         self.profile_secret_loading = false;
         self.profile_configured_models.clear();
         self.profile_model_edit_index = None;
@@ -1742,6 +1734,14 @@ impl ManagementCenter {
         wire_api: Option<vibex_core::ProviderModelWireApi>,
         cx: &mut Context<Self>,
     ) {
+        if wire_api.is_some_and(|wire_api| !self.projection_editor.accepts_wire_api(wire_api)) {
+            self.error = Some(
+                "agent_model_interface_unsupported: model interface is not supported by the exact Agent projection descriptor"
+                    .to_string(),
+            );
+            cx.notify();
+            return;
+        }
         if self.profile_model_edit_index == Some(index) {
             self.profile_model_edit_wire_api = wire_api;
             self.navigation.mark_dirty(ManagementSection::Agents, true);
@@ -1869,7 +1869,8 @@ impl ManagementCenter {
             }
         };
         let agent_id = agent.id.clone();
-        let secret_touched = self.profile_secret_touched;
+        let secret_touched = self.profile_secret_touched
+            && self.projection_editor.credential_surface() == ProjectionCredentialSurface::ApiKey;
         let Some(runtime) = self.runtime.clone() else {
             self.error = Some(
                 management_error_text(
@@ -1978,6 +1979,7 @@ impl ManagementCenter {
                         this.editing_profile_id = None;
                         this.selected_provider_profile_id = Some(saved_profile_id);
                         this.profile_secret_touched = false;
+                        this.projection_editor.set_secret_intent(false, false);
                         this.notice = Some(message);
                         this.refresh(cx);
                     }
@@ -5629,6 +5631,10 @@ impl ManagementCenter {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let pending = self.mutation.is_some();
+        let wire_api_choices = self.projection_editor.wire_api_choices();
+        let shows_wire_api = self
+            .projection_editor
+            .shows(vibex_core::AgentProjectionFormControl::WireProtocol);
         let fetching_models = self.editing_profile_id.as_ref().is_some_and(|profile_id| {
             matches!(
                 &self.mutation,
@@ -5738,21 +5744,14 @@ impl ManagementCenter {
             .map(|index| (index, self.profile_model_edit_wire_api))
             .map(|(index, wire_api)| {
                 let mut wire_controls = h_flex().w_full().flex_wrap().gap_1();
-                for (candidate, label) in [
-                    (None, management_locale_text("Inherit", "继承", "繼承")),
-                    (
-                        Some(vibex_core::ProviderModelWireApi::OpenaiResponses),
-                        "OpenAI Responses",
-                    ),
-                    (
-                        Some(vibex_core::ProviderModelWireApi::OpenaiChatCompletions),
-                        "Chat Completions",
-                    ),
-                    (
-                        Some(vibex_core::ProviderModelWireApi::AnthropicMessages),
-                        "Anthropic Messages",
-                    ),
-                ] {
+                let candidates = std::iter::once(None)
+                    .chain(wire_api_choices.iter().copied().map(Some))
+                    .collect::<Vec<_>>();
+                for candidate in candidates {
+                    let label = candidate.map_or_else(
+                        || management_locale_text("Inherit", "继承", "繼承"),
+                        provider_wire_api_label,
+                    );
                     wire_controls = wire_controls.child(
                         Button::new(SharedString::from(format!(
                             "provider-model-wire-{index}-{candidate:?}"
@@ -5791,18 +5790,21 @@ impl ManagementCenter {
                         false,
                         cx,
                     ))
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_medium()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(management_locale_text(
-                                "Model API protocol",
-                                "模型接口协议",
-                                "模型介面協定",
-                            )),
-                    )
-                    .child(wire_controls)
+                    .when(shows_wire_api, |editor| {
+                        editor
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_medium()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(management_locale_text(
+                                        "Model API protocol",
+                                        "模型接口协议",
+                                        "模型介面協定",
+                                    )),
+                            )
+                            .child(wire_controls)
+                    })
                     .child(
                         h_flex()
                             .w_full()
@@ -5938,6 +5940,330 @@ impl ManagementCenter {
             .into_any_element()
     }
 
+    fn current_projection_state(&self) -> Option<&AgentProviderProjectionState> {
+        if self.profile_editor_open && self.editing_profile_id.is_none() {
+            return None;
+        }
+        let profile_id = self
+            .editing_profile_id
+            .as_deref()
+            .or(self.selected_provider_profile_id.as_deref());
+        profile_id
+            .and_then(|profile_id| {
+                self.projection_states
+                    .iter()
+                    .find(|projection| projection.legacy_profile_id.as_deref() == Some(profile_id))
+            })
+            .or_else(|| {
+                self.selected_agent_id.as_deref().and_then(|agent_id| {
+                    self.projection_states
+                        .iter()
+                        .find(|projection| projection.agent_id == agent_id)
+                })
+            })
+    }
+
+    fn render_projection_credential_control(&self, cx: &mut Context<Self>) -> AnyElement {
+        let surface = self.projection_editor.credential_surface();
+        if surface == ProjectionCredentialSurface::ApiKey {
+            return v_flex()
+                .w_full()
+                .gap_1()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_medium()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("API Key"),
+                        )
+                        .when_some(
+                            self.projection_editor
+                                .capability
+                                .as_ref()
+                                .map(|capability| format!("{:?}", capability.auth_state)),
+                            |row, status| row.child(management_status_badge(status, cx)),
+                        ),
+                )
+                .child(
+                    Input::new(&self.profile_api_key)
+                        .small()
+                        .w_full()
+                        .mask_toggle()
+                        .disabled(self.profile_secret_loading),
+                )
+                .into_any_element();
+        }
+
+        let (title, detail) = match surface {
+            ProjectionCredentialSurface::OAuth => (
+                "OAuth",
+                management_locale_text(
+                    "Agent or host authentication status",
+                    "Agent 或主机认证状态",
+                    "Agent 或主機驗證狀態",
+                ),
+            ),
+            ProjectionCredentialSurface::Cloud => (
+                management_locale_text("Cloud credential", "云凭证", "雲端憑證"),
+                management_locale_text(
+                    "Cloud profile and credential references",
+                    "云端配置与凭证引用",
+                    "雲端設定與憑證引用",
+                ),
+            ),
+            ProjectionCredentialSurface::AgentManaged => (
+                management_locale_text("Agent account", "Agent 账号", "Agent 帳號"),
+                management_locale_text(
+                    "Authentication is managed by the Agent",
+                    "认证由 Agent 管理",
+                    "驗證由 Agent 管理",
+                ),
+            ),
+            ProjectionCredentialSurface::Local => (
+                management_locale_text("Local runtime", "本地运行时", "本機執行階段"),
+                management_locale_text(
+                    "No remote credential is projected",
+                    "不会投影远程凭证",
+                    "不會投影遠端憑證",
+                ),
+            ),
+            ProjectionCredentialSurface::ServiceMarketplace => (
+                management_locale_text("Service marketplace", "服务市场", "服務市集"),
+                management_locale_text(
+                    "Authentication is owned by the service",
+                    "认证由服务管理",
+                    "驗證由服務管理",
+                ),
+            ),
+            ProjectionCredentialSurface::Unsupported => (
+                management_locale_text("Automatic credential", "自动凭证", "自動憑證"),
+                management_locale_text(
+                    "Unsupported or unverified for this exact version",
+                    "当前精确版本不支持或尚未验证",
+                    "目前精確版本不支援或尚未驗證",
+                ),
+            ),
+            ProjectionCredentialSurface::ApiKey => unreachable!(),
+        };
+        v_flex()
+            .w_full()
+            .gap_1()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().muted.opacity(0.20))
+            .px_3()
+            .py_2()
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(div().text_sm().font_medium().child(title))
+                    .when_some(
+                        self.projection_editor
+                            .capability
+                            .as_ref()
+                            .map(|capability| format!("{:?}", capability.auth_state)),
+                        |row, status| row.child(management_status_badge(status, cx)),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(detail),
+            )
+            .into_any_element()
+    }
+
+    fn render_projection_contract(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(capability) = self.projection_editor.capability.as_ref() else {
+            return v_flex()
+                .w_full()
+                .gap_1()
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .pt_3()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .child(management_locale_text(
+                            "Provider projection",
+                            "供应商投影",
+                            "供應商投影",
+                        )),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(management_locale_text(
+                            "No versioned projection descriptor is available for this Agent.",
+                            "此 Agent 暂无可用的版本化投影描述符。",
+                            "此 Agent 暫無可用的版本化投影描述符。",
+                        )),
+                )
+                .into_any_element();
+        };
+
+        let projection_state = self.current_projection_state();
+        let binding_status = projection_state
+            .and_then(|projection| projection.binding.as_ref())
+            .map(|binding| format!("{:?}", binding.status))
+            .unwrap_or_else(|| management_locale_text("New binding", "新绑定", "新綁定").into());
+        let descriptor = capability
+            .descriptor_id
+            .as_ref()
+            .map(|id| id.as_str())
+            .unwrap_or("unverified");
+        let detected_version = capability
+            .detected_agent_version
+            .as_deref()
+            .or(capability.detected_adapter_version.as_deref())
+            .unwrap_or("unknown");
+        let credential_surface =
+            projection_credential_surface_label(self.projection_editor.credential_surface());
+
+        let mut contract = v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_2()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .pt_3()
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child(management_locale_text(
+                                "Provider projection",
+                                "供应商投影",
+                                "供應商投影",
+                            )),
+                    )
+                    .child(management_status_badge(binding_status, cx)),
+            )
+            .child(management_projection_detail_row(
+                management_locale_text("Descriptor", "描述符", "描述符"),
+                format!("{} · v{}", descriptor, capability.descriptor_version),
+                cx,
+            ))
+            .child(management_projection_detail_row(
+                management_locale_text("Detected version", "检测版本", "偵測版本"),
+                detected_version.to_string(),
+                cx,
+            ))
+            .child(management_projection_detail_row(
+                management_locale_text("Evidence", "证据状态", "證據狀態"),
+                format!(
+                    "{:?} · {:?}",
+                    capability.evidence_state, capability.match_kind
+                ),
+                cx,
+            ))
+            .child(management_projection_detail_row(
+                management_locale_text("Credential", "凭证", "憑證"),
+                format!("{} · {:?}", credential_surface, capability.auth_state),
+                cx,
+            ))
+            .child(management_projection_detail_row(
+                management_locale_text("Switch behavior", "切换行为", "切換行為"),
+                format!("{:?}", capability.switch_behavior),
+                cx,
+            ));
+
+        if let Some(preview) = self.projection_editor.preview.as_ref() {
+            contract = contract
+                .child(management_projection_detail_row(
+                    management_locale_text("Command", "命令摘要", "命令摘要"),
+                    preview.command_summary.clone(),
+                    cx,
+                ))
+                .child(management_projection_detail_row(
+                    management_locale_text("Effective model", "实际模型", "實際模型"),
+                    preview.effective_model.clone().unwrap_or_else(|| {
+                        management_locale_text("Agent managed", "由 Agent 管理", "由 Agent 管理")
+                            .to_string()
+                    }),
+                    cx,
+                ));
+            let mut targets = v_flex().w_full().min_w_0().gap_1();
+            for target in &preview.targets {
+                let value = if target.secret {
+                    "[redacted]".to_string()
+                } else {
+                    target.value_preview.clone()
+                };
+                targets = targets.child(management_projection_detail_row(
+                    target.field.clone(),
+                    format!("{:?} · {} · {}", target.target_kind, target.target, value),
+                    cx,
+                ));
+            }
+            if !preview.targets.is_empty() {
+                contract = contract.child(
+                    v_flex()
+                        .w_full()
+                        .gap_1()
+                        .pt_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_medium()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(management_locale_text(
+                                    "Projection targets",
+                                    "投影目标",
+                                    "投影目標",
+                                )),
+                        )
+                        .child(targets),
+                );
+            }
+            if !preview.overlay_files.is_empty() {
+                contract = contract.child(management_projection_detail_row(
+                    management_locale_text("Private overlays", "私有覆盖层", "私有覆蓋層"),
+                    preview
+                        .overlay_files
+                        .iter()
+                        .map(|overlay| format!("{} ({})", overlay.relative_path, overlay.format))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    cx,
+                ));
+            }
+        } else {
+            contract = contract.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text(
+                        "A redacted runtime preview will be available after the binding is saved.",
+                        "保存绑定后将显示脱敏的运行时投影预览。",
+                        "儲存綁定後將顯示遮罩的執行階段投影預覽。",
+                    )),
+            );
+        }
+        contract.into_any_element()
+    }
+
     fn render_profile_editor_dialog(&mut self, cx: &mut Context<Self>) -> AnyElement {
         if !self.profile_editor_open {
             return div().size_full().into_any_element();
@@ -5949,7 +6275,18 @@ impl ManagementCenter {
             self.mutation,
             Some(ManagementMutation::ProfileCreate) | Some(ManagementMutation::ProfileUpdate(_))
         );
-        let model_section = self.render_profile_model_section(selected_agent_id, cx);
+        let shows_endpoint = self
+            .projection_editor
+            .shows(vibex_core::AgentProjectionFormControl::Endpoint);
+        let shows_model = self
+            .projection_editor
+            .shows(vibex_core::AgentProjectionFormControl::Model);
+        let shows_api_key =
+            self.projection_editor.credential_surface() == ProjectionCredentialSurface::ApiKey;
+        let credential_control = self.render_projection_credential_control(cx);
+        let model_section =
+            shows_model.then(|| self.render_profile_model_section(selected_agent_id, cx));
+        let projection_contract = self.render_projection_contract(cx);
         let mut form = v_flex()
             .w_full()
             .gap_3()
@@ -5981,33 +6318,18 @@ impl ManagementCenter {
                 false,
                 cx,
             ))
-            .child(
-                v_flex()
-                    .w_full()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_medium()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("API Key"),
-                    )
-                    .child(
-                        Input::new(&self.profile_api_key)
-                            .small()
-                            .w_full()
-                            .mask_toggle()
-                            .disabled(self.profile_secret_loading),
-                    ),
-            )
-            .child(management_input_field(
-                management_locale_text("API request URL", "API 请求地址", "API 請求位址"),
-                &self.profile_base_url,
-                false,
-                cx,
-            ))
-            .child(model_section);
-        if self.profile_secret_loading {
+            .child(credential_control)
+            .when(shows_endpoint, |form| {
+                form.child(management_input_field(
+                    management_locale_text("API request URL", "API 请求地址", "API 請求位址"),
+                    &self.profile_base_url,
+                    false,
+                    cx,
+                ))
+            })
+            .when_some(model_section, |form, section| form.child(section))
+            .child(projection_contract);
+        if shows_api_key && self.profile_secret_loading {
             form = form.child(status_line(
                 management_locale_text(
                     "Loading saved API Key...",
@@ -6019,15 +6341,15 @@ impl ManagementCenter {
                 cx,
             ));
         }
-        if updating && !self.profile_secret_touched {
+        if shows_api_key && updating && !self.profile_secret_touched {
             form = form.child(
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(management_locale_text(
-                        "Leave API Key empty to keep the saved secret unchanged.",
-                        "API Key 留空将保留当前已保存的密钥。",
-                        "API Key 留空將保留目前已儲存的金鑰。",
+                        "Saved Secret remains unchanged until this field is edited.",
+                        "只有编辑此字段后才会修改已保存的密钥。",
+                        "只有編輯此欄位後才會修改已儲存的金鑰。",
                     )),
             );
         }
@@ -6619,12 +6941,14 @@ impl ManagementCenter {
             };
             failover_rows = failover_rows.child(row);
         }
+        let projection_contract = self.render_projection_contract(cx);
 
         v_flex()
             .w_full()
             .min_w_0()
             .gap_3()
             .child(runtime_options_card)
+            .child(projection_contract)
             .child(
                 v_flex()
                     .w_full()
@@ -11381,6 +11705,66 @@ fn management_status_badge(label: String, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
+fn management_projection_detail_row(
+    label: impl Into<SharedString>,
+    value: impl Into<SharedString>,
+    cx: &App,
+) -> AnyElement {
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .items_start()
+        .justify_between()
+        .gap_3()
+        .child(
+            div()
+                .flex_none()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(label.into()),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .text_right()
+                .text_xs()
+                .font_family(cx.theme().mono_font_family.clone())
+                .text_color(cx.theme().foreground)
+                .child(value.into()),
+        )
+        .into_any_element()
+}
+
+fn provider_wire_api_label(wire_api: vibex_core::ProviderModelWireApi) -> &'static str {
+    match wire_api {
+        vibex_core::ProviderModelWireApi::OpenaiResponses => "OpenAI Responses",
+        vibex_core::ProviderModelWireApi::OpenaiChatCompletions => "Chat Completions",
+        vibex_core::ProviderModelWireApi::AnthropicMessages => "Anthropic Messages",
+    }
+}
+
+fn projection_credential_surface_label(surface: ProjectionCredentialSurface) -> &'static str {
+    match surface {
+        ProjectionCredentialSurface::ApiKey => "API Key",
+        ProjectionCredentialSurface::OAuth => "OAuth",
+        ProjectionCredentialSurface::Cloud => {
+            management_locale_text("Cloud credential", "云凭证", "雲端憑證")
+        }
+        ProjectionCredentialSurface::AgentManaged => {
+            management_locale_text("Agent managed", "Agent 管理", "Agent 管理")
+        }
+        ProjectionCredentialSurface::Local => {
+            management_locale_text("Local runtime", "本地运行时", "本機執行階段")
+        }
+        ProjectionCredentialSurface::ServiceMarketplace => {
+            management_locale_text("Service marketplace", "服务市场", "服務市集")
+        }
+        ProjectionCredentialSurface::Unsupported => {
+            management_locale_text("Unsupported", "不支持", "不支援")
+        }
+    }
+}
+
 fn management_resource_sidebar_header(title: &'static str, count: usize, cx: &App) -> AnyElement {
     h_flex()
         .w_full()
@@ -12074,6 +12458,18 @@ async fn load_snapshot(
         })
         .collect::<Vec<_>>();
     let mut agent_profile_states = Vec::new();
+    let mut projection_states = Vec::new();
+    let projection_workspace_key = default_scope
+        .workspace_id
+        .as_ref()
+        .map(|workspace_id| workspace_id.as_str().to_string())
+        .or_else(|| {
+            default_scope
+                .project_id
+                .as_ref()
+                .map(|project_id| project_id.as_str().to_string())
+        })
+        .unwrap_or_else(|| "management-global".to_string());
     for agent in agents.agents.iter().filter(|agent| agent.added) {
         let response = provider.list_agent_model_provider_profiles(
             vibex_core::AgentModelProviderProfileListRequest {
@@ -12092,6 +12488,62 @@ async fn load_snapshot(
             response,
             scoped_default.provider_profile_id.as_ref(),
         ));
+
+        let runtimes = provider.list_agent_runtime_profiles(&agent.id)?;
+        let bindings = provider.list_agent_model_provider_bindings(
+            vibex_core::AgentModelProviderBindingListRequest {
+                agent_id: Some(agent.id.clone()),
+                model_provider_profile_id: None,
+            },
+        )?;
+        for runtime_profile in runtimes {
+            let runtime_bindings = bindings
+                .iter()
+                .filter(|binding| binding.runtime_profile_id == runtime_profile.id)
+                .collect::<Vec<_>>();
+            if runtime_bindings.is_empty() {
+                let capability = provider.agent_provider_projection_capability(
+                    vibex_core::AgentProviderProjectionCapabilityRequest {
+                        runtime_profile_id: runtime_profile.id,
+                        binding_id: None,
+                    },
+                )?;
+                projection_states.push(AgentProviderProjectionState {
+                    agent_id: agent.id.as_str().to_string(),
+                    legacy_profile_id: None,
+                    binding: None,
+                    capability,
+                    preview: None,
+                });
+                continue;
+            }
+            for binding in runtime_bindings {
+                let capability = provider.agent_provider_projection_capability(
+                    vibex_core::AgentProviderProjectionCapabilityRequest {
+                        runtime_profile_id: runtime_profile.id.clone(),
+                        binding_id: Some(binding.id.clone()),
+                    },
+                )?;
+                let preview = provider
+                    .preview_agent_provider_projection(
+                        vibex_core::AgentProviderProjectionPreviewRequest {
+                            binding_id: binding.id.clone(),
+                            workspace_key: projection_workspace_key.clone(),
+                        },
+                    )
+                    .ok();
+                projection_states.push(AgentProviderProjectionState {
+                    agent_id: agent.id.as_str().to_string(),
+                    legacy_profile_id: binding
+                        .legacy_provider_profile_id
+                        .as_ref()
+                        .map(|profile_id| profile_id.as_str().to_string()),
+                    binding: Some(binding.clone()),
+                    capability,
+                    preview,
+                });
+            }
+        }
     }
     let mcp_servers = provider.list_mcp_servers()?;
     let skills = provider.list_skills()?;
@@ -12196,6 +12648,7 @@ async fn load_snapshot(
         acp_configs,
         native_import_preview,
         agent_profile_states,
+        projection_states,
         health_summaries,
         capability_summaries,
         runtime_option_snapshots,

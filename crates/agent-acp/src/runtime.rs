@@ -56,10 +56,11 @@ use vibex_agent::{
     SwitchTargetExecutor, default_adapter_for_agent,
 };
 use vibex_config_switch::{
-    CODEX_MODEL_PROVIDER_ID_OPTION_KEY, CodexProviderRuntimeConfig, ProviderConfigService,
-    ProviderProfileChangeListener, codex_runtime_config_from_profile, provider_option_value,
-    secrets::resolve_provider_secret,
+    CODEX_MODEL_PROVIDER_ID_OPTION_KEY, ProviderConfigService, ProviderProfileChangeListener,
+    provider_option_value, secrets::resolve_provider_secret,
 };
+#[cfg(test)]
+use vibex_config_switch::{CodexProviderRuntimeConfig, codex_runtime_config_from_profile};
 use vibex_core::{
     AcpProcessStrategy, AcpProviderConfig, AcpProviderEnvSource, ActiveWorkKind,
     AgentEventRawOutput, AgentEventRawOutputMode, AgentId, AgentMessagePhase,
@@ -188,10 +189,15 @@ const OPENCODE_PROMPT_CORRELATION_CLEANUP_TIMEOUT: Duration = Duration::from_sec
 const OPENCODE_STREAM_ERROR_RECOVERY_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 #[cfg(test)]
 const OPENCODE_STREAM_ERROR_RECOVERY_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(test)]
 const CODEX_ACP_API_KEY_ENV: &str = "CODEX_API_KEY";
+#[cfg(test)]
 const CODEX_ACP_MODEL_PROVIDER_ENV: &str = "MODEL_PROVIDER";
+#[cfg(test)]
 const CODEX_ACP_DEFAULT_AUTH_REQUEST_ENV: &str = "DEFAULT_AUTH_REQUEST";
+#[cfg(test)]
 const CODEX_ACP_DEFAULT_API_KEY_AUTH_REQUEST: &str = r#"{"methodId":"api-key"}"#;
+const PROVIDER_PROJECTION_FINGERPRINT_ENV: &str = "__VIBEX_PROVIDER_PROJECTION_FINGERPRINT";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenCodeWireApi {
@@ -7527,14 +7533,17 @@ impl AcpRuntimeClient {
                 overlays.push((key.to_string(), value));
             }
         }
-        for (key, value) in opencode_model_provider_env(profile) {
+        let projection = self
+            .config_service
+            .resolve_legacy_agent_provider_projection(&profile.id, &workspace_runtime_key(cwd))?;
+        for (key, value) in projection.child_environment() {
             upsert_env_overlay(&mut overlays, key, value);
         }
-        match profile.agent_id.as_str() {
-            "claude" => project_claude_provider_env(profile, &mut overlays)?,
-            "codex" => self.project_codex_provider_env(profile, cwd, &mut overlays)?,
-            _ => {}
-        }
+        upsert_env_overlay(
+            &mut overlays,
+            PROVIDER_PROJECTION_FINGERPRINT_ENV.to_string(),
+            projection.fingerprint,
+        );
         Ok(overlays)
     }
 
@@ -7554,6 +7563,7 @@ impl AcpRuntimeClient {
         )
     }
 
+    #[cfg(test)]
     fn project_codex_provider_env(
         &self,
         profile: &ProviderProfile,
@@ -7785,6 +7795,15 @@ impl AcpRuntimeClient {
             &mut non_secret_env,
             &mut secret_reference_versions,
         )?;
+        if !non_secret_env.contains_key(PROVIDER_PROJECTION_FINGERPRINT_ENV) {
+            let projection = self
+                .config_service
+                .plan_legacy_agent_provider_projection(profile_id, &workspace_runtime_key(cwd))?;
+            non_secret_env.insert(
+                PROVIDER_PROJECTION_FINGERPRINT_ENV.to_string(),
+                projection.fingerprint,
+            );
+        }
         let (adapter_version, adapter_identity) = self
             .compatibility_registry
             .for_agent(&profile.agent_id)
@@ -10754,6 +10773,7 @@ fn upsert_env_overlay(overlays: &mut Vec<(String, String)>, key: String, value: 
     }
 }
 
+#[cfg(test)]
 fn project_claude_provider_env(
     profile: &ProviderProfile,
     overlays: &mut Vec<(String, String)>,
@@ -10790,6 +10810,7 @@ fn project_claude_provider_env(
     Ok(())
 }
 
+#[cfg(test)]
 fn codex_api_key_env_key(runtime: &CodexProviderRuntimeConfig) -> &str {
     let key = runtime.api_key_env_key.trim();
     if is_process_env_key(key) {
@@ -10799,6 +10820,7 @@ fn codex_api_key_env_key(runtime: &CodexProviderRuntimeConfig) -> &str {
     }
 }
 
+#[cfg(test)]
 fn is_process_env_key(value: &str) -> bool {
     let mut chars = value.chars();
     let Some(first) = chars.next() else {
@@ -10808,6 +10830,7 @@ fn is_process_env_key(value: &str) -> bool {
         && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
+#[cfg(test)]
 fn render_codex_runtime_config(
     profile: &ProviderProfile,
     runtime: &CodexProviderRuntimeConfig,
@@ -10891,6 +10914,7 @@ fn render_codex_runtime_config(
     Some(format!("{}\n", lines.join("\n")))
 }
 
+#[cfg(test)]
 fn codex_config_is_complete(config: &str) -> bool {
     config.lines().any(|line| {
         let line = line.trim();
@@ -10900,6 +10924,7 @@ fn codex_config_is_complete(config: &str) -> bool {
         .any(|line| line.trim_start().starts_with("[model_providers"))
 }
 
+#[cfg(test)]
 fn toml_quoted_string(value: &str) -> String {
     let mut quoted = String::with_capacity(value.len() + 2);
     quoted.push('"');
@@ -10961,6 +10986,7 @@ fn opencode_model_provider_id(profile: &ProviderProfile) -> Option<String> {
 }
 
 impl OpenCodeWireApi {
+    #[cfg(test)]
     fn npm(self) -> &'static str {
         match self {
             Self::OpenaiResponses => "@ai-sdk/openai",
@@ -10977,6 +11003,7 @@ impl OpenCodeWireApi {
         }
     }
 
+    #[cfg(test)]
     fn display_name(self) -> &'static str {
         match self {
             Self::OpenaiResponses => "OpenAI Responses",
@@ -11072,6 +11099,7 @@ fn opencode_qualified_model_id(profile: &ProviderProfile, model: &str) -> Option
     Some(format!("{provider_id}/{model}"))
 }
 
+#[cfg(test)]
 fn opencode_model_provider_env(profile: &ProviderProfile) -> Vec<(String, String)> {
     let Some(base_provider_id) = opencode_model_provider_id(profile) else {
         return Vec::new();

@@ -29,6 +29,10 @@ use crate::provider::{
     ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, ProviderUsageListRequest,
     ProviderUsageSummary,
 };
+use crate::provider_projection::{
+    AgentProviderProjectionCapability, AgentProviderProjectionCapabilityRequest,
+    AgentProviderProjectionPreview, AgentProviderProjectionPreviewRequest,
+};
 use crate::runtime::{
     AgentSessionRuntimeSelectionState, AgentSessionRuntimeSnapshot, AttachRuntimeRequest,
     AttachRuntimeResponse, CancelAgentSessionRuntimeSwitchRequest, DetachRuntimeRequest,
@@ -1169,6 +1173,8 @@ impl RemoteWorkbenchRequest {
 pub enum RemoteProviderOperationKind {
     ListProfiles,
     PreviewInjection,
+    ProjectionCapability,
+    ProjectionPreview,
     ListHealthSummaries,
     RunHealthProbes,
     ListUsageSummaries,
@@ -1198,6 +1204,32 @@ pub struct RemoteProviderInjectionPreviewRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteProviderInjectionPreviewResponse {
     pub preview: ProviderInjectionPreview,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentProjectionCapabilityRequest {
+    pub auth: RemoteAuthProof,
+    pub request: AgentProviderProjectionCapabilityRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentProjectionCapabilityResponse {
+    pub capability: AgentProviderProjectionCapability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentProjectionPreviewRequest {
+    pub auth: RemoteAuthProof,
+    pub request: AgentProviderProjectionPreviewRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentProjectionPreviewResponse {
+    pub preview: AgentProviderProjectionPreview,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1256,6 +1288,8 @@ pub struct RemoteProviderFailoverRecommendationListResponse {
 pub enum RemoteProviderRequest {
     ListProfiles(RemoteProviderProfileListRequest),
     PreviewInjection(RemoteProviderInjectionPreviewRequest),
+    ProjectionCapability(RemoteAgentProjectionCapabilityRequest),
+    ProjectionPreview(RemoteAgentProjectionPreviewRequest),
     ListHealthSummaries(RemoteProviderHealthSummaryListRequest),
     RunHealthProbes(RemoteProviderRunHealthProbesRequest),
     ListUsageSummaries(RemoteProviderUsageSummaryListRequest),
@@ -1267,6 +1301,8 @@ impl RemoteProviderRequest {
         match self {
             Self::ListProfiles(_) => RemoteProviderOperationKind::ListProfiles,
             Self::PreviewInjection(_) => RemoteProviderOperationKind::PreviewInjection,
+            Self::ProjectionCapability(_) => RemoteProviderOperationKind::ProjectionCapability,
+            Self::ProjectionPreview(_) => RemoteProviderOperationKind::ProjectionPreview,
             Self::ListHealthSummaries(_) => RemoteProviderOperationKind::ListHealthSummaries,
             Self::RunHealthProbes(_) => RemoteProviderOperationKind::RunHealthProbes,
             Self::ListUsageSummaries(_) => RemoteProviderOperationKind::ListUsageSummaries,

@@ -9838,6 +9838,7 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "tempfile",
  "toml 0.8.23",
  "vibex-core",
@@ -9864,6 +9865,7 @@ name = "vibex-core"
 version = "0.1.0-rc.1"
 dependencies = [
  "js-sys",
+ "semver 1.0.28",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

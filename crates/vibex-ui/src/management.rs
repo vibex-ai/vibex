@@ -162,6 +162,131 @@ impl ProviderProfileProjection {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectionCredentialSurface {
+    ApiKey,
+    OAuth,
+    Cloud,
+    AgentManaged,
+    Local,
+    ServiceMarketplace,
+    Unsupported,
+}
+
+/// Shared Desktop/Web/Mobile state for a descriptor-driven Agent binding
+/// editor. It contains no Secret value; `secret_touched` and `secret_clear`
+/// are independent intent flags consumed only by the authoritative desktop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentProviderBindingEditorState {
+    pub capability: Option<vibex_core::AgentProviderProjectionCapability>,
+    pub preview: Option<vibex_core::AgentProviderProjectionPreview>,
+    pub draft_revision: u64,
+    pub secret_touched: bool,
+    pub secret_clear: bool,
+}
+
+impl AgentProviderBindingEditorState {
+    pub fn replace_capability(
+        &mut self,
+        capability: vibex_core::AgentProviderProjectionCapability,
+    ) {
+        // Capability refreshes must not erase an in-progress draft or convert
+        // an untouched blank Secret control into a clear mutation.
+        self.capability = Some(capability);
+    }
+
+    pub fn replace_preview(&mut self, preview: vibex_core::AgentProviderProjectionPreview) {
+        self.preview = Some(preview);
+    }
+
+    pub fn mark_draft_changed(&mut self) {
+        self.draft_revision = self.draft_revision.saturating_add(1);
+    }
+
+    pub fn set_secret_intent(&mut self, touched: bool, clear: bool) {
+        self.secret_touched = touched;
+        self.secret_clear = touched && clear;
+    }
+
+    pub fn shows(&self, control: vibex_core::AgentProjectionFormControl) -> bool {
+        self.capability
+            .as_ref()
+            .is_some_and(|capability| capability.form_controls.contains(&control))
+    }
+
+    pub fn credential_surface(&self) -> ProjectionCredentialSurface {
+        use vibex_core::AgentProjectionFormControl as Control;
+        if self.shows(Control::ApiKey) {
+            ProjectionCredentialSurface::ApiKey
+        } else if self.shows(Control::OAuth) {
+            ProjectionCredentialSurface::OAuth
+        } else if [
+            Control::Aws,
+            Control::Gcp,
+            Control::Azure,
+            Control::Snowflake,
+        ]
+        .into_iter()
+        .any(|control| self.shows(control))
+        {
+            ProjectionCredentialSurface::Cloud
+        } else if self.shows(Control::AgentManagedStatus) {
+            ProjectionCredentialSurface::AgentManaged
+        } else if self.shows(Control::LocalRuntime) {
+            ProjectionCredentialSurface::Local
+        } else if self.shows(Control::ServiceMarketplace) {
+            ProjectionCredentialSurface::ServiceMarketplace
+        } else {
+            ProjectionCredentialSurface::Unsupported
+        }
+    }
+
+    pub fn wire_api_choices(&self) -> Vec<vibex_core::ProviderModelWireApi> {
+        let Some(capability) = self.capability.as_ref() else {
+            return Vec::new();
+        };
+        capability
+            .model_interfaces
+            .iter()
+            .filter(|interface| interface.user_selectable)
+            .filter_map(|interface| match interface.wire_protocol_id.as_str() {
+                vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES => {
+                    Some(vibex_core::ProviderModelWireApi::OpenaiResponses)
+                }
+                vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS => {
+                    Some(vibex_core::ProviderModelWireApi::OpenaiChatCompletions)
+                }
+                vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => {
+                    Some(vibex_core::ProviderModelWireApi::AnthropicMessages)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn accepts_wire_api(&self, wire_api: vibex_core::ProviderModelWireApi) -> bool {
+        self.capability.as_ref().is_some_and(|capability| {
+            let protocol = match wire_api {
+                vibex_core::ProviderModelWireApi::OpenaiResponses => {
+                    vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES
+                }
+                vibex_core::ProviderModelWireApi::OpenaiChatCompletions => {
+                    vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS
+                }
+                vibex_core::ProviderModelWireApi::AnthropicMessages => {
+                    vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES
+                }
+            };
+            capability
+                .model_interfaces
+                .iter()
+                .any(|interface| interface.wire_protocol_id == protocol)
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderHealthProjection {
@@ -902,6 +1027,89 @@ mod tests {
             })
         }
 
+        fn list_model_provider_profiles(
+            &self,
+        ) -> BackendFuture<'_, Vec<vibex_core::ModelProviderProfile>> {
+            error_future()
+        }
+
+        fn create_model_provider_profile(
+            &self,
+            _request: MutationRequest<vibex_core::ModelProviderProfileCreateRequest>,
+        ) -> BackendFuture<'_, vibex_core::ModelProviderProfile> {
+            error_future()
+        }
+
+        fn update_model_provider_profile(
+            &self,
+            _request: MutationRequest<vibex_core::ModelProviderProfileUpdateRequest>,
+        ) -> BackendFuture<'_, vibex_core::ModelProviderProfile> {
+            error_future()
+        }
+
+        fn list_agent_runtime_profiles(
+            &self,
+            _agent_id: AgentId,
+        ) -> BackendFuture<'_, Vec<vibex_core::AgentRuntimeProfile>> {
+            error_future()
+        }
+
+        fn create_agent_runtime_profile(
+            &self,
+            _request: MutationRequest<vibex_core::AgentRuntimeProfileCreateRequest>,
+        ) -> BackendFuture<'_, vibex_core::AgentRuntimeProfile> {
+            error_future()
+        }
+
+        fn update_agent_runtime_profile(
+            &self,
+            _request: MutationRequest<vibex_core::AgentRuntimeProfileUpdateRequest>,
+        ) -> BackendFuture<'_, vibex_core::AgentRuntimeProfile> {
+            error_future()
+        }
+
+        fn list_agent_model_provider_bindings(
+            &self,
+            _request: vibex_core::AgentModelProviderBindingListRequest,
+        ) -> BackendFuture<'_, Vec<vibex_core::AgentModelProviderBinding>> {
+            error_future()
+        }
+
+        fn create_agent_model_provider_binding(
+            &self,
+            _request: MutationRequest<vibex_core::AgentModelProviderBindingCreateRequest>,
+        ) -> BackendFuture<'_, vibex_core::AgentModelProviderBinding> {
+            error_future()
+        }
+
+        fn update_agent_model_provider_binding(
+            &self,
+            _request: MutationRequest<vibex_core::AgentModelProviderBindingUpdateRequest>,
+        ) -> BackendFuture<'_, vibex_core::AgentModelProviderBinding> {
+            error_future()
+        }
+
+        fn agent_provider_projection_capability(
+            &self,
+            _request: vibex_core::AgentProviderProjectionCapabilityRequest,
+        ) -> BackendFuture<'_, vibex_core::AgentProviderProjectionCapability> {
+            error_future()
+        }
+
+        fn preview_agent_provider_projection(
+            &self,
+            _request: vibex_core::AgentProviderProjectionPreviewRequest,
+        ) -> BackendFuture<'_, vibex_core::AgentProviderProjectionPreview> {
+            error_future()
+        }
+
+        fn mutate_provider_credential_secret(
+            &self,
+            _request: MutationRequest<vibex_core::ProviderCredentialSecretMutationRequest>,
+        ) -> BackendFuture<'_, vibex_core::ModelProviderProfile> {
+            error_future()
+        }
+
         fn health_summaries(&self) -> BackendFuture<'_, Vec<vibex_core::ProviderHealthSummary>> {
             error_future()
         }
@@ -974,6 +1182,120 @@ mod tests {
             secret_setup_state: ProviderSecretSetupState::Available,
             updated_at_ms: 7,
         }
+    }
+
+    fn projection_capability(
+        controls: Vec<vibex_core::AgentProjectionFormControl>,
+        model_interfaces: Vec<vibex_core::AgentModelInterfaceDescriptor>,
+    ) -> vibex_core::AgentProviderProjectionCapability {
+        vibex_core::AgentProviderProjectionCapability {
+            schema_version: vibex_core::PROVIDER_PROJECTION_SCHEMA_VERSION,
+            agent_id: AgentId::parse("codex").unwrap(),
+            adapter_id: vibex_core::AcpAdapterId::parse("codex-acp").unwrap(),
+            descriptor_id: Some(
+                vibex_core::AgentProviderProjectionDescriptorId::parse(
+                    vibex_core::CODEX_PROJECTION_DESCRIPTOR_ID,
+                )
+                .unwrap(),
+            ),
+            descriptor_version: "1".to_string(),
+            detected_agent_version: Some("0.146.0".to_string()),
+            detected_adapter_version: Some("1.1.9".to_string()),
+            match_kind: vibex_core::ProjectionDescriptorMatch::Exact,
+            evidence_state: vibex_core::ProjectionEvidenceState::Verified,
+            auth_state: vibex_core::ProjectionAuthState::Ready,
+            provider_control: vibex_core::AgentProviderControl::Unsupported,
+            credential_control: vibex_core::AgentCredentialControl::Unsupported,
+            model_control: vibex_core::AgentModelControl::Unsupported,
+            credential_kinds: Vec::new(),
+            model_interfaces,
+            switch_behavior: vibex_core::ProviderSwitchBehavior::RestartAndResume,
+            form_controls: controls,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn binding_editor_maps_all_eight_typed_credentials_to_semantic_surfaces() {
+        use vibex_core::AgentCredentialKind as Kind;
+        use vibex_core::AgentProjectionFormControl as Control;
+
+        for (kind, control, expected) in [
+            (
+                Kind::ApiKey,
+                Control::ApiKey,
+                ProjectionCredentialSurface::ApiKey,
+            ),
+            (
+                Kind::OAuth,
+                Control::OAuth,
+                ProjectionCredentialSurface::OAuth,
+            ),
+            (Kind::Aws, Control::Aws, ProjectionCredentialSurface::Cloud),
+            (Kind::Gcp, Control::Gcp, ProjectionCredentialSurface::Cloud),
+            (
+                Kind::Azure,
+                Control::Azure,
+                ProjectionCredentialSurface::Cloud,
+            ),
+            (
+                Kind::Snowflake,
+                Control::Snowflake,
+                ProjectionCredentialSurface::Cloud,
+            ),
+            (
+                Kind::Local,
+                Control::LocalRuntime,
+                ProjectionCredentialSurface::Local,
+            ),
+            (
+                Kind::ManagedSubscription,
+                Control::AgentManagedStatus,
+                ProjectionCredentialSurface::AgentManaged,
+            ),
+        ] {
+            let mut capability = projection_capability(vec![control], Vec::new());
+            capability.credential_kinds = vec![kind];
+            let mut editor = AgentProviderBindingEditorState::default();
+            editor.replace_capability(capability);
+            assert_eq!(editor.credential_surface(), expected, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn codex_binding_editor_accepts_responses_and_rejects_chat() {
+        let capability = projection_capability(
+            vec![vibex_core::AgentProjectionFormControl::Model],
+            vec![vibex_core::AgentModelInterfaceDescriptor {
+                wire_protocol_id: vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES.to_string(),
+                sdk_adapter_id: None,
+                transport: "https".to_string(),
+                user_selectable: false,
+                process_scoped: false,
+            }],
+        );
+        let mut editor = AgentProviderBindingEditorState::default();
+        editor.replace_capability(capability);
+
+        assert!(editor.accepts_wire_api(vibex_core::ProviderModelWireApi::OpenaiResponses));
+        assert!(!editor.accepts_wire_api(vibex_core::ProviderModelWireApi::OpenaiChatCompletions));
+        assert!(editor.wire_api_choices().is_empty());
+    }
+
+    #[test]
+    fn capability_refresh_preserves_draft_and_secret_intent() {
+        let mut editor = AgentProviderBindingEditorState::default();
+        editor.mark_draft_changed();
+        editor.mark_draft_changed();
+        editor.set_secret_intent(true, true);
+        editor.replace_capability(projection_capability(
+            vec![vibex_core::AgentProjectionFormControl::ApiKey],
+            Vec::new(),
+        ));
+
+        assert_eq!(editor.draft_revision, 2);
+        assert!(editor.secret_touched);
+        assert!(editor.secret_clear);
     }
 
     #[test]

@@ -1,8 +1,14 @@
 use serde::{Deserialize, Serialize};
 use vibex_core::{
-    AgentId, AgentListRequest, AgentListResponse, ProviderHealthSummary, ProviderProfileId,
-    ProviderProfileSummary, ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult,
-    RelayPeerId, RelayRoomId,
+    AgentId, AgentListRequest, AgentListResponse, AgentModelProviderBinding,
+    AgentModelProviderBindingCreateRequest, AgentModelProviderBindingListRequest,
+    AgentModelProviderBindingUpdateRequest, AgentProviderProjectionCapability,
+    AgentProviderProjectionCapabilityRequest, AgentProviderProjectionPreview,
+    AgentProviderProjectionPreviewRequest, AgentRuntimeProfile, AgentRuntimeProfileCreateRequest,
+    AgentRuntimeProfileUpdateRequest, ModelProviderProfile, ModelProviderProfileCreateRequest,
+    ModelProviderProfileUpdateRequest, ProviderCredentialSecretMutationRequest,
+    ProviderHealthSummary, ProviderProfileId, ProviderProfileSummary,
+    ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, RelayPeerId, RelayRoomId,
 };
 
 use crate::{BackendBound, BackendFuture, MutationRequest};
@@ -47,6 +53,63 @@ pub trait ManagementBackend: BackendBound {
         &self,
         request: MutationRequest<ManagementProfileSelectionRequest>,
     ) -> BackendFuture<'_, ProviderProfileSummary>;
+
+    fn list_model_provider_profiles(&self) -> BackendFuture<'_, Vec<ModelProviderProfile>>;
+
+    fn create_model_provider_profile(
+        &self,
+        request: MutationRequest<ModelProviderProfileCreateRequest>,
+    ) -> BackendFuture<'_, ModelProviderProfile>;
+
+    fn update_model_provider_profile(
+        &self,
+        request: MutationRequest<ModelProviderProfileUpdateRequest>,
+    ) -> BackendFuture<'_, ModelProviderProfile>;
+
+    fn list_agent_runtime_profiles(
+        &self,
+        agent_id: AgentId,
+    ) -> BackendFuture<'_, Vec<AgentRuntimeProfile>>;
+
+    fn create_agent_runtime_profile(
+        &self,
+        request: MutationRequest<AgentRuntimeProfileCreateRequest>,
+    ) -> BackendFuture<'_, AgentRuntimeProfile>;
+
+    fn update_agent_runtime_profile(
+        &self,
+        request: MutationRequest<AgentRuntimeProfileUpdateRequest>,
+    ) -> BackendFuture<'_, AgentRuntimeProfile>;
+
+    fn list_agent_model_provider_bindings(
+        &self,
+        request: AgentModelProviderBindingListRequest,
+    ) -> BackendFuture<'_, Vec<AgentModelProviderBinding>>;
+
+    fn create_agent_model_provider_binding(
+        &self,
+        request: MutationRequest<AgentModelProviderBindingCreateRequest>,
+    ) -> BackendFuture<'_, AgentModelProviderBinding>;
+
+    fn update_agent_model_provider_binding(
+        &self,
+        request: MutationRequest<AgentModelProviderBindingUpdateRequest>,
+    ) -> BackendFuture<'_, AgentModelProviderBinding>;
+
+    fn agent_provider_projection_capability(
+        &self,
+        request: AgentProviderProjectionCapabilityRequest,
+    ) -> BackendFuture<'_, AgentProviderProjectionCapability>;
+
+    fn preview_agent_provider_projection(
+        &self,
+        request: AgentProviderProjectionPreviewRequest,
+    ) -> BackendFuture<'_, AgentProviderProjectionPreview>;
+
+    fn mutate_provider_credential_secret(
+        &self,
+        request: MutationRequest<ProviderCredentialSecretMutationRequest>,
+    ) -> BackendFuture<'_, ModelProviderProfile>;
 
     fn health_summaries(&self) -> BackendFuture<'_, Vec<ProviderHealthSummary>>;
 

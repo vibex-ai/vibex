@@ -2604,3 +2604,188 @@ await queryClient.invalidateQueries({ queryKey: ["agent", "runtime-options"] });
 
 The Runtime Option Catalog is derived Provider state and must be invalidated
 with its source records.
+
+## Scenario: Exact-Version Agent Provider Projection Platform
+
+### 1. Scope / Trigger
+
+- Trigger: adding an Agent/provider integration, changing Provider credentials,
+  projecting configuration into an ACP process, or exposing Provider controls to
+  Desktop/Web/Mobile.
+- The platform separates reusable Provider facts, Agent process identity, and
+  their versioned binding. `DesktopRuntime` remains the only mutation and Secret
+  authority.
+
+### 2. Signatures
+
+```rust
+ModelProviderProfile                    // endpoints, credentials, model catalog
+AgentRuntimeProfile                     // Agent/Adapter command and runtime policy
+AgentModelProviderBinding               // descriptor plus per-model interfaces
+AgentConfiguredModelBinding {
+    provider_model_id,
+    agent_model_id,
+    wire_protocol_id,
+    sdk_adapter_id,
+    deployment,
+    process_scoped,
+}
+
+AgentProviderProjectionRegistry::resolve(&AgentRuntimeVersionIdentity)
+    -> VibexResult<AgentProviderProjectionResolution>
+
+AgentProviderProjectionEngine::plan(
+    &ModelProviderProfile,
+    &AgentRuntimeProfile,
+    &AgentModelProviderBinding,
+    &AgentProviderProjectionDescriptor,
+    &str, // workspace key
+) -> VibexResult<AgentProviderProjectionPlan>
+AgentProviderProjectionEngine::resolve_and_materialize(
+    &AgentProviderProjectionPlan,
+    &Path,
+    &str, // workspace key
+) -> VibexResult<ResolvedAgentProviderProjection>
+
+ProviderConfigService::{
+    list_model_provider_profiles,
+    create_model_provider_profile,
+    update_model_provider_profile,
+    list_agent_runtime_profiles,
+    create_agent_runtime_profile,
+    update_agent_runtime_profile,
+    list_agent_model_provider_bindings,
+    create_agent_model_provider_binding,
+    update_agent_model_provider_binding,
+    agent_provider_projection_capability,
+    preview_agent_provider_projection,
+    mutate_provider_credential_secret,
+}
+```
+
+### 3. Contracts
+
+- `ModelProviderProfile` never owns an Agent command or a global Wire API.
+  Wire protocol and SDK adapter identity are binding-model fields.
+- Descriptor lookup uses the exact `AgentRuntimeRouteKey`, detected Agent/CLI
+  version, Adapter version, and managed dependency identity. Unknown, manual, or
+  mismatched identity returns a conservative capability that emits no automatic
+  Secret or managed overlay.
+- Codex `0.146.0` accepts only `openai_responses`. Claude exposes no selectable
+  Wire API. OpenCode may expose only the adapter/protocol pairs registered in
+  its exact descriptor.
+- `AgentCredential` is a discriminated union covering API key, OAuth, AWS, GCP,
+  Azure, Snowflake, local, and managed-subscription credentials. Ordinary
+  records contain references and status only; plaintext values are resolved
+  immediately before process preparation or an explicit auth operation.
+- Planning is deterministic and contains no plaintext Secret. Resolution may
+  produce child-process Secret env and code-owned JSON/TOML/YAML overlays, but
+  the resolved wrapper's `Debug` output, preview, errors, Remote DTOs, and
+  fingerprints remain redacted.
+- Managed overlays live only under the Vibex private runtime root, use atomic
+  owner-only writes, and reject absolute/parent traversal, symlink escape, and
+  arbitrary catalog templates.
+- Updating shared Provider or Runtime data recomputes each affected plan. Only a
+  binding whose effective process fingerprint changed becomes
+  `stale_restart_required`; saving never stops an active process or advances a
+  runtime generation.
+- `NativeBackend` may expose the typed entity CRUD, preview, capability, and
+  explicit Secret mutation methods. `WebRemoteBackend` exposes only bounded
+  capability and redacted preview; raw entities and Secret mutation fail with a
+  stable private-boundary error.
+- The legacy `ProviderProfile` facade mirrors successful create/update/delete
+  operations into the three new records during the compatibility window.
+  Native import remains read-only unless the separate confirmed export flow is
+  used.
+
+### 4. Validation & Error Matrix
+
+- Codex Chat at create, update, legacy TOML, binding validation, or projection ->
+  `agent_model_interface_unsupported`.
+- Unknown/manual/mismatched exact identity -> conservative resolution with
+  `agent_projection_version_mismatch` or
+  `agent_projection_version_untrusted`; no Secret projection.
+- Binding references another Agent/runtime/provider or an unavailable model ->
+  `agent_projection_input_mismatch`,
+  `agent_model_provider_binding_agent_mismatch`, or
+  `agent_projection_default_model_binding_invalid`.
+- Descriptor requests a credential kind not present in its capability ->
+  `agent_projection_credential_kind_unsupported`.
+- Required Secret reference/value is unavailable ->
+  `agent_projection_secret_reference_missing` or
+  `agent_projection_secret_missing`; do not mutate current runtime state.
+- Unsafe overlay root/path/symlink -> `agent_projection_runtime_directory_invalid`,
+  `agent_projection_overlay_path_unsafe`, or
+  `agent_projection_overlay_symlink_rejected`.
+- Stale revision on any of the three entities -> the matching
+  `*_revision_conflict`; never overwrite a newer record.
+- Remote raw entity query or Secret mutation -> the matching
+  `remote_*_private` / `remote_provider_secret_mutation_unavailable` error.
+
+### 5. Good/Base/Bad Cases
+
+- Good: one Provider profile binds to Claude and Codex; changing an endpoint
+  stales only bindings whose effective projection uses that endpoint.
+- Good: an API key is stored in approved Secret storage, resolved at ACP spawn,
+  and absent from SQLite, preview JSON, `Debug`, Remote, timeline, and switch
+  records.
+- Base: an unknown catalog Agent receives an explicit unverified capability and
+  no fake API-key form or managed overlay.
+- Bad: infer provider projection support from installability or ACP readiness.
+- Bad: place one global `wire_api` on the Provider or inject the same env keys
+  into every Agent.
+- Bad: write `~/.codex`, `~/.claude`, or another user Agent home as the normal
+  projection path.
+
+### 6. Tests Required
+
+- Core tests assert exact-over-range resolution, descriptor uniqueness,
+  conservative unknown/manual behavior, all eight credential variants, and
+  Codex Responses-only model binding.
+- Database tests assert v37 idempotent migration/backfill, three-entity CRUD and
+  revision CAS, legacy id preservation, and one Provider bound to two runtimes.
+- Config-switch tests assert deterministic env/JSON/TOML/YAML projection,
+  private permissions, path/symlink rejection, late Secret resolution,
+  redacted `Debug`/preview, and selective stale propagation.
+- ACP tests assert Claude/Codex/OpenCode parity, prepare-failure fencing, and
+  Profile-save stale marking without process termination.
+- Backend/Remote/UI tests assert exact capability pass-through, redacted preview,
+  private entity/Secret rejection, draft preservation, eight credential
+  surfaces, and Codex Chat rejection.
+- Run `cargo fmt --all --check`, affected crate tests,
+  `cargo check --workspace --all-targets --locked`, workspace Clippy with
+  `-D warnings`, `pnpm check:frontend`, and `git diff --check`.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+let key = resolve_secret(&profile)?;
+let config = format!("api_key = {key}");
+write_user_agent_home(config)?;
+```
+
+This resolves too early, builds an untyped Secret-bearing string, and writes a
+user-owned Agent home.
+
+#### Correct
+
+```rust
+let plan = AgentProviderProjectionEngine::plan(
+    provider,
+    runtime,
+    binding,
+    descriptor,
+    workspace_key,
+)?; // references and safe metadata only
+let resolved = AgentProviderProjectionEngine::resolve_and_materialize(
+    &plan,
+    vibex_private_runtime_root,
+    workspace_key,
+)?;
+spawn_acp_child(resolved.child_environment())?;
+```
+
+Only the authoritative runtime resolves the Secret, and every file target is a
+validated code-owned overlay under the private runtime root.

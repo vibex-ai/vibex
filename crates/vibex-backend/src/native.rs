@@ -1126,6 +1126,204 @@ impl ManagementBackend for NativeBackend {
         })
     }
 
+    fn list_model_provider_profiles(
+        &self,
+    ) -> BackendFuture<'_, Vec<vibex_core::ModelProviderProfile>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .list_model_provider_profiles()
+                .map_err(Into::into)
+        })
+    }
+
+    fn create_model_provider_profile(
+        &self,
+        request: MutationRequest<vibex_core::ModelProviderProfileCreateRequest>,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderProfile> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .create_model_provider_profile(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn update_model_provider_profile(
+        &self,
+        request: MutationRequest<vibex_core::ModelProviderProfileUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderProfile> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .update_model_provider_profile(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn list_agent_runtime_profiles(
+        &self,
+        agent_id: vibex_core::AgentId,
+    ) -> BackendFuture<'_, Vec<vibex_core::AgentRuntimeProfile>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .list_agent_runtime_profiles(&agent_id)
+                .map_err(Into::into)
+        })
+    }
+
+    fn create_agent_runtime_profile(
+        &self,
+        request: MutationRequest<vibex_core::AgentRuntimeProfileCreateRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentRuntimeProfile> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .create_agent_runtime_profile(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn update_agent_runtime_profile(
+        &self,
+        request: MutationRequest<vibex_core::AgentRuntimeProfileUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentRuntimeProfile> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .update_agent_runtime_profile(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn list_agent_model_provider_bindings(
+        &self,
+        request: vibex_core::AgentModelProviderBindingListRequest,
+    ) -> BackendFuture<'_, Vec<vibex_core::AgentModelProviderBinding>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .list_agent_model_provider_bindings(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn create_agent_model_provider_binding(
+        &self,
+        request: MutationRequest<vibex_core::AgentModelProviderBindingCreateRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentModelProviderBinding> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .create_agent_model_provider_binding(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn update_agent_model_provider_binding(
+        &self,
+        request: MutationRequest<vibex_core::AgentModelProviderBindingUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentModelProviderBinding> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .update_agent_model_provider_binding(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn agent_provider_projection_capability(
+        &self,
+        request: vibex_core::AgentProviderProjectionCapabilityRequest,
+    ) -> BackendFuture<'_, vibex_core::AgentProviderProjectionCapability> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .agent_provider_projection_capability(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn preview_agent_provider_projection(
+        &self,
+        request: vibex_core::AgentProviderProjectionPreviewRequest,
+    ) -> BackendFuture<'_, vibex_core::AgentProviderProjectionPreview> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .preview_agent_provider_projection(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn mutate_provider_credential_secret(
+        &self,
+        request: MutationRequest<vibex_core::ProviderCredentialSecretMutationRequest>,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderProfile> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .mutate_provider_credential_secret(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
     fn health_summaries(&self) -> BackendFuture<'_, Vec<ProviderHealthSummary>> {
         let runtime = self.runtime.clone();
         Box::pin(async move {

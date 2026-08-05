@@ -20,16 +20,18 @@ use vibex_core::{
     RemoteAgentAttachRuntimeResponse, RemoteAgentCancelRuntimeSwitchResponse,
     RemoteAgentCatchUpRequest, RemoteAgentCatchUpResponse, RemoteAgentContinueTurnResponse,
     RemoteAgentDeepLinkResolveResponse, RemoteAgentDetachRuntimeResponse,
-    RemoteAgentInterruptResponse, RemoteAgentMessageSubmissionResponse, RemoteAgentRequest,
-    RemoteAgentResolveElicitationResponse, RemoteAgentResolvePermissionResponse,
-    RemoteAgentRuntimeEventsResponse, RemoteAgentRuntimeOptionsResponse,
-    RemoteAgentRuntimeProcessSnapshotResponse, RemoteAgentRuntimeSelectionResponse,
-    RemoteAgentRuntimeSnapshotResponse, RemoteAgentSendMessageResponse,
-    RemoteAgentSessionDetailResponse, RemoteAgentSessionListResponse,
-    RemoteAgentSetDesiredRuntimeResponse, RemoteAgentTimelineCursor,
-    RemoteAgentTimelineFetchResponse, RemoteAuditAction, RemoteAuditOutcome, RemoteAuditRecord,
-    RemoteAuditTargetKind, RemoteAuthContext, RemoteAuthProof, RemoteCapabilitySummary,
-    RemoteClaimPairingCodeRequest, RemoteClaimPairingCodeResponse, RemoteCreatePairingCodeRequest,
+    RemoteAgentInterruptResponse, RemoteAgentMessageSubmissionResponse,
+    RemoteAgentProjectionCapabilityResponse, RemoteAgentProjectionPreviewResponse,
+    RemoteAgentRequest, RemoteAgentResolveElicitationResponse,
+    RemoteAgentResolvePermissionResponse, RemoteAgentRuntimeEventsResponse,
+    RemoteAgentRuntimeOptionsResponse, RemoteAgentRuntimeProcessSnapshotResponse,
+    RemoteAgentRuntimeSelectionResponse, RemoteAgentRuntimeSnapshotResponse,
+    RemoteAgentSendMessageResponse, RemoteAgentSessionDetailResponse,
+    RemoteAgentSessionListResponse, RemoteAgentSetDesiredRuntimeResponse,
+    RemoteAgentTimelineCursor, RemoteAgentTimelineFetchResponse, RemoteAuditAction,
+    RemoteAuditOutcome, RemoteAuditRecord, RemoteAuditTargetKind, RemoteAuthContext,
+    RemoteAuthProof, RemoteCapabilitySummary, RemoteClaimPairingCodeRequest,
+    RemoteClaimPairingCodeResponse, RemoteCreatePairingCodeRequest,
     RemoteCreatePairingCodeResponse, RemoteDeepLinkResolution, RemoteDeepLinkResolutionStatus,
     RemoteDeviceDetail, RemoteDevicePermissionLevel, RemoteDeviceStatus, RemoteFileDeleteResponse,
     RemoteFileReadResponse, RemoteFileRenameResponse, RemoteFileSearchResponse,
@@ -1199,6 +1201,30 @@ async fn dispatch_provider_request(
             request.request.persist = false;
             let preview = service.preview_injection(request.request)?;
             serde_json::to_value(RemoteProviderInjectionPreviewResponse { preview })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::ProjectionCapability(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let capability = service.agent_provider_projection_capability(request.request)?;
+            serde_json::to_value(RemoteAgentProjectionCapabilityResponse { capability })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::ProjectionPreview(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let preview = service.preview_agent_provider_projection(request.request)?;
+            serde_json::to_value(RemoteAgentProjectionPreviewResponse { preview })
                 .map_err(remote_payload_encode_error)
         }
         RemoteProviderRequest::ListHealthSummaries(request) => {
@@ -4212,6 +4238,139 @@ mod tests {
                 .iter()
                 .all(|field| field.value.contains("missing") || field.value.contains("redacted"))
         );
+
+        cleanup_db(db_path);
+    }
+
+    #[tokio::test]
+    async fn remote_provider_projection_exposes_exact_capability_and_redacted_preview_only() {
+        const LOOKUP_SENTINEL: &str = "remote-provider-lookup-must-not-leak";
+        const QUERY_SENTINEL: &str = "remote-provider-query-must-not-leak";
+
+        let (db_path, manager) = test_agent_manager("provider-projection");
+        let agent_id = AgentId::parse("codex").unwrap();
+        let profile = ProviderConfigService::new(db_path.clone())
+            .create_profile(ProviderProfileCreateRequest {
+                agent_id: Some(agent_id.clone()),
+                kind: ProviderKind::Codex,
+                display_name: "Remote projection provider".to_string(),
+                account_alias: Some("remote-projection".to_string()),
+                base_url: Some(format!(
+                    "https://api.example.invalid/v1?api_key={QUERY_SENTINEL}"
+                )),
+                default_model: Some("gpt-5-codex".to_string()),
+                small_model: None,
+                large_model: None,
+                configured_models: Vec::new(),
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: Some(ProviderOptions::empty()),
+                secret_references: vec![vibex_core::ProviderSecretReferenceCreateRequest {
+                    secret_kind: vibex_core::ProviderSecretKind::ApiKey,
+                    backend: vibex_core::ProviderSecretBackend::Placeholder,
+                    setup_state: vibex_core::ProviderSecretSetupState::Missing,
+                    lookup_key: LOOKUP_SENTINEL.to_string(),
+                    display_label: "API key".to_string(),
+                    redacted_hint: "not configured".to_string(),
+                }],
+            })
+            .unwrap();
+        let service = ProviderConfigService::new(db_path.clone());
+        let binding = service
+            .list_agent_model_provider_bindings(vibex_core::AgentModelProviderBindingListRequest {
+                agent_id: Some(agent_id.clone()),
+                model_provider_profile_id: None,
+            })
+            .unwrap()
+            .into_iter()
+            .find(|binding| binding.legacy_provider_profile_id.as_ref() == Some(&profile.id))
+            .unwrap();
+        let runtime = service
+            .list_agent_runtime_profiles(&agent_id)
+            .unwrap()
+            .into_iter()
+            .find(|runtime| runtime.id == binding.runtime_profile_id)
+            .unwrap();
+        let auth = pair_device(&db_path, RemoteDevicePermissionLevel::ReadOnly, "Reader");
+        let router = build_router_with_agent_and_workbench(
+            RemoteServiceConfig::loopback_disabled(),
+            manager,
+            RemoteWorkbenchRuntime::new(db_path.clone(), TerminalManager::new()),
+        );
+
+        let capability_response = post_provider(
+            router.clone(),
+            RemoteProviderRequest::ProjectionCapability(
+                vibex_core::RemoteAgentProjectionCapabilityRequest {
+                    auth: auth.clone(),
+                    request: vibex_core::AgentProviderProjectionCapabilityRequest {
+                        runtime_profile_id: runtime.id,
+                        binding_id: Some(binding.id.clone()),
+                    },
+                },
+            ),
+        )
+        .await;
+        let capability_value = capability_response.payload.unwrap();
+        let capability_json = serde_json::to_string(&capability_value).unwrap();
+        let capability: vibex_core::RemoteAgentProjectionCapabilityResponse =
+            serde_json::from_value(capability_value).unwrap();
+        assert_eq!(
+            capability
+                .capability
+                .descriptor_id
+                .as_ref()
+                .map(|id| id.as_str()),
+            Some(vibex_core::CODEX_PROJECTION_DESCRIPTOR_ID)
+        );
+        assert_eq!(capability.capability.descriptor_version, "1");
+        assert_eq!(
+            capability
+                .capability
+                .model_interfaces
+                .iter()
+                .map(|interface| interface.wire_protocol_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES]
+        );
+        assert!(!capability_json.contains(LOOKUP_SENTINEL));
+        assert!(!capability_json.contains(QUERY_SENTINEL));
+
+        let preview_response = post_provider(
+            router,
+            RemoteProviderRequest::ProjectionPreview(
+                vibex_core::RemoteAgentProjectionPreviewRequest {
+                    auth,
+                    request: vibex_core::AgentProviderProjectionPreviewRequest {
+                        binding_id: binding.id,
+                        workspace_key: "remote-workspace".to_string(),
+                    },
+                },
+            ),
+        )
+        .await;
+        let preview_value = preview_response.payload.unwrap();
+        let preview_json = serde_json::to_string(&preview_value).unwrap();
+        let preview: vibex_core::RemoteAgentProjectionPreviewResponse =
+            serde_json::from_value(preview_value).unwrap();
+        assert_eq!(
+            preview.preview.descriptor_id.as_str(),
+            vibex_core::CODEX_PROJECTION_DESCRIPTOR_ID
+        );
+        assert_eq!(preview.preview.overlay_files.len(), 1);
+        assert_eq!(
+            preview.preview.overlay_files[0].relative_path,
+            "config.toml"
+        );
+        assert!(!preview_json.contains(LOOKUP_SENTINEL));
+        assert!(!preview_json.contains(QUERY_SENTINEL));
+        assert!(!preview_json.contains("\"content\""));
+        assert!(!preview_json.contains("nonSecretEnv"));
+        assert!(!preview_json.contains("secretEnv"));
+        assert!(!preview_json.contains("/home/"));
+        assert!(!preview_json.contains("/tmp/"));
 
         cleanup_db(db_path);
     }
