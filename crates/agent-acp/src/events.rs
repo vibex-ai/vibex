@@ -416,6 +416,7 @@ fn command_event(input: &AgentEventInput) -> CanonicalAgentEvent {
 fn file_events(input: &AgentEventInput) -> Option<Vec<CanonicalAgentEvent>> {
     let mut changes = Vec::new();
     let kind = normalized_kind(&input.tool_name);
+    let operation_hint = file_operation_hint(&kind);
     let structured_file_kind = matches!(
         kind.as_str(),
         "diff"
@@ -427,10 +428,10 @@ fn file_events(input: &AgentEventInput) -> Option<Vec<CanonicalAgentEvent>> {
             | "delete_file"
     );
     if structured_file_kind && let Some(raw_input) = input.raw_input.as_ref() {
-        collect_file_changes(raw_input, &mut changes);
+        collect_file_changes(raw_input, operation_hint, &mut changes);
     }
     if let Some(content) = input.content.as_ref() {
-        collect_diff_blocks(content, &mut changes);
+        collect_diff_blocks(content, operation_hint, &mut changes);
     }
     if changes.is_empty() {
         return None;
@@ -573,7 +574,11 @@ fn content_blocks(content: Option<&Value>) -> (Vec<AgentEventContentBlock>, bool
     (blocks, truncated)
 }
 
-fn collect_file_changes(value: &Value, changes: &mut Vec<StructuredFileChange>) {
+fn collect_file_changes(
+    value: &Value,
+    operation_hint: Option<FileOperationKind>,
+    changes: &mut Vec<StructuredFileChange>,
+) {
     let entries = value
         .get("changes")
         .and_then(Value::as_array)
@@ -581,17 +586,21 @@ fn collect_file_changes(value: &Value, changes: &mut Vec<StructuredFileChange>) 
     if let Some(entries) = entries {
         for entry in entries.iter().take(16) {
             if let Some(path) = string_value(entry, &["path", "file", "uri"]) {
-                changes.push(structured_file_change(entry, path));
+                changes.push(structured_file_change(entry, path, operation_hint));
             }
         }
         return;
     }
     if let Some(path) = string_value(value, &["path", "file", "uri"]) {
-        changes.push(structured_file_change(value, path));
+        changes.push(structured_file_change(value, path, operation_hint));
     }
 }
 
-fn collect_diff_blocks(value: &Value, changes: &mut Vec<StructuredFileChange>) {
+fn collect_diff_blocks(
+    value: &Value,
+    operation_hint: Option<FileOperationKind>,
+    changes: &mut Vec<StructuredFileChange>,
+) {
     let items = value
         .as_array()
         .map(Vec::as_slice)
@@ -601,30 +610,74 @@ fn collect_diff_blocks(value: &Value, changes: &mut Vec<StructuredFileChange>) {
             continue;
         }
         if let Some(path) = string_value(item, &["path", "file", "uri"]) {
-            changes.push(structured_file_change(item, path));
+            changes.push(structured_file_change(item, path, operation_hint));
         }
     }
 }
 
-fn structured_file_change(value: &Value, path: String) -> StructuredFileChange {
+fn structured_file_change(
+    value: &Value,
+    path: String,
+    operation_hint: Option<FileOperationKind>,
+) -> StructuredFileChange {
+    let old_text = text_value(value, &["oldText", "old_text", "before"]);
+    let new_text = text_value(value, &["newText", "new_text", "after", "text", "content"]);
     StructuredFileChange {
-        operation: file_operation(value),
+        operation: file_operation(
+            value,
+            operation_hint,
+            old_text.as_deref(),
+            new_text.as_deref(),
+        ),
         path,
-        old_text: string_value(value, &["oldText", "old_text", "before"]),
-        new_text: string_value(value, &["newText", "new_text", "after", "text", "content"]),
+        old_text,
+        new_text,
     }
 }
 
-fn file_operation(value: &Value) -> FileOperationKind {
-    match string_value(value, &["kind", "operation"])
-        .map(|kind| normalized_kind(&kind))
-        .as_deref()
-    {
-        Some("add" | "create" | "write") => FileOperationKind::Write,
-        Some("delete" | "remove") => FileOperationKind::Delete,
-        Some("move" | "rename") => FileOperationKind::Move,
-        Some("read") => FileOperationKind::Read,
+fn file_operation(
+    value: &Value,
+    operation_hint: Option<FileOperationKind>,
+    old_text: Option<&str>,
+    new_text: Option<&str>,
+) -> FileOperationKind {
+    let explicit = string_value(value, &["kind", "operation"])
+        .and_then(|kind| file_operation_from_kind(&kind))
+        .or_else(|| {
+            value
+                .get("_meta")
+                .and_then(|meta| string_value(meta, &["kind", "operation"]))
+                .and_then(|kind| file_operation_from_kind(&kind))
+        });
+    let inferred = match (old_text, new_text) {
+        // ACP v1 defines an absent oldText as a newly created file.
+        (None, Some(_)) => FileOperationKind::Write,
+        // Codex ACP represents deletion as old contents followed by an
+        // empty or omitted replacement. Explicit operations above remain
+        // authoritative for providers that distinguish clearing a file.
+        (Some(_), None | Some("")) => FileOperationKind::Delete,
         _ => FileOperationKind::Edit,
+    };
+    explicit.or(operation_hint).unwrap_or(inferred)
+}
+
+fn file_operation_from_kind(kind: &str) -> Option<FileOperationKind> {
+    match normalized_kind(kind).as_str() {
+        "add" | "create" | "write" => Some(FileOperationKind::Write),
+        "delete" | "remove" => Some(FileOperationKind::Delete),
+        "move" | "rename" => Some(FileOperationKind::Move),
+        "read" => Some(FileOperationKind::Read),
+        "edit" | "modify" | "update" => Some(FileOperationKind::Edit),
+        _ => None,
+    }
+}
+
+fn file_operation_hint(tool_kind: &str) -> Option<FileOperationKind> {
+    match tool_kind {
+        "write_file" => Some(FileOperationKind::Write),
+        "edit_file" => Some(FileOperationKind::Edit),
+        "delete_file" => Some(FileOperationKind::Delete),
+        _ => None,
     }
 }
 
@@ -739,6 +792,11 @@ fn string_value(value: &Value, keys: &[&str]) -> Option<String> {
             .filter(|value| !value.is_empty())
             .map(str::to_string)
     })
+}
+
+fn text_value(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str).map(str::to_string))
 }
 
 fn integer_value(value: &Value, keys: &[&str]) -> Option<u32> {
@@ -1068,6 +1126,87 @@ mod tests {
         ] {
             let events = normalize_agent_event(AgentEventEnricherKind::Codex, &input(kind, raw));
             assert_eq!(events[0].event.kind_name(), predicate);
+        }
+    }
+
+    #[test]
+    fn acp_v1_diffs_infer_file_lifecycle_and_preserve_empty_text() {
+        let mut event = input("diff", json!({}));
+        event.content = Some(json!([
+            {
+                "type": "diff",
+                "path": "src/new.rs",
+                "newText": "new file",
+                "_meta": { "kind": "add" }
+            },
+            {
+                "type": "diff",
+                "path": "src/empty.rs",
+                "newText": ""
+            },
+            {
+                "type": "diff",
+                "path": "src/lib.rs",
+                "oldText": "before",
+                "newText": "after"
+            },
+            {
+                "type": "diff",
+                "path": "src/old.rs",
+                "oldText": "old file",
+                "newText": "",
+                "kind": "future_file_operation",
+                "_meta": { "kind": "delete" }
+            },
+            {
+                "type": "diff",
+                "path": "src/cleared.rs",
+                "oldText": "clear me",
+                "newText": "",
+                "_meta": { "kind": "update" }
+            }
+        ]));
+
+        let files = normalize_agent_event(AgentEventEnricherKind::Codex, &event)
+            .into_iter()
+            .map(|event| match event.event {
+                CanonicalAgentEvent::FileOperation(file) => file,
+                other => panic!("expected file operation, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(files.len(), 5);
+        assert_eq!(files[0].operation, FileOperationKind::Write);
+        assert_eq!(files[1].operation, FileOperationKind::Write);
+        assert_eq!(files[1].new_text.as_deref(), Some(""));
+        assert_eq!(files[2].operation, FileOperationKind::Edit);
+        assert_eq!(files[3].operation, FileOperationKind::Delete);
+        assert_eq!(files[3].new_text.as_deref(), Some(""));
+        assert_eq!(files[4].operation, FileOperationKind::Edit);
+        assert_eq!(files[4].new_text.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn file_tool_kind_is_used_when_the_diff_has_no_operation() {
+        for (tool_name, operation) in [
+            ("write_file", FileOperationKind::Write),
+            ("edit_file", FileOperationKind::Edit),
+            ("delete_file", FileOperationKind::Delete),
+        ] {
+            let events = normalize_agent_event(
+                AgentEventEnricherKind::Codex,
+                &input(
+                    tool_name,
+                    json!({"path":"src/lib.rs","oldText":"before","newText":"after"}),
+                ),
+            );
+            assert!(matches!(
+                &events[0].event,
+                CanonicalAgentEvent::FileOperation(FileOperationPayload {
+                    operation: actual,
+                    ..
+                }) if *actual == operation
+            ));
         }
     }
 

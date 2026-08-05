@@ -1273,6 +1273,14 @@ carry `rawExtension?: AgentEventRawExtension`. Absence preserves legacy JSON.
   replacement emits a new `snapshot`. The merge state stores only cumulative
   byte length and a SHA-256 prefix fingerprint, never a growing output copy;
   terminal status, turn cleanup, detach, replacement, or crash clears it.
+- File diff normalization preserves `oldText` / `newText` exactly, including
+  empty strings. Operation classification prefers a recognized top-level
+  `kind` / `operation`, then recognized `_meta.kind` / `_meta.operation`, then
+  the exact tool kind (`write_file`, `edit_file`, `delete_file`). Only when all
+  explicit evidence is absent may the Codex enricher infer ACP v1 lifecycle:
+  missing `oldText` with present `newText` is `Write`; present `oldText` with
+  empty or missing `newText` is the legacy Codex deletion fallback. UI and
+  persistence code consume `FileOperationKind` and never repeat this inference.
 - The Agent manager treats an event whose provider correlation, source,
   redaction state, and canonical payload exactly match the latest streamed
   snapshot for the current turn as a no-op before opening a Timeline write or
@@ -1295,6 +1303,9 @@ carry `rawExtension?: AgentEventRawExtension`. Absence preserves legacy JSON.
   redaction-only extension remains durable with `truncated=true`.
 - Over-limit string, collection, or output -> UTF-8-safe deterministic
   truncation; malformed optional structures -> bounded generic fallback.
+- Unknown file `kind` with recognized `_meta.kind` -> use the recognized meta
+  operation; if neither source is recognized, use the exact tool hint or the
+  bounded ACP v1 lifecycle fallback.
 - Repeated cumulative output -> no duplicate raw append; output that replaces
   rather than extends the prior snapshot -> explicit `snapshot`.
 
@@ -1302,6 +1313,9 @@ carry `rawExtension?: AgentEventRawExtension`. Absence preserves legacy JSON.
 
 - Good: the same Codex command fixture normalizes live and transcript records
   to equal `CommandExecution` events and equal hashed correlation ids.
+- Good: Codex ACP diff content with `_meta.kind = add | update | delete`
+  produces `Write | Edit | Delete`, and a provider's explicit `update` remains
+  `Edit` even when `newText` is empty.
 - Base: an unmanaged tool with safe bounded raw evidence stays `ToolCall` and
   remains readable when old records omit `rawExtension`.
 - Bad: matching `command` by title substring, persisting a native tool id,
@@ -1315,7 +1329,9 @@ carry `rawExtension?: AgentEventRawExtension`. Absence preserves legacy JSON.
   state round-trip, and leak-free Debug.
 - Enricher tests cover all twelve variants, exact identity dispatch, ambiguous
   fallback, stable/non-colliding hashes, structured command/file batch/web/
-  todo/collaboration/image classification, and Passthrough non-fabrication.
+  todo/collaboration/image classification, ACP v1 file lifecycle inference,
+  `_meta.kind` precedence, empty-text preservation, exact file-tool hints, and
+  Passthrough non-fabrication.
 - Runtime tests cover route/fence ordering, attachment isolation, snapshot /
   append / duplicate / replacement behavior, and state cleanup on completion,
   failure, replacement, detach, and crash.
@@ -1340,6 +1356,7 @@ session/update -> UI/provider-specific kind parsing -> generic title/summary
 ```text
 session/update -> exact native route + current fence
   -> attachment-local merge -> exact-identity AgentEventEnricher
+  -> top-level/meta/tool file operation evidence -> bounded lifecycle fallback
   -> bounded/redacted canonical event + stable hashed correlation id
   -> provider-neutral Timeline -> shared desktop/remote rendering
 ```
