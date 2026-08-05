@@ -273,8 +273,8 @@ const IMAGE_PREVIEW_HORIZONTAL_PADDING: f32 = 24.0;
 const IMAGE_PREVIEW_VERTICAL_PADDING: f32 = 64.0;
 const SETTINGS_ROW_INLINE_MIN_WIDTH: f32 = 640.0;
 const SETTINGS_VERTICAL_TABS_MIN_WIDTH: f32 = 768.0;
-const SETTINGS_DIALOG_MAX_WIDTH: f32 = 672.0;
-const SETTINGS_DIALOG_MAX_HEIGHT: f32 = 576.0;
+const SETTINGS_DIALOG_MAX_WIDTH: f32 = 864.0;
+const SETTINGS_DIALOG_MAX_HEIGHT: f32 = 640.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AutoContinueCountdown {
@@ -13588,8 +13588,8 @@ impl VibexWorkbench {
         let viewport_width = f32::from(viewport.width);
         let viewport_height = f32::from(viewport.height);
         let dialog_width = (viewport_width - 32.0).clamp(1.0, SETTINGS_DIALOG_MAX_WIDTH);
-        let dialog_max_height = (viewport_height - 32.0).clamp(1.0, SETTINGS_DIALOG_MAX_HEIGHT);
-        let dialog_margin_top = ((viewport_height - dialog_max_height) / 2.0).max(16.0);
+        let dialog_height = (viewport_height - 32.0).clamp(1.0, SETTINGS_DIALOG_MAX_HEIGHT);
+        let dialog_margin_top = ((viewport_height - dialog_height) / 2.0).max(16.0);
         window.open_dialog(cx, move |dialog, _, cx| {
             let on_close = workbench.clone();
             let is_dark = cx.theme().is_dark();
@@ -13599,7 +13599,7 @@ impl VibexWorkbench {
                 .title(settings_title.clone())
                 .w(px(dialog_width))
                 .max_w(px(dialog_width))
-                .max_h(px(dialog_max_height))
+                .h(px(dialog_height))
                 .margin_top(px(dialog_margin_top))
                 .rounded(px(14.0))
                 .bg(popover)
@@ -30076,6 +30076,7 @@ impl Render for FoundationSettings {
         div()
             .id("foundation-settings")
             .flex()
+            .h_full()
             .w_full()
             .min_w_0()
             .min_h_0()
@@ -30085,7 +30086,15 @@ impl Render for FoundationSettings {
             .when(!vertical_tabs, |this| this.flex_col().pr_1())
             .gap_4()
             .child(navigation)
-            .child(div().min_w_0().flex_1().child(page))
+            .child(
+                div()
+                    .id("foundation-settings-page-scroll")
+                    .min_w_0()
+                    .min_h_0()
+                    .flex_1()
+                    .overflow_y_scrollbar()
+                    .child(page),
+            )
     }
 }
 
@@ -35416,6 +35425,34 @@ mod tests {
         session = SessionUiState::default();
         session.enhanced_command_execution_display = true;
         assert!(!settings_defaults_restored(&appearance, &session));
+    }
+
+    #[test]
+    fn settings_dialog_keeps_navigation_outside_the_page_scroll_viewport() {
+        assert_eq!(SETTINGS_DIALOG_MAX_WIDTH, 864.0);
+        assert_eq!(SETTINGS_DIALOG_MAX_HEIGHT, 640.0);
+
+        let source = include_str!("app.rs");
+        let open_settings = source
+            .split_once("    fn open_settings(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn strings("))
+            .map(|(body, _)| body)
+            .expect("settings dialog should remain inspectable");
+        assert!(open_settings.contains(".h(px(dialog_height))"));
+
+        let settings = source
+            .split_once("impl Render for FoundationSettings")
+            .and_then(|(_, tail)| tail.split_once("\nfn locale_choices("))
+            .map(|(body, _)| body)
+            .expect("settings layout should remain inspectable");
+        let navigation = settings
+            .find(".child(navigation)")
+            .expect("settings navigation should render before the page viewport");
+        let page_scroll = settings
+            .find(".id(\"foundation-settings-page-scroll\")")
+            .expect("settings page should own a dedicated scroll viewport");
+        assert!(navigation < page_scroll);
+        assert!(settings.contains(".overflow_y_scrollbar()"));
     }
 
     #[test]
