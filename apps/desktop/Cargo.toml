@@ -9,7 +9,7 @@ repository.workspace = true
 [features]
 default = []
 e2e-test-support = []
-web-preview-spike = ["dep:gtk", "dep:webkit2gtk", "dep:wry"]
+web-preview-spike = ["dep:webkit2gtk", "dep:wry"]
 
 [dependencies]
 gpui.workspace = true
@@ -17,13 +17,14 @@ gpui_platform.workspace = true
 gpui_tokio.workspace = true
 gpui-component.workspace = true
 gpui-component-assets.workspace = true
-image.workspace = true
+image = { workspace = true, features = ["png"] }
 qrcode.workspace = true
 pdfium-render.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 similar = "3.1.1"
+tray-icon.workspace = true
 base64.workspace = true
 chrono = "0.4.45"
 tokio.workspace = true
@@ -45,7 +46,8 @@ vibex-terminal = { path = "../../crates/terminal" }
 wry = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-gtk = { version = "0.18", optional = true }
+gtk = { version = "0.18" }
+tray-icon = { workspace = true, features = ["gtk"] }
 webkit2gtk = { version = "=2.0.2", features = ["v2_38"], optional = true }
 
 [dev-dependencies]

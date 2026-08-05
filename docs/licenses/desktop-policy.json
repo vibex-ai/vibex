@@ -71,6 +71,10 @@
       "rationale": "Third-party product marks are redistributed solely as nominative identifiers for supported integrations; ownership and trademark rights remain with their respective holders."
     },
     {
+      "id": "LGPL-2.1-or-later",
+      "rationale": "Approved for the system-provided Linux AppIndicator and GTK 3 tray runtime; Vibex does not redistribute or modify these libraries."
+    },
+    {
       "id": "Libpng",
       "rationale": "PDFium PNG runtime license; origin and copyright notices remain in the distributed license bundle."
     },
@@ -403,6 +407,16 @@
       ],
       "licenseExpression": "MIT",
       "distribution": "system-provided, not redistributed"
+    },
+    {
+      "id": "linux-appindicator",
+      "name": "Linux Ayatana/AppIndicator and GTK 3 runtime",
+      "platforms": [
+        "linux-x11",
+        "linux-wayland"
+      ],
+      "licenseExpression": "LGPL-2.1-or-later",
+      "distribution": "system-provided tray runtime, not redistributed"
     }
   ]
 }

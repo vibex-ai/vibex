@@ -620,7 +620,8 @@ rfd = { version = "0.17.2", default-features = false,
 ### 3. Contracts
 
 - The default GPUI Linux binary uses XDG Desktop Portal and must not link GTK or
-  WebKit solely for file dialogs.
+  WebKit solely for file dialogs. GTK is permitted only for the Linux AppIndicator
+  system-tray integration; WebKit remains excluded from the default build.
 - Tauri may retain its independently versioned GTK3 dialog backend.
 - The two surfaces must not resolve to the same `rfd` package version when they
   require mutually exclusive backend features.
@@ -632,7 +633,9 @@ rfd = { version = "0.17.2", default-features = false,
 
 - One `rfd` version has both `gtk3` and `xdg-portal` -> workspace build fails;
   split versions instead of weakening either backend.
-- GPUI release `NEEDED` contains `libgtk-3.so.0` -> fail the default package gate.
+- GPUI release contains GTK-backed file-dialog code or links WebKit -> fail the
+  default package gate. A GTK dependency attributable only to AppIndicator tray
+  support is expected.
 - Portal dialog panics with “no reactor running” -> use the rfd backend/version
   whose executor is independent of GPUI worker-thread Tokio context.
 
@@ -962,10 +965,12 @@ vibex-foundation: runtime-stopped
 ### 3. Contracts
 
 - Linux title-bar/window close callbacks must not call `cx.quit()`: GPUI's X11 close
-  path can re-enter window removal and panic. Let GPUI's default `LastWindowClosed`
-  handling initiate application quit. The app-level quit hook is the single owner of
-  final cleanup: queue and synchronously flush the current UI state, spawn and await
-  shared runtime shutdown, then allow process exit.
+  path can re-enter window removal and panic. When close-to-tray is enabled, the
+  callback rehosts the existing workbench entity in a hidden window under
+  `QuitMode::Explicit`. When disabled, it switches to `LastWindowClosed` and lets
+  window removal initiate application quit. The app-level quit hook is the single
+  owner of final cleanup: queue and synchronously flush the current UI state, spawn
+  and await shared runtime shutdown, then allow process exit.
 - `DesktopRuntime` owns the process/home lock. A second shell must fail while the
   workbench is live, and the same external lock probe must succeed only after awaited
   shutdown and process exit. Cleanup that is merely spawned and abandoned is invalid.

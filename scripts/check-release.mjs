@@ -76,6 +76,20 @@ function validateStableIdentity() {
 
 function validatePackaging() {
   const packageJson = readJson("package.json");
+  const linuxPackagingConfigs = [
+    "apps/desktop/Packager.toml",
+    "apps/desktop/Packager.linux.toml",
+    "apps/desktop/Packager.preview.toml",
+    "apps/desktop/Packager.rc.toml",
+    "apps/desktop/Packager.stable.toml"
+  ];
+  for (const configPath of linuxPackagingConfigs) {
+    const config = source(configPath);
+    assert(
+      config.includes("libayatana-appindicator3-1 | libappindicator3-1"),
+      `${configPath} is missing its system-tray runtime dependency`
+    );
+  }
   const channels = [
     ["preview", "dev.vibex.desktop.preview", "Vibex Preview"],
     ["rc", "dev.vibex.desktop.rc", "Vibex RC"],

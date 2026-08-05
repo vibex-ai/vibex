@@ -15,6 +15,7 @@ pub mod platform;
 pub mod primitives;
 pub mod remote_access_pairing;
 pub mod responsive;
+pub mod system_tray;
 pub mod terminal_surface;
 pub mod testing;
 pub mod theme;

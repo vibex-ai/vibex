@@ -259,6 +259,25 @@ const fn default_enhanced_command_execution_display() -> bool {
     false
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopBehaviorUiState {
+    #[serde(default = "default_close_to_tray")]
+    pub close_to_tray: bool,
+}
+
+impl Default for DesktopBehaviorUiState {
+    fn default() -> Self {
+        Self {
+            close_to_tray: default_close_to_tray(),
+        }
+    }
+}
+
+const fn default_close_to_tray() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct UiStateMigration {
@@ -280,6 +299,8 @@ pub struct DesktopUiStateV1 {
     pub right_rail: RightRailUiState,
     #[serde(default)]
     pub session: SessionUiState,
+    #[serde(default)]
+    pub desktop_behavior: DesktopBehaviorUiState,
     #[serde(default)]
     pub composer: ComposerUiState,
     #[serde(default)]
@@ -303,6 +324,7 @@ impl Default for DesktopUiStateV1 {
             terminal: TerminalUiState::default(),
             right_rail: RightRailUiState::default(),
             session: SessionUiState::default(),
+            desktop_behavior: DesktopBehaviorUiState::default(),
             composer: ComposerUiState::default(),
             terminal_tab_titles: BTreeMap::new(),
             agent_tab_order: Vec::new(),
@@ -1079,6 +1101,26 @@ mod tests {
         assert!(!decoded.session.enhanced_command_execution_display);
         assert!(decoded.session.auto_continue_project_ids.is_empty());
         assert!(decoded.session.auto_continue_session_overrides.is_empty());
+    }
+
+    #[test]
+    fn desktop_behavior_defaults_to_close_to_tray_for_legacy_state() {
+        let mut value = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
+        value.as_object_mut().unwrap().remove("desktopBehavior");
+
+        let decoded = decode_and_migrate(&serde_json::to_vec(&value).unwrap()).unwrap();
+
+        assert!(decoded.desktop_behavior.close_to_tray);
+    }
+
+    #[test]
+    fn desktop_behavior_round_trips_an_explicit_exit_on_close_preference() {
+        let mut state = DesktopUiStateV1::default();
+        state.desktop_behavior.close_to_tray = false;
+
+        let decoded = decode_and_migrate(&serde_json::to_vec(&state).unwrap()).unwrap();
+
+        assert!(!decoded.desktop_behavior.close_to_tray);
     }
 
     #[test]

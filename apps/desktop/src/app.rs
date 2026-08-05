@@ -86,17 +86,17 @@ use vibex_core::{
 };
 use vibex_desktop_model::{
     AgentPlanProjection, AppearanceUiState, ComposerAttachment, ComposerSuggestionSelection,
-    ComposerTrigger, DesktopUiStateV1, LocaleMode, NavigationHistory, NewSessionLocation,
-    NewSessionProjectTicket, NewSessionSubmissionStage, NewSessionWorkspaceState,
-    RUNTIME_SELECTION_PREFERENCE_LIMIT, RuntimeCascadeChoice, RuntimeCascadeProjection,
-    SessionContentWidthMode, SessionUiState, SidebarHierarchyMode, SidebarProjectProjection,
-    SidebarState, SidebarWorkspaceProjection, ThemeMode as ModelThemeMode, ThrottledUiStateWriter,
-    TimelineConversationTurn, TimelineFollowState, TimelineModel, TimelineProcessActivityGroup,
-    TimelineRow, TimelineRowKind, UiStateStore, WorkbenchRoute, WorkspaceAgentSummary,
-    WorkspaceContextProjection, WorktreeLifecycleDisplayState, active_collaborations,
-    composer_trigger_at, current_agent_plan, custom_worktree_path_is_absolute,
-    sidebar_project_projections, timeline_agent_message_count_after_sequence,
-    timeline_conversation_turns,
+    ComposerTrigger, DesktopBehaviorUiState, DesktopUiStateV1, LocaleMode, NavigationHistory,
+    NewSessionLocation, NewSessionProjectTicket, NewSessionSubmissionStage,
+    NewSessionWorkspaceState, RUNTIME_SELECTION_PREFERENCE_LIMIT, RuntimeCascadeChoice,
+    RuntimeCascadeProjection, SessionContentWidthMode, SessionUiState, SidebarHierarchyMode,
+    SidebarProjectProjection, SidebarState, SidebarWorkspaceProjection,
+    ThemeMode as ModelThemeMode, ThrottledUiStateWriter, TimelineConversationTurn,
+    TimelineFollowState, TimelineModel, TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
+    UiStateStore, WorkbenchRoute, WorkspaceAgentSummary, WorkspaceContextProjection,
+    WorktreeLifecycleDisplayState, active_collaborations, composer_trigger_at, current_agent_plan,
+    custom_worktree_path_is_absolute, sidebar_project_projections,
+    timeline_agent_message_count_after_sequence, timeline_conversation_turns,
 };
 use vibex_desktop_runtime::{
     DesktopEvent, DesktopRuntime, DesktopRuntimeConfig, DesktopRuntimeFacade, PREVIEW_APP_ID,
@@ -3814,13 +3814,7 @@ impl VibexWorkbench {
         };
         this.schedule_startup_loading_indicator(cx);
         this.begin_runtime_start(cx);
-        this.appearance_subscription =
-            Some(cx.observe_window_appearance(window, |this, window, cx| {
-                if this.ui_state.appearance.theme == ModelThemeMode::System {
-                    theme::apply_appearance(&this.ui_state.appearance, Some(window), cx);
-                    cx.notify();
-                }
-            }));
+        this.bind_to_window(window, cx);
         this.quit_subscription = Some(cx.on_app_quit(|this, cx| {
             let code_workbench_state = this.code_workbench.read(cx).persisted_state_for_exit();
             this.apply_code_workbench_state(code_workbench_state);
@@ -3850,13 +3844,66 @@ impl VibexWorkbench {
                 }
             }
         }));
-        let focus = this.focus_handle.clone();
+        this
+    }
+
+    pub(crate) fn ui_state(&self) -> &DesktopUiStateV1 {
+        &self.ui_state
+    }
+
+    pub(crate) fn resolved_locale_for_tray(&self) -> locale::ResolvedLocale {
+        self.resolved_locale()
+    }
+
+    pub(crate) fn bind_to_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ui_state.appearance.theme == ModelThemeMode::System {
+            theme::apply_appearance(&self.ui_state.appearance, Some(window), cx);
+        }
+        self.appearance_subscription =
+            Some(cx.observe_window_appearance(window, |this, window, cx| {
+                if this.ui_state.appearance.theme == ModelThemeMode::System {
+                    theme::apply_appearance(&this.ui_state.appearance, Some(window), cx);
+                    cx.notify();
+                }
+            }));
+        let focus = self.focus_handle.clone();
         window.defer(cx, move |window, cx| {
             if window.focused(cx).is_none() {
                 focus.focus(window, cx);
             }
         });
-        this
+    }
+
+    pub(crate) fn prepare_for_window_rehost(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window.has_active_dialog(cx) {
+            window.close_all_dialogs(cx);
+        }
+        if window.has_active_sheet(cx) {
+            window.close_sheet(cx);
+        }
+        self.settings_open = false;
+        self.appearance_subscription = None;
+        cx.notify();
+    }
+
+    pub(crate) fn open_new_session_from_tray(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_new_session(None, window, cx);
+    }
+
+    pub(crate) fn open_management_from_tray(&mut self, cx: &mut Context<Self>) {
+        self.open_management(cx);
+    }
+
+    pub(crate) fn open_settings_from_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings(window, cx);
     }
 
     fn begin_runtime_start(&mut self, cx: &mut Context<Self>) {
@@ -3920,6 +3967,7 @@ impl VibexWorkbench {
                                     200,
                                 ));
                                 this.apply_loaded_ui_state(state, cx);
+                                crate::system_tray::update_locale(this.resolved_locale(), cx);
                             } else {
                                 this.ui_writer = None;
                             }
@@ -13705,6 +13753,7 @@ impl VibexWorkbench {
         self.ui_state.appearance.locale = mode;
         locale::apply_locale(mode);
         self.sync_locale_dependents(window, cx);
+        crate::system_tray::update_locale(self.resolved_locale(), cx);
         self.queue_ui_state();
         cx.notify();
     }
@@ -13875,12 +13924,20 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    fn set_close_to_tray(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.ui_state.desktop_behavior.close_to_tray = enabled;
+        self.queue_ui_state();
+        cx.notify();
+    }
+
     fn restore_settings_defaults(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.ui_state.appearance = AppearanceUiState::default();
         self.ui_state.session = SessionUiState::default();
+        self.ui_state.desktop_behavior = DesktopBehaviorUiState::default();
         theme::apply_appearance(&self.ui_state.appearance, Some(window), cx);
         locale::apply_locale(self.ui_state.appearance.locale);
         self.sync_locale_dependents(window, cx);
+        crate::system_tray::update_locale(self.resolved_locale(), cx);
 
         let code_family = self
             .ui_state
@@ -29890,13 +29947,15 @@ impl Render for SettingsDialogTitle {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let appearance = self.settings.read(cx).appearance(cx);
         let session = self.settings.read(cx).session(cx);
+        let desktop_behavior = self.settings.read(cx).desktop_behavior(cx);
         let strings = locale::strings(locale::resolve_locale(
             appearance.locale,
             locale::system_locale().as_deref(),
         ));
         let header_inline =
             f32::from(window.viewport_size().width) >= SETTINGS_ROW_INLINE_MIN_WIDTH;
-        let defaults_restored = settings_defaults_restored(&appearance, &session);
+        let defaults_restored =
+            settings_defaults_restored(&appearance, &session, &desktop_behavior);
         let settings = self.settings.clone();
 
         div()
@@ -30148,6 +30207,12 @@ impl FoundationSettings {
             .unwrap_or_default()
     }
 
+    fn desktop_behavior(&self, cx: &App) -> DesktopBehaviorUiState {
+        self.workbench
+            .read_with(cx, |this, _| this.ui_state.desktop_behavior.clone())
+            .unwrap_or_default()
+    }
+
     fn sync_controls(
         &mut self,
         appearance: &vibex_desktop_model::AppearanceUiState,
@@ -30234,6 +30299,13 @@ impl FoundationSettings {
         let _ = self.workbench.update(cx, |this, cx| {
             this.set_enhanced_command_execution_display(enabled, cx)
         });
+        cx.notify();
+    }
+
+    fn set_close_to_tray(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let _ = self
+            .workbench
+            .update(cx, |this, cx| this.set_close_to_tray(enabled, cx));
         cx.notify();
     }
 
@@ -30430,6 +30502,7 @@ impl FoundationSettings {
 
     fn render_general_page(
         &self,
+        desktop_behavior: &DesktopBehaviorUiState,
         stacked: bool,
         strings: Strings,
         cx: &mut Context<Self>,
@@ -30447,16 +30520,30 @@ impl FoundationSettings {
                 .text_xs()
                 .placeholder(strings.system_default),
         );
+        let close_to_tray_switch = Switch::new("close-to-tray")
+            .small()
+            .checked(desktop_behavior.close_to_tray)
+            .tooltip(strings.close_to_tray)
+            .on_click(cx.listener(|this, enabled, _, cx| this.set_close_to_tray(*enabled, cx)));
         settings_page(
             strings.general,
             strings.general_description,
-            vec![setting_row(
-                strings.language,
-                strings.language_description,
-                language_select,
-                stacked,
-                cx,
-            )],
+            vec![
+                setting_row(
+                    strings.language,
+                    strings.language_description,
+                    language_select,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    strings.close_to_tray,
+                    strings.close_to_tray_description,
+                    close_to_tray_switch,
+                    stacked,
+                    cx,
+                ),
+            ],
             cx,
         )
     }
@@ -30751,6 +30838,7 @@ impl Render for FoundationSettings {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let appearance = self.appearance(cx);
         let session = self.session(cx);
+        let desktop_behavior = self.desktop_behavior(cx);
         let strings = locale::strings(locale::resolve_locale(
             appearance.locale,
             locale::system_locale().as_deref(),
@@ -30760,7 +30848,9 @@ impl Render for FoundationSettings {
         let stacked_rows = viewport_width < SETTINGS_ROW_INLINE_MIN_WIDTH;
         let navigation = self.render_navigation(vertical_tabs, strings, cx);
         let page = match self.active_section {
-            SettingsSection::General => self.render_general_page(stacked_rows, strings, cx),
+            SettingsSection::General => {
+                self.render_general_page(&desktop_behavior, stacked_rows, strings, cx)
+            }
             SettingsSection::Appearance => {
                 self.render_appearance_page(&appearance, stacked_rows, strings, cx)
             }
@@ -31149,8 +31239,16 @@ pub fn open_workbench_window(cx: &mut App) -> Result<(), String> {
         window_background: WindowBackgroundAppearance::Transparent,
         ..Default::default()
     };
+    let application_id = application_id.to_string();
     cx.open_window(options, |window, cx| {
         let workbench = cx.new(|cx| VibexWorkbench::new(window, cx));
+        if let Err(error) =
+            crate::system_tray::initialize(workbench.clone(), application_id, window, cx)
+        {
+            eprintln!("{error}");
+            cx.set_quit_mode(gpui::QuitMode::LastWindowClosed);
+        }
+        window.on_window_should_close(cx, crate::system_tray::handle_window_close);
         cx.new(|cx| Root::new(workbench, window, cx).bordered(false))
     })
     .map_err(|error| format!("failed to open Vibex workbench: {error}"))?;
@@ -31382,8 +31480,14 @@ fn settings_number_stepper(
         .into_any_element()
 }
 
-fn settings_defaults_restored(appearance: &AppearanceUiState, session: &SessionUiState) -> bool {
-    appearance == &AppearanceUiState::default() && session == &SessionUiState::default()
+fn settings_defaults_restored(
+    appearance: &AppearanceUiState,
+    session: &SessionUiState,
+    desktop_behavior: &DesktopBehaviorUiState,
+) -> bool {
+    appearance == &AppearanceUiState::default()
+        && session == &SessionUiState::default()
+        && desktop_behavior == &DesktopBehaviorUiState::default()
 }
 
 fn adjust_u16(value: u16, delta: i16, minimum: u16, maximum: u16) -> u16 {
@@ -36160,22 +36264,51 @@ mod tests {
     fn settings_restore_state_tracks_appearance_and_session_contracts() {
         let mut appearance = AppearanceUiState::default();
         let mut session = SessionUiState::default();
-        assert!(settings_defaults_restored(&appearance, &session));
+        let mut desktop_behavior = DesktopBehaviorUiState::default();
+        assert!(settings_defaults_restored(
+            &appearance,
+            &session,
+            &desktop_behavior
+        ));
 
         appearance.theme = ModelThemeMode::Dark;
-        assert!(!settings_defaults_restored(&appearance, &session));
+        assert!(!settings_defaults_restored(
+            &appearance,
+            &session,
+            &desktop_behavior
+        ));
 
         appearance = AppearanceUiState::default();
         appearance.reduced_motion = true;
-        assert!(!settings_defaults_restored(&appearance, &session));
+        assert!(!settings_defaults_restored(
+            &appearance,
+            &session,
+            &desktop_behavior
+        ));
 
         appearance = AppearanceUiState::default();
         session.turn_preview_rail = false;
-        assert!(!settings_defaults_restored(&appearance, &session));
+        assert!(!settings_defaults_restored(
+            &appearance,
+            &session,
+            &desktop_behavior
+        ));
 
         session = SessionUiState::default();
         session.enhanced_command_execution_display = true;
-        assert!(!settings_defaults_restored(&appearance, &session));
+        assert!(!settings_defaults_restored(
+            &appearance,
+            &session,
+            &desktop_behavior
+        ));
+
+        session = SessionUiState::default();
+        desktop_behavior.close_to_tray = false;
+        assert!(!settings_defaults_restored(
+            &appearance,
+            &session,
+            &desktop_behavior
+        ));
     }
 
     #[test]
