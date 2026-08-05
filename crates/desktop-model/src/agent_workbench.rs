@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use vibex_core::{
-    AgentMessagePhase, AgentSession, AgentSessionState, PermissionRequestStatus, PlanStepPayload,
-    PlanStepStatus, TimelineItem, TimelineItemKind, TimelinePayload, VibexSessionId,
+    AgentMessagePhase, AgentSession, AgentSessionState, ElicitationRequestStatus,
+    PermissionRequestStatus, PlanStepPayload, PlanStepStatus, TimelineItem, TimelineItemKind,
+    TimelinePayload, VibexSessionId,
 };
 
 use crate::SidebarState;
@@ -144,6 +145,8 @@ pub enum TimelineRowKind {
     SystemNotice,
     PermissionRequest,
     PermissionResolution,
+    ElicitationRequest,
+    ElicitationResolution,
     Error,
 }
 
@@ -433,6 +436,7 @@ pub fn timeline_conversation_turns(
             turn_rows.retain(|row| {
                 !(row.kind == TimelineRowKind::Reasoning && row.streaming)
                     && row.kind != TimelineRowKind::PermissionResolution
+                    && row.kind != TimelineRowKind::ElicitationResolution
                     && !matches!(
                         row.kind,
                         TimelineRowKind::Plan | TimelineRowKind::TodoUpdate
@@ -840,6 +844,15 @@ fn timeline_rows_from_refs(items: &[&TimelineItem]) -> Vec<TimelineRow> {
             _ => None,
         })
         .collect::<BTreeSet<_>>();
+    let resolved_elicitation_ids = items
+        .iter()
+        .filter_map(|item| match &item.payload {
+            TimelinePayload::ElicitationResolution(resolution) => {
+                Some(resolution.request_id.as_str())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
     let mut rows = Vec::<TimelineRow>::new();
     for item in items.iter().copied() {
         let correlation = item
@@ -1099,6 +1112,42 @@ fn timeline_rows_from_refs(items: &[&TimelineItem]) -> Vec<TimelineRow> {
                 false,
                 false,
             )),
+            TimelinePayload::ElicitationRequest(request) => {
+                let mut body = request.message.clone();
+                if let Some(description) = request.description.as_deref()
+                    && !description.trim().is_empty()
+                    && description.trim() != request.message.trim()
+                {
+                    if !body.is_empty() {
+                        body.push('\n');
+                    }
+                    body.push_str(description);
+                }
+                let mut row = simple_row(
+                    item,
+                    format!("elicitation:{}", request.id),
+                    TimelineRowKind::ElicitationRequest,
+                    request
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| "Input requested".to_string()),
+                    body,
+                    false,
+                    true,
+                );
+                row.pending_permission = request.status == ElicitationRequestStatus::Pending
+                    && !resolved_elicitation_ids.contains(request.id.as_str());
+                rows.push(row);
+            }
+            TimelinePayload::ElicitationResolution(resolution) => rows.push(simple_row(
+                item,
+                format!("elicitation-resolution:{}", resolution.request_id),
+                TimelineRowKind::ElicitationResolution,
+                "Input request resolved",
+                format!("{:?}", resolution.action),
+                false,
+                false,
+            )),
             TimelinePayload::Error(error) => {
                 let mut row = simple_row(
                     item,
@@ -1312,6 +1361,14 @@ pub fn pending_permission_ids(items: &[TimelineItem]) -> BTreeSet<String> {
                 pending.insert(request.id.to_string());
             }
             TimelinePayload::PermissionResolution(resolution) => {
+                pending.remove(resolution.request_id.as_str());
+            }
+            TimelinePayload::ElicitationRequest(request)
+                if request.status == ElicitationRequestStatus::Pending =>
+            {
+                pending.insert(request.id.to_string());
+            }
+            TimelinePayload::ElicitationResolution(resolution) => {
                 pending.remove(resolution.request_id.as_str());
             }
             _ => {}
@@ -2721,10 +2778,10 @@ mod tests {
                 .unwrap()
             })
             .collect::<Vec<_>>();
-        assert_eq!(timeline_kind_coverage(&items).len(), 17);
+        assert_eq!(timeline_kind_coverage(&items).len(), 19);
         let rows = timeline_rows(&items);
-        assert_eq!(rows.len(), 16);
-        assert_eq!(rows.iter().map(|row| row.item_ids.len()).sum::<usize>(), 17);
+        assert_eq!(rows.len(), 18);
+        assert_eq!(rows.iter().map(|row| row.item_ids.len()).sum::<usize>(), 19);
         assert!(rows.iter().any(|row| {
             row.kind == TimelineRowKind::PermissionRequest && !row.pending_permission
         }));
@@ -2732,6 +2789,9 @@ mod tests {
             rows.iter()
                 .any(|row| row.kind == TimelineRowKind::Error && row.failed)
         );
+        assert!(rows.iter().any(|row| {
+            row.kind == TimelineRowKind::ElicitationRequest && !row.pending_permission
+        }));
         assert!(rows.iter().any(|row| {
             row.kind == TimelineRowKind::AgentMessage && !row.streaming && row.item_ids.len() == 2
         }));

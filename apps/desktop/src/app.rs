@@ -64,7 +64,8 @@ use vibex_core::{
     AgentCommandSourceKind, AgentCommandTrigger, AgentId, AgentListRequest, AgentMessagePhase,
     AgentSession, AgentSessionRuntimeSelectionState, AgentSessionState, AgentSnapshotEntry,
     AgentTokenUsage, AttachRuntimeRequest, CancelAgentSessionRuntimeSwitchRequest,
-    ContinueAgentTurnRequest, CreateAgentSessionRequest, DetachRuntimeRequest,
+    ContinueAgentTurnRequest, CreateAgentSessionRequest, DetachRuntimeRequest, ElicitationField,
+    ElicitationFieldKind, ElicitationRequest, ElicitationResolutionAction,
     ExternalSessionImportCandidateStatus, ExternalSessionImportRequest, FetchTimelineRequest,
     FileEntryKind, FileTreeRequest, ForkAgentSessionRequest, GetMessageSubmissionRequest,
     GitProjectEligibilityState, GitProjectIneligibleReason, GitWorktreeAssistanceSessionRequest,
@@ -106,8 +107,9 @@ use vibex_markdown::{
     ResolvedResource, ResourceKind, parse_markdown_with_limits, utf8_prefix,
 };
 use vibex_ui::{
-    AgentFileGitController, ManagementWorkflowCapabilities, ManagementWorkflowController,
-    ShellKind, TerminalWorkflowCapabilities, TerminalWorkflowController,
+    AgentFileGitController, ElicitationFormDraft, ManagementWorkflowCapabilities,
+    ManagementWorkflowController, ShellKind, TerminalWorkflowCapabilities,
+    TerminalWorkflowController,
 };
 
 use crate::actions::{
@@ -1954,6 +1956,52 @@ fn timeline_item_resident_bytes(item: &TimelineItem) -> usize {
             )
             .saturating_add(option_len(&resolution.provider_resolution_id))
             .saturating_add(option_len(&resolution.note)),
+        TimelinePayload::ElicitationRequest(request) => request
+            .id
+            .as_str()
+            .len()
+            .saturating_add(request.session_id.as_str().len())
+            .saturating_add(option_len(&request.provider_request_id))
+            .saturating_add(option_len(&request.tool_call_id))
+            .saturating_add(request.message.len())
+            .saturating_add(option_len(&request.title))
+            .saturating_add(option_len(&request.description))
+            .saturating_add(
+                request
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        field
+                            .id
+                            .len()
+                            .saturating_add(field.title.len())
+                            .saturating_add(option_len(&field.description))
+                            .saturating_add(elicitation_field_kind_resident_bytes(&field.kind))
+                    })
+                    .sum::<usize>(),
+            ),
+        TimelinePayload::ElicitationResolution(resolution) => resolution
+            .request_id
+            .as_str()
+            .len()
+            .saturating_add(resolution.session_id.as_str().len())
+            .saturating_add(
+                resolution
+                    .answers
+                    .iter()
+                    .map(|(field_id, answer)| {
+                        field_id
+                            .len()
+                            .saturating_add(elicitation_answer_resident_bytes(answer))
+                    })
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                resolution
+                    .responder_device_id
+                    .as_ref()
+                    .map_or(0, |id| id.as_str().len()),
+            ),
         TimelinePayload::Error(error) => error.code.len().saturating_add(error.message.len()),
     };
     std::mem::size_of::<TimelineItem>()
@@ -1977,6 +2025,61 @@ fn timeline_item_resident_bytes(item: &TimelineItem) -> usize {
                 }),
         )
         .saturating_add(payload_bytes)
+}
+
+fn elicitation_field_kind_resident_bytes(kind: &ElicitationFieldKind) -> usize {
+    let option_string_len = |value: &Option<String>| value.as_ref().map_or(0, String::len);
+    let option_bytes = |options: &[vibex_core::ElicitationOption]| {
+        options
+            .iter()
+            .map(|option| {
+                option
+                    .value
+                    .len()
+                    .saturating_add(option.title.len())
+                    .saturating_add(option_string_len(&option.description))
+            })
+            .sum::<usize>()
+    };
+    match kind {
+        ElicitationFieldKind::Text {
+            pattern,
+            default,
+            options,
+            ..
+        } => option_string_len(pattern)
+            .saturating_add(option_string_len(default))
+            .saturating_add(option_bytes(options)),
+        ElicitationFieldKind::Number {
+            minimum,
+            maximum,
+            default,
+        } => option_string_len(minimum)
+            .saturating_add(option_string_len(maximum))
+            .saturating_add(option_string_len(default)),
+        ElicitationFieldKind::Integer { .. } => 0,
+        ElicitationFieldKind::Boolean { .. } => 0,
+        ElicitationFieldKind::MultiSelect {
+            options, default, ..
+        } => default
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+            .saturating_add(option_bytes(options)),
+        ElicitationFieldKind::Unsupported { schema_type } => schema_type.len(),
+    }
+}
+
+fn elicitation_answer_resident_bytes(answer: &vibex_core::ElicitationAnswerValue) -> usize {
+    match answer {
+        vibex_core::ElicitationAnswerValue::String(value)
+        | vibex_core::ElicitationAnswerValue::Number(value) => value.len(),
+        vibex_core::ElicitationAnswerValue::Integer(_)
+        | vibex_core::ElicitationAnswerValue::Boolean(_) => 0,
+        vibex_core::ElicitationAnswerValue::StringArray(values) => {
+            values.iter().map(String::len).sum()
+        }
+    }
 }
 
 fn timeline_conversation_turn_resident_bytes(turn: &TimelineConversationTurn) -> usize {
@@ -2984,6 +3087,8 @@ pub struct VibexWorkbench {
     right_rail_plugins: Vec<RightRailPlugin>,
     pair_button_hovered: bool,
     timeline_command_expansion: BTreeMap<String, bool>,
+    elicitation_inputs: BTreeMap<String, Entity<InputState>>,
+    elicitation_drafts: BTreeMap<String, ElicitationFormDraft>,
     plugin_manager_view: Option<Entity<RightRailPluginManager>>,
     external_import_view: Option<Entity<ExternalImportDialog>>,
     composer_submission_locators: Vec<ComposerSubmissionLocator>,
@@ -3512,6 +3617,8 @@ impl VibexWorkbench {
             right_rail_plugins: Vec::new(),
             pair_button_hovered: false,
             timeline_command_expansion: BTreeMap::new(),
+            elicitation_inputs: BTreeMap::new(),
+            elicitation_drafts: BTreeMap::new(),
             plugin_manager_view: None,
             external_import_view: None,
             composer_submission_locators: Vec::new(),
@@ -9556,6 +9663,159 @@ impl VibexWorkbench {
                     this.agent_action_pending = false;
                     if let Ok(Err(error)) = outcome {
                         this.agent_error = Some(format!("{}: {}", error.code, error.message));
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
+    fn elicitation_input_key(request_id: &str, field_id: &str) -> String {
+        format!("{request_id}:{field_id}")
+    }
+
+    fn prune_elicitation_forms(&mut self) {
+        let mut pending = BTreeSet::new();
+        for item in &self.timeline.items {
+            match &item.payload {
+                TimelinePayload::ElicitationRequest(request)
+                    if request.status == vibex_core::ElicitationRequestStatus::Pending =>
+                {
+                    pending.insert(request.id.to_string());
+                }
+                TimelinePayload::ElicitationResolution(resolution) => {
+                    pending.remove(resolution.request_id.as_str());
+                }
+                _ => {}
+            }
+        }
+        self.elicitation_drafts
+            .retain(|request_id, _| pending.contains(request_id));
+        self.elicitation_inputs.retain(|key, _| {
+            key.split_once(':')
+                .is_some_and(|(request_id, _)| pending.contains(request_id))
+        });
+    }
+
+    fn ensure_elicitation_form(
+        &mut self,
+        request: &ElicitationRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.elicitation_drafts
+            .entry(request.id.to_string())
+            .or_insert_with(|| ElicitationFormDraft::from_request(request));
+        for field in &request.fields {
+            let uses_input = matches!(
+                &field.kind,
+                ElicitationFieldKind::Text { options, .. } if options.is_empty()
+            ) || matches!(
+                &field.kind,
+                ElicitationFieldKind::Number { .. } | ElicitationFieldKind::Integer { .. }
+            );
+            if !uses_input {
+                continue;
+            }
+            let key = Self::elicitation_input_key(request.id.as_str(), &field.id);
+            if self.elicitation_inputs.contains_key(&key) {
+                continue;
+            }
+            let initial_value = self
+                .elicitation_drafts
+                .get(request.id.as_str())
+                .and_then(|draft| draft.text(&field.id))
+                .unwrap_or_default()
+                .to_string();
+            let placeholder = field.title.clone();
+            let input = cx.new(|cx| {
+                let mut input = InputState::new(window, cx).placeholder(placeholder);
+                if !initial_value.is_empty() {
+                    input.set_value(initial_value, window, cx);
+                }
+                input
+            });
+            self.elicitation_inputs.insert(key, input);
+        }
+    }
+
+    fn resolve_elicitation(
+        &mut self,
+        request: ElicitationRequest,
+        action: ElicitationResolutionAction,
+        cx: &mut Context<Self>,
+    ) {
+        if self.agent_action_pending {
+            return;
+        }
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        let request_id = request.id.to_string();
+        let text_values = request
+            .fields
+            .iter()
+            .filter_map(|field| {
+                let key = Self::elicitation_input_key(request.id.as_str(), &field.id);
+                self.elicitation_inputs
+                    .get(&key)
+                    .map(|input| (field.id.clone(), input.read(cx).value().to_string()))
+            })
+            .collect::<Vec<_>>();
+        let draft = self
+            .elicitation_drafts
+            .entry(request_id.clone())
+            .or_insert_with(|| ElicitationFormDraft::from_request(&request));
+        for (field_id, value) in text_values {
+            if request
+                .fields
+                .iter()
+                .find(|field| field.id == field_id)
+                .is_some_and(|field| field.required || !value.is_empty())
+            {
+                draft.set_text(field_id, value);
+            } else {
+                draft.values.remove(&field_id);
+            }
+        }
+        let resolution = match draft.resolve_request(&request, action, unix_timestamp_ms()) {
+            Ok(request) => request,
+            Err(error) => {
+                self.agent_error = Some(format!("{}: {}", error.code, error.message));
+                cx.notify();
+                return;
+            }
+        };
+        self.agent_action_pending = true;
+        let generation = self.session_generation;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            runtime
+                .agent()
+                .manager()
+                .resolve_elicitation(resolution)
+                .await
+        });
+        self.agent_action_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    if this.session_generation != generation {
+                        return;
+                    }
+                    this.agent_action_pending = false;
+                    match outcome {
+                        Ok(Ok(_)) => {
+                            this.elicitation_drafts.remove(&request_id);
+                            let prefix = format!("{request_id}:");
+                            this.elicitation_inputs
+                                .retain(|key, _| !key.starts_with(&prefix));
+                        }
+                        Ok(Err(error)) => {
+                            this.agent_error = Some(format!("{}: {}", error.code, error.message));
+                        }
+                        Err(error) => {
+                            this.agent_error = Some(format!("elicitation failed: {error}"));
+                        }
                     }
                     cx.notify();
                 });
@@ -17642,6 +17902,7 @@ impl VibexWorkbench {
     }
 
     fn render_agent_workbench(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        self.prune_elicitation_forms();
         self.apply_pending_timeline_row_heights();
         self.apply_pending_timeline_scroll();
         let selected = self.selected_session().cloned();
@@ -19807,6 +20068,14 @@ impl VibexWorkbench {
             })
     }
 
+    fn elicitation_request_for_row(&self, row: &TimelineRow) -> Option<ElicitationRequest> {
+        self.timeline_row_latest_item(row)
+            .and_then(|item| match &item.payload {
+                vibex_core::TimelinePayload::ElicitationRequest(request) => Some(request.clone()),
+                _ => None,
+            })
+    }
+
     fn render_timeline_row(
         &mut self,
         row: &TimelineRow,
@@ -19829,6 +20098,9 @@ impl VibexWorkbench {
             }
             TimelineRowKind::Error => self.render_error_row(row, conversation_conclusion, cx),
             TimelineRowKind::PermissionRequest => self.render_permission_request_card(row, cx),
+            TimelineRowKind::ElicitationRequest => {
+                self.render_elicitation_request_card(row, window, cx)
+            }
             TimelineRowKind::Command
                 if self.ui_state.session.enhanced_command_execution_display =>
             {
@@ -19843,7 +20115,8 @@ impl VibexWorkbench {
             | TimelineRowKind::Collaboration => self.render_process_activity_line(row, cx),
             TimelineRowKind::GitNotice
             | TimelineRowKind::SystemNotice
-            | TimelineRowKind::PermissionResolution => self.render_fallback_process_row(row, cx),
+            | TimelineRowKind::PermissionResolution
+            | TimelineRowKind::ElicitationResolution => self.render_fallback_process_row(row, cx),
         };
         self.highlight_session_search_rows(std::slice::from_ref(row), element, cx)
     }
@@ -20069,7 +20342,8 @@ impl VibexWorkbench {
             }
             TimelineRowKind::GitNotice
             | TimelineRowKind::SystemNotice
-            | TimelineRowKind::PermissionResolution => 24.0,
+            | TimelineRowKind::PermissionResolution
+            | TimelineRowKind::ElicitationResolution => 24.0,
             TimelineRowKind::PermissionRequest => {
                 let Some(vibex_core::TimelinePayload::PermissionRequest(request)) = payload else {
                     return 24.0;
@@ -20100,6 +20374,33 @@ impl VibexWorkbench {
                     && request.status == vibex_core::PermissionRequestStatus::Pending
                 {
                     height += 12.0 + 28.0;
+                }
+                height
+            }
+            TimelineRowKind::ElicitationRequest => {
+                let Some(vibex_core::TimelinePayload::ElicitationRequest(request)) = payload else {
+                    return 48.0;
+                };
+                let mut height =
+                    88.0 + (estimated_wrapped_lines(&request.message, 64) as f32) * 20.0 + 44.0;
+                for field in &request.fields {
+                    height += 30.0;
+                    if field.description.is_some() {
+                        height += 20.0;
+                    }
+                    height += match &field.kind {
+                        ElicitationFieldKind::Text { options, .. } if !options.is_empty() => {
+                            options.len().max(1).div_ceil(2) as f32 * 48.0
+                        }
+                        ElicitationFieldKind::MultiSelect { options, .. } => {
+                            options.len().max(1).div_ceil(2) as f32 * 48.0
+                        }
+                        ElicitationFieldKind::Text { .. }
+                        | ElicitationFieldKind::Number { .. }
+                        | ElicitationFieldKind::Integer { .. } => 38.0,
+                        ElicitationFieldKind::Boolean { .. }
+                        | ElicitationFieldKind::Unsupported { .. } => 32.0,
+                    };
                 }
                 height
             }
@@ -21690,6 +21991,310 @@ impl VibexWorkbench {
             return self.render_fallback_process_row(row, cx);
         };
         self.render_permission_request_panel(row, &request, false, cx)
+    }
+
+    fn render_elicitation_field(
+        &mut self,
+        request_id: &str,
+        field: &ElicitationField,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let field_label = if field.required {
+            format!("{} *", field.title)
+        } else {
+            field.title.clone()
+        };
+        let control = match &field.kind {
+            ElicitationFieldKind::Text { options, .. } if !options.is_empty() => {
+                let mut choices = Vec::with_capacity(options.len());
+                for (index, option) in options.iter().enumerate() {
+                    let selected = self
+                        .elicitation_drafts
+                        .get(request_id)
+                        .and_then(|draft| draft.text(&field.id))
+                        .is_some_and(|value| value == option.value);
+                    let draft_id = request_id.to_string();
+                    let field_id = field.id.clone();
+                    let value = option.value.clone();
+                    let mut button = Button::new(format!(
+                        "desktop-elicitation-choice:{request_id}:{}:{index}",
+                        field.id
+                    ))
+                    .small()
+                    .label(option.title.clone())
+                    .disabled(self.agent_action_pending)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(draft) = this.elicitation_drafts.get_mut(&draft_id) {
+                            draft.select_option(field_id.clone(), value.clone());
+                            cx.notify();
+                        }
+                    }));
+                    button = if selected {
+                        button.primary().icon(IconName::Check)
+                    } else {
+                        button.outline()
+                    };
+                    choices.push(
+                        v_flex()
+                            .min_w(px(156.0))
+                            .gap_1()
+                            .child(button)
+                            .when_some(option.description.clone(), |this, description| {
+                                this.child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(description),
+                                )
+                            })
+                            .into_any_element(),
+                    );
+                }
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .flex_wrap()
+                    .items_start()
+                    .gap_2()
+                    .children(choices)
+                    .into_any_element()
+            }
+            ElicitationFieldKind::Text { .. }
+            | ElicitationFieldKind::Number { .. }
+            | ElicitationFieldKind::Integer { .. } => {
+                let key = Self::elicitation_input_key(request_id, &field.id);
+                self.elicitation_inputs
+                    .get(&key)
+                    .map(|input| Input::new(input).w_full().into_any_element())
+                    .unwrap_or_else(|| div().into_any_element())
+            }
+            ElicitationFieldKind::Boolean { default } => {
+                let checked = self
+                    .elicitation_drafts
+                    .get(request_id)
+                    .and_then(|draft| draft.boolean(&field.id))
+                    .or(*default)
+                    .unwrap_or(false);
+                let draft_id = request_id.to_string();
+                let field_id = field.id.clone();
+                Switch::new(SharedString::from(format!(
+                    "desktop-elicitation-boolean:{request_id}:{}",
+                    field.id
+                )))
+                .checked(checked)
+                .disabled(self.agent_action_pending)
+                .on_click(cx.listener(move |this, checked: &bool, _, cx| {
+                    if let Some(draft) = this.elicitation_drafts.get_mut(&draft_id) {
+                        draft.set_boolean(field_id.clone(), *checked);
+                        cx.notify();
+                    }
+                }))
+                .into_any_element()
+            }
+            ElicitationFieldKind::MultiSelect { options, .. } => {
+                let mut choices = Vec::with_capacity(options.len());
+                for (index, option) in options.iter().enumerate() {
+                    let selected = self
+                        .elicitation_drafts
+                        .get(request_id)
+                        .is_some_and(|draft| draft.multi_selected(&field.id, &option.value));
+                    let draft_id = request_id.to_string();
+                    let field_id = field.id.clone();
+                    let value = option.value.clone();
+                    let mut button = Button::new(format!(
+                        "desktop-elicitation-multi:{request_id}:{}:{index}",
+                        field.id
+                    ))
+                    .small()
+                    .label(option.title.clone())
+                    .disabled(self.agent_action_pending)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(draft) = this.elicitation_drafts.get_mut(&draft_id) {
+                            draft.toggle_multi_option(field_id.clone(), value.clone());
+                            cx.notify();
+                        }
+                    }));
+                    button = if selected {
+                        button.primary().icon(IconName::Check)
+                    } else {
+                        button.outline()
+                    };
+                    choices.push(
+                        v_flex()
+                            .min_w(px(156.0))
+                            .gap_1()
+                            .child(button)
+                            .when_some(option.description.clone(), |this, description| {
+                                this.child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(description),
+                                )
+                            })
+                            .into_any_element(),
+                    );
+                }
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .flex_wrap()
+                    .items_start()
+                    .gap_2()
+                    .children(choices)
+                    .into_any_element()
+            }
+            ElicitationFieldKind::Unsupported { schema_type } => h_flex()
+                .min_h(px(32.0))
+                .items_center()
+                .gap_2()
+                .text_sm()
+                .text_color(cx.theme().warning)
+                .child(Icon::new(IconName::TriangleAlert).size(px(14.0)))
+                .child(format!("Unavailable: {schema_type}"))
+                .into_any_element(),
+        };
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_1()
+            .child(div().text_sm().font_medium().child(field_label))
+            .when_some(field.description.clone(), |this, description| {
+                this.child(
+                    div()
+                        .text_size(px(11.0))
+                        .line_height(px(18.0))
+                        .text_color(cx.theme().muted_foreground)
+                        .child(description),
+                )
+            })
+            .child(control)
+            .into_any_element()
+    }
+
+    fn render_elicitation_request_card(
+        &mut self,
+        row: &TimelineRow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(request) = self.elicitation_request_for_row(row) else {
+            return self.render_fallback_process_row(row, cx);
+        };
+        let pending = row.pending_permission
+            && row.turn_pending_permission
+            && request.status == vibex_core::ElicitationRequestStatus::Pending;
+        let title = request
+            .title
+            .clone()
+            .unwrap_or_else(|| locale::text("Input requested", "需要输入", "需要輸入").to_string());
+        if !pending {
+            return h_flex()
+                .id(row.id.clone())
+                .w_full()
+                .min_w_0()
+                .items_center()
+                .gap_2()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(Icon::new(IconName::Check).size(px(14.0)))
+                .child(title)
+                .child("·")
+                .child(locale::text("Resolved", "已完成", "已完成"))
+                .into_any_element();
+        }
+        self.ensure_elicitation_form(&request, window, cx);
+        let request_id = request.id.to_string();
+        let can_submit = !request.fields.iter().any(|field| {
+            field.required && matches!(&field.kind, ElicitationFieldKind::Unsupported { .. })
+        });
+        let fields = request
+            .fields
+            .iter()
+            .map(|field| self.render_elicitation_field(&request_id, field, cx))
+            .collect::<Vec<_>>();
+        let decline_request = request.clone();
+        let submit_request = request.clone();
+        v_flex()
+            .id(row.id.clone())
+            .w_full()
+            .min_w_0()
+            .gap_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().warning.opacity(0.42))
+            .bg(cx
+                .theme()
+                .warning
+                .opacity(if cx.theme().is_dark() { 0.07 } else { 0.04 }))
+            .p_3()
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(Icon::new(IconName::Info).size(px(16.0)))
+                            .child(div().font_semibold().child(title)),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .line_height(px(20.0))
+                            .child(request.message.clone()),
+                    )
+                    .when_some(request.description.clone(), |this, description| {
+                        this.when(description.trim() != request.message.trim(), |this| {
+                            this.child(
+                                div()
+                                    .text_sm()
+                                    .line_height(px(20.0))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(description),
+                            )
+                        })
+                    }),
+            )
+            .children(fields)
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new(format!("desktop-elicitation-decline:{request_id}"))
+                            .small()
+                            .outline()
+                            .icon(IconName::Close)
+                            .label(locale::text("Decline", "拒绝", "拒絕"))
+                            .disabled(self.agent_action_pending)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.resolve_elicitation(
+                                    decline_request.clone(),
+                                    ElicitationResolutionAction::Decline,
+                                    cx,
+                                )
+                            })),
+                    )
+                    .child(
+                        Button::new(format!("desktop-elicitation-submit:{request_id}"))
+                            .small()
+                            .primary()
+                            .icon(IconName::Check)
+                            .label(locale::text("Submit", "提交", "提交"))
+                            .disabled(self.agent_action_pending || !can_submit)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.resolve_elicitation(
+                                    submit_request.clone(),
+                                    ElicitationResolutionAction::Accept,
+                                    cx,
+                                )
+                            })),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn render_permission_request_panel(

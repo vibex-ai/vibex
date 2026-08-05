@@ -549,6 +549,8 @@ fn event_kind(event: &ProviderEvent) -> &'static str {
         TimelineItemKind::SystemNotice => "system_notice",
         TimelineItemKind::PermissionRequest => "permission_request",
         TimelineItemKind::PermissionResolution => "permission_resolution",
+        TimelineItemKind::ElicitationRequest => "elicitation_request",
+        TimelineItemKind::ElicitationResolution => "elicitation_resolution",
         TimelineItemKind::Error => "error",
     }
 }

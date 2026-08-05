@@ -706,6 +706,204 @@ session/request_permission
   -> provider turn completes
 ```
 
+## Scenario: ACP Form Elicitation Callback Loop
+
+### 1. Scope / Trigger
+
+- Trigger: any ACP Agent sends the unstable `elicitation/create` request with a
+  session-scoped `form` while a turn is active.
+- This contract spans ACP capability negotiation and typed schema decoding,
+  provider-neutral Timeline/Core DTOs, SQLite request state, native and Remote
+  mutation APIs, and the shared desktop/Web/mobile workbench.
+- Support is capability-based for every ACP Agent. It must not branch on
+  Claude, Codex, OpenCode, or another Agent id.
+
+### 2. Signatures
+
+ACP transport:
+
+```text
+initialize.clientCapabilities.elicitation = { form: {} }
+
+agent -> Vibex JSON-RPC:
+elicitation/create {
+  id,
+  params: {
+    message,
+    mode: {
+      form: {
+        scope: { session: { sessionId, toolCallId? } },
+        requestedSchema
+      }
+    }
+  }
+}
+
+Vibex -> agent JSON-RPC result:
+{ action: "accept", content } | { action: "decline" } | { action: "cancel" }
+```
+
+Provider-neutral service and storage:
+
+```text
+AgentProvider::resolve_elicitation(ProviderElicitationResolution {
+  session_id,
+  binding,
+  execution_identity: { binding_id, activation_generation, model_id },
+  resolution
+}) -> ()
+AgentManager::resolve_elicitation(ResolveElicitationRequest) -> TimelineItem
+ElicitationRepository::insert_request(ElicitationRequest)
+ElicitationRepository::resolve(ElicitationResolution) // pending-only CAS
+ElicitationRepository::pending_for_session(VibexSessionId)
+
+RemoteAgentRequest::ResolveElicitation {
+  auth,
+  request: ResolveElicitationRequest
+} -> RemoteAgentResolveElicitationResponse { item }
+
+elicitation_requests(
+  request_id PRIMARY KEY,
+  session_id REFERENCES agent_sessions,
+  status,
+  request_json,
+  resolution_json,
+  requested_at_ms,
+  resolved_at_ms
+)
+```
+
+### 3. Contracts
+
+- The ACP schema dependency enables its `unstable` feature explicitly. Vibex
+  advertises only `elicitation.form`; URL mode and non-session scopes are not
+  claimed or inferred.
+- Each admitted callback gets one Vibex `RequestId`. The attachment keeps the
+  native JSON-RPC id in `pending_elicitations`; Timeline and SQLite keep only
+  the provider-neutral request, fields, status, and optional `tool_call_id`.
+- Decode string, finite number, integer, boolean, and enum-backed string-array
+  fields. Deterministically project required membership, defaults, bounds,
+  titles, descriptions, enum values, and enum labels. Durable numbers use
+  canonical finite decimal strings so Core DTOs retain `Eq`; only the ACP
+  adapter converts them back to JSON numbers.
+- Pattern-constrained strings and recognized-but-unrenderable property types
+  become `Unsupported` fields. A required unsupported field disables Accept but
+  still permits Decline. A malformed, oversized, URL-mode, server-scoped, or
+  otherwise unnormalizable request receives `cancel` immediately and creates no
+  Timeline or database state.
+- Admission is bounded to 32 pending callbacks per attachment, 32 fields per
+  form, 64 options per field, 128 characters per field id, 512 characters per
+  label, and 4096 characters per message/description.
+- `ElicitationRequest` and `ElicitationResolution` are append-only Timeline
+  variants. An unresolved request makes the Logical Session `needs_input`; the
+  session returns to `idle` only when both pending permissions and pending
+  elicitations are empty and no turn is running.
+- Accept validates every required field, answer id, answer type, option value,
+  uniqueness, length, numeric bound, and item-count bound. Decline and Cancel
+  carry no answers.
+- Resolution order is provider callback first, then the SQLite pending-only CAS
+  and user Timeline append. A callback error leaves the durable request pending
+  for retry. The ACP runtime removes its pending callback only after the JSON-RPC
+  result enters the process write queue; a closed stdin leaves it retryable.
+- `AgentManager` serializes resolutions by request id with weak async keyed
+  locks. Therefore concurrent desktop/Remote answers cannot send one value to
+  the Agent while persisting another; after the winner commits, losers receive
+  `elicitation_request_not_pending` without a provider callback.
+- The manager passes the exact durable binding id and activation generation to
+  the ACP runtime. Before touching pending state, runtime matches that identity,
+  native session id, and Provider Profile against the current attachment.
+- Native desktop and shared Web/mobile UI render the same typed fields and fence
+  duplicate submissions per elicitation request. Agent mutation tasks are held
+  by mutation request id so answering a form cannot cancel an in-flight send,
+  permission response, or another elicitation response.
+- Remote resolution is an interactive, idempotency-required mutation. It uses
+  `ResolveElicitation` authorization, an elicitation-specific audit target, and
+  validates nested session/request ids before manager dispatch.
+
+### 4. Validation & Error Matrix
+
+- Envelope request/session id mismatch ->
+  `validation/elicitation_resolution_target_mismatch`.
+- Unknown request -> `validation/elicitation_request_not_found`.
+- Request already accepted/declined/cancelled or loses the SQLite CAS ->
+  `conflict/elicitation_request_not_pending`.
+- Accept omits a required field, names an unknown field, uses the wrong answer
+  type, violates a bound, repeats a multi-select value, or selects an unknown
+  option -> `validation/elicitation_answer_invalid` with bounded `fieldId`.
+- Decline/Cancel includes answers -> `validation/elicitation_non_accept_answers`.
+- ACP profile lacks callback support ->
+  `capability/acp_elicitation_resolution_unsupported`.
+- Current runtime binding/attachment is missing or stale -> bounded runtime or
+  attachment conflict, including `acp_elicitation_attachment_mismatch`; never
+  route by ProviderKind or guess another session.
+- ACP process stdin is closed before the response is queued ->
+  `process/acp_process_stdin_closed`; keep both native callback and durable row
+  pending.
+- Invalid/unroutable/unsupported inbound form, no active turn sink, or pending
+  limit reached -> return ACP `cancel`; persist nothing.
+- Remote device lacks approval authority or omits mutation idempotency -> deny
+  before manager dispatch and emit no provider callback.
+
+### 5. Good/Base/Bad Cases
+
+- Good: a generic ACP Agent requests a required single choice plus optional
+  text; desktop submits typed answers, the Agent receives one `accept`, and the
+  persisted resolution matches it exactly.
+- Good: stdin closes during response; the first submission fails, reconnect
+  restores the write path, and retry sends the same pending callback once.
+- Good: desktop and mobile submit different answers concurrently; one wins the
+  request lock and both provider callback and Timeline contain that answer.
+- Base: the form contains an optional unsupported field; UI identifies it as
+  unavailable and can submit the supported required fields.
+- Base: the form contains a required unsupported field; Accept is disabled but
+  Decline remains available.
+- Bad: detect `AskUserQuestion` by Agent name or tool title and synthesize a
+  private UI payload instead of decoding ACP `elicitation/create`.
+- Bad: remove the pending native RPC id before checking the process write result.
+- Bad: use one GPUI task slot for send and elicitation mutations, so opening or
+  answering the form drops the active send task.
+
+### 6. Tests Required
+
+- Core tests assert required/type/enum/bounds/multi-select validation, target
+  matching, non-Accept answer rejection, and unsupported-pattern behavior.
+- ACP protocol/runtime tests assert unstable capability serialization, typed
+  form decoding, bounds, session routing, unsupported mode cancellation,
+  accept/decline/cancel encoding, duplicate no-op, and callback preservation on
+  write failure.
+- Manager tests assert request persistence drives `needs_input`, provider
+  failure remains retryable, concurrent conflicting resolutions deliver and
+  persist one identical winner, and the final pending request returns to idle.
+- Database tests assert migration 36, request/status round trip, pending query,
+  resolution JSON, and pending-only CAS behavior.
+- Backend/Remote tests assert capability exposure, nested id validation,
+  approval authorization, audit target, interactive timeout, and mandatory
+  mutation idempotency.
+- Desktop-model and shared UI tests assert both Timeline kinds project, drafts
+  validate before submit, duplicate submits are fenced per request, and native,
+  Web, and mobile builds consume the same typed contract.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+remove pending_elicitations[requestId]
+-> ignore process.send(response) failure
+-> resolve SQLite with whichever concurrent caller wins
+```
+
+#### Correct
+
+```text
+request-keyed manager lock
+-> reload and validate pending durable request + exact runtime fence
+-> queue ACP JSON-RPC response while native callback remains pending
+-> remove native callback only after queue success
+-> pending-only SQLite CAS + Timeline ElicitationResolution
+-> release lock; later attempts observe not-pending
+```
+
 ## Scenario: Composer Agent Command Discovery And Execution
 
 ### 1. Scope / Trigger

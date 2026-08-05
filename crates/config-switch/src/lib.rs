@@ -5496,6 +5496,9 @@ pub fn acp_capabilities_from_config(config: &AcpProviderConfig) -> ProviderCapab
             && !all_tools_disabled(config);
     capabilities.permission_requests =
         acp_feature_enabled(config, &["permission_requests", "permissions"]);
+    // Vibex hosts ACP form elicitation for every profile through the shared
+    // runtime callback; this capability is not an agent-specific feature flag.
+    capabilities.elicitation = true;
     capabilities.image_input = acp_feature_enabled(config, &["image_input", "images"]);
     capabilities.file_attachments =
         acp_feature_enabled(config, &["file_attachments", "attachments"]);

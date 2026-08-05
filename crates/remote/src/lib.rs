@@ -21,15 +21,15 @@ use vibex_core::{
     RemoteAgentCatchUpRequest, RemoteAgentCatchUpResponse, RemoteAgentContinueTurnResponse,
     RemoteAgentDeepLinkResolveResponse, RemoteAgentDetachRuntimeResponse,
     RemoteAgentInterruptResponse, RemoteAgentMessageSubmissionResponse, RemoteAgentRequest,
-    RemoteAgentResolvePermissionResponse, RemoteAgentRuntimeEventsResponse,
-    RemoteAgentRuntimeOptionsResponse, RemoteAgentRuntimeProcessSnapshotResponse,
-    RemoteAgentRuntimeSelectionResponse, RemoteAgentRuntimeSnapshotResponse,
-    RemoteAgentSendMessageResponse, RemoteAgentSessionDetailResponse,
-    RemoteAgentSessionListResponse, RemoteAgentSetDesiredRuntimeResponse,
-    RemoteAgentTimelineCursor, RemoteAgentTimelineFetchResponse, RemoteAuditAction,
-    RemoteAuditOutcome, RemoteAuditRecord, RemoteAuditTargetKind, RemoteAuthContext,
-    RemoteAuthProof, RemoteCapabilitySummary, RemoteClaimPairingCodeRequest,
-    RemoteClaimPairingCodeResponse, RemoteCreatePairingCodeRequest,
+    RemoteAgentResolveElicitationResponse, RemoteAgentResolvePermissionResponse,
+    RemoteAgentRuntimeEventsResponse, RemoteAgentRuntimeOptionsResponse,
+    RemoteAgentRuntimeProcessSnapshotResponse, RemoteAgentRuntimeSelectionResponse,
+    RemoteAgentRuntimeSnapshotResponse, RemoteAgentSendMessageResponse,
+    RemoteAgentSessionDetailResponse, RemoteAgentSessionListResponse,
+    RemoteAgentSetDesiredRuntimeResponse, RemoteAgentTimelineCursor,
+    RemoteAgentTimelineFetchResponse, RemoteAuditAction, RemoteAuditOutcome, RemoteAuditRecord,
+    RemoteAuditTargetKind, RemoteAuthContext, RemoteAuthProof, RemoteCapabilitySummary,
+    RemoteClaimPairingCodeRequest, RemoteClaimPairingCodeResponse, RemoteCreatePairingCodeRequest,
     RemoteCreatePairingCodeResponse, RemoteDeepLinkResolution, RemoteDeepLinkResolutionStatus,
     RemoteDeviceDetail, RemoteDevicePermissionLevel, RemoteDeviceStatus, RemoteFileDeleteResponse,
     RemoteFileReadResponse, RemoteFileRenameResponse, RemoteFileSearchResponse,
@@ -47,9 +47,10 @@ use vibex_core::{
     RemoteTerminalCreateResponse, RemoteTerminalKillResponse, RemoteTerminalListResponse,
     RemoteTerminalResizeResponse, RemoteTerminalSnapshotResponse, RemoteTerminalWriteResponse,
     RemoteWorkbenchListWorkspacesResponse, RemoteWorkbenchOpenWorkspaceResponse,
-    RemoteWorkbenchRequest, RequestId, ResolvePermissionRequest, RuntimeLeaseRole,
-    SessionRuntimeOptionCatalog, TerminalSession, TerminalStatus, TimelineLiveEvent, VibexError,
-    VibexResult, WorkspaceAggregateStatus, WorkspaceId, WorkspaceMode, unix_timestamp_ms,
+    RemoteWorkbenchRequest, RequestId, ResolveElicitationRequest, ResolvePermissionRequest,
+    RuntimeLeaseRole, SessionRuntimeOptionCatalog, TerminalSession, TerminalStatus,
+    TimelineLiveEvent, VibexError, VibexResult, WorkspaceAggregateStatus, WorkspaceId,
+    WorkspaceMode, unix_timestamp_ms,
 };
 use vibex_db::{
     DbConnection, GitSnapshotRepository, RecentFileRepository, RemoteAuditRepository,
@@ -811,6 +812,7 @@ fn permission_allows(permission: RemoteDevicePermissionLevel, action: RemoteActi
             RemoteActionClass::ReadProject
                 | RemoteActionClass::ReadAgentSession
                 | RemoteActionClass::ResolvePermission
+                | RemoteActionClass::ResolveElicitation
                 | RemoteActionClass::ReadProviderSettings
         ),
         RemoteDevicePermissionLevel::FullControl => true,
@@ -824,6 +826,7 @@ fn audit_target_for_action(action: RemoteActionClass) -> RemoteAuditTargetKind {
             RemoteAuditTargetKind::AgentSession
         }
         RemoteActionClass::ResolvePermission => RemoteAuditTargetKind::Permission,
+        RemoteActionClass::ResolveElicitation => RemoteAuditTargetKind::Elicitation,
         RemoteActionClass::MutateFile => RemoteAuditTargetKind::WorkspaceFile,
         RemoteActionClass::MutateGit => RemoteAuditTargetKind::Git,
         RemoteActionClass::MutateTerminal => RemoteAuditTargetKind::Terminal,
@@ -1625,6 +1628,33 @@ async fn dispatch_agent_request(
             )?;
             let item = item_result?;
             serde_json::to_value(RemoteAgentResolvePermissionResponse { item })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::ResolveElicitation(mut request) => {
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::ResolveElicitation,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            validate_elicitation_resolution(&request.request)?;
+            request.request.resolution.responder_device_id = Some(auth.device_id);
+            let device_id = request.request.resolution.responder_device_id.clone();
+            let elicitation_request_id = request.request.request_id.clone();
+            let item_result = manager.resolve_elicitation(request.request).await;
+            audit_agent_mutation(
+                &manager,
+                device_id,
+                RemoteAuditTargetKind::Elicitation,
+                elicitation_request_id.as_str(),
+                "Elicitation resolution",
+                item_result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let item = item_result?;
+            serde_json::to_value(RemoteAgentResolveElicitationResponse { item })
                 .map_err(remote_payload_encode_error)
         }
         RemoteAgentRequest::CatchUp(request) => {
@@ -2718,6 +2748,10 @@ fn validate_permission_resolution(request: &ResolvePermissionRequest) -> VibexRe
     Ok(())
 }
 
+fn validate_elicitation_resolution(request: &ResolveElicitationRequest) -> VibexResult<()> {
+    request.validate()
+}
+
 fn remote_payload_encode_error(err: serde_json::Error) -> VibexError {
     VibexError::new(
         ErrorCategory::Remote,
@@ -3153,6 +3187,22 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(revoked.code, "remote_device_revoked");
+    }
+
+    #[test]
+    fn approve_only_devices_can_resolve_elicitation_with_dedicated_audit_target() {
+        assert!(permission_allows(
+            RemoteDevicePermissionLevel::ApproveOnly,
+            RemoteActionClass::ResolveElicitation,
+        ));
+        assert!(!permission_allows(
+            RemoteDevicePermissionLevel::ReadOnly,
+            RemoteActionClass::ResolveElicitation,
+        ));
+        assert_eq!(
+            audit_target_for_action(RemoteActionClass::ResolveElicitation),
+            RemoteAuditTargetKind::Elicitation
+        );
     }
 
     #[test]

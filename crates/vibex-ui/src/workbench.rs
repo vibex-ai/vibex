@@ -1,7 +1,10 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use gpui::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, Role, ScrollHandle, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Task, WeakEntity, Window, div, px,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, WeakEntity, Window, div,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, IconName, Root, Sizable as _,
@@ -9,6 +12,7 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     scroll::ScrollableElement as _,
+    switch::Switch,
     v_flex,
 };
 use serde::{Deserialize, Serialize};
@@ -17,7 +21,8 @@ use vibex_backend::{
     BackendProjection, BackendResult, MutationRequest, WorkspaceSummary,
 };
 use vibex_core::{
-    AgentId, DeviceId, FileEntryKind, FileSearchRequest, PermissionResolution,
+    AgentId, DeviceId, ElicitationField, ElicitationFieldKind, ElicitationRequest,
+    ElicitationResolutionAction, FileEntryKind, FileSearchRequest, PermissionResolution,
     PermissionResponseKind, ProviderProfileId, ProviderRunHealthProbesRequest,
     RemoteCreatePairingOfferRequest, RemoteDevicePermissionLevel, RemoteDeviceStatus,
     RemoteRevokeDeviceRequest, RequestId, ResolvePermissionRequest, SendAgentMessageRequest,
@@ -232,6 +237,8 @@ pub struct WorkflowWorkbenchView {
     file_editor: Entity<InputState>,
     commit_message: Entity<InputState>,
     terminal_input: Entity<InputState>,
+    elicitation_inputs: BTreeMap<String, Entity<InputState>>,
+    elicitation_drafts: BTreeMap<String, crate::ElicitationFormDraft>,
     selected_git_key: Option<GitSelectionKey>,
     agent_live_event_count: u64,
     agent_recovery_count: u64,
@@ -249,9 +256,9 @@ pub struct WorkflowWorkbenchView {
     auxiliary_scroll: ScrollHandle,
     bootstrap_task: Option<Task<()>>,
     agent_task: Option<Task<()>>,
-    /// Mutations own a separate slot: an event-driven session reload storing
-    /// into `agent_task` must never cancel an in-flight send/approval future.
-    agent_mutation_task: Option<Task<()>>,
+    /// Event refreshes and concurrent input callbacks must not cancel an
+    /// in-flight send or another Agent mutation future.
+    agent_mutation_tasks: BTreeMap<String, Task<()>>,
     agent_event_refresh_task: Option<Task<()>>,
     event_task: Option<Task<()>>,
     file_task: Option<Task<()>>,
@@ -372,6 +379,8 @@ impl WorkflowWorkbenchView {
             file_editor,
             commit_message,
             terminal_input,
+            elicitation_inputs: BTreeMap::new(),
+            elicitation_drafts: BTreeMap::new(),
             selected_git_key: None,
             agent_live_event_count: 0,
             agent_recovery_count: 0,
@@ -389,7 +398,7 @@ impl WorkflowWorkbenchView {
             auxiliary_scroll: ScrollHandle::new(),
             bootstrap_task: None,
             agent_task: None,
-            agent_mutation_task: None,
+            agent_mutation_tasks: BTreeMap::new(),
             agent_event_refresh_task: None,
             event_task: None,
             file_task: None,
@@ -1160,20 +1169,19 @@ impl WorkflowWorkbenchView {
             }
         };
         let future = self.workflow.agent.send_message(request);
-        self.agent_mutation_task = Some(cx.spawn_in(
-            window,
-            async move |entity: WeakEntity<Self>, cx| {
-                let result = future.await;
-                let succeeded = result.is_ok();
-                let _ = entity.update_in(cx, |this, window, cx| {
-                    if this.workflow.agent.apply_timeline_mutation(&ticket, result) && succeeded {
-                        this.composer
-                            .update(cx, |input, cx| input.set_value("", window, cx));
-                    }
-                    cx.notify();
-                });
-            },
-        ));
+        let task_key = ticket.request_id.clone();
+        let task = cx.spawn_in(window, async move |entity: WeakEntity<Self>, cx| {
+            let result = future.await;
+            let succeeded = result.is_ok();
+            let _ = entity.update_in(cx, |this, window, cx| {
+                if this.workflow.agent.apply_timeline_mutation(&ticket, result) && succeeded {
+                    this.composer
+                        .update(cx, |input, cx| input.set_value("", window, cx));
+                }
+                cx.notify();
+            });
+        });
+        self.store_agent_mutation_task(task_key, task);
     }
 
     fn resolve_approval(
@@ -1208,7 +1216,8 @@ impl WorkflowWorkbenchView {
         });
         let ticket = self.workflow.agent.begin_resolve_permission(&request)?;
         let future = self.workflow.agent.resolve_permission(request);
-        self.agent_mutation_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+        let task_key = ticket.request_id.clone();
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let result = future.await;
             let _ = entity.update(cx, |this, cx| {
                 this.workflow.agent.apply_permission_mutation(
@@ -1218,7 +1227,133 @@ impl WorkflowWorkbenchView {
                 );
                 cx.notify();
             });
-        }));
+        });
+        self.store_agent_mutation_task(task_key, task);
+        Ok(())
+    }
+
+    fn store_agent_mutation_task(&mut self, request_id: String, task: Task<()>) {
+        self.agent_mutation_tasks
+            .retain(|_, existing| !existing.is_ready());
+        self.agent_mutation_tasks.insert(request_id, task);
+    }
+
+    fn elicitation_input_key(request_id: &str, field_id: &str) -> String {
+        format!("{request_id}:{field_id}")
+    }
+
+    fn sync_elicitation_forms(
+        &mut self,
+        surfaces: &[crate::ElicitationSurfaceModel],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let request_ids = surfaces
+            .iter()
+            .map(|surface| surface.request.id.to_string())
+            .collect::<BTreeSet<_>>();
+        let mut input_keys = BTreeSet::new();
+        for surface in surfaces {
+            let request = &surface.request;
+            self.elicitation_drafts
+                .entry(request.id.to_string())
+                .or_insert_with(|| crate::ElicitationFormDraft::from_request(request));
+            for field in &request.fields {
+                let uses_input = matches!(
+                    &field.kind,
+                    ElicitationFieldKind::Text { options, .. } if options.is_empty()
+                ) || matches!(
+                    &field.kind,
+                    ElicitationFieldKind::Number { .. } | ElicitationFieldKind::Integer { .. }
+                );
+                if !uses_input {
+                    continue;
+                }
+                let key = Self::elicitation_input_key(request.id.as_str(), &field.id);
+                input_keys.insert(key.clone());
+                if self.elicitation_inputs.contains_key(&key) {
+                    continue;
+                }
+                let initial_value = self
+                    .elicitation_drafts
+                    .get(request.id.as_str())
+                    .and_then(|draft| draft.text(&field.id))
+                    .unwrap_or_default()
+                    .to_string();
+                let placeholder = field.title.clone();
+                let input = cx.new(|cx| {
+                    let mut input = InputState::new(window, cx).placeholder(placeholder);
+                    if !initial_value.is_empty() {
+                        input.set_value(initial_value, window, cx);
+                    }
+                    input
+                });
+                self.elicitation_inputs.insert(key, input);
+            }
+        }
+        self.elicitation_drafts
+            .retain(|request_id, _| request_ids.contains(request_id));
+        self.elicitation_inputs
+            .retain(|key, _| input_keys.contains(key));
+    }
+
+    fn resolve_elicitation(
+        &mut self,
+        request: ElicitationRequest,
+        action: ElicitationResolutionAction,
+        cx: &mut Context<Self>,
+    ) -> BackendResult<()> {
+        let request_id = request.id.to_string();
+        let text_values = request
+            .fields
+            .iter()
+            .filter_map(|field| {
+                let key = Self::elicitation_input_key(request.id.as_str(), &field.id);
+                self.elicitation_inputs
+                    .get(&key)
+                    .map(|input| (field.id.clone(), input.read(cx).value().to_string()))
+            })
+            .collect::<Vec<_>>();
+        let draft = self
+            .elicitation_drafts
+            .entry(request_id.clone())
+            .or_insert_with(|| crate::ElicitationFormDraft::from_request(&request));
+        for (field_id, value) in text_values {
+            if request
+                .fields
+                .iter()
+                .find(|field| field.id == field_id)
+                .is_some_and(|field| field.required || !value.is_empty())
+            {
+                draft.set_text(field_id, value);
+            } else {
+                draft.values.remove(&field_id);
+            }
+        }
+        let payload = draft
+            .resolve_request(&request, action, unix_timestamp_ms())
+            .map_err(BackendError::from)?;
+        let mutation = MutationRequest::new(payload);
+        let ticket = self.workflow.agent.begin_resolve_elicitation(&mutation)?;
+        let future = self.workflow.agent.resolve_elicitation(mutation);
+        let task_key = ticket.request_id.clone();
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let result = future.await;
+            let succeeded = result.is_ok();
+            let _ = entity.update(cx, |this, cx| {
+                this.workflow
+                    .agent
+                    .apply_elicitation_mutation(&ticket, &request_id, result);
+                if succeeded {
+                    this.elicitation_drafts.remove(&request_id);
+                    let prefix = format!("{request_id}:");
+                    this.elicitation_inputs
+                        .retain(|key, _| !key.starts_with(&prefix));
+                }
+                cx.notify();
+            });
+        });
+        self.store_agent_mutation_task(task_key, task);
         Ok(())
     }
 
@@ -2120,12 +2255,287 @@ impl WorkflowWorkbenchView {
             .into_any_element()
     }
 
-    fn render_agent(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_elicitation_field(
+        &mut self,
+        request_id: &str,
+        field: &ElicitationField,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label = if field.required {
+            format!("{} *", field.title)
+        } else {
+            field.title.clone()
+        };
+        let control = match &field.kind {
+            ElicitationFieldKind::Text { options, .. } if !options.is_empty() => {
+                let mut choices = Vec::with_capacity(options.len());
+                for (index, option) in options.iter().enumerate() {
+                    let selected = self
+                        .elicitation_drafts
+                        .get(request_id)
+                        .and_then(|draft| draft.text(&field.id))
+                        .is_some_and(|value| value == option.value);
+                    let draft_id = request_id.to_string();
+                    let field_id = field.id.clone();
+                    let value = option.value.clone();
+                    let mut button = Button::new(format!(
+                        "elicitation-choice:{request_id}:{}:{index}",
+                        field.id
+                    ))
+                    .label(option.title.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(draft) = this.elicitation_drafts.get_mut(&draft_id) {
+                            draft.select_option(field_id.clone(), value.clone());
+                            cx.notify();
+                        }
+                    }));
+                    button = if selected {
+                        button.primary().icon(IconName::Check)
+                    } else {
+                        button.outline()
+                    };
+                    choices.push(
+                        v_flex()
+                            .min_w(px(140.0))
+                            .gap_1()
+                            .child(button)
+                            .when_some(option.description.clone(), |this, description| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(description),
+                                )
+                            })
+                            .into_any_element(),
+                    );
+                }
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .flex_wrap()
+                    .items_start()
+                    .gap_2()
+                    .children(choices)
+                    .into_any_element()
+            }
+            ElicitationFieldKind::Text { .. }
+            | ElicitationFieldKind::Number { .. }
+            | ElicitationFieldKind::Integer { .. } => {
+                let key = Self::elicitation_input_key(request_id, &field.id);
+                self.elicitation_inputs
+                    .get(&key)
+                    .map(|input| Input::new(input).w_full().into_any_element())
+                    .unwrap_or_else(|| div().into_any_element())
+            }
+            ElicitationFieldKind::Boolean { default } => {
+                let checked = self
+                    .elicitation_drafts
+                    .get(request_id)
+                    .and_then(|draft| draft.boolean(&field.id))
+                    .or(*default)
+                    .unwrap_or(false);
+                let draft_id = request_id.to_string();
+                let field_id = field.id.clone();
+                Switch::new(SharedString::from(format!(
+                    "elicitation-boolean:{request_id}:{}",
+                    field.id
+                )))
+                .checked(checked)
+                .on_click(cx.listener(move |this, checked: &bool, _, cx| {
+                    if let Some(draft) = this.elicitation_drafts.get_mut(&draft_id) {
+                        draft.set_boolean(field_id.clone(), *checked);
+                        cx.notify();
+                    }
+                }))
+                .into_any_element()
+            }
+            ElicitationFieldKind::MultiSelect { options, .. } => {
+                let mut choices = Vec::with_capacity(options.len());
+                for (index, option) in options.iter().enumerate() {
+                    let selected = self
+                        .elicitation_drafts
+                        .get(request_id)
+                        .is_some_and(|draft| draft.multi_selected(&field.id, &option.value));
+                    let draft_id = request_id.to_string();
+                    let field_id = field.id.clone();
+                    let value = option.value.clone();
+                    let mut button = Button::new(format!(
+                        "elicitation-multi:{request_id}:{}:{index}",
+                        field.id
+                    ))
+                    .label(option.title.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(draft) = this.elicitation_drafts.get_mut(&draft_id) {
+                            draft.toggle_multi_option(field_id.clone(), value.clone());
+                            cx.notify();
+                        }
+                    }));
+                    button = if selected {
+                        button.primary().icon(IconName::Check)
+                    } else {
+                        button.outline()
+                    };
+                    choices.push(
+                        v_flex()
+                            .min_w(px(140.0))
+                            .gap_1()
+                            .child(button)
+                            .when_some(option.description.clone(), |this, description| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(description),
+                                )
+                            })
+                            .into_any_element(),
+                    );
+                }
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .flex_wrap()
+                    .items_start()
+                    .gap_2()
+                    .children(choices)
+                    .into_any_element()
+            }
+            ElicitationFieldKind::Unsupported { schema_type } => h_flex()
+                .min_h(px(32.0))
+                .gap_2()
+                .text_sm()
+                .text_color(cx.theme().warning)
+                .child(IconName::TriangleAlert)
+                .child(format!("Unavailable: {schema_type}"))
+                .into_any_element(),
+        };
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_1()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(label),
+            )
+            .when_some(field.description.clone(), |this, description| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(description),
+                )
+            })
+            .child(control)
+            .into_any_element()
+    }
+
+    fn render_elicitation_surface(
+        &mut self,
+        surface: crate::ElicitationSurfaceModel,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let request = surface.request;
+        let request_id = request.id.to_string();
+        let pending = self
+            .workflow
+            .agent
+            .state
+            .pending_elicitation_resolution(&request_id);
+        let can_submit = !request.fields.iter().any(|field| {
+            field.required && matches!(&field.kind, ElicitationFieldKind::Unsupported { .. })
+        });
+        let fields = request
+            .fields
+            .iter()
+            .map(|field| self.render_elicitation_field(&request_id, field, cx))
+            .collect::<Vec<_>>();
+        let decline_request = request.clone();
+        let submit_request = request.clone();
+        let title = request
+            .title
+            .clone()
+            .unwrap_or_else(|| "Input requested".to_string());
+        v_flex()
+            .id(format!("agent-elicitation:{request_id}"))
+            .w_full()
+            .min_w_0()
+            .gap_3()
+            .p_3()
+            .border_1()
+            .border_color(cx.theme().warning.opacity(0.45))
+            .rounded(cx.theme().radius)
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .gap_1()
+                    .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child(title))
+                    .child(div().text_sm().child(request.message.clone()))
+                    .when_some(request.description.clone(), |this, description| {
+                        this.when(description.trim() != request.message.trim(), |this| {
+                            this.child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(description),
+                            )
+                        })
+                    }),
+            )
+            .children(fields)
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new(format!("elicitation-decline:{request_id}"))
+                            .outline()
+                            .icon(IconName::Close)
+                            .label("Decline")
+                            .disabled(pending)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let result = this.resolve_elicitation(
+                                    decline_request.clone(),
+                                    ElicitationResolutionAction::Decline,
+                                    cx,
+                                );
+                                this.record_action_result(result, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new(format!("elicitation-submit:{request_id}"))
+                            .primary()
+                            .icon(IconName::Check)
+                            .label("Submit")
+                            .disabled(pending || !can_submit)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let result = this.resolve_elicitation(
+                                    submit_request.clone(),
+                                    ElicitationResolutionAction::Accept,
+                                    cx,
+                                );
+                                this.record_action_result(result, cx);
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let view = self
             .workflow
             .agent
             .state
             .view(&self.sidebar, "", self.layout.kind);
+        self.sync_elicitation_forms(&view.elicitations, window, cx);
+        let elicitations = view
+            .elicitations
+            .into_iter()
+            .map(|surface| self.render_elicitation_surface(surface, cx))
+            .collect::<Vec<_>>();
         let selected_id = self.workflow.agent.state.selected_session_id.clone();
         let sessions = view.sessions.into_iter().enumerate().map(|(index, row)| {
             let is_session = row.kind == AgentSidebarRowKind::Session;
@@ -2304,6 +2714,7 @@ impl WorkflowWorkbenchView {
                     .children(timeline),
             )
             .child(v_flex().p_2().gap_2().children(approvals))
+            .child(v_flex().p_2().gap_2().children(elicitations))
             .child(
                 h_flex()
                     .min_h(px(72.0))
@@ -3186,7 +3597,7 @@ impl Render for WorkflowWorkbenchView {
         self.layout =
             ShellLayout::resolve(normalized_dimension(width), normalized_dimension(height));
         let surface = match self.active_surface() {
-            WorkbenchSurface::Agent => self.render_agent(cx),
+            WorkbenchSurface::Agent => self.render_agent(window, cx),
             WorkbenchSurface::Files => self.render_files(cx),
             WorkbenchSurface::Git => self.render_git(cx),
             WorkbenchSurface::Terminal => self.render_terminal(cx),

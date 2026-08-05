@@ -20,8 +20,8 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 use vibex_agent::{
-    AgentProvider, AgentUsageTelemetryEvent, ProviderCreateRequest, ProviderEvent,
-    ProviderPermissionResolution, ProviderRuntimeResources, ProviderSessionHandle,
+    AgentProvider, AgentUsageTelemetryEvent, ProviderCreateRequest, ProviderElicitationResolution,
+    ProviderEvent, ProviderPermissionResolution, ProviderRuntimeResources, ProviderSessionHandle,
     ProviderTurnAttachment, ProviderTurnExecutionIdentity, ProviderTurnRequest, ProviderTurnResult,
     materialize_provider_attachments, reject_forbidden_agent_smoke_workspace,
     resolve_agent_smoke_workspace,
@@ -34,13 +34,13 @@ use vibex_core::{
     AgentCommandSourceKind, AgentCommandTrigger, AgentEventRawExtension, AgentMessageDeltaPayload,
     AgentMessagePayload, AgentMessagePhase, AgentModelCapabilities, AgentModelListResponse,
     AgentModelListSource, AgentReasoningEffort, AgentSessionConfigProbe, AgentSessionSafety,
-    AgentUsageCounterOrigin, AgentUsageExecutionContext, ExternalSessionImportCandidate,
-    MessageSubmissionId, PermissionActionDetail, PermissionRequest, PermissionRequestStatus,
-    PermissionResponseKind, PermissionResponseOption, PermissionRiskCategory, PlanPayload,
-    PlanStepPayload, ProviderBinding, ProviderBindingMetadata, ProviderCapabilities,
-    ProviderCapabilitySummary, ProviderKind, ProviderNativeBinding, ProviderProfileId,
-    ProviderRunCapabilityProbesRequest, ProviderSessionConfigOption, ProviderSessionConfigValue,
-    ReasoningPayload, RequestId, SessionRuntimeConfigMutationRequest,
+    AgentUsageCounterOrigin, AgentUsageExecutionContext, ElicitationRequest,
+    ExternalSessionImportCandidate, MessageSubmissionId, PermissionActionDetail, PermissionRequest,
+    PermissionRequestStatus, PermissionResponseKind, PermissionResponseOption,
+    PermissionRiskCategory, PlanPayload, PlanStepPayload, ProviderBinding, ProviderBindingMetadata,
+    ProviderCapabilities, ProviderCapabilitySummary, ProviderKind, ProviderNativeBinding,
+    ProviderProfileId, ProviderRunCapabilityProbesRequest, ProviderSessionConfigOption,
+    ProviderSessionConfigValue, ReasoningPayload, RequestId, SessionRuntimeConfigMutationRequest,
     SessionRuntimeConfigMutationResult, SessionRuntimeSelection, SystemNoticeLevel,
     SystemNoticePayload, TimelineErrorPayload, TimelinePayload, TimelineRedactionState,
     ToolCallPayload, ToolCallStatus, VibexError, VibexResult, VibexSessionId, unix_timestamp_ms,
@@ -340,6 +340,7 @@ pub enum AcpEvent {
         details: Vec<PermissionActionDetail>,
         options: Vec<PermissionResponseOption>,
     },
+    ElicitationRequest(ElicitationRequest),
     SystemNotice {
         level: SystemNoticeLevel,
         message: String,
@@ -435,6 +436,13 @@ pub trait AcpClient: Send + Sync {
         Err(VibexError::capability(
             "acp_permission_resolution_unsupported",
             "ACP permission resolution is not supported by this adapter",
+        ))
+    }
+
+    async fn resolve_elicitation(&self, _request: AcpElicitationResolution) -> VibexResult<()> {
+        Err(VibexError::capability(
+            "acp_elicitation_resolution_unsupported",
+            "ACP elicitation resolution is not supported by this adapter",
         ))
     }
 
@@ -1849,6 +1857,13 @@ pub struct AcpPermissionResolution {
     pub resolution: vibex_core::PermissionResolution,
 }
 
+#[derive(Debug, Clone)]
+pub struct AcpElicitationResolution {
+    pub binding: ProviderBinding,
+    pub execution_identity: ProviderTurnExecutionIdentity,
+    pub resolution: vibex_core::ElicitationResolution,
+}
+
 #[derive(Clone)]
 pub struct AcpAgentProvider {
     client: Arc<dyn AcpClient>,
@@ -1878,6 +1893,7 @@ impl AcpAgentProvider {
             ProviderCapabilities::conservative(ProviderKind::Acp, "acp-foundation-static");
         capabilities.slash_commands = true;
         capabilities.skills = true;
+        capabilities.elicitation = true;
         capabilities
     }
 }
@@ -2310,6 +2326,16 @@ impl AgentProvider for AcpAgentProvider {
         self.client
             .resolve_permission(AcpPermissionResolution {
                 binding: request.binding,
+                resolution: request.resolution,
+            })
+            .await
+    }
+
+    async fn resolve_elicitation(&self, request: ProviderElicitationResolution) -> VibexResult<()> {
+        self.client
+            .resolve_elicitation(AcpElicitationResolution {
+                binding: request.binding,
+                execution_identity: request.execution_identity,
                 resolution: request.resolution,
             })
             .await
@@ -3028,6 +3054,12 @@ fn map_acp_event(session_id: vibex_core::VibexSessionId, event: AcpEvent) -> Pro
                 expires_at_ms: None,
             }),
             provider_correlation_id: provider_request_id,
+            redaction_state: TimelineRedactionState::None,
+        },
+        AcpEvent::ElicitationRequest(request) => ProviderEvent {
+            source: vibex_core::TimelineSource::Provider,
+            provider_correlation_id: request.provider_request_id.clone(),
+            payload: TimelinePayload::ElicitationRequest(request),
             redaction_state: TimelineRedactionState::None,
         },
         AcpEvent::SystemNotice { level, message } => {

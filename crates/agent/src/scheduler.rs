@@ -608,6 +608,7 @@ mod tests {
             plan: false,
             tool_invocations: false,
             permission_requests: true,
+            elicitation: false,
             image_input: false,
             file_attachments: false,
             fork_rollback: false,

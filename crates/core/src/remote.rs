@@ -5,8 +5,8 @@ use serde_json::Value as JsonValue;
 
 use crate::agent::{
     AgentSession, AgentSessionSummary, ContinueAgentTurnRequest, FetchTimelineRequest,
-    GetMessageSubmissionRequest, MessageSubmissionState, ResolvePermissionRequest,
-    SendAgentMessageRequest,
+    GetMessageSubmissionRequest, MessageSubmissionState, ResolveElicitationRequest,
+    ResolvePermissionRequest, SendAgentMessageRequest,
 };
 use crate::error::VibexError;
 use crate::file::{
@@ -270,6 +270,7 @@ pub enum RemoteActionClass {
     ReadProject,
     ReadAgentSession,
     ResolvePermission,
+    ResolveElicitation,
     MutateAgentSession,
     MutateFile,
     MutateGit,
@@ -306,6 +307,7 @@ pub enum RemoteAuditTargetKind {
     PairingOffer,
     Device,
     Permission,
+    Elicitation,
     AgentSession,
     WorkspaceFile,
     Git,
@@ -368,6 +370,7 @@ pub enum RemoteAgentOperationKind {
     ContinueTurn,
     Interrupt,
     ResolvePermission,
+    ResolveElicitation,
     CatchUp,
     GetRuntimeSnapshot,
     GetRuntimeProcessSnapshot,
@@ -637,6 +640,19 @@ pub struct RemoteAgentResolvePermissionResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RemoteAgentResolveElicitationRequest {
+    pub auth: RemoteAuthProof,
+    pub request: ResolveElicitationRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentResolveElicitationResponse {
+    pub item: TimelineItem,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RemoteAgentTimelineCursor {
     pub session_id: VibexSessionId,
     pub after_sequence: i64,
@@ -674,6 +690,7 @@ pub enum RemoteAgentRequest {
     ContinueTurn(RemoteAgentContinueTurnRequest),
     Interrupt(RemoteAgentInterruptRequest),
     ResolvePermission(RemoteAgentResolvePermissionRequest),
+    ResolveElicitation(RemoteAgentResolveElicitationRequest),
     CatchUp(RemoteAgentCatchUpRequest),
     GetRuntimeSnapshot(RemoteAgentRuntimeSnapshotRequest),
     GetRuntimeProcessSnapshot(RemoteAgentRuntimeProcessSnapshotRequest),
@@ -698,6 +715,7 @@ impl RemoteAgentRequest {
             Self::ContinueTurn(_) => RemoteAgentOperationKind::ContinueTurn,
             Self::Interrupt(_) => RemoteAgentOperationKind::Interrupt,
             Self::ResolvePermission(_) => RemoteAgentOperationKind::ResolvePermission,
+            Self::ResolveElicitation(_) => RemoteAgentOperationKind::ResolveElicitation,
             Self::CatchUp(_) => RemoteAgentOperationKind::CatchUp,
             Self::GetRuntimeSnapshot(_) => RemoteAgentOperationKind::GetRuntimeSnapshot,
             Self::GetRuntimeProcessSnapshot(_) => {

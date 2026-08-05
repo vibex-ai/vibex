@@ -2,9 +2,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use vibex_core::{
-    AgentSession, FileEntryKind, GitStatusSummary, PermissionRequest, PermissionResponseKind,
-    PermissionResponseOption, PermissionRiskCategory, RequestId, TerminalId, TimelineItemId,
-    WorkspaceId,
+    AgentSession, ElicitationRequest, FileEntryKind, GitStatusSummary, PermissionRequest,
+    PermissionResponseKind, PermissionResponseOption, PermissionRiskCategory, RequestId,
+    TerminalId, TimelineItemId, WorkspaceId,
 };
 use vibex_desktop_model::{
     AgentSidebarRow, FileExplorerRow, TimelineConversationTurn, TimelineRow,
@@ -150,6 +150,51 @@ impl ApprovalSurfaceModel {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElicitationSurfaceModel {
+    pub request: ElicitationRequest,
+    pub presentation: ApprovalPresentation,
+    pub high_priority: bool,
+    pub touch_target_px: u16,
+    pub hover_required: bool,
+}
+
+impl fmt::Debug for ElicitationSurfaceModel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ElicitationSurfaceModel")
+            .field("request_id", &self.request.id)
+            .field("field_count", &self.request.fields.len())
+            .field("status", &self.request.status)
+            .field("presentation", &self.presentation)
+            .field("high_priority", &self.high_priority)
+            .field("touch_target_px", &self.touch_target_px)
+            .field("hover_required", &self.hover_required)
+            .finish()
+    }
+}
+
+impl ElicitationSurfaceModel {
+    pub fn from_request(request: &ElicitationRequest, shell: ShellKind) -> Self {
+        Self {
+            request: request.clone(),
+            presentation: if shell == ShellKind::Compact {
+                ApprovalPresentation::Sheet
+            } else {
+                ApprovalPresentation::ProminentCard
+            },
+            high_priority: true,
+            touch_target_px: MIN_TOUCH_TARGET_PX,
+            hover_required: false,
+        }
+    }
+
+    pub fn is_touch_discoverable(&self) -> bool {
+        !self.hover_required && self.touch_target_px >= MIN_TOUCH_TARGET_PX
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalPresentation {
@@ -230,6 +275,7 @@ pub struct AgentWorkflowView {
     pub timeline_rows: Vec<TimelineRow>,
     pub conversation_turns: Vec<TimelineConversationTurn>,
     pub approvals: Vec<ApprovalSurfaceModel>,
+    pub elicitations: Vec<ElicitationSurfaceModel>,
     pub connection: crate::AgentConnectionState,
 }
 
@@ -243,6 +289,7 @@ impl fmt::Debug for AgentWorkflowView {
             .field("timeline_row_count", &self.timeline_rows.len())
             .field("turn_count", &self.conversation_turns.len())
             .field("approval_count", &self.approvals.len())
+            .field("elicitation_count", &self.elicitations.len())
             .field("connection", &self.connection)
             .finish()
     }

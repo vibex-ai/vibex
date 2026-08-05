@@ -43,9 +43,10 @@ use std::path::Path;
 use agent_client_protocol_schema::{
     ProtocolVersion,
     v1::{
-        CancelNotification, ClientCapabilities, ContentBlock, FileSystemCapabilities,
-        Implementation, InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest,
-        ResumeSessionRequest, SessionId, SetSessionConfigOptionRequest, SetSessionModeRequest,
+        CancelNotification, ClientCapabilities, ContentBlock, ElicitationCapabilities,
+        ElicitationFormCapabilities, FileSystemCapabilities, Implementation, InitializeRequest,
+        LoadSessionRequest, NewSessionRequest, PromptRequest, ResumeSessionRequest, SessionId,
+        SetSessionConfigOptionRequest, SetSessionModeRequest,
     },
 };
 use serde_json::{Value, json};
@@ -79,6 +80,7 @@ pub enum AcpOperation {
     SessionSetModel,
     SessionUpdate,
     PermissionRequest,
+    ElicitationCreate,
     FsReadTextFile,
     FsWriteTextFile,
     TerminalCreate,
@@ -110,6 +112,7 @@ impl AcpOperation {
             Self::SessionSetModel => "session/set_model",
             Self::SessionUpdate => "session/update",
             Self::PermissionRequest => "session/request_permission",
+            Self::ElicitationCreate => "elicitation/create",
             Self::FsReadTextFile => "fs/read_text_file",
             Self::FsWriteTextFile => "fs/write_text_file",
             Self::TerminalCreate => "terminal/create",
@@ -139,6 +142,7 @@ impl AcpOperation {
             "session/set_model" => Self::SessionSetModel,
             "session/update" => Self::SessionUpdate,
             "session/request_permission" => Self::PermissionRequest,
+            "elicitation/create" => Self::ElicitationCreate,
             "fs/read_text_file" => Self::FsReadTextFile,
             "fs/write_text_file" => Self::FsWriteTextFile,
             "terminal/create" => Self::TerminalCreate,
@@ -263,6 +267,7 @@ pub fn baseline_operation_matrix() -> Vec<AcpOperationSupport> {
         // Versioned / unstable: typed preferred, versioned raw fallback; the
         // actual encoding choice is negotiated (P3-02/P3-03).
         support(Op::SessionFork, St::VersionedUnstable, Enc::VersionedRaw),
+        support(Op::ElicitationCreate, St::VersionedUnstable, Enc::Typed),
         support(
             Op::SessionSetConfigOption,
             St::VersionedUnstable,
@@ -710,6 +715,8 @@ pub(crate) fn build_initialize_params(
     let mut capabilities = ClientCapabilities::new();
     capabilities.fs = fs;
     capabilities.terminal = terminal_tools;
+    capabilities.elicitation =
+        Some(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()));
     let mut request = InitializeRequest::new(ProtocolVersion::V1);
     request.client_capabilities = capabilities;
     request.client_info = Some(Implementation::new("vibex", env!("CARGO_PKG_VERSION")));
@@ -880,6 +887,7 @@ mod tests {
                 "clientCapabilities": {
                     "fs": { "readTextFile": true, "writeTextFile": true },
                     "terminal": false,
+                    "elicitation": { "form": {} },
                     "auth": { "terminal": true },
                     "mcpServers": true,
                     "meta": {

@@ -9,6 +9,7 @@ pub mod agent_config;
 pub mod automation_graph;
 pub mod canonical_json;
 pub mod diagnostics;
+pub mod elicitation;
 pub mod error;
 pub mod event;
 pub mod file;
@@ -41,8 +42,8 @@ pub use agent::{
     AgentSessionSafety, AgentSessionState, AgentSessionSummary, ContinueAgentTurnRequest,
     CreateAgentSessionRequest, FetchTimelineRequest, ForkAgentSessionRequest,
     GetMessageSubmissionRequest, MAX_MESSAGE_IDEMPOTENCY_KEY_LEN, MessageSubmissionState,
-    ProviderCapabilitiesResponse, RenameAgentSessionRequest, ResolvePermissionRequest,
-    SendAgentMessageRequest,
+    ProviderCapabilitiesResponse, RenameAgentSessionRequest, ResolveElicitationRequest,
+    ResolvePermissionRequest, SendAgentMessageRequest,
 };
 pub use agent_config::{
     AgentCatalogListResponse, AgentCommandConfig, AgentConfig, AgentConfigStatus, AgentDefinition,
@@ -77,6 +78,11 @@ pub use diagnostics::{
     DiagnosticScheduledTaskAuditRecord, DiagnosticScheduledTaskSection, DiagnosticSmokeCommandKind,
     DiagnosticSmokeCommandReference, DiagnosticSmokeSection, DiagnosticStorageSection,
     DiagnosticWorkbenchSection,
+};
+pub use elicitation::{
+    ElicitationAnswerValue, ElicitationField, ElicitationFieldKind, ElicitationOption,
+    ElicitationRequest, ElicitationRequestStatus, ElicitationResolution,
+    ElicitationResolutionAction, ElicitationStringFormat,
 };
 pub use error::{ErrorCategory, RedactedDiagnostic, VibexError, VibexResult};
 pub use event::{
@@ -206,7 +212,8 @@ pub use remote::{
     RemoteAgentDeepLinkResolveResponse, RemoteAgentDetachRuntimeRequest,
     RemoteAgentDetachRuntimeResponse, RemoteAgentInterruptRequest, RemoteAgentInterruptResponse,
     RemoteAgentMessageSubmissionRequest, RemoteAgentMessageSubmissionResponse,
-    RemoteAgentOperationKind, RemoteAgentRequest, RemoteAgentResolvePermissionRequest,
+    RemoteAgentOperationKind, RemoteAgentRequest, RemoteAgentResolveElicitationRequest,
+    RemoteAgentResolveElicitationResponse, RemoteAgentResolvePermissionRequest,
     RemoteAgentResolvePermissionResponse, RemoteAgentRuntimeEventsRequest,
     RemoteAgentRuntimeEventsResponse, RemoteAgentRuntimeOptionsRequest,
     RemoteAgentRuntimeOptionsResponse, RemoteAgentRuntimeProcessSnapshotRequest,

@@ -64,6 +64,7 @@ impl AgentFileGitCapabilities {
                     AgentContinueTurn,
                     AgentInterrupt,
                     AgentResolveApproval,
+                    AgentRespondElicitation,
                     AgentManageSession,
                     AgentSwitchRuntime,
                 ],
@@ -119,9 +120,17 @@ impl AgentFileGitCapabilities {
     fn domain_for(&self, operation: BackendOperation) -> &DomainCapabilities {
         use BackendOperation::*;
         match operation {
-            AgentListSessions | AgentCreateSession | AgentOpenSession | AgentFetchTimeline
-            | AgentSendMessage | AgentContinueTurn | AgentInterrupt | AgentResolveApproval
-            | AgentManageSession | AgentSwitchRuntime => &self.agent,
+            AgentListSessions
+            | AgentCreateSession
+            | AgentOpenSession
+            | AgentFetchTimeline
+            | AgentSendMessage
+            | AgentContinueTurn
+            | AgentInterrupt
+            | AgentResolveApproval
+            | AgentRespondElicitation
+            | AgentManageSession
+            | AgentSwitchRuntime => &self.agent,
             FileTree | FileSearch | FileRead | FileWrite | FileMove | FileDelete => &self.file,
             GitStatus | GitDiff | GitStage | GitUnstage | GitCommit => &self.git,
             _ => &self.agent,
@@ -151,6 +160,7 @@ fn operation_label(operation: BackendOperation) -> &'static str {
         AgentContinueTurn => "agent_continue_turn",
         AgentInterrupt => "agent_interrupt",
         AgentResolveApproval => "agent_resolve_approval",
+        AgentRespondElicitation => "agent_respond_elicitation",
         AgentManageSession => "agent_manage_session",
         AgentSwitchRuntime => "agent_switch_runtime",
         FileTree => "file_tree",

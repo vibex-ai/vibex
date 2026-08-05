@@ -18,10 +18,10 @@ use vibex_core::{
     RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
     RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeviceDetail,
     RemotePairingOfferSummary, RemoteRevokeDeviceRequest, RenameAgentSessionRequest,
-    ResolvePermissionRequest, SendAgentMessageRequest, SessionRuntimeOptionCatalog,
-    SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest, TerminalId, TerminalResizeRequest,
-    TerminalSession, TerminalSnapshot, TerminalWriteRequest, TimelineItem, TimelinePage,
-    VibexSessionId, WorkspaceId,
+    ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
+    SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
+    TerminalId, TerminalResizeRequest, TerminalSession, TerminalSnapshot, TerminalWriteRequest,
+    TimelineItem, TimelinePage, VibexSessionId, WorkspaceId,
 };
 
 use crate::{
@@ -112,6 +112,13 @@ impl AgentBackend for DisconnectedBackend {
     fn resolve_permission(
         &self,
         _request: MutationRequest<ResolvePermissionRequest>,
+    ) -> BackendFuture<'_, TimelineItem> {
+        disconnected_future!()
+    }
+
+    fn resolve_elicitation(
+        &self,
+        _request: MutationRequest<ResolveElicitationRequest>,
     ) -> BackendFuture<'_, TimelineItem> {
         disconnected_future!()
     }

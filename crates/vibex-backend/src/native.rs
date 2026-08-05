@@ -18,10 +18,10 @@ use vibex_core::{
     RemoteAuditListRequest, RemoteAuditRecord, RemoteCreatePairingCodeRequest,
     RemoteCreatePairingCodeResponse, RemoteCreatePairingOfferRequest,
     RemoteCreatePairingOfferResponse, RemoteDeviceDetail, RemoteRevokeDeviceRequest,
-    RenameAgentSessionRequest, ResolvePermissionRequest, SendAgentMessageRequest,
-    SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
-    TerminalId, TerminalResizeRequest, TerminalSession, TerminalSnapshot, TerminalStatus,
-    TerminalWriteRequest, TimelineItem, TimelinePage, VibexSessionId, WorkspaceId,
+    RenameAgentSessionRequest, ResolveElicitationRequest, ResolvePermissionRequest,
+    SendAgentMessageRequest, SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest,
+    TerminalCreateRequest, TerminalId, TerminalResizeRequest, TerminalSession, TerminalSnapshot,
+    TerminalStatus, TerminalWriteRequest, TimelineItem, TimelinePage, VibexSessionId, WorkspaceId,
 };
 use vibex_desktop_runtime::{
     AuthoritativeRefetch, DesktopEvent, DesktopEventReceiver, DesktopEventStream, DesktopRuntime,
@@ -283,6 +283,23 @@ impl AgentBackend for NativeBackend {
                 .agent()
                 .manager()
                 .resolve_permission(request.payload)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn resolve_elicitation(
+        &self,
+        request: MutationRequest<ResolveElicitationRequest>,
+    ) -> BackendFuture<'_, TimelineItem> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .manager()
+                .resolve_elicitation(request.payload)
                 .await
                 .map_err(Into::into)
         })

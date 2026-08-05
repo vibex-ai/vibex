@@ -282,6 +282,28 @@ pub struct ResolvePermissionRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ResolveElicitationRequest {
+    pub session_id: VibexSessionId,
+    pub request_id: RequestId,
+    pub resolution: crate::ElicitationResolution,
+}
+
+impl ResolveElicitationRequest {
+    pub fn validate(&self) -> crate::VibexResult<()> {
+        if self.resolution.request_id != self.request_id
+            || self.resolution.session_id != self.session_id
+        {
+            return Err(crate::VibexError::validation(
+                "elicitation_resolution_target_mismatch",
+                "elicitation resolution must match the target session and request id",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentSessionSummary {
     pub session: AgentSession,
     pub latest_timeline: TimelinePage,

@@ -9,22 +9,201 @@ use vibex_backend::{
 };
 use vibex_core::{
     AgentSession, AgentSessionRuntimeSelectionState, ContinueAgentTurnRequest,
-    CreateAgentSessionRequest, FetchTimelineRequest, PermissionRequestStatus,
-    RenameAgentSessionRequest, ResolvePermissionRequest, SendAgentMessageRequest,
+    CreateAgentSessionRequest, ElicitationAnswerValue, ElicitationFieldKind, ElicitationRequest,
+    ElicitationRequestStatus, ElicitationResolution, ElicitationResolutionAction,
+    FetchTimelineRequest, PermissionRequestStatus, RenameAgentSessionRequest,
+    ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
     SessionRuntimeOptionCatalog, TimelineItem, TimelineLiveEvent, TimelinePage, TimelinePayload,
-    VibexSessionId,
+    VibexError, VibexResult, VibexSessionId,
 };
 use vibex_desktop_model::{
     AgentSidebarRow, SidebarState, TimelineConversationTurn, TimelineModel, project_sidebar_rows,
 };
 
 use crate::{
-    AgentWorkflowView, ApprovalSurfaceModel, AsyncPhase, AsyncState, ShellKind,
-    WorkflowViewGeneration,
+    AgentWorkflowView, ApprovalSurfaceModel, AsyncPhase, AsyncState, ElicitationSurfaceModel,
+    ShellKind, WorkflowViewGeneration,
 };
 
 pub const AGENT_TIMELINE_PAGE_LIMIT: u32 = 500;
 pub const AGENT_TIMELINE_MAX_ITEMS: usize = 20_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ElicitationDraftValue {
+    Text(String),
+    Boolean(bool),
+    MultiSelect(BTreeSet<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElicitationFormDraft {
+    pub request_id: vibex_core::RequestId,
+    pub values: BTreeMap<String, ElicitationDraftValue>,
+}
+
+impl ElicitationFormDraft {
+    pub fn from_request(request: &ElicitationRequest) -> Self {
+        let values = request
+            .fields
+            .iter()
+            .filter_map(|field| {
+                let value = match &field.kind {
+                    ElicitationFieldKind::Text { default, .. }
+                    | ElicitationFieldKind::Number { default, .. } => {
+                        default.clone().map(ElicitationDraftValue::Text)
+                    }
+                    ElicitationFieldKind::Integer { default, .. } => {
+                        default.map(|value| ElicitationDraftValue::Text(value.to_string()))
+                    }
+                    ElicitationFieldKind::Boolean { default } => {
+                        default.map(ElicitationDraftValue::Boolean)
+                    }
+                    ElicitationFieldKind::MultiSelect { default, .. } => Some(
+                        ElicitationDraftValue::MultiSelect(default.iter().cloned().collect()),
+                    ),
+                    ElicitationFieldKind::Unsupported { .. } => None,
+                }?;
+                Some((field.id.clone(), value))
+            })
+            .collect();
+        Self {
+            request_id: request.id.clone(),
+            values,
+        }
+    }
+
+    pub fn set_text(&mut self, field_id: impl Into<String>, value: impl Into<String>) {
+        self.values
+            .insert(field_id.into(), ElicitationDraftValue::Text(value.into()));
+    }
+
+    pub fn set_boolean(&mut self, field_id: impl Into<String>, value: bool) {
+        self.values
+            .insert(field_id.into(), ElicitationDraftValue::Boolean(value));
+    }
+
+    pub fn select_option(&mut self, field_id: impl Into<String>, value: impl Into<String>) {
+        self.set_text(field_id, value);
+    }
+
+    pub fn toggle_multi_option(&mut self, field_id: impl Into<String>, value: impl Into<String>) {
+        let field_id = field_id.into();
+        let value = value.into();
+        let selected = self
+            .values
+            .entry(field_id)
+            .or_insert_with(|| ElicitationDraftValue::MultiSelect(BTreeSet::new()));
+        if let ElicitationDraftValue::MultiSelect(selected) = selected
+            && !selected.insert(value.clone())
+        {
+            selected.remove(&value);
+        }
+    }
+
+    pub fn text(&self, field_id: &str) -> Option<&str> {
+        match self.values.get(field_id) {
+            Some(ElicitationDraftValue::Text(value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn boolean(&self, field_id: &str) -> Option<bool> {
+        match self.values.get(field_id) {
+            Some(ElicitationDraftValue::Boolean(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub fn multi_selected(&self, field_id: &str, value: &str) -> bool {
+        matches!(
+            self.values.get(field_id),
+            Some(ElicitationDraftValue::MultiSelect(selected)) if selected.contains(value)
+        )
+    }
+
+    pub fn resolve_request(
+        &self,
+        request: &ElicitationRequest,
+        action: ElicitationResolutionAction,
+        resolved_at_ms: i64,
+    ) -> VibexResult<ResolveElicitationRequest> {
+        if self.request_id != request.id {
+            return Err(VibexError::validation(
+                "elicitation_draft_request_mismatch",
+                "input draft belongs to another request",
+            ));
+        }
+        let mut answers = BTreeMap::new();
+        if action == ElicitationResolutionAction::Accept {
+            for field in &request.fields {
+                let answer = match (&field.kind, self.values.get(&field.id)) {
+                    (
+                        ElicitationFieldKind::Text { .. },
+                        Some(ElicitationDraftValue::Text(value)),
+                    ) if field.required || !value.is_empty() => {
+                        Some(ElicitationAnswerValue::String(value.clone()))
+                    }
+                    (
+                        ElicitationFieldKind::Number { .. },
+                        Some(ElicitationDraftValue::Text(value)),
+                    ) if field.required || !value.is_empty() => {
+                        Some(ElicitationAnswerValue::Number(value.clone()))
+                    }
+                    (
+                        ElicitationFieldKind::Integer { .. },
+                        Some(ElicitationDraftValue::Text(value)),
+                    ) if field.required || !value.is_empty() => Some(
+                        ElicitationAnswerValue::Integer(value.parse::<i64>().map_err(|_| {
+                            VibexError::validation(
+                                "elicitation_answer_invalid",
+                                "integer answer is invalid",
+                            )
+                            .with_diagnostic("fieldId", &field.id)
+                        })?),
+                    ),
+                    (
+                        ElicitationFieldKind::Boolean { .. },
+                        Some(ElicitationDraftValue::Boolean(value)),
+                    ) => Some(ElicitationAnswerValue::Boolean(*value)),
+                    (ElicitationFieldKind::Boolean { .. }, None) if field.required => {
+                        Some(ElicitationAnswerValue::Boolean(false))
+                    }
+                    (
+                        ElicitationFieldKind::MultiSelect { .. },
+                        Some(ElicitationDraftValue::MultiSelect(values)),
+                    ) if field.required || !values.is_empty() => Some(
+                        ElicitationAnswerValue::StringArray(values.iter().cloned().collect()),
+                    ),
+                    (ElicitationFieldKind::Unsupported { .. }, _) if field.required => {
+                        return Err(VibexError::capability(
+                            "elicitation_required_field_unsupported",
+                            "a required input field is not supported by this client",
+                        )
+                        .with_diagnostic("fieldId", &field.id));
+                    }
+                    _ => None,
+                };
+                if let Some(answer) = answer {
+                    answers.insert(field.id.clone(), answer);
+                }
+            }
+        }
+        let resolution = ElicitationResolution {
+            request_id: request.id.clone(),
+            session_id: request.session_id.clone(),
+            action,
+            answers,
+            responder_device_id: None,
+            resolved_at_ms,
+        };
+        request.validate_resolution(&resolution)?;
+        Ok(ResolveElicitationRequest {
+            session_id: request.session_id.clone(),
+            request_id: request.id.clone(),
+            resolution,
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -53,6 +232,7 @@ pub struct AgentWorkflowState {
     pub last_runtime_event: Option<vibex_core::RuntimeSessionEvent>,
     pending_mutations: BTreeSet<String>,
     pending_permission_resolutions: BTreeSet<String>,
+    pending_elicitation_resolutions: BTreeSet<String>,
 }
 
 impl fmt::Debug for AgentWorkflowState {
@@ -77,6 +257,10 @@ impl fmt::Debug for AgentWorkflowState {
                 "pending_permission_resolution_count",
                 &self.pending_permission_resolutions.len(),
             )
+            .field(
+                "pending_elicitation_resolution_count",
+                &self.pending_elicitation_resolutions.len(),
+            )
             .finish()
     }
 }
@@ -98,6 +282,7 @@ impl Default for AgentWorkflowState {
             last_runtime_event: None,
             pending_mutations: BTreeSet::new(),
             pending_permission_resolutions: BTreeSet::new(),
+            pending_elicitation_resolutions: BTreeSet::new(),
         }
     }
 }
@@ -111,6 +296,7 @@ impl AgentWorkflowState {
             timeline_rows: self.timeline.rows(),
             conversation_turns: self.conversation_turns(),
             approvals: self.approval_surfaces(shell),
+            elicitations: self.elicitation_surfaces(shell),
             connection: self.connection,
         }
     }
@@ -161,6 +347,39 @@ impl AgentWorkflowState {
     pub fn pending_permission_resolution(&self, request_id: &str) -> bool {
         self.pending_permission_resolutions.contains(request_id)
     }
+
+    pub fn elicitation_surfaces(&self, shell: ShellKind) -> Vec<ElicitationSurfaceModel> {
+        let resolved = self
+            .timeline
+            .items
+            .iter()
+            .filter_map(|item| match &item.payload {
+                TimelinePayload::ElicitationResolution(resolution) => {
+                    Some(resolution.request_id.to_string())
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let mut seen = BTreeSet::new();
+        self.timeline
+            .items
+            .iter()
+            .filter_map(|item| match &item.payload {
+                TimelinePayload::ElicitationRequest(request)
+                    if request.status == ElicitationRequestStatus::Pending
+                        && !resolved.contains(request.id.as_str())
+                        && seen.insert(request.id.to_string()) =>
+                {
+                    Some(ElicitationSurfaceModel::from_request(request, shell))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn pending_elicitation_resolution(&self, request_id: &str) -> bool {
+        self.pending_elicitation_resolutions.contains(request_id)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,6 +412,7 @@ pub enum AgentMutationKind {
     ContinueTurn,
     Interrupt,
     ResolvePermission,
+    ResolveElicitation,
     CreateSession,
     RenameSession,
     ArchiveSession,
@@ -320,6 +540,7 @@ impl AgentWorkflowController {
             self.state.latest_mutation.clear();
             self.state.pending_mutations.clear();
             self.state.pending_permission_resolutions.clear();
+            self.state.pending_elicitation_resolutions.clear();
         }
         self.state.last_runtime_event = None;
         Ok(AgentSessionLoadTicket {
@@ -586,6 +807,68 @@ impl AgentWorkflowController {
         Box::pin(async move { backend.resolve_permission(request).await })
     }
 
+    pub fn begin_resolve_elicitation(
+        &mut self,
+        request: &MutationRequest<ResolveElicitationRequest>,
+    ) -> BackendResult<AgentMutationTicket> {
+        self.require(BackendOperation::AgentRespondElicitation)?;
+        request.payload.validate().map_err(BackendError::from)?;
+        let elicitation_id = request.payload.request_id.as_str();
+        let pending = self.state.timeline.items.iter().find_map(|item| {
+            let TimelinePayload::ElicitationRequest(elicitation) = &item.payload else {
+                return None;
+            };
+            (elicitation.id == request.payload.request_id
+                && elicitation.session_id == request.payload.session_id
+                && elicitation.status == ElicitationRequestStatus::Pending)
+                .then_some(elicitation)
+        });
+        let Some(elicitation) = pending else {
+            return Err(BackendError::conflict(
+                "agent_elicitation_not_pending",
+                "the input request is no longer pending",
+            ));
+        };
+        elicitation
+            .validate_resolution(&request.payload.resolution)
+            .map_err(BackendError::from)?;
+        if !self
+            .state
+            .pending_elicitation_resolutions
+            .insert(elicitation_id.to_string())
+        {
+            return Err(BackendError::conflict(
+                "agent_elicitation_resolution_pending",
+                "this input response is already being submitted",
+            ));
+        }
+        match self.begin_mutation(
+            request.request_id.as_str(),
+            &request.payload.session_id,
+            AgentMutationKind::ResolveElicitation,
+            BackendOperation::AgentRespondElicitation,
+        ) {
+            Ok(ticket) => Ok(ticket),
+            Err(error) => {
+                self.state
+                    .pending_elicitation_resolutions
+                    .remove(elicitation_id);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn resolve_elicitation(
+        &self,
+        request: MutationRequest<ResolveElicitationRequest>,
+    ) -> BackendFuture<'static, TimelineItem> {
+        if let Err(error) = self.require(BackendOperation::AgentRespondElicitation) {
+            return error_future(error);
+        }
+        let backend = self.backend.clone();
+        Box::pin(async move { backend.resolve_elicitation(request).await })
+    }
+
     pub fn apply_timeline_mutation(
         &mut self,
         ticket: &AgentMutationTicket,
@@ -657,6 +940,50 @@ impl AgentWorkflowController {
                 self.state.latest_mutation.reject(BackendError::failed(
                     "agent_permission_response_mismatch",
                     "the backend returned a different permission resolution",
+                ));
+            }
+            Ok(item) => {
+                let _ = self.state.timeline.apply_live(TimelineLiveEvent {
+                    session_id: ticket.session_id.clone(),
+                    sequence: item.sequence,
+                    item: item.clone(),
+                });
+                self.state.latest_mutation.resolve(vec![item]);
+            }
+            Err(error) => self.state.latest_mutation.reject(error),
+        }
+        true
+    }
+
+    pub fn apply_elicitation_mutation(
+        &mut self,
+        ticket: &AgentMutationTicket,
+        elicitation_request_id: &str,
+        result: BackendResult<TimelineItem>,
+    ) -> bool {
+        if ticket.kind != AgentMutationKind::ResolveElicitation {
+            return false;
+        }
+        if !self.finish_mutation(ticket) {
+            return false;
+        }
+        self.state
+            .pending_elicitation_resolutions
+            .remove(elicitation_request_id);
+        match result {
+            Ok(item)
+                if item.session_id != ticket.session_id
+                    || item.sequence <= 0
+                    || !matches!(
+                        &item.payload,
+                        TimelinePayload::ElicitationResolution(resolution)
+                            if resolution.session_id == ticket.session_id
+                                && resolution.request_id.as_str() == elicitation_request_id
+                    ) =>
+            {
+                self.state.latest_mutation.reject(BackendError::failed(
+                    "agent_elicitation_response_mismatch",
+                    "the backend returned a different input-request resolution",
                 ));
             }
             Ok(item) => {
@@ -894,6 +1221,7 @@ fn agent_operation_label(operation: BackendOperation) -> &'static str {
         AgentContinueTurn => "agent_continue_turn",
         AgentInterrupt => "agent_interrupt",
         AgentResolveApproval => "agent_resolve_approval",
+        AgentRespondElicitation => "agent_respond_elicitation",
         AgentManageSession => "agent_manage_session",
         AgentSwitchRuntime => "agent_switch_runtime",
         _ => "agent_operation",
@@ -912,6 +1240,8 @@ mod tests {
     use vibex_backend::{BackendEventSubscription, MutationRequest};
     use vibex_core::{
         AgentId, AgentMessagePayload, AgentSessionSafety, AgentSessionState, CorrelationId,
+        ElicitationAnswerValue, ElicitationField, ElicitationFieldKind, ElicitationOption,
+        ElicitationRequest, ElicitationRequestStatus, ElicitationResolutionAction,
         PermissionActionDetail, PermissionRequest, PermissionResolution, PermissionResponseKind,
         PermissionResponseOption, PermissionRiskCategory, ProjectId, ProviderProfileId, RequestId,
         SessionRuntimeSelection, TimelineItemId, TimelineRedactionState, TimelineSource,
@@ -923,6 +1253,7 @@ mod tests {
         session: AgentSession,
         timeline: Arc<Mutex<Vec<TimelineItem>>>,
         permission_resolution: Arc<Mutex<Option<TimelineItem>>>,
+        elicitation_resolution: Arc<Mutex<Option<TimelineItem>>>,
     }
 
     impl MockAgentBackend {
@@ -931,6 +1262,7 @@ mod tests {
                 session,
                 timeline: Arc::new(Mutex::new(timeline)),
                 permission_resolution: Arc::new(Mutex::new(None)),
+                elicitation_resolution: Arc::new(Mutex::new(None)),
             }
         }
     }
@@ -1018,6 +1350,19 @@ mod tests {
             _request: MutationRequest<ResolvePermissionRequest>,
         ) -> BackendFuture<'_, TimelineItem> {
             let item = self.permission_resolution.clone();
+            Box::pin(async move {
+                item.lock()
+                    .map_err(|_| BackendError::failed("mock", "mock poisoned"))?
+                    .clone()
+                    .ok_or_else(|| BackendError::failed("mock", "missing resolution"))
+            })
+        }
+
+        fn resolve_elicitation(
+            &self,
+            _request: MutationRequest<ResolveElicitationRequest>,
+        ) -> BackendFuture<'_, TimelineItem> {
+            let item = self.elicitation_resolution.clone();
             Box::pin(async move {
                 item.lock()
                     .map_err(|_| BackendError::failed("mock", "mock poisoned"))?
@@ -1131,6 +1476,7 @@ mod tests {
             BackendOperation::AgentContinueTurn,
             BackendOperation::AgentInterrupt,
             BackendOperation::AgentResolveApproval,
+            BackendOperation::AgentRespondElicitation,
             BackendOperation::AgentManageSession,
         ])
     }
@@ -1254,6 +1600,187 @@ mod tests {
                 .unwrap_err()
                 .code,
             "agent_permission_resolution_pending"
+        );
+    }
+
+    #[test]
+    fn elicitation_draft_builds_typed_answers_and_validates_fields() {
+        let session_id = VibexSessionId::new();
+        let request = ElicitationRequest {
+            id: RequestId::new(),
+            session_id: session_id.clone(),
+            provider_request_id: None,
+            tool_call_id: None,
+            message: "Configure the run".into(),
+            title: Some("Configuration".into()),
+            description: None,
+            fields: vec![
+                ElicitationField {
+                    id: "name".into(),
+                    title: "Name".into(),
+                    description: None,
+                    required: true,
+                    kind: ElicitationFieldKind::Text {
+                        min_length: Some(2),
+                        max_length: Some(20),
+                        pattern: None,
+                        format: None,
+                        default: None,
+                        options: Vec::new(),
+                    },
+                },
+                ElicitationField {
+                    id: "count".into(),
+                    title: "Count".into(),
+                    description: None,
+                    required: true,
+                    kind: ElicitationFieldKind::Integer {
+                        minimum: Some(1),
+                        maximum: Some(3),
+                        default: Some(2),
+                    },
+                },
+                ElicitationField {
+                    id: "confirm".into(),
+                    title: "Confirm".into(),
+                    description: None,
+                    required: true,
+                    kind: ElicitationFieldKind::Boolean {
+                        default: Some(true),
+                    },
+                },
+                ElicitationField {
+                    id: "tags".into(),
+                    title: "Tags".into(),
+                    description: None,
+                    required: true,
+                    kind: ElicitationFieldKind::MultiSelect {
+                        options: vec![
+                            ElicitationOption {
+                                value: "rust".into(),
+                                title: "Rust".into(),
+                                description: None,
+                            },
+                            ElicitationOption {
+                                value: "ui".into(),
+                                title: "UI".into(),
+                                description: None,
+                            },
+                        ],
+                        min_items: Some(1),
+                        max_items: Some(2),
+                        default: vec!["rust".into()],
+                    },
+                },
+            ],
+            status: ElicitationRequestStatus::Pending,
+            requested_at_ms: 1,
+        };
+        let mut draft = ElicitationFormDraft::from_request(&request);
+        draft.set_text("name", "Ada");
+        draft.toggle_multi_option("tags", "ui");
+        let payload = draft
+            .resolve_request(&request, ElicitationResolutionAction::Accept, 2)
+            .unwrap();
+        assert_eq!(payload.session_id, session_id);
+        assert_eq!(
+            payload.resolution.answers.get("name"),
+            Some(&ElicitationAnswerValue::String("Ada".into()))
+        );
+        assert_eq!(
+            payload.resolution.answers.get("count"),
+            Some(&ElicitationAnswerValue::Integer(2))
+        );
+        assert_eq!(
+            payload.resolution.answers.get("confirm"),
+            Some(&ElicitationAnswerValue::Boolean(true))
+        );
+        assert_eq!(
+            payload.resolution.answers.get("tags"),
+            Some(&ElicitationAnswerValue::StringArray(vec![
+                "rust".into(),
+                "ui".into(),
+            ]))
+        );
+
+        draft.set_text("count", "not-an-integer");
+        assert_eq!(
+            draft
+                .resolve_request(&request, ElicitationResolutionAction::Accept, 3)
+                .unwrap_err()
+                .code,
+            "elicitation_answer_invalid"
+        );
+    }
+
+    #[test]
+    fn elicitation_surface_and_resolution_are_deduplicated_and_fenced() {
+        let session = session();
+        let request = ElicitationRequest {
+            id: RequestId::new(),
+            session_id: session.id.clone(),
+            provider_request_id: None,
+            tool_call_id: None,
+            message: "Continue?".into(),
+            title: None,
+            description: None,
+            fields: Vec::new(),
+            status: ElicitationRequestStatus::Pending,
+            requested_at_ms: 1,
+        };
+        let backend = Arc::new(MockAgentBackend::new(session.clone(), Vec::new()));
+        let mut controller = AgentWorkflowController::new(backend, capabilities());
+        controller.state.selected_session_id = Some(session.id.clone());
+        controller.state.generation = WorkflowViewGeneration(1);
+        controller.state.timeline.replace_authoritative(
+            session.id.clone(),
+            [
+                timeline_item(
+                    &session.id,
+                    1,
+                    TimelinePayload::ElicitationRequest(request.clone()),
+                ),
+                timeline_item(
+                    &session.id,
+                    2,
+                    TimelinePayload::ElicitationRequest(request.clone()),
+                ),
+            ],
+        );
+        let surfaces = controller.state.elicitation_surfaces(ShellKind::Compact);
+        assert_eq!(surfaces.len(), 1);
+        assert!(surfaces[0].high_priority);
+        assert!(surfaces[0].is_touch_discoverable());
+        assert_eq!(surfaces[0].presentation, crate::ApprovalPresentation::Sheet);
+
+        let payload = ElicitationFormDraft::from_request(&request)
+            .resolve_request(&request, ElicitationResolutionAction::Decline, 2)
+            .unwrap();
+        let mutation = MutationRequest::new(payload.clone());
+        let ticket = controller.begin_resolve_elicitation(&mutation).unwrap();
+        assert_eq!(
+            controller
+                .begin_resolve_elicitation(&mutation)
+                .unwrap_err()
+                .code,
+            "agent_elicitation_resolution_pending"
+        );
+        let item = timeline_item(
+            &session.id,
+            3,
+            TimelinePayload::ElicitationResolution(payload.resolution),
+        );
+        assert!(controller.apply_elicitation_mutation(&ticket, request.id.as_str(), Ok(item),));
+        assert!(
+            !controller
+                .state
+                .pending_elicitation_resolution(request.id.as_str())
+        );
+        assert!(
+            controller
+                .state
+                .elicitation_surfaces(ShellKind::Compact)
+                .is_empty()
         );
     }
 

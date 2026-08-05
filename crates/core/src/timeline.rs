@@ -4,6 +4,7 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::agent_config::AgentId;
+use crate::elicitation::{ElicitationRequest, ElicitationResolution};
 use crate::ids::{
     CorrelationId, ProviderProfileId, RuntimeBindingId, TimelineItemId, VibexSessionId,
 };
@@ -37,6 +38,8 @@ pub enum TimelineItemKind {
     SystemNotice,
     PermissionRequest,
     PermissionResolution,
+    ElicitationRequest,
+    ElicitationResolution,
     Error,
 }
 
@@ -779,6 +782,8 @@ pub enum TimelinePayload {
     SystemNotice(SystemNoticePayload),
     PermissionRequest(PermissionRequest),
     PermissionResolution(PermissionResolution),
+    ElicitationRequest(ElicitationRequest),
+    ElicitationResolution(ElicitationResolution),
     Error(TimelineErrorPayload),
 }
 
@@ -801,6 +806,8 @@ impl TimelinePayload {
             Self::SystemNotice(_) => TimelineItemKind::SystemNotice,
             Self::PermissionRequest(_) => TimelineItemKind::PermissionRequest,
             Self::PermissionResolution(_) => TimelineItemKind::PermissionResolution,
+            Self::ElicitationRequest(_) => TimelineItemKind::ElicitationRequest,
+            Self::ElicitationResolution(_) => TimelineItemKind::ElicitationResolution,
             Self::Error(_) => TimelineItemKind::Error,
         }
     }

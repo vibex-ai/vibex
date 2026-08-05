@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use vibex_core::{
-    AgentSessionState, PermissionRequestStatus, TimelineItem, TimelineItemKind, TimelineLiveEvent,
-    TimelinePayload, VibexSessionId,
+    AgentSessionState, ElicitationRequestStatus, PermissionRequestStatus, TimelineItem,
+    TimelineItemKind, TimelineLiveEvent, TimelinePayload, VibexSessionId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +131,14 @@ impl TimelineModel {
                 TimelinePayload::PermissionResolution(resolution) => {
                     pending.remove(resolution.request_id.as_str());
                 }
+                TimelinePayload::ElicitationRequest(request)
+                    if request.status == ElicitationRequestStatus::Pending =>
+                {
+                    pending.insert(request.id.to_string());
+                }
+                TimelinePayload::ElicitationResolution(resolution) => {
+                    pending.remove(resolution.request_id.as_str());
+                }
                 _ => {}
             }
         }
@@ -236,6 +244,14 @@ fn finish_turn_ref(turn: &mut TimelineTurnRef<'_>) {
                 pending_permission_ids.insert(request.id.to_string());
             }
             TimelinePayload::PermissionResolution(resolution) => {
+                pending_permission_ids.remove(resolution.request_id.as_str());
+            }
+            TimelinePayload::ElicitationRequest(request)
+                if request.status == ElicitationRequestStatus::Pending =>
+            {
+                pending_permission_ids.insert(request.id.to_string());
+            }
+            TimelinePayload::ElicitationResolution(resolution) => {
                 pending_permission_ids.remove(resolution.request_id.as_str());
             }
             _ => {}

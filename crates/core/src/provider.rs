@@ -2080,6 +2080,8 @@ pub struct ProviderCapabilities {
     pub plan: bool,
     pub tool_invocations: bool,
     pub permission_requests: bool,
+    #[serde(default)]
+    pub elicitation: bool,
     pub image_input: bool,
     pub file_attachments: bool,
     pub fork_rollback: bool,
@@ -2110,6 +2112,7 @@ impl ProviderCapabilities {
             plan: false,
             tool_invocations: false,
             permission_requests: false,
+            elicitation: false,
             image_input: false,
             file_attachments: false,
             fork_rollback: false,

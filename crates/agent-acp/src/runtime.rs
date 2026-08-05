@@ -20,6 +20,15 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use agent_client_protocol_schema::v1::{
+    CreateElicitationRequest as AcpCreateElicitationRequest,
+    CreateElicitationResponse as AcpCreateElicitationResponse, ElicitationAcceptAction,
+    ElicitationAction as AcpElicitationAction,
+    ElicitationContentValue as AcpElicitationContentValue, ElicitationMode as AcpElicitationMode,
+    ElicitationPropertySchema as AcpElicitationPropertySchema,
+    ElicitationScope as AcpElicitationScope, EnumOption as AcpEnumOption,
+    MultiSelectItems as AcpMultiSelectItems, StringFormat as AcpStringFormat,
+};
 use async_trait::async_trait;
 use command_group::AsyncCommandGroup;
 use command_group::AsyncGroupChild;
@@ -59,7 +68,9 @@ use vibex_core::{
     AgentSessionRestoreMethod, AgentSessionRestoreOutcome, AgentSessionState, AgentTokenUsage,
     AgentUsageCounterOrigin, AgentUsageExecution, AgentUsageExecutionContext,
     AgentUsageExecutionStatus, AgentUsageExecutionStatusUpdate, AgentUsageObservation,
-    AgentUsageObservationSource, AgentUsageTokenValues, BindingState,
+    AgentUsageObservationSource, AgentUsageTokenValues, BindingState, ElicitationAnswerValue,
+    ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationRequest,
+    ElicitationRequestStatus, ElicitationResolutionAction, ElicitationStringFormat,
     ExternalSessionContinuationStatus, ExternalSessionImportCandidate,
     ExternalSessionImportCandidateStatus, ExternalSessionImportSource, MAX_AGENT_USAGE_TOKEN_VALUE,
     NativeStateHomeId, PermissionActionDetail, PermissionRequest, PermissionRequestStatus,
@@ -114,9 +125,10 @@ use crate::session_restore::{
 };
 use crate::spawn_config::{ProcessSpawnConfigSnapshot, secret_reference_version};
 use crate::{
-    AcpClient, AcpCreateSessionRequest, AcpEvent, AcpImportSessionRequest, AcpPermissionResolution,
-    AcpRuntimeCommand, AcpRuntimeSessionProbe, AcpSendTurnRequest, AcpSession, AcpTurn,
-    infer_permission_risk_category, looks_sensitive, redact_summary, redacted_args_summary,
+    AcpClient, AcpCreateSessionRequest, AcpElicitationResolution, AcpEvent,
+    AcpImportSessionRequest, AcpPermissionResolution, AcpRuntimeCommand, AcpRuntimeSessionProbe,
+    AcpSendTurnRequest, AcpSession, AcpTurn, infer_permission_risk_category, looks_sensitive,
+    redact_summary, redacted_args_summary,
 };
 use crate::{
     AgentEventInput, AgentEventInputSource, ClaudeBackgroundWorkRegistry, ClaudeWorkKey,
@@ -145,6 +157,12 @@ const ACP_SUMMARY_LIMIT: usize = 2000;
 const ACP_ACTIVE_MESSAGE_LIMIT: usize = 64 * 1024;
 const ACP_ACTIVE_TOOL_CALL_LIMIT: usize = 32;
 const ACP_PENDING_PERMISSION_LIMIT: usize = 32;
+const ACP_PENDING_ELICITATION_LIMIT: usize = 32;
+const ACP_ELICITATION_FIELD_LIMIT: usize = 32;
+const ACP_ELICITATION_OPTION_LIMIT: usize = 64;
+const ACP_ELICITATION_ID_LIMIT: usize = 128;
+const ACP_ELICITATION_LABEL_LIMIT: usize = 512;
+const ACP_ELICITATION_TEXT_LIMIT: usize = 4 * 1024;
 const ACP_PENDING_COMMAND_CATALOG_LIMIT: usize = 16;
 const ACP_TERMINAL_OUTPUT_LIMIT: usize = 24 * 1024;
 const ACP_PROCESS_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -981,6 +999,10 @@ struct PendingPermission {
     details: Vec<PermissionActionDetail>,
 }
 
+struct PendingElicitation {
+    rpc_id: Value,
+}
+
 struct PendingTerminalCreate {
     rpc_id: Value,
     request: AcpTerminalCreateRequest,
@@ -1020,6 +1042,7 @@ struct AcpAttachmentShared {
     usage_prompt_dispatched: bool,
     usage_observation_sequence: u64,
     pending_permissions: HashMap<String, PendingPermission>,
+    pending_elicitations: HashMap<String, PendingElicitation>,
     pending_terminal_creates: HashMap<String, PendingTerminalCreate>,
     terminal_creates_in_flight: usize,
     active_terminal_ids: BTreeSet<TerminalId>,
@@ -1037,6 +1060,7 @@ struct AcpAttachmentShared {
 
 struct AcpSessionAttachment {
     lease: ProcessLease<AcpProcess>,
+    logical_session_id: VibexSessionId,
     native_session_id: String,
     binding_id: RuntimeBindingId,
     activation_generation: AtomicI64,
@@ -1379,6 +1403,7 @@ pub trait AcpTerminalHost: Send + Sync {
 impl AcpSessionAttachment {
     fn new(
         lease: ProcessLease<AcpProcess>,
+        logical_session_id: VibexSessionId,
         opened: OpenedAcpSession,
         crash_receiver: broadcast::Receiver<AcpProcessCrash>,
         binding_id: RuntimeBindingId,
@@ -1391,6 +1416,7 @@ impl AcpSessionAttachment {
         } = opened;
         Self {
             lease,
+            logical_session_id,
             native_session_id,
             binding_id,
             activation_generation: AtomicI64::new(activation_generation),
@@ -1411,6 +1437,10 @@ impl AcpSessionAttachment {
 
     fn process(&self) -> Arc<AcpProcess> {
         self.lease.process()
+    }
+
+    fn logical_session_id(&self) -> &VibexSessionId {
+        &self.logical_session_id
     }
 
     fn process_instance_id(&self) -> &AcpProcessInstanceId {
@@ -1916,6 +1946,50 @@ impl AcpSessionAttachment {
             .and_then(|mut state| state.pending_permissions.remove(request_id))
     }
 
+    fn insert_pending_elicitation(
+        &self,
+        request_id: &RequestId,
+        pending: PendingElicitation,
+    ) -> bool {
+        self.state
+            .lock()
+            .map(|mut state| {
+                if state.pending_elicitations.len() >= ACP_PENDING_ELICITATION_LIMIT {
+                    return false;
+                }
+                state
+                    .pending_elicitations
+                    .insert(request_id.as_str().to_string(), pending);
+                true
+            })
+            .unwrap_or(false)
+    }
+
+    fn remove_pending_elicitation(&self, request_id: &str) -> Option<PendingElicitation> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|mut state| state.pending_elicitations.remove(request_id))
+    }
+
+    fn respond_to_pending_elicitation(
+        &self,
+        request_id: &str,
+        process: &AcpProcess,
+        response: Value,
+    ) -> VibexResult<bool> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| lock_poisoned_error("attachmentState"))?;
+        let Some(pending) = state.pending_elicitations.get(request_id) else {
+            return Ok(false);
+        };
+        process.respond_ok_checked(pending.rpc_id.clone(), response)?;
+        state.pending_elicitations.remove(request_id);
+        Ok(true)
+    }
+
     fn insert_pending_terminal_create(
         &self,
         request_id: &RequestId,
@@ -1958,6 +2032,7 @@ impl AcpSessionAttachment {
             .lock()
             .map(|state| {
                 !state.pending_permissions.is_empty()
+                    || !state.pending_elicitations.is_empty()
                     || !state.pending_terminal_creates.is_empty()
                     || state.terminal_creates_in_flight > 0
             })
@@ -1989,6 +2064,7 @@ impl AcpSessionAttachment {
             .map(|state| ActiveWorkSnapshot {
                 active_turn: state.active_turn.is_some(),
                 pending_permission: !state.pending_permissions.is_empty()
+                    || !state.pending_elicitations.is_empty()
                     || !state.pending_terminal_creates.is_empty()
                     || state.terminal_creates_in_flight > 0,
                 active_terminal: !state.active_terminal_ids.is_empty(),
@@ -2012,6 +2088,7 @@ impl AcpSessionAttachment {
                 state
                     .pending_permissions
                     .len()
+                    .saturating_add(state.pending_elicitations.len())
                     .saturating_add(state.pending_terminal_creates.len())
                     .saturating_add(state.terminal_creates_in_flight)
             })
@@ -2024,6 +2101,7 @@ impl AcpSessionAttachment {
             .map(|state| {
                 state.active_turn.is_none()
                     && state.pending_permissions.is_empty()
+                    && state.pending_elicitations.is_empty()
                     && state.pending_terminal_creates.is_empty()
                     && state.terminal_creates_in_flight == 0
                     && state.active_terminal_ids.is_empty()
@@ -2184,10 +2262,15 @@ impl AcpSessionAttachment {
     }
 
     fn cancel_pending_host_requests(&self) {
-        let (permissions, terminal_creates) = match self.state.lock() {
+        let (permissions, elicitations, terminal_creates) = match self.state.lock() {
             Ok(mut state) => (
                 state
                     .pending_permissions
+                    .drain()
+                    .map(|(_, pending)| pending)
+                    .collect::<Vec<_>>(),
+                state
+                    .pending_elicitations
                     .drain()
                     .map(|(_, pending)| pending)
                     .collect::<Vec<_>>(),
@@ -2197,11 +2280,14 @@ impl AcpSessionAttachment {
                     .map(|(_, pending)| pending)
                     .collect::<Vec<_>>(),
             ),
-            Err(_) => (Vec::new(), Vec::new()),
+            Err(_) => (Vec::new(), Vec::new(), Vec::new()),
         };
         let process = self.process();
         for pending in permissions {
             process.respond_ok(pending.rpc_id, permission_cancelled_response());
+        }
+        for pending in elicitations {
+            process.respond_ok(pending.rpc_id, elicitation_cancelled_response());
         }
         for pending in terminal_creates {
             process.respond_error(pending.rpc_id, -32000, "terminal permission cancelled");
@@ -2230,6 +2316,7 @@ impl AcpSessionAttachment {
         });
         if let Ok(mut state) = self.state.lock() {
             state.pending_permissions.clear();
+            state.pending_elicitations.clear();
             state.pending_terminal_creates.clear();
             state.terminal_creates_in_flight = 0;
             state.claude_background_work = ClaudeBackgroundWorkRegistry::default();
@@ -3177,12 +3264,16 @@ impl AcpProcess {
         }))
     }
 
-    fn respond_ok(&self, id: Value, result: Value) {
-        let _ = self.send_value(&json!({
+    fn respond_ok_checked(&self, id: Value, result: Value) -> VibexResult<()> {
+        self.send_value(&json!({
             "jsonrpc": "2.0",
             "id": id,
             "result": result
-        }));
+        }))
+    }
+
+    fn respond_ok(&self, id: Value, result: Value) {
+        let _ = self.respond_ok_checked(id, result);
     }
 
     fn respond_error(&self, id: Value, code: i64, message: &str) {
@@ -3570,6 +3661,7 @@ impl AcpProcess {
         let params = value.get("params").cloned().unwrap_or(Value::Null);
         match AcpOperation::from_method(method) {
             AcpOperation::PermissionRequest => self.handle_permission_request(id, &params),
+            AcpOperation::ElicitationCreate => self.handle_elicitation_request(id, &params),
             AcpOperation::FsReadTextFile => self.handle_fs_read(id, &params),
             AcpOperation::FsWriteTextFile => self.handle_fs_write(id, &params),
             AcpOperation::TerminalCreate => self.handle_terminal_create(id, &params),
@@ -3652,6 +3744,54 @@ impl AcpProcess {
             // Missing/stale routes and missing turn sinks fail closed so the
             // agent never waits on a request Vibex cannot surface.
             self.respond_ok(rpc_id, permission_cancelled_response());
+        }
+    }
+
+    fn handle_elicitation_request(&self, rpc_id: Value, params: &Value) {
+        let Ok(request) = serde_json::from_value::<AcpCreateElicitationRequest>(params.clone())
+        else {
+            self.respond_ok(rpc_id, elicitation_cancelled_response());
+            return;
+        };
+        if !matches!(
+            &request.mode,
+            AcpElicitationMode::Form(form)
+                if matches!(&form.scope, AcpElicitationScope::Session(_))
+        ) {
+            self.respond_ok(rpc_id, elicitation_cancelled_response());
+            return;
+        }
+
+        let admission = self.with_routed_params(
+            params,
+            AcpOperation::ElicitationCreate.method(),
+            |attachment| {
+                let request_id = RequestId::new();
+                let Some(normalized) = normalize_elicitation_request(
+                    &request,
+                    request_id.clone(),
+                    attachment.logical_session_id().clone(),
+                ) else {
+                    return false;
+                };
+                if !attachment.insert_pending_elicitation(
+                    &request_id,
+                    PendingElicitation {
+                        rpc_id: rpc_id.clone(),
+                    },
+                ) {
+                    return false;
+                }
+                let delivered =
+                    attachment.emit_turn_event(AcpEvent::ElicitationRequest(normalized));
+                if !delivered {
+                    attachment.remove_pending_elicitation(request_id.as_str());
+                }
+                delivered
+            },
+        );
+        if admission != Some(true) {
+            self.respond_ok(rpc_id, elicitation_cancelled_response());
         }
     }
 
@@ -7199,6 +7339,7 @@ impl AcpRuntimeClient {
         let created_native_session_id = Arc::new(Mutex::new(None::<String>));
         let operation_native_session_id = Arc::clone(&created_native_session_id);
         let attachment_key = key.clone();
+        let payload_session_id = session_id.clone();
         let result = self
             .attachment_router
             .registry
@@ -7212,6 +7353,7 @@ impl AcpRuntimeClient {
                     native_session_id,
                     payload: AcpSessionAttachment::new(
                         payload_lease,
+                        payload_session_id,
                         opened,
                         crash_receiver,
                         attachment_key.binding_id.clone(),
@@ -12042,6 +12184,49 @@ impl AcpClient for AcpRuntimeClient {
         Ok(())
     }
 
+    async fn resolve_elicitation(&self, request: AcpElicitationResolution) -> VibexResult<()> {
+        let response = elicitation_response_value(&request.resolution)?;
+        let attachment = self
+            .current_attachment(&request.binding.session_id)
+            .ok_or_else(|| {
+                VibexError::conflict(
+                    "acp_elicitation_process_missing",
+                    "ACP agent process for this elicitation is no longer running",
+                )
+            })?;
+        let payload = attachment.payload();
+        let process = payload.process();
+        let binding_matches = request.execution_identity.binding_id == *attachment.binding_id()
+            && request.execution_identity.activation_generation
+                == attachment.fence().activation_generation as i64
+            && request.binding.provider_profile_id == process.provider_profile_id
+            && request.binding.native.native_session_id.as_deref()
+                == Some(attachment.fence().native_session_id.as_str());
+        if !binding_matches {
+            return Err(VibexError::conflict(
+                "acp_elicitation_attachment_mismatch",
+                "ACP elicitation callback no longer matches the current attachment fence",
+            ));
+        }
+        let responded =
+            self.attachment_router
+                .registry
+                .apply_current(attachment.fence(), |current| {
+                    current.respond_to_pending_elicitation(
+                        request.resolution.request_id.as_str(),
+                        process.as_ref(),
+                        response,
+                    )
+                })??;
+        if !responded {
+            // The first successful response removes the native JSON-RPC
+            // callback. Later UI or remote retries are intentionally
+            // idempotent.
+            return Ok(());
+        }
+        Ok(())
+    }
+
     async fn interrupt(&self, binding: &ProviderBinding) -> VibexResult<()> {
         let Some(attachment) = self.current_attachment(&binding.session_id) else {
             return Ok(());
@@ -12335,6 +12520,300 @@ fn restore_metric_result(outcome: AgentSessionRestoreOutcome) -> RuntimeMetricRe
         AgentSessionRestoreOutcome::TransientFailure => RuntimeMetricResult::TransientFailure,
         AgentSessionRestoreOutcome::FatalFailure => RuntimeMetricResult::FatalFailure,
     }
+}
+
+fn normalize_elicitation_request(
+    request: &AcpCreateElicitationRequest,
+    request_id: RequestId,
+    session_id: VibexSessionId,
+) -> Option<ElicitationRequest> {
+    let AcpElicitationMode::Form(form) = &request.mode else {
+        return None;
+    };
+    let AcpElicitationScope::Session(scope) = &form.scope else {
+        return None;
+    };
+    let schema = &form.requested_schema;
+    if schema.properties.len() > ACP_ELICITATION_FIELD_LIMIT {
+        return None;
+    }
+    let required = schema
+        .required
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut fields = Vec::with_capacity(schema.properties.len());
+    for (id, property) in &schema.properties {
+        if id.trim().is_empty() || id.chars().count() > ACP_ELICITATION_ID_LIMIT {
+            return None;
+        }
+        fields.push(normalize_elicitation_field(
+            id,
+            required.contains(id.as_str()),
+            property,
+        )?);
+    }
+
+    Some(ElicitationRequest {
+        id: request_id.clone(),
+        session_id,
+        provider_request_id: Some(request_id.as_str().to_string()),
+        tool_call_id: scope.tool_call_id.as_ref().map(ToString::to_string),
+        message: bounded_elicitation_text(&request.message, ACP_ELICITATION_TEXT_LIMIT),
+        title: schema
+            .title
+            .as_deref()
+            .map(|value| bounded_elicitation_text(value, ACP_ELICITATION_LABEL_LIMIT)),
+        description: schema
+            .description
+            .as_deref()
+            .map(|value| bounded_elicitation_text(value, ACP_ELICITATION_TEXT_LIMIT)),
+        fields,
+        status: ElicitationRequestStatus::Pending,
+        requested_at_ms: unix_timestamp_ms(),
+    })
+}
+
+fn normalize_elicitation_field(
+    id: &str,
+    required: bool,
+    property: &AcpElicitationPropertySchema,
+) -> Option<ElicitationField> {
+    let (title, description, kind) = match property {
+        AcpElicitationPropertySchema::String(schema) => {
+            let kind = if schema.pattern.is_some() {
+                ElicitationFieldKind::Unsupported {
+                    schema_type: "string_pattern".to_string(),
+                }
+            } else {
+                let options = if let Some(options) = schema.one_of.as_deref() {
+                    normalize_titled_elicitation_options(options)?
+                } else if let Some(values) = schema.enum_values.as_deref() {
+                    normalize_plain_elicitation_options(values)?
+                } else {
+                    Vec::new()
+                };
+                ElicitationFieldKind::Text {
+                    min_length: schema.min_length,
+                    max_length: schema.max_length,
+                    pattern: None,
+                    format: schema.format.and_then(normalize_elicitation_string_format),
+                    default: schema
+                        .default
+                        .as_deref()
+                        .map(|value| bounded_elicitation_text(value, ACP_ELICITATION_TEXT_LIMIT)),
+                    options,
+                }
+            };
+            (schema.title.as_deref(), schema.description.as_deref(), kind)
+        }
+        AcpElicitationPropertySchema::Number(schema) => (
+            schema.title.as_deref(),
+            schema.description.as_deref(),
+            ElicitationFieldKind::Number {
+                minimum: finite_schema_number(schema.minimum),
+                maximum: finite_schema_number(schema.maximum),
+                default: finite_schema_number(schema.default),
+            },
+        ),
+        AcpElicitationPropertySchema::Integer(schema) => (
+            schema.title.as_deref(),
+            schema.description.as_deref(),
+            ElicitationFieldKind::Integer {
+                minimum: schema.minimum,
+                maximum: schema.maximum,
+                default: schema.default,
+            },
+        ),
+        AcpElicitationPropertySchema::Boolean(schema) => (
+            schema.title.as_deref(),
+            schema.description.as_deref(),
+            ElicitationFieldKind::Boolean {
+                default: schema.default,
+            },
+        ),
+        AcpElicitationPropertySchema::Array(schema) => {
+            let options = match &schema.items {
+                AcpMultiSelectItems::String(items) => {
+                    normalize_plain_elicitation_options(&items.values)?
+                }
+                AcpMultiSelectItems::Titled(items) => {
+                    normalize_titled_elicitation_options(&items.options)?
+                }
+                AcpMultiSelectItems::Other(other) => {
+                    return Some(ElicitationField {
+                        id: id.to_string(),
+                        title: schema.title.as_deref().unwrap_or(id).to_string(),
+                        description: schema.description.clone(),
+                        required,
+                        kind: ElicitationFieldKind::Unsupported {
+                            schema_type: format!("array<{}>", other.type_),
+                        },
+                    });
+                }
+                _ => return None,
+            };
+            (
+                schema.title.as_deref(),
+                schema.description.as_deref(),
+                ElicitationFieldKind::MultiSelect {
+                    options,
+                    min_items: schema.min_items,
+                    max_items: schema.max_items,
+                    default: schema
+                        .default
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .take(ACP_ELICITATION_OPTION_LIMIT)
+                        .map(|value| bounded_elicitation_text(value, ACP_ELICITATION_LABEL_LIMIT))
+                        .collect(),
+                },
+            )
+        }
+        AcpElicitationPropertySchema::Other(other) => {
+            return Some(ElicitationField {
+                id: id.to_string(),
+                title: id.to_string(),
+                description: None,
+                required,
+                kind: ElicitationFieldKind::Unsupported {
+                    schema_type: bounded_elicitation_text(
+                        &other.type_,
+                        ACP_ELICITATION_LABEL_LIMIT,
+                    ),
+                },
+            });
+        }
+        _ => return None,
+    };
+    Some(ElicitationField {
+        id: id.to_string(),
+        title: bounded_elicitation_text(title.unwrap_or(id), ACP_ELICITATION_LABEL_LIMIT),
+        description: description
+            .map(|value| bounded_elicitation_text(value, ACP_ELICITATION_TEXT_LIMIT)),
+        required,
+        kind,
+    })
+}
+
+fn normalize_plain_elicitation_options(values: &[String]) -> Option<Vec<ElicitationOption>> {
+    if values.len() > ACP_ELICITATION_OPTION_LIMIT {
+        return None;
+    }
+    let mut seen = BTreeSet::new();
+    values
+        .iter()
+        .map(|value| {
+            let value = bounded_elicitation_text(value, ACP_ELICITATION_LABEL_LIMIT);
+            seen.insert(value.clone()).then(|| ElicitationOption {
+                title: value.clone(),
+                value,
+                description: None,
+            })
+        })
+        .collect()
+}
+
+fn normalize_titled_elicitation_options(
+    values: &[AcpEnumOption],
+) -> Option<Vec<ElicitationOption>> {
+    if values.len() > ACP_ELICITATION_OPTION_LIMIT {
+        return None;
+    }
+    let mut seen = BTreeSet::new();
+    values
+        .iter()
+        .map(|option| {
+            let value = bounded_elicitation_text(&option.value, ACP_ELICITATION_LABEL_LIMIT);
+            seen.insert(value.clone()).then(|| ElicitationOption {
+                value,
+                title: bounded_elicitation_text(&option.title, ACP_ELICITATION_LABEL_LIMIT),
+                description: option.description.as_deref().map(|description| {
+                    bounded_elicitation_text(description, ACP_ELICITATION_TEXT_LIMIT)
+                }),
+            })
+        })
+        .collect()
+}
+
+fn normalize_elicitation_string_format(format: AcpStringFormat) -> Option<ElicitationStringFormat> {
+    match format {
+        AcpStringFormat::Email => Some(ElicitationStringFormat::Email),
+        AcpStringFormat::Uri => Some(ElicitationStringFormat::Uri),
+        AcpStringFormat::Date => Some(ElicitationStringFormat::Date),
+        AcpStringFormat::DateTime => Some(ElicitationStringFormat::DateTime),
+        _ => None,
+    }
+}
+
+fn finite_schema_number(value: Option<f64>) -> Option<String> {
+    value
+        .filter(|value| value.is_finite())
+        .map(|value| value.to_string())
+}
+
+fn bounded_elicitation_text(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn elicitation_response_value(
+    resolution: &vibex_core::ElicitationResolution,
+) -> VibexResult<Value> {
+    let action = match resolution.action {
+        ElicitationResolutionAction::Accept => {
+            let mut content = BTreeMap::new();
+            for (field_id, answer) in &resolution.answers {
+                let value = match answer {
+                    ElicitationAnswerValue::String(value) => {
+                        AcpElicitationContentValue::String(value.clone())
+                    }
+                    ElicitationAnswerValue::Integer(value) => {
+                        AcpElicitationContentValue::Integer(*value)
+                    }
+                    ElicitationAnswerValue::Number(value) => {
+                        let value = value
+                            .parse::<f64>()
+                            .ok()
+                            .filter(|value| value.is_finite())
+                            .ok_or_else(|| {
+                                VibexError::validation(
+                                    "acp_elicitation_number_invalid",
+                                    "elicitation number answer is not finite",
+                                )
+                            })?;
+                        AcpElicitationContentValue::Number(value)
+                    }
+                    ElicitationAnswerValue::Boolean(value) => {
+                        AcpElicitationContentValue::Boolean(*value)
+                    }
+                    ElicitationAnswerValue::StringArray(values) => {
+                        AcpElicitationContentValue::StringArray(values.clone())
+                    }
+                };
+                content.insert(field_id.clone(), value);
+            }
+            AcpElicitationAction::Accept(ElicitationAcceptAction::new().content(content))
+        }
+        ElicitationResolutionAction::Decline => AcpElicitationAction::Decline,
+        ElicitationResolutionAction::Cancel => AcpElicitationAction::Cancel,
+    };
+    serde_json::to_value(AcpCreateElicitationResponse::new(action)).map_err(|error| {
+        VibexError::provider(
+            "acp_elicitation_response_encode_failed",
+            "failed to encode ACP elicitation response",
+        )
+        .with_diagnostic("error", error.to_string())
+    })
+}
+
+fn elicitation_cancelled_response() -> Value {
+    serde_json::to_value(AcpCreateElicitationResponse::new(
+        AcpElicitationAction::Cancel,
+    ))
+    .unwrap_or_else(|_| json!({ "action": "cancel" }))
 }
 
 fn permission_cancelled_response() -> Value {
@@ -13738,6 +14217,7 @@ mod tests {
                         "writeTextFile": true
                     },
                     "terminal": false,
+                    "elicitation": { "form": {} },
                     "auth": {
                         "terminal": false
                     },
@@ -14024,6 +14504,7 @@ mod tests {
                     native_session_id: native_session_id.clone(),
                     payload: AcpSessionAttachment::new(
                         lease,
+                        session_id.clone(),
                         OpenedAcpSession {
                             native_session_id,
                             state: AcpAttachmentShared::default(),
@@ -15515,6 +15996,234 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
             ),
             None
         );
+    }
+
+    #[test]
+    fn typed_form_elicitation_normalizes_supported_fields_and_marks_patterns_unsupported() {
+        let request = serde_json::from_value::<AcpCreateElicitationRequest>(json!({
+            "sessionId": "native-session",
+            "toolCallId": "tool-call-1",
+            "mode": "form",
+            "message": "Configure the run",
+            "requestedSchema": {
+                "type": "object",
+                "title": "Run configuration",
+                "description": "Choose bounded values.",
+                "properties": {
+                    "choice": {
+                        "type": "string",
+                        "oneOf": [
+                            { "const": "fast", "title": "Fast", "description": "Lower latency" },
+                            { "const": "safe", "title": "Safe" }
+                        ],
+                        "default": "safe"
+                    },
+                    "ratio": { "type": "number", "minimum": 0.5, "maximum": 2.5 },
+                    "count": { "type": "integer", "minimum": 1, "maximum": 3, "default": 2 },
+                    "confirm": { "type": "boolean", "default": true },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string", "enum": ["rust", "ui"] },
+                        "minItems": 1,
+                        "maxItems": 2,
+                        "default": ["rust"]
+                    },
+                    "patterned": { "type": "string", "pattern": "^[A-Z]+$" }
+                },
+                "required": ["choice", "tags", "patterned"]
+            }
+        }))
+        .unwrap();
+        let logical_session_id = VibexSessionId::new();
+        let normalized =
+            normalize_elicitation_request(&request, RequestId::new(), logical_session_id.clone())
+                .unwrap();
+
+        assert_eq!(normalized.session_id, logical_session_id);
+        assert_eq!(normalized.tool_call_id.as_deref(), Some("tool-call-1"));
+        assert_eq!(normalized.fields.len(), 6);
+        assert!(normalized.fields.iter().any(|field| {
+            field.id == "choice"
+                && field.required
+                && matches!(
+                    &field.kind,
+                    ElicitationFieldKind::Text { options, default, .. }
+                        if options.len() == 2 && default.as_deref() == Some("safe")
+                )
+        }));
+        assert!(normalized.fields.iter().any(|field| {
+            field.id == "tags"
+                && matches!(
+                    &field.kind,
+                    ElicitationFieldKind::MultiSelect { options, default, .. }
+                        if options.len() == 2 && default == &["rust".to_string()]
+                )
+        }));
+        assert!(normalized.fields.iter().any(|field| {
+            field.id == "patterned"
+                && field.required
+                && matches!(
+                    &field.kind,
+                    ElicitationFieldKind::Unsupported { schema_type }
+                        if schema_type == "string_pattern"
+                )
+        }));
+    }
+
+    #[test]
+    fn elicitation_response_encodes_accept_decline_and_cancel_actions() {
+        let session_id = VibexSessionId::new();
+        let request_id = RequestId::new();
+        let resolution = vibex_core::ElicitationResolution {
+            request_id: request_id.clone(),
+            session_id: session_id.clone(),
+            action: ElicitationResolutionAction::Accept,
+            answers: BTreeMap::from([
+                ("name".into(), ElicitationAnswerValue::String("Ada".into())),
+                ("count".into(), ElicitationAnswerValue::Integer(2)),
+                ("ratio".into(), ElicitationAnswerValue::Number("1.5".into())),
+                ("confirm".into(), ElicitationAnswerValue::Boolean(true)),
+                (
+                    "tags".into(),
+                    ElicitationAnswerValue::StringArray(vec!["rust".into(), "ui".into()]),
+                ),
+            ]),
+            responder_device_id: None,
+            resolved_at_ms: 2,
+        };
+        let encoded = elicitation_response_value(&resolution).unwrap();
+        assert_eq!(encoded["action"], "accept");
+        assert_eq!(encoded["content"]["name"], "Ada");
+        assert_eq!(encoded["content"]["count"], 2);
+        assert_eq!(encoded["content"]["ratio"], 1.5);
+        assert_eq!(encoded["content"]["confirm"], true);
+        assert_eq!(encoded["content"]["tags"], json!(["rust", "ui"]));
+
+        for action in [
+            ElicitationResolutionAction::Decline,
+            ElicitationResolutionAction::Cancel,
+        ] {
+            let encoded = elicitation_response_value(&vibex_core::ElicitationResolution {
+                request_id: request_id.clone(),
+                session_id: session_id.clone(),
+                action,
+                answers: BTreeMap::new(),
+                responder_device_id: None,
+                resolved_at_ms: 3,
+            })
+            .unwrap();
+            assert_eq!(
+                encoded["action"],
+                match action {
+                    ElicitationResolutionAction::Decline => "decline",
+                    ElicitationResolutionAction::Cancel => "cancel",
+                    ElicitationResolutionAction::Accept => unreachable!(),
+                }
+            );
+            assert!(encoded.get("content").is_none());
+        }
+        assert_eq!(elicitation_cancelled_response()["action"], "cancel");
+    }
+
+    #[tokio::test]
+    async fn elicitation_response_write_failure_keeps_callback_retryable() {
+        let workspace = tempfile::tempdir().unwrap();
+        let db_path = workspace.path().join("vibex.db");
+        let client = AcpRuntimeClient::new(ProviderConfigService::new(&db_path));
+        let snapshot = lifecycle_spawn_snapshot(ProviderProfileId::new());
+        let process_key = lifecycle_process_key(workspace.path(), &snapshot);
+        let session_id = VibexSessionId::new();
+        let handle = register_lifecycle_attachment(
+            &client,
+            &session_id,
+            acquire_lifecycle_process(&client, &process_key, &snapshot).await,
+            0,
+        )
+        .await;
+        let process_id = handle.fence().process_instance_id.clone();
+        let process = handle.payload().process();
+        let request_id = RequestId::new();
+        assert!(
+            handle
+                .payload()
+                .insert_pending_elicitation(&request_id, PendingElicitation { rpc_id: json!(77) },)
+        );
+        let binding = test_restore_binding(
+            &session_id,
+            &process.provider_profile_id,
+            &handle.fence().native_session_id,
+        );
+        let callback = AcpElicitationResolution {
+            binding,
+            execution_identity: ProviderTurnExecutionIdentity {
+                binding_id: handle.binding_id().clone(),
+                activation_generation: handle.fence().activation_generation as i64,
+                model_id: "test-model".to_string(),
+            },
+            resolution: vibex_core::ElicitationResolution {
+                request_id: request_id.clone(),
+                session_id: session_id.clone(),
+                action: ElicitationResolutionAction::Decline,
+                answers: BTreeMap::new(),
+                responder_device_id: None,
+                resolved_at_ms: unix_timestamp_ms(),
+            },
+        };
+
+        let mut stale_callback = callback.clone();
+        stale_callback.execution_identity.binding_id = RuntimeBindingId::new();
+        assert_eq!(
+            <AcpRuntimeClient as AcpClient>::resolve_elicitation(&client, stale_callback)
+                .await
+                .unwrap_err()
+                .code,
+            "acp_elicitation_attachment_mismatch"
+        );
+        assert!(
+            handle
+                .payload()
+                .state
+                .lock()
+                .unwrap()
+                .pending_elicitations
+                .contains_key(request_id.as_str())
+        );
+
+        let error = <AcpRuntimeClient as AcpClient>::resolve_elicitation(&client, callback.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "acp_process_stdin_closed");
+        assert!(
+            handle
+                .payload()
+                .state
+                .lock()
+                .unwrap()
+                .pending_elicitations
+                .contains_key(request_id.as_str())
+        );
+
+        let (outbound, mut responses) = mpsc::unbounded_channel();
+        *process.outbound.lock().unwrap() = Some(outbound);
+        <AcpRuntimeClient as AcpClient>::resolve_elicitation(&client, callback)
+            .await
+            .unwrap();
+        let response: Value = serde_json::from_str(&responses.recv().await.unwrap()).unwrap();
+        assert_eq!(response["id"], 77);
+        assert_eq!(response["result"]["action"], "decline");
+        assert!(
+            !handle
+                .payload()
+                .state
+                .lock()
+                .unwrap()
+                .pending_elicitations
+                .contains_key(request_id.as_str())
+        );
+
+        client.detach_attachment(handle.fence()).await;
+        client.process_registry.shutdown(&process_id).await.unwrap();
+        client.process_registry.remove(&process_id).unwrap();
     }
 
     #[test]

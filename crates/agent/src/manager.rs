@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc};
 use vibex_core::{
     AgentCommandDiscoverRequest, AgentCommandDiscoverResponse, AgentCommandEntry,
     AgentCommandExecuteRequest, AgentCommandExecuteResult, AgentCommandExecuteStatus,
@@ -12,7 +12,7 @@ use vibex_core::{
     AgentModelListSource, AgentSession, AgentSessionConfigProbe, AgentSessionRestoreMethod,
     AgentSessionSafety, AgentSessionState, AgentUsageCounterOrigin, AgentUsageExecutionContext,
     AgentUsageStreamAttribution, BindingState, ContinueAgentTurnRequest, CreateAgentSessionRequest,
-    ExternalSessionContinuationStatus, ExternalSessionImportCandidate,
+    ElicitationRequest, ExternalSessionContinuationStatus, ExternalSessionImportCandidate,
     ExternalSessionImportCandidateStatus, ExternalSessionImportDiagnostic,
     ExternalSessionImportPreview, ExternalSessionImportPreviewRequest,
     ExternalSessionImportRequest, ExternalSessionImportResult, ExternalSessionImportSource,
@@ -21,26 +21,27 @@ use vibex_core::{
     PromptKind, PromptStatus, ProviderBinding, ProviderBindingMetadata, ProviderCapabilities,
     ProviderCapabilitiesResponse, ProviderDefaultScopeKind, ProviderKind, ProviderNativeBinding,
     ProviderProfileDefaultScope, ProviderProfileId, ProviderProfileStatus,
-    RenameAgentSessionRequest, ResolvePermissionRequest, SendAgentMessageRequest,
-    SessionRuntimeSelection, SessionRuntimeSelectionStatus, SystemNoticeLevel, SystemNoticePayload,
-    TimelineErrorPayload, TimelineItem, TimelineLiveEvent, TimelinePage, TimelinePayload,
-    TimelineRedactionState, TimelineSource, TransportKind, TurnExecutionAttribution,
-    UsageExecutionId, UserMessagePayload, VibexError, VibexResult, VibexSessionId, WorkspaceId,
-    agent_id_for_provider_kind, builtin_agent_definitions, unix_timestamp_ms,
+    RenameAgentSessionRequest, ResolveElicitationRequest, ResolvePermissionRequest,
+    SendAgentMessageRequest, SessionRuntimeSelection, SessionRuntimeSelectionStatus,
+    SystemNoticeLevel, SystemNoticePayload, TimelineErrorPayload, TimelineItem, TimelineLiveEvent,
+    TimelinePage, TimelinePayload, TimelineRedactionState, TimelineSource, TransportKind,
+    TurnExecutionAttribution, UsageExecutionId, UserMessagePayload, VibexError, VibexResult,
+    VibexSessionId, WorkspaceId, agent_id_for_provider_kind, builtin_agent_definitions,
+    unix_timestamp_ms,
 };
 use vibex_db::{
     AgentConfigRepository, AgentDefaultModelProviderProfileRepository,
-    AgentSessionRuntimeRepository, DbConnection, McpServerRepository, PermissionRepository,
-    PromptRepository, ProviderProfileRepository, RuntimeBindingRepository, RuntimeSwitchRepository,
-    SessionRepository, SkillRepository, TimelineAppend, TimelineRepository, WorkspaceRepository,
-    apply_migrations, open_database,
+    AgentSessionRuntimeRepository, DbConnection, ElicitationRepository, McpServerRepository,
+    PermissionRepository, PromptRepository, ProviderProfileRepository, RuntimeBindingRepository,
+    RuntimeSwitchRepository, SessionRepository, SkillRepository, TimelineAppend,
+    TimelineRepository, WorkspaceRepository, apply_migrations, open_database,
 };
 
 use crate::adapter::{
-    AgentProvider, AgentUsageTelemetryEvent, ProviderEvent, ProviderPermissionResolution,
-    ProviderRuntimeMcpServer, ProviderRuntimeMcpTransport, ProviderRuntimeResources,
-    ProviderRuntimeSkill, ProviderSessionHandle, ProviderTurnExecutionIdentity,
-    ProviderTurnRequest, ProviderTurnResult,
+    AgentProvider, AgentUsageTelemetryEvent, ProviderElicitationResolution, ProviderEvent,
+    ProviderPermissionResolution, ProviderRuntimeMcpServer, ProviderRuntimeMcpTransport,
+    ProviderRuntimeResources, ProviderRuntimeSkill, ProviderSessionHandle,
+    ProviderTurnExecutionIdentity, ProviderTurnRequest, ProviderTurnResult,
 };
 use crate::context_bridge::{ContextBridgeService, PreparedContextBridge};
 use crate::message_submission::MessageSubmissionCoordinator;
@@ -60,6 +61,7 @@ pub struct AgentManager {
     runtime_selection: OnceLock<Weak<RuntimeSelectionService>>,
     message_submission: OnceLock<Weak<MessageSubmissionCoordinator>>,
     usage_telemetry: OnceLock<mpsc::UnboundedSender<AgentUsageTelemetryEvent>>,
+    elicitation_resolution_locks: StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     context_bridge: ContextBridgeService,
 }
 
@@ -129,6 +131,7 @@ impl AgentManager {
             runtime_selection: OnceLock::new(),
             message_submission: OnceLock::new(),
             usage_telemetry: OnceLock::new(),
+            elicitation_resolution_locks: StdMutex::new(HashMap::new()),
             context_bridge,
         };
         manager.recover_interrupted_sessions(&mut conn)?;
@@ -1362,6 +1365,18 @@ impl AgentManager {
                 }
                 needs_input = true;
             }
+            if let TimelinePayload::ElicitationRequest(elicitation) = &event.payload {
+                if let Err(err) = ElicitationRepository::insert_request(&conn, elicitation) {
+                    let _ = self.finish_turn_with_error_on_conn_with_attribution(
+                        &mut conn,
+                        &session.id,
+                        &err,
+                        execution_attribution.as_ref(),
+                    );
+                    return Err(err);
+                }
+                needs_input = true;
+            }
             let item = match self.append_provider_event(
                 &mut conn,
                 &session.id,
@@ -1414,13 +1429,19 @@ impl AgentManager {
         }
 
         let next_state = if needs_input {
-            // Permission requests resolved while the turn was still running
+            // User-input requests resolved while the turn was still running
             // must not park the session in NeedsInput forever; only sessions
             // with unresolved pending requests keep waiting for the user.
-            match PermissionRepository::pending_for_session(&conn, &session.id) {
-                Ok(pending) if pending.is_empty() => AgentSessionState::Idle,
-                Ok(_) => AgentSessionState::NeedsInput,
-                Err(_) => AgentSessionState::NeedsInput,
+            let pending_permissions = PermissionRepository::pending_for_session(&conn, &session.id);
+            let pending_elicitations =
+                ElicitationRepository::pending_for_session(&conn, &session.id);
+            match (pending_permissions, pending_elicitations) {
+                (Ok(permissions), Ok(elicitations))
+                    if permissions.is_empty() && elicitations.is_empty() =>
+                {
+                    AgentSessionState::Idle
+                }
+                _ => AgentSessionState::NeedsInput,
             }
         } else {
             AgentSessionState::Idle
@@ -1772,8 +1793,12 @@ impl AgentManager {
         // here, and only when nothing else is still waiting for the user.
         let conn = self.open_migrated()?;
         let latest = SessionRepository::get(&conn, &session.id)?;
-        let still_pending = PermissionRepository::pending_for_session(&conn, &session.id)?;
-        if still_pending.is_empty()
+        let still_pending_permissions =
+            PermissionRepository::pending_for_session(&conn, &session.id)?;
+        let still_pending_elicitations =
+            ElicitationRepository::pending_for_session(&conn, &session.id)?;
+        if still_pending_permissions.is_empty()
+            && still_pending_elicitations.is_empty()
             && latest
                 .map(|session| session.state != AgentSessionState::Running)
                 .unwrap_or(false)
@@ -1797,6 +1822,110 @@ impl AgentManager {
             &session.id,
             TimelineSource::Provider,
             TimelinePayload::PermissionRequest(request),
+            None,
+            None,
+            TimelineRedactionState::None,
+        )?;
+        SessionRepository::update_state(&conn, &session.id, AgentSessionState::NeedsInput)?;
+        Ok(item)
+    }
+
+    pub async fn resolve_elicitation(
+        &self,
+        request: ResolveElicitationRequest,
+    ) -> VibexResult<TimelineItem> {
+        request.validate()?;
+        let resolution_lock = self.elicitation_resolution_lock(request.request_id.as_str())?;
+        let _resolution_guard = resolution_lock.lock().await;
+        let conn = self.open_migrated()?;
+        let session = SessionRepository::get(&conn, &request.session_id)?.ok_or_else(|| {
+            VibexError::validation("session_not_found", "Agent session was not found")
+        })?;
+        let (selection, binding, execution_identity, route_key) =
+            self.durable_session_execution(&conn, &session)?;
+        let provider = self.runtime(&route_key)?;
+        let capabilities = provider.capabilities_for_profile(Some(&selection.provider_profile_id));
+        if !capabilities.elicitation {
+            return Err(VibexError::capability(
+                "acp_elicitation_resolution_unsupported",
+                "this provider profile does not support elicitation callbacks",
+            ));
+        }
+        let existing =
+            ElicitationRepository::get_request(&conn, &request.request_id)?.ok_or_else(|| {
+                VibexError::validation(
+                    "elicitation_request_not_found",
+                    "elicitation request was not found",
+                )
+                .with_diagnostic("requestId", request.request_id.as_str())
+            })?;
+        existing.validate_resolution(&request.resolution)?;
+        drop(conn);
+
+        provider
+            .resolve_elicitation(ProviderElicitationResolution {
+                session_id: session.id.clone(),
+                binding,
+                execution_identity,
+                resolution: request.resolution.clone(),
+            })
+            .await?;
+
+        let mut conn = self.open_migrated()?;
+        ElicitationRepository::resolve(&conn, &request.resolution)?;
+        let item = self.append_timeline_item(
+            &mut conn,
+            &session.id,
+            TimelineSource::User,
+            TimelinePayload::ElicitationResolution(request.resolution),
+            None,
+            None,
+            TimelineRedactionState::None,
+        )?;
+        let latest = SessionRepository::get(&conn, &session.id)?;
+        let pending_permissions = PermissionRepository::pending_for_session(&conn, &session.id)?;
+        let pending_elicitations = ElicitationRepository::pending_for_session(&conn, &session.id)?;
+        if pending_permissions.is_empty()
+            && pending_elicitations.is_empty()
+            && latest
+                .map(|session| session.state != AgentSessionState::Running)
+                .unwrap_or(false)
+        {
+            SessionRepository::update_state(&conn, &session.id, AgentSessionState::Idle)?;
+        }
+        Ok(item)
+    }
+
+    fn elicitation_resolution_lock(&self, request_id: &str) -> VibexResult<Arc<AsyncMutex<()>>> {
+        let mut locks = self.elicitation_resolution_locks.lock().map_err(|_| {
+            VibexError::process(
+                "agent_elicitation_resolution_lock_poisoned",
+                "Agent elicitation resolution lock is unavailable",
+            )
+        })?;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(request_id).and_then(Weak::upgrade) {
+            return Ok(lock);
+        }
+        let lock = Arc::new(AsyncMutex::new(()));
+        locks.insert(request_id.to_string(), Arc::downgrade(&lock));
+        Ok(lock)
+    }
+
+    pub async fn record_elicitation_request(
+        &self,
+        request: ElicitationRequest,
+    ) -> VibexResult<TimelineItem> {
+        let mut conn = self.open_migrated()?;
+        let session = SessionRepository::get(&conn, &request.session_id)?.ok_or_else(|| {
+            VibexError::validation("session_not_found", "Agent session was not found")
+        })?;
+        ElicitationRepository::insert_request(&conn, &request)?;
+        let item = self.append_timeline_item(
+            &mut conn,
+            &session.id,
+            TimelineSource::Provider,
+            TimelinePayload::ElicitationRequest(request),
             None,
             None,
             TimelineRedactionState::None,
@@ -2493,6 +2622,10 @@ impl AgentManager {
             PermissionRepository::insert_request(&conn, permission)?;
             *needs_input = true;
         }
+        if let TimelinePayload::ElicitationRequest(elicitation) = &event.payload {
+            ElicitationRepository::insert_request(&conn, elicitation)?;
+            *needs_input = true;
+        }
         self.append_provider_event(
             &mut conn,
             session_id,
@@ -2811,6 +2944,8 @@ fn fork_timeline_appends(items: &[TimelineItem]) -> Vec<TimelineAppend> {
                 TimelinePayload::SystemNotice(_)
                     | TimelinePayload::PermissionRequest(_)
                     | TimelinePayload::PermissionResolution(_)
+                    | TimelinePayload::ElicitationRequest(_)
+                    | TimelinePayload::ElicitationResolution(_)
             )
         })
         .map(|item| TimelineAppend {
@@ -3187,6 +3322,7 @@ fn imported_session_notice(candidate: &ExternalSessionImportCandidate) -> String
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
@@ -3209,6 +3345,14 @@ mod tests {
 
     struct UsageOriginProvider {
         identity: ProviderTurnExecutionIdentity,
+    }
+
+    struct RetryingElicitationProvider {
+        attempts: AtomicUsize,
+        identity: ProviderTurnExecutionIdentity,
+        callback_started: tokio::sync::Notify,
+        callback_release: tokio::sync::Notify,
+        delivered: Mutex<Vec<vibex_core::ElicitationResolution>>,
     }
 
     #[async_trait]
@@ -3286,6 +3430,311 @@ mod tests {
         ) -> VibexResult<ProviderTurnResult> {
             unreachable!("usage-origin test injects a runner")
         }
+    }
+
+    #[async_trait]
+    impl AgentProvider for RetryingElicitationProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Acp
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            let mut capabilities =
+                ProviderCapabilities::conservative(ProviderKind::Acp, "elicitation-retry-test");
+            capabilities.elicitation = true;
+            capabilities
+        }
+
+        async fn create_session(
+            &self,
+            _request: ProviderCreateRequest,
+        ) -> VibexResult<ProviderSessionHandle> {
+            unreachable!("elicitation retry test uses a seeded binding")
+        }
+
+        async fn resume_session(
+            &self,
+            binding: ProviderBinding,
+        ) -> VibexResult<ProviderSessionHandle> {
+            Ok(ProviderSessionHandle {
+                binding,
+                capabilities: self.capabilities(),
+            })
+        }
+
+        async fn prepare_turn_execution(
+            &self,
+            _handle: &ProviderSessionHandle,
+            _request: &ProviderTurnRequest,
+        ) -> VibexResult<Option<ProviderTurnExecutionIdentity>> {
+            Ok(Some(self.identity.clone()))
+        }
+
+        async fn send_turn(
+            &self,
+            _handle: ProviderSessionHandle,
+            _request: ProviderTurnRequest,
+        ) -> VibexResult<ProviderTurnResult> {
+            unreachable!("elicitation retry test does not send a turn")
+        }
+
+        async fn resolve_elicitation(
+            &self,
+            request: ProviderElicitationResolution,
+        ) -> VibexResult<()> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                return Err(VibexError::provider(
+                    "elicitation_callback_failed",
+                    "injected callback failure",
+                ));
+            }
+            self.delivered.lock().unwrap().push(request.resolution);
+            if attempt == 1 {
+                self.callback_started.notify_one();
+                self.callback_release.notified().await;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn elicitation_turn_needs_input_and_callback_failure_remains_retryable() {
+        let db_path = temp_db_path("elicitation-callback-retry");
+        let workspace_root = temp_workspace_path("elicitation-callback-retry");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let mut manager = AgentManager::new(&db_path).unwrap();
+        let mut conn = manager.open_migrated().unwrap();
+        ProviderProfileRepository::ensure_local_defaults(&conn).unwrap();
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let agent_id = AgentId::parse("elicitation-test-agent").unwrap();
+        let adapter_id = AcpAdapterId::parse("elicitation-test-acp").unwrap();
+        let provider_profile_id =
+            ProviderProfileId::parse(ProviderKind::Acp.local_default_profile_id().to_string())
+                .unwrap();
+        let session = insert_session(
+            &conn,
+            "elicitation callback retry",
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            agent_id.clone(),
+            AgentSessionState::Idle,
+        );
+        let selection = SessionRuntimeSelection {
+            agent_id: agent_id.clone(),
+            provider_profile_id: provider_profile_id.clone(),
+            model_id: "elicitation-test-model".to_string(),
+            reasoning_effort: None,
+            mode_id: None,
+            config_values: Default::default(),
+        };
+        let mut runtime_config = SessionRuntimeConfigState {
+            preferred_model: Some(selection.model_id.clone()),
+            effective_model: Some(selection.model_id.clone()),
+            ..SessionRuntimeConfigState::default()
+        };
+        runtime_config.mark_generation_if_converged(0);
+        let now = unix_timestamp_ms();
+        let binding = RuntimeBinding {
+            binding_id: RuntimeBindingId::new(),
+            session_id: session.id.clone(),
+            agent_id: agent_id.clone(),
+            transport_kind: TransportKind::Acp,
+            provider_profile_id,
+            adapter_id: adapter_id.clone(),
+            adapter_version: "1.0.0".to_string(),
+            adapter_compatibility_identity: "elicitation-test-acp@1".to_string(),
+            native_session_id: Some("native-elicitation-test".to_string()),
+            native_state_home_id: NativeStateHomeId::new(),
+            provider_resume_identity: None,
+            process_spawn_fingerprint: "elicitation-test".to_string(),
+            session_runtime_config_state: runtime_config,
+            capability_snapshot: None,
+            restore_compatibility_key: None,
+            profile_revision: 1,
+            last_context_sequence: 0,
+            last_summary_sequence: 0,
+            context_bridge_version: 0,
+            activation_generation: 0,
+            binding_state: BindingState::Current,
+            created_by_switch_id: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        AgentSessionRuntimeRepository::initialize_runtime_selection(
+            &mut conn, &binding, &selection,
+        )
+        .unwrap();
+        drop(conn);
+
+        let provider = Arc::new(RetryingElicitationProvider {
+            attempts: AtomicUsize::new(0),
+            identity: ProviderTurnExecutionIdentity {
+                binding_id: binding.binding_id.clone(),
+                activation_generation: binding.activation_generation,
+                model_id: selection.model_id.clone(),
+            },
+            callback_started: tokio::sync::Notify::new(),
+            callback_release: tokio::sync::Notify::new(),
+            delivered: Mutex::new(Vec::new()),
+        });
+        manager
+            .register_runtime(
+                AgentRuntimeRouteKey {
+                    agent_id,
+                    transport_kind: TransportKind::Acp,
+                    adapter_id,
+                },
+                provider.clone(),
+            )
+            .unwrap();
+        let elicitation = ElicitationRequest {
+            id: vibex_core::RequestId::new(),
+            session_id: session.id.clone(),
+            provider_request_id: Some("provider-request".to_string()),
+            tool_call_id: None,
+            message: "Continue?".to_string(),
+            title: None,
+            description: None,
+            fields: Vec::new(),
+            status: vibex_core::ElicitationRequestStatus::Pending,
+            requested_at_ms: now,
+        };
+        manager
+            .run_agent_turn(
+                AgentTurnRequest {
+                    session_id: session.id.clone(),
+                    required_runtime: Some(selection),
+                    text: "request elicitation".to_string(),
+                    attachments: Vec::new(),
+                    reasoning_effort: None,
+                    correlation_id: None,
+                },
+                true,
+                None,
+                |_provider, _handle, _request| {
+                    let elicitation = elicitation.clone();
+                    async move {
+                        Ok(ProviderTurnResult {
+                            events: vec![ProviderEvent::provider(
+                                TimelinePayload::ElicitationRequest(elicitation),
+                            )],
+                            binding_update: None,
+                            completed: true,
+                        })
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        let conn = manager.open_migrated().unwrap();
+        assert_eq!(
+            SessionRepository::get(&conn, &session.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            AgentSessionState::NeedsInput
+        );
+        assert_eq!(
+            ElicitationRepository::pending_for_session(&conn, &session.id)
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(conn);
+        let resolution = vibex_core::ElicitationResolution {
+            request_id: elicitation.id.clone(),
+            session_id: session.id.clone(),
+            action: vibex_core::ElicitationResolutionAction::Decline,
+            answers: Default::default(),
+            responder_device_id: None,
+            resolved_at_ms: now + 1,
+        };
+        let request = ResolveElicitationRequest {
+            session_id: session.id.clone(),
+            request_id: elicitation.id.clone(),
+            resolution,
+        };
+
+        assert_eq!(
+            manager
+                .resolve_elicitation(request.clone())
+                .await
+                .unwrap_err()
+                .code,
+            "elicitation_callback_failed"
+        );
+        let conn = manager.open_migrated().unwrap();
+        assert_eq!(
+            ElicitationRepository::get_request(&conn, &elicitation.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            vibex_core::ElicitationRequestStatus::Pending
+        );
+        drop(conn);
+
+        let manager = Arc::new(manager);
+        let winning_resolution = request.resolution.clone();
+        let winner_manager = Arc::clone(&manager);
+        let winner_request = request.clone();
+        let winner =
+            tokio::spawn(async move { winner_manager.resolve_elicitation(winner_request).await });
+        provider.callback_started.notified().await;
+
+        let mut competing_request = request;
+        competing_request.resolution.action = vibex_core::ElicitationResolutionAction::Cancel;
+        competing_request.resolution.resolved_at_ms += 1;
+        let competing_manager = Arc::clone(&manager);
+        let competing = tokio::spawn(async move {
+            competing_manager
+                .resolve_elicitation(competing_request)
+                .await
+        });
+        tokio::task::yield_now().await;
+        provider.callback_release.notify_one();
+
+        winner.await.unwrap().unwrap();
+        assert_eq!(
+            competing.await.unwrap().unwrap_err().code,
+            "elicitation_request_not_pending"
+        );
+        assert_eq!(provider.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            provider.delivered.lock().unwrap().as_slice(),
+            std::slice::from_ref(&winning_resolution)
+        );
+        let timeline = manager
+            .fetch_timeline(FetchTimelineRequest {
+                session_id: session.id.clone(),
+                after_sequence: None,
+                limit: 100,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            timeline
+                .items
+                .iter()
+                .filter(|item| {
+                    matches!(&item.payload, TimelinePayload::ElicitationResolution(_))
+                })
+                .count(),
+            1
+        );
+        assert!(timeline.items.iter().any(|item| {
+            matches!(
+                &item.payload,
+                TimelinePayload::ElicitationResolution(resolution)
+                    if resolution == &winning_resolution
+            )
+        }));
+
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
     }
 
     #[test]

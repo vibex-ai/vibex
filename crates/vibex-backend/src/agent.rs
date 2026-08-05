@@ -2,10 +2,10 @@ use vibex_core::{
     AgentSession, AgentSessionRuntimeSelectionEvent, AgentSessionRuntimeSelectionState,
     AgentUsageStatistics, AgentUsageStatisticsRequest, CancelAgentSessionRuntimeSwitchRequest,
     ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest,
-    RemoteDeepLinkResolution, RenameAgentSessionRequest, ResolvePermissionRequest,
-    RuntimeSessionEvent, SendAgentMessageRequest, SessionRuntimeOptionCatalog,
-    SetDesiredAgentSessionRuntimeRequest, TimelineItem, TimelineLiveEvent, TimelinePage,
-    VibexSessionId,
+    RemoteDeepLinkResolution, RenameAgentSessionRequest, ResolveElicitationRequest,
+    ResolvePermissionRequest, RuntimeSessionEvent, SendAgentMessageRequest,
+    SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, TimelineItem,
+    TimelineLiveEvent, TimelinePage, VibexSessionId,
 };
 
 use crate::{BackendBound, BackendFuture, BackendResult, MutationRequest};
@@ -112,6 +112,11 @@ pub trait AgentBackend: BackendBound {
     fn resolve_permission(
         &self,
         request: MutationRequest<ResolvePermissionRequest>,
+    ) -> BackendFuture<'_, TimelineItem>;
+
+    fn resolve_elicitation(
+        &self,
+        request: MutationRequest<ResolveElicitationRequest>,
     ) -> BackendFuture<'_, TimelineItem>;
 
     fn rename_session(

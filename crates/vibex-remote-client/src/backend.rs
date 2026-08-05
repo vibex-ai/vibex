@@ -30,6 +30,7 @@ use vibex_core::{
     RemoteAgentCancelRuntimeSwitchResponse, RemoteAgentDeepLinkResolveRequest,
     RemoteAgentDeepLinkResolveResponse, RemoteAgentInterruptRequest, RemoteAgentInterruptResponse,
     RemoteAgentMessageSubmissionRequest, RemoteAgentMessageSubmissionResponse, RemoteAgentRequest,
+    RemoteAgentResolveElicitationRequest, RemoteAgentResolveElicitationResponse,
     RemoteAgentResolvePermissionRequest, RemoteAgentResolvePermissionResponse,
     RemoteAgentRuntimeOptionsRequest, RemoteAgentRuntimeOptionsResponse,
     RemoteAgentRuntimeSelectionRequest, RemoteAgentRuntimeSelectionResponse,
@@ -60,10 +61,10 @@ use vibex_core::{
     RemoteTerminalWriteRequest, RemoteTerminalWriteResponse, RemoteWorkbenchListWorkspacesRequest,
     RemoteWorkbenchListWorkspacesResponse, RemoteWorkbenchOpenWorkspaceRequest,
     RemoteWorkbenchOpenWorkspaceResponse, RemoteWorkbenchRequest, RenameAgentSessionRequest,
-    ResolvePermissionRequest, SendAgentMessageRequest, SessionRuntimeOptionCatalog,
-    SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest, TerminalId, TerminalResizeRequest,
-    TerminalSession, TerminalSnapshot, TerminalWriteRequest, TimelineItem, TimelineLiveEvent,
-    TimelinePage, VibexSessionId, WorkspaceId,
+    ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
+    SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
+    TerminalId, TerminalResizeRequest, TerminalSession, TerminalSnapshot, TerminalWriteRequest,
+    TimelineItem, TimelineLiveEvent, TimelinePage, VibexSessionId, WorkspaceId,
 };
 
 use crate::binary::TerminalBinaryBuffer;
@@ -638,6 +639,32 @@ impl AgentBackend for WebRemoteBackend {
                 )
                 .await?;
             Ok(decode::<RemoteAgentResolvePermissionResponse>(value)?.item)
+        })
+    }
+
+    fn resolve_elicitation(
+        &self,
+        request: MutationRequest<ResolveElicitationRequest>,
+    ) -> BackendFuture<'_, TimelineItem> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload =
+                RemoteAgentRequest::ResolveElicitation(RemoteAgentResolveElicitationRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Interactive,
+                )
+                .await?;
+            Ok(decode::<RemoteAgentResolveElicitationResponse>(value)?.item)
         })
     }
 
@@ -1860,6 +1887,10 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
                 (
                     AgentResolveApproval,
                     permits(RemoteActionClass::ResolvePermission),
+                ),
+                (
+                    AgentRespondElicitation,
+                    permits(RemoteActionClass::ResolveElicitation),
                 ),
                 (
                     AgentSwitchRuntime,

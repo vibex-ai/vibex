@@ -3299,6 +3299,7 @@ fn mutation_requires_idempotency(kind: &str) -> bool {
             | "continue_turn"
             | "interrupt"
             | "resolve_permission"
+            | "resolve_elicitation"
             | "attach_runtime"
             | "detach_runtime"
             | "file_write"
@@ -4071,6 +4072,11 @@ mod tests {
             &database_path,
             directory.path().join("identity.json"),
         )
+    }
+
+    #[test]
+    fn elicitation_resolution_requires_mutation_idempotency() {
+        assert!(mutation_requires_idempotency("resolve_elicitation"));
     }
 
     #[test]

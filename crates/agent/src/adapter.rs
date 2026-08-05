@@ -11,11 +11,11 @@ use vibex_core::{
     AgentCommandDiscoverRequest, AgentCommandDiscoverResponse, AgentCommandExecuteRequest,
     AgentModelListResponse, AgentModelListSource, AgentSessionConfigProbe, AgentSessionSafety,
     AgentUsageCounterOrigin, AgentUsageExecution, AgentUsageExecutionContext,
-    AgentUsageExecutionStatusUpdate, AgentUsageObservation, ExternalSessionImportCandidate,
-    MessageAttachment, MessageSubmissionId, PermissionResolution, ProviderBinding,
-    ProviderBindingMetadata, ProviderCapabilities, ProviderKind, ProviderProfileId,
-    RuntimeBindingId, SessionRuntimeSelection, TimelinePayload, TimelineRedactionState,
-    TimelineSource, VibexError, VibexResult, VibexSessionId,
+    AgentUsageExecutionStatusUpdate, AgentUsageObservation, ElicitationResolution,
+    ExternalSessionImportCandidate, MessageAttachment, MessageSubmissionId, PermissionResolution,
+    ProviderBinding, ProviderBindingMetadata, ProviderCapabilities, ProviderKind,
+    ProviderProfileId, RuntimeBindingId, SessionRuntimeSelection, TimelinePayload,
+    TimelineRedactionState, TimelineSource, VibexError, VibexResult, VibexSessionId,
 };
 
 #[derive(Debug, Clone)]
@@ -404,6 +404,14 @@ pub struct ProviderPermissionResolution {
     pub resolution: PermissionResolution,
 }
 
+#[derive(Debug, Clone)]
+pub struct ProviderElicitationResolution {
+    pub session_id: VibexSessionId,
+    pub binding: ProviderBinding,
+    pub execution_identity: ProviderTurnExecutionIdentity,
+    pub resolution: ElicitationResolution,
+}
+
 #[async_trait]
 pub trait AgentProvider: Send + Sync {
     fn kind(&self) -> ProviderKind;
@@ -522,6 +530,16 @@ pub trait AgentProvider: Send + Sync {
         Err(VibexError::capability(
             "permission_resolution_unsupported",
             "this provider does not support permission resolution callbacks",
+        ))
+    }
+
+    async fn resolve_elicitation(
+        &self,
+        _request: ProviderElicitationResolution,
+    ) -> VibexResult<()> {
+        Err(VibexError::capability(
+            "elicitation_resolution_unsupported",
+            "this provider does not support elicitation callbacks",
         ))
     }
 

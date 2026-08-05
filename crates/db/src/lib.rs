@@ -15,7 +15,8 @@ use vibex_core::{
     AutomationRun, AutomationRunCreateRequest, AutomationRunId, AutomationRunListRequest,
     AutomationRunStep, AutomationRunStepCreateRequest, AutomationRunStepId,
     AutomationRunStepListRequest, AutomationRunStepUpdateRequest, AutomationRunUpdateRequest,
-    CorrelationId, DeviceId, GitManagedWorktreeRecord, GitManagedWorktreeStatus,
+    CorrelationId, DeviceId, ElicitationRequest, ElicitationRequestStatus, ElicitationResolution,
+    ElicitationResolutionAction, GitManagedWorktreeRecord, GitManagedWorktreeStatus,
     GitWorktreeDiagnostic, GitWorktreeOperationCheckpoint, GitWorktreeOperationDetail,
     GitWorktreeOperationRecord, GitWorktreeOperationStatus, GitWorktreeReadinessRecord,
     GitWorktreeReconciliationState, Hook, HookCreateRequest, HookId, HookInstallPreview,
@@ -67,7 +68,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 35;
+pub const CURRENT_SCHEMA_VERSION: i64 = 36;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -1497,6 +1498,24 @@ const MIGRATIONS: &[Migration] = &[
                 ADD COLUMN response_options_json TEXT NOT NULL DEFAULT '[]';
         ",
     },
+    Migration {
+        version: 36,
+        name: "agent_elicitation_requests",
+        sql: "
+            CREATE TABLE IF NOT EXISTS elicitation_requests (
+                request_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL
+                    REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+                status TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                resolution_json TEXT NULL,
+                requested_at_ms INTEGER NOT NULL,
+                resolved_at_ms INTEGER NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_elicitation_requests_session_status
+                ON elicitation_requests(session_id, status, requested_at_ms);
+        ",
+    },
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -1531,6 +1550,7 @@ pub struct PromptRepository;
 pub struct HookRepository;
 pub struct TimelineRepository;
 pub struct PermissionRepository;
+pub struct ElicitationRepository;
 pub struct AdapterDiagnosticsRepository;
 pub struct TerminalSessionRepository;
 pub struct RecentFileRepository;
@@ -6794,6 +6814,128 @@ impl PermissionRepository {
     }
 }
 
+impl ElicitationRepository {
+    pub fn insert_request(conn: &Connection, request: &ElicitationRequest) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO elicitation_requests (
+                request_id, session_id, status, request_json, requested_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ",
+            params![
+                request.id.as_str(),
+                request.session_id.as_str(),
+                enum_to_db(&request.status)?,
+                json_to_db(request)?,
+                request.requested_at_ms,
+            ],
+        )
+        .map_err(storage_err(
+            "elicitation_request_insert_failed",
+            "failed to insert elicitation request",
+        ))?;
+        Ok(())
+    }
+
+    pub fn get_request(
+        conn: &Connection,
+        request_id: &RequestId,
+    ) -> VibexResult<Option<ElicitationRequest>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT request_json, status
+                FROM elicitation_requests
+                WHERE request_id = ?1
+                ",
+            )
+            .map_err(storage_err(
+                "elicitation_request_get_failed",
+                "failed to load elicitation request",
+            ))?;
+        stmt.query_row(params![request_id.as_str()], map_elicitation_request)
+            .optional()
+            .map_err(storage_err(
+                "elicitation_request_decode_failed",
+                "failed to decode elicitation request",
+            ))
+    }
+
+    pub fn resolve(conn: &Connection, resolution: &ElicitationResolution) -> VibexResult<()> {
+        let status = match resolution.action {
+            ElicitationResolutionAction::Accept => ElicitationRequestStatus::Accepted,
+            ElicitationResolutionAction::Decline => ElicitationRequestStatus::Declined,
+            ElicitationResolutionAction::Cancel => ElicitationRequestStatus::Cancelled,
+        };
+        let updated = conn
+            .execute(
+                "
+            UPDATE elicitation_requests
+            SET status = ?3, resolution_json = ?4, resolved_at_ms = ?5
+            WHERE request_id = ?1 AND session_id = ?2 AND status = ?6
+            ",
+                params![
+                    resolution.request_id.as_str(),
+                    resolution.session_id.as_str(),
+                    enum_to_db(&status)?,
+                    json_to_db(resolution)?,
+                    resolution.resolved_at_ms,
+                    enum_to_db(&ElicitationRequestStatus::Pending)?,
+                ],
+            )
+            .map_err(storage_err(
+                "elicitation_request_resolve_failed",
+                "failed to resolve elicitation request",
+            ))?;
+        if updated != 1 {
+            return Err(VibexError::conflict(
+                "elicitation_request_not_pending",
+                "elicitation request is no longer pending",
+            )
+            .with_diagnostic("requestId", resolution.request_id.as_str()));
+        }
+        Ok(())
+    }
+
+    pub fn pending_for_session(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<Vec<ElicitationRequest>> {
+        let pending = enum_to_db(&ElicitationRequestStatus::Pending)?;
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT request_json, status
+                FROM elicitation_requests
+                WHERE session_id = ?1 AND status = ?2
+                ORDER BY requested_at_ms ASC
+                ",
+            )
+            .map_err(storage_err(
+                "elicitation_request_list_failed",
+                "failed to list elicitation requests",
+            ))?;
+        let rows = stmt
+            .query_map(
+                params![session_id.as_str(), pending],
+                map_elicitation_request,
+            )
+            .map_err(storage_err(
+                "elicitation_request_list_failed",
+                "failed to list elicitation requests",
+            ))?;
+        let mut requests = Vec::new();
+        for row in rows {
+            requests.push(row.map_err(storage_err(
+                "elicitation_request_decode_failed",
+                "failed to decode elicitation request",
+            ))?);
+        }
+        Ok(requests)
+    }
+}
+
 impl AdapterDiagnosticsRepository {
     pub fn insert(conn: &Connection, diagnostic: &AdapterDiagnostic) -> VibexResult<()> {
         conn.execute(
@@ -10822,6 +10964,12 @@ fn map_permission_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<Permissio
     })
 }
 
+fn map_elicitation_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<ElicitationRequest> {
+    let mut request = json_from_db_sql::<ElicitationRequest>(row.get(0)?)?;
+    request.status = enum_from_db_sql(row.get(1)?)?;
+    Ok(request)
+}
+
 fn map_terminal_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<TerminalSession> {
     Ok(TerminalSession {
         id: parse_id_sql(row.get(0)?, TerminalId::parse)?,
@@ -11072,7 +11220,8 @@ mod tests {
                 "32:agent_usage_zero_baseline_fence",
                 "33:managed_worktree_recovery_foundation",
                 "34:worktree_merge_lifecycle",
-                "35:permission_response_options"
+                "35:permission_response_options",
+                "36:agent_elicitation_requests"
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -11210,7 +11359,8 @@ mod tests {
                 "32:agent_usage_zero_baseline_fence",
                 "33:managed_worktree_recovery_foundation",
                 "34:worktree_merge_lifecycle",
-                "35:permission_response_options"
+                "35:permission_response_options",
+                "36:agent_elicitation_requests"
             ]
         );
         assert_eq!(
@@ -12754,7 +12904,8 @@ mod tests {
             vec![
                 "33:managed_worktree_recovery_foundation",
                 "34:worktree_merge_lifecycle",
-                "35:permission_response_options"
+                "35:permission_response_options",
+                "36:agent_elicitation_requests"
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
@@ -14118,6 +14269,55 @@ mod tests {
             PermissionRepository::pending_for_session(&conn, &session.id)
                 .unwrap()
                 .is_empty()
+        );
+
+        let elicitation = ElicitationRequest {
+            id: RequestId::new(),
+            session_id: session.id.clone(),
+            provider_request_id: Some("native-elicitation".to_string()),
+            tool_call_id: Some("tool-call-1".to_string()),
+            message: "Choose a target".to_string(),
+            title: Some("Target".to_string()),
+            description: None,
+            fields: Vec::new(),
+            status: ElicitationRequestStatus::Pending,
+            requested_at_ms: unix_timestamp_ms(),
+        };
+        ElicitationRepository::insert_request(&conn, &elicitation).unwrap();
+        assert_eq!(
+            ElicitationRepository::get_request(&conn, &elicitation.id).unwrap(),
+            Some(elicitation.clone())
+        );
+        assert_eq!(
+            ElicitationRepository::pending_for_session(&conn, &session.id).unwrap(),
+            vec![elicitation.clone()]
+        );
+        let elicitation_resolution = ElicitationResolution {
+            request_id: elicitation.id.clone(),
+            session_id: session.id.clone(),
+            action: ElicitationResolutionAction::Decline,
+            answers: BTreeMap::new(),
+            responder_device_id: None,
+            resolved_at_ms: unix_timestamp_ms(),
+        };
+        ElicitationRepository::resolve(&conn, &elicitation_resolution).unwrap();
+        assert_eq!(
+            ElicitationRepository::get_request(&conn, &elicitation.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            ElicitationRequestStatus::Declined
+        );
+        assert!(
+            ElicitationRepository::pending_for_session(&conn, &session.id)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            ElicitationRepository::resolve(&conn, &elicitation_resolution)
+                .unwrap_err()
+                .code,
+            "elicitation_request_not_pending"
         );
 
         AdapterDiagnosticsRepository::insert(
