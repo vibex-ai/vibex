@@ -149,6 +149,48 @@ const OPENCODE_ACP_CATEGORY_SAMPLE_LIMIT: usize = 12;
 const OPENCODE_ACP_PERMISSION_DETAIL_LIMIT: usize = 6;
 const OPENCODE_ACP_PERMISSION_VALUE_LIMIT: usize = 120;
 const REDACTED_SENSITIVE_OUTPUT: &str = "[redacted-sensitive-output]";
+const CODEX_ACP_PROVIDER_COMMANDS: &[CodexAcpSlashCommand] = &[
+    CodexAcpSlashCommand {
+        name: "plan",
+        description: "Turn plan mode on.",
+    },
+    CodexAcpSlashCommand {
+        name: "mcp",
+        description: "List configured Model Context Protocol (MCP) tools.",
+    },
+    CodexAcpSlashCommand {
+        name: "skills",
+        description: "List available skills.",
+    },
+    CodexAcpSlashCommand {
+        name: "status",
+        description: "Display session configuration and token usage.",
+    },
+    CodexAcpSlashCommand {
+        name: "review",
+        description: "Review uncommitted changes, or review with custom instructions.",
+    },
+    CodexAcpSlashCommand {
+        name: "review-branch",
+        description: "Review changes relative to a base branch.",
+    },
+    CodexAcpSlashCommand {
+        name: "review-commit",
+        description: "Review a specific commit.",
+    },
+    CodexAcpSlashCommand {
+        name: "compact",
+        description: "Summarize conversation to avoid hitting the context limit.",
+    },
+    CodexAcpSlashCommand {
+        name: "goal",
+        description: "Set a goal to keep pursuing.",
+    },
+    CodexAcpSlashCommand {
+        name: "logout",
+        description: "Sign out of Codex. This option is available when you are logged in via ChatGPT.",
+    },
+];
 const OPENCODE_ACP_PROVIDER_COMMANDS: &[OpenCodeAcpSlashCommand] = &[
     OpenCodeAcpSlashCommand {
         name: "help",
@@ -229,6 +271,12 @@ const OPENCODE_ACP_PROVIDER_COMMANDS: &[OpenCodeAcpSlashCommand] = &[
         description: "Redo the latest OpenCode action when supported.",
     },
 ];
+
+#[derive(Debug, Clone, Copy)]
+struct CodexAcpSlashCommand {
+    name: &'static str,
+    description: &'static str,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct OpenCodeAcpSlashCommand {
@@ -2211,6 +2259,19 @@ impl AgentProvider for AcpAgentProvider {
             });
         }
 
+        if self.request_supports_codex_commands(&request) {
+            return Ok(AgentCommandDiscoverResponse {
+                entries: CODEX_ACP_PROVIDER_COMMANDS
+                    .iter()
+                    .map(|command| codex_acp_command_entry(command, ProviderKind::Acp))
+                    .collect(),
+                diagnostics: vec![ProviderBindingMetadata {
+                    key: "catalogSource".to_string(),
+                    value: "codex-acp-pinned-adapter".to_string(),
+                }],
+            });
+        }
+
         if !self.request_supports_opencode_commands(&request) {
             return Ok(AgentCommandDiscoverResponse {
                 entries: Vec::new(),
@@ -2285,6 +2346,24 @@ impl AcpAgentProvider {
 
         self.config_service.is_none()
     }
+
+    fn request_supports_codex_commands(&self, request: &AgentCommandDiscoverRequest) -> bool {
+        if request.agent_id.as_ref().map(vibex_core::AgentId::as_str)
+            != Some(registry::CODEX_AGENT_ID)
+        {
+            return false;
+        }
+
+        let Some(profile_id) = request.provider_profile_id.as_ref() else {
+            return self.config_service.is_none();
+        };
+        self.acp_config_for_profile(profile_id)
+            .is_some_and(|config| acp_config_supports_codex_commands(&config))
+    }
+}
+
+fn acp_config_supports_codex_commands(config: &AcpProviderConfig) -> bool {
+    acp_config_has_feature(config, &["slash_commands"]) && acp_runtime_looks_like_codex(config)
 }
 
 fn acp_config_supports_opencode_commands(config: &AcpProviderConfig) -> bool {
@@ -2326,6 +2405,13 @@ fn acp_runtime_looks_like_opencode(config: &AcpProviderConfig) -> bool {
             .any(|arg| normalize_acp_feature_token(arg).contains("opencode"))
 }
 
+fn acp_runtime_looks_like_codex(config: &AcpProviderConfig) -> bool {
+    let adapter_token = normalize_acp_feature_token(registry::CODEX_ADAPTER_ID);
+    std::iter::once(config.command.as_str())
+        .chain(config.args.iter().map(String::as_str))
+        .any(|value| normalize_acp_feature_token(value).contains(&adapter_token))
+}
+
 fn acp_config_has_feature(config: &AcpProviderConfig, aliases: &[&str]) -> bool {
     config.features.iter().any(|feature| {
         let normalized = normalize_acp_feature_token(feature);
@@ -2365,6 +2451,42 @@ fn acp_runtime_command_entry(
             key: "catalogSource".to_string(),
             value: "acp-session-runtime".to_string(),
         }],
+    }
+}
+
+fn codex_acp_command_entry(
+    command: &CodexAcpSlashCommand,
+    provider_kind: ProviderKind,
+) -> AgentCommandEntry {
+    AgentCommandEntry {
+        id: format!("provider:acp:codex:{}", command.name),
+        trigger: AgentCommandTrigger::Slash,
+        source_kind: AgentCommandSourceKind::Provider,
+        label: format!("/{}", command.name),
+        description: Some(command.description.to_string()),
+        insertion_text: format!("/{} ", command.name),
+        command_name: Some(command.name.to_string()),
+        provider_kind: Some(provider_kind),
+        prompt_id: None,
+        skill_id: None,
+        reference_path: None,
+        selection_behavior: AgentCommandSelectionBehavior::Insert,
+        execution_behavior: AgentCommandExecutionBehavior::ProviderCommand,
+        destructive: false,
+        metadata: vec![
+            ProviderBindingMetadata {
+                key: "catalogSource".to_string(),
+                value: "codex-acp-pinned-adapter".to_string(),
+            },
+            ProviderBindingMetadata {
+                key: "acpAdapter".to_string(),
+                value: registry::CODEX_ADAPTER_ID.to_string(),
+            },
+            ProviderBindingMetadata {
+                key: "acpAdapterVersion".to_string(),
+                value: registry::CODEX_ADAPTER_VERSION.to_string(),
+            },
+        ],
     }
 }
 
@@ -2978,9 +3100,10 @@ mod tests {
 
     use async_trait::async_trait;
     use tokio::sync::Mutex;
+    use vibex_agent::AgentManager;
     use vibex_core::{
-        PermissionActionDetail, PermissionRiskCategory, ProviderBindingMetadata, ProviderKind,
-        ProviderVersionInfo, TimelinePayload,
+        AcpAdapterId, AgentRuntimeRouteKey, PermissionActionDetail, PermissionRiskCategory,
+        ProviderBindingMetadata, ProviderKind, ProviderVersionInfo, TimelinePayload, TransportKind,
     };
 
     use super::*;
@@ -2989,6 +3112,7 @@ mod tests {
     struct FixtureAcpClient {
         session: AcpSession,
         turn: Mutex<Option<VibexResult<AcpTurn>>>,
+        commands: Vec<AcpRuntimeCommand>,
     }
 
     impl FixtureAcpClient {
@@ -2996,7 +3120,13 @@ mod tests {
             Self {
                 session,
                 turn: Mutex::new(Some(turn)),
+                commands: Vec::new(),
             }
+        }
+
+        fn with_commands(mut self, commands: Vec<AcpRuntimeCommand>) -> Self {
+            self.commands = commands;
+            self
         }
     }
 
@@ -3019,6 +3149,13 @@ mod tests {
                 .await
                 .take()
                 .expect("fixture turn should be consumed once")
+        }
+
+        async fn list_session_commands(
+            &self,
+            _session_id: &VibexSessionId,
+        ) -> VibexResult<Vec<AcpRuntimeCommand>> {
+            Ok(self.commands.clone())
         }
     }
 
@@ -3181,12 +3318,155 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skips_opencode_commands_for_generic_acp_profile() {
+    async fn discovers_codex_commands_before_a_session_exists() {
+        let db_path = temp_db_path("commands-codex-profile");
+        let service = ProviderConfigService::new(db_path.clone());
+        let profile = service
+            .create_acp_profile(AcpProviderProfileCreateRequest {
+                agent_id: Some(vibex_core::AgentId::parse(registry::CODEX_AGENT_ID).unwrap()),
+                display_name: "Codex ACP".to_string(),
+                account_alias: None,
+                preset_id: None,
+                config: Some(AcpProviderConfig {
+                    command: "node".to_string(),
+                    args: vec![format!(
+                        "/managed/acp-adapters/{}/{}/node_modules/@agentclientprotocol/codex-acp/dist/index.js",
+                        registry::CODEX_ADAPTER_ID,
+                        registry::CODEX_ADAPTER_VERSION
+                    )],
+                    env: Vec::new(),
+                    cwd_template: Some("{workspaceRoot}".to_string()),
+                    process_strategy: vibex_core::AcpProcessStrategy::default(),
+                    terminal_tools: false,
+                    terminal_auth: false,
+                    models: Vec::new(),
+                    modes: Vec::new(),
+                    features: vec!["slash_commands".to_string()],
+                    disabled_tools: Vec::new(),
+                }),
+            })
+            .unwrap();
+        let provider = Arc::new(AcpAgentProvider::with_config_service(
+            Arc::new(FixtureAcpClient::new(
+                AcpSession::default(),
+                Ok(AcpTurn {
+                    events: Vec::new(),
+                    binding_update: None,
+                    completed: true,
+                }),
+            )),
+            service,
+        ));
+        let mut manager = AgentManager::new(&db_path).unwrap();
+        manager
+            .register_runtime(
+                AgentRuntimeRouteKey {
+                    agent_id: profile.agent_id.clone(),
+                    transport_kind: TransportKind::Acp,
+                    adapter_id: AcpAdapterId::parse(registry::CODEX_ADAPTER_ID).unwrap(),
+                },
+                provider,
+            )
+            .unwrap();
+
+        let response = manager
+            .discover_commands(AgentCommandDiscoverRequest {
+                agent_id: Some(profile.agent_id.clone()),
+                provider_profile_id: Some(profile.id.clone()),
+                session_id: None,
+                workspace_id: None,
+                trigger: Some(AgentCommandTrigger::Slash),
+                query: Some(String::new()),
+                limit: Some(10),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response
+                .entries
+                .iter()
+                .map(|entry| entry.label.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "/compact",
+                "/goal",
+                "/logout",
+                "/mcp",
+                "/plan",
+                "/review",
+                "/review-branch",
+                "/review-commit",
+                "/skills",
+                "/status",
+            ]
+        );
+        assert!(response.entries.iter().any(|entry| {
+            entry.label == "/status"
+                && entry.insertion_text == "/status "
+                && entry.command_name.as_deref() == Some("status")
+        }));
+        assert!(response.entries.iter().any(|entry| {
+            entry.label == "/review-commit"
+                && entry.execution_behavior == AgentCommandExecutionBehavior::ProviderCommand
+        }));
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.key == "catalogSource" && diagnostic.value == "codex-acp-pinned-adapter"
+        }));
+
+        cleanup_db(db_path);
+    }
+
+    #[tokio::test]
+    async fn live_acp_commands_override_the_codex_pre_session_catalog() {
+        let provider = AcpAgentProvider::new(Arc::new(
+            FixtureAcpClient::new(
+                AcpSession::default(),
+                Ok(AcpTurn {
+                    events: Vec::new(),
+                    binding_update: None,
+                    completed: true,
+                }),
+            )
+            .with_commands(vec![AcpRuntimeCommand {
+                name: "runtime-only".to_string(),
+                description: Some("Announced by the active ACP session.".to_string()),
+            }]),
+        ));
+
+        let response = provider
+            .discover_commands(AgentCommandDiscoverRequest {
+                agent_id: Some(vibex_core::AgentId::parse(registry::CODEX_AGENT_ID).unwrap()),
+                provider_profile_id: None,
+                session_id: Some(VibexSessionId::new()),
+                workspace_id: None,
+                trigger: Some(AgentCommandTrigger::Slash),
+                query: None,
+                limit: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.entries.len(), 1);
+        assert_eq!(response.entries[0].label, "/runtime-only");
+        assert!(
+            !response
+                .entries
+                .iter()
+                .any(|entry| entry.label == "/status")
+        );
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.key == "catalogSource" && diagnostic.value == "acp-session-runtime"
+        }));
+    }
+
+    #[tokio::test]
+    async fn skips_static_commands_for_generic_codex_acp_profile() {
         let db_path = temp_db_path("commands-generic-profile");
         let service = ProviderConfigService::new(db_path.clone());
         let profile = service
             .create_acp_profile(AcpProviderProfileCreateRequest {
-                agent_id: None,
+                agent_id: Some(vibex_core::AgentId::parse(registry::CODEX_AGENT_ID).unwrap()),
                 display_name: "Generic ACP".to_string(),
                 account_alias: None,
                 preset_id: None,

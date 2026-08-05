@@ -774,6 +774,11 @@ Agents.
   `selection_behavior=execute_immediately`, and `destructive=false`.
 - Desktop may merge workspace file references and local skill manifests at the
   Tauri layer, but provider commands stay owned by provider adapters.
+- A live ACP `available_commands_update` catalog is authoritative for an
+  attached session. Before a Logical Session exists, the provider adapter may
+  expose the built-in catalog of an exact pinned managed Adapter; the Codex
+  fallback must match the selected `codex` Agent, a `codex-acp` launch shape,
+  and a Profile with `slash_commands` enabled.
 - ACP/OpenCode provider slash commands are profile-aware. Generic ACP profiles
   must not receive the OpenCode command catalog unless their typed profile
   config identifies an OpenCode-compatible runtime or catalog marker.
@@ -806,6 +811,9 @@ Agents.
 
 - Provider adapter tests assert deterministic command discovery for every
   static catalog added.
+- Codex ACP tests assert the pinned built-in catalog is available with no
+  `session_id`, live session commands replace that fallback, and Generic ACP
+  Profiles never inherit it.
 - Manager tests assert provider command execution delegates through
   `agent_execute_command` and unsupported sources return capability errors.
 - Desktop/Tauri tests assert `$` local skills and `@` references are merged
