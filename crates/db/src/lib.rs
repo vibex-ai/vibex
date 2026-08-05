@@ -54,6 +54,8 @@ mod remote_v2;
 pub use remote_v2::*;
 mod provider_projection;
 pub use provider_projection::*;
+mod agent_provider_probe;
+pub use agent_provider_probe::*;
 mod usage;
 pub use usage::*;
 
@@ -70,7 +72,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 37;
+pub const CURRENT_SCHEMA_VERSION: i64 = 38;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -1609,6 +1611,35 @@ const MIGRATIONS: &[Migration] = &[
                 ON agent_configured_model_bindings(
                     agent_model_provider_binding_id, order_index
                 );
+        ",
+    },
+    Migration {
+        version: 38,
+        name: "agent_runtime_provider_probe_evidence",
+        sql: "
+            CREATE TABLE IF NOT EXISTS agent_runtime_provider_probes (
+                probe_id TEXT PRIMARY KEY,
+                agent_runtime_profile_id TEXT NOT NULL
+                    REFERENCES agent_runtime_profiles(agent_runtime_profile_id),
+                agent_model_provider_binding_id TEXT NULL
+                    REFERENCES agent_model_provider_bindings_v2(agent_model_provider_binding_id),
+                agent_id TEXT NOT NULL,
+                adapter_id TEXT NOT NULL,
+                descriptor_id TEXT NOT NULL,
+                descriptor_version TEXT NOT NULL,
+                status TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                record_json TEXT NOT NULL,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                revision INTEGER NOT NULL CHECK(revision > 0),
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                finished_at_ms INTEGER NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_runtime_provider_probes_runtime
+                ON agent_runtime_provider_probes(agent_runtime_profile_id, updated_at_ms);
+            CREATE INDEX IF NOT EXISTS idx_agent_runtime_provider_probes_status
+                ON agent_runtime_provider_probes(status, updated_at_ms);
         ",
     },
 ];
@@ -11322,7 +11353,8 @@ mod tests {
                 "34:worktree_merge_lifecycle",
                 "35:permission_response_options",
                 "36:agent_elicitation_requests",
-                "37:agent_provider_projection_platform"
+                "37:agent_provider_projection_platform",
+                "38:agent_runtime_provider_probe_evidence"
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -11462,7 +11494,8 @@ mod tests {
                 "34:worktree_merge_lifecycle",
                 "35:permission_response_options",
                 "36:agent_elicitation_requests",
-                "37:agent_provider_projection_platform"
+                "37:agent_provider_projection_platform",
+                "38:agent_runtime_provider_probe_evidence"
             ]
         );
         assert_eq!(
@@ -13008,7 +13041,8 @@ mod tests {
                 "34:worktree_merge_lifecycle",
                 "35:permission_response_options",
                 "36:agent_elicitation_requests",
-                "37:agent_provider_projection_platform"
+                "37:agent_provider_projection_platform",
+                "38:agent_runtime_provider_probe_evidence"
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)

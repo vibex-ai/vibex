@@ -4,11 +4,13 @@ use vibex_core::{
     AgentModelProviderBindingCreateRequest, AgentModelProviderBindingListRequest,
     AgentModelProviderBindingUpdateRequest, AgentProviderProjectionCapability,
     AgentProviderProjectionCapabilityRequest, AgentProviderProjectionPreview,
-    AgentProviderProjectionPreviewRequest, AgentRuntimeProfile, AgentRuntimeProfileCreateRequest,
-    AgentRuntimeProfileUpdateRequest, ModelProviderProfile, ModelProviderProfileCreateRequest,
-    ModelProviderProfileUpdateRequest, ProviderCredentialSecretMutationRequest,
-    ProviderHealthSummary, ProviderProfileId, ProviderProfileSummary,
-    ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, RelayPeerId, RelayRoomId,
+    AgentProviderProjectionPreviewRequest, AgentRuntimeProbeCancelRequest,
+    AgentRuntimeProbeListRequest, AgentRuntimeProbeRecord, AgentRuntimeProbeStartRequest,
+    AgentRuntimeProfile, AgentRuntimeProfileCreateRequest, AgentRuntimeProfileUpdateRequest,
+    ModelProviderProfile, ModelProviderProfileCreateRequest, ModelProviderProfileUpdateRequest,
+    ProviderCredentialSecretMutationRequest, ProviderHealthSummary, ProviderProfileId,
+    ProviderProfileSummary, ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult,
+    RelayPeerId, RelayRoomId,
 };
 
 use crate::{BackendBound, BackendFuture, MutationRequest};
@@ -105,6 +107,26 @@ pub trait ManagementBackend: BackendBound {
         &self,
         request: AgentProviderProjectionPreviewRequest,
     ) -> BackendFuture<'_, AgentProviderProjectionPreview>;
+
+    fn start_agent_runtime_probe(
+        &self,
+        request: MutationRequest<AgentRuntimeProbeStartRequest>,
+    ) -> BackendFuture<'_, AgentRuntimeProbeRecord>;
+
+    fn get_agent_runtime_probe(
+        &self,
+        probe_id: vibex_core::AgentRuntimeProbeId,
+    ) -> BackendFuture<'_, Option<AgentRuntimeProbeRecord>>;
+
+    fn list_agent_runtime_probes(
+        &self,
+        request: AgentRuntimeProbeListRequest,
+    ) -> BackendFuture<'_, Vec<AgentRuntimeProbeRecord>>;
+
+    fn cancel_agent_runtime_probe(
+        &self,
+        request: MutationRequest<AgentRuntimeProbeCancelRequest>,
+    ) -> BackendFuture<'_, AgentRuntimeProbeRecord>;
 
     fn mutate_provider_credential_secret(
         &self,

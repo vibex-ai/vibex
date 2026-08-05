@@ -24,7 +24,9 @@ use vibex_core::{
     RemoteAgentProjectionCapabilityResponse, RemoteAgentProjectionPreviewResponse,
     RemoteAgentRequest, RemoteAgentResolveElicitationResponse,
     RemoteAgentResolvePermissionResponse, RemoteAgentRuntimeEventsResponse,
-    RemoteAgentRuntimeOptionsResponse, RemoteAgentRuntimeProcessSnapshotResponse,
+    RemoteAgentRuntimeOptionsResponse, RemoteAgentRuntimeProbeCancelResponse,
+    RemoteAgentRuntimeProbeGetResponse, RemoteAgentRuntimeProbeListResponse,
+    RemoteAgentRuntimeProbeStartResponse, RemoteAgentRuntimeProcessSnapshotResponse,
     RemoteAgentRuntimeSelectionResponse, RemoteAgentRuntimeSnapshotResponse,
     RemoteAgentSendMessageResponse, RemoteAgentSessionDetailResponse,
     RemoteAgentSessionListResponse, RemoteAgentSetDesiredRuntimeResponse,
@@ -116,6 +118,7 @@ struct RemoteRouterState {
     runtime_lifecycle: Option<Arc<RuntimeLifecycleService>>,
     message_submission: Option<Arc<MessageSubmissionCoordinator>>,
     runtime_catalog: Option<Arc<dyn RemoteRuntimeOptionCatalogSource>>,
+    runtime_probes: Option<Arc<dyn RemoteAgentRuntimeProbeSource>>,
     workbench: Option<RemoteWorkbenchRuntime>,
     provider: Option<RemoteProviderRuntime>,
 }
@@ -123,6 +126,29 @@ struct RemoteRouterState {
 #[async_trait]
 pub trait RemoteRuntimeOptionCatalogSource: Send + Sync {
     async fn list_runtime_options(&self) -> VibexResult<SessionRuntimeOptionCatalog>;
+}
+
+#[async_trait]
+pub trait RemoteAgentRuntimeProbeSource: Send + Sync {
+    async fn start_runtime_probe(
+        &self,
+        request: vibex_core::AgentRuntimeProbeStartRequest,
+    ) -> VibexResult<vibex_core::AgentRuntimeProbeRecord>;
+
+    async fn get_runtime_probe(
+        &self,
+        probe_id: vibex_core::AgentRuntimeProbeId,
+    ) -> VibexResult<Option<vibex_core::AgentRuntimeProbeRecord>>;
+
+    async fn list_runtime_probes(
+        &self,
+        request: vibex_core::AgentRuntimeProbeListRequest,
+    ) -> VibexResult<Vec<vibex_core::AgentRuntimeProbeRecord>>;
+
+    async fn cancel_runtime_probe(
+        &self,
+        request: vibex_core::AgentRuntimeProbeCancelRequest,
+    ) -> VibexResult<vibex_core::AgentRuntimeProbeRecord>;
 }
 
 #[async_trait]
@@ -191,6 +217,7 @@ impl RemoteRouterState {
             runtime_lifecycle: None,
             message_submission: None,
             runtime_catalog: None,
+            runtime_probes: None,
             workbench: None,
             provider: None,
         }
@@ -205,6 +232,7 @@ impl RemoteRouterState {
             runtime_lifecycle: None,
             message_submission: None,
             runtime_catalog: None,
+            runtime_probes: None,
             workbench: None,
             provider: None,
         }
@@ -224,6 +252,7 @@ impl RemoteRouterState {
             runtime_lifecycle: None,
             message_submission: None,
             runtime_catalog: None,
+            runtime_probes: None,
             workbench: Some(workbench),
             provider: Some(provider),
         }
@@ -245,6 +274,7 @@ impl RemoteRouterState {
             runtime_lifecycle: None,
             message_submission: Some(message_submission),
             runtime_catalog: None,
+            runtime_probes: None,
             workbench: Some(workbench),
             provider: Some(provider),
         }
@@ -367,6 +397,14 @@ impl RemoteDispatcher {
         self.state.runtime_catalog = Some(source);
         self.state.capabilities.supports_seamless_runtime_selection =
             self.state.runtime_selection.is_some();
+        self
+    }
+
+    pub fn with_agent_runtime_probe_source(
+        mut self,
+        source: Arc<dyn RemoteAgentRuntimeProbeSource>,
+    ) -> Self {
+        self.state.runtime_probes = Some(source);
         self
     }
 
@@ -1227,6 +1265,79 @@ async fn dispatch_provider_request(
             serde_json::to_value(RemoteAgentProjectionPreviewResponse { preview })
                 .map_err(remote_payload_encode_error)
         }
+        RemoteProviderRequest::StartRuntimeProbe(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let source = remote_runtime_probe_source(state)?;
+            let result = source.start_runtime_probe(request.request).await;
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "agent_runtime_probe_start",
+                "Agent runtime probe requested".to_string(),
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            serde_json::to_value(RemoteAgentRuntimeProbeStartResponse { probe: result? })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::GetRuntimeProbe(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let probe = remote_runtime_probe_source(state)?
+                .get_runtime_probe(request.probe_id)
+                .await?;
+            serde_json::to_value(RemoteAgentRuntimeProbeGetResponse { probe })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::ListRuntimeProbes(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let probes = remote_runtime_probe_source(state)?
+                .list_runtime_probes(request.request)
+                .await?;
+            serde_json::to_value(RemoteAgentRuntimeProbeListResponse { probes })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::CancelRuntimeProbe(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = remote_runtime_probe_source(state)?
+                .cancel_runtime_probe(request.request)
+                .await;
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "agent_runtime_probe_cancel",
+                "Agent runtime probe cancellation requested".to_string(),
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            serde_json::to_value(RemoteAgentRuntimeProbeCancelResponse { probe: result? })
+                .map_err(remote_payload_encode_error)
+        }
         RemoteProviderRequest::ListHealthSummaries(request) => {
             authorize_provider_action(
                 runtime,
@@ -1300,6 +1411,17 @@ async fn dispatch_provider_request(
             .map_err(remote_payload_encode_error)
         }
     }
+}
+
+fn remote_runtime_probe_source(
+    state: &RemoteRouterState,
+) -> VibexResult<&Arc<dyn RemoteAgentRuntimeProbeSource>> {
+    state.runtime_probes.as_ref().ok_or_else(|| {
+        VibexError::capability(
+            "remote_agent_runtime_probe_unavailable",
+            "Agent runtime probe execution is not available on this service",
+        )
+    })
 }
 
 async fn dispatch_agent_request(
@@ -2878,6 +3000,15 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct TestRuntimeProbeSource {
+        record: Mutex<vibex_core::AgentRuntimeProbeRecord>,
+        start_calls: AtomicUsize,
+        get_calls: AtomicUsize,
+        list_calls: AtomicUsize,
+        cancel_calls: AtomicUsize,
+        sensitive_execution_state: Vec<String>,
+    }
+
     struct TestWorktreeSnapshotSource {
         eligibility: vibex_core::GitProjectEligibility,
         snapshot: vibex_core::GitWorktreeLifecycleSnapshot,
@@ -2913,11 +3044,118 @@ mod tests {
         }
     }
 
+    impl TestRuntimeProbeSource {
+        fn new() -> Self {
+            let mut record = vibex_core::AgentRuntimeProbeRecord::requested(
+                vibex_core::AgentRuntimeProbeId::new(),
+                vibex_core::AgentRuntimeProbeRequest {
+                    runtime_profile_id: vibex_core::AgentRuntimeProfileId::new(),
+                    binding_id: Some(vibex_core::AgentModelProviderBindingId::new()),
+                    workspace_key: "remote-probe-workspace".to_string(),
+                    timeout_ms: vibex_core::MIN_PROBE_TIMEOUT_MS,
+                    minimal_prompt: false,
+                },
+                AgentId::parse("codex").unwrap(),
+                vibex_core::AcpAdapterId::parse("codex-acp").unwrap(),
+                vibex_core::AgentProviderProjectionDescriptorId::parse(
+                    vibex_core::CODEX_PROJECTION_DESCRIPTOR_ID,
+                )
+                .unwrap(),
+                "1".to_string(),
+                1,
+            )
+            .unwrap();
+            record.status = vibex_core::AgentRuntimeProbeStatus::Running;
+            record.stage = vibex_core::AgentRuntimeProbeStage::InitializingAcp;
+            record.facts = vec![
+                vibex_core::AgentRuntimeProbeFact::passed(
+                    vibex_core::AgentRuntimeProbeCapability::BinaryIdentity,
+                ),
+                vibex_core::AgentRuntimeProbeFact::passed(
+                    vibex_core::AgentRuntimeProbeCapability::AcpHandshake,
+                ),
+            ];
+            Self {
+                record: Mutex::new(record),
+                start_calls: AtomicUsize::new(0),
+                get_calls: AtomicUsize::new(0),
+                list_calls: AtomicUsize::new(0),
+                cancel_calls: AtomicUsize::new(0),
+                sensitive_execution_state: vec![
+                    "runtime-probe-command-sentinel".to_string(),
+                    "runtime-probe-secret-sentinel".to_string(),
+                    "runtime-probe-overlay-content-sentinel".to_string(),
+                    "native-session-runtime-probe-sentinel".to_string(),
+                    "/home/runtime-probe-user".to_string(),
+                    "/tmp/runtime-probe-private".to_string(),
+                ],
+            }
+        }
+
+        fn record(&self) -> vibex_core::AgentRuntimeProbeRecord {
+            self.record.lock().unwrap().clone()
+        }
+    }
+
     #[async_trait::async_trait]
     impl RemoteRuntimeOptionCatalogSource for TestRuntimeCatalogSource {
         async fn list_runtime_options(&self) -> VibexResult<SessionRuntimeOptionCatalog> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.catalog.clone())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteAgentRuntimeProbeSource for TestRuntimeProbeSource {
+        async fn start_runtime_probe(
+            &self,
+            _request: vibex_core::AgentRuntimeProbeStartRequest,
+        ) -> VibexResult<vibex_core::AgentRuntimeProbeRecord> {
+            self.start_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.record())
+        }
+
+        async fn get_runtime_probe(
+            &self,
+            probe_id: vibex_core::AgentRuntimeProbeId,
+        ) -> VibexResult<Option<vibex_core::AgentRuntimeProbeRecord>> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            let record = self.record();
+            Ok((record.id == probe_id).then_some(record))
+        }
+
+        async fn list_runtime_probes(
+            &self,
+            request: vibex_core::AgentRuntimeProbeListRequest,
+        ) -> VibexResult<Vec<vibex_core::AgentRuntimeProbeRecord>> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            let record = self.record();
+            Ok(request
+                .runtime_profile_id
+                .as_ref()
+                .is_none_or(|profile_id| profile_id == &record.request.runtime_profile_id)
+                .then_some(record)
+                .into_iter()
+                .collect())
+        }
+
+        async fn cancel_runtime_probe(
+            &self,
+            request: vibex_core::AgentRuntimeProbeCancelRequest,
+        ) -> VibexResult<vibex_core::AgentRuntimeProbeRecord> {
+            self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+            let mut record = self.record.lock().unwrap();
+            if record.id != request.probe_id || record.revision != request.expected_revision {
+                return Err(VibexError::conflict(
+                    "test_runtime_probe_revision_conflict",
+                    "test runtime probe revision does not match",
+                ));
+            }
+            record.set_cancel_requested(2);
+            record.status = vibex_core::AgentRuntimeProbeStatus::Cancelled;
+            record.stage = vibex_core::AgentRuntimeProbeStage::Completed;
+            record.finished_at_ms = Some(2);
+            Ok(record.clone())
         }
     }
 
@@ -3553,6 +3791,7 @@ mod tests {
                 runtime_lifecycle: Some(lifecycle.clone()),
                 message_submission: None,
                 runtime_catalog: None,
+                runtime_probes: None,
                 workbench: None,
                 provider: None,
             },
@@ -4371,6 +4610,176 @@ mod tests {
         assert!(!preview_json.contains("secretEnv"));
         assert!(!preview_json.contains("/home/"));
         assert!(!preview_json.contains("/tmp/"));
+
+        cleanup_db(db_path);
+    }
+
+    #[tokio::test]
+    async fn remote_runtime_probes_enforce_permissions_audit_and_redaction() {
+        let (db_path, manager) = test_agent_manager("provider-runtime-probes");
+        let reader = pair_device(&db_path, RemoteDevicePermissionLevel::ReadOnly, "Reader");
+        let controller = pair_device(
+            &db_path,
+            RemoteDevicePermissionLevel::FullControl,
+            "Controller",
+        );
+        let source = Arc::new(TestRuntimeProbeSource::new());
+        let initial = source.record();
+        let dispatcher = RemoteDispatcher::with_agent_and_workbench(
+            RemoteServiceConfig::loopback_disabled(),
+            manager,
+            RemoteWorkbenchRuntime::new(db_path.clone(), TerminalManager::new()),
+        )
+        .with_agent_runtime_probe_source(source.clone());
+        let router = build_router_with_dispatcher(dispatcher);
+
+        let get = post_provider(
+            router.clone(),
+            RemoteProviderRequest::GetRuntimeProbe(vibex_core::RemoteAgentRuntimeProbeGetRequest {
+                auth: reader.clone(),
+                probe_id: initial.id.clone(),
+            }),
+        )
+        .await;
+        let get_json = serde_json::to_string(&get).unwrap();
+        let get_payload: vibex_core::RemoteAgentRuntimeProbeGetResponse =
+            serde_json::from_value(get.payload.unwrap()).unwrap();
+        assert_eq!(get.status, RemoteEnvelopeStatus::Ok);
+        assert_eq!(get_payload.probe.unwrap().id, initial.id);
+
+        let list = post_provider(
+            router.clone(),
+            RemoteProviderRequest::ListRuntimeProbes(
+                vibex_core::RemoteAgentRuntimeProbeListRequest {
+                    auth: reader.clone(),
+                    request: vibex_core::AgentRuntimeProbeListRequest::default(),
+                },
+            ),
+        )
+        .await;
+        let list_json = serde_json::to_string(&list).unwrap();
+        let list_payload: vibex_core::RemoteAgentRuntimeProbeListResponse =
+            serde_json::from_value(list.payload.unwrap()).unwrap();
+        assert_eq!(list.status, RemoteEnvelopeStatus::Ok);
+        assert_eq!(list_payload.probes.len(), 1);
+        assert_eq!(source.get_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(source.list_calls.load(Ordering::SeqCst), 1);
+
+        let start_request = vibex_core::AgentRuntimeProbeStartRequest {
+            runtime_profile_id: initial.request.runtime_profile_id.clone(),
+            binding_id: initial.request.binding_id.clone(),
+            workspace_key: "remote-probe-workspace".to_string(),
+            timeout_ms: vibex_core::MIN_PROBE_TIMEOUT_MS,
+            minimal_prompt: false,
+        };
+        let denied_start = post_provider(
+            router.clone(),
+            RemoteProviderRequest::StartRuntimeProbe(
+                vibex_core::RemoteAgentRuntimeProbeStartRequest {
+                    auth: reader.clone(),
+                    request: start_request.clone(),
+                },
+            ),
+        )
+        .await;
+        let denied_cancel = post_provider(
+            router.clone(),
+            RemoteProviderRequest::CancelRuntimeProbe(
+                vibex_core::RemoteAgentRuntimeProbeCancelRequest {
+                    auth: reader,
+                    request: vibex_core::AgentRuntimeProbeCancelRequest {
+                        probe_id: initial.id.clone(),
+                        expected_revision: initial.revision,
+                    },
+                },
+            ),
+        )
+        .await;
+        assert_eq!(denied_start.error.unwrap().code, "remote_permission_denied");
+        assert_eq!(
+            denied_cancel.error.unwrap().code,
+            "remote_permission_denied"
+        );
+        assert_eq!(source.start_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(source.cancel_calls.load(Ordering::SeqCst), 0);
+
+        let allowed_start = post_provider(
+            router.clone(),
+            RemoteProviderRequest::StartRuntimeProbe(
+                vibex_core::RemoteAgentRuntimeProbeStartRequest {
+                    auth: controller.clone(),
+                    request: start_request,
+                },
+            ),
+        )
+        .await;
+        let start_json = serde_json::to_string(&allowed_start).unwrap();
+        let start_payload: vibex_core::RemoteAgentRuntimeProbeStartResponse =
+            serde_json::from_value(allowed_start.payload.unwrap()).unwrap();
+        assert_eq!(allowed_start.status, RemoteEnvelopeStatus::Ok);
+        assert_eq!(source.start_calls.load(Ordering::SeqCst), 1);
+
+        let allowed_cancel = post_provider(
+            router,
+            RemoteProviderRequest::CancelRuntimeProbe(
+                vibex_core::RemoteAgentRuntimeProbeCancelRequest {
+                    auth: controller.clone(),
+                    request: vibex_core::AgentRuntimeProbeCancelRequest {
+                        probe_id: start_payload.probe.id,
+                        expected_revision: start_payload.probe.revision,
+                    },
+                },
+            ),
+        )
+        .await;
+        let cancel_json = serde_json::to_string(&allowed_cancel).unwrap();
+        let cancel_payload: vibex_core::RemoteAgentRuntimeProbeCancelResponse =
+            serde_json::from_value(allowed_cancel.payload.unwrap()).unwrap();
+        assert_eq!(allowed_cancel.status, RemoteEnvelopeStatus::Ok);
+        assert_eq!(
+            cancel_payload.probe.status,
+            vibex_core::AgentRuntimeProbeStatus::Cancelled
+        );
+        assert_eq!(source.cancel_calls.load(Ordering::SeqCst), 1);
+
+        let serialized = [get_json, list_json, start_json, cancel_json].join("\n");
+        for sentinel in &source.sensitive_execution_state {
+            assert!(!serialized.contains(sentinel), "leaked {sentinel}");
+        }
+        assert!(!serialized.contains(&controller.auth_token));
+        assert!(!serialized.contains("\"command\""));
+        assert!(!serialized.contains("\"overlayContent\""));
+        assert!(!serialized.contains("\"nativeSessionId\""));
+        assert!(!serialized.contains("/home/"));
+        assert!(!serialized.contains("/tmp/"));
+
+        let mut conn = open_database(&db_path).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let audits = RemoteAuditRepository::list(
+            &conn,
+            &RemoteAuditListRequest {
+                device_id: Some(controller.device_id),
+                limit: Some(50),
+            },
+        )
+        .unwrap();
+        assert!(audits.iter().any(|record| {
+            record.target_kind == RemoteAuditTargetKind::ProviderSettings
+                && record.target_id.as_deref() == Some("agent_runtime_probe_start")
+                && record.action == RemoteAuditAction::MutationAllowed
+        }));
+        assert!(audits.iter().any(|record| {
+            record.target_kind == RemoteAuditTargetKind::ProviderSettings
+                && record.target_id.as_deref() == Some("agent_runtime_probe_cancel")
+                && record.action == RemoteAuditAction::MutationAllowed
+        }));
+        assert!(audits.iter().all(|record| {
+            record.redacted_summary.len() <= 256
+                && source
+                    .sensitive_execution_state
+                    .iter()
+                    .all(|sentinel| !record.redacted_summary.contains(sentinel))
+        }));
 
         cleanup_db(db_path);
     }

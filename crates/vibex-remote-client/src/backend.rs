@@ -1773,6 +1773,110 @@ impl ManagementBackend for WebRemoteBackend {
         })
     }
 
+    fn start_agent_runtime_probe(
+        &self,
+        request: MutationRequest<vibex_core::AgentRuntimeProbeStartRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentRuntimeProbeRecord> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::StartRuntimeProbe(
+                vibex_core::RemoteAgentRuntimeProbeStartRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, None, None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentRuntimeProbeStartResponse>(value)?.probe)
+        })
+    }
+
+    fn get_agent_runtime_probe(
+        &self,
+        probe_id: vibex_core::AgentRuntimeProbeId,
+    ) -> BackendFuture<'_, Option<vibex_core::AgentRuntimeProbeRecord>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::GetRuntimeProbe(
+                vibex_core::RemoteAgentRuntimeProbeGetRequest {
+                    auth: this.auth(),
+                    probe_id,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentRuntimeProbeGetResponse>(value)?.probe)
+        })
+    }
+
+    fn list_agent_runtime_probes(
+        &self,
+        request: vibex_core::AgentRuntimeProbeListRequest,
+    ) -> BackendFuture<'_, Vec<vibex_core::AgentRuntimeProbeRecord>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::ListRuntimeProbes(
+                vibex_core::RemoteAgentRuntimeProbeListRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentRuntimeProbeListResponse>(value)?.probes)
+        })
+    }
+
+    fn cancel_agent_runtime_probe(
+        &self,
+        request: MutationRequest<vibex_core::AgentRuntimeProbeCancelRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentRuntimeProbeRecord> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::CancelRuntimeProbe(
+                vibex_core::RemoteAgentRuntimeProbeCancelRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, None, None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentRuntimeProbeCancelResponse>(value)?.probe)
+        })
+    }
+
     fn mutate_provider_credential_secret(
         &self,
         _request: MutationRequest<vibex_core::ProviderCredentialSecretMutationRequest>,
@@ -2156,6 +2260,14 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
                     permits(RemoteActionClass::ReadProviderSettings),
                 ),
                 (
+                    BackendOperation::ManagementRuntimeProbeRead,
+                    permits(RemoteActionClass::ReadProviderSettings),
+                ),
+                (
+                    BackendOperation::ManagementRuntimeProbeMutate,
+                    permits(RemoteActionClass::MutateProviderSettings),
+                ),
+                (
                     BackendOperation::ManagementHealth,
                     permits(RemoteActionClass::ReadProviderSettings),
                 ),
@@ -2536,7 +2648,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_management_exposes_redacted_profiles_and_health_only() {
+    fn remote_management_exposes_redacted_profiles_health_and_runtime_probes() {
         let snapshot = remote_capabilities(None);
         assert!(
             snapshot
@@ -2549,6 +2661,16 @@ mod tests {
                 .supports(BackendOperation::ManagementHealth)
         );
         assert!(
+            snapshot
+                .management
+                .supports(BackendOperation::ManagementRuntimeProbeRead)
+        );
+        assert!(
+            snapshot
+                .management
+                .supports(BackendOperation::ManagementRuntimeProbeMutate)
+        );
+        assert!(
             !snapshot
                 .management
                 .supports(BackendOperation::ManagementProfileSelect)
@@ -2557,6 +2679,25 @@ mod tests {
             snapshot.device.availability,
             vibex_backend::CapabilityAvailability::Unsupported
         ));
+    }
+
+    #[test]
+    fn remote_runtime_probe_capabilities_follow_provider_permissions() {
+        let mut info = full_control_server_info(&["provider_settings"]);
+        info.device_permissions = vec![RemoteActionClass::ReadProviderSettings];
+
+        let snapshot = remote_capabilities(Some(&info));
+
+        assert!(
+            snapshot
+                .management
+                .supports(BackendOperation::ManagementRuntimeProbeRead)
+        );
+        assert!(
+            !snapshot
+                .management
+                .supports(BackendOperation::ManagementRuntimeProbeMutate)
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@
 mod acp_catalog;
 pub mod agent;
 pub mod agent_config;
+pub mod agent_provider_runtime;
 pub mod automation_graph;
 pub mod canonical_json;
 pub mod diagnostics;
@@ -53,6 +54,7 @@ pub use agent_config::{
     AgentRuntimeStatus, AgentSnapshotEntry, AgentSourceKind, AgentUpdateConfigRequest,
     agent_id_for_provider_kind, builtin_agent_definitions,
 };
+pub use agent_provider_runtime::*;
 pub use automation_graph::{
     AutomationAgentPromptConfig, AutomationApprovalGateConfig, AutomationEdge,
     AutomationEdgeCondition, AutomationEdgeConditionKind, AutomationEdgeCreateRequest,
@@ -121,9 +123,9 @@ pub use git::{
 };
 pub use ids::{
     AgentConfiguredModelBindingId, AgentModelProviderBindingId,
-    AgentProviderProjectionDescriptorId, AgentRuntimeProfileId, AutomationEdgeId,
-    AutomationGraphId, AutomationNodeId, AutomationRunId, AutomationRunStepId, ChannelId,
-    CorrelationId, DeviceId, EventId, HookId, McpServerId, MessageSubmissionId,
+    AgentProviderProjectionDescriptorId, AgentRuntimeProbeId, AgentRuntimeProfileId,
+    AutomationEdgeId, AutomationGraphId, AutomationNodeId, AutomationRunId, AutomationRunStepId,
+    ChannelId, CorrelationId, DeviceId, EventId, HookId, McpServerId, MessageSubmissionId,
     ModelProviderProfileId, NativeStateHomeId, ProjectId, PromptId, ProviderProfileId,
     RelayConnectionId, RelayFrameId, RelayPeerId, RelayRoomId, RelaySessionId, RequestId,
     RightRailPluginId, RuntimeBindingId, RuntimeClientId, RuntimeLeaseId, RuntimeProcessId,
@@ -223,7 +225,11 @@ pub use remote::{
     RemoteAgentResolveElicitationResponse, RemoteAgentResolvePermissionRequest,
     RemoteAgentResolvePermissionResponse, RemoteAgentRuntimeEventsRequest,
     RemoteAgentRuntimeEventsResponse, RemoteAgentRuntimeOptionsRequest,
-    RemoteAgentRuntimeOptionsResponse, RemoteAgentRuntimeProcessSnapshotRequest,
+    RemoteAgentRuntimeOptionsResponse, RemoteAgentRuntimeProbeCancelRequest,
+    RemoteAgentRuntimeProbeCancelResponse, RemoteAgentRuntimeProbeGetRequest,
+    RemoteAgentRuntimeProbeGetResponse, RemoteAgentRuntimeProbeListRequest,
+    RemoteAgentRuntimeProbeListResponse, RemoteAgentRuntimeProbeStartRequest,
+    RemoteAgentRuntimeProbeStartResponse, RemoteAgentRuntimeProcessSnapshotRequest,
     RemoteAgentRuntimeProcessSnapshotResponse, RemoteAgentRuntimeSelectionRequest,
     RemoteAgentRuntimeSelectionResponse, RemoteAgentRuntimeSnapshotRequest,
     RemoteAgentRuntimeSnapshotResponse, RemoteAgentSendMessageRequest,

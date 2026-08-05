@@ -1307,6 +1307,72 @@ impl ManagementBackend for NativeBackend {
         })
     }
 
+    fn start_agent_runtime_probe(
+        &self,
+        request: MutationRequest<vibex_core::AgentRuntimeProbeStartRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentRuntimeProbeRecord> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .start_agent_runtime_probe(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn get_agent_runtime_probe(
+        &self,
+        probe_id: vibex_core::AgentRuntimeProbeId,
+    ) -> BackendFuture<'_, Option<vibex_core::AgentRuntimeProbeRecord>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .get_agent_runtime_probe(&probe_id)
+                .map_err(Into::into)
+        })
+    }
+
+    fn list_agent_runtime_probes(
+        &self,
+        request: vibex_core::AgentRuntimeProbeListRequest,
+    ) -> BackendFuture<'_, Vec<vibex_core::AgentRuntimeProbeRecord>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .list_agent_runtime_probes(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn cancel_agent_runtime_probe(
+        &self,
+        request: MutationRequest<vibex_core::AgentRuntimeProbeCancelRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentRuntimeProbeRecord> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .cancel_agent_runtime_probe(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
     fn mutate_provider_credential_secret(
         &self,
         request: MutationRequest<vibex_core::ProviderCredentialSecretMutationRequest>,

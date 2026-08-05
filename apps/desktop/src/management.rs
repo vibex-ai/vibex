@@ -47,7 +47,9 @@ use vibex_desktop_runtime::{
     validate_external_open_url,
 };
 use vibex_markdown::code_font_weight;
-use vibex_ui::{AgentProviderBindingEditorState, ProjectionCredentialSurface};
+use vibex_ui::{
+    AgentProviderBindingEditorState, AgentRuntimeProbeProjection, ProjectionCredentialSurface,
+};
 
 use crate::assets::agent_brand_icon;
 use crate::gpui_ext::button_with_aria_label;
@@ -284,6 +286,7 @@ struct ManagementSnapshot {
     native_import_preview: Option<vibex_core::ProviderNativeImportPreview>,
     agent_profile_states: Vec<AgentProviderProfileState>,
     projection_states: Vec<AgentProviderProjectionState>,
+    runtime_probes: Vec<AgentRuntimeProbeProjection>,
     health_summaries: Vec<vibex_core::ProviderHealthSummary>,
     capability_summaries: Vec<vibex_core::ProviderCapabilitySummary>,
     runtime_option_snapshots: Vec<RuntimeOptionSnapshotSummary>,
@@ -313,6 +316,7 @@ struct AgentProviderProfileState {
 #[derive(Clone)]
 struct AgentProviderProjectionState {
     agent_id: String,
+    runtime_profile_id: vibex_core::AgentRuntimeProfileId,
     legacy_profile_id: Option<String>,
     binding: Option<vibex_core::AgentModelProviderBinding>,
     capability: vibex_core::AgentProviderProjectionCapability,
@@ -326,6 +330,7 @@ enum ManagementMutation {
     ProfileDelete(String),
     AcpConfig(String),
     ProviderProbe(String),
+    AgentRuntimeProbe(String),
     ProviderPreview(String),
     ProviderFailover(String),
     AgentToggle(String),
@@ -363,6 +368,7 @@ impl ManagementMutation {
             Self::ProfileDelete(id) => format!("profile:delete:{id}"),
             Self::AcpConfig(id) => format!("provider:acp-config:{id}"),
             Self::ProviderProbe(id) => format!("provider:probe:{id}"),
+            Self::AgentRuntimeProbe(id) => format!("agent:runtime-probe:{id}"),
             Self::ProviderPreview(id) => format!("provider:preview:{id}"),
             Self::ProviderFailover(id) => format!("provider:failover:{id}"),
             Self::AgentToggle(id) => format!("agent:toggle:{id}"),
@@ -424,6 +430,7 @@ pub struct ManagementCenter {
     native_import_preview: Option<vibex_core::ProviderNativeImportPreview>,
     agent_profile_states: Vec<AgentProviderProfileState>,
     projection_states: Vec<AgentProviderProjectionState>,
+    runtime_probes: Vec<AgentRuntimeProbeProjection>,
     projection_editor: AgentProviderBindingEditorState,
     health_summaries: Vec<vibex_core::ProviderHealthSummary>,
     capability_summaries: Vec<vibex_core::ProviderCapabilitySummary>,
@@ -799,6 +806,7 @@ impl ManagementCenter {
             native_import_preview: None,
             agent_profile_states: Vec::new(),
             projection_states: Vec::new(),
+            runtime_probes: Vec::new(),
             projection_editor: AgentProviderBindingEditorState::default(),
             health_summaries: Vec::new(),
             capability_summaries: Vec::new(),
@@ -1270,6 +1278,7 @@ impl ManagementCenter {
         self.native_import_preview = snapshot.native_import_preview;
         self.agent_profile_states = snapshot.agent_profile_states;
         self.projection_states = snapshot.projection_states;
+        self.runtime_probes = snapshot.runtime_probes;
         if !self.snapshot.agents.iter().any(|agent| {
             agent.added && self.selected_agent_id.as_deref() == Some(agent.id.as_str())
         }) {
@@ -2096,6 +2105,98 @@ impl ManagementCenter {
                     &result,
                     active_locale,
                 ))
+            },
+        );
+    }
+
+    fn run_agent_runtime_probe(&mut self, cx: &mut Context<Self>) {
+        let (Some(runtime), Some(projection), Some(agent_id)) = (
+            self.runtime.clone(),
+            self.current_projection_state().cloned(),
+            self.selected_agent_id.clone(),
+        ) else {
+            self.error = Some(
+                management_locale_text(
+                    "No runtime profile is available for verification",
+                    "没有可用于验证的运行时配置",
+                    "沒有可用於驗證的執行階段設定",
+                )
+                .into(),
+            );
+            cx.notify();
+            return;
+        };
+        let workspace_key = self
+            .pairing_workspace_id
+            .as_ref()
+            .map(|id| id.as_str().to_string())
+            .unwrap_or_else(|| "management-global".to_string());
+        let active_locale = locale::current_locale();
+        self.begin_simple_task(
+            ManagementMutation::AgentRuntimeProbe(format!("run:{agent_id}")),
+            cx,
+            async move {
+                let probe = runtime
+                    .management()
+                    .providers()
+                    .management()
+                    .start_agent_runtime_probe(vibex_core::AgentRuntimeProbeStartRequest {
+                        runtime_profile_id: projection.runtime_profile_id,
+                        binding_id: projection.binding.map(|binding| binding.id),
+                        workspace_key,
+                        timeout_ms: 60_000,
+                        minimal_prompt: false,
+                    })?;
+                Ok(match active_locale {
+                    ResolvedLocale::En => format!("Runtime verification started: {}", probe.id),
+                    ResolvedLocale::ZhCn => format!("运行时验证已启动：{}", probe.id),
+                    ResolvedLocale::ZhTw => format!("執行階段驗證已啟動：{}", probe.id),
+                })
+            },
+        );
+    }
+
+    fn cancel_agent_runtime_probe(
+        &mut self,
+        probe_id: String,
+        expected_revision: i64,
+        cx: &mut Context<Self>,
+    ) {
+        let (Ok(probe_id), Some(runtime)) = (
+            vibex_core::AgentRuntimeProbeId::parse(probe_id.clone()),
+            self.runtime.clone(),
+        ) else {
+            self.error = Some(
+                management_locale_text(
+                    "Runtime probe identity is invalid",
+                    "运行时探测标识无效",
+                    "執行階段探測識別碼無效",
+                )
+                .into(),
+            );
+            cx.notify();
+            return;
+        };
+        let active_locale = locale::current_locale();
+        self.begin_simple_task(
+            ManagementMutation::AgentRuntimeProbe(format!("cancel:{probe_id}")),
+            cx,
+            async move {
+                runtime
+                    .management()
+                    .providers()
+                    .management()
+                    .cancel_agent_runtime_probe(vibex_core::AgentRuntimeProbeCancelRequest {
+                        probe_id,
+                        expected_revision,
+                    })?;
+                Ok(management_locale_text_for(
+                    active_locale,
+                    "Runtime verification cancellation requested",
+                    "已请求取消运行时验证",
+                    "已要求取消執行階段驗證",
+                )
+                .to_string())
             },
         );
     }
@@ -6085,6 +6186,159 @@ impl ManagementCenter {
             .into_any_element()
     }
 
+    fn render_runtime_verification_card(
+        &mut self,
+        agent_id: &str,
+        agent_enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let latest = self
+            .runtime_probes
+            .iter()
+            .find(|probe| probe.agent_id == agent_id)
+            .cloned();
+        let pending = self.mutation.is_some();
+        let starting = matches!(
+            &self.mutation,
+            Some(ManagementMutation::AgentRuntimeProbe(action))
+                if action == &format!("run:{agent_id}")
+        );
+        let cancelling = latest.as_ref().is_some_and(|probe| {
+            matches!(
+                &self.mutation,
+                Some(ManagementMutation::AgentRuntimeProbe(action))
+                    if action == &format!("cancel:{}", probe.id)
+            )
+        });
+        let can_run = agent_enabled && self.current_projection_state().is_some();
+        let mut content = v_flex().w_full().min_w_0().gap_2().child(
+            h_flex()
+                .w_full()
+                .flex_wrap()
+                .items_center()
+                .justify_end()
+                .gap_2()
+                .child(
+                    Button::new("agent-runtime-verification-run")
+                        .small()
+                        .primary()
+                        .icon(IconName::CircleCheck)
+                        .label(management_locale_text(
+                            "Run verification",
+                            "运行验证",
+                            "執行驗證",
+                        ))
+                        .loading(starting)
+                        .disabled(pending || !can_run)
+                        .on_click(cx.listener(|this, _, _, cx| this.run_agent_runtime_probe(cx))),
+                )
+                .when_some(
+                    latest
+                        .as_ref()
+                        .filter(|probe| probe.can_cancel())
+                        .map(|probe| (probe.id.clone(), probe.revision)),
+                    |actions, (probe_id, revision)| {
+                        actions.child(
+                            Button::new("agent-runtime-verification-cancel")
+                                .small()
+                                .outline()
+                                .icon(IconName::CircleX)
+                                .label(management_cancel_label())
+                                .loading(cancelling)
+                                .disabled(pending)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.cancel_agent_runtime_probe(probe_id.clone(), revision, cx)
+                                })),
+                        )
+                    },
+                ),
+        );
+
+        if let Some(probe) = latest {
+            content = content
+                .child(management_projection_detail_row(
+                    management_locale_text("Status", "状态", "狀態"),
+                    format!("{:?}", probe.status),
+                    cx,
+                ))
+                .child(management_projection_detail_row(
+                    management_locale_text("Stage", "阶段", "階段"),
+                    format!("{:?}", probe.stage),
+                    cx,
+                ))
+                .child(management_projection_detail_row(
+                    management_locale_text("Descriptor", "描述符", "描述符"),
+                    format!("{} · v{}", probe.descriptor_id, probe.descriptor_version),
+                    cx,
+                ));
+            if let Some(code) = probe.diagnostic_code {
+                content = content.child(management_projection_detail_row(
+                    management_locale_text("Diagnostic", "诊断", "診斷"),
+                    code,
+                    cx,
+                ));
+            }
+            if probe.facts.is_empty() {
+                content = content.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(management_locale_text(
+                            "No verification facts recorded yet",
+                            "尚未记录验证事实",
+                            "尚未記錄驗證事實",
+                        )),
+                );
+            } else {
+                let mut facts = v_flex().w_full().gap_1();
+                for fact in probe.facts {
+                    facts = facts.child(
+                        h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .child(format!("{:?}", fact.capability)),
+                            )
+                            .child(management_status_badge(format!("{:?}", fact.status), cx)),
+                    );
+                }
+                content = content.child(facts);
+            }
+        } else {
+            content = content.child(compact_empty_state(
+                management_locale_text(
+                    "No runtime verification",
+                    "暂无运行时验证",
+                    "暫無執行階段驗證",
+                ),
+                management_locale_text(
+                    "No evidence has been recorded for this Agent.",
+                    "此 Agent 尚未记录运行证据。",
+                    "此 Agent 尚未記錄執行證據。",
+                ),
+                cx,
+            ));
+        }
+
+        management_card(
+            management_locale_text("Runtime verification", "运行时验证", "執行階段驗證"),
+            management_locale_text(
+                "Exact Agent and Adapter evidence",
+                "精确 Agent 与适配器证据",
+                "精確 Agent 與配接器證據",
+            ),
+            content.into_any_element(),
+            cx,
+        )
+    }
+
     fn render_projection_contract(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(capability) = self.projection_editor.capability.as_ref() else {
             return v_flex()
@@ -6943,12 +7197,15 @@ impl ManagementCenter {
             };
             failover_rows = failover_rows.child(row);
         }
+        let runtime_verification_card =
+            self.render_runtime_verification_card(&selected_agent_id, selected_agent.enabled, cx);
         let projection_contract = self.render_projection_contract(cx);
 
         v_flex()
             .w_full()
             .min_w_0()
             .gap_3()
+            .child(runtime_verification_card)
             .child(runtime_options_card)
             .child(projection_contract)
             .child(
@@ -12508,12 +12765,13 @@ async fn load_snapshot(
             if runtime_bindings.is_empty() {
                 let capability = provider.agent_provider_projection_capability(
                     vibex_core::AgentProviderProjectionCapabilityRequest {
-                        runtime_profile_id: runtime_profile.id,
+                        runtime_profile_id: runtime_profile.id.clone(),
                         binding_id: None,
                     },
                 )?;
                 projection_states.push(AgentProviderProjectionState {
                     agent_id: agent.id.as_str().to_string(),
+                    runtime_profile_id: runtime_profile.id,
                     legacy_profile_id: None,
                     binding: None,
                     capability,
@@ -12538,6 +12796,7 @@ async fn load_snapshot(
                     .ok();
                 projection_states.push(AgentProviderProjectionState {
                     agent_id: agent.id.as_str().to_string(),
+                    runtime_profile_id: runtime_profile.id.clone(),
                     legacy_profile_id: binding
                         .legacy_provider_profile_id
                         .as_ref()
@@ -12553,6 +12812,14 @@ async fn load_snapshot(
     let skills = provider.list_skills()?;
     let prompts = provider.list_prompts()?;
     let hooks = provider.list_hooks()?;
+    let runtime_probes = provider
+        .list_agent_runtime_probes(vibex_core::AgentRuntimeProbeListRequest {
+            runtime_profile_id: None,
+            limit: Some(100),
+        })?
+        .iter()
+        .map(AgentRuntimeProbeProjection::from_record)
+        .collect();
     let health_summaries = provider.list_health_summaries()?;
     let capability_summaries = provider.list_capability_summaries()?;
     let runtime_option_snapshots = runtime.agent().runtime_catalog().snapshot_summaries()?;
@@ -12653,6 +12920,7 @@ async fn load_snapshot(
         native_import_preview,
         agent_profile_states,
         projection_states,
+        runtime_probes,
         health_summaries,
         capability_summaries,
         runtime_option_snapshots,

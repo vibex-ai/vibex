@@ -15,9 +15,11 @@ use vibex_backend::{
     MutationRequest, RelayConnectionState, RelayStatusSummary,
 };
 use vibex_core::{
-    AgentListRequest, ProviderHealthStatus, ProviderProfileSummary, ProviderRunHealthProbesRequest,
-    ProviderRunHealthProbesResult, RemoteAuditListRequest, RemoteAuditRecord,
-    RemoteCancelPairingOfferRequest, RemoteCreatePairingOfferRequest,
+    AgentListRequest, AgentRuntimeProbeCancelRequest, AgentRuntimeProbeFactStatus,
+    AgentRuntimeProbeListRequest, AgentRuntimeProbeRecord, AgentRuntimeProbeStartRequest,
+    AgentRuntimeProbeStatus, ProviderHealthStatus, ProviderProfileSummary,
+    ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, RemoteAuditListRequest,
+    RemoteAuditRecord, RemoteCancelPairingOfferRequest, RemoteCreatePairingOfferRequest,
     RemoteCreatePairingOfferResponse, RemoteDeviceDetail, RemoteDevicePermissionLevel,
     RemoteDeviceStatus, RemotePairingOfferSummary, RemoteRevokeDeviceRequest, RequestId,
 };
@@ -159,6 +161,83 @@ impl ProviderProfileProjection {
             secret_setup_state: profile.secret_setup_state,
             updated_at_ms: profile.updated_at_ms,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRuntimeProbeFactProjection {
+    pub capability: vibex_core::AgentRuntimeProbeCapability,
+    pub status: AgentRuntimeProbeFactStatus,
+    pub diagnostic_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRuntimeProbeProjection {
+    pub id: String,
+    pub runtime_profile_id: String,
+    pub binding_id: Option<String>,
+    pub agent_id: String,
+    pub adapter_id: String,
+    pub descriptor_id: String,
+    pub descriptor_version: String,
+    pub status: AgentRuntimeProbeStatus,
+    pub stage: vibex_core::AgentRuntimeProbeStage,
+    pub facts: Vec<AgentRuntimeProbeFactProjection>,
+    pub diagnostic_code: Option<String>,
+    pub provider_projection_verified: bool,
+    pub live_switch_verified: bool,
+    pub revision: i64,
+    pub updated_at_ms: i64,
+    pub finished_at_ms: Option<i64>,
+}
+
+impl AgentRuntimeProbeProjection {
+    pub fn from_record(record: &AgentRuntimeProbeRecord) -> Self {
+        Self {
+            id: record.id.as_str().to_string(),
+            runtime_profile_id: record.request.runtime_profile_id.as_str().to_string(),
+            binding_id: record
+                .request
+                .binding_id
+                .as_ref()
+                .map(|id| id.as_str().to_string()),
+            agent_id: record.agent_id.as_str().to_string(),
+            adapter_id: record.adapter_id.as_str().to_string(),
+            descriptor_id: record.descriptor_id.as_str().to_string(),
+            descriptor_version: record.descriptor_version.clone(),
+            status: record.status,
+            stage: record.stage,
+            facts: record
+                .facts
+                .iter()
+                .map(|fact| AgentRuntimeProbeFactProjection {
+                    capability: fact.capability,
+                    status: fact.status,
+                    diagnostic_code: fact.diagnostic_code.clone(),
+                })
+                .collect(),
+            diagnostic_code: record.diagnostic_code.clone(),
+            provider_projection_verified: record
+                .evidence
+                .as_ref()
+                .is_some_and(|evidence| evidence.provider_projection_verified()),
+            live_switch_verified: record
+                .evidence
+                .as_ref()
+                .is_some_and(|evidence| evidence.live_switch_verified()),
+            revision: record.revision,
+            updated_at_ms: record.updated_at_ms,
+            finished_at_ms: record.finished_at_ms,
+        }
+    }
+
+    pub fn can_cancel(&self) -> bool {
+        matches!(
+            self.status,
+            AgentRuntimeProbeStatus::Requested | AgentRuntimeProbeStatus::Running
+        )
     }
 }
 
@@ -439,6 +518,7 @@ pub struct ManagementWorkflowState {
     pub load_state: ManagementLoadState,
     pub agents: Vec<AgentStatusProjection>,
     pub profiles: Vec<ProviderProfileProjection>,
+    pub runtime_probes: Vec<AgentRuntimeProbeProjection>,
     pub health: Vec<ProviderHealthProjection>,
     pub relay: Option<RelayStatusProjection>,
     pub devices: Vec<DeviceProjection>,
@@ -457,6 +537,7 @@ impl fmt::Debug for ManagementWorkflowState {
             .field("load_state", &self.load_state)
             .field("agent_count", &self.agents.len())
             .field("profile_count", &self.profiles.len())
+            .field("runtime_probe_count", &self.runtime_probes.len())
             .field("health_count", &self.health.len())
             .field("has_relay", &self.relay.is_some())
             .field("device_count", &self.devices.len())
@@ -479,6 +560,7 @@ impl Default for ManagementWorkflowState {
             load_state: ManagementLoadState::Idle,
             agents: Vec::new(),
             profiles: Vec::new(),
+            runtime_probes: Vec::new(),
             health: Vec::new(),
             relay: None,
             devices: Vec::new(),
@@ -545,6 +627,8 @@ impl ManagementWorkflowCapabilities {
             ManagementAgents,
             ManagementProfiles,
             ManagementProfileSelect,
+            ManagementRuntimeProbeRead,
+            ManagementRuntimeProbeMutate,
             ManagementHealth,
             ManagementRelay,
         ]
@@ -566,6 +650,8 @@ impl ManagementWorkflowCapabilities {
             BackendOperation::ManagementAgents
             | BackendOperation::ManagementProfiles
             | BackendOperation::ManagementProfileSelect
+            | BackendOperation::ManagementRuntimeProbeRead
+            | BackendOperation::ManagementRuntimeProbeMutate
             | BackendOperation::ManagementHealth
             | BackendOperation::ManagementRelay => &self.management,
             BackendOperation::DevicePairing
@@ -585,6 +671,8 @@ impl ManagementWorkflowCapabilities {
             BackendOperation::ManagementAgents
             | BackendOperation::ManagementProfiles
             | BackendOperation::ManagementProfileSelect
+            | BackendOperation::ManagementRuntimeProbeRead
+            | BackendOperation::ManagementRuntimeProbeMutate
             | BackendOperation::ManagementHealth
             | BackendOperation::ManagementRelay => &self.management,
             _ => &self.device,
@@ -629,6 +717,8 @@ fn management_operation_label(operation: BackendOperation) -> &'static str {
         ManagementAgents => "management_agents",
         ManagementProfiles => "management_profiles",
         ManagementProfileSelect => "management_profile_select",
+        ManagementRuntimeProbeRead => "management_runtime_probe_read",
+        ManagementRuntimeProbeMutate => "management_runtime_probe_mutate",
         ManagementHealth => "management_health",
         ManagementRelay => "management_relay",
         DevicePairing => "device_pairing",
@@ -647,6 +737,7 @@ pub struct ManagementWorkflowView {
     pub load_state: ManagementLoadState,
     pub agents: Vec<AgentStatusProjection>,
     pub profiles: Vec<ProviderProfileProjection>,
+    pub runtime_probes: Vec<AgentRuntimeProbeProjection>,
     pub health: Vec<ProviderHealthProjection>,
     pub relay: Option<RelayStatusProjection>,
     pub devices: Vec<DeviceProjection>,
@@ -668,6 +759,7 @@ impl fmt::Debug for ManagementWorkflowView {
             .field("load_state", &self.load_state)
             .field("agent_count", &self.agents.len())
             .field("profile_count", &self.profiles.len())
+            .field("runtime_probe_count", &self.runtime_probes.len())
             .field("health_count", &self.health.len())
             .field("has_relay", &self.relay.is_some())
             .field("device_count", &self.devices.len())
@@ -693,6 +785,7 @@ impl ManagementWorkflowState {
             load_state: self.load_state,
             agents: self.agents.clone(),
             profiles: self.profiles.clone(),
+            runtime_probes: self.runtime_probes.clone(),
             health: self.health.clone(),
             relay: self.relay.clone(),
             devices: self.devices.clone(),
@@ -798,6 +891,25 @@ impl ManagementWorkflowController {
         }
         if self
             .capabilities
+            .supports(BackendOperation::ManagementRuntimeProbeRead)
+        {
+            match self
+                .management
+                .list_agent_runtime_probes(AgentRuntimeProbeListRequest::default())
+                .await
+            {
+                Ok(probes) if generation == self.state.generation => {
+                    self.state.runtime_probes = probes
+                        .iter()
+                        .map(AgentRuntimeProbeProjection::from_record)
+                        .collect();
+                }
+                Err(error) => failures.push(error),
+                _ => return Ok(()),
+            }
+        }
+        if self
+            .capabilities
             .supports(BackendOperation::ManagementHealth)
         {
             match self.management.health_summaries().await {
@@ -843,6 +955,7 @@ impl ManagementWorkflowController {
                 ManagementLoadState::Offline
             } else if self.state.agents.is_empty()
                 && self.state.profiles.is_empty()
+                && self.state.runtime_probes.is_empty()
                 && self.state.health.is_empty()
                 && self.state.devices.is_empty()
             {
@@ -900,6 +1013,56 @@ impl ManagementWorkflowController {
             self.state.last_error = Some(error.clone());
         }
         result
+    }
+
+    pub async fn run_agent_runtime_probe(
+        &mut self,
+        request: MutationRequest<AgentRuntimeProbeStartRequest>,
+    ) -> BackendResult<AgentRuntimeProbeProjection> {
+        self.capabilities
+            .require(BackendOperation::ManagementRuntimeProbeMutate)?;
+        let operation = self.state.next_operation();
+        let result = self.management.start_agent_runtime_probe(request).await;
+        self.state.ensure_current_operation(operation)?;
+        match result {
+            Ok(record) => {
+                let projection = AgentRuntimeProbeProjection::from_record(&record);
+                self.state
+                    .runtime_probes
+                    .retain(|probe| probe.id != projection.id);
+                self.state.runtime_probes.insert(0, projection.clone());
+                Ok(projection)
+            }
+            Err(error) => {
+                self.state.last_error = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn cancel_agent_runtime_probe(
+        &mut self,
+        request: MutationRequest<AgentRuntimeProbeCancelRequest>,
+    ) -> BackendResult<AgentRuntimeProbeProjection> {
+        self.capabilities
+            .require(BackendOperation::ManagementRuntimeProbeMutate)?;
+        let operation = self.state.next_operation();
+        let result = self.management.cancel_agent_runtime_probe(request).await;
+        self.state.ensure_current_operation(operation)?;
+        match result {
+            Ok(record) => {
+                let projection = AgentRuntimeProbeProjection::from_record(&record);
+                self.state
+                    .runtime_probes
+                    .retain(|probe| probe.id != projection.id);
+                self.state.runtime_probes.insert(0, projection.clone());
+                Ok(projection)
+            }
+            Err(error) => {
+                self.state.last_error = Some(error.clone());
+                Err(error)
+            }
+        }
     }
 
     pub async fn create_pairing_offer(
@@ -983,6 +1146,7 @@ impl ManagementWorkflowController {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use vibex_backend::BackendFuture;
@@ -998,6 +1162,8 @@ mod tests {
     struct MockManagementBackend {
         selected_profile: ProviderProfileSummary,
         selection_requests: Arc<Mutex<Vec<ManagementProfileSelectionRequest>>>,
+        runtime_probe_record: Option<vibex_core::AgentRuntimeProbeRecord>,
+        runtime_probe_start_calls: Arc<AtomicUsize>,
     }
 
     impl ManagementBackend for MockManagementBackend {
@@ -1103,6 +1269,52 @@ mod tests {
             error_future()
         }
 
+        fn start_agent_runtime_probe(
+            &self,
+            _request: MutationRequest<vibex_core::AgentRuntimeProbeStartRequest>,
+        ) -> BackendFuture<'_, vibex_core::AgentRuntimeProbeRecord> {
+            let record = self.runtime_probe_record.clone();
+            let calls = self.runtime_probe_start_calls.clone();
+            Box::pin(async move {
+                let record = record.ok_or_else(|| {
+                    BackendError::unsupported("mock", "mock runtime probe is unavailable")
+                })?;
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(record)
+            })
+        }
+
+        fn get_agent_runtime_probe(
+            &self,
+            probe_id: vibex_core::AgentRuntimeProbeId,
+        ) -> BackendFuture<'_, Option<vibex_core::AgentRuntimeProbeRecord>> {
+            let record = self.runtime_probe_record.clone();
+            Box::pin(async move { Ok(record.filter(|record| record.id == probe_id)) })
+        }
+
+        fn list_agent_runtime_probes(
+            &self,
+            _request: vibex_core::AgentRuntimeProbeListRequest,
+        ) -> BackendFuture<'_, Vec<vibex_core::AgentRuntimeProbeRecord>> {
+            let record = self.runtime_probe_record.clone();
+            Box::pin(async move { Ok(record.into_iter().collect()) })
+        }
+
+        fn cancel_agent_runtime_probe(
+            &self,
+            _request: MutationRequest<vibex_core::AgentRuntimeProbeCancelRequest>,
+        ) -> BackendFuture<'_, vibex_core::AgentRuntimeProbeRecord> {
+            let record = self.runtime_probe_record.clone();
+            Box::pin(async move {
+                let mut record = record.ok_or_else(|| {
+                    BackendError::unsupported("mock", "mock runtime probe is unavailable")
+                })?;
+                record.status = vibex_core::AgentRuntimeProbeStatus::Cancelled;
+                record.stage = vibex_core::AgentRuntimeProbeStage::Completed;
+                Ok(record)
+            })
+        }
+
         fn mutate_provider_credential_secret(
             &self,
             _request: MutationRequest<vibex_core::ProviderCredentialSecretMutationRequest>,
@@ -1184,6 +1396,66 @@ mod tests {
         }
     }
 
+    fn runtime_probe_record() -> vibex_core::AgentRuntimeProbeRecord {
+        let facts = [
+            vibex_core::AgentRuntimeProbeCapability::BinaryIdentity,
+            vibex_core::AgentRuntimeProbeCapability::AcpHandshake,
+            vibex_core::AgentRuntimeProbeCapability::Authentication,
+            vibex_core::AgentRuntimeProbeCapability::Session,
+            vibex_core::AgentRuntimeProbeCapability::ModelSelection,
+            vibex_core::AgentRuntimeProbeCapability::ProviderProjection,
+            vibex_core::AgentRuntimeProbeCapability::Redaction,
+        ]
+        .into_iter()
+        .map(vibex_core::AgentRuntimeProbeFact::passed)
+        .collect::<Vec<_>>();
+        let mut record = vibex_core::AgentRuntimeProbeRecord::requested(
+            vibex_core::AgentRuntimeProbeId::new(),
+            vibex_core::AgentRuntimeProbeRequest {
+                runtime_profile_id: vibex_core::AgentRuntimeProfileId::new(),
+                binding_id: Some(vibex_core::AgentModelProviderBindingId::new()),
+                workspace_key: "workspace-secret-sentinel".to_string(),
+                timeout_ms: vibex_core::MIN_PROBE_TIMEOUT_MS,
+                minimal_prompt: false,
+            },
+            AgentId::parse("codex").unwrap(),
+            vibex_core::AcpAdapterId::parse("codex-acp").unwrap(),
+            vibex_core::AgentProviderProjectionDescriptorId::parse(
+                vibex_core::CODEX_PROJECTION_DESCRIPTOR_ID,
+            )
+            .unwrap(),
+            "1".to_string(),
+            1,
+        )
+        .unwrap();
+        record.status = vibex_core::AgentRuntimeProbeStatus::Passed;
+        record.stage = vibex_core::AgentRuntimeProbeStage::Completed;
+        record.facts = facts.clone();
+        record.evidence = Some(vibex_core::AgentRuntimeProbeEvidence {
+            schema_version: vibex_core::AGENT_RUNTIME_PROBE_SCHEMA_VERSION,
+            agent_id: record.agent_id.clone(),
+            agent_version: Some("native-session-id-sentinel".to_string()),
+            adapter_id: record.adapter_id.clone(),
+            adapter_version: Some("command-env-sentinel".to_string()),
+            descriptor_id: record.descriptor_id.clone(),
+            descriptor_version: record.descriptor_version.clone(),
+            descriptor_match: vibex_core::ProjectionDescriptorMatch::Exact,
+            projection_fingerprint: Some("sha256:0123456789abcdef".to_string()),
+            source_revision: "secret_sentinel_revision".to_string(),
+            platform_os: "linux".to_string(),
+            platform_arch: "x86_64".to_string(),
+            facts,
+            switch_behavior: vibex_core::ProviderSwitchBehavior::RestartAndResume,
+            source_survived_prepare_failure: false,
+            redaction_passed: true,
+            recorded_at_ms: 2,
+        });
+        record.finished_at_ms = Some(2);
+        record.updated_at_ms = 2;
+        record.validate().unwrap();
+        record
+    }
+
     fn projection_capability(
         controls: Vec<vibex_core::AgentProjectionFormControl>,
         model_interfaces: Vec<vibex_core::AgentModelInterfaceDescriptor>,
@@ -1263,6 +1535,83 @@ mod tests {
     }
 
     #[test]
+    fn runtime_probe_projection_is_display_safe_and_keeps_independent_facts() {
+        let record = runtime_probe_record();
+        let projection = AgentRuntimeProbeProjection::from_record(&record);
+        let json = serde_json::to_string(&projection).unwrap();
+
+        assert!(projection.provider_projection_verified);
+        assert!(!projection.live_switch_verified);
+        assert_eq!(projection.facts.len(), record.facts.len());
+        assert!(projection.facts.iter().any(|fact| {
+            fact.capability == vibex_core::AgentRuntimeProbeCapability::ProviderProjection
+                && fact.status == vibex_core::AgentRuntimeProbeFactStatus::Passed
+        }));
+        for sentinel in [
+            "workspace-secret-sentinel",
+            "sha256:0123456789abcdef",
+            "secret_sentinel_revision",
+            "native-session-id-sentinel",
+            "command-env-sentinel",
+        ] {
+            assert!(
+                !json.contains(sentinel),
+                "display projection leaked {sentinel}"
+            );
+        }
+        assert!(!json.contains("workspaceKey"));
+        assert!(!json.contains("projectionFingerprint"));
+        assert!(!json.contains("sourceRevision"));
+    }
+
+    #[tokio::test]
+    async fn runtime_probe_controller_checks_mutation_capability_before_dispatch() {
+        let record = runtime_probe_record();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let management = Arc::new(MockManagementBackend {
+            selected_profile: selected_profile(),
+            selection_requests: Arc::new(Mutex::new(Vec::new())),
+            runtime_probe_record: Some(record.clone()),
+            runtime_probe_start_calls: calls.clone(),
+        });
+        let mut snapshot = BackendCapabilitySnapshot::desktop_native_v1();
+        snapshot
+            .management
+            .operations
+            .remove(&BackendOperation::ManagementRuntimeProbeMutate);
+        let mut controller = ManagementWorkflowController::new(
+            management,
+            Arc::new(UnsupportedDeviceBackend),
+            ManagementWorkflowCapabilities::from_backend(&snapshot),
+        );
+        let request = AgentRuntimeProbeStartRequest {
+            runtime_profile_id: record.request.runtime_profile_id.clone(),
+            binding_id: record.request.binding_id.clone(),
+            workspace_key: "runtime-probe-controller".to_string(),
+            timeout_ms: vibex_core::MIN_PROBE_TIMEOUT_MS,
+            minimal_prompt: false,
+        };
+
+        let error = controller
+            .run_agent_runtime_probe(MutationRequest::new(request.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "management_runtime_probe_mutate_unsupported");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        controller.set_capabilities(ManagementWorkflowCapabilities::from_backend(
+            &BackendCapabilitySnapshot::desktop_native_v1(),
+        ));
+        let projection = controller
+            .run_agent_runtime_probe(MutationRequest::new(request))
+            .await
+            .unwrap();
+        assert_eq!(projection.id, record.id.as_str());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(controller.state.runtime_probes, vec![projection]);
+    }
+
+    #[test]
     fn codex_binding_editor_accepts_responses_and_rejects_chat() {
         let capability = projection_capability(
             vec![vibex_core::AgentProjectionFormControl::Model],
@@ -1326,6 +1675,8 @@ mod tests {
         let management = Arc::new(MockManagementBackend {
             selected_profile: selected_profile(),
             selection_requests: Arc::new(Mutex::new(Vec::new())),
+            runtime_probe_record: None,
+            runtime_probe_start_calls: Arc::new(AtomicUsize::new(0)),
         });
         let mut snapshot = BackendCapabilitySnapshot::desktop_native_v1();
         let mut controller = ManagementWorkflowController::new(
@@ -1417,6 +1768,8 @@ mod tests {
         let management = Arc::new(MockManagementBackend {
             selected_profile: selected_profile.clone(),
             selection_requests: selection_requests.clone(),
+            runtime_probe_record: None,
+            runtime_probe_start_calls: Arc::new(AtomicUsize::new(0)),
         });
         let capabilities = ManagementWorkflowCapabilities::from_backend(
             &BackendCapabilitySnapshot::desktop_native_v1(),

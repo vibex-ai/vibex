@@ -6,8 +6,7 @@ use vibex_core::{AcpAdapterId, AgentId};
 /// Compatibility Registry only has to replace this single function to become
 /// the source of truth for adapter ids.
 pub fn default_adapter_for_agent(agent_id: &AgentId) -> AcpAdapterId {
-    AcpAdapterId::parse(format!("{}-acp", agent_id.as_str()))
-        .expect("agent ids are non-empty, so derived adapter ids are valid")
+    vibex_core::default_acp_adapter_id(agent_id)
 }
 
 #[cfg(test)]

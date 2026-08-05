@@ -190,6 +190,9 @@ pub struct SwitchTargetAssessment {
     pub process_config_changed: bool,
     pub session_scoped_changes_only: bool,
     pub live_ops_supported: bool,
+    pub exact_descriptor: bool,
+    pub runtime_evidence_verified: bool,
+    pub projection_fingerprint_matches: bool,
     pub active_turn: bool,
     pub restore: RestoreAssessment,
     pub resumable_historical_binding: bool,
@@ -215,6 +218,9 @@ pub fn decide_switch_strategy(
         && !assessment.process_config_changed
         && assessment.session_scoped_changes_only
         && assessment.live_ops_supported
+        && assessment.exact_descriptor
+        && assessment.runtime_evidence_verified
+        && assessment.projection_fingerprint_matches
         && !assessment.active_turn
     {
         return RuntimeSwitchStrategy::LiveMutation;
@@ -3025,6 +3031,9 @@ mod tests {
             process_config_changed: true,
             session_scoped_changes_only: false,
             live_ops_supported: true,
+            exact_descriptor: true,
+            runtime_evidence_verified: true,
+            projection_fingerprint_matches: true,
             active_turn: false,
             restore: RestoreAssessment::Compatible,
             resumable_historical_binding: false,
@@ -3038,6 +3047,9 @@ mod tests {
             process_config_changed: true,
             session_scoped_changes_only: false,
             live_ops_supported: false,
+            exact_descriptor: false,
+            runtime_evidence_verified: false,
+            projection_fingerprint_matches: false,
             active_turn: false,
             restore: RestoreAssessment::Incompatible,
             resumable_historical_binding: false,
@@ -3051,6 +3063,9 @@ mod tests {
             process_config_changed: false,
             session_scoped_changes_only: true,
             live_ops_supported: true,
+            exact_descriptor: true,
+            runtime_evidence_verified: true,
+            projection_fingerprint_matches: true,
             active_turn: false,
             restore: RestoreAssessment::Compatible,
             resumable_historical_binding: false,
@@ -3128,6 +3143,20 @@ mod tests {
             decide_switch_strategy(RuntimeSwitchPolicy::Automatic, &active_turn),
             RuntimeSwitchStrategy::RestartAndResume
         );
+        for missing_gate in [
+            |assessment: &mut SwitchTargetAssessment| assessment.exact_descriptor = false,
+            |assessment: &mut SwitchTargetAssessment| assessment.runtime_evidence_verified = false,
+            |assessment: &mut SwitchTargetAssessment| {
+                assessment.projection_fingerprint_matches = false
+            },
+        ] {
+            let mut assessment = live_assessment();
+            missing_gate(&mut assessment);
+            assert_eq!(
+                decide_switch_strategy(RuntimeSwitchPolicy::Automatic, &assessment),
+                RuntimeSwitchStrategy::RestartAndResume
+            );
+        }
     }
 
     #[tokio::test]

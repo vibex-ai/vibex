@@ -64,7 +64,8 @@ use vibex_config_switch::{CodexProviderRuntimeConfig, codex_runtime_config_from_
 use vibex_core::{
     AcpProcessStrategy, AcpProviderConfig, AcpProviderEnvSource, ActiveWorkKind,
     AgentEventRawOutput, AgentEventRawOutputMode, AgentId, AgentMessagePhase,
-    AgentModelCapabilities, AgentModelListRequest, AgentModelListSource, AgentReasoningEffort,
+    AgentModelCapabilities, AgentModelListRequest, AgentModelListSource,
+    AgentProviderProjectionRegistry, AgentReasoningEffort, AgentRuntimeProbeStatus,
     AgentRuntimeRouteKey, AgentSessionRestoreCompatibility, AgentSessionRestoreCompatibilityKey,
     AgentSessionRestoreMethod, AgentSessionRestoreOutcome, AgentSessionState, AgentTokenUsage,
     AgentUsageCounterOrigin, AgentUsageExecution, AgentUsageExecutionContext,
@@ -76,24 +77,25 @@ use vibex_core::{
     ExternalSessionImportCandidateStatus, ExternalSessionImportSource, MAX_AGENT_USAGE_TOKEN_VALUE,
     NativeStateHomeId, PermissionActionDetail, PermissionRequest, PermissionRequestStatus,
     PermissionResponseKind, PermissionResponseOption, PermissionRiskCategory, PlanStepPayload,
-    PlanStepStatus, ProviderBinding, ProviderBindingMetadata, ProviderKind, ProviderModelWireApi,
-    ProviderNativeBinding, ProviderProfile, ProviderProfileId, ProviderProfileStatus,
-    ProviderSecretBackend, ProviderSessionConfigOption, ProviderSessionConfigOptionKind,
-    ProviderSessionConfigState, ProviderSessionConfigValue, RequestId, RuntimeAttachmentSnapshot,
-    RuntimeAttachmentStatus, RuntimeBinding, RuntimeBindingId, RuntimeLeaseRole,
-    RuntimeLeaseRoleCounts, RuntimeLiveMessageSnapshot, RuntimeLiveToolCallSnapshot,
-    RuntimeMaterializationStatus, RuntimeProcessConfigStatus, RuntimeProcessId,
-    RuntimeProcessSnapshot, RuntimeSwitchActiveWorkPolicy, RuntimeSwitchId, RuntimeSwitchPolicy,
-    SessionConfigValue, SessionRuntimeConfigApplyStatus, SessionRuntimeConfigFieldOutcome,
-    SessionRuntimeConfigMutationRequest, SessionRuntimeConfigMutationResult,
-    SessionRuntimeConfigPatch, SessionRuntimeConfigState, SessionRuntimeSelection,
-    SystemNoticeLevel, TerminalAuthActionDescriptor, TerminalId, TimelineRedactionState,
-    ToolCallStatus, TransportKind, VibexError, VibexResult, VibexSessionId, WorkspaceMode,
-    unix_timestamp_ms,
+    PlanStepStatus, ProjectionDescriptorMatch, ProviderBinding, ProviderBindingMetadata,
+    ProviderKind, ProviderModelWireApi, ProviderNativeBinding, ProviderProfile, ProviderProfileId,
+    ProviderProfileStatus, ProviderSecretBackend, ProviderSessionConfigOption,
+    ProviderSessionConfigOptionKind, ProviderSessionConfigState, ProviderSessionConfigValue,
+    RequestId, RuntimeAttachmentSnapshot, RuntimeAttachmentStatus, RuntimeBinding,
+    RuntimeBindingId, RuntimeLeaseRole, RuntimeLeaseRoleCounts, RuntimeLiveMessageSnapshot,
+    RuntimeLiveToolCallSnapshot, RuntimeMaterializationStatus, RuntimeProcessConfigStatus,
+    RuntimeProcessId, RuntimeProcessSnapshot, RuntimeSwitchActiveWorkPolicy, RuntimeSwitchId,
+    RuntimeSwitchPolicy, SessionConfigValue, SessionRuntimeConfigApplyStatus,
+    SessionRuntimeConfigFieldOutcome, SessionRuntimeConfigMutationRequest,
+    SessionRuntimeConfigMutationResult, SessionRuntimeConfigPatch, SessionRuntimeConfigState,
+    SessionRuntimeSelection, SystemNoticeLevel, TerminalAuthActionDescriptor, TerminalId,
+    TimelineRedactionState, ToolCallStatus, TransportKind, VibexError, VibexResult, VibexSessionId,
+    WorkspaceMode, unix_timestamp_ms,
 };
 use vibex_db::{
-    AgentSessionRuntimeRepository, RuntimeBindingRepository, SessionRepository,
-    SwitchOperationRecord, apply_migrations, open_database,
+    AgentModelProviderBindingRepository, AgentRuntimeProbeRepository,
+    AgentRuntimeProfileRepository, AgentSessionRuntimeRepository, RuntimeBindingRepository,
+    SessionRepository, SwitchOperationRecord, apply_migrations, open_database,
 };
 
 use crate::process_environment::sanitize_inherited_appimage_environment;
@@ -144,7 +146,7 @@ const ACP_PROTOCOL_VERSION: i64 = 1;
 const ACP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const ACP_SESSION_LOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const ACP_PROMPT_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
-const ACP_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const ACP_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 #[cfg(not(test))]
 const ACP_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 // Keep tests faster than production while allowing OS process-group cleanup to run
@@ -258,19 +260,19 @@ impl AcpRpcFailure {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AcpProcessPurpose {
+pub(crate) enum AcpProcessPurpose {
     Session,
     Probe,
 }
 
-struct AcpProcessLaunch<'a> {
-    profile_id: &'a ProviderProfileId,
-    config: &'a AcpProviderConfig,
-    cwd: &'a Path,
-    runtime_resources: &'a ProviderRuntimeResources,
-    purpose: AcpProcessPurpose,
-    process_strategy_effective: AcpProcessStrategy,
-    pool_fallback_reason: Option<String>,
+pub(crate) struct AcpProcessLaunch<'a> {
+    pub(crate) profile_id: &'a ProviderProfileId,
+    pub(crate) config: &'a AcpProviderConfig,
+    pub(crate) cwd: &'a Path,
+    pub(crate) runtime_resources: &'a ProviderRuntimeResources,
+    pub(crate) purpose: AcpProcessPurpose,
+    pub(crate) process_strategy_effective: AcpProcessStrategy,
+    pub(crate) pool_fallback_reason: Option<String>,
 }
 
 /// Values materialized for one process launch. `env_overlays` may contain
@@ -1268,7 +1270,7 @@ struct ProcessShared {
     operation_evidence: BTreeMap<AcpOperation, SessionConfigOperationEvidence>,
 }
 
-struct AcpProcess {
+pub(crate) struct AcpProcess {
     process_instance_id: AcpProcessInstanceId,
     exit_reporter: Option<ProcessExitReporter<AcpProcess>>,
     provider_profile_id: ProviderProfileId,
@@ -3037,7 +3039,12 @@ impl AcpProcess {
         self.clear_pending_prompt_request_id(request_id);
     }
 
-    async fn request(&self, method: &str, params: Value, wait: Duration) -> VibexResult<Value> {
+    pub(crate) async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        wait: Duration,
+    ) -> VibexResult<Value> {
         self.request_internal(method, params, wait, false)
             .await
             .map(|(result, _)| result)
@@ -4246,7 +4253,7 @@ impl AcpProcess {
         self.cleanup_closed_state();
     }
 
-    async fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self) {
         let _shutdown_guard = self.shutdown_lock.lock().await;
         let Some(_) = self.claim_shutdown() else {
             return;
@@ -4398,7 +4405,7 @@ impl AcpProcessHandle for AcpProcess {
 /// Generic ACP runtime client keyed by Vibex session id. One spawned ACP
 /// process serves each active session and stays alive across turns.
 pub struct AcpRuntimeClient {
-    config_service: ProviderConfigService,
+    pub(crate) config_service: ProviderConfigService,
     attachment_router: Arc<AcpAttachmentRouter>,
     legacy_attachment_identities: Mutex<HashMap<String, LegacyAttachmentIdentity>>,
     runtime_config_states: Mutex<HashMap<RuntimeBindingId, SessionRuntimeConfigState>>,
@@ -4440,6 +4447,13 @@ struct AcpSwitchTargetContext {
     process_strategy_effective: AcpProcessStrategy,
     pool_fallback_reason: Option<String>,
     spawn_snapshot: ProcessSpawnConfigSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ProviderProjectionSwitchAssessment {
+    exact_descriptor: bool,
+    runtime_evidence_verified: bool,
+    projection_fingerprint_matches: bool,
 }
 
 impl std::fmt::Debug for AcpRuntimeSwitchBridge {
@@ -4747,6 +4761,67 @@ impl AcpRuntimeSwitchBridge {
         };
         let conn = open_database(&self.db_path)?;
         RuntimeBindingRepository::get(&conn, binding_id)
+    }
+
+    fn provider_projection_switch_assessment(
+        &self,
+        intent: &SwitchIntent,
+        context: &AcpSwitchTargetContext,
+    ) -> VibexResult<ProviderProjectionSwitchAssessment> {
+        let conn = open_database(&self.db_path)?;
+        let Some(binding) = AgentModelProviderBindingRepository::get_by_legacy_profile(
+            &conn,
+            &intent.target_selection.provider_profile_id,
+        )?
+        else {
+            return Ok(ProviderProjectionSwitchAssessment::default());
+        };
+        let Some(runtime) = AgentRuntimeProfileRepository::get(&conn, &binding.runtime_profile_id)?
+        else {
+            return Ok(ProviderProjectionSwitchAssessment::default());
+        };
+        let resolution =
+            AgentProviderProjectionRegistry::builtin()?.resolve(&runtime.version_identity)?;
+        let exact_descriptor = resolution.match_kind == ProjectionDescriptorMatch::Exact
+            && binding.projection_descriptor_id == resolution.descriptor.id
+            && resolution.descriptor.route.agent_id == intent.target_selection.agent_id
+            && resolution.descriptor.route.adapter_id == intent.target_adapter_id;
+
+        let latest_probe = AgentRuntimeProbeRepository::latest_for_binding(&conn, &binding.id)?;
+        let runtime_evidence_verified = latest_probe.as_ref().is_some_and(|probe| {
+            probe.status == AgentRuntimeProbeStatus::Passed
+                && probe.request.binding_id.as_ref() == Some(&binding.id)
+                && probe.agent_id == runtime.version_identity.route.agent_id
+                && probe.adapter_id == runtime.version_identity.route.adapter_id
+                && probe.descriptor_id == resolution.descriptor.id
+                && probe.descriptor_version == resolution.descriptor.descriptor_version
+                && probe.evidence.as_ref().is_some_and(|evidence| {
+                    evidence.agent_id == runtime.version_identity.route.agent_id
+                        && evidence.adapter_id == runtime.version_identity.route.adapter_id
+                        && evidence.agent_version == runtime.version_identity.agent_version
+                        && evidence.adapter_version == runtime.version_identity.adapter_version
+                        && evidence.descriptor_id == resolution.descriptor.id
+                        && evidence.descriptor_version == resolution.descriptor.descriptor_version
+                        && evidence.live_switch_verified()
+                })
+        });
+        let target_fingerprint = context
+            .spawn_snapshot
+            .non_secret_env
+            .get(PROVIDER_PROJECTION_FINGERPRINT_ENV);
+        let evidence_fingerprint = latest_probe
+            .as_ref()
+            .and_then(|probe| probe.evidence.as_ref())
+            .and_then(|evidence| evidence.projection_fingerprint.as_ref());
+        let projection_fingerprint_matches = target_fingerprint.is_some()
+            && target_fingerprint == binding.projection_fingerprint.as_ref()
+            && target_fingerprint == evidence_fingerprint;
+
+        Ok(ProviderProjectionSwitchAssessment {
+            exact_descriptor,
+            runtime_evidence_verified,
+            projection_fingerprint_matches,
+        })
     }
 
     fn expected_adapter_compatibility_identity(&self, agent_id: &vibex_core::AgentId) -> String {
@@ -5677,11 +5752,15 @@ impl SwitchTargetExecutor for AcpRuntimeSwitchBridge {
         let resumable_historical_binding = self
             .historical_resume_binding(intent, &context, source.as_ref())?
             .is_some();
+        let projection_assessment = self.provider_projection_switch_assessment(intent, &context)?;
         Ok(SwitchTargetAssessment {
             same_route,
             process_config_changed,
             session_scoped_changes_only: same_route && !process_config_changed,
             live_ops_supported,
+            exact_descriptor: projection_assessment.exact_descriptor,
+            runtime_evidence_verified: projection_assessment.runtime_evidence_verified,
+            projection_fingerprint_matches: projection_assessment.projection_fingerprint_matches,
             active_turn: activity.active_turn,
             restore,
             resumable_historical_binding,
@@ -6755,6 +6834,10 @@ impl std::fmt::Debug for AcpRuntimeClient {
 }
 
 impl AcpRuntimeClient {
+    pub(crate) fn provider_config_service(&self) -> &ProviderConfigService {
+        &self.config_service
+    }
+
     pub fn new(config_service: ProviderConfigService) -> Self {
         Self::new_with_observability(config_service, Arc::new(RuntimeObservability::new()))
     }
@@ -7483,7 +7566,10 @@ impl AcpRuntimeClient {
             .map(|attachment| attachment.payload().process())
     }
 
-    fn profile_config(&self, profile_id: &ProviderProfileId) -> VibexResult<AcpProviderConfig> {
+    pub(crate) fn profile_config(
+        &self,
+        profile_id: &ProviderProfileId,
+    ) -> VibexResult<AcpProviderConfig> {
         self.config_service
             .get_acp_profile_config(profile_id.clone())
             .map_err(|err| {
@@ -8016,7 +8102,7 @@ impl AcpRuntimeClient {
         .unwrap();
     }
 
-    fn pool_decision(
+    pub(crate) fn pool_decision(
         &self,
         profile_id: &ProviderProfileId,
         config: &AcpProviderConfig,
@@ -8238,7 +8324,7 @@ impl AcpRuntimeClient {
         Ok(lease)
     }
 
-    async fn spawn_process(
+    pub(crate) async fn spawn_process(
         &self,
         process_instance_id: AcpProcessInstanceId,
         launch: AcpProcessLaunch<'_>,
@@ -13474,7 +13560,7 @@ pub(crate) fn extract_probe_reasoning_efforts(response: &Value) -> Vec<AgentReas
     efforts
 }
 
-fn extract_current_model_id(response: &Value) -> Option<String> {
+pub(crate) fn extract_current_model_id(response: &Value) -> Option<String> {
     response
         .get("currentModelId")
         .and_then(Value::as_str)

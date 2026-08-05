@@ -10,6 +10,7 @@ use std::fmt;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 
+use crate::agent_provider_runtime::catalog_projection_descriptors;
 use crate::{
     AcpAdapterId, AcpProcessStrategy, AcpProviderEnvReference, AgentConfiguredModelBindingId,
     AgentId, AgentModelProviderBindingId, AgentProviderProjectionDescriptorId,
@@ -37,7 +38,7 @@ const CODEX_ADAPTER_VERSION: &str = "1.1.9";
 const CODEX_RUNTIME_PACKAGE: &str = "@openai/codex";
 const CODEX_RUNTIME_VERSION: &str = "0.146.0";
 const OPENCODE_AGENT_ID: &str = "opencode";
-const OPENCODE_ADAPTER_ID: &str = "opencode";
+const OPENCODE_ADAPTER_ID: &str = "opencode-acp";
 const OPENCODE_VERIFIED_VERSION: &str = "1.17.9";
 
 const MAX_DISPLAY_NAME_LEN: usize = 160;
@@ -852,6 +853,9 @@ impl AgentProviderProjectionRegistry {
             codex_projection_descriptor()?,
             opencode_projection_descriptor()?,
         ] {
+            registry.register(descriptor)?;
+        }
+        for descriptor in catalog_projection_descriptors()? {
             registry.register(descriptor)?;
         }
         Ok(registry)

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use vibex_core::default_acp_adapter_id;
 use vibex_core::{
     AcpAdapterId, AcpProcessStrategy, AcpProviderConfig, AcpProviderEnvReference,
     AcpProviderEnvSource, AgentConfiguredModelBinding, AgentConfiguredModelBindingId,
@@ -1195,7 +1196,7 @@ fn legacy_runtime_identity(
             } else {
                 AgentVersionSource::Unknown
             };
-            ("opencode", None, detected, BTreeMap::new(), source)
+            ("opencode-acp", None, detected, BTreeMap::new(), source)
         }
         _ => {
             let detected = latest_agent_version(conn, &profile.agent_id)?;
@@ -1213,7 +1214,11 @@ fn legacy_runtime_identity(
         route: AgentRuntimeRouteKey {
             agent_id: profile.agent_id.clone(),
             transport_kind: TransportKind::Acp,
-            adapter_id: AcpAdapterId::parse(adapter)?,
+            adapter_id: if adapter == agent {
+                default_acp_adapter_id(&profile.agent_id)
+            } else {
+                AcpAdapterId::parse(adapter)?
+            },
         },
         adapter_version,
         agent_version,
@@ -1855,7 +1860,10 @@ mod tests {
 
         assert_eq!(
             apply_migrations(&mut conn).unwrap(),
-            vec!["37:agent_provider_projection_platform"]
+            vec![
+                "37:agent_provider_projection_platform",
+                "38:agent_runtime_provider_probe_evidence",
+            ]
         );
         assert_eq!(
             current_schema_version(&conn).unwrap(),

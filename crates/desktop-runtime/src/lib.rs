@@ -27,7 +27,7 @@ use vibex_agent::{
 };
 use vibex_agent_acp::{
     AcpAgentProvider, AcpCompatibilityRegistry, AcpRuntimeClient, AcpRuntimeLifecycleBackend,
-    AcpRuntimeSwitchBridge, ManagedAcpAdapterStore,
+    AcpRuntimeSwitchBridge, AgentRuntimeProbeService, ManagedAcpAdapterStore,
 };
 use vibex_config_switch::{ProviderConfigService, ProviderProfileChangeListener};
 use vibex_core::{
@@ -43,8 +43,9 @@ use vibex_db::{
 use vibex_desktop_model::DesktopPollingPolicy;
 use vibex_diagnostics::{DiagnosticBundleService, DiagnosticBundleServiceConfig};
 use vibex_remote::{
-    RemoteDispatcher, RemoteGateway, RemoteGatewayConfig, RemoteRouter, RemoteServiceConfig,
-    RemoteWorkbenchRuntime, RemoteWorktreeSnapshotSource, build_router_with_dispatcher,
+    RemoteAgentRuntimeProbeSource, RemoteDispatcher, RemoteGateway, RemoteGatewayConfig,
+    RemoteRouter, RemoteServiceConfig, RemoteWorkbenchRuntime, RemoteWorktreeSnapshotSource,
+    build_router_with_dispatcher,
 };
 use vibex_terminal::TerminalManager;
 
@@ -341,12 +342,48 @@ impl AgentHandle {
 #[derive(Clone)]
 pub struct ProviderHandle {
     service: ProviderConfigService,
+    runtime_probe: AgentRuntimeProbeService,
     mutation_guard: ManagementMutationGuard,
 }
 
 impl ProviderHandle {
     pub fn service(&self) -> ProviderConfigService {
         self.service.clone()
+    }
+
+    pub fn runtime_probe_service(&self) -> AgentRuntimeProbeService {
+        self.runtime_probe.clone()
+    }
+}
+
+#[async_trait]
+impl RemoteAgentRuntimeProbeSource for ProviderHandle {
+    async fn start_runtime_probe(
+        &self,
+        request: vibex_core::AgentRuntimeProbeStartRequest,
+    ) -> VibexResult<vibex_core::AgentRuntimeProbeRecord> {
+        self.management().start_agent_runtime_probe(request)
+    }
+
+    async fn get_runtime_probe(
+        &self,
+        probe_id: vibex_core::AgentRuntimeProbeId,
+    ) -> VibexResult<Option<vibex_core::AgentRuntimeProbeRecord>> {
+        self.management().get_agent_runtime_probe(&probe_id)
+    }
+
+    async fn list_runtime_probes(
+        &self,
+        request: vibex_core::AgentRuntimeProbeListRequest,
+    ) -> VibexResult<Vec<vibex_core::AgentRuntimeProbeRecord>> {
+        self.management().list_agent_runtime_probes(request)
+    }
+
+    async fn cancel_runtime_probe(
+        &self,
+        request: vibex_core::AgentRuntimeProbeCancelRequest,
+    ) -> VibexResult<vibex_core::AgentRuntimeProbeRecord> {
+        self.management().cancel_agent_runtime_probe(request)
     }
 }
 
@@ -686,6 +723,7 @@ impl DesktopRuntime {
         });
         let (manager, provider_config_service, acp_runtime) =
             build_agent_manager(&config, observability.clone(), provider_change_listener)?;
+        let runtime_probe = acp_runtime.runtime_probe_service();
         let manager = Arc::new(manager);
         let db_path = manager.database_path().to_path_buf();
         let usage = AgentUsageService::new(db_path.clone())?;
@@ -738,6 +776,11 @@ impl DesktopRuntime {
             mutation_claims: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             worktrees: Arc::new(WorktreeCoordinator::new(db_path.clone())),
         };
+        let providers = ProviderHandle {
+            service: provider_config_service,
+            runtime_probe,
+            mutation_guard: ManagementMutationGuard::default(),
+        };
         let remote_config = config.remote_gateway.service.clone();
         let remote_dispatcher = RemoteDispatcher::with_agent_runtime_lifecycle_and_workbench(
             remote_config.clone(),
@@ -748,7 +791,8 @@ impl DesktopRuntime {
             RemoteWorkbenchRuntime::new(db_path.clone(), terminals.clone())
                 .with_worktree_snapshot_source(Arc::new(git.clone())),
         )
-        .with_runtime_option_catalog_source(runtime_catalog.clone());
+        .with_runtime_option_catalog_source(runtime_catalog.clone())
+        .with_agent_runtime_probe_source(Arc::new(providers.clone()));
         let remote_gateway = RemoteGateway::new(
             config.remote_gateway.clone(),
             remote_dispatcher.clone(),
@@ -791,10 +835,7 @@ impl DesktopRuntime {
                 message_submission,
                 runtime_catalog,
             },
-            providers: ProviderHandle {
-                service: provider_config_service,
-                mutation_guard: ManagementMutationGuard::default(),
-            },
+            providers,
             workspace: WorkspaceHandle {
                 db_path: db_path.clone(),
             },
@@ -858,6 +899,13 @@ impl DesktopRuntime {
         self.agent
             .runtime_lifecycle
             .start(&tokio::runtime::Handle::current())?;
+        if let Err(error) = self.providers.runtime_probe.reconcile_on_startup() {
+            tracing::warn!(
+                target: "vibex_desktop",
+                error_code = %error.code,
+                "Agent runtime probe startup reconciliation failed"
+            );
+        }
         if let Err(error) = self.remote.gateway.start().await {
             let _ = self.agent.runtime_lifecycle.stop().await;
             return Err(error);

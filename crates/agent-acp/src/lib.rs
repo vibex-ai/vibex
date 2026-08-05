@@ -58,6 +58,7 @@ mod process_registry;
 mod protocol;
 mod registry;
 mod runtime;
+mod runtime_probe;
 mod session_attachment_registry;
 mod session_config;
 mod session_restore;
@@ -115,6 +116,7 @@ pub use runtime::{
     AcpTerminalCreateRequest, AcpTerminalExitStatus, AcpTerminalHost, AcpTerminalOutput,
     DisabledAcpTerminalHost,
 };
+pub use runtime_probe::{AgentRuntimeProbeReconcileReport, AgentRuntimeProbeService};
 pub use session_attachment_registry::{
     SessionAttachmentAcquireKey, SessionAttachmentAcquireOutput, SessionAttachmentAcquireResult,
     SessionAttachmentEventFence, SessionAttachmentHandle, SessionAttachmentPromptGuard,

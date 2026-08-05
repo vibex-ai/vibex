@@ -53,6 +53,7 @@ use crate::{
 #[derive(Clone)]
 pub struct ProviderManagementFacade {
     service: vibex_config_switch::ProviderConfigService,
+    runtime_probe: vibex_agent_acp::AgentRuntimeProbeService,
     mutation_guard: ManagementMutationGuard,
 }
 
@@ -178,6 +179,45 @@ impl ProviderManagementFacade {
         request: vibex_core::AgentProviderProjectionPreviewRequest,
     ) -> VibexResult<vibex_core::AgentProviderProjectionPreview> {
         self.service.preview_agent_provider_projection(request)
+    }
+
+    pub fn start_agent_runtime_probe(
+        &self,
+        request: vibex_core::AgentRuntimeProbeStartRequest,
+    ) -> VibexResult<vibex_core::AgentRuntimeProbeRecord> {
+        let _claim = self.mutation_guard.claim(format!(
+            "provider:runtime-probe:start:{}",
+            request.runtime_profile_id
+        ))?;
+        let record = self.runtime_probe.request(request)?;
+        self.runtime_probe.spawn(record.id.clone())?;
+        Ok(record)
+    }
+
+    pub fn get_agent_runtime_probe(
+        &self,
+        probe_id: &vibex_core::AgentRuntimeProbeId,
+    ) -> VibexResult<Option<vibex_core::AgentRuntimeProbeRecord>> {
+        self.runtime_probe.get(probe_id)
+    }
+
+    pub fn list_agent_runtime_probes(
+        &self,
+        request: vibex_core::AgentRuntimeProbeListRequest,
+    ) -> VibexResult<Vec<vibex_core::AgentRuntimeProbeRecord>> {
+        self.runtime_probe.list(request)
+    }
+
+    pub fn cancel_agent_runtime_probe(
+        &self,
+        request: vibex_core::AgentRuntimeProbeCancelRequest,
+    ) -> VibexResult<vibex_core::AgentRuntimeProbeRecord> {
+        let _claim = self.mutation_guard.claim(format!(
+            "provider:runtime-probe:cancel:{}",
+            request.probe_id
+        ))?;
+        self.runtime_probe
+            .cancel(&request.probe_id, request.expected_revision)
     }
 
     pub fn mutate_provider_credential_secret(
@@ -724,6 +764,7 @@ impl ProviderHandle {
     pub fn management(&self) -> ProviderManagementFacade {
         ProviderManagementFacade {
             service: self.service(),
+            runtime_probe: self.runtime_probe_service(),
             mutation_guard: self.mutation_guard.clone(),
         }
     }
@@ -1277,10 +1318,13 @@ mod tests {
     #[test]
     fn provider_facade_exposes_exact_projection_capability_and_preview() {
         let directory = tempfile::tempdir().unwrap();
+        let service =
+            vibex_config_switch::ProviderConfigService::new(directory.path().join("vibex.db"));
+        let runtime_probe = Arc::new(vibex_agent_acp::AcpRuntimeClient::new(service.clone()))
+            .runtime_probe_service();
         let facade = ProviderManagementFacade {
-            service: vibex_config_switch::ProviderConfigService::new(
-                directory.path().join("vibex.db"),
-            ),
+            service,
+            runtime_probe,
             mutation_guard: ManagementMutationGuard::default(),
         };
         let agent_id = vibex_core::AgentId::parse("codex").unwrap();

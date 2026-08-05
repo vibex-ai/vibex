@@ -8,6 +8,10 @@ use crate::agent::{
     GetMessageSubmissionRequest, MessageSubmissionState, ResolveElicitationRequest,
     ResolvePermissionRequest, SendAgentMessageRequest,
 };
+use crate::agent_provider_runtime::{
+    AgentRuntimeProbeCancelRequest, AgentRuntimeProbeListRequest, AgentRuntimeProbeRecord,
+    AgentRuntimeProbeStartRequest,
+};
 use crate::error::VibexError;
 use crate::file::{
     FileMutationRequest, FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult,
@@ -21,7 +25,8 @@ use crate::git::{
     GitStatusSummary, GitWorktreeLifecycleSnapshot,
 };
 use crate::ids::{
-    CorrelationId, DeviceId, EventId, RequestId, RuntimeProcessId, TerminalId, VibexSessionId,
+    AgentRuntimeProbeId, CorrelationId, DeviceId, EventId, RequestId, RuntimeProcessId, TerminalId,
+    VibexSessionId,
 };
 use crate::provider::{
     ProviderFailoverRecommendation, ProviderFailoverRecommendationRequest, ProviderHealthSummary,
@@ -1175,6 +1180,10 @@ pub enum RemoteProviderOperationKind {
     PreviewInjection,
     ProjectionCapability,
     ProjectionPreview,
+    StartRuntimeProbe,
+    GetRuntimeProbe,
+    ListRuntimeProbes,
+    CancelRuntimeProbe,
     ListHealthSummaries,
     RunHealthProbes,
     ListUsageSummaries,
@@ -1230,6 +1239,58 @@ pub struct RemoteAgentProjectionPreviewRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAgentProjectionPreviewResponse {
     pub preview: AgentProviderProjectionPreview,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentRuntimeProbeStartRequest {
+    pub auth: RemoteAuthProof,
+    pub request: AgentRuntimeProbeStartRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentRuntimeProbeStartResponse {
+    pub probe: AgentRuntimeProbeRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentRuntimeProbeGetRequest {
+    pub auth: RemoteAuthProof,
+    pub probe_id: AgentRuntimeProbeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentRuntimeProbeGetResponse {
+    pub probe: Option<AgentRuntimeProbeRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentRuntimeProbeListRequest {
+    pub auth: RemoteAuthProof,
+    pub request: AgentRuntimeProbeListRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentRuntimeProbeListResponse {
+    pub probes: Vec<AgentRuntimeProbeRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentRuntimeProbeCancelRequest {
+    pub auth: RemoteAuthProof,
+    pub request: AgentRuntimeProbeCancelRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentRuntimeProbeCancelResponse {
+    pub probe: AgentRuntimeProbeRecord,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1290,6 +1351,10 @@ pub enum RemoteProviderRequest {
     PreviewInjection(RemoteProviderInjectionPreviewRequest),
     ProjectionCapability(RemoteAgentProjectionCapabilityRequest),
     ProjectionPreview(RemoteAgentProjectionPreviewRequest),
+    StartRuntimeProbe(RemoteAgentRuntimeProbeStartRequest),
+    GetRuntimeProbe(RemoteAgentRuntimeProbeGetRequest),
+    ListRuntimeProbes(RemoteAgentRuntimeProbeListRequest),
+    CancelRuntimeProbe(RemoteAgentRuntimeProbeCancelRequest),
     ListHealthSummaries(RemoteProviderHealthSummaryListRequest),
     RunHealthProbes(RemoteProviderRunHealthProbesRequest),
     ListUsageSummaries(RemoteProviderUsageSummaryListRequest),
@@ -1303,6 +1368,10 @@ impl RemoteProviderRequest {
             Self::PreviewInjection(_) => RemoteProviderOperationKind::PreviewInjection,
             Self::ProjectionCapability(_) => RemoteProviderOperationKind::ProjectionCapability,
             Self::ProjectionPreview(_) => RemoteProviderOperationKind::ProjectionPreview,
+            Self::StartRuntimeProbe(_) => RemoteProviderOperationKind::StartRuntimeProbe,
+            Self::GetRuntimeProbe(_) => RemoteProviderOperationKind::GetRuntimeProbe,
+            Self::ListRuntimeProbes(_) => RemoteProviderOperationKind::ListRuntimeProbes,
+            Self::CancelRuntimeProbe(_) => RemoteProviderOperationKind::CancelRuntimeProbe,
             Self::ListHealthSummaries(_) => RemoteProviderOperationKind::ListHealthSummaries,
             Self::RunHealthProbes(_) => RemoteProviderOperationKind::RunHealthProbes,
             Self::ListUsageSummaries(_) => RemoteProviderOperationKind::ListUsageSummaries,
@@ -1883,5 +1952,66 @@ mod tests {
             "auth-token-returned-once"
         );
         assert!(json["data"]["request"]["providerProfileIds"].is_null());
+    }
+
+    #[test]
+    fn remote_runtime_probe_requests_use_stable_tags_and_canonical_contracts() {
+        let auth = RemoteAuthProof {
+            device_id: DeviceId::new(),
+            auth_token: "runtime-probe-auth-token".to_string(),
+        };
+        let probe_id = AgentRuntimeProbeId::new();
+        let requests = [
+            (
+                RemoteProviderRequest::StartRuntimeProbe(RemoteAgentRuntimeProbeStartRequest {
+                    auth: auth.clone(),
+                    request: AgentRuntimeProbeStartRequest {
+                        runtime_profile_id: crate::AgentRuntimeProfileId::new(),
+                        binding_id: None,
+                        workspace_key: "remote-probe-workspace".to_string(),
+                        timeout_ms: crate::MIN_PROBE_TIMEOUT_MS,
+                        minimal_prompt: false,
+                    },
+                }),
+                RemoteProviderOperationKind::StartRuntimeProbe,
+                "start_runtime_probe",
+            ),
+            (
+                RemoteProviderRequest::GetRuntimeProbe(RemoteAgentRuntimeProbeGetRequest {
+                    auth: auth.clone(),
+                    probe_id: probe_id.clone(),
+                }),
+                RemoteProviderOperationKind::GetRuntimeProbe,
+                "get_runtime_probe",
+            ),
+            (
+                RemoteProviderRequest::ListRuntimeProbes(RemoteAgentRuntimeProbeListRequest {
+                    auth: auth.clone(),
+                    request: AgentRuntimeProbeListRequest::default(),
+                }),
+                RemoteProviderOperationKind::ListRuntimeProbes,
+                "list_runtime_probes",
+            ),
+            (
+                RemoteProviderRequest::CancelRuntimeProbe(RemoteAgentRuntimeProbeCancelRequest {
+                    auth,
+                    request: AgentRuntimeProbeCancelRequest {
+                        probe_id,
+                        expected_revision: 7,
+                    },
+                }),
+                RemoteProviderOperationKind::CancelRuntimeProbe,
+                "cancel_runtime_probe",
+            ),
+        ];
+
+        for (request, operation, tag) in requests {
+            assert_eq!(request.operation_kind(), operation);
+            let value = serde_json::to_value(&request).unwrap();
+            assert_eq!(value["type"], tag);
+            let decoded: RemoteProviderRequest = serde_json::from_value(value).unwrap();
+            assert_eq!(decoded, request);
+            assert!(!format!("{request:?}").contains("runtime-probe-auth-token"));
+        }
     }
 }

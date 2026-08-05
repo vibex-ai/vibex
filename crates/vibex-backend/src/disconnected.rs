@@ -532,6 +532,34 @@ impl ManagementBackend for DisconnectedBackend {
         disconnected_future!()
     }
 
+    fn start_agent_runtime_probe(
+        &self,
+        _request: MutationRequest<vibex_core::AgentRuntimeProbeStartRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentRuntimeProbeRecord> {
+        disconnected_future!()
+    }
+
+    fn get_agent_runtime_probe(
+        &self,
+        _probe_id: vibex_core::AgentRuntimeProbeId,
+    ) -> BackendFuture<'_, Option<vibex_core::AgentRuntimeProbeRecord>> {
+        disconnected_future!()
+    }
+
+    fn list_agent_runtime_probes(
+        &self,
+        _request: vibex_core::AgentRuntimeProbeListRequest,
+    ) -> BackendFuture<'_, Vec<vibex_core::AgentRuntimeProbeRecord>> {
+        disconnected_future!()
+    }
+
+    fn cancel_agent_runtime_probe(
+        &self,
+        _request: MutationRequest<vibex_core::AgentRuntimeProbeCancelRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentRuntimeProbeRecord> {
+        disconnected_future!()
+    }
+
     fn mutate_provider_credential_secret(
         &self,
         _request: MutationRequest<vibex_core::ProviderCredentialSecretMutationRequest>,
