@@ -237,6 +237,10 @@ pub struct SessionUiState {
     pub turn_preview_rail: bool,
     #[serde(default = "default_enhanced_command_execution_display")]
     pub enhanced_command_execution_display: bool,
+    #[serde(default)]
+    pub auto_continue_project_ids: BTreeSet<String>,
+    #[serde(default)]
+    pub auto_continue_session_overrides: BTreeMap<String, bool>,
 }
 
 impl Default for SessionUiState {
@@ -245,6 +249,8 @@ impl Default for SessionUiState {
             content_width: SessionContentWidthMode::Standard,
             turn_preview_rail: true,
             enhanced_command_execution_display: false,
+            auto_continue_project_ids: BTreeSet::new(),
+            auto_continue_session_overrides: BTreeMap::new(),
         }
     }
 }
@@ -395,6 +401,15 @@ impl DesktopUiStateV1 {
             runtime_selections_by_model.push(selection);
         }
         self.composer.runtime_selections_by_model = runtime_selections_by_model;
+        normalize_set(&mut self.session.auto_continue_project_ids, 1_000);
+        self.session.auto_continue_session_overrides =
+            std::mem::take(&mut self.session.auto_continue_session_overrides)
+                .into_iter()
+                .filter_map(|(session_id, enabled)| {
+                    bounded_required(&session_id, 256).map(|session_id| (session_id, enabled))
+                })
+                .take(2_000)
+                .collect();
         normalize_ids(&mut self.agent_tab_order, 256);
         self.terminal_tab_titles = std::mem::take(&mut self.terminal_tab_titles)
             .into_iter()
@@ -431,6 +446,12 @@ impl DesktopUiStateV1 {
         self.sidebar
             .pinned_session_ids
             .retain(|id| references.session_ids.contains(id));
+        self.session
+            .auto_continue_project_ids
+            .retain(|id| references.project_ids.contains(id));
+        self.session
+            .auto_continue_session_overrides
+            .retain(|id, _| references.session_ids.contains(id));
         self.terminal
             .tab_order
             .retain(|id| references.terminal_ids.contains(id));
@@ -1050,10 +1071,78 @@ mod tests {
             .and_then(serde_json::Value::as_object_mut)
             .unwrap();
         session.remove("enhancedCommandExecutionDisplay");
+        session.remove("autoContinueProjectIds");
+        session.remove("autoContinueSessionOverrides");
 
         let decoded = decode_and_migrate(&serde_json::to_vec(&value).unwrap()).unwrap();
 
         assert!(!decoded.session.enhanced_command_execution_display);
+        assert!(decoded.session.auto_continue_project_ids.is_empty());
+        assert!(decoded.session.auto_continue_session_overrides.is_empty());
+    }
+
+    #[test]
+    fn auto_continue_preferences_are_normalized_and_cleaned_up() {
+        let mut state = DesktopUiStateV1::default();
+        state
+            .session
+            .auto_continue_project_ids
+            .insert(" project_kept ".into());
+        state
+            .session
+            .auto_continue_project_ids
+            .insert("project_stale".into());
+        state
+            .session
+            .auto_continue_session_overrides
+            .insert(" session_enabled ".into(), true);
+        state
+            .session
+            .auto_continue_session_overrides
+            .insert("session_disabled".into(), false);
+        state
+            .session
+            .auto_continue_session_overrides
+            .insert("session_stale".into(), true);
+
+        state.normalize().unwrap();
+        assert!(
+            state
+                .session
+                .auto_continue_project_ids
+                .contains("project_kept")
+        );
+        assert_eq!(
+            state
+                .session
+                .auto_continue_session_overrides
+                .get("session_enabled"),
+            Some(&true)
+        );
+        assert_eq!(
+            state
+                .session
+                .auto_continue_session_overrides
+                .get("session_disabled"),
+            Some(&false)
+        );
+
+        state.cleanup_stale_ids(&UiStateReferences {
+            project_ids: BTreeSet::from(["project_kept".into()]),
+            session_ids: BTreeSet::from(["session_enabled".into(), "session_disabled".into()]),
+            ..UiStateReferences::default()
+        });
+        assert_eq!(
+            state.session.auto_continue_project_ids,
+            BTreeSet::from(["project_kept".into()])
+        );
+        assert_eq!(
+            state.session.auto_continue_session_overrides,
+            BTreeMap::from([
+                ("session_disabled".into(), false),
+                ("session_enabled".into(), true),
+            ])
+        );
     }
 
     #[test]

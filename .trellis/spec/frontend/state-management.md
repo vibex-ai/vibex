@@ -970,6 +970,12 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   update timeline content, not the sidebar/session-state snapshot; using the
   pre-submit `Idle` or `Running` snapshot can hide the continue affordance and
   skip recovery even though storage has already committed `Error`.
+- Auto-continue is a safe local preference persisted in `DesktopUiStateV1`.
+  Store project defaults separately from per-session boolean overrides so an
+  explicit session disable survives restart even when its project default is
+  enabled. Normalize and bound both collections, remove stale project/session
+  ids during authoritative UI-state cleanup, and keep countdown/handled-error
+  bookkeeping transient.
 - Claude/Codex JSONL support in this surface is offline import only. Adding the
   offline import crates must not introduce a Native online runtime route or
   provider-specific timeline rendering.

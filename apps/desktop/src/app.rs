@@ -2698,6 +2698,15 @@ fn auto_continue_should_start(
         && handled_error_updated_at_ms != Some(session_updated_at_ms)
 }
 
+fn restored_auto_continue_session_ids(state: &SessionUiState) -> BTreeSet<String> {
+    state
+        .auto_continue_session_overrides
+        .iter()
+        .filter(|(_, enabled)| **enabled)
+        .map(|(session_id, _)| session_id.clone())
+        .collect()
+}
+
 fn auto_continue_countdown_label(locale: locale::ResolvedLocale, remaining_seconds: u8) -> String {
     match locale {
         locale::ResolvedLocale::En => format!("Continue ({remaining_seconds}s)"),
@@ -3207,6 +3216,8 @@ impl VibexWorkbench {
             ),
         };
         normalize_empty_preview_visibility(&mut ui_state);
+        let auto_continue_default_project_ids = ui_state.session.auto_continue_project_ids.clone();
+        let auto_continue_session_ids = restored_auto_continue_session_ids(&ui_state.session);
         let initial_locale = locale::apply_locale(ui_state.appearance.locale);
         theme::apply_appearance(&ui_state.appearance, Some(window), cx);
         Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
@@ -3657,8 +3668,8 @@ impl VibexWorkbench {
             fork_session_pending: false,
             pending_agent_turn_session_ids: BTreeSet::new(),
             agent_turn_pending: false,
-            auto_continue_default_project_ids: BTreeSet::new(),
-            auto_continue_session_ids: BTreeSet::new(),
+            auto_continue_default_project_ids,
+            auto_continue_session_ids,
             auto_continue_paused_error_session_ids: BTreeSet::new(),
             auto_continue_handled_errors: BTreeMap::new(),
             auto_continue_countdowns: BTreeMap::new(),
@@ -3885,6 +3896,8 @@ impl VibexWorkbench {
 
     fn apply_loaded_ui_state(&mut self, mut state: DesktopUiStateV1, cx: &mut Context<Self>) {
         normalize_empty_preview_visibility(&mut state);
+        let auto_continue_default_project_ids = state.session.auto_continue_project_ids.clone();
+        let auto_continue_session_ids = restored_auto_continue_session_ids(&state.session);
         let selected_session_id = state
             .workbench
             .selected_session_id
@@ -3898,6 +3911,8 @@ impl VibexWorkbench {
             .unwrap_or_else(|| crate::platform::default_code_font_family().to_string());
         let code_font_size = state.appearance.code_font.size;
         self.ui_state = state;
+        self.auto_continue_default_project_ids = auto_continue_default_project_ids;
+        self.auto_continue_session_ids = auto_continue_session_ids;
         self.sidebar_state.row_order = self.ui_state.sidebar.session_order.clone();
         self.sidebar_state.pinned_ids = self.ui_state.sidebar.pinned_session_ids.clone();
         self.sidebar_state.collapsed_ids = self.ui_state.sidebar.collapsed_project_ids.clone();
@@ -4709,7 +4724,13 @@ impl VibexWorkbench {
         {
             return;
         }
-        let auto_continue_by_default = self.project_auto_continue_enabled(&session.project_id);
+        let auto_continue_enabled = self
+            .ui_state
+            .session
+            .auto_continue_session_overrides
+            .get(session.id.as_str())
+            .copied()
+            .unwrap_or_else(|| self.project_auto_continue_enabled(&session.project_id));
         if let Some(existing) = self
             .sessions
             .iter_mut()
@@ -4717,7 +4738,7 @@ impl VibexWorkbench {
         {
             *existing = session;
         } else {
-            if auto_continue_by_default {
+            if auto_continue_enabled {
                 self.auto_continue_session_ids
                     .insert(session.id.as_str().to_string());
             }
@@ -4772,6 +4793,9 @@ impl VibexWorkbench {
             self.auto_continue_default_project_ids
                 .remove(project_id.as_str());
         }
+        self.ui_state.session.auto_continue_project_ids =
+            self.auto_continue_default_project_ids.clone();
+        self.queue_ui_state();
         cx.notify();
     }
 
@@ -4813,6 +4837,11 @@ impl VibexWorkbench {
                 .remove(session_id.as_str());
             self.cancel_auto_continue_countdown(&session_id);
         }
+        self.ui_state
+            .session
+            .auto_continue_session_overrides
+            .insert(session_id.as_str().to_string(), enabled);
+        self.queue_ui_state();
         cx.notify();
     }
 
@@ -34071,6 +34100,22 @@ mod tests {
     }
 
     #[test]
+    fn auto_continue_restore_keeps_only_enabled_session_overrides() {
+        let mut state = SessionUiState::default();
+        state
+            .auto_continue_session_overrides
+            .insert("session_enabled".into(), true);
+        state
+            .auto_continue_session_overrides
+            .insert("session_disabled".into(), false);
+
+        assert_eq!(
+            restored_auto_continue_session_ids(&state),
+            BTreeSet::from(["session_enabled".into()])
+        );
+    }
+
+    #[test]
     fn auto_continue_ui_supports_session_scoping_countdown_and_pause() {
         let source = include_str!("app.rs");
         assert!(source.contains("auto_continue_default_project_ids"));
@@ -34125,6 +34170,8 @@ mod tests {
             .expect("project auto-continue toggle should remain inspectable");
         assert!(project_toggle.contains("session.project_id.as_str() == project_id.as_str()"));
         assert!(project_toggle.contains("self.set_auto_continue_enabled(session_id, true, cx)"));
+        assert!(project_toggle.contains("self.ui_state.session.auto_continue_project_ids"));
+        assert!(project_toggle.contains("self.queue_ui_state()"));
 
         let upsert = source
             .split_once("    fn upsert_session_snapshot(")
@@ -34132,7 +34179,16 @@ mod tests {
             .map(|(body, _)| body)
             .expect("session snapshot reconciliation should remain inspectable");
         assert!(upsert.contains("self.project_auto_continue_enabled(&session.project_id)"));
+        assert!(upsert.contains("auto_continue_session_overrides"));
         assert!(upsert.contains("self.auto_continue_session_ids"));
+
+        let session_toggle = source
+            .split_once("    fn set_auto_continue_enabled(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn sync_auto_continue_for_session("))
+            .map(|(body, _)| body)
+            .expect("session auto-continue toggle should remain inspectable");
+        assert!(session_toggle.contains("auto_continue_session_overrides"));
+        assert!(session_toggle.contains("self.queue_ui_state()"));
     }
 
     #[test]
