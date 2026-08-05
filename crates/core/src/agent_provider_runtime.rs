@@ -16,7 +16,8 @@ use crate::{
     AgentModelInterfaceDescriptor, AgentProviderControl, AgentProviderProjectionDescriptor,
     AgentProviderProjectionDescriptorId, AgentRuntimeHomeStrategy, AgentVersionCompatibility,
     ProjectionDescriptorMatch, ProjectionEvidenceReference, ProjectionEvidenceState,
-    ProviderSwitchBehavior, VibexError, VibexResult, acp_agent_catalog_entries,
+    ProviderSecretKind, ProviderSwitchBehavior, VibexError, VibexResult,
+    WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, acp_agent_catalog_entries,
 };
 use crate::{AgentModelProviderBindingId, AgentRuntimeProbeId, AgentRuntimeProfileId};
 
@@ -63,6 +64,7 @@ pub struct AgentProviderRolloutManifestEntry {
     pub evidence_state: ProjectionEvidenceState,
     pub source_evidence_reference: String,
     pub smoke_id: String,
+    pub capability_diagnostic_code: Option<String>,
 }
 
 impl AgentProviderRolloutManifestEntry {
@@ -82,6 +84,31 @@ impl AgentProviderRolloutManifestEntry {
             return Err(VibexError::validation(
                 "agent_rollout_manifest_identity_unsafe",
                 "rollout manifest identities must not contain path separators",
+            ));
+        }
+        if self
+            .capability_diagnostic_code
+            .as_deref()
+            .is_some_and(|code| !is_diagnostic_code(code))
+        {
+            return Err(VibexError::validation(
+                "agent_rollout_manifest_diagnostic_invalid",
+                "rollout manifest capability diagnostics must be bounded stable codes",
+            ));
+        }
+        let conservative = self.evidence_state == ProjectionEvidenceState::Unverified
+            || self.switch_behavior == ProviderSwitchBehavior::Unverified;
+        if conservative
+            && (self.evidence_state != ProjectionEvidenceState::Unverified
+                || self.switch_behavior != ProviderSwitchBehavior::Unverified
+                || self.runtime_home_strategy != AgentRuntimeHomeStrategy::None
+                || !self.credential_kinds.is_empty()
+                || !self.model_interfaces.is_empty()
+                || self.capability_diagnostic_code.is_none())
+        {
+            return Err(VibexError::validation(
+                "agent_rollout_manifest_conservative_shape_invalid",
+                "conservative rollout entries must disable projection and carry an explicit diagnostic",
             ));
         }
         if !is_safe_identity(&self.catalog_version)
@@ -189,55 +216,77 @@ fn documented_source(agent_id: &str, version: &str) -> String {
     format!("research/acp-agent/{agent_id}@{version}")
 }
 
-fn generic_projection_shape(
+struct CatalogProjectionShape {
+    provider_control: AgentProviderControl,
+    credential_control: AgentCredentialControl,
+    model_control: AgentModelControl,
+    credential_kinds: Vec<AgentCredentialKind>,
+    model_interfaces: Vec<AgentModelInterfaceDescriptor>,
+    runtime_home_strategy: AgentRuntimeHomeStrategy,
+    switch_behavior: ProviderSwitchBehavior,
+    evidence_state: ProjectionEvidenceState,
+    capability_diagnostic_code: Option<&'static str>,
+}
+
+fn catalog_projection_shape(
     agent_id: &str,
     mode: AgentProviderCapabilityMode,
-) -> (
-    AgentProviderControl,
-    AgentCredentialControl,
-    AgentModelControl,
-    Vec<AgentCredentialKind>,
-    Vec<AgentModelInterfaceDescriptor>,
-    AgentRuntimeHomeStrategy,
-    ProviderSwitchBehavior,
-    ProjectionEvidenceState,
-) {
-    match mode {
-        AgentProviderCapabilityMode::ServiceMarketplace => (
-            AgentProviderControl::ServiceMarketplace,
-            AgentCredentialControl::ServiceMarketplace,
-            AgentModelControl::ServiceMarketplace,
-            vec![AgentCredentialKind::ManagedSubscription],
-            Vec::new(),
-            AgentRuntimeHomeStrategy::AgentManaged,
-            ProviderSwitchBehavior::AgentManaged,
-            ProjectionEvidenceState::ServiceMarketplace,
-        ),
-        AgentProviderCapabilityMode::LocalModel => (
-            AgentProviderControl::LocalModel,
-            AgentCredentialControl::Local,
-            AgentModelControl::LocalModel,
-            vec![AgentCredentialKind::Local],
-            Vec::new(),
-            AgentRuntimeHomeStrategy::VibexPrivate,
-            ProviderSwitchBehavior::RestartFreshAndBridge,
-            ProjectionEvidenceState::Local,
-        ),
-        AgentProviderCapabilityMode::AgentManaged => (
-            AgentProviderControl::AgentManaged,
-            AgentCredentialControl::OAuthAgentManaged,
-            AgentModelControl::AgentManaged,
-            vec![
+) -> VibexResult<CatalogProjectionShape> {
+    if mode == AgentProviderCapabilityMode::ReplaceableProvider {
+        return match agent_id {
+            "codebuddy-code" => Ok(environment_projection_shape(
+                "CODEBUDDY_BASE_URL",
+                "CODEBUDDY_API_KEY",
+                "CODEBUDDY_MODEL",
+            )),
+            "glm-acp-agent" => Ok(environment_projection_shape(
+                "ACP_GLM_BASE_URL",
+                "Z_AI_API_KEY",
+                "ACP_GLM_MODEL",
+            )),
+            _ => conservative_replaceable_shape(agent_id),
+        };
+    }
+
+    Ok(match mode {
+        AgentProviderCapabilityMode::ServiceMarketplace => CatalogProjectionShape {
+            provider_control: AgentProviderControl::ServiceMarketplace,
+            credential_control: AgentCredentialControl::ServiceMarketplace,
+            model_control: AgentModelControl::ServiceMarketplace,
+            credential_kinds: vec![AgentCredentialKind::ManagedSubscription],
+            model_interfaces: Vec::new(),
+            runtime_home_strategy: AgentRuntimeHomeStrategy::AgentManaged,
+            switch_behavior: ProviderSwitchBehavior::AgentManaged,
+            evidence_state: ProjectionEvidenceState::ServiceMarketplace,
+            capability_diagnostic_code: None,
+        },
+        AgentProviderCapabilityMode::LocalModel => CatalogProjectionShape {
+            provider_control: AgentProviderControl::LocalModel,
+            credential_control: AgentCredentialControl::Local,
+            model_control: AgentModelControl::LocalModel,
+            credential_kinds: vec![AgentCredentialKind::Local],
+            model_interfaces: Vec::new(),
+            runtime_home_strategy: AgentRuntimeHomeStrategy::VibexPrivate,
+            switch_behavior: ProviderSwitchBehavior::RestartFreshAndBridge,
+            evidence_state: ProjectionEvidenceState::Local,
+            capability_diagnostic_code: None,
+        },
+        AgentProviderCapabilityMode::AgentManaged => CatalogProjectionShape {
+            provider_control: AgentProviderControl::AgentManaged,
+            credential_control: AgentCredentialControl::OAuthAgentManaged,
+            model_control: AgentModelControl::AgentManaged,
+            credential_kinds: vec![
                 AgentCredentialKind::OAuth,
                 AgentCredentialKind::ManagedSubscription,
             ],
-            Vec::new(),
-            AgentRuntimeHomeStrategy::AgentManaged,
-            ProviderSwitchBehavior::AgentManaged,
-            ProjectionEvidenceState::AgentManaged,
-        ),
+            model_interfaces: Vec::new(),
+            runtime_home_strategy: AgentRuntimeHomeStrategy::AgentManaged,
+            switch_behavior: ProviderSwitchBehavior::AgentManaged,
+            evidence_state: ProjectionEvidenceState::AgentManaged,
+            capability_diagnostic_code: None,
+        },
         AgentProviderCapabilityMode::CloudCredential => {
-            let (credential, kinds) = match agent_id {
+            let (credential_control, credential_kinds) = match agent_id {
                 "cortex-code" => (
                     AgentCredentialControl::AdvertisedAuthMethod {
                         method_ids: vec!["snowflake_connection".to_string(), "oauth".to_string()],
@@ -258,56 +307,112 @@ fn generic_projection_shape(
                         AgentCredentialKind::Gcp,
                     ],
                 ),
-                _ => (
+                "kiro" => (
                     AgentCredentialControl::AdvertisedAuthMethod {
                         method_ids: vec!["agent_login".to_string(), "aws_chain".to_string()],
                     },
                     vec![AgentCredentialKind::OAuth, AgentCredentialKind::Aws],
                 ),
+                _ => {
+                    return Err(VibexError::validation(
+                        "agent_rollout_cloud_contract_missing",
+                        "cloud credential Agent has no explicit catalog contract",
+                    ));
+                }
             };
-            (
-                AgentProviderControl::AdvertisedSessionOption {
+            CatalogProjectionShape {
+                provider_control: AgentProviderControl::AdvertisedSessionOption {
                     option_ids: vec!["provider".to_string(), "model".to_string()],
                 },
-                credential,
-                AgentModelControl::AcpConfigOption {
+                credential_control,
+                model_control: AgentModelControl::AcpConfigOption {
                     aliases: vec!["model".to_string(), "deployment".to_string()],
                 },
-                kinds,
-                Vec::new(),
-                AgentRuntimeHomeStrategy::AgentManaged,
-                ProviderSwitchBehavior::RestartAndResume,
-                ProjectionEvidenceState::Documented,
-            )
+                credential_kinds,
+                model_interfaces: Vec::new(),
+                runtime_home_strategy: AgentRuntimeHomeStrategy::AgentManaged,
+                switch_behavior: ProviderSwitchBehavior::RestartAndResume,
+                evidence_state: ProjectionEvidenceState::Documented,
+                capability_diagnostic_code: Some("agent_projection_runtime_verification_required"),
+            }
         }
-        AgentProviderCapabilityMode::ReplaceableProvider => {
-            (
-                // The upstream matrix documents provider entry points, but it
-                // does not prove a Vibex-owned isolated projector. Exact
-                // catalog identity therefore resolves to an explicit
-                // conservative descriptor until a typed projector and runtime
-                // smoke are added for that version.
-                AgentProviderControl::Unverified,
-                AgentCredentialControl::Unverified,
-                AgentModelControl::Unverified,
-                Vec::new(),
-                Vec::new(),
-                AgentRuntimeHomeStrategy::VibexPrivate,
-                ProviderSwitchBehavior::Unverified,
-                ProjectionEvidenceState::Documented,
-            )
-        }
-        AgentProviderCapabilityMode::Unsupported => (
-            AgentProviderControl::Unsupported,
-            AgentCredentialControl::Unsupported,
-            AgentModelControl::Unsupported,
-            Vec::new(),
-            Vec::new(),
-            AgentRuntimeHomeStrategy::None,
-            ProviderSwitchBehavior::Unsupported,
-            ProjectionEvidenceState::Unsupported,
-        ),
+        AgentProviderCapabilityMode::Unsupported => CatalogProjectionShape {
+            provider_control: AgentProviderControl::Unsupported,
+            credential_control: AgentCredentialControl::Unsupported,
+            model_control: AgentModelControl::Unsupported,
+            credential_kinds: Vec::new(),
+            model_interfaces: Vec::new(),
+            runtime_home_strategy: AgentRuntimeHomeStrategy::None,
+            switch_behavior: ProviderSwitchBehavior::Unsupported,
+            evidence_state: ProjectionEvidenceState::Unsupported,
+            capability_diagnostic_code: Some("agent_projection_unsupported"),
+        },
+        AgentProviderCapabilityMode::ReplaceableProvider => unreachable!(),
+    })
+}
+
+fn environment_projection_shape(
+    base_url_key: &str,
+    secret_env_key: &str,
+    model_env_key: &str,
+) -> CatalogProjectionShape {
+    CatalogProjectionShape {
+        provider_control: AgentProviderControl::Environment {
+            base_url_key: Some(base_url_key.to_string()),
+        },
+        credential_control: AgentCredentialControl::Environment {
+            secret_env_key: secret_env_key.to_string(),
+            accepted_secret_kinds: vec![ProviderSecretKind::ApiKey],
+        },
+        model_control: AgentModelControl::ProcessEnvironment {
+            key: model_env_key.to_string(),
+        },
+        credential_kinds: vec![AgentCredentialKind::ApiKey],
+        model_interfaces: vec![AgentModelInterfaceDescriptor {
+            wire_protocol_id: WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+            sdk_adapter_id: None,
+            transport: "https".to_string(),
+            user_selectable: false,
+            process_scoped: true,
+        }],
+        runtime_home_strategy: AgentRuntimeHomeStrategy::VibexPrivate,
+        switch_behavior: ProviderSwitchBehavior::RestartAndResume,
+        evidence_state: ProjectionEvidenceState::Documented,
+        capability_diagnostic_code: Some("agent_projection_runtime_verification_required"),
     }
+}
+
+fn conservative_replaceable_shape(agent_id: &str) -> VibexResult<CatalogProjectionShape> {
+    let diagnostic = match agent_id {
+        "autohand" | "codewhale" | "crow-cli" | "dimcode" | "factory-droid" | "fast-agent"
+        | "kimi" | "mistral-vibe" | "qwen-code" | "stakpak" | "vtcode" => {
+            "agent_projection_typed_projector_not_implemented"
+        }
+        "cline" | "dirac" | "kilo" | "minion-code" | "nova" => {
+            "agent_projection_auth_boundary_not_runtime_verified"
+        }
+        "copilot" | "hermes" => "agent_projection_version_detection_required",
+        "deepagents" => "agent_projection_environment_contract_not_runtime_verified",
+        "goose" => "agent_projection_acp_option_not_runtime_verified",
+        "grok" | "poolside" => "agent_projection_mixed_auth_boundary_not_runtime_verified",
+        _ => {
+            return Err(VibexError::validation(
+                "agent_rollout_conservative_contract_missing",
+                "replaceable-provider Agent has no explicit projector or conservative contract",
+            ));
+        }
+    };
+    Ok(CatalogProjectionShape {
+        provider_control: AgentProviderControl::Unverified,
+        credential_control: AgentCredentialControl::Unverified,
+        model_control: AgentModelControl::Unverified,
+        credential_kinds: Vec::new(),
+        model_interfaces: Vec::new(),
+        runtime_home_strategy: AgentRuntimeHomeStrategy::None,
+        switch_behavior: ProviderSwitchBehavior::Unverified,
+        evidence_state: ProjectionEvidenceState::Unverified,
+        capability_diagnostic_code: Some(diagnostic),
+    })
 }
 
 fn catalog_manifest_entry(
@@ -317,8 +422,7 @@ fn catalog_manifest_entry(
     let agent_id = AgentId::parse(id)?;
     let mode = mode_for(id);
     let (version_policy, _) = exact_or_manual(version);
-    let (_, _, _, credential_kinds, model_interfaces, home, switch_behavior, evidence_state) =
-        generic_projection_shape(id, mode);
+    let shape = catalog_projection_shape(id, mode)?;
     let entry = AgentProviderRolloutManifestEntry {
         agent_id: agent_id.clone(),
         catalog_version: version.to_string(),
@@ -327,13 +431,14 @@ fn catalog_manifest_entry(
         descriptor_version: "1".to_string(),
         version_policy,
         capability_mode: mode,
-        runtime_home_strategy: home,
-        switch_behavior,
-        credential_kinds,
-        model_interfaces,
-        evidence_state,
+        runtime_home_strategy: shape.runtime_home_strategy,
+        switch_behavior: shape.switch_behavior,
+        credential_kinds: shape.credential_kinds,
+        model_interfaces: shape.model_interfaces,
+        evidence_state: shape.evidence_state,
         source_evidence_reference: documented_source(id, version),
         smoke_id: format!("agent-provider-{id}"),
+        capability_diagnostic_code: shape.capability_diagnostic_code.map(str::to_string),
     };
     entry.validate()?;
     Ok(entry)
@@ -370,6 +475,9 @@ pub fn agent_provider_rollout_manifest() -> VibexResult<Vec<AgentProviderRollout
             evidence_state: ProjectionEvidenceState::Documented,
             source_evidence_reference: format!("provider-config/{id}-environment-v1"),
             smoke_id: format!("builtin-provider-{id}"),
+            capability_diagnostic_code: Some(
+                "agent_projection_runtime_verification_required".to_string(),
+            ),
         });
     }
     for entry in acp_agent_catalog_entries() {
@@ -429,16 +537,7 @@ pub fn catalog_projection_descriptors() -> VibexResult<Vec<AgentProviderProjecti
     for entry in acp_agent_catalog_entries() {
         let agent_id = AgentId::parse(entry.id)?;
         let mode = mode_for(entry.id);
-        let (
-            provider_control,
-            credential_control,
-            model_control,
-            credential_kinds,
-            model_interfaces,
-            runtime_home_strategy,
-            switch_behavior,
-            evidence_state,
-        ) = generic_projection_shape(entry.id, mode);
+        let shape = catalog_projection_shape(entry.id, mode)?;
         let (version_policy, compatibility) = exact_or_manual(entry.version);
         let _ = version_policy;
         result.push(AgentProviderProjectionDescriptor {
@@ -450,17 +549,18 @@ pub fn catalog_projection_descriptors() -> VibexResult<Vec<AgentProviderProjecti
                 adapter_id: default_acp_adapter_id(&agent_id),
             },
             compatibility,
-            provider_control,
-            credential_control,
-            model_control,
-            credential_kinds,
-            model_interfaces,
-            runtime_home_strategy,
-            switch_behavior,
+            provider_control: shape.provider_control,
+            credential_control: shape.credential_control,
+            model_control: shape.model_control,
+            credential_kinds: shape.credential_kinds,
+            model_interfaces: shape.model_interfaces,
+            runtime_home_strategy: shape.runtime_home_strategy,
+            switch_behavior: shape.switch_behavior,
             evidence: ProjectionEvidenceReference {
-                state: evidence_state,
+                state: shape.evidence_state,
                 source_reference: Some(documented_source(entry.id, entry.version)),
                 runtime_reference: None,
+                diagnostic_code: shape.capability_diagnostic_code.map(str::to_string),
             },
         });
     }
@@ -934,6 +1034,16 @@ mod tests {
                 .iter()
                 .all(|entry| !entry.source_evidence_reference.is_empty())
         );
+
+        let mut unsafe_conservative = manifest
+            .into_iter()
+            .find(|entry| entry.evidence_state == ProjectionEvidenceState::Unverified)
+            .unwrap();
+        unsafe_conservative.runtime_home_strategy = AgentRuntimeHomeStrategy::VibexPrivate;
+        assert_eq!(
+            unsafe_conservative.validate().unwrap_err().code,
+            "agent_rollout_manifest_conservative_shape_invalid"
+        );
     }
 
     #[test]
@@ -1037,27 +1147,135 @@ mod tests {
     }
 
     #[test]
-    fn catalog_replaceable_agents_do_not_claim_unimplemented_generic_projection() {
-        for descriptor in catalog_projection_descriptors().unwrap() {
+    fn catalog_projection_contracts_are_explicit_and_conservative() {
+        let descriptors = catalog_projection_descriptors().unwrap();
+        let codebuddy = descriptors
+            .iter()
+            .find(|descriptor| descriptor.route.agent_id.as_str() == "codebuddy-code")
+            .unwrap();
+        assert_eq!(
+            codebuddy.provider_control,
+            AgentProviderControl::Environment {
+                base_url_key: Some("CODEBUDDY_BASE_URL".to_string())
+            }
+        );
+        assert_eq!(
+            codebuddy.credential_control,
+            AgentCredentialControl::Environment {
+                secret_env_key: "CODEBUDDY_API_KEY".to_string(),
+                accepted_secret_kinds: vec![ProviderSecretKind::ApiKey],
+            }
+        );
+        assert_eq!(
+            codebuddy.model_control,
+            AgentModelControl::ProcessEnvironment {
+                key: "CODEBUDDY_MODEL".to_string()
+            }
+        );
+        let glm = descriptors
+            .iter()
+            .find(|descriptor| descriptor.route.agent_id.as_str() == "glm-acp-agent")
+            .unwrap();
+        assert_eq!(
+            glm.provider_control,
+            AgentProviderControl::Environment {
+                base_url_key: Some("ACP_GLM_BASE_URL".to_string())
+            }
+        );
+        assert_eq!(
+            glm.credential_control,
+            AgentCredentialControl::Environment {
+                secret_env_key: "Z_AI_API_KEY".to_string(),
+                accepted_secret_kinds: vec![ProviderSecretKind::ApiKey],
+            }
+        );
+        assert_eq!(
+            glm.model_control,
+            AgentModelControl::ProcessEnvironment {
+                key: "ACP_GLM_MODEL".to_string()
+            }
+        );
+
+        for descriptor in descriptors {
             let mode = mode_for(descriptor.route.agent_id.as_str());
             if mode != AgentProviderCapabilityMode::ReplaceableProvider {
                 continue;
             }
-            assert_eq!(
-                descriptor.provider_control,
-                AgentProviderControl::Unverified
-            );
-            assert_eq!(
-                descriptor.credential_control,
-                AgentCredentialControl::Unverified
-            );
-            assert_eq!(descriptor.model_control, AgentModelControl::Unverified);
-            assert!(descriptor.credential_kinds.is_empty());
-            assert!(descriptor.model_interfaces.is_empty());
-            assert_eq!(
-                descriptor.switch_behavior,
-                ProviderSwitchBehavior::Unverified
-            );
+            if matches!(
+                descriptor.route.agent_id.as_str(),
+                "codebuddy-code" | "glm-acp-agent"
+            ) {
+                assert!(matches!(
+                    descriptor.provider_control,
+                    AgentProviderControl::Environment { .. }
+                ));
+                assert!(matches!(
+                    descriptor.credential_control,
+                    AgentCredentialControl::Environment { .. }
+                ));
+                assert!(matches!(
+                    descriptor.model_control,
+                    AgentModelControl::ProcessEnvironment { .. }
+                ));
+                assert_eq!(
+                    descriptor.evidence.state,
+                    ProjectionEvidenceState::Documented
+                );
+            } else {
+                assert_eq!(
+                    descriptor.provider_control,
+                    AgentProviderControl::Unverified
+                );
+                assert_eq!(
+                    descriptor.credential_control,
+                    AgentCredentialControl::Unverified
+                );
+                assert_eq!(descriptor.model_control, AgentModelControl::Unverified);
+                assert_eq!(
+                    descriptor.evidence.state,
+                    ProjectionEvidenceState::Unverified
+                );
+                assert!(descriptor.evidence.diagnostic_code.is_some());
+                assert_eq!(
+                    descriptor.switch_behavior,
+                    ProviderSwitchBehavior::Unverified
+                );
+            }
         }
+    }
+
+    #[test]
+    fn conservative_descriptor_requires_a_diagnostic_and_fail_closed_shape() {
+        let mut descriptor = catalog_projection_descriptors()
+            .unwrap()
+            .into_iter()
+            .find(|descriptor| descriptor.route.agent_id.as_str() == "autohand")
+            .unwrap();
+        descriptor.evidence.diagnostic_code = None;
+        assert_eq!(
+            descriptor.validate().unwrap_err().code,
+            "agent_projection_unverified_contract_incomplete"
+        );
+
+        descriptor.evidence.diagnostic_code =
+            Some("agent_projection_typed_projector_not_implemented".to_string());
+        descriptor
+            .credential_kinds
+            .push(AgentCredentialKind::ApiKey);
+        assert_eq!(
+            descriptor.validate().unwrap_err().code,
+            "agent_projection_unverified_contract_incomplete"
+        );
+
+        let mut documented_projector = catalog_projection_descriptors()
+            .unwrap()
+            .into_iter()
+            .find(|descriptor| descriptor.route.agent_id.as_str() == "codebuddy-code")
+            .unwrap();
+        documented_projector.evidence.state = ProjectionEvidenceState::Unverified;
+        assert_eq!(
+            documented_projector.validate().unwrap_err().code,
+            "agent_projection_unverified_contract_incomplete"
+        );
     }
 }

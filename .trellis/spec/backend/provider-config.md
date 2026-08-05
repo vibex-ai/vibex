@@ -2789,3 +2789,178 @@ spawn_acp_child(resolved.child_environment())?;
 
 Only the authoritative runtime resolves the Secret, and every file target is a
 validated code-owned overlay under the private runtime root.
+
+## Scenario: Agent Provider Runtime Verification Rollout
+
+### 1. Scope / Trigger
+
+- Trigger: adding or upgrading a catalog Agent descriptor, running an ACP
+  provider probe, or deciding whether an existing binding may switch provider.
+- The rollout manifest contains exactly three builtin and 35 catalog Agent ids.
+  Catalog installability and provider verification remain separate claims.
+
+### 2. Signatures
+
+```text
+agent_provider_rollout_manifest() -> VibexResult<Vec<AgentProviderRolloutManifestEntry>>
+catalog_projection_descriptors() -> VibexResult<Vec<AgentProviderProjectionDescriptor>>
+AgentProviderProjectionDescriptor::validate() -> VibexResult<()>
+AgentRuntimeProbeService::{request, spawn, cancel, get, list}
+effective_provider_fact(
+  initialize, session, model_apply_response, projection,
+  expected_provider_identities,
+)
+status_for_resolution(match_kind, descriptor) -> AgentModelProviderBindingStatus
+apply_stale_state(binding, next_fingerprint, match_kind)
+capture:agent-provider-runtime -> agent-provider-runtime-evidence.v1
+check:agent-provider-runtime[:self-test]
+```
+
+### 3. Contracts
+
+- `agent_provider_rollout_manifest()` is the checked source of truth for Agent,
+  catalog version policy, descriptor identity, capability mode, credential/model
+  shape, evidence state, smoke id, and any conservative diagnostic. Registry and
+  catalog drift must fail tests instead of silently dropping an Agent.
+- An exact descriptor with `Documented` evidence still requires a real runtime
+  probe. An `Unverified` descriptor emits no automatic endpoint, Secret, model,
+  overlay, or switch projection and carries a bounded diagnostic explaining the
+  missing contract. Binary identity or ACP initialize alone never promotes it.
+- Exact identity does not override conservative evidence. A binding resolved to
+  `Unverified` stays `AgentModelProviderBindingStatus::Unverified`, stores no
+  projection fingerprint, and cannot be changed to `Ready` by refresh/stale
+  calculation. `Unsupported` follows the same rule with `Unsupported` status.
+- GLM Agent `1.1.4` projects only the documented
+  `ACP_GLM_BASE_URL`/`Z_AI_API_KEY`/`ACP_GLM_MODEL` environment contract.
+  CodeBuddy `2.109.0` projects only
+  `CODEBUDDY_BASE_URL`/`CODEBUDDY_API_KEY`/`CODEBUDDY_MODEL`. Both are
+  process-scoped, restart-based, and remain `Documented` until a real smoke
+  confirms the effective provider and model.
+- A probe's requested timeout covers identity resolution, projection planning,
+  process start, and ACP operations. Cleanup still runs after a terminal
+  timeout/cancel decision and must terminate the probe process and remove its
+  private root. Cancellation is observed while starting the process as well as
+  between stages.
+- Before spawn, remove every inherited/projected, case-insensitive occurrence of `HOME`,
+  `USERPROFILE`, XDG config/data/state/cache homes, and `CODEX_HOME`, then append
+  exactly one probe-owned value for each. Duplicate keys must not allow a later
+  value to escape the isolated root.
+- `SessionResume` evidence requires an actual successful negotiated
+  `session/resume` or `session/load` request against the probe session. An
+  advertised capability alone is not evidence; method-not-found is
+  `Unsupported`, other request failures are `Failed`, and invalid restore
+  responses are `Failed`.
+- Provider verification requires exact descriptor match, a safe projection
+  fingerprint, passed binary/ACP/auth/session/model/provider facts, and passed
+  redaction. Live switching additionally requires `LiveSessionConfig`, a passed
+  switch compatibility fact, and proof that failed target preparation preserved
+  the source.
+- Effective-provider proof compares the runtime's explicit endpoint/provider
+  observation with the safe normalized endpoint origins from the selected
+  projection preview. The observed origin and exact target model must both
+  match. A provider string with no planned safe identity, or the same model name
+  served by a different origin, remains blocked.
+- The checked evidence capture includes all 38 entries, hashes every bound
+  implementation surface, scans forbidden Secret/native/path fields, and rejects
+  binary-only or false live-switch claims. Missing accounts, licenses, cloud
+  projects, or local model assets produce `blocked/not_run`; they never count as
+  a passing real smoke.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Missing/duplicate Agent, descriptor, or Adapter identity | `agent_rollout_manifest_*` error; gate fails. |
+| `Unverified` entry has a runtime home, credential/model interface, missing diagnostic, or non-Unverified switch | `agent_rollout_manifest_conservative_shape_invalid`. |
+| Any descriptor control or evidence is `Unverified` without the complete fail-closed shape | `agent_projection_unverified_contract_incomplete`. |
+| Exact `Unverified`/`Unsupported` binding is created or refreshed | Keep matching conservative status and `projection_fingerprint = None`. |
+| Probe timeout or cancel during spawn/ACP work | Terminal typed status, process shutdown, private-root cleanup. |
+| Restore operation returns method-not-found | `SessionResume = Unsupported`; load may be tried only when negotiated. |
+| Restore response is non-object, has a non-string id, or echoes another session id | `SessionResume = Failed`; never promote resume compatibility. |
+| Binary/handshake succeeds without effective provider/model proof | Provider verification remains false. |
+| Runtime reports another endpoint while the target model name matches | `effective_provider_mismatch`; provider verification remains blocked. |
+| Projection has no safe expected endpoint identity | `effective_provider_not_confirmed`; never infer identity from the model name. |
+| Operator credentials/assets are absent | Evidence is `blocked/not_run`, never a passed real smoke. |
+
+### 5. Good/Base/Bad Cases
+
+- Good: CodeBuddy exact `2.109.0` receives only its three documented env keys,
+  the isolated probe confirms the planned safe origin plus exact model, and
+  evidence remains scoped to that exact descriptor/version.
+- Good: an exact Autohand descriptor without a typed projector remains
+  `Unverified`, has no runtime home/fingerprint, and returns its stable
+  capability diagnostic.
+- Base: a licensed Agent is unavailable on the capture machine; the manifest
+  and contract gate pass while the real smoke remains explicitly blocked.
+- Bad: mark an exact descriptor `Ready` merely because version matching or ACP
+  initialize succeeded, or retain a prior fingerprint for an `Unverified`
+  binding.
+- Bad: accept Profile B because it reports the requested model when the explicit
+  endpoint observation still identifies Profile A.
+
+### 6. Tests Required
+
+- Core tests cover exact 38-entry catalog/descriptor/manifest identity,
+  per-entry conservative diagnostics, and the two explicit environment
+  descriptors.
+- ACP probe tests cover duplicate isolation keys, bounded cleanup, independent
+  fact aggregation, restore response identity, matching safe origins, wrong
+  origins with identical model names, and missing expected identities.
+  Mock/runtime tests must cover timeout, cancel, crash cleanup, prepare failure,
+  source preservation, and startup reconciliation.
+- `check-agent-provider-runtime.mjs --self-test` must reject missing/duplicate
+  Agents, source/version drift, missing conservative diagnostics, Secret/path
+  leakage, binary-only verification, false provider verification, and false live
+  switching. Evidence changes are made only by the matching capture command.
+- Config-switch tests assert exact conservative evidence never produces
+  `Ready` or a projection fingerprint on create, update, or stale refresh.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+if resolution.match_kind == ProjectionDescriptorMatch::Exact {
+    binding.status = AgentModelProviderBindingStatus::Ready;
+    binding.projection_fingerprint = Some(plan.fingerprint);
+}
+```
+
+Exact version matching says only which descriptor applies; it does not upgrade
+that descriptor's evidence or enable an unimplemented projector.
+
+#### Correct
+
+```rust
+binding.status = status_for_resolution(resolution.match_kind, &resolution.descriptor);
+if binding.status == AgentModelProviderBindingStatus::Ready {
+    binding.projection_fingerprint = Some(plan.fingerprint);
+}
+```
+
+The descriptor evidence and match kind jointly determine whether any automatic
+projection state may become active.
+
+#### Wrong
+
+```rust
+if observed_provider.is_some() && current_model == target_model {
+    provider_projection = Passed;
+}
+```
+
+The model id is not a provider identity; two profiles may expose the same model
+name.
+
+#### Correct
+
+```rust
+let provider_matches = planned_safe_origins.contains(&observed_safe_origin);
+if provider_matches && current_model == target_model {
+    provider_projection = Passed;
+}
+```
+
+Only descriptor-owned, redacted projection targets define the expected provider
+identity. Raw endpoint paths, query strings, credentials, and response payloads
+do not enter durable evidence.

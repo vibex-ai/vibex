@@ -524,7 +524,7 @@ impl ProviderConfigService {
             &resolution.descriptor,
             "binding-create",
         )?;
-        if resolution.match_kind != ProjectionDescriptorMatch::Conservative {
+        if binding.status == AgentModelProviderBindingStatus::Ready {
             binding.projection_fingerprint = Some(plan.fingerprint);
         }
         AgentModelProviderBindingRepository::insert(&conn, &binding)?;
@@ -1543,10 +1543,12 @@ fn status_for_resolution(
 ) -> AgentModelProviderBindingStatus {
     if match_kind == ProjectionDescriptorMatch::Conservative {
         AgentModelProviderBindingStatus::Unverified
-    } else if descriptor.evidence.state == ProjectionEvidenceState::Unsupported {
-        AgentModelProviderBindingStatus::Unsupported
     } else {
-        AgentModelProviderBindingStatus::Ready
+        match descriptor.evidence.state {
+            ProjectionEvidenceState::Unverified => AgentModelProviderBindingStatus::Unverified,
+            ProjectionEvidenceState::Unsupported => AgentModelProviderBindingStatus::Unsupported,
+            _ => AgentModelProviderBindingStatus::Ready,
+        }
     }
 }
 
@@ -1555,10 +1557,17 @@ fn apply_stale_state(
     next_fingerprint: &str,
     match_kind: ProjectionDescriptorMatch,
 ) {
-    if match_kind == ProjectionDescriptorMatch::Conservative {
+    if match_kind == ProjectionDescriptorMatch::Conservative
+        || binding.verification.state == ProjectionEvidenceState::Unverified
+    {
         binding.status = AgentModelProviderBindingStatus::Unverified;
         binding.projection_fingerprint = None;
         binding.verification.state = ProjectionEvidenceState::Unverified;
+        return;
+    }
+    if binding.verification.state == ProjectionEvidenceState::Unsupported {
+        binding.status = AgentModelProviderBindingStatus::Unsupported;
+        binding.projection_fingerprint = None;
         return;
     }
     match binding.projection_fingerprint.as_deref() {
@@ -2021,6 +2030,7 @@ mod tests {
                 state: ProjectionEvidenceState::Documented,
                 source_reference: Some("test/source".to_string()),
                 runtime_reference: None,
+                diagnostic_code: None,
             },
         };
         let binding = AgentModelProviderBinding {
@@ -2098,6 +2108,42 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn exact_conservative_evidence_never_promotes_a_binding_to_ready() {
+        let (_, _, mut binding, mut descriptor) =
+            fixture(ConfigOverlayStrategy::StructuredJsonOverlay);
+
+        descriptor.evidence.state = ProjectionEvidenceState::Unverified;
+        assert_eq!(
+            status_for_resolution(ProjectionDescriptorMatch::Exact, &descriptor),
+            AgentModelProviderBindingStatus::Unverified
+        );
+        binding.verification = verification_from_descriptor(&descriptor);
+        binding.projection_fingerprint = Some("sha256:active".to_string());
+        apply_stale_state(
+            &mut binding,
+            "sha256:next",
+            ProjectionDescriptorMatch::Exact,
+        );
+        assert_eq!(binding.status, AgentModelProviderBindingStatus::Unverified);
+        assert!(binding.projection_fingerprint.is_none());
+
+        descriptor.evidence.state = ProjectionEvidenceState::Unsupported;
+        assert_eq!(
+            status_for_resolution(ProjectionDescriptorMatch::Exact, &descriptor),
+            AgentModelProviderBindingStatus::Unsupported
+        );
+        binding.verification = verification_from_descriptor(&descriptor);
+        binding.projection_fingerprint = Some("sha256:active".to_string());
+        apply_stale_state(
+            &mut binding,
+            "sha256:next",
+            ProjectionDescriptorMatch::Exact,
+        );
+        assert_eq!(binding.status, AgentModelProviderBindingStatus::Unsupported);
+        assert!(binding.projection_fingerprint.is_none());
     }
 
     #[test]

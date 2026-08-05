@@ -11,15 +11,17 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tokio::time::{MissedTickBehavior, interval, timeout};
+use url::Url;
 use vibex_config_switch::{
     AgentProviderProjectionEngine, ProviderConfigService, secrets::resolve_provider_secret,
 };
 use vibex_core::{
-    AgentProviderProjectionRegistry, AgentRuntimeProbeCapability, AgentRuntimeProbeFact,
-    AgentRuntimeProbeFactStatus, AgentRuntimeProbeId, AgentRuntimeProbeListRequest,
-    AgentRuntimeProbeRecord, AgentRuntimeProbeRequest, AgentRuntimeProbeStage,
-    AgentRuntimeProbeStartRequest, AgentRuntimeProbeStatus, AgentRuntimeProfile,
-    ProjectionDescriptorMatch, ProviderSwitchBehavior, VibexError, VibexResult, unix_timestamp_ms,
+    AgentProviderProjectionPreview, AgentProviderProjectionRegistry, AgentRuntimeProbeCapability,
+    AgentRuntimeProbeFact, AgentRuntimeProbeFactStatus, AgentRuntimeProbeId,
+    AgentRuntimeProbeListRequest, AgentRuntimeProbeRecord, AgentRuntimeProbeRequest,
+    AgentRuntimeProbeStage, AgentRuntimeProbeStartRequest, AgentRuntimeProbeStatus,
+    AgentRuntimeProfile, ProjectionDescriptorMatch, ProviderSwitchBehavior, VibexError,
+    VibexResult, unix_timestamp_ms,
 };
 use vibex_db::{
     AgentModelProviderBindingRepository, AgentRuntimeProbeRepository,
@@ -27,13 +29,16 @@ use vibex_db::{
 };
 
 use crate::AcpProcessInstanceId;
-use crate::protocol::{self, AcpOperation, build_initialize_params, build_session_new_params};
+use crate::protocol::{
+    self, AcpOperation, build_initialize_params, build_session_load_params,
+    build_session_new_params, build_session_resume_params,
+};
 use crate::runtime::{
     ACP_PROBE_TIMEOUT, AcpProcess, AcpProcessLaunch, AcpProcessPurpose, AcpRuntimeClient,
-    extract_current_model_id, extract_model_ids,
+    extract_current_model_id, extract_model_ids, validate_restore_response,
 };
 
-const PROBE_SOURCE_REVISION: &str = "runtime-probe-v1";
+const PROBE_SOURCE_REVISION: &str = "runtime-probe-v2";
 const MIN_DIAGNOSTIC_LEN: usize = 1;
 const PROBE_ENV_KEYS: &[&str] = &[
     "HOME",
@@ -171,6 +176,7 @@ struct ProbeProjectionContext {
     provider_profile_id: Option<vibex_core::ProviderProfileId>,
     descriptor_match: ProjectionDescriptorMatch,
     projection: Option<vibex_config_switch::ResolvedAgentProviderProjection>,
+    expected_provider_identities: Vec<String>,
 }
 
 struct RunningProbeContext<'a> {
@@ -178,8 +184,10 @@ struct RunningProbeContext<'a> {
     profile_id: &'a vibex_core::ProviderProfileId,
     descriptor_match: ProjectionDescriptorMatch,
     projection: Option<&'a vibex_config_switch::ResolvedAgentProviderProjection>,
+    expected_provider_identities: &'a [String],
     cwd: &'a Path,
     process: Arc<AcpProcess>,
+    deadline: Instant,
 }
 
 struct ProbeRootGuard {
@@ -340,6 +348,7 @@ impl AcpRuntimeClient {
         &self,
         record: &mut AgentRuntimeProbeRecord,
     ) -> VibexResult<ProbeExecutionResult> {
+        let deadline = Instant::now() + Duration::from_millis(record.request.timeout_ms);
         self.transition_probe_stage(record, AgentRuntimeProbeStage::ResolvingIdentity)?;
         let conn = self.open_probe_connection()?;
         let runtime =
@@ -365,8 +374,20 @@ impl AcpRuntimeClient {
         let root = self.probe_root(&record.id)?;
         let _root_guard = ProbeRootGuard::new(root.clone());
         self.transition_probe_stage(record, AgentRuntimeProbeStage::PlanningProjection)?;
+        if Instant::now() >= deadline {
+            return Err(VibexError::process(
+                "agent_runtime_probe_timeout",
+                "runtime probe exceeded its deadline while planning projection",
+            ));
+        }
         let projection_context =
             self.plan_probe_projection(&conn, record, &runtime, resolution.match_kind, &root)?;
+        if Instant::now() >= deadline {
+            return Err(VibexError::process(
+                "agent_runtime_probe_timeout",
+                "runtime probe exceeded its deadline while planning projection",
+            ));
+        }
         drop(conn);
         self.ensure_probe_not_cancelled(record)?;
 
@@ -424,23 +445,40 @@ impl AcpRuntimeClient {
         );
         let cwd = workspace;
         let (strategy, fallback) = self.pool_decision(&profile_id, &config)?;
-        let process = self
-            .spawn_process(
-                AcpProcessInstanceId::new(),
-                AcpProcessLaunch {
-                    profile_id: &profile_id,
-                    config: &config,
-                    cwd: &cwd,
-                    runtime_resources: &vibex_agent::ProviderRuntimeResources::default(),
-                    purpose: AcpProcessPurpose::Probe,
-                    process_strategy_effective: strategy,
-                    pool_fallback_reason: fallback,
-                },
-                None,
-                Some(env),
-                None,
-            )
-            .await?;
+        let runtime_resources = vibex_agent::ProviderRuntimeResources::default();
+        let process = tokio::select! {
+            result = timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                self.spawn_process(
+                    AcpProcessInstanceId::new(),
+                    AcpProcessLaunch {
+                        profile_id: &profile_id,
+                        config: &config,
+                        cwd: &cwd,
+                        runtime_resources: &runtime_resources,
+                        purpose: AcpProcessPurpose::Probe,
+                        process_strategy_effective: strategy,
+                        pool_fallback_reason: fallback,
+                    },
+                    None,
+                    Some(env),
+                    None,
+                ),
+            ) => match result {
+                Ok(result) => result?,
+                Err(_) => return Err(VibexError::process(
+                    "agent_runtime_probe_timeout",
+                    "runtime probe exceeded its deadline while starting process",
+                )),
+            },
+            cancellation = self.wait_for_probe_cancel(&record.id) => {
+                cancellation?;
+                return Err(VibexError::conflict(
+                    "agent_runtime_probe_cancelled",
+                    "runtime probe cancellation was requested",
+                ));
+            }
+        };
 
         let probe_result = self
             .run_process_probe(
@@ -450,8 +488,10 @@ impl AcpRuntimeClient {
                     profile_id: &profile_id,
                     descriptor_match: projection_context.descriptor_match,
                     projection: projection_context.projection.as_ref(),
+                    expected_provider_identities: &projection_context.expected_provider_identities,
                     cwd: &cwd,
                     process: process.clone(),
+                    deadline,
                 },
             )
             .await;
@@ -469,11 +509,18 @@ impl AcpRuntimeClient {
             profile_id,
             descriptor_match,
             projection,
+            expected_provider_identities,
             cwd,
             process,
+            deadline,
         } = context;
-        let timeout_duration = Duration::from_millis(record.request.timeout_ms);
-        let started = Instant::now();
+        let timeout_duration = deadline.saturating_duration_since(Instant::now());
+        if timeout_duration.is_zero() {
+            return Err(VibexError::process(
+                "agent_runtime_probe_timeout",
+                "runtime probe exceeded its deadline before ACP execution",
+            ));
+        }
         let probe_id = record.id.clone();
         let operation = async {
             self.transition_probe_stage(record, AgentRuntimeProbeStage::InitializingAcp)?;
@@ -622,27 +669,17 @@ impl AcpRuntimeClient {
                 &session,
                 model_apply_response.as_ref(),
                 projection,
+                expected_provider_identities,
             );
             facts.push(provider_fact);
-            let resume_fact = if initialize
-                .get("agentCapabilities")
-                .and_then(|value| value.get("loadSession"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-                || initialize
-                    .get("agentCapabilities")
-                    .and_then(|value| value.get("sessionCapabilities"))
-                    .and_then(|value| value.get("resume"))
-                    .is_some()
-            {
-                AgentRuntimeProbeFact::passed(AgentRuntimeProbeCapability::SessionResume)
-            } else {
-                AgentRuntimeProbeFact {
-                    capability: AgentRuntimeProbeCapability::SessionResume,
-                    status: AgentRuntimeProbeFactStatus::Unsupported,
-                    diagnostic_code: Some("session_resume_unsupported".to_string()),
-                }
-            };
+            let resume_fact = probe_session_resume(
+                &initialize,
+                &process,
+                _native_session_id_guard,
+                cwd,
+                timeout_duration.min(ACP_PROBE_TIMEOUT),
+            )
+            .await;
             facts.push(resume_fact);
             facts.push(AgentRuntimeProbeFact::blocked(
                 AgentRuntimeProbeCapability::SwitchCompatibility,
@@ -653,7 +690,7 @@ impl AcpRuntimeClient {
             ));
             record.facts = facts.clone();
             self.transition_probe_stage(record, AgentRuntimeProbeStage::CleaningUp)?;
-            if started.elapsed() > timeout_duration {
+            if Instant::now() >= deadline {
                 return Err(VibexError::process(
                     "agent_runtime_probe_timeout",
                     "runtime probe exceeded its deadline",
@@ -784,6 +821,7 @@ impl AcpRuntimeClient {
                 provider_profile_id,
                 descriptor_match,
                 projection: None,
+                expected_provider_identities: Vec::new(),
             });
         };
         let binding =
@@ -799,6 +837,7 @@ impl AcpRuntimeClient {
                 binding_id: binding.id,
                 workspace_key: record.request.workspace_key.clone(),
             })?;
+        let expected_provider_identities = safe_projection_provider_identities(&plan.preview);
         let resolved = AgentProviderProjectionEngine::resolve_and_materialize(
             &plan,
             probe_root,
@@ -808,6 +847,7 @@ impl AcpRuntimeClient {
             provider_profile_id,
             descriptor_match,
             projection: Some(resolved),
+            expected_provider_identities,
         })
     }
 
@@ -819,7 +859,7 @@ impl AcpRuntimeClient {
         let mut values = Vec::new();
         for reference in &config.env {
             let key = reference.key.trim();
-            if key.is_empty() || PROBE_ENV_KEYS.contains(&key) {
+            if key.is_empty() || is_probe_environment_key(key) {
                 continue;
             }
             let value = match reference.source {
@@ -922,6 +962,10 @@ fn add_isolation_environment(
     state: &Path,
     cache: &Path,
 ) {
+    // Projection env is assembled from several sources and may contain the
+    // same key more than once. Remove every protected entry before appending
+    // the probe-owned values so a later duplicate cannot escape the sandbox.
+    env.retain(|(name, _)| !is_probe_environment_key(name));
     for (key, value) in [
         ("HOME", home),
         ("USERPROFILE", home),
@@ -932,11 +976,110 @@ fn add_isolation_environment(
         ("CODEX_HOME", home),
     ] {
         let value = value.to_string_lossy().into_owned();
-        if let Some(existing) = env.iter_mut().find(|(name, _)| name == key) {
-            existing.1 = value;
-        } else {
-            env.push((key.to_string(), value));
+        env.push((key.to_string(), value));
+    }
+}
+
+fn is_probe_environment_key(name: &str) -> bool {
+    PROBE_ENV_KEYS
+        .iter()
+        .any(|protected| name.eq_ignore_ascii_case(protected))
+}
+
+async fn probe_session_resume(
+    initialize: &Value,
+    process: &Arc<AcpProcess>,
+    native_session_id: &str,
+    cwd: &Path,
+    request_timeout: Duration,
+) -> AgentRuntimeProbeFact {
+    let Some(capabilities) = initialize.get("agentCapabilities") else {
+        return AgentRuntimeProbeFact {
+            capability: AgentRuntimeProbeCapability::SessionResume,
+            status: AgentRuntimeProbeFactStatus::Unsupported,
+            diagnostic_code: Some("session_resume_unsupported".to_string()),
+        };
+    };
+    let supports_load = capabilities
+        .get("loadSession")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let supports_resume = capabilities
+        .get("sessionCapabilities")
+        .and_then(|value| value.get("resume"))
+        .is_some();
+    if !supports_resume && !supports_load {
+        return AgentRuntimeProbeFact {
+            capability: AgentRuntimeProbeCapability::SessionResume,
+            status: AgentRuntimeProbeFactStatus::Unsupported,
+            diagnostic_code: Some("session_resume_unsupported".to_string()),
+        };
+    }
+
+    // Match the live runtime's preference order. If negotiated resume is
+    // unavailable at the operation boundary, a declared session/load method
+    // is a valid fallback for this capability.
+    let operations = [
+        (supports_resume, AcpOperation::SessionResume),
+        (supports_load, AcpOperation::SessionLoad),
+    ];
+    let mut saw_unsupported = false;
+    for (advertised, operation) in operations {
+        if !advertised {
+            continue;
         }
+        let params = match operation {
+            AcpOperation::SessionResume => {
+                build_session_resume_params(native_session_id, cwd, json!([]))
+            }
+            AcpOperation::SessionLoad => {
+                build_session_load_params(native_session_id, cwd, json!([]))
+            }
+            _ => unreachable!("session restore probe only uses restore operations"),
+        };
+        match process
+            .request(operation.method(), params, request_timeout)
+            .await
+        {
+            Ok(response) => {
+                match validate_restore_response(operation, &response, native_session_id) {
+                    Ok(()) => {
+                        return AgentRuntimeProbeFact::passed(
+                            AgentRuntimeProbeCapability::SessionResume,
+                        );
+                    }
+                    Err(error) => {
+                        return AgentRuntimeProbeFact {
+                            capability: AgentRuntimeProbeCapability::SessionResume,
+                            status: AgentRuntimeProbeFactStatus::Failed,
+                            diagnostic_code: Some(safe_code(&error.code)),
+                        };
+                    }
+                }
+            }
+            Err(error) if is_method_unsupported(&error) => {
+                saw_unsupported = true;
+            }
+            Err(error) => {
+                return AgentRuntimeProbeFact {
+                    capability: AgentRuntimeProbeCapability::SessionResume,
+                    status: AgentRuntimeProbeFactStatus::Failed,
+                    diagnostic_code: Some(safe_code(&error.code)),
+                };
+            }
+        }
+    }
+    AgentRuntimeProbeFact {
+        capability: AgentRuntimeProbeCapability::SessionResume,
+        status: AgentRuntimeProbeFactStatus::Unsupported,
+        diagnostic_code: Some(
+            if saw_unsupported {
+                "session_resume_method_unsupported"
+            } else {
+                "session_resume_unsupported"
+            }
+            .to_string(),
+        ),
     }
 }
 
@@ -997,6 +1140,7 @@ fn effective_provider_fact(
     session: &Value,
     model_apply_response: Option<&Value>,
     projection: Option<&vibex_config_switch::ResolvedAgentProviderProjection>,
+    expected_provider_identities: &[String],
 ) -> AgentRuntimeProbeFact {
     let values = model_apply_response
         .into_iter()
@@ -1018,22 +1162,39 @@ fn effective_provider_fact(
         .and_then(extract_current_model_id)
         .or_else(|| extract_current_model_id(session))
         .or_else(|| extract_current_model_id(initialize));
-    classify_effective_provider(explicit, target_model, current_model.as_deref())
+    classify_effective_provider(
+        explicit,
+        expected_provider_identities,
+        target_model,
+        current_model.as_deref(),
+    )
 }
 
 fn classify_effective_provider(
     explicit_provider: Option<&str>,
+    expected_provider_identities: &[String],
     target_model: Option<&str>,
     current_model: Option<&str>,
 ) -> AgentRuntimeProbeFact {
-    if explicit_provider.is_some() && target_model.is_some() && current_model == target_model {
+    let observed_provider = explicit_provider.and_then(normalize_provider_identity);
+    let provider_matches = observed_provider.as_ref().is_some_and(|observed| {
+        expected_provider_identities
+            .iter()
+            .any(|expected| expected.eq_ignore_ascii_case(observed))
+    });
+    if provider_matches && target_model.is_some() && current_model == target_model {
         AgentRuntimeProbeFact::passed(AgentRuntimeProbeCapability::ProviderProjection)
     } else {
         AgentRuntimeProbeFact {
             capability: AgentRuntimeProbeCapability::ProviderProjection,
             status: AgentRuntimeProbeFactStatus::Blocked,
             diagnostic_code: Some(
-                if explicit_provider.is_some() && target_model.is_some() {
+                if explicit_provider.is_some()
+                    && !expected_provider_identities.is_empty()
+                    && !provider_matches
+                {
+                    "effective_provider_mismatch"
+                } else if provider_matches && target_model.is_some() {
                     "effective_model_not_confirmed"
                 } else {
                     "effective_provider_not_confirmed"
@@ -1042,6 +1203,29 @@ fn classify_effective_provider(
             ),
         }
     }
+}
+
+fn safe_projection_provider_identities(preview: &AgentProviderProjectionPreview) -> Vec<String> {
+    let mut identities = preview
+        .targets
+        .iter()
+        .filter(|target| {
+            target.field == "endpoint"
+                && !target.value_preview.eq_ignore_ascii_case("not configured")
+        })
+        .filter_map(|target| normalize_provider_identity(&target.value_preview))
+        .collect::<Vec<_>>();
+    identities.sort();
+    identities.dedup();
+    identities
+}
+
+fn normalize_provider_identity(value: &str) -> Option<String> {
+    let url = Url::parse(value.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return None;
+    }
+    Some(url.origin().ascii_serialization().to_ascii_lowercase())
 }
 
 fn binary_identity_fact(
@@ -1244,7 +1428,49 @@ mod tests {
             fingerprint: "sha256:0123456789abcdef".to_string(),
         };
         let session = json!({"models": {"availableModels": [{"modelId": "target-model"}]}});
-        let fact = effective_provider_fact(&json!({}), &session, None, Some(&projection));
+        let fact = effective_provider_fact(&json!({}), &session, None, Some(&projection), &[]);
+        assert_eq!(fact.status, AgentRuntimeProbeFactStatus::Blocked);
+        assert_eq!(
+            fact.diagnostic_code.as_deref(),
+            Some("effective_provider_not_confirmed")
+        );
+    }
+
+    #[test]
+    fn matching_model_does_not_confirm_the_wrong_provider_identity() {
+        let fact = classify_effective_provider(
+            Some("https://profile-a.example/v1"),
+            &["https://profile-b.example".to_string()],
+            Some("shared-model"),
+            Some("shared-model"),
+        );
+        assert_eq!(fact.status, AgentRuntimeProbeFactStatus::Blocked);
+        assert_eq!(
+            fact.diagnostic_code.as_deref(),
+            Some("effective_provider_mismatch")
+        );
+    }
+
+    #[test]
+    fn matching_safe_origin_and_model_confirm_provider_projection() {
+        let fact = classify_effective_provider(
+            Some("HTTPS://PROFILE-B.EXAMPLE:443/v1/models?request=probe"),
+            &["https://profile-b.example".to_string()],
+            Some("shared-model"),
+            Some("shared-model"),
+        );
+        assert_eq!(fact.status, AgentRuntimeProbeFactStatus::Passed);
+        assert_eq!(fact.diagnostic_code, None);
+    }
+
+    #[test]
+    fn missing_expected_provider_identity_remains_blocked() {
+        let fact = classify_effective_provider(
+            Some("https://profile-b.example"),
+            &[],
+            Some("shared-model"),
+            Some("shared-model"),
+        );
         assert_eq!(fact.status, AgentRuntimeProbeFactStatus::Blocked);
         assert_eq!(
             fact.diagnostic_code.as_deref(),
@@ -1287,5 +1513,51 @@ mod tests {
         fs::write(root.join("overlay/config.json"), b"fixture").unwrap();
         drop(ProbeRootGuard::new(root.clone()));
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn isolation_environment_replaces_all_protected_duplicates() {
+        let parent = tempdir().unwrap();
+        let home = parent.path().join("home");
+        let config = parent.path().join("config");
+        let data = parent.path().join("data");
+        let state = parent.path().join("state");
+        let cache = parent.path().join("cache");
+        let mut env = vec![
+            ("HOME".to_string(), "/user/home".to_string()),
+            ("HOME".to_string(), "/shadow/home".to_string()),
+            ("Home".to_string(), "/windows-shadow/home".to_string()),
+            ("CODEX_HOME".to_string(), "/user/codex".to_string()),
+            (
+                "Codex_Home".to_string(),
+                "/windows-shadow/codex".to_string(),
+            ),
+            ("UNRELATED".to_string(), "keep".to_string()),
+        ];
+
+        add_isolation_environment(&mut env, &home, &config, &data, &state, &cache);
+
+        assert_eq!(
+            env.iter()
+                .filter(|(key, _)| key.eq_ignore_ascii_case("HOME"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            env.iter()
+                .filter(|(key, _)| key.eq_ignore_ascii_case("CODEX_HOME"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            env.iter()
+                .find(|(key, _)| key == "HOME")
+                .map(|(_, value)| value),
+            Some(&home.to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            env.iter().find(|(key, _)| key == "UNRELATED"),
+            Some(&("UNRELATED".to_string(), "keep".to_string()))
+        );
     }
 }

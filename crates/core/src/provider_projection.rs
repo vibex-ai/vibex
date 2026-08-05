@@ -704,6 +704,8 @@ pub struct ProjectionEvidenceReference {
     pub state: ProjectionEvidenceState,
     pub source_reference: Option<String>,
     pub runtime_reference: Option<String>,
+    #[serde(default)]
+    pub diagnostic_code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -748,12 +750,56 @@ impl AgentProviderProjectionDescriptor {
                 "verified projection descriptors require source and runtime evidence references",
             ));
         }
+        if self.evidence.state == ProjectionEvidenceState::Verified
+            && self.evidence.diagnostic_code.is_some()
+        {
+            return Err(VibexError::validation(
+                "agent_projection_verified_diagnostic_invalid",
+                "verified projection descriptors cannot retain a conservative diagnostic",
+            ));
+        }
+        if self
+            .evidence
+            .diagnostic_code
+            .as_deref()
+            .is_some_and(|code| {
+                code.is_empty()
+                    || code.len() > 96
+                    || !code
+                        .chars()
+                        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+            })
+        {
+            return Err(VibexError::validation(
+                "agent_projection_evidence_diagnostic_invalid",
+                "projection evidence diagnostics must be bounded stable codes",
+            ));
+        }
         if self.credential_control.automatically_projects_secret()
             && self.credential_kinds.is_empty()
         {
             return Err(VibexError::validation(
                 "agent_projection_credential_capability_missing",
                 "secret-capable projection descriptors must declare credential capabilities",
+            ));
+        }
+        let has_unverified_control =
+            matches!(self.provider_control, AgentProviderControl::Unverified)
+                || matches!(self.credential_control, AgentCredentialControl::Unverified)
+                || matches!(self.model_control, AgentModelControl::Unverified);
+        if (has_unverified_control || self.evidence.state == ProjectionEvidenceState::Unverified)
+            && (!matches!(self.provider_control, AgentProviderControl::Unverified)
+                || !matches!(self.credential_control, AgentCredentialControl::Unverified)
+                || !matches!(self.model_control, AgentModelControl::Unverified)
+                || self.evidence.state != ProjectionEvidenceState::Unverified
+                || self.evidence.diagnostic_code.is_none()
+                || self.switch_behavior != ProviderSwitchBehavior::Unverified
+                || !self.credential_kinds.is_empty()
+                || !self.model_interfaces.is_empty())
+        {
+            return Err(VibexError::validation(
+                "agent_projection_unverified_contract_incomplete",
+                "unverified descriptors must fail closed with one explicit conservative diagnostic",
             ));
         }
         if matches!(
@@ -938,7 +984,7 @@ impl AgentProviderProjectionRegistry {
             return Ok(AgentProviderProjectionResolution {
                 descriptor: descriptor.clone(),
                 match_kind: ProjectionDescriptorMatch::Exact,
-                diagnostic_code: None,
+                diagnostic_code: descriptor.evidence.diagnostic_code.clone(),
             });
         }
         if let Some(descriptor) = self.descriptors.values().find(|descriptor| {
@@ -947,7 +993,7 @@ impl AgentProviderProjectionRegistry {
             return Ok(AgentProviderProjectionResolution {
                 descriptor: descriptor.clone(),
                 match_kind: ProjectionDescriptorMatch::SemverRange,
-                diagnostic_code: None,
+                diagnostic_code: descriptor.evidence.diagnostic_code.clone(),
             });
         }
         let has_route = self
@@ -1468,6 +1514,7 @@ fn verified_evidence(source: &str, runtime: &str) -> ProjectionEvidenceReference
         state: ProjectionEvidenceState::Verified,
         source_reference: Some(source.to_string()),
         runtime_reference: Some(runtime.to_string()),
+        diagnostic_code: None,
     }
 }
 
@@ -1516,6 +1563,7 @@ fn conservative_resolution(
                 state: ProjectionEvidenceState::Unverified,
                 source_reference: None,
                 runtime_reference: None,
+                diagnostic_code: Some(diagnostic_code.to_string()),
             },
         },
         match_kind: ProjectionDescriptorMatch::Conservative,

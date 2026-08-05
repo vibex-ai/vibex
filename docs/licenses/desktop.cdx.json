@@ -46658,6 +46658,7 @@
         "cargo:thiserror@2.0.18:c19b7c6f923b580a",
         "cargo:tokio@1.52.3:c19b7c6f923b580a",
         "cargo:tracing@0.1.44:c19b7c6f923b580a",
+        "cargo:url@2.5.8:c19b7c6f923b580a",
         "cargo:uuid@1.23.3:c19b7c6f923b580a",
         "cargo:vibex-agent@0.1.0-rc.1:1d51dd7c8fac44fa",
         "cargo:vibex-config-switch@0.1.0-rc.1:15ba9694989d1411",

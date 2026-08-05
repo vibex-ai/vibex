@@ -136,6 +136,9 @@ After implementation:
       (`seq`, `id`, `version`) instead of inventing a second cursor
 - [ ] Checked that duplicate triggers are rejected or coalesced at the durable
       service/storage boundary, not only hidden by UI pending state
+- [ ] Checked that identity/version matches are not reused as capability or
+      readiness proof; downstream status, fingerprints, controls, and evidence
+      must all preserve the source capability's conservative state
 
 ---
 

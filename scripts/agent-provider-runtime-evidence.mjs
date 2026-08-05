@@ -31,7 +31,8 @@ const MANIFEST_ENTRY_KEYS = [
   "modelInterfaces",
   "evidenceState",
   "sourceEvidenceReference",
-  "smokeId"
+  "smokeId",
+  "capabilityDiagnosticCode"
 ];
 const MANIFEST_KEYS = ["schemaVersion", "entries"];
 const SMOKE_KEYS = [
@@ -295,6 +296,13 @@ function safeFingerprint(value, label) {
   );
 }
 
+function safeDiagnosticCode(value, label) {
+  assert(
+    typeof value === "string" && /^[a-z0-9_]{1,96}$/.test(value),
+    `${label} is not a bounded diagnostic code`
+  );
+}
+
 function validateManifestEntry(entry, label) {
   exactKeys(entry, MANIFEST_ENTRY_KEYS, label);
   for (const key of ["agentId", "catalogVersion", "adapterId", "descriptorId", "descriptorVersion", "capabilityMode", "runtimeHomeStrategy", "switchBehavior", "evidenceState", "sourceEvidenceReference", "smokeId"]) {
@@ -307,8 +315,22 @@ function validateManifestEntry(entry, label) {
   } else {
     assert(entry.catalogVersion !== "manual", `${label} exact policy cannot use manual catalog version`);
   }
+  if (entry.capabilityDiagnosticCode !== null) {
+    safeDiagnosticCode(entry.capabilityDiagnosticCode, `${label}.capabilityDiagnosticCode`);
+  }
   assert(Array.isArray(entry.credentialKinds), `${label}.credentialKinds must be an array`);
   assert(Array.isArray(entry.modelInterfaces), `${label}.modelInterfaces must be an array`);
+  if (entry.switchBehavior === "unverified" || entry.evidenceState === "unverified") {
+    assert(
+      entry.switchBehavior === "unverified" &&
+        entry.evidenceState === "unverified" &&
+        entry.runtimeHomeStrategy === "none" &&
+        entry.credentialKinds.length === 0 &&
+        entry.modelInterfaces.length === 0 &&
+        entry.capabilityDiagnosticCode !== null,
+      `${label} conservative capability shape is unsafe`
+    );
+  }
   for (const [index, model] of entry.modelInterfaces.entries()) {
     assert(model && typeof model === "object", `${label}.modelInterfaces[${index}] is invalid`);
     assert(typeof model.wireProtocolId === "string" && model.wireProtocolId.length > 0, `${label}.modelInterfaces[${index}] has no wire protocol`);
@@ -469,7 +491,7 @@ function validateSmoke(smoke, entry, matrix) {
   assert(["not_run", "real_runtime"].includes(smoke.execution), `smoke execution is invalid for ${entry.agentId}`);
   if (smoke.status === "blocked") {
     assert(smoke.execution === "not_run", `blocked smoke ${entry.agentId} must be not_run`);
-    assert(typeof smoke.diagnosticCode === "string" && smoke.diagnosticCode.length > 0, `blocked smoke ${entry.agentId} needs a diagnostic code`);
+    safeDiagnosticCode(smoke.diagnosticCode, `smoke ${entry.agentId}.diagnosticCode`);
   } else {
     assert(smoke.execution === "real_runtime" && smoke.diagnosticCode === null, `passed smoke ${entry.agentId} has an invalid execution state`);
   }
@@ -610,7 +632,10 @@ export function buildConservativeEvidence(manifest) {
     switchBehavior: entry.switchBehavior,
     status: "blocked",
     execution: "not_run",
-    diagnosticCode: "operator_prerequisites_unavailable",
+    diagnosticCode:
+      entry.evidenceState === "unverified"
+        ? entry.capabilityDiagnosticCode
+        : "operator_prerequisites_unavailable",
     detectedIdentity: null,
     descriptorMatch: "not_checked",
     projectionFingerprint: null,

@@ -10134,7 +10134,7 @@ fn selected_model_from_binding(binding: &ProviderBinding) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn validate_restore_response(
+pub(crate) fn validate_restore_response(
     operation: AcpOperation,
     response: &Value,
     expected_native_session_id: &str,

@@ -3,9 +3,9 @@
   "status": "passed",
   "claimScope": "manifest_and_contract",
   "realRuntimeVerification": "blocked",
-  "capturedAt": "2026-08-05T15:12:58.175Z",
+  "capturedAt": "2026-08-05T16:45:17.058Z",
   "source": {
-    "captureParentCommit": "afa4b748ac8d6a6e78a9c72fd7fe32ba8a8575bd",
+    "captureParentCommit": "ce14d2843515f3852789c058453d873e959fdc02",
     "rustToolchain": "rustc-1.97.0",
     "sourceInputRoots": [
       "crates/core/src/acp_catalog.rs",
@@ -53,21 +53,21 @@
       "crates/vibex-ui/Cargo.toml",
       "apps/desktop/Cargo.toml"
     ],
-    "sourceInputTreeSha256": "c49fe140a68efa448dc0cbc63d5fd05fec7645507e24f928ad3204a564b55f65",
+    "sourceInputTreeSha256": "c80b7bf7f7624c5ffde132337a7d90a94f5cc8dc56410232a3974b1591e458d2",
     "bindings": {
       "catalog": "7ad921ebb2f6b6bbc8e948a6b7ed225c2b84d301f5d6a309ce697e3cbf9592d0",
-      "manifest": "1a1f58a2c312c56fe0977d38512550c6883db2e6542506ee59d5e3610a296fb4",
-      "probe": "0456f1fa302053957d1f51a048fd93002e7f9c73f4ef17270ed253312d160388",
+      "manifest": "808e48b21513f4e8cb3cdbedded2bd7c6c12012e320483bf710257ead905dd35",
+      "probe": "c52da1e943cfc3dd4b85b20ca128f2bc18ce5f15bb9c20fa52b10213e320057e",
       "database": "a3d36a7197d377d99548648c817458027a0a46c6fe125b3f7c7b3855d38c10b3",
       "remote": "cca712dc885a20fa5dbf4ec8d0db5d603015c7b87d1f879f458d88d29cb70905",
       "ui": "6babdec6c3043144e325825dfac7f4c850c8c4dd85bf3b4858cc3290d4de5661",
       "switch": "aa9ef1a461fb4adad5756ba2c7931aaae3b0de499b85d1603df5c9cdf7fe9996",
-      "scripts": "dedf7839bbca7f65d41a84b2bd7f1e0a71195eabfdb0038737b16e2ba0ad642a",
-      "packageMetadata": "6d1391bd7732c98fd60ef296e354b4909e3f1447c3705efd2077ab5b8045f2e0"
+      "scripts": "f8ee734adf65733321f5870b4496f21c7030057070601eb67923cbc28bbcfc2b",
+      "packageMetadata": "b2d5d46dcae3b52d11aba4cdbb7284a64e87b2f4fec37029f64be8a9c89feac7"
     },
-    "cargoLockSha256": "a924f252e397f6e150b473cecc3dcfb0a5fdb112f36f34bf72bb3b146b33bf50",
+    "cargoLockSha256": "05725820d1c20bade0212ebf149278dff90fb68840551188157673deb31ca42b",
     "packageJsonSha256": "49b47c1791188832d51b2cc9c32632d9c0abd17d7df1c2dd8c3fad5ff7837abf",
-    "rolloutManifestSha256": "5034326018757bc27723ba4023438aca3f9685551097e597cf8fdc0ca8fe427e"
+    "rolloutManifestSha256": "6c5af84d0818661933089d8f90fd96c6f7c46998648ff2900a995079cef08c7f"
   },
   "manifest": {
     "schemaVersion": "agent-provider-runtime-manifest.v1",
@@ -93,7 +93,8 @@
         "modelInterfaces": [],
         "evidenceState": "documented",
         "sourceEvidenceReference": "provider-config/claude-environment-v1",
-        "smokeId": "builtin-provider-claude"
+        "smokeId": "builtin-provider-claude",
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
         "agentId": "codex",
@@ -113,7 +114,8 @@
         "modelInterfaces": [],
         "evidenceState": "documented",
         "sourceEvidenceReference": "provider-config/codex-environment-v1",
-        "smokeId": "builtin-provider-codex"
+        "smokeId": "builtin-provider-codex",
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
         "agentId": "opencode",
@@ -133,7 +135,8 @@
         "modelInterfaces": [],
         "evidenceState": "documented",
         "sourceEvidenceReference": "provider-config/opencode-environment-v1",
-        "smokeId": "builtin-provider-opencode"
+        "smokeId": "builtin-provider-opencode",
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
         "agentId": "agoragentic-acp",
@@ -153,7 +156,8 @@
         "modelInterfaces": [],
         "evidenceState": "service_marketplace",
         "sourceEvidenceReference": "research/acp-agent/agoragentic-acp@1.3.3",
-        "smokeId": "agent-provider-agoragentic-acp"
+        "smokeId": "agent-provider-agoragentic-acp",
+        "capabilityDiagnosticCode": null
       },
       {
         "agentId": "amp-acp",
@@ -174,7 +178,8 @@
         "modelInterfaces": [],
         "evidenceState": "agent_managed",
         "sourceEvidenceReference": "research/acp-agent/amp-acp@0.7.0",
-        "smokeId": "agent-provider-amp-acp"
+        "smokeId": "agent-provider-amp-acp",
+        "capabilityDiagnosticCode": null
       },
       {
         "agentId": "auggie",
@@ -195,7 +200,8 @@
         "modelInterfaces": [],
         "evidenceState": "agent_managed",
         "sourceEvidenceReference": "research/acp-agent/auggie@0.30.0",
-        "smokeId": "agent-provider-auggie"
+        "smokeId": "agent-provider-auggie",
+        "capabilityDiagnosticCode": null
       },
       {
         "agentId": "autohand",
@@ -207,13 +213,14 @@
           "kind": "exact"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "vibex_private",
+        "runtimeHomeStrategy": "none",
         "switchBehavior": "unverified",
         "credentialKinds": [],
         "modelInterfaces": [],
-        "evidenceState": "documented",
+        "evidenceState": "unverified",
         "sourceEvidenceReference": "research/acp-agent/autohand@0.2.1",
-        "smokeId": "agent-provider-autohand"
+        "smokeId": "agent-provider-autohand",
+        "capabilityDiagnosticCode": "agent_projection_typed_projector_not_implemented"
       },
       {
         "agentId": "cline",
@@ -225,13 +232,14 @@
           "kind": "exact"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "vibex_private",
+        "runtimeHomeStrategy": "none",
         "switchBehavior": "unverified",
         "credentialKinds": [],
         "modelInterfaces": [],
-        "evidenceState": "documented",
+        "evidenceState": "unverified",
         "sourceEvidenceReference": "research/acp-agent/cline@3.0.29",
-        "smokeId": "agent-provider-cline"
+        "smokeId": "agent-provider-cline",
+        "capabilityDiagnosticCode": "agent_projection_auth_boundary_not_runtime_verified"
       },
       {
         "agentId": "copilot",
@@ -243,13 +251,14 @@
           "kind": "detected_manual"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "vibex_private",
+        "runtimeHomeStrategy": "none",
         "switchBehavior": "unverified",
         "credentialKinds": [],
         "modelInterfaces": [],
-        "evidenceState": "documented",
+        "evidenceState": "unverified",
         "sourceEvidenceReference": "research/acp-agent/copilot@manual",
-        "smokeId": "agent-provider-copilot"
+        "smokeId": "agent-provider-copilot",
+        "capabilityDiagnosticCode": "agent_projection_version_detection_required"
       },
       {
         "agentId": "codebuddy-code",
@@ -262,12 +271,23 @@
         },
         "capabilityMode": "replaceable_provider",
         "runtimeHomeStrategy": "vibex_private",
-        "switchBehavior": "unverified",
-        "credentialKinds": [],
-        "modelInterfaces": [],
+        "switchBehavior": "restart_and_resume",
+        "credentialKinds": [
+          "api_key"
+        ],
+        "modelInterfaces": [
+          {
+            "wireProtocolId": "openai_chat_completions",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": false,
+            "processScoped": true
+          }
+        ],
         "evidenceState": "documented",
         "sourceEvidenceReference": "research/acp-agent/codebuddy-code@2.109.0",
-        "smokeId": "agent-provider-codebuddy-code"
+        "smokeId": "agent-provider-codebuddy-code",
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
         "agentId": "codewhale",
@@ -279,13 +299,14 @@
           "kind": "exact"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "vibex_private",
+        "runtimeHomeStrategy": "none",
         "switchBehavior": "unverified",
         "credentialKinds": [],
         "modelInterfaces": [],
-        "evidenceState": "documented",
+        "evidenceState": "unverified",
         "sourceEvidenceReference": "research/acp-agent/codewhale@0.8.55",
-        "smokeId": "agent-provider-codewhale"
+        "smokeId": "agent-provider-codewhale",
+        "capabilityDiagnosticCode": "agent_projection_typed_projector_not_implemented"
       },
       {
         "agentId": "cortex-code",
@@ -306,7 +327,8 @@
         "modelInterfaces": [],
         "evidenceState": "documented",
         "sourceEvidenceReference": "research/acp-agent/cortex-code@1.0.73",
-        "smokeId": "agent-provider-cortex-code"
+        "smokeId": "agent-provider-cortex-code",
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
         "agentId": "crow-cli",
@@ -318,13 +340,14 @@
           "kind": "exact"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "vibex_private",
+        "runtimeHomeStrategy": "none",
         "switchBehavior": "unverified",
         "credentialKinds": [],
         "modelInterfaces": [],
-        "evidenceState": "documented",
+        "evidenceState": "unverified",
         "sourceEvidenceReference": "research/acp-agent/crow-cli@0.1.23",
-        "smokeId": "agent-provider-crow-cli"
+        "smokeId": "agent-provider-crow-cli",
+        "capabilityDiagnosticCode": "agent_projection_typed_projector_not_implemented"
       },
       {
         "agentId": "cursor",
@@ -345,7 +368,8 @@
         "modelInterfaces": [],
         "evidenceState": "agent_managed",
         "sourceEvidenceReference": "research/acp-agent/cursor@2026.03.30",
-        "smokeId": "agent-provider-cursor"
+        "smokeId": "agent-provider-cursor",
+        "capabilityDiagnosticCode": null
       },
       {
         "agentId": "deepagents",
@@ -357,13 +381,14 @@
           "kind": "exact"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "vibex_private",
+        "runtimeHomeStrategy": "none",
         "switchBehavior": "unverified",
         "credentialKinds": [],
         "modelInterfaces": [],
-        "evidenceState": "documented",
+        "evidenceState": "unverified",
         "sourceEvidenceReference": "research/acp-agent/deepagents@0.1.15",
-        "smokeId": "agent-provider-deepagents"
+        "smokeId": "agent-provider-deepagents",
+        "capabilityDiagnosticCode": "agent_projection_environment_contract_not_runtime_verified"
       },
       {
         "agentId": "devin",
@@ -384,7 +409,8 @@
         "modelInterfaces": [],
         "evidenceState": "agent_managed",
         "sourceEvidenceReference": "research/acp-agent/devin@manual",
-        "smokeId": "agent-provider-devin"
+        "smokeId": "agent-provider-devin",
+        "capabilityDiagnosticCode": null
       },
       {
         "agentId": "dimcode",
@@ -396,13 +422,14 @@
           "kind": "exact"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "vibex_private",
+        "runtimeHomeStrategy": "none",
         "switchBehavior": "unverified",
         "credentialKinds": [],
         "modelInterfaces": [],
-        "evidenceState": "documented",
+        "evidenceState": "unverified",
         "sourceEvidenceReference": "research/acp-agent/dimcode@0.2.7",
-        "smokeId": "agent-provider-dimcode"
+        "smokeId": "agent-provider-dimcode",
+        "capabilityDiagnosticCode": "agent_projection_typed_projector_not_implemented"
       },
       {
         "agentId": "dirac",
@@ -414,13 +441,14 @@
           "kind": "exact"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "vibex_private",
+        "runtimeHomeStrategy": "none",
         "switchBehavior": "unverified",
         "credentialKinds": [],
         "modelInterfaces": [],
-        "evidenceState": "documented",
+        "evidenceState": "unverified",
         "sourceEvidenceReference": "research/acp-agent/dirac@0.4.1",
-        "smokeId": "agent-provider-dirac"
+        "smokeId": "agent-provider-dirac",
+        "capabilityDiagnosticCode": "agent_projection_auth_boundary_not_runtime_verified"
       },
       {
         "agentId": "factory-droid",
@@ -432,13 +460,14 @@
           "kind": "exact"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "vibex_private",
+        "runtimeHomeStrategy": "none",
         "switchBehavior": "unverified",
         "credentialKinds": [],
         "modelInterfaces": [],
-        "evidenceState": "documented",
+        "evidenceState": "unverified",
         "sourceEvidenceReference": "research/acp-agent/factory-droid@0.153.1",
-        "smokeId": "agent-provider-factory-droid"
+        "smokeId": "agent-provider-factory-droid",
+        "capabilityDiagnosticCode": "agent_projection_typed_projector_not_implemented"
       },
       {
         "agentId": "fast-agent",
@@ -450,13 +479,14 @@
           "kind": "exact"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "vibex_private",
+        "runtimeHomeStrategy": "none",
         "switchBehavior": "unverified",
         "credentialKinds": [],
         "modelInterfaces": [],
-        "evidenceState": "documented",
+        "evidenceState": "unverified",
         "sourceEvidenceReference": "research/acp-agent/fast-agent@0.7.21",
-        "smokeId": "agent-provider-fast-agent"
+        "smokeId": "agent-provider-fast-agent",
+        "capabilityDiagnosticCode": "agent_projection_typed_projector_not_implemented"
       },
       {
         "agentId": "gemini",
@@ -478,7 +508,8 @@
         "modelInterfaces": [],
         "evidenceState": "documented",
         "sourceEvidenceReference": "research/acp-agent/gemini@0.47.0",
-        "smokeId": "agent-provider-gemini"
+        "smokeId": "agent-provider-gemini",
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
         "agentId": "glm-acp-agent",
@@ -491,12 +522,23 @@
         },
         "capabilityMode": "replaceable_provider",
         "runtimeHomeStrategy": "vibex_private",
-        "switchBehavior": "unverified",
-        "credentialKinds": [],
-        "modelInterfaces": [],
+        "switchBehavior": "restart_and_resume",
+        "credentialKinds": [
+          "api_key"
+        ],
+        "modelInterfaces": [
+          {
+            "wireProtocolId": "openai_chat_completions",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": false,
+            "processScoped": true
+          }
+        ],
         "evidenceState": "documented",
         "sourceEvidenceReference": "research/acp-agent/glm-acp-agent@1.1.4",
-        "smokeId": "agent-provider-glm-acp-agent"
+        "smokeId": "agent-provider-glm-acp-agent",
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
         "agentId": "goose",
@@ -508,13 +550,14 @@
           "kind": "exact"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "vibex_private",
+        "runtimeHomeStrategy": "none",
         "switchBehavior": "unverified",
         "credentialKinds": [],
         "modelInterfaces": [],
-        "evidenceState": "documented",
+        "evidenceState": "unverified",
         "sourceEvidenceReference": "research/acp-agent/goose@1.33.1",
-        "smokeId": "agent-provider-goose"
+        "smokeId": "agent-provider-goose",
+        "capabilityDiagnosticCode": "agent_projection_acp_option_not_runtime_verified"
       },
       {
         "agentId": "grok",
@@ -526,13 +569,14 @@
           "kind": "exact"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "vibex_private",
+        "runtimeHomeStrategy": "none",
         "switchBehavior": "unverified",
         "credentialKinds": [],
         "modelInterfaces": [],
-        "evidenceState": "documented",
+        "evidenceState": "unverified",
         "sourceEvidenceReference": "research/acp-agent/grok@0.2.11",
-        "smokeId": "agent-provider-grok"
+        "smokeId": "agent-provider-grok",
+        "capabilityDiagnosticCode": "agent_projection_mixed_auth_boundary_not_runtime_verified"
       },
       {
         "agentId": "hermes",
@@ -544,13 +588,14 @@
           "kind": "detected_manual"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "vibex_private",
+        "runtimeHomeStrategy": "none",
         "switchBehavior": "unverified",
         "credentialKinds": [],
         "modelInterfaces": [],
-        "evidenceState": "documented",
+        "evidenceState": "unverified",
         "sourceEvidenceReference": "research/acp-agent/hermes@manual",
-        "smokeId": "agent-provider-hermes"
+        "smokeId": "agent-provider-hermes",
+        "capabilityDiagnosticCode": "agent_projection_version_detection_required"
       },
       {
         "agentId": "junie",
@@ -571,7 +616,8 @@
         "modelInterfaces": [],
         "evidenceState": "agent_managed",
         "sourceEvidenceReference": "research/acp-agent/junie@1468.30.0",
-        "smokeId": "agent-provider-junie"
+        "smokeId": "agent-provider-junie",
+        "capabilityDiagnosticCode": null
       },
       {
         "agentId": "kilo",
@@ -583,13 +629,14 @@
           "kind": "exact"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "vibex_private",
+        "runtimeHomeStrategy": "none",
         "switchBehavior": "unverified",
         "credentialKinds": [],
         "modelInterfaces": [],
-        "evidenceState": "documented",
+        "evidenceState": "unverified",
         "sourceEvidenceReference": "research/acp-agent/kilo@7.2.40",
-        "smokeId": "agent-provider-kilo"
+        "smokeId": "agent-provider-kilo",
+        "capabilityDiagnosticCode": "agent_projection_auth_boundary_not_runtime_verified"
       },
       {
         "agentId": "kiro",
@@ -610,7 +657,8 @@
         "modelInterfaces": [],
         "evidenceState": "documented",
         "sourceEvidenceReference": "research/acp-agent/kiro@manual",
-        "smokeId": "agent-provider-kiro"
+        "smokeId": "agent-provider-kiro",
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
         "agentId": "kimi",
@@ -622,13 +670,14 @@
           "kind": "exact"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "vibex_private",
+        "runtimeHomeStrategy": "none",
         "switchBehavior": "unverified",
         "credentialKinds": [],
         "modelInterfaces": [],
-        "evidenceState": "documented",
+        "evidenceState": "unverified",
         "sourceEvidenceReference": "research/acp-agent/kimi@0.11.0",
-        "smokeId": "agent-provider-kimi"
+        "smokeId": "agent-provider-kimi",
+        "capabilityDiagnosticCode": "agent_projection_typed_projector_not_implemented"
       },
       {
         "agentId": "minion-code",
@@ -640,13 +689,14 @@
           "kind": "exact"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "vibex_private",
+        "runtimeHomeStrategy": "none",
         "switchBehavior": "unverified",
         "credentialKinds": [],
         "modelInterfaces": [],
-        "evidenceState": "documented",
+        "evidenceState": "unverified",
         "sourceEvidenceReference": "research/acp-agent/minion-code@0.1.44",
-        "smokeId": "agent-provider-minion-code"
+        "smokeId": "agent-provider-minion-code",
+        "capabilityDiagnosticCode": "agent_projection_auth_boundary_not_runtime_verified"
       },
       {
         "agentId": "mistral-vibe",
@@ -658,13 +708,14 @@
           "kind": "exact"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "vibex_private",
+        "runtimeHomeStrategy": "none",
         "switchBehavior": "unverified",
         "credentialKinds": [],
         "modelInterfaces": [],
-        "evidenceState": "documented",
+        "evidenceState": "unverified",
         "sourceEvidenceReference": "research/acp-agent/mistral-vibe@2.9.3",
-        "smokeId": "agent-provider-mistral-vibe"
+        "smokeId": "agent-provider-mistral-vibe",
+        "capabilityDiagnosticCode": "agent_projection_typed_projector_not_implemented"
       },
       {
         "agentId": "nova",
@@ -676,13 +727,14 @@
           "kind": "exact"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "vibex_private",
+        "runtimeHomeStrategy": "none",
         "switchBehavior": "unverified",
         "credentialKinds": [],
         "modelInterfaces": [],
-        "evidenceState": "documented",
+        "evidenceState": "unverified",
         "sourceEvidenceReference": "research/acp-agent/nova@1.1.18",
-        "smokeId": "agent-provider-nova"
+        "smokeId": "agent-provider-nova",
+        "capabilityDiagnosticCode": "agent_projection_auth_boundary_not_runtime_verified"
       },
       {
         "agentId": "poolside",
@@ -694,13 +746,14 @@
           "kind": "exact"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "vibex_private",
+        "runtimeHomeStrategy": "none",
         "switchBehavior": "unverified",
         "credentialKinds": [],
         "modelInterfaces": [],
-        "evidenceState": "documented",
+        "evidenceState": "unverified",
         "sourceEvidenceReference": "research/acp-agent/poolside@1.0.0",
-        "smokeId": "agent-provider-poolside"
+        "smokeId": "agent-provider-poolside",
+        "capabilityDiagnosticCode": "agent_projection_mixed_auth_boundary_not_runtime_verified"
       },
       {
         "agentId": "qoder",
@@ -721,7 +774,8 @@
         "modelInterfaces": [],
         "evidenceState": "agent_managed",
         "sourceEvidenceReference": "research/acp-agent/qoder@1.0.24",
-        "smokeId": "agent-provider-qoder"
+        "smokeId": "agent-provider-qoder",
+        "capabilityDiagnosticCode": null
       },
       {
         "agentId": "qwen-code",
@@ -733,13 +787,14 @@
           "kind": "exact"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "vibex_private",
+        "runtimeHomeStrategy": "none",
         "switchBehavior": "unverified",
         "credentialKinds": [],
         "modelInterfaces": [],
-        "evidenceState": "documented",
+        "evidenceState": "unverified",
         "sourceEvidenceReference": "research/acp-agent/qwen-code@0.18.4",
-        "smokeId": "agent-provider-qwen-code"
+        "smokeId": "agent-provider-qwen-code",
+        "capabilityDiagnosticCode": "agent_projection_typed_projector_not_implemented"
       },
       {
         "agentId": "sigit",
@@ -759,7 +814,8 @@
         "modelInterfaces": [],
         "evidenceState": "local",
         "sourceEvidenceReference": "research/acp-agent/sigit@1.0.3",
-        "smokeId": "agent-provider-sigit"
+        "smokeId": "agent-provider-sigit",
+        "capabilityDiagnosticCode": null
       },
       {
         "agentId": "stakpak",
@@ -771,13 +827,14 @@
           "kind": "exact"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "vibex_private",
+        "runtimeHomeStrategy": "none",
         "switchBehavior": "unverified",
         "credentialKinds": [],
         "modelInterfaces": [],
-        "evidenceState": "documented",
+        "evidenceState": "unverified",
         "sourceEvidenceReference": "research/acp-agent/stakpak@0.3.80",
-        "smokeId": "agent-provider-stakpak"
+        "smokeId": "agent-provider-stakpak",
+        "capabilityDiagnosticCode": "agent_projection_typed_projector_not_implemented"
       },
       {
         "agentId": "vtcode",
@@ -789,13 +846,14 @@
           "kind": "exact"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "vibex_private",
+        "runtimeHomeStrategy": "none",
         "switchBehavior": "unverified",
         "credentialKinds": [],
         "modelInterfaces": [],
-        "evidenceState": "documented",
+        "evidenceState": "unverified",
         "sourceEvidenceReference": "research/acp-agent/vtcode@0.96.14",
-        "smokeId": "agent-provider-vtcode"
+        "smokeId": "agent-provider-vtcode",
+        "capabilityDiagnosticCode": "agent_projection_typed_projector_not_implemented"
       }
     ]
   },
@@ -1043,7 +1101,7 @@
       "switchBehavior": "unverified",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "operator_prerequisites_unavailable",
+      "diagnosticCode": "agent_projection_typed_projector_not_implemented",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1078,7 +1136,7 @@
       "switchBehavior": "unverified",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "operator_prerequisites_unavailable",
+      "diagnosticCode": "agent_projection_auth_boundary_not_runtime_verified",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1113,7 +1171,7 @@
       "switchBehavior": "unverified",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "operator_prerequisites_unavailable",
+      "diagnosticCode": "agent_projection_version_detection_required",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1145,7 +1203,7 @@
       "descriptorVersion": "1",
       "versionPolicy": "exact",
       "capabilityMode": "replaceable_provider",
-      "switchBehavior": "unverified",
+      "switchBehavior": "restart_and_resume",
       "status": "blocked",
       "execution": "not_run",
       "diagnosticCode": "operator_prerequisites_unavailable",
@@ -1183,7 +1241,7 @@
       "switchBehavior": "unverified",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "operator_prerequisites_unavailable",
+      "diagnosticCode": "agent_projection_typed_projector_not_implemented",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1253,7 +1311,7 @@
       "switchBehavior": "unverified",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "operator_prerequisites_unavailable",
+      "diagnosticCode": "agent_projection_typed_projector_not_implemented",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1323,7 +1381,7 @@
       "switchBehavior": "unverified",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "operator_prerequisites_unavailable",
+      "diagnosticCode": "agent_projection_environment_contract_not_runtime_verified",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1393,7 +1451,7 @@
       "switchBehavior": "unverified",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "operator_prerequisites_unavailable",
+      "diagnosticCode": "agent_projection_typed_projector_not_implemented",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1428,7 +1486,7 @@
       "switchBehavior": "unverified",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "operator_prerequisites_unavailable",
+      "diagnosticCode": "agent_projection_auth_boundary_not_runtime_verified",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1463,7 +1521,7 @@
       "switchBehavior": "unverified",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "operator_prerequisites_unavailable",
+      "diagnosticCode": "agent_projection_typed_projector_not_implemented",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1498,7 +1556,7 @@
       "switchBehavior": "unverified",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "operator_prerequisites_unavailable",
+      "diagnosticCode": "agent_projection_typed_projector_not_implemented",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1565,7 +1623,7 @@
       "descriptorVersion": "1",
       "versionPolicy": "exact",
       "capabilityMode": "replaceable_provider",
-      "switchBehavior": "unverified",
+      "switchBehavior": "restart_and_resume",
       "status": "blocked",
       "execution": "not_run",
       "diagnosticCode": "operator_prerequisites_unavailable",
@@ -1603,7 +1661,7 @@
       "switchBehavior": "unverified",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "operator_prerequisites_unavailable",
+      "diagnosticCode": "agent_projection_acp_option_not_runtime_verified",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1638,7 +1696,7 @@
       "switchBehavior": "unverified",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "operator_prerequisites_unavailable",
+      "diagnosticCode": "agent_projection_mixed_auth_boundary_not_runtime_verified",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1673,7 +1731,7 @@
       "switchBehavior": "unverified",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "operator_prerequisites_unavailable",
+      "diagnosticCode": "agent_projection_version_detection_required",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1743,7 +1801,7 @@
       "switchBehavior": "unverified",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "operator_prerequisites_unavailable",
+      "diagnosticCode": "agent_projection_auth_boundary_not_runtime_verified",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1813,7 +1871,7 @@
       "switchBehavior": "unverified",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "operator_prerequisites_unavailable",
+      "diagnosticCode": "agent_projection_typed_projector_not_implemented",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1848,7 +1906,7 @@
       "switchBehavior": "unverified",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "operator_prerequisites_unavailable",
+      "diagnosticCode": "agent_projection_auth_boundary_not_runtime_verified",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1883,7 +1941,7 @@
       "switchBehavior": "unverified",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "operator_prerequisites_unavailable",
+      "diagnosticCode": "agent_projection_typed_projector_not_implemented",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1918,7 +1976,7 @@
       "switchBehavior": "unverified",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "operator_prerequisites_unavailable",
+      "diagnosticCode": "agent_projection_auth_boundary_not_runtime_verified",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1953,7 +2011,7 @@
       "switchBehavior": "unverified",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "operator_prerequisites_unavailable",
+      "diagnosticCode": "agent_projection_mixed_auth_boundary_not_runtime_verified",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -2023,7 +2081,7 @@
       "switchBehavior": "unverified",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "operator_prerequisites_unavailable",
+      "diagnosticCode": "agent_projection_typed_projector_not_implemented",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -2093,7 +2151,7 @@
       "switchBehavior": "unverified",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "operator_prerequisites_unavailable",
+      "diagnosticCode": "agent_projection_typed_projector_not_implemented",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -2128,7 +2186,7 @@
       "switchBehavior": "unverified",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "operator_prerequisites_unavailable",
+      "diagnosticCode": "agent_projection_typed_projector_not_implemented",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
