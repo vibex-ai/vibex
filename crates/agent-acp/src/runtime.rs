@@ -100,7 +100,8 @@ use crate::registry::{
 use crate::session_attachment_registry::{
     SessionAttachmentAcquireKey, SessionAttachmentAcquireOutput, SessionAttachmentAcquireResult,
     SessionAttachmentEventFence, SessionAttachmentHandle, SessionAttachmentPromptGuard,
-    SessionAttachmentRegistry, SessionAttachmentRoute, SessionAttachmentState, redact_native_id,
+    SessionAttachmentRegistry, SessionAttachmentRoute, SessionAttachmentRouteRejection,
+    SessionAttachmentState, redact_native_id,
 };
 use crate::session_config::{
     CanonicalSessionConfigKey, SessionConfigFieldKind, SessionConfigFieldRequest,
@@ -144,6 +145,7 @@ const ACP_SUMMARY_LIMIT: usize = 2000;
 const ACP_ACTIVE_MESSAGE_LIMIT: usize = 64 * 1024;
 const ACP_ACTIVE_TOOL_CALL_LIMIT: usize = 32;
 const ACP_PENDING_PERMISSION_LIMIT: usize = 32;
+const ACP_PENDING_COMMAND_CATALOG_LIMIT: usize = 16;
 const ACP_TERMINAL_OUTPUT_LIMIT: usize = 24 * 1024;
 const ACP_PROCESS_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const ACP_PERMISSION_CANCELLED_RESPONSE: &str = "cancelled";
@@ -1176,6 +1178,41 @@ impl Drop for AcpRegistrationBarrier {
     }
 }
 
+#[derive(Default)]
+struct PendingAvailableCommandCatalogs {
+    catalogs: HashMap<String, Vec<AcpRuntimeCommand>>,
+    order: VecDeque<String>,
+}
+
+impl PendingAvailableCommandCatalogs {
+    fn insert(&mut self, native_session_id: String, commands: Vec<AcpRuntimeCommand>) {
+        if self.catalogs.contains_key(&native_session_id) {
+            self.order.retain(|queued| queued != &native_session_id);
+        }
+        self.catalogs.insert(native_session_id.clone(), commands);
+        self.order.push_back(native_session_id);
+
+        while self.catalogs.len() > ACP_PENDING_COMMAND_CATALOG_LIMIT {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.catalogs.remove(&oldest);
+        }
+    }
+
+    fn take(&mut self, native_session_id: &str) -> Option<Vec<AcpRuntimeCommand>> {
+        let commands = self.catalogs.remove(native_session_id)?;
+        self.order.retain(|queued| queued != native_session_id);
+        Some(commands)
+    }
+}
+
+enum AcpNativeRouteOutcome<R> {
+    Delivered(R),
+    Consumed,
+    Diagnostic(SessionAttachmentRouteRejection),
+}
+
 struct PendingTransportResponse {
     response: oneshot::Sender<Result<Value, AcpRpcFailure>>,
     registration_release: Option<oneshot::Receiver<()>>,
@@ -1214,6 +1251,7 @@ struct AcpProcess {
     next_request_id: AtomicU64,
     pending_requests: Mutex<HashMap<u64, PendingTransportResponse>>,
     pending_prompt_requests: Mutex<HashMap<String, u64>>,
+    pending_available_commands: Mutex<PendingAvailableCommandCatalogs>,
     active_terminal_owners: Mutex<HashMap<TerminalId, Weak<AcpSessionAttachment>>>,
     request_admission: Mutex<()>,
     shared: Mutex<ProcessShared>,
@@ -2851,6 +2889,48 @@ impl AcpProcess {
             .is_ok_and(|pending| pending.values().any(|pending_id| *pending_id == request_id))
     }
 
+    fn has_pending_registration_request(&self) -> bool {
+        self.pending_requests.lock().is_ok_and(|pending| {
+            pending
+                .values()
+                .any(|response| response.registration_release.is_some())
+        })
+    }
+
+    fn buffer_available_commands(&self, params: &Value) -> bool {
+        if !self.has_pending_registration_request() {
+            return false;
+        }
+        let Some(native_session_id) = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return false;
+        };
+        let commands = parse_available_commands(
+            params
+                .get("update")
+                .and_then(|update| update.get("availableCommands")),
+        );
+        let Ok(mut pending) = self.pending_available_commands.lock() else {
+            return false;
+        };
+        pending.insert(native_session_id.to_string(), commands);
+        true
+    }
+
+    fn take_pending_available_commands(
+        &self,
+        native_session_id: &str,
+    ) -> Option<Vec<AcpRuntimeCommand>> {
+        self.pending_available_commands
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.take(native_session_id))
+    }
+
     fn clear_pending_prompt_for_session(&self, native_session_id: &str) {
         if let Ok(mut pending) = self.pending_prompt_requests.lock() {
             pending.remove(native_session_id);
@@ -3143,6 +3223,19 @@ impl AcpProcess {
         method: &str,
         operation: impl FnOnce(&AcpSessionAttachment) -> R,
     ) -> Option<R> {
+        match self.route_native(native_session_id, method, true, operation) {
+            AcpNativeRouteOutcome::Delivered(result) => Some(result),
+            AcpNativeRouteOutcome::Consumed | AcpNativeRouteOutcome::Diagnostic(_) => None,
+        }
+    }
+
+    fn route_native<R>(
+        &self,
+        native_session_id: Option<&str>,
+        method: &str,
+        diagnose_unroutable: bool,
+        operation: impl FnOnce(&AcpSessionAttachment) -> R,
+    ) -> AcpNativeRouteOutcome<R> {
         let method = protocol::safe_method_metadata(method);
         let Some(router) = self.attachment_router.upgrade() else {
             tracing::debug!(
@@ -3152,7 +3245,7 @@ impl AcpProcess {
                 code = "acp_attachment_router_closed",
                 "ACP session-scoped message routed to process diagnostics"
             );
-            return None;
+            return AcpNativeRouteOutcome::Consumed;
         };
         match router.registry.route(
             &self.process_instance_id,
@@ -3167,7 +3260,7 @@ impl AcpProcess {
                             &handle,
                             vibex_core::RuntimeEventKind::AttachmentUpdated,
                         );
-                        Some(result)
+                        AcpNativeRouteOutcome::Delivered(result)
                     }
                     Err(error) => {
                         router.observability.increment(
@@ -3182,7 +3275,7 @@ impl AcpProcess {
                             code = %error.code,
                             "ACP session-scoped message failed its final attachment fence"
                         );
-                        None
+                        AcpNativeRouteOutcome::Consumed
                     }
                 }
             }
@@ -3212,30 +3305,32 @@ impl AcpProcess {
                     code = "acp_event_attachment_prepared",
                     "ACP prepared-attachment message quarantined"
                 );
-                None
+                AcpNativeRouteOutcome::Consumed
             }
             SessionAttachmentRoute::Diagnostic(diagnostic) => {
-                router.observability.increment(
-                    RuntimeMetricName::UnroutableNativeEvent,
-                    None,
-                    RuntimeMetricResult::Unroutable,
-                );
-                self.log_context.clone().emit(
-                    RuntimeLogLevel::Warn,
-                    "acp_native_event_unroutable",
-                    RuntimeMetricResult::Unroutable,
-                    Some(&diagnostic.code),
-                    None,
-                );
-                tracing::debug!(
-                    target: "vibex_agent_acp",
-                    process_instance = %diagnostic.process_instance_id.as_str(),
-                    method = diagnostic.method.as_deref().unwrap_or(method.as_str()),
-                    code = %diagnostic.code,
-                    native_session_hash = diagnostic.native_session_hash.as_deref().unwrap_or("none"),
-                    "ACP session-scoped message routed to process diagnostics"
-                );
-                None
+                if diagnose_unroutable {
+                    router.observability.increment(
+                        RuntimeMetricName::UnroutableNativeEvent,
+                        None,
+                        RuntimeMetricResult::Unroutable,
+                    );
+                    self.log_context.clone().emit(
+                        RuntimeLogLevel::Warn,
+                        "acp_native_event_unroutable",
+                        RuntimeMetricResult::Unroutable,
+                        Some(&diagnostic.code),
+                        None,
+                    );
+                    tracing::debug!(
+                        target: "vibex_agent_acp",
+                        process_instance = %diagnostic.process_instance_id.as_str(),
+                        method = diagnostic.method.as_deref().unwrap_or(method.as_str()),
+                        code = %diagnostic.code,
+                        native_session_hash = diagnostic.native_session_hash.as_deref().unwrap_or("none"),
+                        "ACP session-scoped message routed to process diagnostics"
+                    );
+                }
+                AcpNativeRouteOutcome::Diagnostic(diagnostic.rejection)
             }
         }
     }
@@ -3835,6 +3930,26 @@ impl AcpProcess {
     }
 
     fn handle_session_update(&self, params: &Value) {
+        let is_available_commands_update = params
+            .get("update")
+            .and_then(|update| update.get("sessionUpdate"))
+            .and_then(Value::as_str)
+            == Some("available_commands_update");
+        if is_available_commands_update && self.has_pending_registration_request() {
+            let native_session_id = params.get("sessionId").and_then(Value::as_str);
+            match self.route_native(
+                native_session_id,
+                AcpOperation::SessionUpdate.method(),
+                false,
+                |attachment| attachment.handle_session_update(params),
+            ) {
+                AcpNativeRouteOutcome::Delivered(_) | AcpNativeRouteOutcome::Consumed => return,
+                AcpNativeRouteOutcome::Diagnostic(
+                    SessionAttachmentRouteRejection::UnknownNativeSessionId,
+                ) if self.buffer_available_commands(params) => return,
+                AcpNativeRouteOutcome::Diagnostic(_) => {}
+            }
+        }
         let _ =
             self.with_routed_params(params, AcpOperation::SessionUpdate.method(), |attachment| {
                 attachment.handle_session_update(params)
@@ -8132,6 +8247,7 @@ impl AcpRuntimeClient {
             next_request_id: AtomicU64::new(1),
             pending_requests: Mutex::new(HashMap::new()),
             pending_prompt_requests: Mutex::new(HashMap::new()),
+            pending_available_commands: Mutex::new(PendingAvailableCommandCatalogs::default()),
             active_terminal_owners: Mutex::new(HashMap::new()),
             request_admission: Mutex::new(()),
             shared: Mutex::new(ProcessShared::default()),
@@ -8379,6 +8495,9 @@ impl AcpRuntimeClient {
             &native_session_id,
             &result,
         );
+        if let Some(commands) = process.take_pending_available_commands(&native_session_id) {
+            state.available_commands = commands;
+        }
         Ok(OpenedAcpSession {
             native_session_id,
             state,
@@ -8409,8 +8528,8 @@ impl AcpRuntimeClient {
         process: &Arc<AcpProcess>,
         native_session_id: &str,
     ) -> VibexResult<OpenedAcpSession> {
-        let result = process
-            .request(
+        let (result, registration_barrier) = process
+            .request_with_registration_barrier(
                 AcpOperation::SessionResume.method(),
                 protocol::build_session_resume_params(
                     native_session_id,
@@ -8428,10 +8547,13 @@ impl AcpRuntimeClient {
             native_session_id,
             &result,
         );
+        if let Some(commands) = process.take_pending_available_commands(native_session_id) {
+            state.available_commands = commands;
+        }
         Ok(OpenedAcpSession {
             native_session_id: native_session_id.to_string(),
             state,
-            registration_barrier: None,
+            registration_barrier: Some(registration_barrier),
         })
     }
 
@@ -8458,8 +8580,8 @@ impl AcpRuntimeClient {
         process: &Arc<AcpProcess>,
         native_session_id: &str,
     ) -> VibexResult<OpenedAcpSession> {
-        let result = process
-            .request(
+        let (result, registration_barrier) = process
+            .request_with_registration_barrier(
                 AcpOperation::SessionLoad.method(),
                 build_session_load_params(
                     native_session_id,
@@ -8477,10 +8599,13 @@ impl AcpRuntimeClient {
             native_session_id,
             &result,
         );
+        if let Some(commands) = process.take_pending_available_commands(native_session_id) {
+            state.available_commands = commands;
+        }
         Ok(OpenedAcpSession {
             native_session_id: native_session_id.to_string(),
             state,
-            registration_barrier: None,
+            registration_barrier: Some(registration_barrier),
         })
     }
 
@@ -13782,6 +13907,7 @@ mod tests {
             next_request_id: AtomicU64::new(1),
             pending_requests: Mutex::new(HashMap::new()),
             pending_prompt_requests: Mutex::new(HashMap::new()),
+            pending_available_commands: Mutex::new(PendingAvailableCommandCatalogs::default()),
             active_terminal_owners: Mutex::new(HashMap::new()),
             request_admission: Mutex::new(()),
             shared: Mutex::new(ProcessShared::default()),
@@ -15474,6 +15600,31 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
     }
 
     #[test]
+    fn pending_available_command_catalogs_are_bounded_and_keep_latest_update() {
+        let mut pending = PendingAvailableCommandCatalogs::default();
+        for index in 0..(ACP_PENDING_COMMAND_CATALOG_LIMIT + 2) {
+            pending.insert(
+                format!("session-{index}"),
+                vec![AcpRuntimeCommand {
+                    name: format!("command-{index}"),
+                    description: None,
+                }],
+            );
+        }
+        pending.insert(
+            "session-2".to_string(),
+            vec![AcpRuntimeCommand {
+                name: "updated".to_string(),
+                description: None,
+            }],
+        );
+
+        assert_eq!(pending.catalogs.len(), ACP_PENDING_COMMAND_CATALOG_LIMIT);
+        assert!(pending.take("session-0").is_none());
+        assert_eq!(pending.take("session-2").unwrap()[0].name, "updated");
+    }
+
+    #[test]
     fn opencode_model_provider_env_is_profile_scoped_and_secret_safe() {
         const SECRET_ENV: &str = "VIBEX_TEST_OPENCODE_PROFILE_KEY";
         unsafe {
@@ -15756,6 +15907,19 @@ for line in sys.stdin:
         session_id = "mock-session-" + str(session_counter)
         send({
             "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [
+                        {"name": "compact", "description": "Compact context"}
+                    ],
+                },
+            },
+        })
+        send({
+            "jsonrpc": "2.0",
             "id": mid,
             "result": {
                 "sessionId": session_id,
@@ -15801,19 +15965,6 @@ for line in sys.stdin:
                         ],
                     }
                 ],
-            },
-        })
-        send({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "sessionId": session_id,
-                "update": {
-                    "sessionUpdate": "available_commands_update",
-                    "availableCommands": [
-                        {"name": "compact", "description": "Compact context"}
-                    ],
-                },
             },
         })
     elif method == "session/set_model":
@@ -15928,6 +16079,19 @@ for line in sys.stdin:
         else:
             send({
                 "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "available_commands_update",
+                        "availableCommands": [
+                            {"name": "resume-command", "description": "Restored by resume"}
+                        ],
+                    },
+                },
+            })
+            send({
+                "jsonrpc": "2.0",
                 "id": mid,
                 "result": {
                     "models": {
@@ -15963,6 +16127,19 @@ for line in sys.stdin:
         if restore_mode == "native_mismatch":
             send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "wrong-native-session"}})
             continue
+        send({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [
+                        {"name": "load-command", "description": "Restored by load"}
+                    ],
+                },
+            },
+        })
         send({
             "jsonrpc": "2.0",
             "id": mid,
@@ -19656,6 +19833,15 @@ for line in sys.stdin:
             assert_eq!(logged_request_count(&log, "session/resume"), 1);
             assert_eq!(logged_request_count(&log, "session/load"), expected_load);
             assert_eq!(logged_request_count(&log, "session/new"), 0);
+            let commands = client.list_session_commands(&session_id).await.unwrap();
+            assert_eq!(
+                commands.first().map(|command| command.name.as_str()),
+                Some(if expected_load == 0 {
+                    "resume-command"
+                } else {
+                    "load-command"
+                })
+            );
             let restore_result = client.last_restore_result(&session_id).unwrap();
             assert_eq!(
                 restore_result.outcome,
@@ -20393,6 +20579,38 @@ for line in sys.stdin:
             logged_request_count(&fixture.request_log(), "session/cancel"),
             0
         );
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mock_acp_keeps_commands_announced_before_session_new_response() {
+        let Some(fixture) = MockAcpFixture::create("commands-before-new-response") else {
+            return;
+        };
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+
+        let commands = client.list_session_commands(&session_id).await.unwrap();
+        assert_eq!(
+            commands,
+            vec![AcpRuntimeCommand {
+                name: "compact".to_string(),
+                description: Some("Compact context".to_string()),
+            }]
+        );
+
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
         client.close_session(&binding).await.unwrap();
         fixture.cleanup();
     }

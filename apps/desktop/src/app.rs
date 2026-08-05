@@ -257,6 +257,10 @@ const COMPOSER_TEXT_AREA_MIN_HEIGHT: f32 = 52.0;
 const COMPOSER_SURFACE_RADIUS: f32 = 20.0;
 const COMPOSER_RUNTIME_MENU_WIDTH: f32 = 320.0;
 const COMPOSER_RUNTIME_MENU_MAX_HEIGHT: f32 = 448.0;
+const COMPOSER_SUGGESTION_MENU_MAX_HEIGHT: f32 = 288.0;
+const COMPOSER_SUGGESTION_MENU_EMPTY_HEIGHT: f32 = 48.0;
+const COMPOSER_SUGGESTION_MENU_ROW_HEIGHT: f32 = 54.0;
+const COMPOSER_SUGGESTION_MENU_VERTICAL_PADDING: f32 = 12.0;
 const NEW_SESSION_RUNTIME_MENU_MAX_HEIGHT: f32 = 360.0;
 const NEW_SESSION_RUNTIME_MENU_MIN_HEIGHT: f32 = 104.0;
 const RUNTIME_MENU_VIEWPORT_MARGIN: f32 = 12.0;
@@ -435,6 +439,13 @@ struct RuntimeMenuPlacement {
     trigger_offset: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ComposerSuggestionMenuPlacement {
+    anchor: Anchor,
+    max_height: f32,
+    window_edge_offset: f32,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct ComposerGeometry {
     input_bounds: Option<Bounds<Pixels>>,
@@ -561,6 +572,42 @@ fn composer_runtime_menu_placement(
 
 fn composer_runtime_choice_menu_height(row_count: usize, max_height: f32) -> f32 {
     (12.0 + COMPOSER_RUNTIME_CHOICE_ROW_HEIGHT * row_count.max(1) as f32).min(max_height)
+}
+
+fn composer_suggestion_menu_height(row_count: usize) -> f32 {
+    if row_count == 0 {
+        COMPOSER_SUGGESTION_MENU_EMPTY_HEIGHT
+    } else {
+        (COMPOSER_SUGGESTION_MENU_VERTICAL_PADDING
+            + COMPOSER_SUGGESTION_MENU_ROW_HEIGHT * row_count as f32)
+            .min(COMPOSER_SUGGESTION_MENU_MAX_HEIGHT)
+    }
+}
+
+fn composer_suggestion_menu_placement(
+    trigger_bounds: Bounds<Pixels>,
+    viewport_height: f32,
+    row_count: usize,
+) -> ComposerSuggestionMenuPlacement {
+    let trigger_top = f32::from(trigger_bounds.origin.y);
+    let trigger_bottom = trigger_top + f32::from(trigger_bounds.size.height);
+    let placement = composer_runtime_menu_placement(
+        Some(trigger_bounds),
+        viewport_height,
+        composer_suggestion_menu_height(row_count),
+        COMPOSER_SUGGESTION_MENU_MAX_HEIGHT,
+    );
+    let window_edge_offset = match placement.anchor {
+        Anchor::TopLeft | Anchor::TopCenter | Anchor::TopRight => {
+            trigger_bottom + placement.trigger_offset
+        }
+        _ => viewport_height - trigger_top + placement.trigger_offset,
+    };
+    ComposerSuggestionMenuPlacement {
+        anchor: placement.anchor,
+        max_height: placement.height,
+        window_edge_offset,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22064,12 +22111,9 @@ impl VibexWorkbench {
         let menu_width = (viewport_width - 24.0).clamp(240.0, 360.0);
         let max_left = (viewport_width - menu_width - 12.0).max(12.0);
         let menu_left = f32::from(trigger_bounds.origin.x).clamp(12.0, max_left);
-        let below = f32::from(trigger_bounds.origin.y + trigger_bounds.size.height) + 8.0;
-        let menu_top = if below + 260.0 > viewport_height {
-            (f32::from(trigger_bounds.origin.y) - 268.0).max(12.0)
-        } else {
-            below
-        };
+        let visible_row_count = self.suggestions.len().min(10);
+        let menu_placement =
+            composer_suggestion_menu_placement(trigger_bounds, viewport_height, visible_row_count);
 
         let rows = self
             .suggestions
@@ -22173,7 +22217,7 @@ impl VibexWorkbench {
         let scroll_content = v_flex()
             .id(format!("composer-command-menu-scroll:{}", target.id()))
             .w_full()
-            .max_h(px(288.0))
+            .max_h(px(menu_placement.max_height))
             .p(px(6.0))
             .when(!rows.is_empty(), |this| this.children(rows))
             .when(self.suggestions.is_empty(), |this| {
@@ -22198,9 +22242,8 @@ impl VibexWorkbench {
             .aria_label("Composer commands")
             .absolute()
             .left(px(menu_left))
-            .top(px(menu_top))
             .w(px(menu_width))
-            .max_h(px(288.0))
+            .max_h(px(menu_placement.max_height))
             .occlude()
             .rounded(px(14.0))
             .border_1()
@@ -22208,6 +22251,12 @@ impl VibexWorkbench {
             .bg(cx.theme().popover.opacity(0.96))
             .shadow_xl()
             .child(scroll_content)
+            .map(|menu| match menu_placement.anchor {
+                Anchor::TopLeft | Anchor::TopCenter | Anchor::TopRight => {
+                    menu.top(px(menu_placement.window_edge_offset))
+                }
+                _ => menu.bottom(px(menu_placement.window_edge_offset)),
+            })
             .into_any_element()
     }
 
@@ -34828,6 +34877,34 @@ mod tests {
                 trigger_offset: 4.0,
             }
         );
+    }
+
+    #[test]
+    fn composer_suggestion_menu_stays_attached_above_the_trigger() {
+        let viewport_height = 900.0;
+        for row_count in [0, 1] {
+            let trigger_bounds = Bounds {
+                origin: gpui::Point {
+                    x: px(180.0),
+                    y: px(850.0),
+                },
+                size: Size {
+                    width: px(8.0),
+                    height: px(20.0),
+                },
+            };
+            let placement =
+                composer_suggestion_menu_placement(trigger_bounds, viewport_height, row_count);
+
+            assert_eq!(placement.anchor, Anchor::BottomLeft);
+            let menu_bottom = viewport_height - placement.window_edge_offset;
+            let gap = f32::from(trigger_bounds.origin.y) - menu_bottom;
+            assert_eq!(gap, RUNTIME_MENU_TRIGGER_GAP);
+            assert_eq!(
+                placement.max_height,
+                composer_suggestion_menu_height(row_count)
+            );
+        }
     }
 
     #[gpui::test]

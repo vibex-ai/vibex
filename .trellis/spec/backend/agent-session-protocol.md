@@ -335,6 +335,9 @@ SessionAttachmentRegistry::route(process_instance_id, native_session_id, method)
 SessionAttachmentRegistry::apply_current(fence, synchronous_operation)
 SessionAttachmentRegistry::acquire_prompt(fence)
 SessionAttachmentRegistry::mark_crashed(fence)
+AcpProcess::request_with_registration_barrier(
+  session/new | session/load | session/resume
+)
 ```
 
 Inbound session-scoped ACP envelopes:
@@ -386,10 +389,19 @@ request: terminal/create { id, params.sessionId, ... }
   `session/set_config_option` re-enters `apply_current` before mutating model,
   mode, or config state; a response that became stale while awaiting I/O has
   zero attachment side effects.
-- `session/new` uses a bounded response registration barrier: after the response
-  yields its native id, the stdout reader waits only until the exact route is
-  registered and activated before reading immediately following notifications.
-  The barrier does not infer identity or store process-global session state.
+- `session/new`, `session/load`, and `session/resume` use a bounded response
+  registration barrier: after the response yields or confirms its native id,
+  the stdout reader waits only until the exact route is registered and activated
+  before reading immediately following notifications.
+- An ACP Agent may publish `available_commands_update` before the corresponding
+  registration response. While a registration-barrier request is pending, an
+  update for an unknown exact native route is retained in a process-local map
+  keyed by native session id, capped at 16 catalogs with latest-update-wins
+  replacement. The validated response drains that catalog into the new
+  attachment before route registration. Updates for an already registered
+  pooled-session route are delivered normally, and every other unroutable event
+  keeps the normal diagnostic path. The buffer does not infer identity or become
+  process-global session authority.
 - Each created attachment subscribes to `ProcessLease::subscribe_crashes()`
   before load/new. Broadcast plus process snapshot closes the registration race;
   `mark_crashed(fence)` makes fan-out idempotent. Detach removes the route before
@@ -417,6 +429,12 @@ request: terminal/create { id, params.sessionId, ... }
 - Empty event `sessionId` -> process diagnostic `acp_event_session_id_empty`.
 - Unknown process/native route -> process diagnostic
   `acp_event_session_route_unknown`.
+- Pre-response `available_commands_update` for an unknown native route while a
+  registration request is pending -> bounded pending catalog with no
+  `acp_event_session_route_unknown` warning; without that pending request it is
+  an ordinary unroutable diagnostic.
+- More than 16 pending command catalogs -> evict the oldest native-session
+  catalog; never grow process memory without a bound.
 - Binding or generation mismatch -> process diagnostic `acp_event_fence_stale`.
 - Prepared attachment -> quarantine `acp_event_attachment_prepared`.
 - Non-current/inactive attachment -> `acp_attachment_not_current` or
@@ -429,6 +447,11 @@ request: terminal/create { id, params.sessionId, ... }
 
 - Good: two native sessions on one verified pooled process interleave updates,
   model state, permissions, and interrupts; each modifies only its attachment.
+- Good: Codex ACP announces `/compact` before answering `session/new`; the
+  created attachment exposes `/compact` through live command discovery.
+- Base: one pooled session has a committed route while another is registering;
+  a command update for the committed session is delivered there, not captured
+  by the pending-registration buffer.
 - Good: process crash broadcasts once; both affected attachments receive one
   recoverable error carrying their own fence, then a rebuild uses a newer
   generation and rejects late old-process events.
@@ -454,6 +477,11 @@ request: terminal/create { id, params.sessionId, ... }
 - Mock ACP integration asserts pooled update/model/tool/permission isolation,
   target-only interrupt/close, missing/unknown dedicated routing rejection, and
   terminal/permission fail-closed responses.
+- Mock ACP registration tests send `available_commands_update` before successful
+  `session/new`, `session/load`, and `session/resume` responses and assert each
+  created attachment exposes the command; unit tests assert the pending catalog
+  remains capped at 16 and a repeated native-session update replaces its earlier
+  value.
 - Crash tests assert registration-race coverage, single fan-out per attachment,
   exact reservation decrement, rebuild generation increment, and rejection of
   late old-process events.
@@ -497,6 +525,23 @@ existing.acquire_key == requested_key
 acquire_locks: HashMap<SessionAttachmentAcquireKey, Weak<Mutex<()>>>
 // Each acquire owns an RAII guard that removes the matching weak entry when
 // the final strong lock owner exits, including cancellation paths.
+```
+
+#### Wrong
+
+```text
+available_commands_update before session/new response
+  -> exact route missing -> unroutable diagnostic -> discard
+response -> register route -> command catalog stays empty
+```
+
+#### Correct
+
+```text
+registration request pending + unknown exact route + available_commands_update
+  -> bounded pending catalog[nativeSessionId]
+response validates nativeSessionId
+  -> drain catalog into attachment -> register/activate route -> release barrier
 ```
 
 ## Scenario: ACP Permission Callback Loop
