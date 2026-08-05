@@ -966,11 +966,14 @@ vibex-foundation: runtime-stopped
 
 - Linux title-bar/window close callbacks must not call `cx.quit()`: GPUI's X11 close
   path can re-enter window removal and panic. When close-to-tray is enabled, the
-  callback rehosts the existing workbench entity in a hidden window under
-  `QuitMode::Explicit`. When disabled, it switches to `LastWindowClosed` and lets
-  window removal initiate application quit. The app-level quit hook is the single
-  owner of final cleanup: queue and synchronously flush the current UI state, spawn
-  and await shared runtime shutdown, then allow process exit.
+  tray global retains the existing workbench entity under `QuitMode::Explicit` while
+  the application has zero windows; this must not rely on `WindowOptions::show`
+  because GPUI's Linux backend maps every newly created window. Restoring creates one
+  visible window and must recover from a stale tracked window handle. When disabled,
+  the callback switches to `LastWindowClosed` and lets window removal initiate
+  application quit. The app-level quit hook is the single owner of final cleanup:
+  queue and synchronously flush the current UI state, spawn and await shared runtime
+  shutdown, then allow process exit.
 - `DesktopRuntime` owns the process/home lock. A second shell must fail while the
   workbench is live, and the same external lock probe must succeed only after awaited
   shutdown and process exit. Cleanup that is merely spawned and abandoned is invalid.

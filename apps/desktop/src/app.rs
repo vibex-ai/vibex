@@ -3874,11 +3874,7 @@ impl VibexWorkbench {
         });
     }
 
-    pub(crate) fn prepare_for_window_rehost(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn prepare_for_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if window.has_active_dialog(cx) {
             window.close_all_dialogs(cx);
         }

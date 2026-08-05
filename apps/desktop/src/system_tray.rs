@@ -40,7 +40,6 @@ pub(crate) struct SystemTray {
     workbench: Entity<VibexWorkbench>,
     application_id: String,
     visible_window: Option<AnyWindowHandle>,
-    hidden_window: Option<AnyWindowHandle>,
     last_window_bounds: WindowBounds,
     locale: ResolvedLocale,
     quitting: bool,
@@ -95,7 +94,6 @@ impl SystemTray {
             workbench,
             application_id,
             visible_window: Some(window.window_handle()),
-            hidden_window: None,
             last_window_bounds: window.window_bounds(),
             locale,
             quitting: false,
@@ -134,50 +132,26 @@ impl SystemTray {
 
         self.last_window_bounds = window.window_bounds();
         self.workbench.update(cx, |workbench, cx| {
-            workbench.prepare_for_window_rehost(window, cx)
+            workbench.prepare_for_window_close(window, cx)
         });
-        let workbench = self.workbench.clone();
-        let hidden_options = workbench_window_options(
-            self.application_id.clone(),
-            self.last_window_bounds,
-            false,
-            false,
-        );
-        match cx.open_window(hidden_options, move |window, cx| {
-            cx.new(|cx| Root::new(workbench, window, cx).bordered(false))
-        }) {
-            Ok(hidden_window) => {
-                self.visible_window = None;
-                self.hidden_window = Some(hidden_window.into());
-                true
-            }
-            Err(error) => {
-                eprintln!("failed to move Vibex to the background: {error}");
-                false
-            }
-        }
+        self.visible_window = None;
+        true
     }
 
     fn restore(&mut self, cx: &mut App) {
         if self.quitting {
             return;
         }
-        if let Some(visible_window) = self.visible_window {
-            cx.activate(true);
-            let _ = visible_window.update(cx, |_, window, _| window.activate_window());
+        if let Some(visible_window) = self.visible_window
+            && activate_existing_window(visible_window, cx)
+        {
             return;
         }
+        self.visible_window = None;
 
-        let Some(hidden_window) = self.hidden_window else {
-            return;
-        };
         let workbench = self.workbench.clone();
-        let visible_options = workbench_window_options(
-            self.application_id.clone(),
-            self.last_window_bounds,
-            true,
-            true,
-        );
+        let visible_options =
+            workbench_window_options(self.application_id.clone(), self.last_window_bounds);
         let visible_window = match cx.open_window(visible_options, move |window, cx| {
             window.on_window_should_close(cx, handle_window_close);
             cx.new(|cx| Root::new(workbench, window, cx).bordered(false))
@@ -191,13 +165,15 @@ impl SystemTray {
 
         let visible_window: AnyWindowHandle = visible_window.into();
         self.visible_window = Some(visible_window);
-        self.hidden_window = None;
         let workbench = self.workbench.clone();
-        let _ = visible_window.update(cx, |_, window, cx| {
+        if let Err(error) = visible_window.update(cx, |_, window, cx| {
             workbench.update(cx, |workbench, cx| workbench.bind_to_window(window, cx));
             window.activate_window();
-        });
-        let _ = hidden_window.update(cx, |_, window, _| window.remove_window());
+        }) {
+            eprintln!("failed to activate the restored Vibex window: {error}");
+            self.visible_window = None;
+            return;
+        }
         cx.activate(true);
     }
 
@@ -313,6 +289,17 @@ fn poll_events(cx: &mut App) {
     .detach();
 }
 
+fn activate_existing_window(window_handle: AnyWindowHandle, cx: &mut App) -> bool {
+    if window_handle
+        .update(cx, |_, window, _| window.activate_window())
+        .is_err()
+    {
+        return false;
+    }
+    cx.activate(true);
+    true
+}
+
 fn load_tray_icon() -> Result<Icon, String> {
     let image = ImageReader::new(Cursor::new(TRAY_ICON_BYTES))
         .with_guessed_format()
@@ -325,37 +312,28 @@ fn load_tray_icon() -> Result<Icon, String> {
         .map_err(|error| format!("failed to load Vibex tray icon pixels: {error}"))
 }
 
-fn workbench_window_options(
-    application_id: String,
-    window_bounds: WindowBounds,
-    show: bool,
-    focus: bool,
-) -> WindowOptions {
+fn workbench_window_options(application_id: String, window_bounds: WindowBounds) -> WindowOptions {
     WindowOptions {
-        window_bounds: Some(normalized_window_bounds(window_bounds, show)),
+        window_bounds: Some(normalized_window_bounds(window_bounds)),
         titlebar: Some(TitleBar::title_bar_options()),
         app_id: Some(application_id),
         window_min_size: Some(size(px(MIN_WIDTH as f32), px(MIN_HEIGHT as f32))),
         window_decorations: Some(WindowDecorations::Client),
-        show,
-        focus,
         #[cfg(target_os = "linux")]
         window_background: WindowBackgroundAppearance::Transparent,
         ..Default::default()
     }
 }
 
-fn normalized_window_bounds(bounds: WindowBounds, preserve_window_state: bool) -> WindowBounds {
+fn normalized_window_bounds(bounds: WindowBounds) -> WindowBounds {
     let restore_bounds = bounds.get_bounds();
     if f32::from(restore_bounds.size.width) <= 0.0 || f32::from(restore_bounds.size.height) <= 0.0 {
         WindowBounds::Windowed(Bounds::new(
             restore_bounds.origin,
             size(px(DEFAULT_WIDTH as f32), px(DEFAULT_HEIGHT as f32)),
         ))
-    } else if preserve_window_state {
-        bounds
     } else {
-        WindowBounds::Windowed(restore_bounds)
+        bounds
     }
 }
 
@@ -364,13 +342,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn invalid_hidden_window_bounds_fall_back_to_the_desktop_default() {
+    fn invalid_restore_bounds_fall_back_to_the_desktop_default() {
         let bounds = WindowBounds::Windowed(Bounds::new(
             gpui::point(px(24.0), px(36.0)),
             size(px(0.0), px(0.0)),
         ));
 
-        let normalized = normalized_window_bounds(bounds, false);
+        let normalized = normalized_window_bounds(bounds);
 
         assert_eq!(
             normalized.get_bounds(),
@@ -382,16 +360,69 @@ mod tests {
     }
 
     #[test]
-    fn hidden_window_uses_restored_bounds_without_preserving_maximized_state() {
+    fn restored_window_preserves_maximized_state() {
         let restored = Bounds::new(gpui::point(px(40.0), px(60.0)), size(px(1280.0), px(820.0)));
 
         assert_eq!(
-            normalized_window_bounds(WindowBounds::Maximized(restored), false),
-            WindowBounds::Windowed(restored)
-        );
-        assert_eq!(
-            normalized_window_bounds(WindowBounds::Maximized(restored), true),
+            normalized_window_bounds(WindowBounds::Maximized(restored)),
             WindowBounds::Maximized(restored)
+        );
+    }
+
+    struct TrayWindowProbe;
+
+    impl gpui::Render for TrayWindowProbe {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            gpui::div()
+        }
+    }
+
+    #[gpui::test]
+    fn stale_visible_window_handle_does_not_block_restore(cx: &mut gpui::TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| cx.new(|_| TrayWindowProbe))
+                .expect("tray window probe should open")
+        });
+        let handle: AnyWindowHandle = window.into();
+
+        cx.update(|cx| {
+            assert!(activate_existing_window(handle, cx));
+            handle
+                .update(cx, |_, window, _| window.remove_window())
+                .expect("tray window probe should close");
+            assert!(!activate_existing_window(handle, cx));
+        });
+    }
+
+    #[gpui::test]
+    fn retained_workbench_entity_can_be_rehosted_after_its_window_closes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let workbench = cx.update(|cx| cx.new(|_| TrayWindowProbe));
+        let first_window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, _| workbench.clone())
+                .expect("first tray window probe should open")
+        });
+        cx.update(|cx| {
+            first_window
+                .update(cx, |_, window, _| window.remove_window())
+                .expect("first tray window probe should close");
+        });
+
+        let restored_window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, _| workbench.clone())
+                .expect("restored tray window probe should open")
+        });
+
+        assert_eq!(
+            restored_window
+                .entity(cx)
+                .expect("restored tray window probe should have a root"),
+            workbench
         );
     }
 }
