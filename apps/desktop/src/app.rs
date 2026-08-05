@@ -17341,11 +17341,7 @@ impl VibexWorkbench {
                 AGENT_TURN_PREVIEW_CARD_MIN_WIDTH,
                 AGENT_TURN_PREVIEW_CARD_MAX_WIDTH,
             );
-        let card_background = if is_dark {
-            muted.opacity(0.68)
-        } else {
-            popover.opacity(0.98)
-        };
+        let card_background = if is_dark { muted } else { popover };
         let empty_message = match locale {
             locale::ResolvedLocale::En => "Empty message",
             locale::ResolvedLocale::ZhCn => "空消息",
@@ -35718,6 +35714,9 @@ mod tests {
 
         assert!(renderer.contains("AGENT_TURN_PREVIEW_CARD_MAX_WIDTH"));
         assert!(renderer.contains(".rounded(px(14.0))"));
+        assert!(renderer.contains("let card_background = if is_dark { muted } else { popover };"));
+        assert!(!renderer.contains("muted.opacity(0.68)"));
+        assert!(!renderer.contains("popover.opacity(0.98)"));
         assert!(renderer.contains("agent_turn_preview_content("));
         assert!(renderer.contains("icons/vibex/file-code.svg"));
         assert!(renderer.contains("AGENT_TURN_PREVIEW_VISIBLE_FILE_COUNT"));
