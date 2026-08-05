@@ -2071,6 +2071,7 @@ struct AgentStreamingDeltaUpdate {
     sequence: i64,
     timestamp_ms: i64,
     text: String,
+    conclusion: bool,
     runtime_attribution: Option<String>,
 }
 
@@ -2099,9 +2100,7 @@ fn agent_streaming_delta_updates(
         let TimelinePayload::AgentMessageDelta(delta) = &event.item.payload else {
             return None;
         };
-        if delta.phase != Some(AgentMessagePhase::FinalAnswer)
-            || delta.text_delta.contains("Reconnecting... ")
-        {
+        if delta.text_delta.contains("Reconnecting... ") {
             return None;
         }
         updates.push(AgentStreamingDeltaUpdate {
@@ -2109,6 +2108,7 @@ fn agent_streaming_delta_updates(
             sequence: event.sequence,
             timestamp_ms: event.item.timestamp_ms,
             text: delta.text_delta.clone(),
+            conclusion: delta.phase == Some(AgentMessagePhase::FinalAnswer),
             runtime_attribution: event
                 .item
                 .execution_attribution
@@ -2125,8 +2125,21 @@ fn agent_streaming_delta_updates(
     }
     updates
         .windows(2)
-        .all(|pair| pair[1].sequence == pair[0].sequence.saturating_add(1))
+        .all(|pair| {
+            pair[1].sequence == pair[0].sequence.saturating_add(1)
+                && pair[1].conclusion == pair[0].conclusion
+        })
         .then_some(updates)
+}
+
+fn agent_text_append_batch(events: &[TimelineLiveEvent]) -> bool {
+    !events.is_empty()
+        && events.iter().all(|event| {
+            matches!(
+                &event.item.payload,
+                TimelinePayload::AgentMessageDelta(_) | TimelinePayload::AgentMessage(_)
+            )
+        })
 }
 
 fn record_timeline_row_endpoint(item_ids: &mut Vec<String>, item_id: String) {
@@ -2151,10 +2164,17 @@ fn append_agent_streaming_deltas_to_cache(
         return None;
     }
     let last_turn = cache.last()?;
-    let last_row = last_turn.conclusion_row.as_ref()?;
+    let conclusion = updates.first()?.conclusion;
+    let last_row = if conclusion {
+        last_turn.conclusion_row.as_ref()?
+    } else {
+        last_turn.process_rows.last()?
+    };
     if last_turn.complete
         || last_row.kind != TimelineRowKind::AgentMessage
         || !last_row.streaming
+        || last_row.conclusion != conclusion
+        || updates.iter().any(|update| update.conclusion != conclusion)
         || updates
             .iter()
             .any(|update| update.runtime_attribution != last_row.runtime_attribution)
@@ -2175,10 +2195,15 @@ fn append_agent_streaming_deltas_to_cache(
     let turns = Rc::make_mut(cache);
     let turn = Rc::make_mut(turns.last_mut().expect("cache was checked above"));
     let body_len = {
-        let row = turn
-            .conclusion_row
-            .as_mut()
-            .expect("streaming row was checked above");
+        let row = if conclusion {
+            turn.conclusion_row
+                .as_mut()
+                .expect("streaming conclusion row was checked above")
+        } else {
+            turn.process_rows
+                .last_mut()
+                .expect("streaming process row was checked above")
+        };
         for update in updates {
             row.body.push_str(&update.text);
             record_timeline_row_endpoint(&mut row.item_ids, update.item_id.clone());
@@ -2340,6 +2365,20 @@ fn timeline_should_auto_follow_content(
         && content_extent_changed
 }
 
+fn stable_streaming_timeline_height(
+    previous_height: Option<f32>,
+    measured_height: f32,
+    preserve_streaming_extent: bool,
+) -> f32 {
+    if preserve_streaming_extent {
+        previous_height
+            .unwrap_or(measured_height)
+            .max(measured_height)
+    } else {
+        measured_height
+    }
+}
+
 fn timeline_turn_duration_end(turn_complete: bool, ended_at_ms: Option<i64>) -> Option<i64> {
     turn_complete.then_some(ended_at_ms).flatten()
 }
@@ -2355,6 +2394,16 @@ fn timeline_turn_conclusion_row(turn: &TimelineConversationTurn) -> Option<&Time
     turn.conclusion_row
         .as_ref()
         .filter(|row| !row.body.trim().is_empty())
+}
+
+fn timeline_streaming_agent_row<'a>(
+    turn: &'a TimelineConversationTurn,
+    row_id: &str,
+) -> Option<&'a TimelineRow> {
+    turn.conclusion_row
+        .iter()
+        .chain(turn.process_rows.iter().rev())
+        .find(|row| row.id == row_id && row.kind == TimelineRowKind::AgentMessage && row.streaming)
 }
 
 fn show_agent_answer_actions(conversation_conclusion: bool, row: &TimelineRow) -> bool {
@@ -6114,6 +6163,12 @@ impl VibexWorkbench {
         let previous_end_sequence = self.timeline.authoritative_end_sequence;
         let updates_existing_item = previous_end_sequence
             .is_some_and(|end| events.iter().any(|event| event.sequence <= end));
+        let text_append_tail = (!updates_existing_item && agent_text_append_batch(&events))
+            .then(|| {
+                let turns = self.conversation_turns_cached();
+                turns.last().map(|turn| (turns.len(), turn.id.clone()))
+            })
+            .flatten();
         let streaming_updates = (!updates_existing_item)
             .then(|| agent_streaming_delta_updates(&events))
             .flatten();
@@ -6145,6 +6200,13 @@ impl VibexWorkbench {
             }
             let content_extent_changed = if let Some(update) = streaming_cache_update.as_ref() {
                 self.refresh_last_timeline_size_incrementally(update)
+            } else if let Some((previous_turn_count, previous_turn_id)) = text_append_tail.as_ref()
+            {
+                self.streaming_row_state = None;
+                self.preserve_last_timeline_size_after_text_append(
+                    *previous_turn_count,
+                    previous_turn_id,
+                )
             } else {
                 self.streaming_row_state = None;
                 self.refresh_last_timeline_size()
@@ -6302,6 +6364,42 @@ impl VibexWorkbench {
         true
     }
 
+    fn preserve_last_timeline_size_after_text_append(
+        &mut self,
+        previous_turn_count: usize,
+        previous_turn_id: &str,
+    ) -> bool {
+        let turns = self.conversation_turns_cached();
+        let Some(turn) = turns.last().cloned() else {
+            return self.rebuild_timeline_sizes();
+        };
+        if turns.len() != previous_turn_count
+            || turn.id != previous_turn_id
+            || self.timeline_row_sizes.len() != turns.len()
+        {
+            return self.refresh_last_timeline_size();
+        }
+        let Some(current_height) = self
+            .timeline_row_sizes
+            .last()
+            .map(|row_size| f32::from(row_size.height))
+        else {
+            return self.refresh_last_timeline_size();
+        };
+
+        // A text-only append may still change presentation structure, such as
+        // commentary transitioning into the final answer or a final message
+        // reconciling the streaming row. Keep the current virtual extent for
+        // this frame, but let the new rendered structure establish its next
+        // intrinsic measurement without an estimated-height detour.
+        self.invalidate_timeline_turn_measurement(&turn.id);
+        let process_expansion = self.timeline_process_expansion.get(&turn.id).copied();
+        let signature = self.timeline_turn_estimate_signature(&turn, process_expansion);
+        self.timeline_estimated_turn_heights
+            .insert(turn.id.clone(), (signature, current_height));
+        false
+    }
+
     fn refresh_last_timeline_size_incrementally(
         &mut self,
         update: &AgentStreamingCacheUpdate,
@@ -6309,7 +6407,7 @@ impl VibexWorkbench {
         let Some(turn) = self.conversation_turns_cache.last().cloned() else {
             return self.rebuild_timeline_sizes();
         };
-        let Some(row) = turn.conclusion_row.as_ref() else {
+        let Some(row) = timeline_streaming_agent_row(&turn, &update.row_id) else {
             return self.rebuild_timeline_sizes();
         };
         if turn.id != update.turn_id
@@ -6434,11 +6532,22 @@ impl VibexWorkbench {
             return;
         }
         let measured_height = measured_height.ceil().max(72.0);
-        if self
-            .timeline_measured_turn_heights
-            .get(&turn_id)
-            .is_some_and(|current| (current - measured_height).abs() < 1.0)
-        {
+        let previous_height = self.timeline_measured_turn_heights.get(&turn_id).copied();
+        let preserve_streaming_extent = self.streaming_row_state.as_ref().is_some_and(|state| {
+            state.turn_id == turn_id
+                && self
+                    .conversation_turns_cache
+                    .get(turn_index)
+                    .filter(|turn| turn.id == turn_id)
+                    .and_then(|turn| timeline_streaming_agent_row(turn, &state.row_id))
+                    .is_some_and(|row| row.body.len() == state.body_len)
+        });
+        let measured_height = stable_streaming_timeline_height(
+            previous_height,
+            measured_height,
+            preserve_streaming_extent,
+        );
+        if previous_height.is_some_and(|current| (current - measured_height).abs() < 1.0) {
             return;
         }
         self.timeline_measured_turn_heights
@@ -30802,7 +30911,7 @@ mod tests {
     }
 
     #[test]
-    fn commentary_delta_does_not_enter_the_conclusion_fast_path() {
+    fn commentary_delta_uses_the_process_streaming_fast_path() {
         let session_id = VibexSessionId::parse("session_commentary_delta").unwrap();
         let item = timeline_item_with_payload(
             &session_id,
@@ -30819,8 +30928,12 @@ mod tests {
             sequence: 1,
             item,
         };
+        let events = [event];
 
-        assert!(agent_streaming_delta_updates(&[event]).is_none());
+        assert!(agent_text_append_batch(&events));
+        let updates = agent_streaming_delta_updates(&events).unwrap();
+        assert_eq!(updates.len(), 1);
+        assert!(!updates[0].conclusion);
     }
 
     #[test]
@@ -30885,6 +30998,7 @@ mod tests {
             sequence: 5,
             timestamp_ms: 5,
             text: "ing".into(),
+            conclusion: true,
             runtime_attribution: None,
         }];
 
@@ -30903,6 +31017,7 @@ mod tests {
             sequence: 7,
             timestamp_ms: 7,
             text: "gap".into(),
+            conclusion: true,
             runtime_attribution: None,
         }];
         assert!(
@@ -30912,6 +31027,56 @@ mod tests {
             cache[1].conclusion_row.as_ref().unwrap().body,
             body_before_gap
         );
+    }
+
+    #[test]
+    fn pure_commentary_delta_updates_the_streaming_process_row() {
+        let session_id = VibexSessionId::parse("session_streaming_commentary_cache").unwrap();
+        let items = [
+            timeline_item_with_payload(
+                &session_id,
+                1,
+                TimelineSource::User,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "inspect".into(),
+                    attachments: Vec::new(),
+                }),
+            ),
+            timeline_item_with_payload(
+                &session_id,
+                2,
+                TimelineSource::Agent,
+                TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                    text_delta: "checking".into(),
+                    chunk_index: 0,
+                    phase: Some(AgentMessagePhase::Commentary),
+                }),
+            ),
+        ];
+        let turns = timeline_conversation_turns(&items, Some(AgentSessionState::Running), false);
+        let mut cache = Rc::new(turns.into_iter().map(Rc::new).collect());
+        let mut state_cache = None;
+        let updates = [AgentStreamingDeltaUpdate {
+            item_id: "timeline_commentary_3".into(),
+            sequence: 3,
+            timestamp_ms: 3,
+            text: " files".into(),
+            conclusion: false,
+            runtime_attribution: None,
+        }];
+
+        let update = append_agent_streaming_deltas_to_cache(&mut cache, &mut state_cache, &updates)
+            .expect("contiguous commentary should use the process-row fast path");
+        let turn = cache.last().unwrap();
+        assert!(turn.conclusion_row.is_none());
+        assert_eq!(turn.process_rows.last().unwrap().body, "checking files");
+        assert_eq!(
+            timeline_streaming_agent_row(turn, &update.row_id)
+                .unwrap()
+                .body,
+            "checking files"
+        );
+        assert_eq!(state_cache.as_ref().unwrap().row_id, update.row_id);
     }
 
     #[test]
@@ -33464,6 +33629,23 @@ mod tests {
         assert!(!timeline_should_auto_follow_content(
             true, false, false, false,
         ));
+    }
+
+    #[test]
+    fn append_only_streaming_measurements_do_not_shrink_the_turn() {
+        assert_eq!(stable_streaming_timeline_height(None, 180.0, true), 180.0);
+        assert_eq!(
+            stable_streaming_timeline_height(Some(220.0), 180.0, true),
+            220.0
+        );
+        assert_eq!(
+            stable_streaming_timeline_height(Some(220.0), 260.0, true),
+            260.0
+        );
+        assert_eq!(
+            stable_streaming_timeline_height(Some(220.0), 180.0, false),
+            180.0
+        );
     }
 
     #[test]

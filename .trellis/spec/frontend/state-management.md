@@ -82,10 +82,19 @@ and the non-shrinking card container.
 `MarkdownView` parses streaming input in the background, so the authoritative
 row body can be newer than the document currently laid out on screen. During the
 append-only Agent-message fast path, keep the virtual turn at its current extent
-and preserve any pending intrinsic measurement. Do not resize the virtual row
-from character counts or Markdown syntax in the newer source. Once the parser
-applies that source, the visible turn's prepaint measurement is the sole owner of
-the new extent, and bottom-follow scrolls against that measured extent once.
+and preserve any pending intrinsic measurement. This applies equally to a
+`FinalAnswer` conclusion row and to commentary or unknown-phase Agent text kept
+in process history. Do not resize the virtual row from character counts or
+Markdown syntax in the newer source.
+
+While the same streaming row remains active, intrinsic measurements may grow but
+must not shrink the turn: incomplete Markdown syntax can temporarily reparse into
+a shorter document and otherwise make bottom-follow bounce in both directions.
+A text-only event that changes presentation structure, such as commentary moving
+to the conclusion or the final message reconciling the stream, keeps the current
+virtual extent for that frame but invalidates the old intrinsic measurement. Once
+the new structure is laid out, prepaint owns its next extent and bottom-follow
+scrolls against that measured extent once.
 
 ```rust
 // Wrong: the virtual row expands before MarkdownView renders the new document,
@@ -94,12 +103,15 @@ virtual_height += estimate_height(delta);
 
 // Correct: source update -> background parse -> intrinsic measurement -> scroll.
 estimated_heights.insert(turn_id, (signature, current_virtual_height));
+measured_height = previous_measured_height.max(measured_height); // same streaming row only
 ```
 
 Regression coverage must assert that the streaming fast path neither clears
 pending turn heights nor invalidates a measured height, and does not mutate the
-virtual row-size vector. Non-stream structured events continue to use the full
-invalidation contract above.
+virtual row-size vector. Cover both conclusion and process-history Agent text,
+the non-shrinking same-row measurement rule, and the text-only structural
+transition path that bypasses estimated height. Non-text structured events
+continue to use the full invalidation contract above.
 
 When a new-session draft includes an initial message, await session creation
 only long enough to obtain the authoritative session record. Commit and select
