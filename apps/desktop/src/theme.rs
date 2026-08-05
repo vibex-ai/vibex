@@ -6,6 +6,7 @@ use gpui_component::{
     highlighter::{HighlightTheme, HighlightThemeStyle},
 };
 use vibex_desktop_model::{AppearanceUiState, ThemeMode};
+use vibex_markdown::apply_code_font_weight;
 use vibex_ui::{
     CODE_TYPOGRAPHY, DARK_HIGHLIGHT_THEME_JSON, DARK_TOKENS, GpuiColorToken, INTERFACE_TYPOGRAPHY,
     LIGHT_HIGHLIGHT_THEME_JSON, LIGHT_TOKENS, RADII, SHADOWS_ENABLED,
@@ -99,6 +100,7 @@ pub fn apply_appearance(appearance: &AppearanceUiState, window: Option<&mut Wind
         theme.sidebar_border = theme.border;
         theme.title_bar_border = theme.border;
     }
+    apply_code_font_weight(appearance.code_font.weight, cx);
 }
 
 pub(crate) fn semantic_color(name: &str, dark: bool) -> Hsla {

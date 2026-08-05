@@ -4,6 +4,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::typography::code_font_weight;
 use ::gpui::prelude::FluentBuilder as _;
 use ::gpui::{
     AnyElement, App, AppContext as _, AvailableSpace, Bounds, ClipboardItem, Context, Element,
@@ -1877,21 +1878,21 @@ impl MarkdownViewState {
             } => {
                 let anchor = self.anchors.get(&block.id).cloned();
                 let size = match level {
-                    1 => 24.0,
-                    2 => 21.0,
-                    3 => 18.0,
-                    4 => 16.0,
-                    5 => 15.0,
-                    _ => 14.0,
+                    1 => 1.714,
+                    2 => 1.5,
+                    3 => 1.286,
+                    4 => 1.143,
+                    5 => 1.071,
+                    _ => 1.0,
                 };
                 div()
                     .id(format!("markdown-heading:{slug}"))
                     .w_full()
                     .min_w_0()
                     .anchor_scroll(anchor)
-                    .text_size(px(size))
+                    .text_size(gpui::rems(size))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .line_height(px(size + 8.0))
+                    .line_height(gpui::relative(1.35))
                     .child(self.render_inlines(content, window, cx))
                     .into_any_element()
             }
@@ -2506,6 +2507,7 @@ impl MarkdownViewState {
                     .bg(cx.theme().muted)
                     .font_family(cx.theme().mono_font_family.clone())
                     .text_size(cx.theme().mono_font_size)
+                    .font_weight(code_font_weight(cx))
                     .child(text)
                     .into_any_element()
             }
@@ -2527,6 +2529,7 @@ impl MarkdownViewState {
                 .border_color(cx.theme().border)
                 .bg(cx.theme().background)
                 .font_family(cx.theme().mono_font_family.clone())
+                .font_weight(code_font_weight(cx))
                 .text_xs()
                 .shadow_xs()
                 .children(
@@ -2818,6 +2821,7 @@ impl MarkdownViewState {
                     .p_3()
                     .font_family(cx.theme().mono_font_family.clone())
                     .text_size(cx.theme().mono_font_size)
+                    .font_weight(code_font_weight(cx))
                     .line_height(px(f32::from(cx.theme().mono_font_size) + 6.0))
                     .child(source_text),
             )
@@ -2901,6 +2905,7 @@ impl MarkdownViewState {
                     .text_color(foreground)
                     .font_family(cx.theme().mono_font_family.clone())
                     .text_size(cx.theme().mono_font_size)
+                    .font_weight(code_font_weight(cx))
                     .child(text),
             );
         }
@@ -3087,6 +3092,7 @@ impl MarkdownViewState {
             .min_w_0()
             .font_family(cx.theme().mono_font_family.clone())
             .text_size(cx.theme().mono_font_size)
+            .font_weight(code_font_weight(cx))
             .text_color(cx.theme().muted_foreground)
             .child(source)
             .into_any_element()
@@ -3890,7 +3896,10 @@ mod tests {
                 heading_heights.windows(2).all(|pair| pair[0] > pair[1]),
                 "heading line heights must descend by level: {heading_heights:?}"
             );
-            assert_eq!(heading_heights[5], line_height("BodyText"));
+            assert!(
+                (heading_heights[5] - line_height("BodyText")).abs() <= 1.0,
+                "level-six heading and body text should share the base size after pixel rounding"
+            );
         });
     }
 

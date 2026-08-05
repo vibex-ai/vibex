@@ -104,7 +104,8 @@ use vibex_desktop_runtime::{
 };
 use vibex_markdown::{
     MarkdownInput, MarkdownLimits, MarkdownPresentation, MarkdownSurface, MarkdownView,
-    ResolvedResource, ResourceKind, parse_markdown_with_limits, utf8_prefix,
+    ResolvedResource, ResourceKind, apply_code_font_weight, code_font_weight,
+    parse_markdown_with_limits, utf8_prefix,
 };
 use vibex_ui::{
     AgentFileGitController, ElicitationFormDraft, ManagementWorkflowCapabilities,
@@ -1039,7 +1040,7 @@ fn render_composer_plan_details(
                         .flex_1()
                         .whitespace_normal()
                         .text_sm()
-                        .line_height(px(20.0))
+                        .line_height(gpui::relative(1.5))
                         .text_color(if step.status == PlanStepStatus::Pending {
                             cx.theme().muted_foreground
                         } else {
@@ -13811,6 +13812,11 @@ impl VibexWorkbench {
             900,
         );
         Theme::global_mut(cx).font_size = px(self.ui_state.appearance.interface_font.size as f32);
+        apply_code_font_weight(self.ui_state.appearance.code_font.weight, cx);
+        self.timeline_measured_turn_heights.clear();
+        self.timeline_pending_turn_heights.clear();
+        self.timeline_estimated_turn_heights.clear();
+        self.rebuild_timeline_sizes();
         self.queue_ui_state();
         cx.notify();
     }
@@ -13825,6 +13831,11 @@ impl VibexWorkbench {
             900,
         );
         Theme::global_mut(cx).mono_font_size = px(self.ui_state.appearance.code_font.size as f32);
+        apply_code_font_weight(self.ui_state.appearance.code_font.weight, cx);
+        self.timeline_measured_turn_heights.clear();
+        self.timeline_pending_turn_heights.clear();
+        self.timeline_estimated_turn_heights.clear();
+        self.rebuild_timeline_sizes();
         let code_family = self
             .ui_state
             .appearance
@@ -14367,7 +14378,7 @@ impl VibexWorkbench {
                     .pt_3()
                     .child(
                         div()
-                            .text_size(px(12.0))
+                            .text_sm()
                             .font_medium()
                             .text_color(cx.theme().sidebar_foreground.opacity(0.52))
                             .child(strings.sidebar_projects),
@@ -14525,7 +14536,7 @@ impl VibexWorkbench {
                                 .items_center()
                                 .justify_between()
                                 .gap_2()
-                                .text_size(px(11.0))
+                                .text_xs()
                                 .font_medium()
                                 .text_color(cx.theme().sidebar_foreground.opacity(0.60))
                                 .child(selected_count_label.clone())
@@ -14593,7 +14604,7 @@ impl VibexWorkbench {
                                 .border_color(cx.theme().sidebar_border.opacity(0.70))
                                 .bg(cx.theme().background.opacity(0.30))
                                 .p_3()
-                                .text_size(px(13.0))
+                                .text_sm()
                                 .text_color(cx.theme().sidebar_foreground.opacity(0.55))
                                 .child(strings.sidebar_no_matching_sessions),
                         )
@@ -14708,7 +14719,7 @@ impl VibexWorkbench {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(13.0))
+                            .text_sm()
                             .font_semibold()
                             .child(project_name.clone()),
                     ),
@@ -15033,7 +15044,7 @@ impl VibexWorkbench {
                                 div()
                                     .min_w_0()
                                     .truncate()
-                                    .text_size(px(12.0))
+                                    .text_sm()
                                     .font_medium()
                                     .child(branch),
                             )
@@ -15041,7 +15052,7 @@ impl VibexWorkbench {
                                 h_flex()
                                     .min_w_0()
                                     .gap(px(5.0))
-                                    .text_size(px(10.0))
+                                    .text_xs()
                                     .text_color(cx.theme().sidebar_foreground.opacity(0.48))
                                     .child(identity)
                                     .when(dirty, |this| {
@@ -15269,7 +15280,7 @@ impl VibexWorkbench {
                             .pt_1()
                             .pl(px(22.0))
                             .pr_1()
-                            .text_size(px(11.0))
+                            .text_xs()
                             .text_color(cx.theme().danger)
                             .child(locale::localize_error_message(&error)),
                     )
@@ -15508,7 +15519,7 @@ impl VibexWorkbench {
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .text_size(px(13.0))
+                                    .text_sm()
                                     .when(selected, |this| this.font_medium())
                                     .child(session.title.clone()),
                             ),
@@ -15520,7 +15531,7 @@ impl VibexWorkbench {
                             .items_center()
                             .justify_end()
                             .gap(px(6.0))
-                            .text_size(px(12.0))
+                            .text_sm()
                             .text_color(cx.theme().sidebar_foreground.opacity(0.48))
                             .when(!self.sidebar_batch_mode, |this| {
                                 this.group_hover(&hover_group, |style| style.invisible())
@@ -15553,7 +15564,7 @@ impl VibexWorkbench {
                                             .flex_none()
                                             .rounded(px(4.0))
                                             .px(px(6.0))
-                                            .text_size(px(10.0))
+                                            .text_xs()
                                             .bg(cx.theme().secondary)
                                             .text_color(cx.theme().muted_foreground)
                                             .child(label),
@@ -17043,7 +17054,7 @@ impl VibexWorkbench {
                         div()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(11.0))
+                            .text_xs()
                             .text_color(muted_foreground)
                             .child(format!(
                                 "{}: {branch_preview}",
@@ -17081,7 +17092,7 @@ impl VibexWorkbench {
                     .child(
                         div()
                             .min_w_0()
-                            .text_size(px(11.0))
+                            .text_xs()
                             .text_color(if custom_path_invalid {
                                 cx.theme().danger
                             } else {
@@ -17169,7 +17180,7 @@ impl VibexWorkbench {
                         h_flex()
                             .min_w_0()
                             .gap_1()
-                            .text_size(px(11.0))
+                            .text_xs()
                             .text_color(muted_foreground)
                             .child(div().min_w_0().flex_1().child(reason))
                             .when(self.new_session_eligibility_error.is_some(), |this| {
@@ -17723,8 +17734,8 @@ impl VibexWorkbench {
                             .gap(px(12.0))
                             .pt(px(2.0))
                             .overflow_hidden()
-                            .text_size(px(11.5))
-                            .line_height(px(16.0))
+                            .text_xs()
+                            .line_height(gpui::relative(1.45))
                             .text_color(muted_foreground)
                             .children(file_items)
                             .when(remaining_file_count > 0, |this| {
@@ -17757,8 +17768,8 @@ impl VibexWorkbench {
                                 .min_w_0()
                                 .overflow_hidden()
                                 .line_clamp(1)
-                                .text_size(px(13.0))
-                                .line_height(px(18.0))
+                                .text_sm()
+                                .line_height(gpui::relative(1.4))
                                 .font_weight(FontWeight(550.0))
                                 .child(content.title.clone()),
                         )
@@ -17769,8 +17780,8 @@ impl VibexWorkbench {
                                 .overflow_hidden()
                                 .whitespace_normal()
                                 .line_clamp(3)
-                                .text_size(px(13.0))
-                                .line_height(px(20.0))
+                                .text_sm()
+                                .line_height(gpui::relative(1.5))
                                 .text_color(muted_foreground)
                                 .child(content.message.clone()),
                         )
@@ -19437,7 +19448,7 @@ impl VibexWorkbench {
                         .border_color(cx.theme().border)
                         .bg(cx.theme().muted)
                         .px(px(7.0))
-                        .text_size(px(13.0))
+                        .text_sm()
                         .font_weight(FontWeight(600.0))
                         .text_color(cx.theme().foreground)
                         .role(Role::Button)
@@ -19744,7 +19755,7 @@ impl VibexWorkbench {
                 div()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(10.88))
+                    .text_xs()
                     .text_color(cx.theme().muted_foreground.opacity(0.80))
                     .child(attribution.clone())
                     .into_any_element()
@@ -19964,7 +19975,7 @@ impl VibexWorkbench {
                 .min_w_0()
                 .max_w(px(120.0))
                 .truncate()
-                .text_size(px(10.88))
+                .text_xs()
                 .text_color(text_color)
                 .child(agent_label)
                 .into_any_element()
@@ -19972,7 +19983,7 @@ impl VibexWorkbench {
         let runtime = div()
             .min_w_0()
             .truncate()
-            .text_size(px(10.88))
+            .text_xs()
             .text_color(text_color)
             .child(runtime_label)
             .into_any_element();
@@ -20763,7 +20774,7 @@ impl VibexWorkbench {
                             h_flex()
                                 .items_center()
                                 .gap_2()
-                                .text_size(px(10.88))
+                                .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .opacity(0.0)
                                 .group_hover(hover_group, |style| style.opacity(1.0))
@@ -20913,7 +20924,7 @@ impl VibexWorkbench {
                     AgentAnswerAction::Timestamp => timestamp.map(|timestamp| {
                         div()
                             .ml_1()
-                            .text_size(px(10.88))
+                            .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .opacity(0.0)
                             .group_hover(hover_group.clone(), |style| style.opacity(1.0))
@@ -21303,6 +21314,7 @@ impl VibexWorkbench {
                             .truncate()
                             .font_family(cx.theme().mono_font_family.clone())
                             .text_size(cx.theme().mono_font_size)
+                            .font_weight(code_font_weight(cx))
                             .child(command_title),
                     )
                     .child(Self::render_process_status_badge(
@@ -21355,6 +21367,7 @@ impl VibexWorkbench {
                                             .min_w_0()
                                             .truncate()
                                             .font_family(cx.theme().mono_font_family.clone())
+                                            .font_weight(code_font_weight(cx))
                                             .child(cwd),
                                     ),
                             )
@@ -21479,6 +21492,7 @@ impl VibexWorkbench {
                                 .flex_none()
                                 .text_xs()
                                 .font_family(cx.theme().mono_font_family.clone())
+                                .font_weight(code_font_weight(cx))
                                 .text_color(cx.theme().danger)
                                 .child(format!("-{}", preview.removed_lines)),
                         )
@@ -21489,6 +21503,7 @@ impl VibexWorkbench {
                                 .flex_none()
                                 .text_xs()
                                 .font_family(cx.theme().mono_font_family.clone())
+                                .font_weight(code_font_weight(cx))
                                 .text_color(cx.theme().success)
                                 .child(format!("+{}", preview.added_lines)),
                         )
@@ -21580,7 +21595,8 @@ impl VibexWorkbench {
                     .px_2()
                     .font_family(cx.theme().mono_font_family.clone())
                     .text_size(cx.theme().mono_font_size)
-                    .line_height(px(20.0))
+                    .font_weight(code_font_weight(cx))
+                    .line_height(gpui::relative(1.5))
                     .text_color(foreground)
                     .child(div().w(px(18.0)).flex_none().child(prefix))
                     .child(div().whitespace_nowrap().child(line.text.clone()))
@@ -21823,14 +21839,14 @@ impl VibexWorkbench {
                     div()
                         .min_w_0()
                         .text_sm()
-                        .line_height(px(24.0))
+                        .line_height(gpui::relative(1.5))
                         .text_color(tone)
                         .child(highlighted_message),
                 )
                 .when_some(timestamp, |this, timestamp| {
                     this.child(
                         div()
-                            .text_size(px(10.88))
+                            .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .opacity(0.0)
                             .group_hover(hover_group, |style| style.opacity(1.0))
@@ -21861,8 +21877,8 @@ impl VibexWorkbench {
             .bg(tone.opacity(0.10))
             .px_3()
             .py_2()
-            .text_size(px(12.0))
-            .line_height(px(20.0))
+            .text_sm()
+            .line_height(gpui::relative(1.5))
             .text_color(tone)
             .child(
                 h_flex()
@@ -21926,7 +21942,7 @@ impl VibexWorkbench {
             .items_center()
             .rounded_full()
             .px_2()
-            .text_size(px(10.0))
+            .text_xs()
             .font_medium()
             .child(label.to_uppercase());
         if failed {
@@ -21961,7 +21977,8 @@ impl VibexWorkbench {
             .py_2()
             .font_family(cx.theme().mono_font_family.clone())
             .text_size(cx.theme().mono_font_size)
-            .line_height(px(20.0))
+            .font_weight(code_font_weight(cx))
+            .line_height(gpui::relative(1.5))
             .text_color(cx.theme().foreground)
             .child(value)
             .into_any_element()
@@ -21973,7 +21990,7 @@ impl VibexWorkbench {
             .child(
                 div()
                     .mb_1()
-                    .text_size(px(10.88))
+                    .text_xs()
                     .font_medium()
                     .text_color(cx.theme().muted_foreground)
                     .child(label.to_uppercase()),
@@ -22042,7 +22059,7 @@ impl VibexWorkbench {
                             .when_some(option.description.clone(), |this, description| {
                                 this.child(
                                     div()
-                                        .text_size(px(11.0))
+                                        .text_xs()
                                         .text_color(cx.theme().muted_foreground)
                                         .child(description),
                                 )
@@ -22127,7 +22144,7 @@ impl VibexWorkbench {
                             .when_some(option.description.clone(), |this, description| {
                                 this.child(
                                     div()
-                                        .text_size(px(11.0))
+                                        .text_xs()
                                         .text_color(cx.theme().muted_foreground)
                                         .child(description),
                                 )
@@ -22162,8 +22179,8 @@ impl VibexWorkbench {
             .when_some(field.description.clone(), |this, description| {
                 this.child(
                     div()
-                        .text_size(px(11.0))
-                        .line_height(px(18.0))
+                        .text_xs()
+                        .line_height(gpui::relative(1.5))
                         .text_color(cx.theme().muted_foreground)
                         .child(description),
                 )
@@ -22242,7 +22259,7 @@ impl VibexWorkbench {
                     .child(
                         div()
                             .text_sm()
-                            .line_height(px(20.0))
+                            .line_height(gpui::relative(1.5))
                             .child(request.message.clone()),
                     )
                     .when_some(request.description.clone(), |this, description| {
@@ -22250,7 +22267,7 @@ impl VibexWorkbench {
                             this.child(
                                 div()
                                     .text_sm()
-                                    .line_height(px(20.0))
+                                    .line_height(gpui::relative(1.5))
                                     .text_color(cx.theme().muted_foreground)
                                     .child(description),
                             )
@@ -22388,8 +22405,8 @@ impl VibexWorkbench {
                 cx.theme().border
             })
             .bg(card_bg.opacity(0.72))
-            .text_size(px(12.0))
-            .line_height(px(20.0))
+            .text_sm()
+            .line_height(gpui::relative(1.5))
             .child(
                 h_flex()
                     .w_full()
@@ -22633,7 +22650,7 @@ impl VibexWorkbench {
                             .border_color(cx.theme().border)
                             .bg(cx.theme().muted)
                             .px(px(7.0))
-                            .text_size(px(13.0))
+                            .text_sm()
                             .font_weight(FontWeight(600.0))
                             .text_color(cx.theme().foreground)
                             .role(Role::Button)
@@ -22790,7 +22807,7 @@ impl VibexWorkbench {
                             .border_1()
                             .border_color(cx.theme().primary.opacity(0.24))
                             .bg(cx.theme().primary.opacity(0.14))
-                            .text_size(px(14.0))
+                            .text_base()
                             .font_weight(FontWeight(800.0))
                             .text_color(cx.theme().primary)
                             .child(command_trigger_symbol(entry.trigger)),
@@ -22824,7 +22841,7 @@ impl VibexWorkbench {
                             .border_color(cx.theme().border)
                             .px(px(7.0))
                             .py(px(2.0))
-                            .text_size(px(11.0))
+                            .text_xs()
                             .font_weight(FontWeight(700.0))
                             .text_color(cx.theme().muted_foreground)
                             .child(source_label.to_ascii_uppercase()),
@@ -26425,7 +26442,7 @@ fn sidebar_empty_sessions(strings: Strings, cx: &App) -> AnyElement {
         .h(px(28.0))
         .items_center()
         .gap_2()
-        .text_size(px(13.0))
+        .text_sm()
         .text_color(cx.theme().sidebar_foreground.opacity(0.45))
         .child(sidebar_icon("icons/vibex/message-square.svg").size(px(14.0)))
         .child(strings.sidebar_no_sessions)
@@ -28905,7 +28922,7 @@ impl RightRailPluginManager {
                     )
                     .child(
                         div()
-                            .text_size(px(11.0))
+                            .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child(text.locked_description),
                     ),
@@ -28918,7 +28935,7 @@ impl RightRailPluginManager {
                     .border_color(cx.theme().border)
                     .px_2()
                     .py(px(1.0))
-                    .text_size(px(11.0))
+                    .text_xs()
                     .child(text.system_plugin),
             )
             .into_any_element()
@@ -28947,7 +28964,7 @@ impl RightRailPluginManager {
                     .child(
                         div()
                             .truncate()
-                            .text_size(px(11.0))
+                            .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child(plugin.url.clone().unwrap_or_default()),
                     ),
@@ -29641,7 +29658,7 @@ impl ExternalImportDialog {
                 .bg(cx.theme().secondary)
                 .px_2()
                 .py(px(1.0))
-                .text_size(px(11.0))
+                .text_xs()
                 .child(label)
                 .into_any_element()
         };
@@ -29653,7 +29670,7 @@ impl ExternalImportDialog {
                 .border_color(cx.theme().border)
                 .px_2()
                 .py(px(1.0))
-                .text_size(px(11.0))
+                .text_xs()
                 .child(label)
                 .into_any_element()
         };
@@ -31442,7 +31459,7 @@ fn render_user_message_bubble(
         .px(px(14.0))
         .py(px(10.0))
         .text_sm()
-        .line_height(px(24.0))
+        .line_height(gpui::relative(1.5))
         .shadow_sm()
         .text_color(foreground)
         .child(body)

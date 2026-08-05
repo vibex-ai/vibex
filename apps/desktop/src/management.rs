@@ -46,6 +46,7 @@ use vibex_desktop_runtime::{
     DesktopRuntime, ManagementHandle, RuntimeOptionRefreshResult, RuntimeOptionSnapshotSummary,
     validate_external_open_url,
 };
+use vibex_markdown::code_font_weight;
 use vibex_ui::{AgentProviderBindingEditorState, ProjectionCredentialSurface};
 
 use crate::assets::agent_brand_icon;
@@ -4930,7 +4931,7 @@ impl ManagementCenter {
                 .justify_center()
                 .when(status_missing, |indicator| {
                     indicator
-                        .text_size(px(13.0))
+                        .text_sm()
                         .font_bold()
                         .text_color(cx.theme().danger)
                         .child("!")
@@ -6862,6 +6863,7 @@ impl ManagementCenter {
                                 .truncate()
                                 .text_xs()
                                 .font_family(cx.theme().mono_font_family.clone())
+                                .font_weight(code_font_weight(cx))
                                 .text_color(cx.theme().muted_foreground)
                                 .child(profile.id.clone()),
                         ),
@@ -8439,6 +8441,7 @@ impl ManagementCenter {
                                 .p_2()
                                 .text_xs()
                                 .font_family(cx.theme().mono_font_family.clone())
+                                .font_weight(code_font_weight(cx))
                                 .child(preview_text),
                         ),
                 );
@@ -11679,7 +11682,7 @@ fn management_profile_glyph(label: &str, is_default: bool, cx: &App) -> AnyEleme
         } else {
             cx.theme().muted.opacity(0.35)
         })
-        .text_size(px(11.0))
+        .text_xs()
         .font_medium()
         .text_color(if is_default {
             cx.theme().primary
@@ -11699,7 +11702,7 @@ fn management_status_badge(label: String, cx: &App) -> AnyElement {
         .bg(cx.theme().muted.opacity(0.25))
         .px_1p5()
         .py(px(1.0))
-        .text_size(px(10.0))
+        .text_xs()
         .text_color(cx.theme().muted_foreground)
         .child(label)
         .into_any_element()
@@ -11729,6 +11732,7 @@ fn management_projection_detail_row(
                 .text_right()
                 .text_xs()
                 .font_family(cx.theme().mono_font_family.clone())
+                .font_weight(code_font_weight(cx))
                 .text_color(cx.theme().foreground)
                 .child(value.into()),
         )

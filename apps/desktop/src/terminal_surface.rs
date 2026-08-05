@@ -30,13 +30,17 @@ use vibex_core::{
     TerminalCreateRequest, TerminalId, TerminalSession, TerminalStatus, TerminalSwitchShellRequest,
     WorkspaceId,
 };
+use vibex_markdown::code_font_weight;
 use vibex_terminal::{
     TerminalCellColor, TerminalCellSnapshot, TerminalCursorShape, TerminalFrameSnapshot,
     TerminalGridPoint, TerminalManager,
 };
 
-const TERMINAL_CELL_WIDTH: f32 = 8.0;
-const TERMINAL_CELL_HEIGHT: f32 = 16.0;
+const TERMINAL_BASE_FONT_SIZE: f32 = 13.0;
+const TERMINAL_BASE_CELL_WIDTH: f32 = 8.0;
+const TERMINAL_BASE_CELL_HEIGHT: f32 = 16.0;
+const TERMINAL_MIN_FONT_SIZE: f32 = 10.0;
+const TERMINAL_MAX_FONT_SIZE: f32 = 24.0;
 const TERMINAL_HORIZONTAL_PADDING: f32 = 12.0;
 const TERMINAL_VERTICAL_PADDING: f32 = 12.0;
 // Tauri preview terminals use `p-2`, while the Composer surface has another
@@ -170,6 +174,7 @@ pub struct TerminalSurface {
     selection_text: Option<String>,
     active_hyperlink: Option<String>,
     focus: FocusHandle,
+    cell_metrics: TerminalCellMetrics,
     resize: TerminalResizeCoordinator,
     resize_task: Option<Task<()>>,
     last_grid_bounds: Option<(String, u32, u32)>,
@@ -352,7 +357,8 @@ impl TerminalSurface {
                 cx.notify();
             }
         });
-        let resize = terminal_resize_coordinator(mode);
+        let cell_metrics = terminal_cell_metrics(f32::from(cx.theme().mono_font_size), mode);
+        let resize = TerminalResizeCoordinator::new(cell_metrics);
         let owned_terminal_ids = if owns_initial_sessions {
             tabs.iter()
                 .map(|tab| tab.session.id.as_str().to_string())
@@ -375,6 +381,7 @@ impl TerminalSurface {
             selection_text: None,
             active_hyperlink: None,
             focus,
+            cell_metrics,
             resize,
             resize_task: None,
             last_grid_bounds: None,
@@ -698,6 +705,13 @@ impl TerminalSurface {
         if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
             return;
         }
+        let cell_metrics = terminal_cell_metrics(f32::from(cx.theme().mono_font_size), self.mode);
+        if self.cell_metrics != cell_metrics {
+            self.cell_metrics = cell_metrics;
+            self.resize = TerminalResizeCoordinator::new(cell_metrics);
+            self.resize_task = None;
+            self.last_grid_bounds = None;
+        }
         let bounds = (
             terminal_id.as_str().to_string(),
             width.round().max(1.0) as u32,
@@ -711,7 +725,7 @@ impl TerminalSurface {
             .as_ref()
             .is_some_and(|(previous_id, _, _)| previous_id != terminal_id.as_str())
         {
-            self.resize = terminal_resize_coordinator(self.mode);
+            self.resize = TerminalResizeCoordinator::new(self.cell_metrics);
         }
         self.last_grid_bounds = Some(bounds);
         let _ = self.resize.observe(terminal_id.clone(), width, height);
@@ -1164,9 +1178,10 @@ impl TerminalSurface {
     }
 
     fn on_scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let cell_metrics = terminal_cell_metrics(f32::from(cx.theme().mono_font_size), self.mode);
         let y = match event.delta {
             ScrollDelta::Lines(point) => point.y,
-            ScrollDelta::Pixels(point) => f32::from(point.y) / TERMINAL_CELL_HEIGHT,
+            ScrollDelta::Pixels(point) => f32::from(point.y) / cell_metrics.cell_height,
         };
         if y == 0.0 {
             return;
@@ -1486,6 +1501,7 @@ impl TerminalSurface {
         let marked_text = self.marked_text.clone();
         let horizontal_padding = self.horizontal_padding();
         let vertical_padding = self.vertical_padding();
+        let cell_metrics = terminal_cell_metrics(f32::from(cx.theme().mono_font_size), self.mode);
         let mut cells = vec![None; usize::from(rows).saturating_mul(usize::from(columns))];
         for cell in tab.frame.cells() {
             let index = usize::from(cell.row)
@@ -1507,6 +1523,7 @@ impl TerminalSurface {
             .py(px(vertical_padding))
             .font_family(cx.theme().mono_font_family.clone())
             .text_size(cx.theme().mono_font_size)
+            .font_weight(code_font_weight(cx))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .on_mouse_down(
                 MouseButton::Left,
@@ -1516,7 +1533,7 @@ impl TerminalSurface {
             )
             .children((0..rows).map(|row| {
                 h_flex()
-                    .h(px(TERMINAL_CELL_HEIGHT))
+                    .h(px(cell_metrics.cell_height))
                     .flex_none()
                     .overflow_hidden()
                     .children((0..columns).map(|column| {
@@ -1524,7 +1541,13 @@ impl TerminalSurface {
                         let index = usize::from(row)
                             .saturating_mul(usize::from(columns))
                             .saturating_add(usize::from(column));
-                        self.render_cell(point, cells.get(index).cloned().flatten(), cursor, cx)
+                        self.render_cell(
+                            point,
+                            cells.get(index).cloned().flatten(),
+                            cursor,
+                            cell_metrics,
+                            cx,
+                        )
                     }))
             }))
             .when_some(cursor.zip(marked_text), |grid, (cursor, marked_text)| {
@@ -1532,13 +1555,13 @@ impl TerminalSurface {
                     div()
                         .absolute()
                         .left(px(
-                            horizontal_padding + f32::from(cursor.column) * TERMINAL_CELL_WIDTH
+                            horizontal_padding + f32::from(cursor.column) * cell_metrics.cell_width
                         ))
                         .top(px(
-                            vertical_padding + f32::from(cursor.row) * TERMINAL_CELL_HEIGHT
+                            vertical_padding + f32::from(cursor.row) * cell_metrics.cell_height
                         ))
-                        .min_w(px(TERMINAL_CELL_WIDTH))
-                        .h(px(TERMINAL_CELL_HEIGHT))
+                        .min_w(px(cell_metrics.cell_width))
+                        .h(px(cell_metrics.cell_height))
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .bg(cx.theme().background)
@@ -1575,13 +1598,14 @@ impl TerminalSurface {
         point: TerminalGridPoint,
         cell: Option<TerminalCellSnapshot>,
         cursor: Option<vibex_terminal::TerminalCursorSnapshot>,
+        cell_metrics: TerminalCellMetrics,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let cell = cell.unwrap_or_else(|| empty_cell(point));
         if cell.wide_spacer {
             return div()
                 .w_0()
-                .h(px(TERMINAL_CELL_HEIGHT))
+                .h(px(cell_metrics.cell_height))
                 .flex_none()
                 .into_any_element();
         }
@@ -1619,11 +1643,11 @@ impl TerminalSurface {
         div()
             .id(format!("terminal-cell-{}-{}", point.row, point.column))
             .w(px(if cell.wide {
-                TERMINAL_CELL_WIDTH * 2.0
+                cell_metrics.cell_width * 2.0
             } else {
-                TERMINAL_CELL_WIDTH
+                cell_metrics.cell_width
             }))
-            .h(px(TERMINAL_CELL_HEIGHT))
+            .h(px(cell_metrics.cell_height))
             .flex_none()
             .overflow_hidden()
             .bg(background)
@@ -1741,7 +1765,7 @@ impl EntityInputHandler for TerminalSurface {
         range_utf16: Range<usize>,
         element_bounds: Bounds<Pixels>,
         _: &mut Window,
-        _: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let cursor = self
             .active_tab
@@ -1750,15 +1774,19 @@ impl EntityInputHandler for TerminalSurface {
             .cursor()?;
         let start = range_utf16.start as f32;
         let width = range_utf16.end.saturating_sub(range_utf16.start).max(1) as f32;
+        let cell_metrics = terminal_cell_metrics(f32::from(cx.theme().mono_font_size), self.mode);
         Some(Bounds::new(
             point(
                 element_bounds.left()
                     + px(self.horizontal_padding()
-                        + (f32::from(cursor.column) + start) * TERMINAL_CELL_WIDTH),
+                        + (f32::from(cursor.column) + start) * cell_metrics.cell_width),
                 element_bounds.top()
-                    + px(self.vertical_padding() + f32::from(cursor.row) * TERMINAL_CELL_HEIGHT),
+                    + px(self.vertical_padding() + f32::from(cursor.row) * cell_metrics.cell_height),
             ),
-            size(px(width * TERMINAL_CELL_WIDTH), px(TERMINAL_CELL_HEIGHT)),
+            size(
+                px(width * cell_metrics.cell_width),
+                px(cell_metrics.cell_height),
+            ),
         ))
     }
 
@@ -1874,13 +1902,19 @@ fn empty_cell(point: TerminalGridPoint) -> TerminalCellSnapshot {
     }
 }
 
-fn terminal_resize_coordinator(mode: TerminalSurfaceMode) -> TerminalResizeCoordinator {
-    TerminalResizeCoordinator::new(TerminalCellMetrics {
-        cell_width: TERMINAL_CELL_WIDTH,
-        cell_height: TERMINAL_CELL_HEIGHT,
+fn terminal_cell_metrics(code_font_size: f32, mode: TerminalSurfaceMode) -> TerminalCellMetrics {
+    let code_font_size = if code_font_size.is_finite() {
+        code_font_size.clamp(TERMINAL_MIN_FONT_SIZE, TERMINAL_MAX_FONT_SIZE)
+    } else {
+        TERMINAL_BASE_FONT_SIZE
+    };
+    let scale = code_font_size / TERMINAL_BASE_FONT_SIZE;
+    TerminalCellMetrics {
+        cell_width: TERMINAL_BASE_CELL_WIDTH * scale,
+        cell_height: TERMINAL_BASE_CELL_HEIGHT * scale,
         horizontal_padding: mode.horizontal_padding(),
         vertical_padding: mode.vertical_padding(),
-    })
+    }
 }
 
 fn terminal_color(
@@ -2045,6 +2079,28 @@ mod tests {
     }
 
     #[test]
+    fn terminal_cell_metrics_follow_clamped_code_font_size() {
+        let default = terminal_cell_metrics(13.0, TerminalSurfaceMode::Standalone);
+        assert_eq!(default.cell_width, 8.0);
+        assert_eq!(default.cell_height, 16.0);
+
+        let minimum = terminal_cell_metrics(1.0, TerminalSurfaceMode::Preview);
+        assert_eq!(minimum.cell_width, 80.0 / 13.0);
+        assert_eq!(minimum.cell_height, 160.0 / 13.0);
+        assert_eq!(minimum.horizontal_padding, PREVIEW_TERMINAL_PADDING);
+
+        let maximum = terminal_cell_metrics(100.0, TerminalSurfaceMode::Composer);
+        assert_eq!(maximum.cell_width, 192.0 / 13.0);
+        assert_eq!(maximum.cell_height, 384.0 / 13.0);
+        assert_eq!(maximum.vertical_padding, COMPOSER_TERMINAL_PADDING);
+
+        assert_eq!(
+            terminal_cell_metrics(f32::NAN, TerminalSurfaceMode::Standalone),
+            default
+        );
+    }
+
+    #[test]
     fn terminal_polling_backs_off_after_consecutive_idle_frames() {
         assert_eq!(terminal_poll_interval(0), TERMINAL_ACTIVE_POLL_INTERVAL);
         assert_eq!(terminal_poll_interval(3), TERMINAL_ACTIVE_POLL_INTERVAL);
@@ -2170,7 +2226,10 @@ mod tests {
             Vec::<Vec<u8>>::new()
         );
         let marked_bounds = marked_bounds.expect("IME bounds should follow the terminal cursor");
-        assert_eq!(marked_bounds.size.height, px(TERMINAL_CELL_HEIGHT));
+        assert_eq!(
+            marked_bounds.size.height,
+            px(terminal_cell_metrics(13.0, TerminalSurfaceMode::Standalone).cell_height)
+        );
 
         cx.update(|window, cx| {
             surface.update(cx, |surface, cx| {

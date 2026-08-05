@@ -10,6 +10,8 @@ pub mod svg;
 
 #[cfg(feature = "gpui")]
 mod gpui_view;
+#[cfg(feature = "gpui")]
+mod typography;
 
 #[cfg(feature = "artifact-engines")]
 pub mod engines;
@@ -23,3 +25,5 @@ pub use svg::*;
 
 #[cfg(feature = "gpui")]
 pub use gpui_view::*;
+#[cfg(feature = "gpui")]
+pub use typography::*;

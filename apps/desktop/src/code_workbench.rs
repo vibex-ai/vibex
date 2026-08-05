@@ -59,7 +59,7 @@ use vibex_desktop_model::{
 use vibex_desktop_runtime::{DesktopRuntime, GitHandle, validate_external_open_url};
 use vibex_markdown::{
     MarkdownDocument, MarkdownInput, MarkdownSurface, MarkdownView, ResolvedResource, ResourceKind,
-    ResourcePolicy, ResourceRole, parse_markdown,
+    ResourcePolicy, ResourceRole, code_font_weight, parse_markdown,
 };
 
 use crate::app::VibexWorkbench;
@@ -87,9 +87,8 @@ const GIT_COMMIT_MESSAGE_HEIGHT: f32 = 80.0;
 const GIT_COMMIT_TYPES: [&str; 11] = [
     "feat", "fix", "refactor", "test", "docs", "style", "perf", "chore", "build", "ci", "revert",
 ];
-const DIFF_ROW_HEIGHT: f32 = 22.0;
+const DIFF_ROW_MIN_HEIGHT: f32 = 22.0;
 const DIFF_LIST_OVERDRAW: f32 = 512.0;
-const DIFF_LINE_HEIGHT: f32 = 18.0;
 const DIFF_LINE_VERTICAL_PADDING: f32 = 2.0;
 const FILE_PREVIEW_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const IMAGE_SOURCE_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -109,17 +108,17 @@ struct PatchListState {
 }
 
 impl PatchListState {
-    fn new(revision: String, row_count: usize) -> Self {
+    fn new(revision: String, row_count: usize, row_height: f32) -> Self {
         Self {
             revision,
             list: ListState::new(row_count, ListAlignment::Top, px(DIFF_LIST_OVERDRAW))
-                .with_uniform_item_height(px(DIFF_ROW_HEIGHT)),
+                .with_uniform_item_height(px(row_height)),
         }
     }
 
-    fn reconcile(&mut self, revision: &str, row_count: usize) {
+    fn reconcile(&mut self, revision: &str, row_count: usize, row_height: f32) {
         if self.revision != revision {
-            *self = Self::new(revision.to_string(), row_count);
+            *self = Self::new(revision.to_string(), row_count, row_height);
             return;
         }
         if self.list.item_count() == row_count {
@@ -128,7 +127,7 @@ impl PatchListState {
 
         let scroll_top = self.list.logical_scroll_top();
         self.list
-            .reset_with_uniform_height(row_count, px(DIFF_ROW_HEIGHT));
+            .reset_with_uniform_height(row_count, px(row_height));
         self.list.scroll_to(ListOffset {
             item_ix: scroll_top.item_ix.min(row_count),
             offset_in_item: scroll_top.offset_in_item,
@@ -1307,6 +1306,8 @@ impl CodeWorkbench {
     pub fn set_code_font(&mut self, family: String, size: u16, cx: &mut Context<Self>) {
         self.code_font_family = family;
         self.code_font_size = size.clamp(10, 24);
+        self.preview_diff_lists.clear();
+        self.preview_commit_lists.clear();
         cx.notify();
     }
 
@@ -1372,6 +1373,8 @@ impl CodeWorkbench {
         self.restore_hydration_scheduled = false;
         self.code_font_family = code_font_family;
         self.code_font_size = code_font_size.clamp(10, 24);
+        self.preview_diff_lists.clear();
+        self.preview_commit_lists.clear();
         self.sync_terminal_surface_activity(cx);
         cx.notify();
     }
@@ -5103,7 +5106,7 @@ impl CodeWorkbench {
                                                 "暫無預覽標籤",
                                             )),
                                     )
-                                    .child(div().line_height(px(20.0)).child(locale::text(
+                                    .child(div().line_height(gpui::relative(1.5)).child(locale::text(
                                         "Open a file, terminal, or webpage here while keeping the Agent visible.",
                                         "在这里打开文件、终端或网页，同时保留 Agent 对话。",
                                         "在這裡開啟檔案、終端或網頁，同時保留 Agent 對話。",
@@ -6132,6 +6135,7 @@ impl CodeWorkbench {
                         .min_h_0()
                         .font_family(self.code_font_family.clone())
                         .text_size(px(f32::from(self.code_font_size)))
+                        .font_weight(code_font_weight(cx))
                         .child(
                             Input::new(&binding.input)
                                 .appearance(false)
@@ -6222,6 +6226,7 @@ impl CodeWorkbench {
         let path = key.path.clone();
         let key_for_list = key.clone();
         let code_font_family = self.code_font_family.clone();
+        let diff_row_height = diff_row_height(self.code_font_size);
         let list = if !has_files {
             self.render_empty(locale::text("No diff", "没有差异", "沒有差異"), cx)
         } else if count == 0 {
@@ -6241,8 +6246,8 @@ impl CodeWorkbench {
             let list_state = self
                 .preview_diff_lists
                 .entry(tab_id.to_string())
-                .or_insert_with(|| PatchListState::new(revision.clone(), count));
-            list_state.reconcile(&revision, count);
+                .or_insert_with(|| PatchListState::new(revision.clone(), count, diff_row_height));
+            list_state.reconcile(&revision, count, diff_row_height);
             let list_state = list_state.list.clone();
             self.render_patch_list(
                 format!("diff-rows:{}:{}", key.staged, key.path),
@@ -6254,9 +6259,9 @@ impl CodeWorkbench {
                         .get_mut(&key_for_list)
                         .and_then(|document| document.rows.prepared_row(index))
                     else {
-                        return div().w_full().h(px(DIFF_ROW_HEIGHT)).into_any_element();
+                        return div().w_full().h(px(diff_row_height)).into_any_element();
                     };
-                    render_diff_row(row, &code_font_family, cx)
+                    render_diff_row(row, &code_font_family, diff_row_height, cx)
                 },
                 cx,
             )
@@ -6377,11 +6382,14 @@ impl CodeWorkbench {
         }
         let row_count = self.git.commit_preview_row_count(&hash);
         let commit_revision = format!("commit:{hash}");
+        let diff_row_height = diff_row_height(self.code_font_size);
         let list_state = self
             .preview_commit_lists
             .entry(tab_id.to_string())
-            .or_insert_with(|| PatchListState::new(commit_revision.clone(), row_count));
-        list_state.reconcile(&commit_revision, row_count);
+            .or_insert_with(|| {
+                PatchListState::new(commit_revision.clone(), row_count, diff_row_height)
+            });
+        list_state.reconcile(&commit_revision, row_count, diff_row_height);
         let list_state = list_state.list.clone();
         if let Some(row_index) = focused_row_index {
             list_state.scroll_to(ListOffset {
@@ -6410,10 +6418,11 @@ impl CodeWorkbench {
                                 row,
                                 hash_for_list.clone(),
                                 code_font_family.clone(),
+                                diff_row_height,
                                 cx,
                             )
                         })
-                        .unwrap_or_else(|| div().w_full().h(px(DIFF_ROW_HEIGHT)).into_any_element())
+                        .unwrap_or_else(|| div().w_full().h(px(diff_row_height)).into_any_element())
                 },
                 cx,
             )
@@ -6486,7 +6495,7 @@ impl CodeWorkbench {
                         this.child(
                             v_flex()
                                 .mt_3()
-                                .line_height(px(20.0))
+                                .line_height(gpui::relative(1.5))
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .children(body_lines.into_iter().map(|line| {
@@ -8197,7 +8206,7 @@ impl CodeRightRail {
                     .min_w_0()
                     .gap(px(6.0))
                     .pl(px(row.depth as f32 * FILE_TREE_INDENT))
-                    .text_size(px(13.0))
+                    .text_sm()
                     .font_medium()
                     .text_color(text_color)
                     .child(file_tree_icon(row.icon.kind, row.ignored, cx))
@@ -8475,7 +8484,7 @@ impl CodeRightRail {
                                         div()
                                             .min_w_0()
                                             .truncate()
-                                            .text_size(px(12.0))
+                                            .text_sm()
                                             .font_semibold()
                                             .child(format!("{source_branch} -> {target_branch}")),
                                     )
@@ -8483,7 +8492,7 @@ impl CodeRightRail {
                                         h_flex()
                                             .flex_wrap()
                                             .gap_2()
-                                            .text_size(px(10.0))
+                                            .text_xs()
                                             .text_color(cx.theme().muted_foreground)
                                             .child(div().text_color(state_color).child(state_label))
                                             .child(if dirty {
@@ -8592,7 +8601,7 @@ impl CodeRightRail {
                                     )
                                     .child(
                                         div()
-                                            .text_size(px(10.0))
+                                            .text_xs()
                                             .text_color(cx.theme().muted_foreground)
                                             .child(localized_conflict_count(unresolved)),
                                     ),
@@ -8602,7 +8611,7 @@ impl CodeRightRail {
                         this.child(
                             div()
                                 .whitespace_normal()
-                                .text_size(px(10.0))
+                                .text_xs()
                                 .text_color(cx.theme().warning)
                                 .child(localized_source_delta(
                                     operation.detail.source_commits_after_start,
@@ -8613,7 +8622,7 @@ impl CodeRightRail {
                         this.child(
                             div()
                                 .whitespace_normal()
-                                .text_size(px(10.0))
+                                .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(locale::localize_ui_message(&diagnostic.summary)),
                         )
@@ -8733,12 +8742,12 @@ impl CodeRightRail {
             .px_3()
             .py_3()
             .bg(cx.theme().background.opacity(0.94))
-            .child(div().font_semibold().text_size(px(12.0)).child(title))
+            .child(div().font_semibold().text_sm().child(title))
             .child(
                 div()
                     .min_w_0()
                     .whitespace_normal()
-                    .text_size(px(10.0))
+                    .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(summary),
             )
@@ -8791,7 +8800,7 @@ impl CodeRightRail {
                 div()
                     .min_w_0()
                     .whitespace_normal()
-                    .text_size(px(10.0))
+                    .text_xs()
                     .text_color(if risk.blocking {
                         cx.theme().danger
                     } else {
@@ -8871,15 +8880,14 @@ impl CodeRightRail {
                             .size(px(13.0))
                             .text_color(cx.theme().warning),
                     )
+                    .child(div().font_semibold().text_xs().child(locale::text(
+                        "Conflicts",
+                        "冲突",
+                        "衝突",
+                    )))
                     .child(
                         div()
-                            .font_semibold()
-                            .text_size(px(11.0))
-                            .child(locale::text("Conflicts", "冲突", "衝突")),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.0))
+                            .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child(total.to_string()),
                     ),
@@ -8891,7 +8899,7 @@ impl CodeRightRail {
                         .px_3()
                         .py_2()
                         .whitespace_normal()
-                        .text_size(px(10.0))
+                        .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child(localized_conflict_render_limit(
                             WORKTREE_CONFLICT_RENDER_LIMIT,
@@ -8936,6 +8944,7 @@ impl CodeRightRail {
                         div()
                             .flex_none()
                             .font_family("monospace")
+                            .font_weight(code_font_weight(cx))
                             .font_semibold()
                             .text_color(cx.theme().warning)
                             .child("!"),
@@ -8948,7 +8957,8 @@ impl CodeRightRail {
                             .cursor_pointer()
                             .truncate()
                             .font_family("monospace")
-                            .text_size(px(11.0))
+                            .font_weight(code_font_weight(cx))
+                            .text_xs()
                             .child(path.clone())
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.update_workbench(cx, |workbench, cx| {
@@ -8965,7 +8975,7 @@ impl CodeRightRail {
                     .child(
                         div()
                             .flex_none()
-                            .text_size(px(10.0))
+                            .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child(worktree_conflict_kind_label(conflict.kind, conflict.binary)),
                     ),
@@ -9404,6 +9414,7 @@ impl CodeRightRail {
                                 .flex_none()
                                 .gap_3()
                                 .font_family("monospace")
+                                .font_weight(code_font_weight(cx))
                                 .text_xs()
                                 .font_semibold()
                                 .child(
@@ -9624,7 +9635,7 @@ impl CodeRightRail {
                                     ))
                                     .child(
                                         div()
-                                            .text_size(px(11.0))
+                                            .text_xs()
                                             .text_color(cx.theme().sidebar_foreground.opacity(0.70))
                                             .child("amend"),
                                     )
@@ -9961,7 +9972,8 @@ impl CodeRightRail {
                             .gap_1()
                             .ml_2()
                             .font_family("monospace")
-                            .text_size(px(10.0))
+                            .font_weight(code_font_weight(cx))
+                            .text_xs()
                             .child(
                                 div()
                                     .text_color(if change.additions > 0 {
@@ -9994,7 +10006,8 @@ impl CodeRightRail {
                             .border_color(cx.theme().border.opacity(0.70))
                             .px_1()
                             .font_family("monospace")
-                            .text_size(px(10.0))
+                            .font_weight(code_font_weight(cx))
+                            .text_xs()
                             .text_color(cx.theme().sidebar_foreground.opacity(0.50))
                             .child(git_change_label(change.kind)),
                     )
@@ -10359,7 +10372,7 @@ impl CodeRightRail {
                 div()
                     .h(px(18.0))
                     .flex_none()
-                    .text_size(px(11.0))
+                    .text_xs()
                     .font_semibold()
                     .text_color(cx.theme().sidebar_foreground.opacity(0.50))
                     .child(if show_date {
@@ -10420,7 +10433,7 @@ impl CodeRightRail {
                                 h_flex()
                                     .min_w_0()
                                     .gap_2()
-                                    .text_size(px(11.0))
+                                    .text_xs()
                                     .text_color(cx.theme().muted_foreground)
                                     .child(
                                         div()
@@ -10432,6 +10445,7 @@ impl CodeRightRail {
                                         div()
                                             .flex_none()
                                             .font_family("monospace")
+                                            .font_weight(code_font_weight(cx))
                                             .child(commit.short_hash),
                                     ),
                             )
@@ -10560,7 +10574,8 @@ impl CodeRightRail {
                                             .px_1p5()
                                             .py_0p5()
                                             .font_family("monospace")
-                                            .text_size(px(10.0))
+                                            .font_weight(code_font_weight(cx))
+                                            .text_xs()
                                             .text_color(cx.theme().muted_foreground)
                                             .child(short_hash),
                                     ),
@@ -10570,7 +10585,8 @@ impl CodeRightRail {
                                     .flex_none()
                                     .gap_3()
                                     .font_family("monospace")
-                                    .text_size(px(10.0))
+                                    .font_weight(code_font_weight(cx))
+                                    .text_xs()
                                     .font_semibold()
                                     .child(
                                         div()
@@ -10623,7 +10639,7 @@ impl CodeRightRail {
                             .mt_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(11.0))
+                            .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child(subject),
                     ),
@@ -11043,7 +11059,7 @@ fn rail_empty_card(
                 .child(
                     div()
                         .text_sm()
-                        .line_height(px(24.0))
+                        .line_height(gpui::relative(1.5))
                         .text_color(cx.theme().muted_foreground)
                         .child(description.into()),
                 ),
@@ -11810,6 +11826,7 @@ fn render_commit_patch_row(
     row: GitCommitPatchRow,
     hash: String,
     code_font_family: String,
+    diff_row_height: f32,
     cx: &Context<CodeWorkbench>,
 ) -> AnyElement {
     match row {
@@ -11832,7 +11849,7 @@ fn render_commit_patch_row(
             let key_path = path.clone();
             h_flex()
                 .id(format!("commit-file:{hash}:{file_index}"))
-                .h(px(DIFF_ROW_HEIGHT))
+                .h(px(diff_row_height))
                 .w_full()
                 .flex_none()
                 .min_w_0()
@@ -11878,7 +11895,8 @@ fn render_commit_patch_row(
                         .flex_none()
                         .gap_2()
                         .font_family(code_font_family)
-                        .text_size(px(11.0))
+                        .text_size(cx.theme().mono_font_size)
+                        .font_weight(code_font_weight(cx))
                         .child(
                             div()
                                 .text_color(cx.theme().success)
@@ -11906,10 +11924,12 @@ fn render_commit_patch_row(
                 }))
                 .into_any_element()
         }
-        GitCommitPatchRow::Diff(row) => render_diff_row(row, &code_font_family, cx),
+        GitCommitPatchRow::Diff(row) => {
+            render_diff_row(row, &code_font_family, diff_row_height, cx)
+        }
         GitCommitPatchRow::Empty { file_index, path } => div()
             .id(format!("commit-file-empty:{hash}:{file_index}"))
-            .h(px(DIFF_ROW_HEIGHT))
+            .h(px(diff_row_height))
             .flex_none()
             .px_3()
             .border_b_1()
@@ -11933,6 +11953,7 @@ fn render_commit_patch_row(
 fn render_diff_row(
     row: vibex_desktop_model::PreparedDiffRow,
     code_font_family: &str,
+    diff_row_height: f32,
     cx: &Context<CodeWorkbench>,
 ) -> AnyElement {
     let background = match row.row.kind {
@@ -11962,15 +11983,16 @@ fn render_diff_row(
         row.row.content
     };
     h_flex()
-        .min_h(px(DIFF_ROW_HEIGHT))
+        .min_h(px(diff_row_height))
         .w_full()
         .flex_none()
         .min_w_0()
         .items_stretch()
         .bg(background)
         .font_family(code_font_family.to_string())
-        .text_xs()
-        .line_height(px(DIFF_LINE_HEIGHT))
+        .text_size(cx.theme().mono_font_size)
+        .font_weight(code_font_weight(cx))
+        .line_height(gpui::relative(1.5))
         .text_color(foreground)
         .border_b_1()
         .border_color(cx.theme().border.opacity(0.30))
@@ -12018,6 +12040,12 @@ fn render_diff_row(
                 .child(format!("{prefix}{content}")),
         )
         .into_any_element()
+}
+
+fn diff_row_height(code_font_size: u16) -> f32 {
+    (f32::from(code_font_size.clamp(10, 24)) * 1.5 + DIFF_LINE_VERTICAL_PADDING * 2.0)
+        .ceil()
+        .max(DIFF_ROW_MIN_HEIGHT)
 }
 
 fn normalized_relative_path(path: &str) -> Option<String> {
@@ -12844,20 +12872,28 @@ mod tests {
 
     #[test]
     fn wrapping_patch_list_reconciles_rows_and_revisions() {
-        let mut state = PatchListState::new("revision-1".to_string(), 20);
+        let mut state = PatchListState::new("revision-1".to_string(), 20, DIFF_ROW_MIN_HEIGHT);
         state.list.scroll_to(ListOffset {
             item_ix: 12,
             offset_in_item: px(4.0),
         });
 
-        state.reconcile("revision-1", 8);
+        state.reconcile("revision-1", 8, DIFF_ROW_MIN_HEIGHT);
         assert_eq!(state.list.item_count(), 8);
         assert_eq!(state.list.logical_scroll_top().item_ix, 8);
 
-        state.reconcile("revision-2", 4);
+        state.reconcile("revision-2", 4, DIFF_ROW_MIN_HEIGHT);
         assert_eq!(state.revision, "revision-2");
         assert_eq!(state.list.item_count(), 4);
         assert_eq!(state.list.logical_scroll_top().item_ix, 0);
+    }
+
+    #[test]
+    fn diff_row_height_tracks_clamped_code_font_size() {
+        assert_eq!(diff_row_height(10), DIFF_ROW_MIN_HEIGHT);
+        assert_eq!(diff_row_height(13), 24.0);
+        assert_eq!(diff_row_height(24), 40.0);
+        assert_eq!(diff_row_height(100), diff_row_height(24));
     }
 
     #[test]
