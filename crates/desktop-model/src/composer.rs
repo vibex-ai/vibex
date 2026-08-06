@@ -346,6 +346,21 @@ mod tests {
     }
 
     #[test]
+    fn trigger_opens_for_a_bare_marker() {
+        for (text, kind) in [
+            ("/", ComposerTriggerKind::Command),
+            ("@", ComposerTriggerKind::File),
+            ("$", ComposerTriggerKind::Skill),
+        ] {
+            let trigger = composer_trigger_at(text, text.chars().count()).unwrap();
+            assert_eq!(trigger.kind, kind);
+            assert!(trigger.query.is_empty());
+            assert_eq!(trigger.character_range, 0..1);
+        }
+        assert!(composer_trigger_at("", 0).is_none());
+    }
+
+    #[test]
     fn trigger_uses_the_same_token_boundaries_as_tauri() {
         let text = "before\u{200b}@src";
         let trigger = composer_trigger_at(text, text.chars().count()).unwrap();

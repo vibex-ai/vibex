@@ -260,10 +260,13 @@ const COMPOSER_TEXT_AREA_MIN_HEIGHT: f32 = 52.0;
 const COMPOSER_SURFACE_RADIUS: f32 = 20.0;
 const COMPOSER_RUNTIME_MENU_WIDTH: f32 = 320.0;
 const COMPOSER_RUNTIME_MENU_MAX_HEIGHT: f32 = 448.0;
-const COMPOSER_SUGGESTION_MENU_MAX_HEIGHT: f32 = 288.0;
-const COMPOSER_SUGGESTION_MENU_EMPTY_HEIGHT: f32 = 48.0;
-const COMPOSER_SUGGESTION_MENU_ROW_HEIGHT: f32 = 54.0;
-const COMPOSER_SUGGESTION_MENU_VERTICAL_PADDING: f32 = 12.0;
+const COMPOSER_SUGGESTION_MENU_MAX_HEIGHT: f32 = 360.0;
+const COMPOSER_SUGGESTION_MENU_EMPTY_HEIGHT: f32 = 72.0;
+const COMPOSER_SUGGESTION_MENU_HEADER_HEIGHT: f32 = 32.0;
+const COMPOSER_SUGGESTION_MENU_ROW_HEIGHT: f32 = 40.0;
+const COMPOSER_SUGGESTION_MENU_VERTICAL_PADDING: f32 = 8.0;
+const COMPOSER_SUGGESTION_MENU_HORIZONTAL_MARGIN: f32 = 12.0;
+const COMPOSER_SUGGESTION_MENU_TRIGGER_GAP: f32 = 6.0;
 const NEW_SESSION_RUNTIME_MENU_MAX_HEIGHT: f32 = 360.0;
 const NEW_SESSION_RUNTIME_MENU_MIN_HEIGHT: f32 = 104.0;
 const RUNTIME_MENU_VIEWPORT_MARGIN: f32 = 12.0;
@@ -444,7 +447,6 @@ struct RuntimeMenuPlacement {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ComposerSuggestionMenuPlacement {
-    anchor: Anchor,
     max_height: f32,
     window_edge_offset: f32,
 }
@@ -452,6 +454,7 @@ struct ComposerSuggestionMenuPlacement {
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct ComposerGeometry {
     input_bounds: Option<Bounds<Pixels>>,
+    surface_bounds: Option<Bounds<Pixels>>,
     runtime_trigger_bounds: Option<Bounds<Pixels>>,
 }
 
@@ -581,34 +584,28 @@ fn composer_suggestion_menu_height(row_count: usize) -> f32 {
     if row_count == 0 {
         COMPOSER_SUGGESTION_MENU_EMPTY_HEIGHT
     } else {
-        (COMPOSER_SUGGESTION_MENU_VERTICAL_PADDING
+        (COMPOSER_SUGGESTION_MENU_HEADER_HEIGHT
+            + COMPOSER_SUGGESTION_MENU_VERTICAL_PADDING
             + COMPOSER_SUGGESTION_MENU_ROW_HEIGHT * row_count as f32)
             .min(COMPOSER_SUGGESTION_MENU_MAX_HEIGHT)
     }
 }
 
 fn composer_suggestion_menu_placement(
-    trigger_bounds: Bounds<Pixels>,
+    surface_bounds: Bounds<Pixels>,
     viewport_height: f32,
     row_count: usize,
 ) -> ComposerSuggestionMenuPlacement {
-    let trigger_top = f32::from(trigger_bounds.origin.y);
-    let trigger_bottom = trigger_top + f32::from(trigger_bounds.size.height);
-    let placement = composer_runtime_menu_placement(
-        Some(trigger_bounds),
-        viewport_height,
-        composer_suggestion_menu_height(row_count),
-        COMPOSER_SUGGESTION_MENU_MAX_HEIGHT,
-    );
-    let window_edge_offset = match placement.anchor {
-        Anchor::TopLeft | Anchor::TopCenter | Anchor::TopRight => {
-            trigger_bottom + placement.trigger_offset
-        }
-        _ => viewport_height - trigger_top + placement.trigger_offset,
-    };
+    // Suggestions belong to the composer surface, rather than the caret. Keeping
+    // the overlay above the whole surface lets it cover queue/plan extensions
+    // without changing their normal-flow layout.
+    let surface_top = f32::from(surface_bounds.origin.y);
+    let available_above =
+        (surface_top - RUNTIME_MENU_VIEWPORT_MARGIN - COMPOSER_SUGGESTION_MENU_TRIGGER_GAP)
+            .max(1.0);
+    let window_edge_offset = viewport_height - surface_top + COMPOSER_SUGGESTION_MENU_TRIGGER_GAP;
     ComposerSuggestionMenuPlacement {
-        anchor: placement.anchor,
-        max_height: placement.height,
+        max_height: composer_suggestion_menu_height(row_count).min(available_above),
         window_edge_offset,
     }
 }
@@ -17270,6 +17267,7 @@ impl VibexWorkbench {
             && worktree_form_valid
             && !self.agent_action_pending;
         let input_geometry_entity = cx.weak_entity();
+        let surface_geometry_entity = cx.weak_entity();
         h_flex()
             .id("new-session-home")
             .size_full()
@@ -17353,6 +17351,17 @@ impl VibexWorkbench {
                             .border_color(cx.theme().primary.opacity(0.15))
                             .bg(card_color)
                             .shadow_xl()
+                            .on_prepaint(move |bounds, _, cx| {
+                                let _ = surface_geometry_entity.update(cx, |this, cx| {
+                                    if this.new_session_composer_geometry.surface_bounds
+                                        != Some(bounds)
+                                    {
+                                        this.new_session_composer_geometry.surface_bounds =
+                                            Some(bounds);
+                                        cx.notify();
+                                    }
+                                });
+                            })
                             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                                 this.add_composer_paths(paths, window, cx)
                             }))
@@ -22798,22 +22807,51 @@ impl VibexWorkbench {
         else {
             return Empty.into_any_element();
         };
-        let input = self.input_for_composer_target(target);
-        let value = input.read(cx).value().to_string();
-        let trigger_range = character_offset_to_byte(&value, context.character_range.start)
-            ..character_offset_to_byte(&value, context.character_range.end);
-        let Some(trigger_bounds) = input.read(cx).range_to_bounds(&trigger_range) else {
+        let Some(surface_bounds) = (match target {
+            ComposerTarget::Session => self.composer_geometry.surface_bounds,
+            ComposerTarget::NewSession => self.new_session_composer_geometry.surface_bounds,
+        }) else {
             return Empty.into_any_element();
         };
         let viewport = window.viewport_size();
         let viewport_width = f32::from(viewport.width);
         let viewport_height = f32::from(viewport.height);
-        let menu_width = (viewport_width - 24.0).clamp(240.0, 360.0);
-        let max_left = (viewport_width - menu_width - 12.0).max(12.0);
-        let menu_left = f32::from(trigger_bounds.origin.x).clamp(12.0, max_left);
+        let viewport_menu_width =
+            (viewport_width - COMPOSER_SUGGESTION_MENU_HORIZONTAL_MARGIN * 2.0).max(1.0);
+        let menu_width = f32::from(surface_bounds.size.width)
+            .min(viewport_menu_width)
+            .max(1.0);
+        let max_left = (viewport_width - menu_width - COMPOSER_SUGGESTION_MENU_HORIZONTAL_MARGIN)
+            .max(COMPOSER_SUGGESTION_MENU_HORIZONTAL_MARGIN);
+        let menu_left = f32::from(surface_bounds.origin.x)
+            .clamp(COMPOSER_SUGGESTION_MENU_HORIZONTAL_MARGIN, max_left);
         let visible_row_count = self.suggestions.len().min(10);
         let menu_placement =
-            composer_suggestion_menu_placement(trigger_bounds, viewport_height, visible_row_count);
+            composer_suggestion_menu_placement(surface_bounds, viewport_height, visible_row_count);
+        let list_max_height =
+            (menu_placement.max_height - COMPOSER_SUGGESTION_MENU_HEADER_HEIGHT).max(1.0);
+        let (menu_title, menu_icon, trigger_symbol) = match context.request.trigger {
+            Some(AgentCommandTrigger::Slash) => (
+                locale::text("Commands", "命令", "命令"),
+                IconName::SquareTerminal,
+                "/",
+            ),
+            Some(AgentCommandTrigger::Dollar) => (
+                locale::text("Skills", "技能", "技能"),
+                IconName::BookOpen,
+                "$",
+            ),
+            Some(AgentCommandTrigger::Mention) => (
+                locale::text("Workspace files", "工作区文件", "工作區檔案"),
+                IconName::File,
+                "@",
+            ),
+            None => (
+                locale::text("Suggestions", "建议", "建議"),
+                IconName::Search,
+                "",
+            ),
+        };
 
         let rows = self
             .suggestions
@@ -22825,21 +22863,27 @@ impl VibexWorkbench {
                 let selected = self.suggestion_selection.selected_index == Some(index);
                 let selected_entry = entry.clone();
                 let source_label = command_source_label(entry.source_kind);
+                let display_label = entry.label.trim_start_matches(['/', '$', '@']).to_string();
                 let description = entry
                     .description
                     .clone()
-                    .unwrap_or_else(|| source_label.to_string());
+                    .filter(|value| !value.trim().is_empty());
+                let aria_label = description
+                    .as_ref()
+                    .map(|description| format!("{display_label}, {description}"))
+                    .unwrap_or_else(|| display_label.clone());
                 h_flex()
                     .id(format!("composer-suggestion:{}:{}", target.id(), entry.id))
                     .role(Role::ListBoxOption)
                     .aria_selected(selected)
+                    .aria_label(aria_label)
                     .w_full()
+                    .h(px(COMPOSER_SUGGESTION_MENU_ROW_HEIGHT))
                     .min_w_0()
                     .items_center()
-                    .gap(px(9.0))
-                    .rounded(px(10.0))
-                    .px(px(10.0))
-                    .py(px(9.0))
+                    .gap_2()
+                    .rounded(px(7.0))
+                    .px(px(9.0))
                     .cursor_pointer()
                     .text_color(cx.theme().popover_foreground)
                     .when(selected, |this| {
@@ -22851,53 +22895,48 @@ impl VibexWorkbench {
                             .text_color(cx.theme().accent_foreground)
                     })
                     .child(
-                        h_flex()
-                            .size(px(26.0))
+                        div()
+                            .size(px(22.0))
                             .flex_none()
+                            .flex()
                             .items_center()
                             .justify_center()
-                            .rounded(px(7.0))
-                            .border_1()
-                            .border_color(cx.theme().primary.opacity(0.24))
-                            .bg(cx.theme().primary.opacity(0.14))
-                            .text_base()
-                            .font_weight(FontWeight(800.0))
-                            .text_color(cx.theme().primary)
-                            .child(command_trigger_symbol(entry.trigger)),
+                            .child(
+                                Icon::new(command_source_icon(entry.source_kind))
+                                    .small()
+                                    .text_color(cx.theme().muted_foreground),
+                            ),
                     )
                     .child(
-                        v_flex()
+                        h_flex()
                             .min_w_0()
                             .flex_1()
                             .child(
                                 div()
-                                    .min_w_0()
-                                    .truncate()
+                                    .flex_none()
                                     .text_sm()
                                     .font_medium()
-                                    .child(entry.label),
+                                    .child(display_label),
                             )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(description),
-                            ),
+                            .when_some(description, |this, description| {
+                                this.child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .pl_2()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(description),
+                                )
+                            }),
                     )
                     .child(
                         div()
                             .flex_none()
-                            .rounded(px(999.0))
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .px(px(7.0))
-                            .py(px(2.0))
                             .text_xs()
-                            .font_weight(FontWeight(700.0))
                             .text_color(cx.theme().muted_foreground)
-                            .child(source_label.to_ascii_uppercase()),
+                            .child(source_label),
                     )
                     .on_mouse_down(MouseButton::Left, |_, window, cx| {
                         window.prevent_default();
@@ -22912,25 +22951,55 @@ impl VibexWorkbench {
             })
             .collect::<Vec<_>>();
 
+        let menu_header = h_flex()
+            .w_full()
+            .h(px(COMPOSER_SUGGESTION_MENU_HEADER_HEIGHT))
+            .flex_none()
+            .items_center()
+            .justify_between()
+            .border_b_1()
+            .border_color(cx.theme().border.opacity(0.72))
+            .px_3()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .child(Icon::new(menu_icon).small())
+                    .child(div().truncate().font_medium().child(menu_title)),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .child(trigger_symbol),
+            );
+
         // ScrollableElement adds a normal-flow wrapper, so it must stay inside
         // the absolutely positioned shell or it will shrink the workbench.
         let scroll_content = v_flex()
             .id(format!("composer-command-menu-scroll:{}", target.id()))
             .w_full()
-            .max_h(px(menu_placement.max_height))
-            .p(px(6.0))
+            .max_h(px(list_max_height))
+            .p(px(4.0))
             .when(!rows.is_empty(), |this| this.children(rows))
             .when(self.suggestions.is_empty(), |this| {
                 this.child(
                     div()
+                        .h(px(COMPOSER_SUGGESTION_MENU_EMPTY_HEIGHT
+                            - COMPOSER_SUGGESTION_MENU_HEADER_HEIGHT
+                            - COMPOSER_SUGGESTION_MENU_VERTICAL_PADDING))
+                        .flex()
+                        .items_center()
                         .px_3()
-                        .py_2()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
                         .child(if self.suggestion_loading {
-                            "Loading commands..."
+                            locale::text("Loading...", "加载中...", "載入中...")
                         } else {
-                            "No commands found"
+                            locale::text("No matches", "没有匹配项", "沒有符合項目")
                         }),
                 )
             })
@@ -22945,18 +23014,15 @@ impl VibexWorkbench {
             .w(px(menu_width))
             .max_h(px(menu_placement.max_height))
             .occlude()
-            .rounded(px(14.0))
+            .overflow_hidden()
+            .rounded(px(12.0))
             .border_1()
             .border_color(cx.theme().border)
-            .bg(cx.theme().popover.opacity(0.96))
+            .bg(cx.theme().popover.opacity(0.985))
             .shadow_xl()
+            .child(menu_header)
             .child(scroll_content)
-            .map(|menu| match menu_placement.anchor {
-                Anchor::TopLeft | Anchor::TopCenter | Anchor::TopRight => {
-                    menu.top(px(menu_placement.window_edge_offset))
-                }
-                _ => menu.bottom(px(menu_placement.window_edge_offset)),
-            })
+            .bottom(px(menu_placement.window_edge_offset))
             .into_any_element()
     }
 
@@ -23789,6 +23855,7 @@ impl VibexWorkbench {
         let composer_queue = self.render_composer_queue(cx);
         let composer_queue_visible = composer_queue.is_some();
         let input_geometry_entity = cx.weak_entity();
+        let surface_geometry_entity = cx.weak_entity();
         let runtime_controls = if let Some((desired, catalog, projection)) = runtime_projection {
             let mut controls = vec![self.render_composer_runtime_cascade(
                 desired.clone(),
@@ -24104,6 +24171,14 @@ impl VibexWorkbench {
                             })
                             .when(!composer_queue_visible && is_dark, |this| this.shadow_lg())
                             .when(!composer_queue_visible && !is_dark, |this| this.shadow_sm())
+                            .on_prepaint(move |bounds, _, cx| {
+                                let _ = surface_geometry_entity.update(cx, |this, cx| {
+                                    if this.composer_geometry.surface_bounds != Some(bounds) {
+                                        this.composer_geometry.surface_bounds = Some(bounds);
+                                        cx.notify();
+                                    }
+                                });
+                            })
                             .child(
                                 h_flex()
                                     .w_full()
@@ -27165,11 +27240,13 @@ fn resolve_composer_command_invocation(
     })
 }
 
-fn command_trigger_symbol(trigger: AgentCommandTrigger) -> &'static str {
-    match trigger {
-        AgentCommandTrigger::Slash => "/",
-        AgentCommandTrigger::Mention => "@",
-        AgentCommandTrigger::Dollar => "$",
+fn command_source_icon(source_kind: AgentCommandSourceKind) -> IconName {
+    match source_kind {
+        AgentCommandSourceKind::Provider => IconName::SquareTerminal,
+        AgentCommandSourceKind::Prompt => IconName::BookOpen,
+        AgentCommandSourceKind::Skill => IconName::Bot,
+        AgentCommandSourceKind::Reference => IconName::File,
+        AgentCommandSourceKind::ClientBuiltin => IconName::Settings2,
     }
 }
 
@@ -35655,26 +35732,25 @@ mod tests {
     }
 
     #[test]
-    fn composer_suggestion_menu_stays_attached_above_the_trigger() {
+    fn composer_suggestion_menu_stays_attached_above_the_composer_surface() {
         let viewport_height = 900.0;
         for row_count in [0, 1] {
-            let trigger_bounds = Bounds {
+            let surface_bounds = Bounds {
                 origin: gpui::Point {
-                    x: px(180.0),
-                    y: px(850.0),
+                    x: px(120.0),
+                    y: px(780.0),
                 },
                 size: Size {
-                    width: px(8.0),
-                    height: px(20.0),
+                    width: px(680.0),
+                    height: px(96.0),
                 },
             };
             let placement =
-                composer_suggestion_menu_placement(trigger_bounds, viewport_height, row_count);
+                composer_suggestion_menu_placement(surface_bounds, viewport_height, row_count);
 
-            assert_eq!(placement.anchor, Anchor::BottomLeft);
             let menu_bottom = viewport_height - placement.window_edge_offset;
-            let gap = f32::from(trigger_bounds.origin.y) - menu_bottom;
-            assert_eq!(gap, RUNTIME_MENU_TRIGGER_GAP);
+            let gap = f32::from(surface_bounds.origin.y) - menu_bottom;
+            assert_eq!(gap, COMPOSER_SUGGESTION_MENU_TRIGGER_GAP);
             assert_eq!(
                 placement.max_height,
                 composer_suggestion_menu_height(row_count)
