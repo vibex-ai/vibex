@@ -4924,13 +4924,13 @@ impl VibexWorkbench {
             .get(session.id.as_str())
             .copied()
             .unwrap_or_else(|| self.project_auto_continue_enabled(&session.project_id));
-        if let Some(existing_updated_at_ms) = self
+        if let Some((existing_state, existing_updated_at_ms)) = self
             .sessions
             .iter()
             .find(|existing| existing.id == session.id)
-            .map(|existing| existing.updated_at_ms)
+            .map(|existing| (existing.state, existing.updated_at_ms))
         {
-            if existing_updated_at_ms != session.updated_at_ms {
+            if existing_state != session.state || existing_updated_at_ms != session.updated_at_ms {
                 self.auto_continue_turn_statuses.remove(session.id.as_str());
                 self.auto_continue_probe_tasks.remove(session.id.as_str());
                 self.cancel_auto_continue_countdown(&session.id);
@@ -4962,6 +4962,10 @@ impl VibexWorkbench {
                 .insert(session_id.as_str().to_string());
             self.auto_continue_paused_turn_session_ids
                 .remove(session_id.as_str());
+            self.auto_continue_handled_turns.remove(session_id.as_str());
+            self.auto_continue_turn_statuses.remove(session_id.as_str());
+            self.auto_continue_probe_tasks.remove(session_id.as_str());
+            self.cancel_auto_continue_countdown(session_id);
         } else {
             self.pending_agent_turn_session_ids
                 .remove(session_id.as_str());
@@ -35299,6 +35303,17 @@ mod tests {
         assert!(upsert.contains("self.project_auto_continue_enabled(&session.project_id)"));
         assert!(upsert.contains("auto_continue_session_overrides"));
         assert!(upsert.contains("self.auto_continue_session_ids"));
+        assert!(upsert.contains("existing_state != session.state"));
+
+        let pending = source
+            .split_once("    fn set_session_turn_pending(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn project_auto_continue_enabled("))
+            .map(|(body, _)| body)
+            .expect("turn-pending reconciliation should remain inspectable");
+        assert!(pending.contains("self.auto_continue_handled_turns.remove"));
+        assert!(pending.contains("self.auto_continue_turn_statuses.remove"));
+        assert!(pending.contains("self.auto_continue_probe_tasks.remove"));
+        assert!(pending.contains("self.cancel_auto_continue_countdown(session_id)"));
 
         let session_toggle = source
             .split_once("    fn set_auto_continue_enabled(")

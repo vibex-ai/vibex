@@ -1102,6 +1102,12 @@ ContinueAgentTurnRequest {
   `TimelinePayload::AgentMessage { is_final: true }`. An `error` or `idle`
   session whose latest segment has user/Agent content without that final
   message is eligible for continuation; system notices alone are not a turn.
+- ACP compatibility adapters must not promote a provider-side terminal failure
+  into that final Agent message. Codex terminal text delivered as an
+  unattributed `agent_message_chunk` (no `messageId`) is structured Provider
+  error evidence even when the adapter subsequently returns `end_turn`;
+  classification uses the missing message attribution, not a human error
+  sentence.
 - `continue_turn` reloads the same current `RuntimeBinding`, activation
   generation, effective selection, and committed ACP attachment used by the
   failed turn. Missing or mismatched authority fails closed; the fallback must
@@ -1118,6 +1124,9 @@ ContinueAgentTurnRequest {
 - Imported read-only session -> `capability/imported_session_read_only`.
 - Provider fails during continuation -> append a recoverable timeline `error`,
   keep session state `error`, return the structured provider error.
+- Codex returns an unattributed terminal message plus `end_turn` -> return a
+  structured Provider error and leave no final Agent message that could suppress
+  continuation.
 - Current RuntimeBinding or committed attachment changed after the failed turn
   -> a bounded execution-fence conflict; do not send continuation input.
 
@@ -1141,6 +1150,9 @@ ContinueAgentTurnRequest {
 - Manager/ACP test: a failed turn retains its current durable binding;
   `continue_turn` sends only through the exact committed attachment and rejects
   a missing or stale fence without restore/failover.
+- ACP runtime test: a capacity failure delivered as unattributed Codex text plus
+  `end_turn` remains a retryable Provider error and emits no Agent delta/final
+  message.
 - Manager unit test: `continue_turn` rejects an idle session with
   an explicit final Agent message with
   `agent_continue_requires_incomplete_turn`, and accepts an idle session whose

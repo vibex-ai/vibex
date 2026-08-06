@@ -179,6 +179,7 @@ const OPENCODE_MODEL_API_RETRYING_CODE: &str = "opencode_model_api_retrying";
 const CODEX_STREAM_RECONNECTING_CODE: &str = "codex_stream_reconnecting";
 const CODEX_STREAM_RECONNECT_EXHAUSTED_CODE: &str = "codex_stream_reconnect_exhausted";
 const CODEX_HTTP_STATUS_ERROR_CODE: &str = "codex_http_status_error";
+const CODEX_UNATTRIBUTED_ERROR_CODE: &str = "codex_unattributed_agent_error";
 const CODEX_RECONNECT_PROGRESS_PREFIX: &str = "Reconnecting... ";
 // OpenCode retries transient model failures with a 2/4/8/16/30-second backoff.
 // Eight consecutive failures preserve a roughly two-minute recovery window.
@@ -1828,6 +1829,20 @@ impl AcpSessionAttachment {
         true
     }
 
+    fn record_codex_unattributed_error(&self, text: &str) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let Some(turn) = state.active_turn.as_mut() else {
+            return false;
+        };
+        turn.codex_terminal_error = Some(
+            VibexError::provider(CODEX_UNATTRIBUTED_ERROR_CODE, redact_summary(text))
+                .with_recovery_hint("Continue the session to retry from the failed turn"),
+        );
+        true
+    }
+
     fn codex_terminal_error(&self) -> Option<VibexError> {
         let state = self.state.lock().ok()?;
         let turn = state.active_turn.as_ref()?;
@@ -2423,6 +2438,14 @@ impl AcpSessionAttachment {
                         if self.record_codex_terminal_http_error(&text) {
                             return;
                         }
+                        // Codex uses an unattributed `agent_message_chunk` for
+                        // provider-side terminal failures (including capacity
+                        // errors) and still returns `end_turn`. Without a
+                        // message id there is no conversational assistant
+                        // segment to mark final, so preserve it as a Provider
+                        // error and let the manager expose continuation.
+                        self.record_codex_unattributed_error(&text);
+                        return;
                     } else if is_codex {
                         self.clear_codex_reconnect();
                     }
@@ -17096,6 +17119,23 @@ for line in sys.stdin:
             })
             send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
             continue
+        if prompt_mode == "codex_unattributed_capacity_error":
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {
+                            "type": "text",
+                            "text": "Selected model is at capacity. Please try a different model.",
+                        },
+                    },
+                },
+            })
+            send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
+            continue
         if prompt_mode == "stream_error":
             send_stream_error(session_id, True, "AI_RetryError: title generation failed")
             for _ in range(8):
@@ -21043,6 +21083,69 @@ for line in sys.stdin:
             logged_request_count(&fixture.request_log(), "session/cancel"),
             0
         );
+
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn codex_unattributed_capacity_error_remains_retryable() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "codex-unattributed-capacity-error",
+            Some(AgentId::parse("codex").unwrap()),
+        ) else {
+            return;
+        };
+        fixture.set_prompt_mode("codex_unattributed_capacity_error");
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let error = prepare_and_send_turn(
+            &client,
+            AcpSendTurnRequest {
+                session_id: session_id.clone(),
+                message_submission_id: None,
+                required_runtime: None,
+                text: "trigger a capacity failure".to_string(),
+                attachments: Vec::new(),
+                workspace_root: fixture.workspace.display().to_string(),
+                binding: binding.clone(),
+                runtime_resources: ProviderRuntimeResources::default(),
+                execution_identity: None,
+                event_sender: Some(event_tx),
+                usage_execution_context: None,
+                usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                usage_event_sender: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.category, vibex_core::ErrorCategory::Provider);
+        assert_eq!(error.code, CODEX_UNATTRIBUTED_ERROR_CODE);
+        assert_eq!(
+            error.message,
+            "Selected model is at capacity. Please try a different model."
+        );
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(!events.iter().any(|event| {
+            matches!(
+                event,
+                AcpEvent::AssistantDelta { .. } | AcpEvent::AssistantMessage { .. }
+            )
+        }));
 
         client.close_session(&binding).await.unwrap();
         fixture.cleanup();

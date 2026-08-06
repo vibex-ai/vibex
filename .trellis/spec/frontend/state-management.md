@@ -981,6 +981,11 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   an enabled `Idle` or `Error` session starts the countdown whenever its latest
   conversational segment lacks an explicit final Agent message. A final Agent
   message suppresses the countdown even if the session state is `Error`.
+  Starting any local send/continue turn invalidates the previous completion
+  probe, handled-turn marker, and countdown immediately. Replacing an
+  authoritative session snapshot also invalidates them when either state or
+  `updatedAtMs` changes, so an `Idle -> Error` transition cannot reuse a normal
+  completion cached in the same millisecond.
 - Claude/Codex JSONL support in this surface is offline import only. Adding the
   offline import crates must not introduce a Native online runtime route or
   provider-specific timeline rendering.
@@ -1024,6 +1029,10 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   still surfaces the submission error and must not infer `Error` from provider
   message text. The same reconciliation applies when an `Idle` session has
   user/Agent content without a normal final message.
+- A new turn starts while its session still has the previous turn's timestamp,
+  or an authoritative state transition reuses that millisecond -> discard the
+  previous completion/handled cache and probe the current timeline; do not use
+  timestamp equality as the sole turn identity.
 - Runtime event stream lags -> keep fallback polling active and refetch the
   required authoritative projections.
 - Session search closes while indexing -> advance its generation, cancel/drop
@@ -1078,6 +1087,9 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
 - Good: an enabled auto-continue session receives a provider 429 failure; the
   completion reloads its durable `Error` snapshot, starts one countdown, and
   continues without matching the human-readable error text in GPUI.
+- Good: a Codex capacity failure is normalized to a Provider timeline error;
+  even when the session transition shares a millisecond with the previous
+  snapshot, stale final-message evidence is discarded and one countdown starts.
 - Good: an enabled session becomes `Idle` after a delta-only or interrupted
   turn; the authoritative timeline has no final Agent message, so the same
   countdown and continuation path are offered.
