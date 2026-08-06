@@ -46,6 +46,8 @@ use crate::resource::{ResolvedResource, ResourceKind};
 use crate::svg::{SvgArtifact, SvgPolicy};
 
 const SYNCHRONOUS_PARSE_BYTES: usize = 16 * 1024;
+const AGENT_STREAMING_BLOCK_VIRTUALIZATION_MIN_BLOCKS: usize = 8;
+const AGENT_STREAMING_BLOCK_VIRTUALIZATION_MIN_SOURCE_BYTES: usize = 8 * 1024;
 const AGENT_BLOCK_VIRTUALIZATION_MIN_BLOCKS: usize = 24;
 const AGENT_BLOCK_VIRTUALIZATION_MIN_SOURCE_BYTES: usize = 16 * 1024;
 const AGENT_BLOCK_VIRTUALIZATION_MIN_LARGE_BLOCKS: usize = 8;
@@ -615,6 +617,13 @@ struct SelectionSegment {
     layout: TextLayout,
 }
 
+struct MarkdownVirtualLayoutSnapshot {
+    width: Pixels,
+    document: Arc<MarkdownDocument>,
+    block_sizes: Arc<Vec<Pixels>>,
+    block_measured: Arc<Vec<bool>>,
+}
+
 pub struct MarkdownViewState {
     view_id: Arc<str>,
     focus_handle: FocusHandle,
@@ -643,6 +652,7 @@ pub struct MarkdownViewState {
     selection_segments: BTreeMap<usize, SelectionSegment>,
     text_selection: MarkdownTextSelection,
     virtual_block_sizes: Arc<Vec<Pixels>>,
+    virtual_block_measured: Arc<Vec<bool>>,
     virtual_block_origins: Arc<Vec<Pixels>>,
     virtual_layout_width: Option<Pixels>,
     virtual_visible_blocks: Option<Range<usize>>,
@@ -702,13 +712,14 @@ impl MarkdownViewState {
             selection_segments: BTreeMap::new(),
             text_selection: MarkdownTextSelection::default(),
             virtual_block_sizes: Arc::new(Vec::new()),
+            virtual_block_measured: Arc::new(Vec::new()),
             virtual_block_origins: Arc::new(Vec::new()),
             virtual_layout_width: None,
             virtual_visible_blocks: None,
             virtualized_selection: false,
             select_all_document: false,
         };
-        this.refresh_document_state();
+        this.refresh_document_state(None);
         if let Some(input) = background_input {
             this.queue_background_parse(input, 1, cx);
         }
@@ -794,17 +805,18 @@ impl MarkdownViewState {
     }
 
     fn apply_document(&mut self, document: Arc<MarkdownDocument>) {
+        let virtual_layout = self.append_only_virtual_layout_snapshot(&document);
         self.document = document;
-        self.refresh_document_state();
+        self.refresh_document_state(virtual_layout);
     }
 
-    fn refresh_document_state(&mut self) {
+    fn refresh_document_state(&mut self, virtual_layout: Option<MarkdownVirtualLayoutSnapshot>) {
         self.text_selection = MarkdownTextSelection::default();
         self.select_all_document = false;
         self.selection_segments.clear();
         self.selection_text.clear();
         self.virtual_visible_blocks = None;
-        self.virtual_layout_width = None;
+        self.virtual_layout_width = virtual_layout.as_ref().map(|layout| layout.width);
         let mut live_nodes = BTreeSet::new();
         let mut artifact_specs = Vec::new();
         collect_document_state(
@@ -828,7 +840,14 @@ impl MarkdownViewState {
             .retain(|(node_id, _), _| self.live_nodes.contains(node_id));
         self.artifact_controller
             .prune(&self.view_id, self.document.revision, &self.live_nodes);
-        self.rebuild_virtual_layout(AGENT_BLOCK_ESTIMATE_WIDTH_PX);
+        let virtual_layout_width = virtual_layout
+            .as_ref()
+            .map(|layout| f32::from(layout.width))
+            .unwrap_or(AGENT_BLOCK_ESTIMATE_WIDTH_PX);
+        self.rebuild_virtual_layout(virtual_layout_width);
+        if let Some(virtual_layout) = virtual_layout {
+            self.restore_append_only_virtual_layout(virtual_layout);
+        }
         self.rebuild_anchors();
     }
 
@@ -837,9 +856,33 @@ impl MarkdownViewState {
             return false;
         }
         let block_count = self.document.blocks.len();
-        block_count >= AGENT_BLOCK_VIRTUALIZATION_MIN_BLOCKS
+        (self.options.streaming
+            && self.document.source.len() >= AGENT_STREAMING_BLOCK_VIRTUALIZATION_MIN_SOURCE_BYTES
+            && block_count >= AGENT_STREAMING_BLOCK_VIRTUALIZATION_MIN_BLOCKS)
+            || block_count >= AGENT_BLOCK_VIRTUALIZATION_MIN_BLOCKS
             || (self.document.source.len() >= AGENT_BLOCK_VIRTUALIZATION_MIN_SOURCE_BYTES
                 && block_count >= AGENT_BLOCK_VIRTUALIZATION_MIN_LARGE_BLOCKS)
+    }
+
+    fn append_only_virtual_layout_snapshot(
+        &self,
+        next: &MarkdownDocument,
+    ) -> Option<MarkdownVirtualLayoutSnapshot> {
+        let width = self.virtual_layout_width?;
+        if !self.should_virtualize_blocks()
+            || self.document.base_path != next.base_path
+            || !next.source.starts_with(self.document.source.as_ref())
+            || self.virtual_block_sizes.len() != self.document.blocks.len()
+            || self.virtual_block_measured.len() != self.document.blocks.len()
+        {
+            return None;
+        }
+        Some(MarkdownVirtualLayoutSnapshot {
+            width,
+            document: self.document.clone(),
+            block_sizes: self.virtual_block_sizes.clone(),
+            block_measured: self.virtual_block_measured.clone(),
+        })
     }
 
     fn rebuild_virtual_layout(&mut self, width: f32) {
@@ -866,7 +909,45 @@ impl MarkdownViewState {
             origin += height;
         }
         self.virtual_block_sizes = Arc::new(sizes);
+        self.virtual_block_measured = Arc::new(vec![false; block_count]);
         self.virtual_block_origins = Arc::new(origins);
+    }
+
+    fn restore_append_only_virtual_layout(&mut self, previous: MarkdownVirtualLayoutSnapshot) {
+        let sizes = Arc::make_mut(&mut self.virtual_block_sizes);
+        let measured = Arc::make_mut(&mut self.virtual_block_measured);
+        let shared_block_count = self
+            .document
+            .blocks
+            .len()
+            .min(previous.document.blocks.len());
+        // Stable blocks keep their NodeId; the active tail changes identity as its source grows.
+        for index in 0..shared_block_count {
+            let block = &self.document.blocks[index];
+            let old = &previous.document.blocks[index];
+            let unchanged = block.id == old.id;
+            let continued_tail = index + 1 == previous.document.blocks.len()
+                && block.range.start == old.range.start
+                && block.kind.kind_name() == old.kind.kind_name()
+                && self
+                    .document
+                    .source_for(block.range)
+                    .starts_with(previous.document.source_for(old.range));
+            if !unchanged && !continued_tail {
+                break;
+            }
+            sizes[index] = previous.block_sizes[index];
+            measured[index] = previous.block_measured[index];
+        }
+
+        let sizes = self.virtual_block_sizes.clone();
+        let mut origin = px(0.0);
+        let origins = Arc::make_mut(&mut self.virtual_block_origins);
+        origins.resize(sizes.len(), px(0.0));
+        for (index, height) in sizes.iter().enumerate() {
+            origins[index] = origin;
+            origin += *height;
+        }
     }
 
     fn prepare_virtual_layout(&mut self, width: Pixels) -> bool {
@@ -959,11 +1040,21 @@ impl MarkdownViewState {
             return false;
         }
         let sizes = Arc::make_mut(&mut self.virtual_block_sizes);
+        let measured_blocks = Arc::make_mut(&mut self.virtual_block_measured);
+        measured_blocks.resize(sizes.len(), false);
         let mut first_changed = None;
         for (index, measured) in measurements {
             let measured = px(f32::from(*measured).ceil().max(1.0));
             let Some(current) = sizes.get_mut(*index) else {
                 continue;
+            };
+            let was_measured = measured_blocks[*index];
+            measured_blocks[*index] = true;
+            // Incomplete Markdown can transiently lay out shorter between streaming parses.
+            let measured = if self.options.streaming && was_measured && measured < *current {
+                *current
+            } else {
+                measured
             };
             if f32::from(*current - measured).abs() >= 1.0 {
                 *current = measured;
@@ -3661,7 +3752,8 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn rebuild_anchors("))
             .map(|(body, _)| body)
             .expect("virtual block measurement should remain inspectable");
-        assert_eq!(measurement.matches("Arc::make_mut").count(), 2);
+        assert_eq!(measurement.matches("Arc::make_mut").count(), 3);
+        assert!(measurement.contains("virtual_block_measured"));
         assert!(!measurement.contains("virtual_block_sizes.as_ref().clone()"));
     }
 
@@ -3790,6 +3882,85 @@ mod tests {
         });
         assert!(second_range.start > first_range.start);
         assert!(second_range.len() < block_count / 4);
+    }
+
+    #[::gpui::test]
+    fn streaming_virtual_markdown_preserves_measured_height_across_appends(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let sections = (0..4)
+            .map(|index| {
+                format!(
+                    "## Section {index}\n\nParagraph {index}: {}",
+                    "streaming content ".repeat(128)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let source = format!("{sections}\n\nTail paragraph");
+        let input = MarkdownInput::new(source.clone(), "", 1).surface(MarkdownSurface::Agent);
+        let document = Arc::new(parse_markdown(input.clone()));
+        let options = MarkdownViewOptions {
+            presentation: MarkdownPresentation::Agent,
+            streaming: true,
+            ..MarkdownViewOptions::default()
+        };
+        let (state, cx) = cx.add_window_view(|_, cx| {
+            MarkdownViewState::new(
+                "streaming-virtual-layout".into(),
+                input,
+                Some(document),
+                options,
+                cx,
+            )
+        });
+
+        state.update(cx, |state, _| {
+            assert!(source.len() >= AGENT_STREAMING_BLOCK_VIRTUALIZATION_MIN_SOURCE_BYTES);
+            assert!(source.len() < AGENT_BLOCK_VIRTUALIZATION_MIN_SOURCE_BYTES);
+            assert!(state.document.blocks.len() >= AGENT_STREAMING_BLOCK_VIRTUALIZATION_MIN_BLOCKS);
+            assert!(state.document.blocks.len() < AGENT_BLOCK_VIRTUALIZATION_MIN_BLOCKS);
+            assert!(state.should_virtualize_blocks());
+            state.options.streaming = false;
+            assert!(!state.should_virtualize_blocks());
+            state.options.streaming = true;
+
+            let width = px(560.0);
+            state.virtual_layout_width = Some(width);
+            state.rebuild_virtual_layout(f32::from(width));
+            let tail = state.document.blocks.len() - 1;
+            let first_id = state.document.blocks[0].id;
+            let old_tail_id = state.document.blocks[tail].id;
+            assert!(state.record_virtual_block_heights(width, &[(0, px(91.0)), (tail, px(83.0))],));
+            let previous_total = state.virtual_total_height();
+
+            let next_input = MarkdownInput::new(
+                format!("{source} that continues on the same rendered line."),
+                "",
+                2,
+            )
+            .surface(MarkdownSurface::Agent);
+            state.apply_document(Arc::new(parse_markdown(next_input)));
+
+            assert_eq!(state.virtual_layout_width, Some(width));
+            assert_eq!(state.document.blocks[0].id, first_id);
+            assert_ne!(state.document.blocks[tail].id, old_tail_id);
+            assert_eq!(state.virtual_block_sizes[0], px(91.0));
+            assert_eq!(state.virtual_block_sizes[tail], px(83.0));
+            assert!(state.virtual_block_measured[0]);
+            assert!(state.virtual_block_measured[tail]);
+            assert_eq!(state.virtual_total_height(), previous_total);
+
+            assert!(!state.record_virtual_block_heights(width, &[(tail, px(63.0))]));
+            assert_eq!(state.virtual_block_sizes[tail], px(83.0));
+            assert!(state.record_virtual_block_heights(width, &[(tail, px(103.0))]));
+            assert_eq!(state.virtual_block_sizes[tail], px(103.0));
+
+            state.options.streaming = false;
+            assert!(state.record_virtual_block_heights(width, &[(tail, px(63.0))]));
+            assert_eq!(state.virtual_block_sizes[tail], px(63.0));
+        });
     }
 
     #[::gpui::test]

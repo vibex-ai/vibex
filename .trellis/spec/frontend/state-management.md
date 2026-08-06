@@ -106,12 +106,45 @@ estimated_heights.insert(turn_id, (signature, current_virtual_height));
 measured_height = previous_measured_height.max(measured_height); // same streaming row only
 ```
 
+The same ownership rule applies inside `MarkdownVirtualFlow`. A long streaming
+document is reparsed as each accepted snapshot arrives, but replacing the
+document must not reset every top-level block from a measured height back to its
+estimate. Carry the virtual layout width and the previous block measurements
+across an append-only source update: reuse a block with the same stable `NodeId`
+and reuse the final block when its kind, start offset, and old source are a
+prefix of the new source. Keep a per-block measured flag so an already measured
+block can grow but cannot shrink while `MarkdownViewOptions::streaming` is true;
+after streaming ends, the normal measurement path may shrink it to the final
+intrinsic height. Streaming Agent documents enter block virtualization before
+the large-document threshold once they have at least 8 top-level blocks and 8
+KiB of source, so short structured answers keep the full renderer while long
+answers do not switch rendering modes only after substantial content is already
+laid out.
+
+```rust
+// Wrong: every background parse throws away the visible block geometry.
+self.virtual_block_sizes = estimate_all_blocks(&document);
+
+// Correct: stable prefix and the continuing tail keep their current extent;
+// prepaint measures the new source and grows it when the rendered block grows.
+restore_append_only_virtual_layout(previous_layout);
+height = if streaming && block_was_measured {
+    previous_height.max(measured_height)
+} else {
+    measured_height
+};
+```
+
 Regression coverage must assert that the streaming fast path neither clears
 pending turn heights nor invalidates a measured height, and does not mutate the
 virtual row-size vector. Cover both conclusion and process-history Agent text,
 the non-shrinking same-row measurement rule, and the text-only structural
 transition path that bypasses estimated height. Non-text structured events
 continue to use the full invalidation contract above.
+For long Markdown, also assert that an append-only document update preserves
+the measured prefix and continuing tail, that repeated streaming measurements
+are monotonic, and that the final non-streaming measurement can converge
+downward.
 
 When a new-session draft includes an initial message, await session creation
 only long enough to obtain the authoritative session record. Commit and select
@@ -1146,6 +1179,10 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   updates, sequence gaps reject the fast path, incremental height metrics equal
   full estimation, and a throttled Markdown snapshot keeps its source and
   revision paired while replacement/final snapshots refresh immediately.
+  The `vibex-markdown` GPUI tests also cover append-only virtual-block geometry:
+  measured stable blocks and the continuing tail survive each parse, streaming
+  heights never shrink, and the first non-streaming measurement may settle to a
+  smaller final intrinsic height.
 - `desktop-model` runtime tests feed descriptions and shuffled Effort values,
   then assert value-derived names, semantic low-to-high ordering, deterministic
   unknown ordering, and no `Default` effort.
