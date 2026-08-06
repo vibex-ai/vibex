@@ -2708,6 +2708,11 @@ ProviderConfigService::{
   produce child-process Secret env and code-owned JSON/TOML/YAML overlays, but
   the resolved wrapper's `Debug` output, preview, errors, Remote DTOs, and
   fingerprints remain redacted.
+- OpenCode overlay fields that are optional in its native schema must be
+  omitted when unavailable, not serialized as JSON `null`. In particular, a
+  configured model without a display name is emitted as an empty model object;
+  OpenCode accepts `name: string | undefined` and rejects `name: null` before
+  the ACP handshake.
 - Managed overlays live only under the Vibex private runtime root, use atomic
   owner-only writes, and reject absolute/parent traversal, symlink escape, and
   arbitrary catalog templates.
@@ -2758,11 +2763,16 @@ ProviderConfigService::{
 - Good: user-installed OpenCode `1.18.11` is detected from PATH, matches the
   supported `1.x` descriptor, and exposes Endpoint, API Key, Model, and Wire API
   controls without pinning the user's CLI patch/minor version.
+- Good: an OpenCode model with no display name projects as `"model-id": {}` and
+  the resulting inline configuration reaches the ACP initialize handshake.
 - Base: an unknown catalog Agent receives an explicit unverified capability and
   no fake API-key form or managed overlay.
 - Base: a future OpenCode `2.x` remains conservative until that breaking major
   version is explicitly verified and assigned a compatible descriptor.
 - Bad: infer provider projection support from installability or ACP readiness.
+- Bad: serialize a missing optional OpenCode model name as `"name": null`; the
+  CLI rejects the entire inline configuration before provider or model access
+  can be tested.
 - Bad: place one global `wire_api` on the Provider or inject the same env keys
   into every Agent.
 - Bad: write `~/.codex`, `~/.claude`, or another user Agent home as the normal
@@ -2778,7 +2788,8 @@ ProviderConfigService::{
   revision CAS, legacy id preservation, and one Provider bound to two runtimes.
 - Config-switch tests assert deterministic env/JSON/TOML/YAML projection,
   private permissions, path/symlink rejection, late Secret resolution,
-  redacted `Debug`/preview, and selective stale propagation.
+  redacted `Debug`/preview, selective stale propagation, and omission of an
+  absent OpenCode model display name without losing a configured name.
 - ACP tests assert Claude/Codex/OpenCode parity, prepare-failure fencing, and
   Profile-save stale marking without process termination.
 - Backend/Remote/UI tests assert version-matched capability pass-through,

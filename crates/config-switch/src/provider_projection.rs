@@ -1226,15 +1226,18 @@ fn opencode_overlay(
             .get_mut("models")
             .and_then(serde_json::Value::as_object_mut)
         {
+            let display_name = provider
+                .configured_models
+                .iter()
+                .find(|entry| entry.id == model.provider_model_id)
+                .and_then(|entry| entry.display_name.clone());
+            let mut model_config = serde_json::Map::new();
+            if let Some(display_name) = display_name {
+                model_config.insert("name".to_string(), serde_json::Value::String(display_name));
+            }
             models.insert(
                 model.agent_model_id.clone(),
-                serde_json::json!({
-                    "name": provider
-                        .configured_models
-                        .iter()
-                        .find(|entry| entry.id == model.provider_model_id)
-                        .and_then(|entry| entry.display_name.clone())
-                }),
+                serde_json::Value::Object(model_config),
             );
         }
     }
@@ -2108,6 +2111,27 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn opencode_overlay_omits_absent_model_display_name() {
+        let (mut provider, _, binding, _) = fixture(ConfigOverlayStrategy::OpenCodeInlineProvider);
+        let endpoint = provider.endpoints.first().unwrap();
+
+        let content = opencode_overlay(&provider, &binding, Some(endpoint)).unwrap();
+        let overlay: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            overlay["provider"]["fake"]["models"]["model-a"],
+            serde_json::json!({})
+        );
+
+        provider.configured_models[0].display_name = Some("Model A".to_string());
+        let content = opencode_overlay(&provider, &binding, Some(endpoint)).unwrap();
+        let overlay: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            overlay["provider"]["fake"]["models"]["model-a"]["name"],
+            "Model A"
+        );
     }
 
     #[test]
