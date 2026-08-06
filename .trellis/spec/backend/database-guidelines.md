@@ -38,7 +38,10 @@ Plan migrations around these domain records:
 - `agent_sessions`.
 - `agent_timeline_items`.
 - `provider_configs`, `provider_bindings`, `provider_health`,
-  `provider_usage`, `provider_injection_plans`, and `provider_runtime_option_snapshots`.
+  `provider_usage`, `provider_injection_plans`, and the legacy
+  `provider_runtime_option_snapshots` table.
+- `agent_configs`, `agent_discovery_records`, and the active Agent-owned
+  `agent_runtime_option_snapshots` table.
 - `mcp_servers`, `skills`, `skill_repos`, and `prompts`.
 - `terminals`.
 - `git_snapshots`.
@@ -113,15 +116,25 @@ state before the side effect to support recovery on restart.
   `project_id`, or `provider_profile_id`.
 - JSON columns must have documented payload versions.
 
-`provider_runtime_option_snapshots` stores one ACP model/session-config evidence snapshot per Provider Profile. Its
-nullable payloads represent a failed first attempt, while `last_success_at_ms`, `last_attempt_at_ms`, and
-`last_error_code` distinguish successful, stale-after-failure, and failure-only states. Failure updates must preserve
-the previous successful JSON payloads. Profile soft deletion removes its snapshot in the same transaction, while a
-physical deletion is covered by the foreign-key cascade.
+`agent_runtime_option_snapshots` is the active Runtime Option Catalog cache. It
+stores one row per `agent_id` (not per Provider Profile) with a nullable
+`session_config_json`, `last_success_at_ms`, `last_attempt_at_ms`, and
+`last_error_code`. Successful Agent probes persist only modes, reasoning
+controls, and generic session options; model ids must be empty because models
+are owned by Provider Profiles. A successful row is reused without a process
+launch until the Agent is removed. Removing an Agent deletes the row so a later
+re-add can probe again. A failed first attempt records its timestamp and stable
+error code; ordinary reads never retry it.
 
-Runtime-option snapshot payload schema v1 stores the camelCase JSON forms of `AgentModelListResponse` and
-`AgentSessionConfigProbe`. Additive fields require serde defaults for old rows; incompatible payload changes require a
-new migration and an explicit payload-version discriminator before writing the new shape.
+`provider_runtime_option_snapshots` is retained only as a migration-compatible
+legacy table. Current catalog code must not read, write, invalidate, or key new
+records by `provider_profile_id`.
+
+Runtime-option payload schema v1 stores the camelCase JSON form of
+`AgentSessionConfigProbe` with an empty `models` array. Additive fields require
+serde defaults for old rows; incompatible payload changes require a new
+migration and an explicit payload-version discriminator before writing the new
+shape.
 
 ## Anti-Patterns
 

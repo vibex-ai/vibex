@@ -43,7 +43,7 @@ use vibex_desktop_model::{
     ProviderCenterSnapshot, RecoveryOperationState, RedactedDiagnosticProjection,
 };
 use vibex_desktop_runtime::{
-    DesktopRuntime, ManagementHandle, RuntimeOptionRefreshResult, RuntimeOptionSnapshotSummary,
+    DesktopRuntime, ManagementHandle, RuntimeOptionProbeResult, RuntimeOptionSnapshotSummary,
     validate_external_open_url,
 };
 use vibex_markdown::code_font_weight;
@@ -277,6 +277,7 @@ enum ManagementMutation {
     ProfileDelete(String),
     AcpConfig(String),
     ProviderProbe(String),
+    AgentOptionProbe(String),
     AgentRuntimeProbe(String),
     ProviderPreview(String),
     AgentToggle(String),
@@ -314,6 +315,7 @@ impl ManagementMutation {
             Self::ProfileDelete(id) => format!("profile:delete:{id}"),
             Self::AcpConfig(id) => format!("provider:acp-config:{id}"),
             Self::ProviderProbe(id) => format!("provider:probe:{id}"),
+            Self::AgentOptionProbe(id) => format!("agent:option-probe:{id}"),
             Self::AgentRuntimeProbe(id) => format!("agent:runtime-probe:{id}"),
             Self::ProviderPreview(id) => format!("provider:preview:{id}"),
             Self::AgentToggle(id) => format!("agent:toggle:{id}"),
@@ -2007,7 +2009,7 @@ impl ManagementCenter {
         );
     }
 
-    fn refresh_agent_runtime_options(&mut self, cx: &mut Context<Self>) {
+    fn probe_agent_runtime_options(&mut self, cx: &mut Context<Self>) {
         let (Some(runtime), Some(agent_id)) =
             (self.runtime.clone(), self.selected_agent_id.clone())
         else {
@@ -2023,15 +2025,15 @@ impl ManagementCenter {
         };
         let active_locale = locale::current_locale();
         self.begin_simple_task(
-            ManagementMutation::ProviderProbe("runtime-options".into()),
+            ManagementMutation::AgentOptionProbe(agent_id.as_str().to_string()),
             cx,
             async move {
                 let result = runtime
                     .agent()
                     .runtime_catalog()
-                    .refresh_agent(&agent_id)
+                    .probe_agent(&agent_id)
                     .await?;
-                Ok(management_runtime_option_refresh_message(
+                Ok(management_runtime_option_probe_message(
                     &result,
                     active_locale,
                 ))
@@ -2450,26 +2452,13 @@ impl ManagementCenter {
                         env: None,
                         params: None,
                     })?;
-                let message = management_locale_text_for(
+                Ok(management_locale_text_for(
                     active_locale,
                     "Agent updated",
                     "Agent 已更新",
                     "Agent 已更新",
                 )
-                .to_string();
-                if !enabled {
-                    return Ok(message);
-                }
-                let refresh = runtime
-                    .agent()
-                    .runtime_catalog()
-                    .refresh_agent(&agent_id)
-                    .await;
-                Ok(management_append_runtime_option_refresh(
-                    message,
-                    refresh,
-                    active_locale,
-                ))
+                .to_string())
             },
         );
     }
@@ -2545,9 +2534,9 @@ impl ManagementCenter {
                     let refresh = runtime
                         .agent()
                         .runtime_catalog()
-                        .refresh_agent(&parsed_agent_id)
+                        .probe_agent(&parsed_agent_id)
                         .await;
-                    Ok(management_append_runtime_option_refresh(
+                    Ok(management_append_runtime_option_probe(
                         message,
                         refresh,
                         active_locale,
@@ -2593,7 +2582,7 @@ impl ManagementCenter {
             let providers = runtime.management().providers().management();
             let runtime_catalog = runtime.agent().runtime_catalog();
             let mut discovered_count = 0_usize;
-            let mut option_refresh = RuntimeOptionRefreshResult::default();
+            let mut option_refresh = RuntimeOptionProbeResult::default();
             let mut option_refresh_errors = 0_usize;
             for agent_id in candidates {
                 providers.update_agent_config(AgentUpdateConfigRequest {
@@ -2625,14 +2614,17 @@ impl ManagementCenter {
                         params: None,
                     })?;
                     discovered_count = discovered_count.saturating_add(1);
-                    match runtime_catalog.refresh_agent(&agent_id).await {
+                    match runtime_catalog.probe_agent(&agent_id).await {
                         Ok(result) => {
                             option_refresh
-                                .refreshed_profile_ids
-                                .extend(result.refreshed_profile_ids);
+                                .probed_agent_ids
+                                .extend(result.probed_agent_ids);
                             option_refresh
-                                .failed_profile_ids
-                                .extend(result.failed_profile_ids);
+                                .failed_agent_ids
+                                .extend(result.failed_agent_ids);
+                            option_refresh
+                                .cached_agent_ids
+                                .extend(result.cached_agent_ids);
                         }
                         Err(_) => {
                             option_refresh_errors = option_refresh_errors.saturating_add(1);
@@ -2640,7 +2632,7 @@ impl ManagementCenter {
                     }
                 } else {
                     providers.update_agent_config(AgentUpdateConfigRequest {
-                        agent_id,
+                        agent_id: agent_id.clone(),
                         added: Some(false),
                         enabled: Some(false),
                         label_override: None,
@@ -2666,11 +2658,8 @@ impl ManagementCenter {
                     format!("已發現並啟用 {count} 個本機 Agent CLI")
                 }
             };
-            let message = management_append_runtime_option_refresh(
-                message,
-                Ok(option_refresh),
-                active_locale,
-            );
+            let message =
+                management_append_runtime_option_probe(message, Ok(option_refresh), active_locale);
             if option_refresh_errors == 0 {
                 Ok(message)
             } else {
@@ -2678,12 +2667,12 @@ impl ManagementCenter {
                     "{message}; {}",
                     match active_locale {
                         ResolvedLocale::En => format!(
-                            "runtime option refresh failed for {option_refresh_errors} Agent(s)"
+                            "runtime option probing failed for {option_refresh_errors} Agent(s)"
                         ),
                         ResolvedLocale::ZhCn =>
-                            format!("{option_refresh_errors} 个 Agent 的运行选项刷新失败"),
+                            format!("{option_refresh_errors} 个 Agent 的运行选项探测失败"),
                         ResolvedLocale::ZhTw =>
-                            format!("{option_refresh_errors} 個 Agent 的執行選項重新整理失敗"),
+                            format!("{option_refresh_errors} 個 Agent 的執行選項探測失敗"),
                     }
                 ))
             }
@@ -2742,9 +2731,9 @@ impl ManagementCenter {
                     let refresh = runtime
                         .agent()
                         .runtime_catalog()
-                        .refresh_agent(&response.agent.id)
+                        .probe_agent(&response.agent.id)
                         .await;
-                    return Ok(management_append_runtime_option_refresh(
+                    return Ok(management_append_runtime_option_probe(
                         message,
                         refresh,
                         active_locale,
@@ -2847,10 +2836,9 @@ impl ManagementCenter {
                 this.mutation = None;
                 let agent_registry_changed = matches!(
                     &completed_mutation,
-                    ManagementMutation::AgentToggle(_) | ManagementMutation::AgentDiscovery
-                ) || matches!(
-                    &completed_mutation,
-                    ManagementMutation::ProviderProbe(action) if action == "runtime-options"
+                    ManagementMutation::AgentToggle(_)
+                        | ManagementMutation::AgentDiscovery
+                        | ManagementMutation::AgentOptionProbe(_)
                 );
                 match outcome {
                     Ok(Ok(message)) => {
@@ -6355,33 +6343,26 @@ impl ManagementCenter {
         });
         let refreshing_runtime_options = matches!(
             &self.mutation,
-            Some(ManagementMutation::ProviderProbe(action)) if action == "runtime-options"
+            Some(ManagementMutation::AgentOptionProbe(agent_id))
+                if agent_id == &selected_agent_id
         );
-        let mut runtime_option_rows = v_flex().w_full().gap_1();
-        for profile in &profiles {
-            let summary = self.runtime_option_snapshots.iter().find(|summary| {
-                summary.provider_profile_id.as_str() == profile.id
-                    && summary.agent_id.as_str() == selected_agent_id
-            });
-            runtime_option_rows = runtime_option_rows.child(stat_line(
-                profile.display_name.clone(),
-                management_runtime_option_snapshot_status(summary),
-                cx,
-            ));
-        }
-        if profiles.is_empty() {
-            runtime_option_rows = runtime_option_rows.child(compact_empty_state(
-                copy.no_profiles,
-                copy.no_profiles_description,
-                cx,
-            ));
-        }
+        let runtime_option_summary = self
+            .runtime_option_snapshots
+            .iter()
+            .find(|summary| summary.agent_id.as_str() == selected_agent_id);
+        let runtime_options_cached =
+            runtime_option_summary.is_some_and(|summary| summary.last_success_at_ms.is_some());
+        let runtime_option_rows = v_flex().w_full().gap_1().child(stat_line(
+            selected_agent.label.clone(),
+            management_runtime_option_snapshot_status(runtime_option_summary),
+            cx,
+        ));
         let runtime_options_card = management_card(
             management_locale_text("Runtime options", "运行选项", "執行選項"),
             management_locale_text(
-                "Models, thinking depth, run modes, and Features detected through ACP are cached per configuration.",
-                "通过 ACP 探测到的模型、思考深度、运行模式与 Features 会按配置缓存。",
-                "透過 ACP 探測到的模型、思考深度、執行模式與 Features 會依配置快取。",
+                "Run modes, reasoning controls, and Features reported by the Agent CLI are detected once and cached for this Agent.",
+                "Agent CLI 上报的运行模式、推理控制项与 Features 只探测一次，并按 Agent 缓存。",
+                "Agent CLI 回報的執行模式、推理控制項與 Features 只探測一次，並依 Agent 快取。",
             ),
             v_flex()
                 .w_full()
@@ -6392,13 +6373,11 @@ impl ManagementCenter {
                             .small()
                             .secondary()
                             .icon(Icon::default().path("icons/vibex/rotate-ccw.svg"))
-                            .label(management_refresh_options_label())
+                            .label(management_probe_options_label())
                             .loading(refreshing_runtime_options)
-                            .disabled(pending || !selected_agent.enabled || profiles.is_empty())
+                            .disabled(pending || !selected_agent.enabled || runtime_options_cached)
                             .on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.refresh_agent_runtime_options(cx)
-                                }),
+                                cx.listener(|this, _, _, cx| this.probe_agent_runtime_options(cx)),
                             ),
                     ),
                 )
@@ -11945,8 +11924,8 @@ fn management_capability_probe_label() -> &'static str {
     management_locale_text("Capability check", "能力检查", "能力檢查")
 }
 
-fn management_refresh_options_label() -> &'static str {
-    management_locale_text("Refresh options", "刷新选项", "重新整理選項")
+fn management_probe_options_label() -> &'static str {
+    management_locale_text("Probe options", "探测选项", "探測選項")
 }
 
 fn management_runtime_option_snapshot_status(
@@ -11954,75 +11933,88 @@ fn management_runtime_option_snapshot_status(
 ) -> String {
     match summary {
         Some(summary) if summary.last_success_at_ms.is_some() => {
-            if summary.last_error_code.is_some() {
-                management_locale_text(
-                    "Cached; refresh failed",
-                    "已缓存；刷新失败",
-                    "已快取；重新整理失敗",
-                )
+            management_locale_text("Detected and cached", "已探测并缓存", "已探測並快取")
                 .to_string()
-            } else {
-                management_locale_text("Cached", "已缓存", "已快取").to_string()
-            }
         }
-        Some(_) => management_locale_text("Detection failed", "探测失败", "探測失敗").to_string(),
-        None => management_locale_text("Not detected", "尚未探测", "尚未探測").to_string(),
+        Some(_) => management_locale_text("Probe failed", "探测失败", "探測失敗").to_string(),
+        None => management_locale_text("Not probed", "尚未探测", "尚未探測").to_string(),
     }
 }
 
-fn management_runtime_option_refresh_message(
-    result: &RuntimeOptionRefreshResult,
+fn management_runtime_option_probe_message(
+    result: &RuntimeOptionProbeResult,
     active_locale: ResolvedLocale,
 ) -> String {
-    let refreshed = result.refreshed_profile_ids.len();
-    let failed = result.failed_profile_ids.len();
-    match (active_locale, refreshed, failed) {
-        (ResolvedLocale::En, 0, 0) => "No enabled ACP configuration to refresh".into(),
-        (ResolvedLocale::ZhCn, 0, 0) => "没有可刷新的已启用 ACP 配置".into(),
-        (ResolvedLocale::ZhTw, 0, 0) => "沒有可重新整理的已啟用 ACP 配置".into(),
-        (ResolvedLocale::En, refreshed, 0) => {
-            format!("Refreshed options for {refreshed} configuration(s)")
+    let detected = result.probed_agent_ids.len();
+    let failed = result.failed_agent_ids.len();
+    let cached = result.cached_agent_ids.len();
+    match (active_locale, detected, failed, cached) {
+        (ResolvedLocale::En, 0, 0, 0) => "Agent runtime option probe was not started".into(),
+        (ResolvedLocale::ZhCn, 0, 0, 0) => "未启动 Agent 运行选项探测".into(),
+        (ResolvedLocale::ZhTw, 0, 0, 0) => "未啟動 Agent 執行選項探測".into(),
+        (ResolvedLocale::En, detected, 0, 0) => {
+            format!("Detected and cached runtime options for {detected} Agent(s)")
         }
-        (ResolvedLocale::ZhCn, refreshed, 0) => {
-            format!("已刷新 {refreshed} 个配置的运行选项")
+        (ResolvedLocale::ZhCn, detected, 0, 0) => {
+            format!("已探测并缓存 {detected} 个 Agent 的运行选项")
         }
-        (ResolvedLocale::ZhTw, refreshed, 0) => {
-            format!("已重新整理 {refreshed} 個配置的執行選項")
+        (ResolvedLocale::ZhTw, detected, 0, 0) => {
+            format!("已探測並快取 {detected} 個 Agent 的執行選項")
         }
-        (ResolvedLocale::En, refreshed, failed) => format!(
-            "Refreshed {refreshed} configuration(s); {failed} failed and kept their last cache"
-        ),
-        (ResolvedLocale::ZhCn, refreshed, failed) => {
-            format!("已刷新 {refreshed} 个配置；{failed} 个失败并保留原缓存")
+        (ResolvedLocale::En, 0, 0, cached) => {
+            format!("Using cached runtime options for {cached} Agent(s)")
         }
-        (ResolvedLocale::ZhTw, refreshed, failed) => {
-            format!("已重新整理 {refreshed} 個配置；{failed} 個失敗並保留原快取")
+        (ResolvedLocale::ZhCn, 0, 0, cached) => {
+            format!("正在使用 {cached} 个 Agent 的运行选项缓存")
+        }
+        (ResolvedLocale::ZhTw, 0, 0, cached) => {
+            format!("正在使用 {cached} 個 Agent 的執行選項快取")
+        }
+        (ResolvedLocale::En, 0, failed, 0) => {
+            format!("Runtime option probing failed for {failed} Agent(s)")
+        }
+        (ResolvedLocale::ZhCn, 0, failed, 0) => {
+            format!("{failed} 个 Agent 的运行选项探测失败")
+        }
+        (ResolvedLocale::ZhTw, 0, failed, 0) => {
+            format!("{failed} 個 Agent 的執行選項探測失敗")
+        }
+        (ResolvedLocale::En, detected, failed, cached) => {
+            format!("Agent runtime options: {detected} detected, {cached} cached, {failed} failed")
+        }
+        (ResolvedLocale::ZhCn, detected, failed, cached) => {
+            format!("Agent 运行选项：{detected} 个已探测，{cached} 个已缓存，{failed} 个失败")
+        }
+        (ResolvedLocale::ZhTw, detected, failed, cached) => {
+            format!("Agent 執行選項：{detected} 個已探測，{cached} 個已快取，{failed} 個失敗")
         }
     }
 }
 
-fn management_append_runtime_option_refresh(
+fn management_append_runtime_option_probe(
     message: String,
-    result: Result<RuntimeOptionRefreshResult, VibexError>,
+    result: Result<RuntimeOptionProbeResult, VibexError>,
     active_locale: ResolvedLocale,
 ) -> String {
     match result {
         Ok(result)
-            if result.refreshed_profile_ids.is_empty() && result.failed_profile_ids.is_empty() =>
+            if result.probed_agent_ids.is_empty()
+                && result.failed_agent_ids.is_empty()
+                && result.cached_agent_ids.is_empty() =>
         {
             message
         }
         Ok(result) => format!(
             "{message}; {}",
-            management_runtime_option_refresh_message(&result, active_locale)
+            management_runtime_option_probe_message(&result, active_locale)
         ),
         Err(error) => format!(
             "{message}; {} ({})",
             management_locale_text_for(
                 active_locale,
-                "runtime option refresh failed",
-                "运行选项刷新失败",
-                "執行選項重新整理失敗",
+                "runtime option probe failed",
+                "运行选项探测失败",
+                "執行選項探測失敗",
             ),
             error.code
         ),
@@ -12908,7 +12900,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_profile_saves_do_not_wait_for_runtime_catalog_probes() {
+    fn provider_profile_saves_do_not_probe_agent_runtime_options() {
         let source = include_str!("management.rs");
         let duplicate = source
             .split_once("    fn duplicate_provider_profile(")
@@ -12926,9 +12918,61 @@ mod tests {
             .map(|(body, _)| body)
             .expect("ACP config save handler should remain inspectable");
 
-        assert!(!duplicate.contains(".refresh_agent("));
-        assert!(!save.contains(".refresh_agent("));
-        assert!(!acp.contains(".refresh_agent("));
+        assert!(!duplicate.contains(".probe_agent("));
+        assert!(!save.contains(".probe_agent("));
+        assert!(!acp.contains(".probe_agent("));
+    }
+
+    #[test]
+    fn agent_setup_probes_options_but_ordinary_toggle_does_not() {
+        let source = include_str!("management.rs");
+        let toggle = source
+            .split_once("    fn toggle_agent(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn set_agent_added("))
+            .map(|(body, _)| body)
+            .expect("Agent toggle handler should remain inspectable");
+        let add = source
+            .split_once("    fn set_agent_added(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn discover_local_agents("))
+            .map(|(body, _)| body)
+            .expect("Agent add handler should remain inspectable");
+        let discover = source
+            .split_once("    fn discover_local_agents(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn probe_agent("))
+            .map(|(body, _)| body)
+            .expect("Agent discovery handler should remain inspectable");
+        let detect_after_install = source
+            .split_once("    fn probe_agent(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn set_default_provider_profile("))
+            .map(|(body, _)| body)
+            .expect("Agent install detection handler should remain inspectable");
+
+        assert!(!toggle.contains(".probe_agent("));
+        assert_eq!(add.matches(".probe_agent(").count(), 1);
+        assert_eq!(discover.matches(".probe_agent(").count(), 1);
+        assert_eq!(detect_after_install.matches(".probe_agent(").count(), 1);
+    }
+
+    #[test]
+    fn successful_agent_option_snapshot_disables_reprobe_without_provider_gate() {
+        let source = include_str!("management.rs");
+        let render = source
+            .split_once("    fn render_providers(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_mcp("))
+            .map(|(body, _)| body)
+            .expect("Provider renderer should remain inspectable");
+
+        assert!(render.contains("summary.agent_id.as_str() == selected_agent_id"));
+        assert!(render.contains("runtime_options_cached"));
+        assert!(
+            render.contains(
+                ".disabled(pending || !selected_agent.enabled || runtime_options_cached)"
+            )
+        );
+        assert!(
+            !render
+                .contains(".disabled(pending || !selected_agent.enabled || profiles.is_empty())")
+        );
     }
 
     #[test]

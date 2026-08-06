@@ -1863,6 +1863,7 @@ mod tests {
             vec![
                 "37:agent_provider_projection_platform",
                 "38:agent_runtime_provider_probe_evidence",
+                "39:agent_runtime_option_snapshots",
             ]
         );
         assert_eq!(

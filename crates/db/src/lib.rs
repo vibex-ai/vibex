@@ -72,7 +72,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 38;
+pub const CURRENT_SCHEMA_VERSION: i64 = 39;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -1642,6 +1642,21 @@ const MIGRATIONS: &[Migration] = &[
                 ON agent_runtime_provider_probes(status, updated_at_ms);
         ",
     },
+    Migration {
+        version: 39,
+        name: "agent_runtime_option_snapshots",
+        sql: "
+            CREATE TABLE IF NOT EXISTS agent_runtime_option_snapshots (
+                agent_id TEXT PRIMARY KEY,
+                session_config_json TEXT NULL,
+                last_success_at_ms INTEGER NULL,
+                last_attempt_at_ms INTEGER NOT NULL,
+                last_error_code TEXT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_runtime_option_snapshots_attempt
+                ON agent_runtime_option_snapshots(last_attempt_at_ms);
+        ",
+    },
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -1666,6 +1681,7 @@ pub struct ProviderInjectionPreviewRepository;
 pub struct ProviderNativeExportRepository;
 pub struct ProviderCapabilityRepository;
 pub struct ProviderRuntimeOptionSnapshotRepository;
+pub struct AgentRuntimeOptionSnapshotRepository;
 pub struct ProviderHealthRepository;
 pub struct ProviderUsageRepository;
 pub struct ScheduledTaskRepository;
@@ -1694,6 +1710,15 @@ pub struct ProviderRuntimeOptionSnapshotRecord {
     pub provider_profile_id: ProviderProfileId,
     pub agent_id: AgentId,
     pub model_response: Option<AgentModelListResponse>,
+    pub session_config: Option<AgentSessionConfigProbe>,
+    pub last_success_at_ms: Option<i64>,
+    pub last_attempt_at_ms: i64,
+    pub last_error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRuntimeOptionSnapshotRecord {
+    pub agent_id: AgentId,
     pub session_config: Option<AgentSessionConfigProbe>,
     pub last_success_at_ms: Option<i64>,
     pub last_attempt_at_ms: i64,
@@ -3904,6 +3929,119 @@ impl ProviderRuntimeOptionSnapshotRepository {
             records.push(row.map_err(storage_err(
                 "runtime_option_snapshot_decode_failed",
                 "failed to decode runtime option snapshot",
+            ))?);
+        }
+        Ok(records)
+    }
+}
+
+impl AgentRuntimeOptionSnapshotRepository {
+    pub fn upsert_success(
+        conn: &Connection,
+        record: &AgentRuntimeOptionSnapshotRecord,
+    ) -> VibexResult<()> {
+        let session_config = record.session_config.as_ref().ok_or_else(|| {
+            VibexError::validation(
+                "agent_runtime_option_snapshot_session_config_missing",
+                "successful Agent runtime option snapshot requires session configuration evidence",
+            )
+        })?;
+        let last_success_at_ms = record.last_success_at_ms.ok_or_else(|| {
+            VibexError::validation(
+                "agent_runtime_option_snapshot_success_time_missing",
+                "successful Agent runtime option snapshot requires a success timestamp",
+            )
+        })?;
+        conn.execute(
+            "
+            INSERT INTO agent_runtime_option_snapshots (
+                agent_id, session_config_json, last_success_at_ms,
+                last_attempt_at_ms, last_error_code
+            )
+            VALUES (?1, ?2, ?3, ?4, NULL)
+            ON CONFLICT(agent_id) DO UPDATE SET
+                session_config_json = excluded.session_config_json,
+                last_success_at_ms = excluded.last_success_at_ms,
+                last_attempt_at_ms = excluded.last_attempt_at_ms,
+                last_error_code = NULL
+            ",
+            params![
+                record.agent_id.as_str(),
+                json_to_db(session_config)?,
+                last_success_at_ms,
+                record.last_attempt_at_ms,
+            ],
+        )
+        .map_err(storage_err(
+            "agent_runtime_option_snapshot_upsert_failed",
+            "failed to persist Agent runtime option snapshot",
+        ))?;
+        Ok(())
+    }
+
+    pub fn record_failure(
+        conn: &Connection,
+        agent_id: &AgentId,
+        attempted_at_ms: i64,
+        error_code: &str,
+    ) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO agent_runtime_option_snapshots (
+                agent_id, session_config_json, last_success_at_ms,
+                last_attempt_at_ms, last_error_code
+            )
+            VALUES (?1, NULL, NULL, ?2, ?3)
+            ON CONFLICT(agent_id) DO UPDATE SET
+                last_attempt_at_ms = excluded.last_attempt_at_ms,
+                last_error_code = excluded.last_error_code
+            ",
+            params![agent_id.as_str(), attempted_at_ms, error_code],
+        )
+        .map_err(storage_err(
+            "agent_runtime_option_snapshot_failure_record_failed",
+            "failed to record Agent runtime option snapshot failure",
+        ))?;
+        Ok(())
+    }
+
+    pub fn delete(conn: &Connection, agent_id: &AgentId) -> VibexResult<()> {
+        conn.execute(
+            "DELETE FROM agent_runtime_option_snapshots WHERE agent_id = ?1",
+            params![agent_id.as_str()],
+        )
+        .map_err(storage_err(
+            "agent_runtime_option_snapshot_delete_failed",
+            "failed to delete Agent runtime option snapshot",
+        ))?;
+        Ok(())
+    }
+
+    pub fn list(conn: &Connection) -> VibexResult<Vec<AgentRuntimeOptionSnapshotRecord>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT agent_id, session_config_json, last_success_at_ms,
+                    last_attempt_at_ms, last_error_code
+                FROM agent_runtime_option_snapshots
+                ORDER BY agent_id ASC
+                ",
+            )
+            .map_err(storage_err(
+                "agent_runtime_option_snapshot_list_failed",
+                "failed to list Agent runtime option snapshots",
+            ))?;
+        let rows = stmt
+            .query_map([], map_agent_runtime_option_snapshot)
+            .map_err(storage_err(
+                "agent_runtime_option_snapshot_list_failed",
+                "failed to list Agent runtime option snapshots",
+            ))?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(storage_err(
+                "agent_runtime_option_snapshot_decode_failed",
+                "failed to decode Agent runtime option snapshot",
             ))?);
         }
         Ok(records)
@@ -11027,6 +11165,22 @@ fn map_provider_runtime_option_snapshot(
     })
 }
 
+fn map_agent_runtime_option_snapshot(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<AgentRuntimeOptionSnapshotRecord> {
+    let session_config = row
+        .get::<_, Option<String>>(1)?
+        .map(json_from_db_sql::<AgentSessionConfigProbe>)
+        .transpose()?;
+    Ok(AgentRuntimeOptionSnapshotRecord {
+        agent_id: parse_id_sql(row.get(0)?, AgentId::parse)?,
+        session_config,
+        last_success_at_ms: row.get(2)?,
+        last_attempt_at_ms: row.get(3)?,
+        last_error_code: row.get(4)?,
+    })
+}
+
 fn map_provider_usage_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderUsageRecord> {
     let window_label: Option<String> = row.get(9)?;
     let window_started_at_ms: Option<i64> = row.get(10)?;
@@ -11354,7 +11508,8 @@ mod tests {
                 "35:permission_response_options",
                 "36:agent_elicitation_requests",
                 "37:agent_provider_projection_platform",
-                "38:agent_runtime_provider_probe_evidence"
+                "38:agent_runtime_provider_probe_evidence",
+                "39:agent_runtime_option_snapshots"
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -11495,7 +11650,8 @@ mod tests {
                 "35:permission_response_options",
                 "36:agent_elicitation_requests",
                 "37:agent_provider_projection_platform",
-                "38:agent_runtime_provider_probe_evidence"
+                "38:agent_runtime_provider_probe_evidence",
+                "39:agent_runtime_option_snapshots"
             ]
         );
         assert_eq!(
@@ -13042,7 +13198,8 @@ mod tests {
                 "35:permission_response_options",
                 "36:agent_elicitation_requests",
                 "37:agent_provider_projection_platform",
-                "38:agent_runtime_provider_probe_evidence"
+                "38:agent_runtime_provider_probe_evidence",
+                "39:agent_runtime_option_snapshots"
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
@@ -14128,6 +14285,64 @@ mod tests {
                 .all(|snapshot| snapshot.provider_profile_id != successful_profile.id)
         );
 
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn agent_runtime_option_snapshot_round_trips_by_agent() {
+        let temp = temp_db_path("agent-runtime-option-snapshot");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let agent_id = AgentId::parse("opencode").unwrap();
+        let session_config = AgentSessionConfigProbe {
+            models: Vec::new(),
+            modes: vec![ProviderSessionConfigValue {
+                value: "plan".to_string(),
+                label: Some("Plan".to_string()),
+            }],
+            reasoning_efforts: vec![AgentReasoningEffort {
+                value: "high".to_string(),
+                description: None,
+            }],
+            options: Vec::new(),
+        };
+        AgentRuntimeOptionSnapshotRepository::upsert_success(
+            &conn,
+            &AgentRuntimeOptionSnapshotRecord {
+                agent_id: agent_id.clone(),
+                session_config: Some(session_config.clone()),
+                last_success_at_ms: Some(100),
+                last_attempt_at_ms: 100,
+                last_error_code: None,
+            },
+        )
+        .unwrap();
+        AgentRuntimeOptionSnapshotRepository::record_failure(
+            &conn,
+            &agent_id,
+            200,
+            "agent_option_probe_failed",
+        )
+        .unwrap();
+
+        let snapshots = AgentRuntimeOptionSnapshotRepository::list(&conn).unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].agent_id, agent_id);
+        assert_eq!(snapshots[0].session_config, Some(session_config));
+        assert_eq!(snapshots[0].last_success_at_ms, Some(100));
+        assert_eq!(snapshots[0].last_attempt_at_ms, 200);
+        assert_eq!(
+            snapshots[0].last_error_code.as_deref(),
+            Some("agent_option_probe_failed")
+        );
+
+        AgentRuntimeOptionSnapshotRepository::delete(&conn, &agent_id).unwrap();
+        assert!(
+            AgentRuntimeOptionSnapshotRepository::list(&conn)
+                .unwrap()
+                .is_empty()
+        );
         cleanup_db(temp);
     }
 

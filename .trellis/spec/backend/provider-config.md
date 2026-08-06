@@ -1930,10 +1930,10 @@ provider_capability_probe_records(
 
 ### 1. Scope / Trigger
 
-- Trigger: desktop startup installs or upgrades managed ACP adapters and probes
-  missing Runtime Option snapshots.
-- This crosses runtime lifecycle, Provider Profile persistence, the Runtime
-  Option Catalog, desktop events, and remote catalog invalidation.
+- Trigger: desktop startup installs or upgrades managed ACP adapters after the
+  authoritative runtime is ready.
+- Runtime-option probing is deliberately outside startup. It belongs to Agent
+  setup and must remain independent from Provider Profile reconciliation.
 
 ### 2. Signatures
 
@@ -1941,11 +1941,8 @@ provider_capability_probe_records(
 DesktopRuntime::start(config) -> Arc<DesktopRuntime>
 DesktopRuntime::spawn_agent_bootstrap() -> VibexResult<()>
 prepare_managed_acp_adapters(config_service, db_path).await
-RuntimeOptionCatalogService::refresh_missing().await
-DesktopEvent::ProviderConfigChanged {
-    phase: ProviderConfigChangePhase::RuntimeOptionsChanged,
-    provider_profile_ids,
-}
+RuntimeOptionCatalogService::probe_agent(agent_id).await
+ProviderProfileMutationEvent::{Saved, Deleted}(provider_profile_id)
 ```
 
 ### 3. Contracts
@@ -1954,14 +1951,21 @@ DesktopEvent::ProviderConfigChanged {
   gateway, and startup reconciliation, but not network-backed adapter installs
   or Agent process capability probes.
 - Start managed adapter preparation only after `DesktopRuntime::activate`
-  succeeds. Own the task in `DesktopRuntime.tasks` so shutdown aborts any npm or
-  probe child through its existing kill-on-drop lifecycle.
+  succeeds. Own the task in `DesktopRuntime.tasks` so shutdown aborts any npm
+  child through its existing kill-on-drop lifecycle.
 - Use the listener-enabled runtime `ProviderConfigService`. Adapter command
   reconciliation must still invalidate ACP process configuration and publish
   Provider Profile changes.
-- Probe only missing Runtime Option snapshots. After success or a persisted
-  failure, publish `RuntimeOptionsChanged` for the affected Profile ids and
-  invalidate the remote Provider projection.
+- Startup never scans for missing runtime-option snapshots and never calls an
+  Agent CLI for catalog enrichment. Existing Agent snapshots remain ordinary
+  SQLite cache reads.
+- Provider Profile save/delete consumers publish `ProfilesChanged` only. They
+  must not clear Agent snapshots, call `probe_agent`, enqueue a Profile-scoped
+  refresh, or publish `RuntimeOptionsChanged` as a consequence of the Provider
+  mutation.
+- After a Provider mutation, clients rebuild the Profile/model projection and
+  read the unchanged Agent snapshot. A newly configured model therefore gains
+  the Agent's cached controls without another probe.
 
 ### 4. Validation & Error Matrix
 
@@ -1969,30 +1973,40 @@ DesktopEvent::ProviderConfigChanged {
   background bootstrap.
 - Runtime task ownership lock fails -> return
   `process/desktop_runtime_task_lock_failed` from startup.
-- Managed install/reconciliation fails after readiness -> emit a bounded warning
-  and continue to the missing-snapshot phase.
-- Missing-snapshot refresh fails as a whole -> emit a bounded warning; keep the
-  runtime available.
-- Individual probe failure persisted successfully -> include that Profile id in
-  `RuntimeOptionsChanged` so unavailable evidence replaces provisional data.
+- Managed install/reconciliation fails after readiness -> emit a bounded
+  warning and keep the runtime available; do not fall through to an option
+  probe.
+- Provider save/delete succeeds -> publish one coalesced `ProfilesChanged`
+  event and remote Provider invalidation only.
+- Agent has no runtime-option snapshot at startup -> leave it `not probed`;
+  startup must not create a failed attempt record.
+- Agent has a successful snapshot while a Provider changes -> preserve the
+  snapshot and reuse it in the rebuilt catalog.
 
 ### 5. Good/Base/Bad Cases
 
 - Good: a new adapter version downloads slowly while the workbench opens; its
-  completed reconciliation refreshes Profile and Runtime Option projections.
-- Base: exact adapters and all snapshots already exist; the background task
-  performs no external install and emits no redundant Runtime Option event.
+  completed command reconciliation publishes Provider changes without starting
+  an Agent option probe.
+- Base: exact adapters are installed and an Agent has no snapshot; the
+  workbench remains ready and the Config Center shows `not probed`.
+- Good: adding a Provider Profile updates models and immediately reuses the
+  Agent's previously cached modes and Features.
 - Bad: `build_agent_manager` or `activate` awaits `npm install`, an ACP probe, or
   complete catalog enrichment before reporting the runtime ready.
+- Bad: startup calls `refresh_missing`, or a Profile save calls
+  `refresh_profile`/`probe_agent`.
 
 ### 6. Tests Required
 
 - `vibex-desktop-runtime` asserts activation precedes background bootstrap and
   manager construction contains no adapter installation.
-- Runtime catalog tests assert a failed missing snapshot is persisted and is not
-  retried on every application start.
-- Provider mutation tests assert Profile changes publish static invalidation
-  before background Runtime Option invalidation.
+- Runtime source assertions reject `refresh_missing` and
+  `RuntimeOptionsChanged` in bootstrap and Provider mutation consumers.
+- Provider mutation tests assert `ProfilesChanged` is published and no later
+  `RuntimeOptionsChanged` arrives.
+- Runtime catalog tests assert startup/list paths perform no provider or Agent
+  process call and Provider changes preserve the Agent snapshot.
 - Desktop tests assert the startup brand overlay is released before overview and
   authoritative timeline restoration, while its spinner delay remains five
   seconds.
@@ -2016,7 +2030,7 @@ Ok(runtime)
 ```
 
 The runtime becomes usable first; the owned background task converges managed
-Agent commands and capability evidence without weakening later invalidation.
+Agent commands only. Agent setup owns the separate one-time option probe.
 
 ## Scenario: Config Center Agent Registry And Selector Gating
 

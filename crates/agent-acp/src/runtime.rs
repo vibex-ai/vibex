@@ -268,6 +268,9 @@ pub(crate) enum AcpProcessPurpose {
 
 pub(crate) struct AcpProcessLaunch<'a> {
     pub(crate) profile_id: &'a ProviderProfileId,
+    /// Agent identity supplied for profile-free setup probes. Normal session
+    /// launches derive it from `profile_id`.
+    pub(crate) agent_id: Option<&'a AgentId>,
     pub(crate) config: &'a AcpProviderConfig,
     pub(crate) cwd: &'a Path,
     pub(crate) runtime_resources: &'a ProviderRuntimeResources,
@@ -4701,6 +4704,7 @@ impl AcpRuntimeSwitchBridge {
             .client
             .acquire_initialized_process(AcpProcessLaunch {
                 profile_id: &intent.target_selection.provider_profile_id,
+                agent_id: None,
                 config: &context.config,
                 cwd: &context.cwd,
                 runtime_resources: &context.runtime_resources,
@@ -7602,14 +7606,6 @@ impl AcpRuntimeClient {
             })
     }
 
-    fn is_opencode_profile(&self, profile_id: &ProviderProfileId) -> bool {
-        self.config_service
-            .get_profile(profile_id)
-            .ok()
-            .flatten()
-            .is_some_and(|profile| profile.agent_id.as_str() == OPENCODE_AGENT_ID)
-    }
-
     fn resolve_env_overlays_for_profile(
         &self,
         profile: &ProviderProfile,
@@ -8404,6 +8400,7 @@ impl AcpRuntimeClient {
     ) -> VibexResult<Arc<AcpProcess>> {
         let AcpProcessLaunch {
             profile_id,
+            agent_id,
             config,
             cwd,
             runtime_resources,
@@ -8411,14 +8408,17 @@ impl AcpRuntimeClient {
             process_strategy_effective,
             pool_fallback_reason,
         } = launch;
-        let agent_id = self
-            .config_service
-            .get_profile(profile_id)?
-            .map(|profile| profile.agent_id)
-            .unwrap_or_else(|| {
-                vibex_core::AgentId::parse("unknown-agent")
-                    .expect("static fallback agent id is valid")
-            });
+        let agent_id = match agent_id {
+            Some(agent_id) => agent_id.clone(),
+            None => self
+                .config_service
+                .get_profile(profile_id)?
+                .map(|profile| profile.agent_id)
+                .unwrap_or_else(|| {
+                    vibex_core::AgentId::parse("unknown-agent")
+                        .expect("static fallback agent id is valid")
+                }),
+        };
         let (compatibility_identity, event_enricher) = self
             .compatibility_registry
             .for_agent(&agent_id)
@@ -8441,7 +8441,7 @@ impl AcpRuntimeClient {
             .with_diagnostic("command", config.command.clone()));
         }
 
-        let opencode_error_bridge_enabled = self.is_opencode_profile(profile_id);
+        let opencode_error_bridge_enabled = agent_id.as_str() == OPENCODE_AGENT_ID;
         let process_args = materialized_args
             .unwrap_or_else(|| effective_acp_process_args(config, opencode_error_bridge_enabled));
         let env_overlays = match materialized_env {
@@ -9966,6 +9966,7 @@ impl AcpRuntimeClient {
         let lease = self
             .acquire_initialized_process(AcpProcessLaunch {
                 profile_id: &binding.provider_profile_id,
+                agent_id: None,
                 config: &config,
                 cwd: &cwd,
                 runtime_resources,
@@ -10014,6 +10015,7 @@ impl AcpRuntimeClient {
                     let fresh_lease = self
                         .acquire_initialized_process(AcpProcessLaunch {
                             profile_id: &binding.provider_profile_id,
+                            agent_id: None,
                             config: &config,
                             cwd: &cwd,
                             runtime_resources,
@@ -11829,6 +11831,89 @@ async fn resolve_terminal_create_permission(
     Ok(())
 }
 
+fn agent_probe_env_overlays(config: &AcpProviderConfig) -> Vec<(String, String)> {
+    config
+        .env
+        .iter()
+        .filter_map(|reference| {
+            let key = reference.key.trim();
+            if key.is_empty() {
+                return None;
+            }
+            let value = match reference.source {
+                AcpProviderEnvSource::Literal => reference.value.clone(),
+                AcpProviderEnvSource::ProcessEnvironment => std::env::var(key).ok(),
+                // Agent-level probes never resolve Provider secrets. A
+                // SecretReference here belongs to a Provider Profile and is
+                // intentionally ignored on this path.
+                AcpProviderEnvSource::SecretReference => None,
+            }?;
+            (!value.trim().is_empty()).then(|| (key.to_string(), value))
+        })
+        .collect()
+}
+
+async fn probe_runtime_session_config_with_config(
+    client: &AcpRuntimeClient,
+    profile_id: &ProviderProfileId,
+    agent_id: Option<&AgentId>,
+    config: &AcpProviderConfig,
+    materialized_env: Option<Vec<(String, String)>>,
+) -> VibexResult<AcpRuntimeSessionProbe> {
+    let probe_cwd = std::env::var("HOME")
+        .map(PathBuf::from)
+        .ok()
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
+    let probe_resources = ProviderRuntimeResources::default();
+    let process = client
+        .spawn_process(
+            AcpProcessInstanceId::new(),
+            AcpProcessLaunch {
+                profile_id,
+                agent_id,
+                config,
+                cwd: &probe_cwd,
+                runtime_resources: &probe_resources,
+                purpose: AcpProcessPurpose::Probe,
+                process_strategy_effective: AcpProcessStrategy::PerSession,
+                pool_fallback_reason: None,
+            },
+            None,
+            materialized_env,
+            None,
+        )
+        .await?;
+
+    let probe = async {
+        let initialize = process
+            .request(
+                AcpOperation::Initialize.method(),
+                build_initialize_params(false, false, false, false, false),
+                ACP_PROBE_TIMEOUT,
+            )
+            .await?;
+        let _ = initialize;
+        let session = process
+            .request(
+                AcpOperation::SessionNew.method(),
+                build_session_new_params(&probe_cwd, &[]),
+                ACP_PROBE_TIMEOUT,
+            )
+            .await?;
+        Ok::<AcpRuntimeSessionProbe, VibexError>(AcpRuntimeSessionProbe {
+            models: extract_model_ids(&session),
+            modes: extract_config_values(mode_candidates(&session)),
+            reasoning_efforts: extract_probe_reasoning_efforts(&session),
+            options: extract_config_options(&session),
+        })
+    };
+
+    let probed = probe.await;
+    process.shutdown().await;
+    probed
+}
+
 #[async_trait]
 impl AcpClient for AcpRuntimeClient {
     async fn create_session(&self, request: AcpCreateSessionRequest) -> VibexResult<AcpSession> {
@@ -11847,6 +11932,7 @@ impl AcpClient for AcpRuntimeClient {
         let lease = self
             .acquire_initialized_process(AcpProcessLaunch {
                 profile_id: &request.provider_profile_id,
+                agent_id: None,
                 config: &config,
                 cwd: &cwd,
                 runtime_resources: &request.runtime_resources,
@@ -11970,6 +12056,7 @@ impl AcpClient for AcpRuntimeClient {
                 AcpProcessInstanceId::new(),
                 AcpProcessLaunch {
                     profile_id: provider_profile_id,
+                    agent_id: None,
                     config: &config,
                     cwd: &cwd,
                     runtime_resources: &probe_resources,
@@ -12041,6 +12128,7 @@ impl AcpClient for AcpRuntimeClient {
         let lease = self
             .acquire_initialized_process(AcpProcessLaunch {
                 profile_id: &request.provider_profile_id,
+                agent_id: None,
                 config: &config,
                 cwd: &cwd,
                 runtime_resources: &request.runtime_resources,
@@ -12405,57 +12493,33 @@ impl AcpClient for AcpRuntimeClient {
         provider_profile_id: &ProviderProfileId,
     ) -> VibexResult<AcpRuntimeSessionProbe> {
         let config = self.profile_config(provider_profile_id)?;
-        let probe_cwd = std::env::var("HOME")
-            .map(PathBuf::from)
-            .ok()
-            .filter(|path| path.is_dir())
-            .unwrap_or_else(std::env::temp_dir);
-        let probe_resources = ProviderRuntimeResources::default();
-        let process = self
-            .spawn_process(
-                AcpProcessInstanceId::new(),
-                AcpProcessLaunch {
-                    profile_id: provider_profile_id,
-                    config: &config,
-                    cwd: &probe_cwd,
-                    runtime_resources: &probe_resources,
-                    purpose: AcpProcessPurpose::Probe,
-                    process_strategy_effective: AcpProcessStrategy::PerSession,
-                    pool_fallback_reason: None,
-                },
-                None,
-                None,
-                None,
-            )
-            .await?;
+        probe_runtime_session_config_with_config(self, provider_profile_id, None, &config, None)
+            .await
+    }
 
-        let probe = async {
-            let initialize = process
-                .request(
-                    AcpOperation::Initialize.method(),
-                    build_initialize_params(false, false, false, false, false),
-                    ACP_PROBE_TIMEOUT,
-                )
-                .await?;
-            let _ = initialize;
-            let session = process
-                .request(
-                    AcpOperation::SessionNew.method(),
-                    build_session_new_params(&probe_cwd, &[]),
-                    ACP_PROBE_TIMEOUT,
-                )
-                .await?;
-            Ok::<AcpRuntimeSessionProbe, VibexError>(AcpRuntimeSessionProbe {
-                models: extract_model_ids(&session),
-                modes: extract_config_values(mode_candidates(&session)),
-                reasoning_efforts: extract_probe_reasoning_efforts(&session),
-                options: extract_config_options(&session),
-            })
-        };
-
-        let probed = probe.await;
-        process.shutdown().await;
-        probed
+    async fn probe_runtime_session_config_for_agent(
+        &self,
+        agent_id: &AgentId,
+    ) -> VibexResult<AcpRuntimeSessionProbe> {
+        let config = self.config_service.get_agent_acp_runtime_config(agent_id)?;
+        // A setup probe has no Provider Profile by design. The synthetic id is
+        // process bookkeeping only and is never persisted or used for config
+        // resolution; the explicit Agent identity selects the compatibility
+        // descriptor.
+        let probe_profile_id = ProviderProfileId::new();
+        let env_overlays = agent_probe_env_overlays(&config);
+        let mut probe = probe_runtime_session_config_with_config(
+            self,
+            &probe_profile_id,
+            Some(agent_id),
+            &config,
+            Some(env_overlays),
+        )
+        .await?;
+        // Model choices are owned by model Provider Profiles, not by this
+        // Agent-level capability snapshot.
+        probe.models.clear();
+        Ok(probe)
     }
 
     async fn list_runtime_model_capabilities(
@@ -12491,6 +12555,7 @@ impl AcpClient for AcpRuntimeClient {
                 AcpProcessInstanceId::new(),
                 AcpProcessLaunch {
                     profile_id: provider_profile_id,
+                    agent_id: None,
                     config: &config,
                     cwd: &probe_cwd,
                     runtime_resources: &probe_resources,
@@ -22281,6 +22346,7 @@ for line in sys.stdin:
         let replacement = runtime
             .acquire_initialized_process(AcpProcessLaunch {
                 profile_id: &fixture.profile_id,
+                agent_id: None,
                 config: &config,
                 cwd: &cwd,
                 runtime_resources: &resources,
@@ -22359,6 +22425,7 @@ for line in sys.stdin:
             Duration::from_millis(400),
             client.acquire_initialized_process(AcpProcessLaunch {
                 profile_id: &fixture.profile_id,
+                agent_id: None,
                 config: &config,
                 cwd: &cwd,
                 runtime_resources: &resources,

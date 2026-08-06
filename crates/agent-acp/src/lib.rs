@@ -124,11 +124,12 @@ pub use session_attachment_registry::{
     SessionAttachmentRouteRejection, SessionAttachmentState,
 };
 pub use session_config::{
-    CanonicalKeyError, CanonicalSessionConfigKey, RuntimeOptionCatalogProfileEvidence,
-    SessionConfigExtension, SessionConfigFieldKind, SessionConfigFieldRequest,
-    SessionConfigOperationEvidence, SessionConfigPlan, SessionConfigPlanner,
-    SessionModelCatalogEntry, SessionModelCatalogSource, build_runtime_option_catalog,
-    merge_model_catalog, normalize_identifier, resolve_canonical_option_key, validate_effort_value,
+    CanonicalKeyError, CanonicalSessionConfigKey, RuntimeOptionCatalogAgentEvidence,
+    RuntimeOptionCatalogProfileEvidence, SessionConfigExtension, SessionConfigFieldKind,
+    SessionConfigFieldRequest, SessionConfigOperationEvidence, SessionConfigPlan,
+    SessionConfigPlanner, SessionModelCatalogEntry, SessionModelCatalogSource,
+    build_runtime_option_catalog, build_runtime_option_catalog_for_agents, merge_model_catalog,
+    normalize_identifier, resolve_canonical_option_key, validate_effort_value,
     validate_model_value,
 };
 pub use session_restore::{
@@ -481,6 +482,19 @@ pub trait AcpClient: Send + Sync {
             reasoning_efforts: Vec::new(),
             options: Vec::new(),
         })
+    }
+
+    /// Stateless Agent-level session option probe. Implementations may
+    /// override this when the CLI can be launched from its Agent-owned
+    /// command configuration without a Provider Profile.
+    async fn probe_runtime_session_config_for_agent(
+        &self,
+        _agent_id: &vibex_core::AgentId,
+    ) -> VibexResult<AcpRuntimeSessionProbe> {
+        Err(VibexError::capability(
+            "acp_agent_runtime_probe_unsupported",
+            "this ACP adapter does not support Agent-level runtime option probing",
+        ))
     }
 
     async fn list_runtime_model_capabilities(
@@ -2071,6 +2085,24 @@ impl AgentProvider for AcpAgentProvider {
             .await?;
         Ok(AgentSessionConfigProbe {
             models: probed.models,
+            modes: probed.modes,
+            reasoning_efforts: probed.reasoning_efforts,
+            options: probed.options,
+        })
+    }
+
+    async fn probe_agent_session_config(
+        &self,
+        agent_id: &vibex_core::AgentId,
+    ) -> VibexResult<AgentSessionConfigProbe> {
+        let probed = self
+            .client
+            .probe_runtime_session_config_for_agent(agent_id)
+            .await?;
+        Ok(AgentSessionConfigProbe {
+            // Models belong to Provider Profiles. Agent setup persists only
+            // CLI-owned runtime controls even if session/new reports a model.
+            models: Vec::new(),
             modes: probed.modes,
             reasoning_efforts: probed.reasoning_efforts,
             options: probed.options,

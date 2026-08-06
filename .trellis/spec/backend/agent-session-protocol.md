@@ -39,79 +39,132 @@ one attachment.
 
 ### 1. Scope / Trigger
 
-Session creation and in-session selectors need one provider-neutral list of enabled Agent/Profile/Model combinations.
-The catalog is published by the configuration/runtime boundary and is also the stale-check input for desired/effective
-session selection.
+Session creation and in-session selectors need one provider-neutral list of
+enabled Agent/Profile/Model combinations. Runtime controls belong to the Agent
+CLI, while model choices belong to Provider Profiles. The catalog joins those
+two independently owned inputs without turning a model Provider configuration
+into a capability probe target.
 
 ### 2. Signatures
 
 ```text
 agent_list_runtime_options() -> SessionRuntimeOptionCatalog
-build_runtime_option_catalog(agents, profiles, evidence_by_profile) -> SessionRuntimeOptionCatalog
-refresh_agent_runtime_options(agent_id) -> RuntimeOptionRefreshResult
+RuntimeOptionCatalogService::probe_agent(agent_id) -> RuntimeOptionProbeResult
+AgentProvider::probe_agent_session_config(agent_id) -> AgentSessionConfigProbe
+ProviderConfigService::get_agent_acp_runtime_config(agent_id) -> AcpProviderConfig
+build_runtime_option_catalog_for_agents(agents, profiles, evidence_by_agent)
+  -> SessionRuntimeOptionCatalog
+
+agent_runtime_option_snapshots(
+  agent_id PRIMARY KEY,
+  session_config_json,
+  last_success_at_ms,
+  last_attempt_at_ms,
+  last_error_code
+)
 ```
 
 ### 3. Contracts
 
-- `SessionRuntimeOption` contains product selection, Agent/Profile/Model labels, evidence-backed `reasoningEfforts` and
-  `modes`, and `availability` (`available | temporarily_unavailable | requires_configuration`).
-- `SessionRuntimeOptionCatalog.revision` is a deterministic positive revision of the ordered redacted projection.
-- Ordinary Catalog reads use the persisted runtime-option snapshot for each Provider Profile and must never start an
-  ACP process. Slow ACP probing is restricted to first enable/setup, one-time bootstrap of Profiles with no attempt
-  record, configuration changes, and the explicit per-Agent refresh action in the configuration center.
-- A successful refresh atomically replaces the Profile's model/session-config evidence. A failed refresh records the
-  attempt and stable error code without overwriting the last successful snapshot. A first failed bootstrap counts as
-  attempted and is not retried on every application start; the user can retry with the explicit refresh action.
-- Only `added && enabled` Agents and enabled `ProviderProfile.kind = acp` Profiles are included. Explicit enabled
-  configured Models remain authoritative; when a Profile has no explicit Model configuration, models discovered from
-  that Profile's ACP `session/new` response populate the catalog. Explicitly disabled Models are never revived by probe
-  evidence. Configuration-only Claude/Codex Profiles are omitted. Adapter ids, commands, native ids, URLs, secrets and
-  raw provider payloads never cross this DTO.
-- `reasoningEffort = null` and `modeId = null` mean that the Adapter's converged defaults remain authoritative. Runtime
-  fence matching always requires the exact Model and compares Effort/Mode only when the product selection explicitly
-  sets them.
-- `AgentSessionRuntimeSelectionState` carries desired/effective selection, session/selection revisions, binding and
-  activation fence metadata, pending switch id and an actionable error.
+- Store at most one successful runtime-option snapshot per `agent_id`. It
+  contains modes, reasoning controls, and generic session options only. Clear
+  `AgentSessionConfigProbe.models` before persistence even if an Adapter
+  reports models from `session/new`.
+- An Agent-level probe launches the configured Agent command with its Agent
+  args and Agent env. It must not list or load a Provider Profile, resolve a
+  Provider secret, materialize a Provider projection, or use a Provider model.
+  A synthetic `ProviderProfileId` may exist only as in-process bookkeeping.
+- Trigger the probe when an installed Agent is added, discovered in bulk, or
+  detected after installation. A failed first attempt may be retried by an
+  explicit Agent action. Startup, ordinary enable/disable, and Provider
+  Profile create/update/delete never trigger an Agent option probe.
+- A successful snapshot is immutable while the Agent remains added. Later
+  calls return `cached_agent_ids` without launching the CLI. Removing the
+  Agent deletes its snapshot so a later re-add can probe once again.
+- Ordinary catalog reads load SQLite snapshots only and never start an ACP
+  process. Provider mutations rebuild the Profile/model projection and then
+  reuse the same cached Agent evidence; they neither clear nor replace it.
+- Enabled ACP Provider Profiles contribute only enabled configured model ids,
+  or their configured default model when the explicit list is empty. Agent
+  discovery models and Agent probe models never populate the selector.
+- Every enabled Profile for one Agent receives the same cached modes,
+  reasoning controls, and Features. `SessionRuntimeOptionCatalog.revision` is
+  a deterministic positive revision of the ordered redacted projection.
+- `reasoningEffort = null` and `modeId = null` mean that the Adapter's
+  converged defaults remain authoritative. Runtime fence matching always
+  requires the exact model and compares Effort/Mode only when explicitly set.
 
 ### 4. Validation & Error Matrix
 
-- Disabled Agent/Profile/Model -> omitted from the catalog; probe evidence cannot revive an explicitly disabled Model.
-- Profile without explicit Models -> use only models advertised by that Profile's ACP `session/new` response.
-- Missing negotiated Effort/Mode evidence -> empty values and null overrides; never synthesize `planning`, `fast`,
-  `medium` or similar.
-- Enabled non-ACP Profile -> omitted from the catalog; never reinterpret it as an ACP runtime Profile.
+- Agent missing, not added, or disabled -> return an empty probe result and do
+  not launch a process.
+- Successful snapshot exists -> return the Agent in `cached_agent_ids`; do not
+  probe again.
+- Agent command/config changes while a probe is in flight -> discard the stale
+  result by comparing the Agent config revision before commit.
+- Probe fails before any success -> persist `last_attempt_at_ms` and the stable
+  error code; mark the Agent projection `temporarily_unavailable` and permit an
+  explicit retry.
+- Adapter returns models -> clear them before the Agent snapshot write.
+- No Provider Profile or no configured Provider model -> probing may still
+  succeed, but the joined catalog has no model option for that Profile.
+- Disabled Agent/Profile/model -> omit it; cached Agent evidence cannot revive
+  an explicitly disabled model.
+- Enabled non-ACP Profile -> omit it; never reinterpret it as an ACP runtime
+  Profile.
 - Unknown/needs-configuration Agent -> `requires_configuration`.
-- Failed probe/runtime -> `temporarily_unavailable`.
-- Failed refresh with an older successful snapshot -> continue serving the older snapshot and expose the failed refresh
-  status in configuration management; do not empty working selectors.
-- Catalog revision changes -> clients must re-fetch and reject stale desired selections.
+- Catalog revision changes -> clients re-fetch and reject stale desired
+  selections.
 
 ### 5. Good/Base/Bad Cases
 
-- Good: two enabled Profiles expose the same Model with different evidence; both options remain distinct and ordered.
-- Base: a Profile has configured Models but no Effort evidence; the Model is selectable and Effort is empty/disabled.
-- Base: a selected option has null Effort/Mode while the attachment reports Adapter defaults; the exact Model still
-  matches and the fence remains valid.
-- Bad: a static UI fallback adds `planning` or `fast` when the ACP session advertises no modes.
+- Good: one Agent probe succeeds, two Provider Profiles are added later, and
+  both Profiles reuse the same cached controls without another CLI launch.
+- Base: an Agent has no Provider Profile. Its controls can be probed and cached,
+  while the session selector remains empty until a Profile supplies a model.
+- Base: a Profile has models but the Agent exposes no reasoning control; its
+  models remain selectable and the reasoning selector is empty.
+- Bad: saving a Provider API key starts `session/new`, clears the Agent
+  snapshot, or creates another snapshot keyed by `provider_profile_id`.
+- Bad: a model returned by the Agent probe appears in a Profile that did not
+  configure that model.
 
 ### 6. Tests Required
 
-- Catalog unit tests assert deterministic revision/order, disabled filtering, zero-configuration ACP model discovery,
-  duplicate handling, capability evidence, availability states and redacted serialization.
-- Persistence tests assert snapshot round-trip, last-success preservation on failure, first-failure attempt records, and
-  that ordinary Catalog reads work with no registered Agent runtime.
-- Tauri/browser contract tests assert the command and mock return the generated DTO shape.
-- Frontend typecheck asserts selectors consume catalog values and render an empty/disabled state without fallback.
+- `cargo test -p vibex-db agent_runtime_option_snapshot --locked` asserts the
+  Agent-keyed SQLite round trip and deletion.
+- `cargo test -p vibex-config-switch agent_acp_runtime_config --locked` asserts
+  command/args/Agent-env resolution without a Provider Profile.
+- `cargo test -p vibex-agent-acp session_config::tests --locked` asserts Agent
+  evidence is shared and models come only from Provider Profiles.
+- `cargo test -p vibex-desktop-runtime catalog --locked` asserts one process
+  call, cached reuse, Profile mutation independence, model stripping, and
+  failure recording by Agent.
+- Desktop management tests assert Agent add/discovery/install detection invokes
+  `probe_agent`, ordinary toggles and Profile saves do not, and a successful
+  snapshot disables the probe button.
 
 ### 7. Wrong vs Correct
 
-```typescript
-// Wrong: invents a mode that the Agent never negotiated.
-const modes = [{ value: "planning", label: "Planning" }];
+#### Wrong
 
-// Correct: render only the catalog/session evidence.
-const modes = runtimeOption?.modes ?? negotiatedSessionConfig.modes;
+```rust
+for profile in enabled_profiles {
+    catalog.refresh_profile(&profile.id).await?;
+}
 ```
+
+This couples Agent capabilities to Provider credentials and repeats the same
+CLI discovery for every model configuration.
+
+#### Correct
+
+```rust
+let result = catalog.probe_agent(&agent_id).await?;
+let options = catalog.list().await?; // SQLite read plus Profile/model join
+```
+
+The successful Agent snapshot is reused until that Agent is removed.
 
 ## Scenario: Claude ACP Extension And Transcript Compensation
 

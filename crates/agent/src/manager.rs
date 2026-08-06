@@ -2206,6 +2206,19 @@ impl AgentManager {
         provider.probe_session_config(&provider_profile_id).await
     }
 
+    /// Discovers session-level options from the Agent CLI itself. This is
+    /// intentionally independent of any Provider Profile so setup can cache
+    /// one Agent-owned capability snapshot.
+    pub async fn probe_agent_session_config(
+        &self,
+        agent_id: AgentId,
+    ) -> VibexResult<AgentSessionConfigProbe> {
+        let resolved_agent =
+            self.resolve_enabled_agent(Some(agent_id.clone()), ProviderKind::Acp, false)?;
+        let provider = self.runtime(&self.route_for_agent(&resolved_agent.agent_id)?)?;
+        provider.probe_agent_session_config(&agent_id).await
+    }
+
     fn validate_import_candidate(
         &self,
         candidate: &ExternalSessionImportCandidate,

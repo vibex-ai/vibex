@@ -51,7 +51,7 @@ use gpui_component::{
 use sha2::{Digest as _, Sha256};
 use similar::{ChangeTag, TextDiff};
 use tokio::sync::mpsc;
-use vibex_agent_acp::build_runtime_option_catalog;
+use vibex_agent_acp::build_runtime_option_catalog_for_agents;
 use vibex_agent_claude::{ClaudeSessionImportPreviewRequest, preview_claude_external_sessions};
 use vibex_agent_codex::{CodexSessionImportPreviewRequest, preview_codex_external_sessions};
 use vibex_backend::{
@@ -4267,7 +4267,7 @@ impl VibexWorkbench {
                                 &agents,
                                 preferred_new_session_agent.as_ref(),
                             );
-                            this.runtime_catalog = Some(build_runtime_option_catalog(
+                            this.runtime_catalog = Some(build_runtime_option_catalog_for_agents(
                                 &agents,
                                 &profiles,
                                 &BTreeMap::new(),
@@ -4279,6 +4279,7 @@ impl VibexWorkbench {
                             {
                                 this.refresh_active_suggestions(ComposerTarget::NewSession, cx);
                             }
+                            this.load_agent_runtime_catalog(cx);
                         }
                         Ok(Err(error)) => {
                             this.runtime_note = Some(format!(
@@ -4380,11 +4381,12 @@ impl VibexWorkbench {
                                 preferred_new_session_agent.as_ref(),
                             );
                             if this.agent_catalog_generation == catalog_generation {
-                                this.runtime_catalog = Some(build_runtime_option_catalog(
-                                    &agents,
-                                    &profiles,
-                                    &BTreeMap::new(),
-                                ));
+                                this.runtime_catalog =
+                                    Some(build_runtime_option_catalog_for_agents(
+                                        &agents,
+                                        &profiles,
+                                        &BTreeMap::new(),
+                                    ));
                             }
                             this.runtime_provider_profiles = profiles;
                             this.agent_snapshots = agents;
@@ -36297,7 +36299,7 @@ mod tests {
         let profile = runtime_profile_summary(agent.id.clone(), Vec::new());
 
         let profiles = runtime_profiles_for_agent(std::slice::from_ref(&profile), &agent.id);
-        let catalog = build_runtime_option_catalog(
+        let catalog = build_runtime_option_catalog_for_agents(
             std::slice::from_ref(&agent),
             std::slice::from_ref(&profile),
             &BTreeMap::new(),
@@ -36319,15 +36321,19 @@ mod tests {
         let profile_fetch = overview
             .find("let profiles = backend.management().list_profiles().await?;")
             .expect("provider summaries should be fetched with the overview");
-        let configured_catalog = overview
-            .find("this.runtime_catalog = Some(build_runtime_option_catalog(")
+        let configured_catalog_assignment = overview
+            .find("this.runtime_catalog =")
             .expect("configured catalog should be installed immediately");
+        let configured_catalog_builder = overview
+            .find("build_runtime_option_catalog_for_agents(")
+            .expect("Agent-level catalog builder should be used");
         let enriched_catalog = overview
             .find("this.load_agent_runtime_catalog(cx);")
             .expect("capability enrichment should follow the configured catalog");
 
-        assert!(profile_fetch < configured_catalog);
-        assert!(configured_catalog < enriched_catalog);
+        assert!(profile_fetch < configured_catalog_assignment);
+        assert!(configured_catalog_assignment < configured_catalog_builder);
+        assert!(configured_catalog_builder < enriched_catalog);
         assert_eq!(
             overview
                 .matches("this.load_agent_runtime_catalog(cx);")
@@ -36354,7 +36360,8 @@ mod tests {
 
         assert!(configured_catalog.contains(".list_agents(AgentListRequest"));
         assert!(configured_catalog.contains(".list_profiles().await?"));
-        assert!(configured_catalog.contains("build_runtime_option_catalog("));
+        assert!(configured_catalog.contains("build_runtime_option_catalog_for_agents("));
+        assert!(configured_catalog.contains("this.load_agent_runtime_catalog(cx);"));
         assert!(!configured_catalog.contains("list_sessions("));
         assert!(!configured_catalog.contains("list_workspaces("));
         assert!(handler.contains("DesktopEvent::ProviderConfigChanged(event)"));

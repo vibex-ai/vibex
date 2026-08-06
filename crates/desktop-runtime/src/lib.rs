@@ -50,7 +50,7 @@ use vibex_remote::{
 use vibex_terminal::TerminalManager;
 
 pub use catalog::{
-    RuntimeOptionCatalogService, RuntimeOptionRefreshResult, RuntimeOptionSnapshotSummary,
+    RuntimeOptionCatalogService, RuntimeOptionProbeResult, RuntimeOptionSnapshotSummary,
 };
 pub use events::{
     AuthoritativeRefetch, DesktopEvent, DesktopEventReceiver, DesktopEventReceiverClosed,
@@ -948,9 +948,6 @@ impl DesktopRuntime {
         let install_managed_adapters = self.config.install_managed_adapters;
         let config_service = self.providers.service.clone();
         let db_path = self.config.database_path.clone();
-        let catalog = self.agent.runtime_catalog.clone();
-        let events = self.events.clone();
-        let gateway = self.remote.gateway.clone();
         tasks.push(tokio::spawn(async move {
             if install_managed_adapters
                 && let Err(error) = prepare_managed_acp_adapters(&config_service, &db_path).await
@@ -960,39 +957,6 @@ impl DesktopRuntime {
                     error_code = %error.code,
                     "managed ACP adapter background preparation failed"
                 );
-            }
-            match catalog.refresh_missing().await {
-                Ok(result) => {
-                    let provider_profile_ids = result
-                        .refreshed_profile_ids
-                        .into_iter()
-                        .chain(result.failed_profile_ids)
-                        .collect::<BTreeSet<_>>()
-                        .into_iter()
-                        .collect::<Vec<_>>();
-                    if !provider_profile_ids.is_empty() {
-                        let _ = events.send(DesktopEvent::ProviderConfigChanged(
-                            ProviderConfigChangedEvent {
-                                provider_profile_ids,
-                                phase: ProviderConfigChangePhase::RuntimeOptionsChanged,
-                            },
-                        ));
-                        if let Err(error) = gateway.publish_provider_invalidation() {
-                            tracing::warn!(
-                                target: "vibex_desktop",
-                                error_code = %error.code,
-                                "Initial Provider runtime option invalidation failed"
-                            );
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        target: "vibex_desktop",
-                        error_code = %error.code,
-                        "initial ACP runtime option background snapshot probe failed"
-                    );
-                }
             }
         }));
         Ok(())
@@ -1109,8 +1073,6 @@ impl DesktopRuntime {
                 "desktop runtime task ownership is unavailable",
             )
         })?;
-        let (refresh_sender, mut refresh_receiver) = mpsc::unbounded_channel();
-        let catalog = self.agent.runtime_catalog.clone();
         let profile_events = self.events.clone();
         let profile_gateway = self.remote.gateway.clone();
         tasks.push(tokio::spawn(async move {
@@ -1120,28 +1082,14 @@ impl DesktopRuntime {
                     changes.push(change);
                 }
                 let mut changed_profile_ids = BTreeSet::new();
-                let mut refresh_profile_ids = BTreeSet::new();
                 for change in changes {
-                    match change {
-                        ProviderProfileMutationEvent::Saved(provider_profile_id) => {
-                            refresh_profile_ids.insert(provider_profile_id.clone());
-                            changed_profile_ids.insert(provider_profile_id);
+                    let provider_profile_id = match change {
+                        ProviderProfileMutationEvent::Saved(provider_profile_id)
+                        | ProviderProfileMutationEvent::Deleted(provider_profile_id) => {
+                            provider_profile_id
                         }
-                        ProviderProfileMutationEvent::Deleted(provider_profile_id) => {
-                            refresh_profile_ids.remove(&provider_profile_id);
-                            changed_profile_ids.insert(provider_profile_id);
-                        }
-                    }
-                }
-                for provider_profile_id in &changed_profile_ids {
-                    if let Err(error) = catalog.invalidate_profile_snapshot(provider_profile_id) {
-                        tracing::warn!(
-                            target: "vibex_desktop",
-                            provider_profile_id = %provider_profile_id,
-                            error_code = %error.code,
-                            "Provider runtime option snapshot invalidation failed"
-                        );
-                    }
+                    };
+                    changed_profile_ids.insert(provider_profile_id);
                 }
                 if !changed_profile_ids.is_empty() {
                     let provider_profile_ids = changed_profile_ids.into_iter().collect();
@@ -1158,52 +1106,6 @@ impl DesktopRuntime {
                             "Remote Provider projection invalidation failed"
                         );
                     }
-                }
-                for provider_profile_id in refresh_profile_ids {
-                    let _ = refresh_sender.send(provider_profile_id);
-                }
-            }
-        }));
-
-        let catalog = self.agent.runtime_catalog.clone();
-        let runtime_option_events = self.events.clone();
-        let runtime_option_gateway = self.remote.gateway.clone();
-        tasks.push(tokio::spawn(async move {
-            let mut pending = BTreeSet::new();
-            loop {
-                if pending.is_empty() {
-                    let Some(provider_profile_id) = refresh_receiver.recv().await else {
-                        break;
-                    };
-                    pending.insert(provider_profile_id);
-                }
-                tokio::task::yield_now().await;
-                while let Ok(provider_profile_id) = refresh_receiver.try_recv() {
-                    pending.insert(provider_profile_id);
-                }
-                let Some(provider_profile_id) = pending.pop_first() else {
-                    continue;
-                };
-                if let Err(error) = catalog.refresh_profile(&provider_profile_id).await {
-                    tracing::warn!(
-                        target: "vibex_desktop",
-                        provider_profile_id = %provider_profile_id,
-                        error_code = %error.code,
-                        "Provider runtime option background refresh failed"
-                    );
-                }
-                let _ = runtime_option_events.send(DesktopEvent::ProviderConfigChanged(
-                    ProviderConfigChangedEvent {
-                        provider_profile_ids: vec![provider_profile_id],
-                        phase: ProviderConfigChangePhase::RuntimeOptionsChanged,
-                    },
-                ));
-                if let Err(error) = runtime_option_gateway.publish_provider_invalidation() {
-                    tracing::warn!(
-                        target: "vibex_desktop",
-                        error_code = %error.code,
-                        "Remote Provider runtime option invalidation failed"
-                    );
                 }
             }
         }));
@@ -1660,6 +1562,11 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\nasync fn prepare_managed_acp_adapters("))
             .map(|(body, _)| body)
             .expect("agent manager construction should remain inspectable");
+        let provider_consumer = source
+            .split_once("    fn spawn_provider_config_consumer(")
+            .and_then(|(_, tail)| tail.split_once("\n    pub fn config("))
+            .map(|(body, _)| body)
+            .expect("Provider mutation consumer should remain inspectable");
 
         assert!(start.contains("runtime.activate().await?;"));
         assert!(start.contains("runtime.spawn_agent_bootstrap()?;"));
@@ -1670,9 +1577,11 @@ mod tests {
         assert!(!activate.contains("refresh_missing().await"));
         assert!(!manager.contains("prepare_managed_acp_adapters"));
         assert!(bootstrap.contains("prepare_managed_acp_adapters"));
-        assert!(bootstrap.contains("catalog.refresh_missing().await"));
-        assert!(bootstrap.contains("ProviderConfigChangePhase::RuntimeOptionsChanged"));
-        assert!(bootstrap.contains("gateway.publish_provider_invalidation()"));
+        assert!(!bootstrap.contains("refresh_missing"));
+        assert!(!bootstrap.contains("RuntimeOptionsChanged"));
+        assert!(!provider_consumer.contains("refresh_profile"));
+        assert!(!provider_consumer.contains("invalidate_profile_snapshot"));
+        assert!(!provider_consumer.contains("RuntimeOptionsChanged"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1692,7 +1601,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn provider_mutations_publish_static_then_runtime_option_invalidations() {
+    async fn provider_mutations_publish_only_profile_changes() {
         let home = tempfile::tempdir().unwrap();
         let runtime = DesktopRuntime::start(DesktopRuntimeConfig::isolated_test(home.path()))
             .await
@@ -1738,7 +1647,7 @@ mod tests {
         );
 
         let runtime_options_changed =
-            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::time::timeout(std::time::Duration::from_millis(150), async {
                 loop {
                     if let DesktopEvent::ProviderConfigChanged(event) = events.recv().await.unwrap()
                         && event.phase == ProviderConfigChangePhase::RuntimeOptionsChanged
@@ -1747,12 +1656,8 @@ mod tests {
                     }
                 }
             })
-            .await
-            .unwrap();
-        assert_eq!(
-            runtime_options_changed.provider_profile_ids,
-            vec![profile.id.clone()]
-        );
+            .await;
+        assert!(runtime_options_changed.is_err());
 
         runtime
             .management()

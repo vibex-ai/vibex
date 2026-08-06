@@ -453,6 +453,7 @@ impl AcpRuntimeClient {
                     AcpProcessInstanceId::new(),
                     AcpProcessLaunch {
                         profile_id: &profile_id,
+                        agent_id: None,
                         config: &config,
                         cwd: &cwd,
                         runtime_resources: &runtime_resources,

@@ -8,7 +8,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 use vibex_core::{
-    AgentCommandDiscoverRequest, AgentCommandDiscoverResponse, AgentCommandExecuteRequest,
+    AgentCommandDiscoverRequest, AgentCommandDiscoverResponse, AgentCommandExecuteRequest, AgentId,
     AgentModelListResponse, AgentModelListSource, AgentSessionConfigProbe, AgentSessionSafety,
     AgentUsageCounterOrigin, AgentUsageExecution, AgentUsageExecutionContext,
     AgentUsageExecutionStatusUpdate, AgentUsageObservation, ElicitationResolution,
@@ -450,6 +450,17 @@ pub trait AgentProvider: Send + Sync {
     async fn probe_session_config(
         &self,
         _provider_profile_id: &ProviderProfileId,
+    ) -> VibexResult<AgentSessionConfigProbe> {
+        Ok(AgentSessionConfigProbe::default())
+    }
+
+    /// Stateless Agent-level probe used during Agent setup. Unlike
+    /// `probe_session_config`, this path deliberately has no Provider Profile
+    /// and therefore must not resolve credentials, models, or provider
+    /// projections.
+    async fn probe_agent_session_config(
+        &self,
+        _agent_id: &AgentId,
     ) -> VibexResult<AgentSessionConfigProbe> {
         Ok(AgentSessionConfigProbe::default())
     }

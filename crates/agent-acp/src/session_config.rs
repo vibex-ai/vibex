@@ -11,15 +11,15 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use vibex_core::{
-    AgentConfigStatus, AgentReasoningEffort, AgentRuntimeStatus, AgentSnapshotEntry, ProviderKind,
-    ProviderProfileStatus, ProviderProfileSummary, ProviderSessionConfigOption,
+    AgentConfigStatus, AgentId, AgentReasoningEffort, AgentRuntimeStatus, AgentSnapshotEntry,
+    ProviderKind, ProviderProfileStatus, ProviderProfileSummary, ProviderSessionConfigOption,
     ProviderSessionConfigOptionKind, ProviderSessionConfigValue, RuntimeOptionAvailability,
     SessionConfigValue, SessionRuntimeFeature, SessionRuntimeFeatureKind, SessionRuntimeOption,
     SessionRuntimeOptionCatalog, SessionRuntimeSelection,
 };
 
 use crate::protocol::{AcpOperation, AcpOperationStability, AcpWireEncoding, CapabilitySource};
-use crate::registry::CapabilitySupport;
+use crate::registry::{CapabilitySupport, fallback_session_modes};
 
 pub const CANONICAL_MODEL: &str = "model";
 pub const CANONICAL_REASONING_EFFORT: &str = "reasoning_effort";
@@ -561,6 +561,135 @@ pub struct RuntimeOptionCatalogProfileEvidence {
     pub temporarily_unavailable: bool,
 }
 
+/// Runtime option evidence owned by one Agent CLI. It intentionally contains
+/// no Provider Profile or model identity; profiles only supply the model
+/// choices that are rendered alongside this shared Agent capability set.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuntimeOptionCatalogAgentEvidence {
+    pub modes: Vec<ProviderSessionConfigValue>,
+    pub reasoning_efforts: Vec<AgentReasoningEffort>,
+    pub options: Vec<ProviderSessionConfigOption>,
+    pub temporarily_unavailable: bool,
+}
+
+/// Builds the runtime option catalog from one persisted capability snapshot
+/// per Agent. Provider Profiles contribute only their configured model IDs;
+/// no profile config is consulted for modes, efforts, or Features.
+pub fn build_runtime_option_catalog_for_agents(
+    agents: &[AgentSnapshotEntry],
+    profiles: &[ProviderProfileSummary],
+    evidence_by_agent: &BTreeMap<AgentId, RuntimeOptionCatalogAgentEvidence>,
+) -> SessionRuntimeOptionCatalog {
+    let agents_by_id = agents
+        .iter()
+        .filter(|agent| agent.added && agent.enabled)
+        .map(|agent| (agent.id.clone(), agent))
+        .collect::<BTreeMap<_, _>>();
+    let mut enabled_profiles = profiles
+        .iter()
+        .filter(|profile| {
+            profile.kind == ProviderKind::Acp && profile.status == ProviderProfileStatus::Enabled
+        })
+        .filter_map(|profile| {
+            agents_by_id
+                .get(&profile.agent_id)
+                .map(|agent| (*agent, profile))
+        })
+        .collect::<Vec<_>>();
+    enabled_profiles.sort_by(|(left_agent, left_profile), (right_agent, right_profile)| {
+        left_agent
+            .order_index
+            .cmp(&right_agent.order_index)
+            .then_with(|| left_agent.id.cmp(&right_agent.id))
+            .then_with(|| left_profile.display_name.cmp(&right_profile.display_name))
+            .then_with(|| left_profile.id.cmp(&right_profile.id))
+    });
+
+    let mut options = Vec::new();
+    for (agent, profile) in enabled_profiles {
+        let evidence = evidence_by_agent.get(&agent.id);
+        let profile_evidence = evidence.map(|entry| RuntimeOptionCatalogProfileEvidence {
+            models: Vec::new(),
+            modes: entry.modes.clone(),
+            options: entry.options.clone(),
+            temporarily_unavailable: entry.temporarily_unavailable,
+        });
+        let reasoning_efforts = evidence
+            .map(|entry| entry.reasoning_efforts.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|effort| {
+                let value = validate_effort_value(&effort.value).ok()?;
+                Some(SessionConfigValue {
+                    value,
+                    label: effort.description.as_deref().map(bounded_catalog_label),
+                })
+            })
+            .collect::<Vec<_>>();
+        let modes = catalog_modes_from_values(
+            evidence
+                .map(|entry| entry.modes.clone())
+                .unwrap_or_default(),
+            &agent.id,
+        );
+        let features = catalog_features(profile_evidence.as_ref());
+        let feature_config_values = features
+            .iter()
+            .filter_map(|feature| {
+                feature
+                    .current_value
+                    .as_ref()
+                    .or(feature.default_value.as_ref())
+                    .map(|value| (feature.id.clone(), value.value.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let mut model_ids = profile
+            .configured_models
+            .iter()
+            .filter(|model| model.enabled)
+            .filter_map(|model| {
+                let id = validate_model_value(&model.id).ok()?;
+                let label = bounded_catalog_label(model.display_name.as_deref().unwrap_or(&id));
+                Some((id, label))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if model_ids.is_empty()
+            && let Some(model) = profile
+                .default_model
+                .as_deref()
+                .and_then(|model| validate_model_value(model).ok())
+        {
+            model_ids.insert(model.clone(), model);
+        }
+        let availability = catalog_availability(agent, profile_evidence.as_ref());
+        for (model_id, model_label) in model_ids {
+            options.push(SessionRuntimeOption {
+                selection: SessionRuntimeSelection {
+                    agent_id: agent.id.clone(),
+                    provider_profile_id: profile.id.clone(),
+                    model_id,
+                    reasoning_effort: None,
+                    mode_id: None,
+                    config_values: feature_config_values.clone(),
+                },
+                agent_label: bounded_catalog_label(&agent.label),
+                provider_profile_label: bounded_catalog_label(&profile.display_name),
+                model_label,
+                reasoning_efforts: reasoning_efforts.clone(),
+                modes: modes.clone(),
+                features: features.clone(),
+                availability,
+            });
+        }
+    }
+
+    SessionRuntimeOptionCatalog {
+        revision: runtime_option_catalog_revision(&options),
+        options,
+    }
+}
+
 /// Builds the redacted, deterministic Runtime Option Catalog consumed by
 /// ordinary session selectors.
 pub fn build_runtime_option_catalog(
@@ -720,6 +849,37 @@ fn catalog_modes(
             })
         })
         .collect::<Vec<_>>();
+    modes.sort_by(|left, right| left.value.cmp(&right.value));
+    modes.dedup_by(|left, right| left.value == right.value);
+    modes
+}
+
+fn catalog_modes_from_values(
+    values: Vec<ProviderSessionConfigValue>,
+    agent_id: &AgentId,
+) -> Vec<SessionConfigValue> {
+    let mut modes = values
+        .into_iter()
+        .filter_map(|mode| {
+            let value = validate_effort_value(&mode.value).ok()?;
+            Some(SessionConfigValue {
+                value,
+                label: mode.label.as_deref().map(bounded_catalog_label),
+            })
+        })
+        .collect::<Vec<_>>();
+    if modes.is_empty() {
+        modes = fallback_session_modes(agent_id)
+            .into_iter()
+            .filter_map(|mode| {
+                let value = validate_effort_value(&mode.value).ok()?;
+                Some(SessionConfigValue {
+                    value,
+                    label: mode.label.as_deref().map(bounded_catalog_label),
+                })
+            })
+            .collect();
+    }
     modes.sort_by(|left, right| left.value.cmp(&right.value));
     modes.dedup_by(|left, right| left.value == right.value);
     modes
@@ -1348,6 +1508,37 @@ mod tests {
         );
         assert_eq!(catalog[0].source, SessionModelCatalogSource::Session);
         assert_eq!(catalog[0].reasoning_efforts[0].value, "high");
+    }
+
+    #[test]
+    fn agent_level_runtime_catalog_takes_models_only_from_provider_profiles() {
+        let definition = builtin_agent_definitions()
+            .into_iter()
+            .find(|definition| definition.id.as_str() == "claude")
+            .unwrap();
+        let mut agent = AgentSnapshotEntry::from_definition(&definition, None, None);
+        agent.added = true;
+        agent.enabled = true;
+        agent.config_status = AgentConfigStatus::Configured;
+        agent.runtime_status = AgentRuntimeStatus::Ready;
+        agent.models = vec!["discovered-agent-model".to_string()];
+        let profile = ProviderProfileSummary {
+            id: vibex_core::ProviderProfileId::new(),
+            agent_id: agent.id.clone(),
+            kind: ProviderKind::Acp,
+            display_name: "Claude".to_string(),
+            status: ProviderProfileStatus::Enabled,
+            account_alias: None,
+            default_model: None,
+            configured_models: Vec::new(),
+            secret_setup_state: ProviderSecretSetupState::Available,
+            updated_at_ms: 1,
+        };
+
+        let catalog =
+            build_runtime_option_catalog_for_agents(&[agent], &[profile], &BTreeMap::new());
+
+        assert!(catalog.options.is_empty());
     }
 
     #[test]

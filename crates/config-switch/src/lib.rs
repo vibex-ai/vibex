@@ -61,11 +61,11 @@ use vibex_core::{
 };
 use vibex_db::{
     AgentConfigRepository, AgentDefaultModelProviderProfileRepository, AgentDiscoveryRepository,
-    AgentModelProviderFailoverRepository, HookRepository, McpServerRepository, PromptRepository,
-    ProviderCapabilityRepository, ProviderDefaultProfileRepository, ProviderHealthRepository,
-    ProviderInjectionPreviewRepository, ProviderProfileRepository,
-    ProviderSecretReferenceRepository, ProviderUsageRepository, SkillRepository, apply_migrations,
-    open_database,
+    AgentModelProviderFailoverRepository, AgentRuntimeOptionSnapshotRepository, HookRepository,
+    McpServerRepository, PromptRepository, ProviderCapabilityRepository,
+    ProviderDefaultProfileRepository, ProviderHealthRepository, ProviderInjectionPreviewRepository,
+    ProviderProfileRepository, ProviderSecretReferenceRepository, ProviderUsageRepository,
+    SkillRepository, apply_migrations, open_database,
 };
 
 mod native_export;
@@ -282,6 +282,9 @@ impl ProviderConfigService {
             deleted_at_ms: if added { None } else { Some(now) },
         };
         AgentConfigRepository::upsert(&conn, &config)?;
+        if !added {
+            AgentRuntimeOptionSnapshotRepository::delete(&conn, &config.agent_id)?;
+        }
         if added && config.enabled && definition.runtime_kind == AgentRuntimeKind::Acp {
             self.ensure_default_acp_profile_for_agent(&conn, &definition, &config)?;
         }
@@ -1105,6 +1108,17 @@ impl ProviderConfigService {
             )
             .with_diagnostic("providerProfileId", profile.id.as_str())
         })
+    }
+
+    /// Returns the typed ACP command configuration owned by an Agent. This
+    /// deliberately does not inspect or require a model Provider Profile and
+    /// is used for Agent-level runtime capability discovery.
+    pub fn get_agent_acp_runtime_config(
+        &self,
+        agent_id: &AgentId,
+    ) -> VibexResult<AcpProviderConfig> {
+        let conn = self.open_connection()?;
+        default_acp_runtime_config_for_agent(&conn, agent_id)
     }
 
     pub fn get_codex_runtime_config(
@@ -4134,6 +4148,22 @@ fn default_acp_runtime_config_for_agent(
     {
         config.command = command.command.clone();
         config.args = command.args.clone();
+    }
+    let agent_env = agent_config
+        .as_ref()
+        .map(|agent| &agent.env)
+        .unwrap_or(&definition.env);
+    for (key, value) in agent_env {
+        config
+            .env
+            .retain(|reference| reference.key.trim() != key.as_str());
+        config.env.push(AcpProviderEnvReference {
+            key: key.clone(),
+            source: AcpProviderEnvSource::Literal,
+            value: Some(value.clone()),
+            secret_lookup_key: None,
+            redacted_hint: "Agent configuration value".to_string(),
+        });
     }
     validate_acp_config(&config).map_err(|error| {
         error
@@ -8480,6 +8510,99 @@ mod tests {
                 .sdk_options
                 .iter()
                 .any(|field| field.key == ACP_CONFIG_OPTION_KEY)
+        );
+    }
+
+    #[test]
+    fn agent_acp_runtime_config_uses_agent_environment_without_a_provider_profile() {
+        let dir = tempdir().unwrap();
+        let service = ProviderConfigService::new(dir.path().join("vibex.db"));
+        let agent_id = AgentId::parse("opencode").unwrap();
+        service
+            .update_agent_config(AgentUpdateConfigRequest {
+                agent_id: agent_id.clone(),
+                added: Some(true),
+                enabled: Some(false),
+                label_override: None,
+                description_override: None,
+                order_index: None,
+                command: Some(AgentCommandConfig {
+                    command: "/bin/opencode-fixture".to_string(),
+                    args: vec!["acp".to_string()],
+                }),
+                env: Some(std::collections::BTreeMap::from([(
+                    "OPENCODE_CONFIG_DIR".to_string(),
+                    "/tmp/opencode-fixture".to_string(),
+                )])),
+                params: None,
+            })
+            .unwrap();
+
+        let config = service.get_agent_acp_runtime_config(&agent_id).unwrap();
+        assert_eq!(config.command, "/bin/opencode-fixture");
+        assert_eq!(config.args, vec!["acp"]);
+        let env = config
+            .env
+            .iter()
+            .find(|reference| reference.key == "OPENCODE_CONFIG_DIR")
+            .unwrap();
+        assert_eq!(env.source, AcpProviderEnvSource::Literal);
+        assert_eq!(env.value.as_deref(), Some("/tmp/opencode-fixture"));
+        assert!(env.secret_lookup_key.is_none());
+    }
+
+    #[test]
+    fn removing_agent_deletes_its_runtime_option_snapshot() {
+        let dir = tempdir().unwrap();
+        let service = ProviderConfigService::new(dir.path().join("vibex.db"));
+        let agent_id = AgentId::parse("opencode").unwrap();
+        service
+            .update_agent_config(AgentUpdateConfigRequest {
+                agent_id: agent_id.clone(),
+                added: Some(true),
+                enabled: Some(false),
+                label_override: None,
+                description_override: None,
+                order_index: None,
+                command: None,
+                env: None,
+                params: None,
+            })
+            .unwrap();
+        let conn = service.open_connection().unwrap();
+        AgentRuntimeOptionSnapshotRepository::upsert_success(
+            &conn,
+            &vibex_db::AgentRuntimeOptionSnapshotRecord {
+                agent_id: agent_id.clone(),
+                session_config: Some(vibex_core::AgentSessionConfigProbe::default()),
+                last_success_at_ms: Some(100),
+                last_attempt_at_ms: 100,
+                last_error_code: None,
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        service
+            .update_agent_config(AgentUpdateConfigRequest {
+                agent_id: agent_id.clone(),
+                added: Some(false),
+                enabled: Some(false),
+                label_override: None,
+                description_override: None,
+                order_index: None,
+                command: None,
+                env: None,
+                params: None,
+            })
+            .unwrap();
+
+        let conn = service.open_connection().unwrap();
+        assert!(
+            AgentRuntimeOptionSnapshotRepository::list(&conn)
+                .unwrap()
+                .into_iter()
+                .all(|snapshot| snapshot.agent_id != agent_id)
         );
     }
 
