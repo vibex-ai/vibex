@@ -99,36 +99,6 @@ impl Render for ManagementSidebarResizeDrag {
     }
 }
 
-#[derive(Clone)]
-struct ProviderFailoverDrag {
-    profile_id: String,
-    agent_id: String,
-    label: SharedString,
-}
-
-impl Render for ProviderFailoverDrag {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
-            .gap_2()
-            .px_3()
-            .py_1()
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(cx.theme().drag_border)
-            .bg(cx.theme().popover)
-            .text_color(cx.theme().popover_foreground)
-            .shadow_md()
-            .child(Icon::default().path("icons/vibex/grip-vertical.svg"))
-            .child(self.label.clone())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ProviderFailoverDropTarget {
-    profile_id: String,
-    after: bool,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ManagementImportKind {
     Mcp,
@@ -179,17 +149,12 @@ struct ManagementCopy {
     skills: &'static str,
     advanced: &'static str,
     search_agents: &'static str,
-    search_catalog: &'static str,
     search_mcp: &'static str,
     search_skills: &'static str,
-    add_agent: &'static str,
     remove: &'static str,
     add_configuration: &'static str,
     import_configuration: &'static str,
     provider_configuration: &'static str,
-    failover: &'static str,
-    no_failover: &'static str,
-    no_failover_description: &'static str,
     no_agents: &'static str,
     no_agents_description: &'static str,
     no_profiles: &'static str,
@@ -207,19 +172,14 @@ fn management_copy() -> ManagementCopy {
             skills: "Skills",
             advanced: "Advanced",
             search_agents: "Search Agent",
-            search_catalog: "Search available Agents",
             search_mcp: "Search MCP",
             search_skills: "Search Skills",
-            add_agent: "Add Agent",
             remove: "Remove",
             add_configuration: "Add config",
             import_configuration: "Import existing config",
             provider_configuration: "Model provider configuration",
-            failover: "Failover",
-            no_failover: "No failover queue",
-            no_failover_description: "Add configurations to failover to build a queue.",
             no_agents: "No Agent added",
-            no_agents_description: "Add an Agent from the catalog below.",
+            no_agents_description: "Add an Agent from the list.",
             no_profiles: "No model provider configuration",
             no_profiles_description: "Add or import a configuration for the selected Agent.",
             import_mcp: "Import Existing MCP",
@@ -232,19 +192,14 @@ fn management_copy() -> ManagementCopy {
             skills: "技能",
             advanced: "高级",
             search_agents: "搜索 Agent",
-            search_catalog: "搜索可添加 Agent",
             search_mcp: "搜索 MCP",
             search_skills: "搜索技能",
-            add_agent: "添加 Agent",
             remove: "移除",
             add_configuration: "添加配置",
             import_configuration: "导入已有配置",
             provider_configuration: "模型供应商配置",
-            failover: "故障转移",
-            no_failover: "没有故障转移队列",
-            no_failover_description: "将配置加入故障转移以构建队列。",
             no_agents: "尚未添加 Agent",
-            no_agents_description: "从下方目录添加一个 Agent。",
+            no_agents_description: "从列表中添加一个 Agent。",
             no_profiles: "暂无模型供应商配置",
             no_profiles_description: "为当前 Agent 添加或导入配置。",
             import_mcp: "导入已有 MCP",
@@ -257,19 +212,14 @@ fn management_copy() -> ManagementCopy {
             skills: "技能",
             advanced: "進階",
             search_agents: "搜尋 Agent",
-            search_catalog: "搜尋可新增 Agent",
             search_mcp: "搜尋 MCP",
             search_skills: "搜尋技能",
-            add_agent: "新增 Agent",
             remove: "移除",
             add_configuration: "新增配置",
             import_configuration: "匯入既有配置",
             provider_configuration: "模型供應商配置",
-            failover: "故障轉移",
-            no_failover: "沒有故障轉移佇列",
-            no_failover_description: "將配置加入故障轉移以建立佇列。",
             no_agents: "尚未新增 Agent",
-            no_agents_description: "從下方目錄新增一個 Agent。",
+            no_agents_description: "從列表中新增一個 Agent。",
             no_profiles: "暫無模型供應商配置",
             no_profiles_description: "為目前 Agent 新增或匯入配置。",
             import_mcp: "匯入已有 MCP",
@@ -291,7 +241,6 @@ struct ManagementSnapshot {
     capability_summaries: Vec<vibex_core::ProviderCapabilitySummary>,
     runtime_option_snapshots: Vec<RuntimeOptionSnapshotSummary>,
     usage_summaries: Vec<vibex_core::ProviderUsageSummary>,
-    failover_recommendations: Vec<vibex_core::ProviderFailoverRecommendation>,
     native_exports: Vec<vibex_core::ProviderNativeExportRecordSummary>,
     device_count: usize,
     revoked_device_count: usize,
@@ -309,8 +258,6 @@ struct AgentProviderProfileState {
     agent_id: String,
     profile_id: String,
     is_default: bool,
-    failover_order_index: Option<i64>,
-    in_failover_queue: bool,
 }
 
 #[derive(Clone)]
@@ -332,7 +279,6 @@ enum ManagementMutation {
     ProviderProbe(String),
     AgentRuntimeProbe(String),
     ProviderPreview(String),
-    ProviderFailover(String),
     AgentToggle(String),
     AgentDiscovery,
     McpAction(String),
@@ -370,7 +316,6 @@ impl ManagementMutation {
             Self::ProviderProbe(id) => format!("provider:probe:{id}"),
             Self::AgentRuntimeProbe(id) => format!("agent:runtime-probe:{id}"),
             Self::ProviderPreview(id) => format!("provider:preview:{id}"),
-            Self::ProviderFailover(id) => format!("provider:failover:{id}"),
             Self::AgentToggle(id) => format!("agent:toggle:{id}"),
             Self::AgentDiscovery => "agent:discover".into(),
             Self::McpAction(id) => format!("mcp:{id}"),
@@ -436,7 +381,6 @@ pub struct ManagementCenter {
     capability_summaries: Vec<vibex_core::ProviderCapabilitySummary>,
     runtime_option_snapshots: Vec<RuntimeOptionSnapshotSummary>,
     usage_summaries: Vec<vibex_core::ProviderUsageSummary>,
-    failover_recommendations: Vec<vibex_core::ProviderFailoverRecommendation>,
     native_exports: Vec<vibex_core::ProviderNativeExportRecordSummary>,
     native_export_source: vibex_core::ProviderNativeExportSource,
     native_export_mode: vibex_core::ProviderNativeExportMode,
@@ -477,8 +421,6 @@ pub struct ManagementCenter {
     compact_sidebar_height: f32,
     compact_sidebar_resize_hovered: bool,
     compact_sidebar_resize_drag: Option<ManagementSidebarResizeDragState>,
-    provider_failover_drop_target: Option<ProviderFailoverDropTarget>,
-    catalog_open: bool,
     profile_editor_open: bool,
     editing_profile_id: Option<String>,
     profile_secret_touched: bool,
@@ -490,7 +432,6 @@ pub struct ManagementCenter {
     selected_acp_profile_id: Option<String>,
     acp_config_draft: Option<vibex_core::AcpProviderConfig>,
     agent_search: Entity<InputState>,
-    catalog_search: Entity<InputState>,
     mcp_search: Entity<InputState>,
     skill_search: Entity<InputState>,
     profile_name: Entity<InputState>,
@@ -523,8 +464,6 @@ impl ManagementCenter {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let copy = management_copy();
         let agent_search = cx.new(|cx| InputState::new(window, cx).placeholder(copy.search_agents));
-        let catalog_search =
-            cx.new(|cx| InputState::new(window, cx).placeholder(copy.search_catalog));
         let mcp_search = cx.new(|cx| InputState::new(window, cx).placeholder(copy.search_mcp));
         let skill_search = cx.new(|cx| InputState::new(window, cx).placeholder(copy.search_skills));
         let profile_name = cx.new(|cx| {
@@ -680,7 +619,6 @@ impl ManagementCenter {
         });
         let subscriptions = vec![
             cx.subscribe(&agent_search, |_, _, _: &InputEvent, cx| cx.notify()),
-            cx.subscribe(&catalog_search, |_, _, _: &InputEvent, cx| cx.notify()),
             cx.subscribe(&mcp_search, |_, _, _: &InputEvent, cx| cx.notify()),
             cx.subscribe(&skill_search, |_, _, _: &InputEvent, cx| cx.notify()),
             cx.subscribe(&profile_name, |this, _, _: &InputEvent, cx| {
@@ -812,7 +750,6 @@ impl ManagementCenter {
             capability_summaries: Vec::new(),
             runtime_option_snapshots: Vec::new(),
             usage_summaries: Vec::new(),
-            failover_recommendations: Vec::new(),
             native_exports: Vec::new(),
             native_export_source: vibex_core::ProviderNativeExportSource::Codex,
             native_export_mode: vibex_core::ProviderNativeExportMode::ProviderProfile,
@@ -853,8 +790,6 @@ impl ManagementCenter {
             compact_sidebar_height: MANAGEMENT_COMPACT_SIDEBAR_DEFAULT_HEIGHT,
             compact_sidebar_resize_hovered: false,
             compact_sidebar_resize_drag: None,
-            provider_failover_drop_target: None,
-            catalog_open: true,
             profile_editor_open: false,
             editing_profile_id: None,
             profile_secret_touched: false,
@@ -866,7 +801,6 @@ impl ManagementCenter {
             selected_acp_profile_id: None,
             acp_config_draft: None,
             agent_search,
-            catalog_search,
             mcp_search,
             skill_search,
             profile_name,
@@ -905,9 +839,6 @@ impl ManagementCenter {
         let copy = management_copy();
         self.agent_search.update(cx, |input, cx| {
             input.set_placeholder(copy.search_agents, window, cx)
-        });
-        self.catalog_search.update(cx, |input, cx| {
-            input.set_placeholder(copy.search_catalog, window, cx)
         });
         self.mcp_search.update(cx, |input, cx| {
             input.set_placeholder(copy.search_mcp, window, cx)
@@ -1356,7 +1287,6 @@ impl ManagementCenter {
         self.capability_summaries = snapshot.capability_summaries;
         self.runtime_option_snapshots = snapshot.runtime_option_snapshots;
         self.usage_summaries = snapshot.usage_summaries;
-        self.failover_recommendations = snapshot.failover_recommendations;
         self.native_exports = snapshot.native_exports;
         self.device_count = snapshot.device_count;
         self.revoked_device_count = snapshot.revoked_device_count;
@@ -2883,151 +2813,6 @@ impl ManagementCenter {
                         },
                     )
                     .map(|_| management_default_updated_message(active_locale, scope_kind).into())
-            },
-        );
-    }
-
-    fn failover_profile_ids(&self, agent_id: &str) -> Vec<String> {
-        let enabled_profile_ids = self
-            .snapshot
-            .profiles
-            .iter()
-            .filter(|profile| {
-                profile.agent_id == agent_id
-                    && profile.status == vibex_core::ProviderProfileStatus::Enabled
-            })
-            .map(|profile| profile.id.as_str())
-            .collect::<std::collections::HashSet<_>>();
-        let mut states = self
-            .agent_profile_states
-            .iter()
-            .filter(|state| {
-                state.agent_id == agent_id
-                    && state.in_failover_queue
-                    && enabled_profile_ids.contains(state.profile_id.as_str())
-            })
-            .collect::<Vec<_>>();
-        states.sort_by_key(|state| state.failover_order_index.unwrap_or(i64::MAX));
-        states
-            .into_iter()
-            .map(|state| state.profile_id.clone())
-            .collect()
-    }
-
-    fn set_failover_profile(
-        &mut self,
-        profile_id: String,
-        agent_id: String,
-        enabled: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let profile_enabled = self.snapshot.profiles.iter().any(|profile| {
-            profile.id == profile_id
-                && profile.agent_id == agent_id
-                && profile.status == vibex_core::ProviderProfileStatus::Enabled
-        });
-        if enabled && !profile_enabled {
-            self.error = Some(
-                management_error_text(
-                    "Only enabled provider profiles can join failover",
-                    "只有已启用的供应商配置才能加入故障转移",
-                    "只有已啟用的供應商配置才能加入故障轉移",
-                )
-                .into(),
-            );
-            cx.notify();
-            return;
-        }
-        let current = self.failover_profile_ids(&agent_id);
-        let next = next_failover_profile_ids(&current, &profile_id, enabled);
-        self.persist_failover_queue(agent_id, next, profile_id, cx);
-    }
-
-    fn reorder_failover_profile(
-        &mut self,
-        source_id: String,
-        target_id: String,
-        agent_id: String,
-        after: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let current = self.failover_profile_ids(&agent_id);
-        let next = reordered_failover_profile_ids(&current, &source_id, &target_id, after);
-        if next == current {
-            return;
-        }
-        self.persist_failover_queue(agent_id, next, format!("move:{source_id}"), cx);
-    }
-
-    fn persist_failover_queue(
-        &mut self,
-        agent_id: String,
-        profile_ids: Vec<String>,
-        action: String,
-        cx: &mut Context<Self>,
-    ) {
-        let Ok(agent_id) = AgentId::parse(agent_id) else {
-            self.error = Some(
-                management_error_text("Invalid Agent id", "Agent 标识无效", "Agent 識別碼無效")
-                    .into(),
-            );
-            cx.notify();
-            return;
-        };
-        let entries = profile_ids
-            .into_iter()
-            .map(vibex_core::ProviderProfileId::parse)
-            .collect::<VibexResult<Vec<_>>>();
-        let Ok(entries) = entries else {
-            self.error = Some(
-                management_error_text(
-                    "Provider profile identity is invalid",
-                    "供应商配置标识无效",
-                    "供應商配置識別碼無效",
-                )
-                .into(),
-            );
-            cx.notify();
-            return;
-        };
-        let Some(runtime) = self.runtime.clone() else {
-            return;
-        };
-        let active_locale = locale::current_locale();
-        self.begin_simple_task(
-            ManagementMutation::ProviderFailover(action),
-            cx,
-            async move {
-                runtime
-                    .management()
-                    .providers()
-                    .management()
-                    .set_agent_model_provider_failover(
-                        vibex_core::AgentModelProviderFailoverSetRequest {
-                            agent_id,
-                            entries: entries
-                                .into_iter()
-                                .map(|provider_profile_id| {
-                                    vibex_core::AgentModelProviderFailoverSetEntry {
-                                        provider_profile_id,
-                                        enabled: true,
-                                    }
-                                })
-                                .collect(),
-                        },
-                    )
-                    .map(|response| match active_locale {
-                        ResolvedLocale::En => format!(
-                            "Failover queue updated: {} profile(s)",
-                            response.entries.len()
-                        ),
-                        ResolvedLocale::ZhCn => {
-                            format!("故障转移队列已更新：{} 个配置", response.entries.len())
-                        }
-                        ResolvedLocale::ZhTw => {
-                            format!("故障轉移佇列已更新：{} 個配置", response.entries.len())
-                        }
-                    })
             },
         );
     }
@@ -4948,77 +4733,40 @@ impl ManagementCenter {
     fn render_agents(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let copy = management_copy();
         let query = self.agent_search.read(cx).value().trim().to_lowercase();
-        let catalog_query = self.catalog_search.read(cx).value().trim().to_lowercase();
-        let added_agents = self
+        let mut agents = self
             .snapshot
             .agents
             .iter()
-            .filter(|agent| agent.added && management_agent_matches_search(agent, &query))
+            .filter(|agent| management_agent_matches_search(agent, &query))
             .cloned()
             .collect::<Vec<_>>();
-        let available_agents = self
-            .snapshot
-            .agents
-            .iter()
-            .filter(|agent| !agent.added && management_agent_matches_search(agent, &catalog_query))
-            .cloned()
-            .collect::<Vec<_>>();
-        let has_available_agents = !available_agents.is_empty();
+        agents.sort_by_cached_key(management_agent_sort_key);
         let pending = self.mutation.is_some();
-        let discovering = matches!(self.mutation, Some(ManagementMutation::AgentDiscovery));
         let mut agent_rows = v_flex().w_full().gap(px(6.0));
-        if added_agents.is_empty() {
-            let title = management_locale_text(
-                "No enabled Agent",
-                "没有已启用的 Agent",
-                "沒有已啟用的 Agent",
-            );
-            let description = management_locale_text(
-                "Click to detect installed Agent CLIs on this device.",
-                "点击探测此设备上已安装的 Agent CLI。",
-                "點擊探測此裝置上已安裝的 Agent CLI。",
-            );
-            agent_rows = agent_rows.child(
-                Button::new("management-agent-discover-local")
-                    .small()
-                    .outline()
-                    .w_full()
-                    .h(px(76.0))
-                    .justify_start()
-                    .px_3()
-                    .icon(IconName::Search)
-                    .loading(discovering)
-                    .tooltip(format!("{title}. {description}"))
-                    .disabled(pending)
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .items_start()
-                            .gap_1()
-                            .child(div().text_sm().font_medium().child(title))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(description),
-                            ),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| this.discover_local_agents(cx))),
-            );
+        if agents.is_empty() {
+            agent_rows = agent_rows.child(compact_empty_state(
+                management_no_matching_agents_title(),
+                management_no_matching_agents_description(),
+                cx,
+            ));
         }
-        for agent in added_agents {
+        for agent in agents {
             let id = agent.id.as_str().to_string();
             let row_select_id = id.clone();
             let keyboard_select_id = id.clone();
             let toggle_id = id.clone();
             let remove_id = id.clone();
             let probe_id = id.clone();
-            let selected = self.selected_agent_id.as_deref() == Some(id.as_str());
+            let add_id = id.clone();
+            let added = agent.added;
+            let selected = added && self.selected_agent_id.as_deref() == Some(id.as_str());
             let enabled = agent.enabled;
             let show_install_prompt =
-                agent.install_status == vibex_core::AgentInstallStatus::Missing;
-            let status_missing = show_install_prompt
-                || (agent.enabled && agent.runtime_status != vibex_core::AgentRuntimeStatus::Ready);
+                added && agent.install_status == vibex_core::AgentInstallStatus::Missing;
+            let status_missing = added
+                && (show_install_prompt
+                    || (agent.enabled
+                        && agent.runtime_status != vibex_core::AgentRuntimeStatus::Ready));
             let status_label = management_agent_status_label(&agent);
             let status_tooltip = SharedString::from(status_label);
             let status_indicator = div()
@@ -5038,11 +4786,13 @@ impl ManagementCenter {
                         .child("!")
                 })
                 .when(!status_missing, |indicator| {
-                    indicator.child(div().size(px(6.0)).rounded(px(3.0)).bg(if agent.enabled {
-                        cx.theme().success
-                    } else {
-                        cx.theme().muted_foreground.opacity(0.55)
-                    }))
+                    indicator.child(div().size(px(6.0)).rounded(px(3.0)).bg(
+                        if added && agent.enabled {
+                            cx.theme().success
+                        } else {
+                            cx.theme().muted_foreground.opacity(0.55)
+                        },
+                    ))
                 })
                 .tooltip(move |window, cx| Tooltip::new(status_tooltip.clone()).build(window, cx));
             let profile_count = self
@@ -5051,16 +4801,12 @@ impl ManagementCenter {
                 .iter()
                 .filter(|profile| profile.agent_id == id)
                 .count();
-            agent_rows = agent_rows.child(
+            let row =
                 v_flex()
                     .id(SharedString::from(format!("management-agent-row-{id}")))
-                    .role(Role::Button)
                     .aria_label(agent.label.clone())
-                    .focusable()
-                    .tab_index(0)
                     .w_full()
                     .gap_1()
-                    .cursor_pointer()
                     .rounded(px(16.0))
                     .border_1()
                     .border_color(if selected {
@@ -5078,15 +4824,22 @@ impl ManagementCenter {
                     .when(!selected, |row| {
                         row.hover(|style| style.bg(cx.theme().accent.opacity(0.18)))
                     })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_management_agent(row_select_id.clone(), cx);
-                    }))
-                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                        if event.keystroke.key == "enter" || event.keystroke.key == "space" {
-                            this.select_management_agent(keyboard_select_id.clone(), cx);
-                            cx.stop_propagation();
-                        }
-                    }))
+                    .when(added, |row| {
+                        row.role(Role::Button)
+                            .focusable()
+                            .tab_index(0)
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.select_management_agent(row_select_id.clone(), cx);
+                            }))
+                            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                                if event.keystroke.key == "enter" || event.keystroke.key == "space"
+                                {
+                                    this.select_management_agent(keyboard_select_id.clone(), cx);
+                                    cx.stop_propagation();
+                                }
+                            }))
+                    })
                     .child(
                         h_flex()
                             .w_full()
@@ -5137,7 +4890,7 @@ impl ManagementCenter {
                                     })),
                                 )
                             })
-                            .when(!show_install_prompt, |actions| {
+                            .when(added && !show_install_prompt, |actions| {
                                 actions.child(
                                     Switch::new(SharedString::from(format!(
                                         "management-agent-toggle-{toggle_id}"
@@ -5152,24 +4905,47 @@ impl ManagementCenter {
                                     })),
                                 )
                             })
-                            .child(button_with_aria_label(
-                                Button::new(SharedString::from(format!(
-                                    "management-agent-remove-{remove_id}"
-                                )))
-                                .small()
-                                .ghost()
-                                .size(px(32.0))
-                                .icon(IconName::CircleX)
-                                .tooltip(copy.remove)
-                                .disabled(pending)
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
+                            .when(added, |actions| {
+                                actions.child(button_with_aria_label(
+                                    Button::new(SharedString::from(format!(
+                                        "management-agent-remove-{remove_id}"
+                                    )))
+                                    .small()
+                                    .ghost()
+                                    .size(px(32.0))
+                                    .icon(IconName::CircleX)
+                                    .tooltip(copy.remove)
+                                    .disabled(pending)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
                                         cx.stop_propagation();
                                         this.set_agent_added(remove_id.clone(), false, cx)
-                                    },
-                                )),
-                                copy.remove,
-                            )),
+                                    })),
+                                    copy.remove,
+                                ))
+                            })
+                            .when(!added, |actions| {
+                                actions.child(button_with_aria_label(
+                                    Button::new(SharedString::from(format!(
+                                        "management-agent-add-{add_id}"
+                                    )))
+                                    .small()
+                                    .outline()
+                                    .size(px(32.0))
+                                    .icon(IconName::Plus)
+                                    .tooltip(management_add_label())
+                                    .loading(matches!(
+                                        &self.mutation,
+                                        Some(ManagementMutation::AgentToggle(action))
+                                            if action == &format!("add:{add_id}")
+                                    ))
+                                    .disabled(pending)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.set_agent_added(add_id.clone(), true, cx)
+                                    })),
+                                    management_add_label(),
+                                ))
+                            }),
                     )
                     .child(
                         div()
@@ -5177,126 +4953,14 @@ impl ManagementCenter {
                             .truncate()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(management_profile_count(profile_count)),
-                    ),
-            );
+                            .child(if added {
+                                management_profile_count(profile_count)
+                            } else {
+                                status_label.to_string()
+                            }),
+                    );
+            agent_rows = agent_rows.child(row);
         }
-
-        let mut catalog_rows = v_flex().w_full().gap(px(6.0));
-        for agent in available_agents {
-            let id = agent.id.as_str().to_string();
-            let add_id = id.clone();
-            catalog_rows = catalog_rows.child(
-                h_flex()
-                    .w_full()
-                    .min_h(px(48.0))
-                    .min_w_0()
-                    .items_center()
-                    .gap(px(10.0))
-                    .rounded(px(6.0))
-                    .border_1()
-                    .border_color(cx.theme().border.opacity(0.70))
-                    .bg(cx.theme().background.opacity(0.55))
-                    .px(px(10.0))
-                    .py_2()
-                    .child(management_agent_glyph(
-                        agent.id.as_str(),
-                        &agent.label,
-                        false,
-                        cx,
-                    ))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .truncate()
-                            .text_sm()
-                            .font_medium()
-                            .child(agent.label),
-                    )
-                    .child(button_with_aria_label(
-                        Button::new(SharedString::from(format!("management-agent-add-{add_id}")))
-                            .small()
-                            .outline()
-                            .size(px(32.0))
-                            .icon(IconName::Plus)
-                            .tooltip(management_add_label())
-                            .loading(matches!(
-                                &self.mutation,
-                                Some(ManagementMutation::AgentToggle(action))
-                                    if action == &format!("add:{add_id}")
-                            ))
-                            .disabled(pending)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.set_agent_added(add_id.clone(), true, cx)
-                            })),
-                        management_add_label(),
-                    )),
-            );
-        }
-        if !has_available_agents {
-            catalog_rows = catalog_rows.child(compact_empty_state(
-                management_no_catalog_title(),
-                management_no_catalog_description(),
-                cx,
-            ));
-        }
-
-        let catalog_drawer = v_flex()
-            .w_full()
-            .min_h_0()
-            .mt_2()
-            .overflow_hidden()
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(cx.theme().border.opacity(0.70))
-            .bg(if self.catalog_open {
-                cx.theme().background.opacity(0.60)
-            } else {
-                cx.theme().muted.opacity(0.10)
-            })
-            .when(self.catalog_open, |drawer| drawer.min_h(px(176.0)).flex_1())
-            .child(
-                Button::new("management-agent-catalog-toggle")
-                    .small()
-                    .ghost()
-                    .w_full()
-                    .h(px(36.0))
-                    .flex_none()
-                    .justify_start()
-                    .px(px(10.0))
-                    .icon(if self.catalog_open {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
-                    })
-                    .label(copy.add_agent)
-                    .child(div().flex_1())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.catalog_open = !this.catalog_open;
-                        cx.notify();
-                    })),
-            )
-            .when(self.catalog_open, |drawer| {
-                drawer.child(
-                    v_flex()
-                        .min_h_0()
-                        .flex_1()
-                        .border_t_1()
-                        .border_color(cx.theme().border.opacity(0.70))
-                        .p_2()
-                        .child(management_search_input(&self.catalog_search, cx))
-                        .child(
-                            div()
-                                .id("management-agent-catalog-scroll")
-                                .min_h_0()
-                                .flex_1()
-                                .mt_2()
-                                .overflow_y_scroll()
-                                .child(catalog_rows),
-                        ),
-                )
-            });
 
         v_flex()
             .size_full()
@@ -5310,14 +4974,7 @@ impl ManagementCenter {
                     .flex_1()
                     .overflow_y_scroll()
                     .pr_1()
-                    .child(
-                        v_flex()
-                            .size_full()
-                            .min_h_0()
-                            .gap(px(6.0))
-                            .child(agent_rows)
-                            .child(catalog_drawer),
-                    ),
+                    .child(agent_rows),
             )
             .into_any_element()
     }
@@ -6687,7 +6344,6 @@ impl ManagementCenter {
         let selected_profile_id = self
             .selected_management_provider_profile()
             .map(|profile| profile.id.as_str().to_string());
-        let failover_profile_ids = self.failover_profile_ids(&selected_agent_id);
         let pending = self.mutation.is_some();
         let native_importing = matches!(
             &self.mutation,
@@ -6761,8 +6417,6 @@ impl ManagementCenter {
             let duplicate_id = id.clone();
             let default_id = id.clone();
             let default_agent = agent_id.clone();
-            let failover_id = id.clone();
-            let failover_agent = agent_id.clone();
             let delete_id = id.clone();
             let delete_label = profile.display_name.clone();
             let profile_state = self
@@ -6771,7 +6425,6 @@ impl ManagementCenter {
                 .find(|state| state.agent_id == agent_id && state.profile_id == id);
             let is_default = profile_state.is_some_and(|state| state.is_default);
             let active = selected_profile_id.as_deref() == Some(id.as_str());
-            let in_failover_queue = profile_state.is_some_and(|state| state.in_failover_queue);
             let address = profile
                 .base_url
                 .as_deref()
@@ -6826,13 +6479,6 @@ impl ManagementCenter {
                                 .when(is_default, |header| {
                                     header.child(management_status_badge(
                                         management_locale_text("Default", "默认", "預設")
-                                            .to_string(),
-                                        cx,
-                                    ))
-                                })
-                                .when(in_failover_queue, |header| {
-                                    header.child(management_status_badge(
-                                        management_locale_text("Failover", "故障转移", "故障轉移")
                                             .to_string(),
                                         cx,
                                     ))
@@ -6908,38 +6554,6 @@ impl ManagementCenter {
                     ))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.duplicate_provider_profile(duplicate_id.clone(), cx)
-                    })),
-                )
-                .child(
-                    Button::new(SharedString::from(format!(
-                        "provider-failover-{failover_id}"
-                    )))
-                    .xsmall()
-                    .outline()
-                    .compact()
-                    .icon(Icon::default().path("icons/vibex/shield-alert.svg"))
-                    .selected(in_failover_queue)
-                    .tooltip(if in_failover_queue {
-                        management_locale_text(
-                            "Remove from failover",
-                            "移出故障转移",
-                            "移出故障轉移",
-                        )
-                    } else {
-                        management_locale_text("Add to failover", "加入故障转移", "加入故障轉移")
-                    })
-                    .disabled(
-                        pending
-                            || (!in_failover_queue
-                                && profile.status != vibex_core::ProviderProfileStatus::Enabled),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_failover_profile(
-                            failover_id.clone(),
-                            failover_agent.clone(),
-                            !in_failover_queue,
-                            cx,
-                        )
                     })),
                 )
                 .child(
@@ -7022,181 +6636,6 @@ impl ManagementCenter {
             );
         }
 
-        let mut failover_rows = v_flex().w_full().gap_2();
-        for (index, profile_id) in failover_profile_ids.iter().enumerate() {
-            let Some(profile) = profiles.iter().find(|profile| &profile.id == profile_id) else {
-                continue;
-            };
-            let remove_id = profile.id.clone();
-            let remove_agent = profile.agent_id.clone();
-            let drag_profile_id = profile.id.clone();
-            let drag_agent_id = profile.agent_id.clone();
-            let drag_payload = ProviderFailoverDrag {
-                profile_id: drag_profile_id.clone(),
-                agent_id: drag_agent_id.clone(),
-                label: profile.display_name.clone().into(),
-            };
-            let drag_entity = cx.weak_entity();
-            let drag_target_profile_id = profile.id.clone();
-            let drop_target_profile_id = profile.id.clone();
-            let drop_target_agent_id = profile.agent_id.clone();
-            let active_drop_after =
-                self.provider_failover_drop_target
-                    .as_ref()
-                    .and_then(|target| {
-                        (cx.has_active_drag() && target.profile_id == profile.id)
-                            .then_some(target.after)
-                    });
-            let row = h_flex()
-                .id(SharedString::from(format!(
-                    "provider-failover-drag-{}",
-                    profile.id
-                )))
-                .relative()
-                .w_full()
-                .min_w_0()
-                .items_center()
-                .gap_3()
-                .rounded(px(16.0))
-                .border_1()
-                .border_color(cx.theme().border.opacity(0.70))
-                .bg(cx.theme().background.opacity(0.90))
-                .px_3()
-                .py_2()
-                .hover(|style| {
-                    style
-                        .border_color(cx.theme().ring.opacity(0.45))
-                        .bg(cx.theme().muted.opacity(0.30))
-                })
-                .when_some(active_drop_after, |row, after| {
-                    row.child(
-                        div()
-                            .absolute()
-                            .left_2()
-                            .right_2()
-                            .h(px(2.0))
-                            .bg(cx.theme().drag_border)
-                            .map(|line| if after { line.bottom_0() } else { line.top_0() }),
-                    )
-                })
-                .child(
-                    div()
-                        .size(px(36.0))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(12.0))
-                        .border_1()
-                        .border_color(cx.theme().border.opacity(0.70))
-                        .bg(cx.theme().muted.opacity(0.35))
-                        .text_xs()
-                        .font_semibold()
-                        .text_color(cx.theme().muted_foreground)
-                        .child((index + 1).to_string()),
-                )
-                .child(
-                    Icon::default()
-                        .path("icons/vibex/grip-vertical.svg")
-                        .size(px(16.0))
-                        .text_color(cx.theme().muted_foreground),
-                )
-                .child(
-                    v_flex()
-                        .min_w_0()
-                        .flex_1()
-                        .child(
-                            div()
-                                .truncate()
-                                .text_sm()
-                                .font_semibold()
-                                .child(profile.display_name.clone()),
-                        )
-                        .child(
-                            div()
-                                .truncate()
-                                .text_xs()
-                                .font_family(cx.theme().mono_font_family.clone())
-                                .font_weight(code_font_weight(cx))
-                                .text_color(cx.theme().muted_foreground)
-                                .child(profile.id.clone()),
-                        ),
-                )
-                .child(management_status_badge(
-                    management_enabled_label(true).to_string(),
-                    cx,
-                ))
-                .child(
-                    Button::new(SharedString::from(format!(
-                        "provider-failover-remove-{remove_id}"
-                    )))
-                    .small()
-                    .ghost()
-                    .icon(IconName::Delete)
-                    .label(management_locale_text(
-                        "Remove",
-                        "移出故障转移",
-                        "移出故障轉移",
-                    ))
-                    .disabled(pending)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_failover_profile(
-                            remove_id.clone(),
-                            remove_agent.clone(),
-                            false,
-                            cx,
-                        )
-                    })),
-                );
-            let row = if pending {
-                row
-            } else {
-                row.on_drag(drag_payload, move |drag, _, _, cx| {
-                    cx.stop_propagation();
-                    let _ = drag_entity.update(cx, |this, cx| {
-                        this.provider_failover_drop_target = None;
-                        cx.notify();
-                    });
-                    cx.new(|_| drag.clone())
-                })
-                .on_drag_move(cx.listener(
-                    move |this, event: &DragMoveEvent<ProviderFailoverDrag>, _, cx| {
-                        let drag = event.drag(cx);
-                        let next = (event.bounds.contains(&event.event.position)
-                            && drag.profile_id != drag_target_profile_id
-                            && drag.agent_id == drag_agent_id)
-                            .then_some(ProviderFailoverDropTarget {
-                                profile_id: drag_target_profile_id.clone(),
-                                after: event.event.position.y >= event.bounds.center().y,
-                            });
-                        if this.provider_failover_drop_target != next {
-                            this.provider_failover_drop_target = next;
-                            cx.notify();
-                        }
-                    },
-                ))
-                .on_drop(cx.listener(
-                    move |this, drag: &ProviderFailoverDrag, _, cx| {
-                        let target = this.provider_failover_drop_target.take();
-                        if let Some(target) = target.filter(|target| {
-                            target.profile_id == drop_target_profile_id
-                                && drag.agent_id == drop_target_agent_id
-                        }) {
-                            this.reorder_failover_profile(
-                                drag.profile_id.clone(),
-                                target.profile_id,
-                                drag.agent_id.clone(),
-                                target.after,
-                                cx,
-                            );
-                        } else {
-                            cx.notify();
-                        }
-                    },
-                ))
-            };
-            failover_rows = failover_rows.child(row);
-        }
         let runtime_verification_card =
             self.render_runtime_verification_card(&selected_agent_id, selected_agent.enabled, cx);
         let projection_contract = self.render_projection_contract(cx);
@@ -7273,27 +6712,6 @@ impl ManagementCenter {
                         compact_empty_state(copy.no_profiles, copy.no_profiles_description, cx)
                     } else {
                         profile_rows.into_any_element()
-                    }),
-            )
-            .child(
-                v_flex()
-                    .w_full()
-                    .gap_3()
-                    .rounded(px(8.0))
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .p_4()
-                    .child(div().text_sm().font_semibold().child(copy.failover))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(management_failover_description()),
-                    )
-                    .child(if failover_profile_ids.is_empty() {
-                        compact_empty_state(copy.no_failover, copy.no_failover_description, cx)
-                    } else {
-                        failover_rows.into_any_element()
                     }),
             )
             .into_any_element()
@@ -11493,18 +10911,15 @@ fn native_export_preview_matches(
 
 fn agent_provider_profile_states(
     agent_id: &str,
-    response: vibex_core::AgentModelProviderProfileListResponse,
+    profiles: impl IntoIterator<Item = vibex_core::ProviderProfile>,
     default_profile_id: Option<&vibex_core::ProviderProfileId>,
 ) -> Vec<AgentProviderProfileState> {
-    response
-        .profiles
+    profiles
         .into_iter()
-        .map(|item| AgentProviderProfileState {
+        .map(|profile| AgentProviderProfileState {
             agent_id: agent_id.to_string(),
-            profile_id: item.profile.id.as_str().to_string(),
-            is_default: default_profile_id == Some(&item.profile.id),
-            failover_order_index: item.failover_order_index,
-            in_failover_queue: item.in_failover_queue,
+            profile_id: profile.id.as_str().to_string(),
+            is_default: default_profile_id == Some(&profile.id),
         })
         .collect()
 }
@@ -11568,6 +10983,21 @@ fn management_agent_matches_search(agent: &AgentSnapshotEntry, query: &str) -> b
         )
         .to_lowercase()
         .contains(query)
+}
+
+fn management_agent_sort_key(agent: &AgentSnapshotEntry) -> (u8, String, String) {
+    let group = if !agent.added {
+        2
+    } else if agent.enabled {
+        0
+    } else {
+        1
+    };
+    (
+        group,
+        agent.label.to_lowercase(),
+        agent.id.as_str().to_string(),
+    )
 }
 
 fn agent_install_url(agent: &AgentSnapshotEntry) -> Option<&str> {
@@ -11725,18 +11155,6 @@ fn updated_skill_agent_matrix(
     matrix
 }
 
-fn next_failover_profile_ids(current: &[String], profile_id: &str, enabled: bool) -> Vec<String> {
-    let mut next = current
-        .iter()
-        .filter(|id| id.as_str() != profile_id)
-        .cloned()
-        .collect::<Vec<_>>();
-    if enabled {
-        next.push(profile_id.to_string());
-    }
-    next
-}
-
 fn normalized_provider_models(
     models: &[vibex_core::ProviderConfiguredModel],
 ) -> Vec<vibex_core::ProviderConfiguredModel> {
@@ -11860,30 +11278,6 @@ fn pending_cc_switch_import_item_ids(
         .filter(|item| seen_item_ids.insert(item.import_item_id.as_str().to_string()))
         .map(|item| item.import_item_id.clone())
         .collect()
-}
-
-fn reordered_failover_profile_ids(
-    current: &[String],
-    source_id: &str,
-    target_id: &str,
-    after: bool,
-) -> Vec<String> {
-    if source_id == target_id {
-        return current.to_vec();
-    }
-    let Some(source_index) = current.iter().position(|id| id == source_id) else {
-        return current.to_vec();
-    };
-    if !current.iter().any(|id| id == target_id) {
-        return current.to_vec();
-    }
-    let mut next = current.to_vec();
-    let source = next.remove(source_index);
-    let Some(target_index) = next.iter().position(|id| id == target_id) else {
-        return current.to_vec();
-    };
-    next.insert(target_index + usize::from(after), source);
-    next
 }
 
 fn management_agent_icon(identity: &str, label: &str, active: bool, cx: &App) -> AnyElement {
@@ -12222,6 +11616,9 @@ fn management_install_label() -> &'static str {
 }
 
 fn management_agent_status_label(agent: &AgentSnapshotEntry) -> &'static str {
+    if !agent.added {
+        return management_locale_text("Not added", "未添加", "未新增");
+    }
     if !agent.installed {
         return management_locale_text("Not installed", "未安装", "未安裝");
     }
@@ -12251,19 +11648,15 @@ fn management_add_label() -> &'static str {
     management_locale_text("Add", "添加", "新增")
 }
 
-fn management_no_catalog_title() -> &'static str {
-    management_locale_text(
-        "No available Agents",
-        "没有可添加的 Agent",
-        "沒有可新增的 Agent",
-    )
+fn management_no_matching_agents_title() -> &'static str {
+    management_locale_text("No matching Agents", "没有匹配的 Agent", "沒有符合的 Agent")
 }
 
-fn management_no_catalog_description() -> &'static str {
+fn management_no_matching_agents_description() -> &'static str {
     management_locale_text(
-        "All matching Agents have already been added.",
-        "所有匹配的 Agent 均已添加。",
-        "所有符合的 Agent 均已新增。",
+        "Try another name or Agent id.",
+        "请尝试其他名称或 Agent ID。",
+        "請嘗試其他名稱或 Agent ID。",
     )
 }
 
@@ -12636,14 +12029,6 @@ fn management_append_runtime_option_refresh(
     }
 }
 
-fn management_failover_description() -> &'static str {
-    management_locale_text(
-        "When an Agent model provider call fails, retry with the failover queue below.",
-        "当 Agent 模型供应商调用发生异常时，将自动按下方故障转移队列进行重试。",
-        "當 Agent 模型供應商呼叫發生異常時，將自動按下方故障轉移佇列重試。",
-    )
-}
-
 fn management_mcp_description() -> &'static str {
     management_locale_text(
         "Managed servers, validation, and Agent enablement.",
@@ -12746,7 +12131,7 @@ async fn load_snapshot(
         )?;
         agent_profile_states.extend(agent_provider_profile_states(
             agent.id.as_str(),
-            response,
+            response.profiles.into_iter().map(|item| item.profile),
             scoped_default.provider_profile_id.as_ref(),
         ));
 
@@ -12827,12 +12212,6 @@ async fn load_snapshot(
         provider_profile_ids: None,
         include_empty: true,
     })?;
-    let failover_recommendations = provider.list_failover_recommendations(
-        vibex_core::ProviderFailoverRecommendationRequest {
-            provider_profile_ids: None,
-            max_candidates_per_profile: Some(3),
-        },
-    )?;
     let native_exports =
         provider.list_native_exports(vibex_core::ProviderNativeExportListRequest {
             provider_profile_id: None,
@@ -12925,7 +12304,6 @@ async fn load_snapshot(
         capability_summaries,
         runtime_option_snapshots,
         usage_summaries,
-        failover_recommendations,
         native_exports,
         device_count: devices.len().saturating_sub(revoked_device_count),
         revoked_device_count,
@@ -13181,34 +12559,14 @@ mod tests {
             .expect("valid Provider profile id");
         workspace_profile.display_name = "Workspace Provider".into();
 
-        let response = vibex_core::AgentModelProviderProfileListResponse {
-            profiles: vec![
-                vibex_core::AgentModelProviderProfile {
-                    profile: global_profile.clone(),
-                    is_default: true,
-                    failover_order_index: None,
-                    in_failover_queue: false,
-                },
-                vibex_core::AgentModelProviderProfile {
-                    profile: workspace_profile.clone(),
-                    is_default: false,
-                    failover_order_index: Some(0),
-                    in_failover_queue: true,
-                },
-            ],
-        };
-
         let states = agent_provider_profile_states(
             global_profile.agent_id.as_str(),
-            response,
+            vec![global_profile.clone(), workspace_profile.clone()],
             Some(&workspace_profile.id),
         );
         assert_eq!(states.len(), 2);
         assert!(states.iter().any(|state| {
-            state.profile_id == workspace_profile.id.as_str()
-                && state.is_default
-                && state.in_failover_queue
-                && state.failover_order_index == Some(0)
+            state.profile_id == workspace_profile.id.as_str() && state.is_default
         }));
         assert!(
             states.iter().any(|state| {
@@ -13305,35 +12663,6 @@ mod tests {
                 && !entry.enabled
                 && entry.source_kind == vibex_core::ResourceAgentMatrixSourceKind::NativeImport
         }));
-    }
-
-    #[test]
-    fn failover_queue_toggle_and_reorder_preserve_sequence() {
-        let current = vec![
-            "provider-a".to_string(),
-            "provider-b".to_string(),
-            "provider-c".to_string(),
-        ];
-        assert_eq!(
-            next_failover_profile_ids(&current, "provider-d", true),
-            vec!["provider-a", "provider-b", "provider-c", "provider-d"]
-        );
-        assert_eq!(
-            next_failover_profile_ids(&current, "provider-a", false),
-            vec!["provider-b", "provider-c"]
-        );
-        assert_eq!(
-            reordered_failover_profile_ids(&current, "provider-c", "provider-a", false),
-            vec!["provider-c", "provider-a", "provider-b"]
-        );
-        assert_eq!(
-            reordered_failover_profile_ids(&current, "provider-a", "provider-b", true),
-            vec!["provider-b", "provider-a", "provider-c"]
-        );
-        assert_eq!(
-            reordered_failover_profile_ids(&current, "provider-a", "provider-missing", true),
-            current
-        );
     }
 
     #[test]
@@ -13613,7 +12942,42 @@ mod tests {
         assert!(render_agents.contains("management-agent-row-{id}"));
         assert!(render_agents.contains("this.select_management_agent(row_select_id.clone(), cx);"));
         assert!(!render_agents.contains("management-agent-select-"));
+        assert!(render_agents.contains("agents.sort_by_cached_key(management_agent_sort_key);"));
+        assert!(render_agents.contains("management-agent-add-{add_id}"));
+        assert!(!render_agents.contains("management-agent-catalog-"));
         assert!(render_agents.matches("cx.stop_propagation();").count() >= 4);
+    }
+
+    #[test]
+    fn agent_sidebar_orders_enabled_disabled_then_unadded_by_name() {
+        let definitions = vibex_core::builtin_agent_definitions();
+        assert!(definitions.len() >= 5);
+        let mut agents = definitions
+            .iter()
+            .take(5)
+            .map(|definition| AgentSnapshotEntry::from_definition(definition, None, None))
+            .collect::<Vec<_>>();
+        for (agent, (label, added, enabled)) in agents.iter_mut().zip([
+            ("Zulu", true, true),
+            ("alpha", true, true),
+            ("Delta", true, false),
+            ("beta", true, false),
+            ("Aardvark", false, false),
+        ]) {
+            agent.label = label.to_string();
+            agent.added = added;
+            agent.enabled = enabled;
+        }
+
+        agents.sort_by_cached_key(management_agent_sort_key);
+
+        assert_eq!(
+            agents
+                .iter()
+                .map(|agent| agent.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "Zulu", "beta", "Delta", "Aardvark"]
+        );
     }
 
     #[test]

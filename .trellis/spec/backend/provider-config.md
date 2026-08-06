@@ -2093,6 +2093,14 @@ agent_discovery_records(
 - `ProviderConfigService::list_agents` merges built-ins, persisted
   `agent_configs`, and latest cached `agent_discovery_records`. It must not
   spawn provider runtimes, ACP processes, or Agent probes.
+- The GPUI Config Center Agent sidebar renders every supported Agent in one
+  card list. Added/enabled Agents come first, added/disabled Agents follow,
+  and unadded Agents come last; each group sorts case-insensitively by display
+  name. Unadded Agents expose their Add action on the card instead of a
+  separate catalog dropdown.
+- The GPUI Config Center Agent surface does not load, render, or mutate Provider
+  failover recommendations or queues. Backend failover storage and service
+  contracts remain independent of this presentation rule.
 - `agent_refresh_snapshot` may perform low-cost filesystem/PATH detection and
   cache a discovery record for an added Agent even while it is disabled. The
   detection may update install/config status, but runtime status remains
@@ -2195,6 +2203,8 @@ agent_discovery_records(
   lookup, non-ACP registration rejection, and no ProviderKind fallback.
 - `cargo test -p vibex-agent-acp --lib` covers exact Claude/Codex managed route
   ids and optional Effort/Mode effective-config matching.
+- `cargo test -p vibex-desktop management` covers the unified Agent list order,
+  card actions, and absence of the catalog drawer and failover controls.
 - `cargo test -p vibex-desktop agent` and
   `pnpm --dir apps/desktop typecheck` and frontend builds
   cover Runtime Option Catalog/create contract consumption.
