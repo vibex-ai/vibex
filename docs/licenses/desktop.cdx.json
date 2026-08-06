@@ -39159,7 +39159,7 @@
     },
     {
       "type": "file",
-      "bom-ref": "asset:vibex-desktop-application-icons:938133838497e43c",
+      "bom-ref": "asset:vibex-desktop-application-icons:9ae646c05c9fa1f7",
       "name": "Vibex desktop application and tray icons",
       "version": "0.1.0-rc.1",
       "licenses": [
@@ -39170,7 +39170,7 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "938133838497e43cec2d4ae201a4c90cf187332afcb84f96ace44069421d2c7b"
+          "content": "9ae646c05c9fa1f745ad2cb98aa0479021e216248e597b1678c205b99343eb44"
         }
       ],
       "externalReferences": [
@@ -39190,7 +39190,7 @@
         },
         {
           "name": "vibex:file-count",
-          "value": "3"
+          "value": "10"
         },
         {
           "name": "vibex:selected-license",
@@ -39541,7 +39541,7 @@
       "dependsOn": []
     },
     {
-      "ref": "asset:vibex-desktop-application-icons:938133838497e43c",
+      "ref": "asset:vibex-desktop-application-icons:9ae646c05c9fa1f7",
       "dependsOn": []
     },
     {
@@ -46728,6 +46728,7 @@
         "cargo:keyring@3.6.3:c19b7c6f923b580a",
         "cargo:reqwest@0.13.4:c19b7c6f923b580a",
         "cargo:rusqlite@0.37.0:c19b7c6f923b580a",
+        "cargo:semver@1.0.28:c19b7c6f923b580a",
         "cargo:serde_json@1.0.150:c19b7c6f923b580a",
         "cargo:serde_yaml@0.9.34+deprecated:c19b7c6f923b580a",
         "cargo:sha2@0.10.9:c19b7c6f923b580a",
@@ -46820,7 +46821,7 @@
     {
       "ref": "cargo:vibex-desktop@0.1.0-rc.1:8be20e5fa4f9b6f0",
       "dependsOn": [
-        "asset:vibex-desktop-application-icons:938133838497e43c",
+        "asset:vibex-desktop-application-icons:9ae646c05c9fa1f7",
         "asset:vibex-desktop-reviewed-icons:c8d0b5c8e37627d4",
         "cargo:base64@0.22.1:c19b7c6f923b580a",
         "cargo:chrono@0.4.45:c19b7c6f923b580a",

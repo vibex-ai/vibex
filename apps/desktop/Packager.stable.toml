@@ -9,6 +9,13 @@ copyright = "Copyright 2026 Vibex"
 binariesDir = "../../target/release"
 outDir = "../../target/release-packages/stable"
 icons = [
+  "assets/app-icons/icon-16.png",
+  "assets/app-icons/icon-24.png",
+  "assets/app-icons/icon-32.png",
+  "assets/app-icons/icon-48.png",
+  "assets/app-icons/icon-64.png",
+  "assets/app-icons/icon-128.png",
+  "assets/app-icons/icon-256.png",
   "assets/app-icons/icon.png",
   "assets/app-icons/icon.ico",
 ]

@@ -879,11 +879,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn window_icon_is_a_high_contrast_x11_asset() {
+    fn window_icon_is_high_contrast_and_rounded() {
         let icon = window_icon().expect("bundled window icon should decode");
 
         assert_eq!(icon.dimensions(), (256, 256));
-        assert_eq!(*icon.get_pixel(0, 0), image::Rgba([0, 0, 0, 255]));
+        assert_eq!(*icon.get_pixel(0, 0), image::Rgba([0, 0, 0, 0]));
         assert!(icon.pixels().any(|pixel| pixel.0 == [255, 255, 255, 255]));
     }
 

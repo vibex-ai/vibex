@@ -102,6 +102,7 @@ function validatePackaging() {
     assert(config.includes(`identifier = "${applicationId}"`), `${channel} package id drifted`);
     assert(config.includes(`productName = "${productName}"`), `${channel} product name drifted`);
     assert(config.includes('assets/app-icons/icon.png'), `${channel} package does not own its icon`);
+    assert(config.includes('assets/app-icons/icon-256.png'), `${channel} package is missing its taskbar icon size`);
     assert(config.includes(`packaging/${applicationId}.desktop`), `${channel} package is missing its app-id desktop entry`);
     assert(desktopEntry.includes(`StartupWMClass=${applicationId}`), `${channel} desktop entry app id drifted`);
     assert(desktopEntry.includes("Icon=vibex-desktop"), `${channel} desktop entry icon drifted`);

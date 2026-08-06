@@ -7,16 +7,23 @@ if (process.platform === "linux") {
   const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
   const dataHome = resolve(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"));
   const appId = "dev.vibex.desktop.preview";
-  const iconDir = join(dataHome, "icons", "hicolor", "1024x1024", "apps");
   const desktopDir = join(dataHome, "applications");
-  const iconPath = join(iconDir, `${appId}.png`);
-  const desktopPath = join(desktopDir, `${appId}.desktop`);
+  const iconSizes = [16, 24, 32, 48, 64, 128, 256, 1024];
 
-  mkdirSync(iconDir, { recursive: true });
   mkdirSync(desktopDir, { recursive: true });
-  copyFileSync(join(root, "apps", "desktop", "assets", "app-icons", "icon.png"), iconPath);
+  for (const size of iconSizes) {
+    const iconDir = join(dataHome, "icons", "hicolor", `${size}x${size}`, "apps");
+    const sourceName = size === 1024 ? "icon.png" : `icon-${size}.png`;
+    mkdirSync(iconDir, { recursive: true });
+    copyFileSync(
+      join(root, "apps", "desktop", "assets", "app-icons", sourceName),
+      join(iconDir, `${appId}.png`)
+    );
+  }
+  const iconPath = join(dataHome, "icons", "hicolor", "256x256", "apps", `${appId}.png`);
+  const desktopPath = join(desktopDir, `${appId}.desktop`);
   writeFileSync(
     desktopPath,
-    `[Desktop Entry]\nName=Vibex Preview\nComment=Vibex development desktop application\nExec=${join(root, "target", "debug", "vibex-desktop")}\nIcon=${appId}\nNoDisplay=true\nStartupWMClass=${appId}\nTerminal=false\nType=Application\n`
+    `[Desktop Entry]\nName=Vibex Preview\nComment=Vibex development desktop application\nExec=${join(root, "target", "debug", "vibex-desktop")}\nIcon=${iconPath}\nNoDisplay=true\nStartupWMClass=${appId}\nTerminal=false\nType=Application\n`
   );
 }

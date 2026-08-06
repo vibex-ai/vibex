@@ -229,8 +229,8 @@
         ".ico",
         ".png"
       ],
-      "expectedFileCount": 3,
-      "treeSha256": "938133838497e43cec2d4ae201a4c90cf187332afcb84f96ace44069421d2c7b",
+      "expectedFileCount": 10,
+      "treeSha256": "9ae646c05c9fa1f745ad2cb98aa0479021e216248e597b1678c205b99343eb44",
       "licenseExpression": "AGPL-3.0-or-later",
       "source": "https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/app-icons"
     },

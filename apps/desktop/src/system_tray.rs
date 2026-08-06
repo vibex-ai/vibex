@@ -352,6 +352,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tray_icon_is_high_contrast_and_rounded() {
+        let icon = image::load_from_memory_with_format(TRAY_ICON_BYTES, image::ImageFormat::Png)
+            .expect("bundled tray icon should decode")
+            .into_rgba8();
+
+        assert_eq!(icon.dimensions(), (128, 128));
+        assert_eq!(*icon.get_pixel(0, 0), image::Rgba([0, 0, 0, 0]));
+        assert!(icon.pixels().any(|pixel| pixel.0 == [255, 255, 255, 255]));
+    }
+
+    #[test]
     fn invalid_restore_bounds_fall_back_to_the_desktop_default() {
         let bounds = WindowBounds::Windowed(Bounds::new(
             gpui::point(px(24.0), px(36.0)),
