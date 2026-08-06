@@ -1668,7 +1668,7 @@ fn latest_agent_version(conn: &Connection, agent_id: &AgentId) -> VibexResult<Op
             "
             SELECT version
             FROM agent_discovery_records
-            WHERE agent_id = ?1 AND version IS NOT NULL
+            WHERE agent_id = ?1
             ORDER BY discovered_at_ms DESC
             LIMIT 1
             ",

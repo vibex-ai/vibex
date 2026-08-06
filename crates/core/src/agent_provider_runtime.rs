@@ -9,8 +9,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 
+use crate::provider_projection::{
+    OPENCODE_COMPATIBLE_VERSION_REQUIREMENT, OPENCODE_LAST_VERIFIED_VERSION,
+};
 use crate::{
     AcpAdapterId, AgentCredentialControl, AgentCredentialKind, AgentId, AgentModelControl,
     AgentModelInterfaceDescriptor, AgentProviderControl, AgentProviderProjectionDescriptor,
@@ -41,9 +45,10 @@ pub enum AgentProviderCapabilityMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "version", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentVersionPolicy {
     Exact,
+    DetectedSemver { requirement: String },
     DetectedManual,
 }
 
@@ -119,6 +124,32 @@ impl AgentProviderRolloutManifestEntry {
                 "agent_rollout_manifest_identity_invalid",
                 "rollout manifest versions and smoke ids must be bounded identities",
             ));
+        }
+        match &self.version_policy {
+            AgentVersionPolicy::Exact if self.catalog_version == "manual" => {
+                return Err(VibexError::validation(
+                    "agent_rollout_manifest_version_policy_invalid",
+                    "exact rollout entries cannot use the manual catalog version",
+                ));
+            }
+            AgentVersionPolicy::DetectedManual if self.catalog_version != "manual" => {
+                return Err(VibexError::validation(
+                    "agent_rollout_manifest_version_policy_invalid",
+                    "manual rollout entries must use the manual catalog version",
+                ));
+            }
+            AgentVersionPolicy::DetectedSemver { requirement }
+                if requirement.trim().is_empty()
+                    || requirement.len() > 192
+                    || VersionReq::parse(requirement).is_err()
+                    || self.catalog_version == "manual" =>
+            {
+                return Err(VibexError::validation(
+                    "agent_rollout_manifest_version_policy_invalid",
+                    "detected semantic-version rollout entries require a valid non-manual range",
+                ));
+            }
+            _ => {}
         }
         let mut interfaces = BTreeSet::new();
         for interface in &self.model_interfaces {
@@ -450,7 +481,7 @@ pub fn agent_provider_rollout_manifest() -> VibexResult<Vec<AgentProviderRollout
     for (id, version) in [
         ("claude", "0.64.2"),
         ("codex", "0.146.0"),
-        ("opencode", "1.17.9"),
+        ("opencode", OPENCODE_LAST_VERIFIED_VERSION),
     ] {
         let agent_id = AgentId::parse(id)?;
         entries.push(AgentProviderRolloutManifestEntry {
@@ -463,7 +494,13 @@ pub fn agent_provider_rollout_manifest() -> VibexResult<Vec<AgentProviderRollout
                 _ => "projection_opencode_inline_provider_v1",
             })?,
             descriptor_version: "1".to_string(),
-            version_policy: AgentVersionPolicy::Exact,
+            version_policy: if id == "opencode" {
+                AgentVersionPolicy::DetectedSemver {
+                    requirement: OPENCODE_COMPATIBLE_VERSION_REQUIREMENT.to_string(),
+                }
+            } else {
+                AgentVersionPolicy::Exact
+            },
             capability_mode: AgentProviderCapabilityMode::ReplaceableProvider,
             runtime_home_strategy: AgentRuntimeHomeStrategy::VibexPrivate,
             switch_behavior: ProviderSwitchBehavior::RestartAndResume,
@@ -473,7 +510,11 @@ pub fn agent_provider_rollout_manifest() -> VibexResult<Vec<AgentProviderRollout
             // only authority allowed to promote a concrete profile to
             // Verified. The rollout manifest therefore starts conservatively.
             evidence_state: ProjectionEvidenceState::Documented,
-            source_evidence_reference: format!("provider-config/{id}-environment-v1"),
+            source_evidence_reference: if id == "opencode" {
+                "provider-config/opencode-inline-provider-v1".to_string()
+            } else {
+                format!("provider-config/{id}-environment-v1")
+            },
             smoke_id: format!("builtin-provider-{id}"),
             capability_diagnostic_code: Some(
                 "agent_projection_runtime_verification_required".to_string(),
@@ -676,7 +717,15 @@ pub struct AgentRuntimeProbeEvidence {
 
 impl AgentRuntimeProbeEvidence {
     pub fn provider_projection_verified(&self) -> bool {
-        self.descriptor_match == ProjectionDescriptorMatch::Exact
+        let version_identity_verified = match self.descriptor_match {
+            ProjectionDescriptorMatch::Exact => true,
+            ProjectionDescriptorMatch::SemverRange => self
+                .agent_version
+                .as_deref()
+                .is_some_and(|version| Version::parse(version).is_ok()),
+            ProjectionDescriptorMatch::Conservative => false,
+        };
+        version_identity_verified
             && self
                 .projection_fingerprint
                 .as_deref()
@@ -1034,6 +1083,17 @@ mod tests {
                 .iter()
                 .all(|entry| !entry.source_evidence_reference.is_empty())
         );
+        let opencode = manifest
+            .iter()
+            .find(|entry| entry.agent_id.as_str() == "opencode")
+            .unwrap();
+        assert_eq!(opencode.catalog_version, OPENCODE_LAST_VERIFIED_VERSION);
+        assert_eq!(
+            opencode.version_policy,
+            AgentVersionPolicy::DetectedSemver {
+                requirement: OPENCODE_COMPATIBLE_VERSION_REQUIREMENT.to_string()
+            }
+        );
 
         let mut unsafe_conservative = manifest
             .into_iter()
@@ -1043,6 +1103,34 @@ mod tests {
         assert_eq!(
             unsafe_conservative.validate().unwrap_err().code,
             "agent_rollout_manifest_conservative_shape_invalid"
+        );
+    }
+
+    #[test]
+    fn version_policy_keeps_legacy_unit_json_and_adds_range_payload() {
+        assert_eq!(
+            serde_json::from_value::<AgentVersionPolicy>(serde_json::json!({
+                "kind": "exact"
+            }))
+            .unwrap(),
+            AgentVersionPolicy::Exact
+        );
+        assert_eq!(
+            serde_json::from_value::<AgentVersionPolicy>(serde_json::json!({
+                "kind": "detected_manual"
+            }))
+            .unwrap(),
+            AgentVersionPolicy::DetectedManual
+        );
+        let range = AgentVersionPolicy::DetectedSemver {
+            requirement: OPENCODE_COMPATIBLE_VERSION_REQUIREMENT.to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(range).unwrap(),
+            serde_json::json!({
+                "kind": "detected_semver",
+                "requirement": OPENCODE_COMPATIBLE_VERSION_REQUIREMENT,
+            })
         );
     }
 
@@ -1104,6 +1192,45 @@ mod tests {
             AgentRuntimeProbeCapability::SwitchCompatibility,
         ));
         assert!(evidence.live_switch_verified());
+    }
+
+    #[test]
+    fn semver_range_evidence_requires_a_detected_agent_version() {
+        let mut evidence = AgentRuntimeProbeEvidence {
+            schema_version: AGENT_RUNTIME_PROBE_SCHEMA_VERSION,
+            agent_id: AgentId::parse("fixture").unwrap(),
+            agent_version: None,
+            adapter_id: AcpAdapterId::parse("fixture-acp").unwrap(),
+            adapter_version: None,
+            descriptor_id: AgentProviderProjectionDescriptorId::parse("projection_fixture_v1")
+                .unwrap(),
+            descriptor_version: "1".to_string(),
+            descriptor_match: ProjectionDescriptorMatch::SemverRange,
+            projection_fingerprint: Some("sha256:0123456789abcdef".to_string()),
+            source_revision: "fixture".to_string(),
+            platform_os: "linux".to_string(),
+            platform_arch: "x86_64".to_string(),
+            facts: [
+                AgentRuntimeProbeCapability::BinaryIdentity,
+                AgentRuntimeProbeCapability::AcpHandshake,
+                AgentRuntimeProbeCapability::Authentication,
+                AgentRuntimeProbeCapability::Session,
+                AgentRuntimeProbeCapability::ModelSelection,
+                AgentRuntimeProbeCapability::ProviderProjection,
+            ]
+            .into_iter()
+            .map(AgentRuntimeProbeFact::passed)
+            .collect(),
+            switch_behavior: ProviderSwitchBehavior::RestartAndResume,
+            source_survived_prepare_failure: false,
+            redaction_passed: true,
+            recorded_at_ms: 1,
+        };
+        assert!(!evidence.provider_projection_verified());
+        evidence.agent_version = Some("1.18.11".to_string());
+        assert!(evidence.provider_projection_verified());
+        evidence.agent_version = Some("not-semver".to_string());
+        assert!(!evidence.provider_projection_verified());
     }
 
     #[test]

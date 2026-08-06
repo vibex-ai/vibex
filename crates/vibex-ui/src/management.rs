@@ -1535,6 +1535,42 @@ mod tests {
     }
 
     #[test]
+    fn opencode_detected_range_uses_api_key_credential_surface() {
+        let registry = vibex_core::AgentProviderProjectionRegistry::builtin().unwrap();
+        let identity = vibex_core::AgentRuntimeVersionIdentity {
+            route: vibex_core::AgentRuntimeRouteKey {
+                agent_id: AgentId::parse("opencode").unwrap(),
+                transport_kind: vibex_core::TransportKind::Acp,
+                adapter_id: vibex_core::AcpAdapterId::parse("opencode-acp").unwrap(),
+            },
+            adapter_version: None,
+            agent_version: Some(vibex_core::OPENCODE_LAST_VERIFIED_VERSION.to_string()),
+            runtime_dependencies: std::collections::BTreeMap::new(),
+            source: vibex_core::AgentVersionSource::Detected,
+        };
+        let resolution = registry.resolve(&identity).unwrap();
+        assert_eq!(
+            resolution.match_kind,
+            vibex_core::ProjectionDescriptorMatch::SemverRange
+        );
+        let capability = vibex_core::AgentProviderProjectionCapability::from_resolution(
+            &identity,
+            &resolution,
+            vibex_core::ProjectionAuthState::Missing,
+        );
+        let mut editor = AgentProviderBindingEditorState::default();
+        editor.replace_capability(capability);
+
+        assert_eq!(
+            editor.credential_surface(),
+            ProjectionCredentialSurface::ApiKey
+        );
+        assert!(editor.shows(vibex_core::AgentProjectionFormControl::ApiKey));
+        assert!(editor.shows(vibex_core::AgentProjectionFormControl::Endpoint));
+        assert!(editor.shows(vibex_core::AgentProjectionFormControl::Model));
+    }
+
+    #[test]
     fn runtime_probe_projection_is_display_safe_and_keeps_independent_facts() {
         let record = runtime_probe_record();
         let projection = AgentRuntimeProbeProjection::from_record(&record);

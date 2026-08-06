@@ -9923,6 +9923,7 @@ dependencies = [
  "keyring",
  "reqwest",
  "rusqlite",
+ "semver 1.0.28",
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",

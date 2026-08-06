@@ -3,9 +3,11 @@ use std::env;
 use std::fs;
 use std::path::Component;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use semver::Version;
 use vibex_core::{
     AcpAgentCatalogEntry, AcpProcessStrategy, AcpProviderCatalogListResponse,
     AcpProviderCatalogPreset, AcpProviderConfig, AcpProviderEnvReference, AcpProviderEnvSource,
@@ -418,7 +420,8 @@ impl ProviderConfigService {
             .cwd_scope
             .filter(|scope| !scope.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_AGENT_CWD_SCOPE.to_string());
-        let discovery = low_cost_agent_discovery(&snapshot, &cwd_scope);
+        let mut discovery = low_cost_agent_discovery(&snapshot, &cwd_scope);
+        probe_explicit_agent_version(&snapshot, &mut discovery);
         AgentDiscoveryRepository::insert(&conn, &discovery)?;
         Ok(AgentRefreshSnapshotResponse {
             agent: AgentSnapshotEntry::from_definition(
@@ -3139,13 +3142,30 @@ fn refresh_changed_agent_discoveries(
     discoveries: &mut HashMap<AgentId, AgentDiscoveryRecord>,
 ) -> VibexResult<()> {
     for snapshot in snapshots {
-        let discovery = low_cost_agent_discovery(snapshot, DEFAULT_AGENT_CWD_SCOPE);
-        if agent_discovery_changed(discoveries.get(&snapshot.id), &discovery) {
+        let existing = discoveries.get(&snapshot.id);
+        let mut discovery = low_cost_agent_discovery(snapshot, DEFAULT_AGENT_CWD_SCOPE);
+        preserve_cached_agent_version(existing, &mut discovery);
+        if agent_discovery_changed(existing, &discovery) {
             AgentDiscoveryRepository::insert(conn, &discovery)?;
             discoveries.insert(discovery.agent_id.clone(), discovery);
         }
     }
     Ok(())
+}
+
+fn preserve_cached_agent_version(
+    existing: Option<&AgentDiscoveryRecord>,
+    candidate: &mut AgentDiscoveryRecord,
+) {
+    let Some(existing) = existing else {
+        return;
+    };
+    if candidate.version.is_none()
+        && candidate.install_status == AgentInstallStatus::Installed
+        && candidate.binary_path == existing.binary_path
+    {
+        candidate.version.clone_from(&existing.version);
+    }
 }
 
 fn agent_discovery_changed(
@@ -3258,6 +3278,99 @@ fn low_cost_agent_discovery(
         diagnostics,
         discovered_at_ms: now,
     }
+}
+
+/// Explicit Config Center refreshes may identify a PATH-launched OpenCode CLI
+/// without starting its ACP runtime or creating a session. Ordinary list and
+/// cached-discovery paths never call this helper.
+fn probe_explicit_agent_version(
+    snapshot: &AgentSnapshotEntry,
+    discovery: &mut AgentDiscoveryRecord,
+) {
+    if snapshot.id.as_str() != "opencode"
+        || discovery.install_status != AgentInstallStatus::Installed
+    {
+        return;
+    }
+    let Some(binary_path) = discovery.binary_path.as_deref() else {
+        return;
+    };
+    if Path::new(binary_path)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .is_none_or(|name| !name.eq_ignore_ascii_case("opencode"))
+    {
+        discovery.diagnostics.push(ProviderBindingMetadata {
+            key: "versionProbe".to_string(),
+            value: "agent_version_probe_command_untrusted".to_string(),
+        });
+        return;
+    }
+    match probe_cli_version(Path::new(binary_path)) {
+        Ok(version) => {
+            discovery.version = Some(version.clone());
+            discovery.diagnostics.push(ProviderBindingMetadata {
+                key: "version".to_string(),
+                value: version,
+            });
+        }
+        Err(code) => discovery.diagnostics.push(ProviderBindingMetadata {
+            key: "versionProbe".to_string(),
+            value: code.to_string(),
+        }),
+    }
+}
+
+const CLI_VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn probe_cli_version(binary_path: &Path) -> Result<String, &'static str> {
+    let mut child = Command::new(binary_path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| "agent_version_probe_spawn_failed")?;
+    let deadline = Instant::now() + CLI_VERSION_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let output = child
+                    .wait_with_output()
+                    .map_err(|_| "agent_version_probe_read_failed")?;
+                if !output.status.success() {
+                    return Err("agent_version_probe_exit_failed");
+                }
+                return parse_cli_version(&output.stdout)
+                    .or_else(|| parse_cli_version(&output.stderr))
+                    .ok_or("agent_version_probe_output_invalid");
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("agent_version_probe_timeout");
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("agent_version_probe_wait_failed");
+            }
+        }
+    }
+}
+
+fn parse_cli_version(output: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(output)
+        .split_whitespace()
+        .map(|token| {
+            token.trim_matches(|character: char| {
+                !(character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '+'))
+            })
+        })
+        .map(|token| token.strip_prefix('v').unwrap_or(token))
+        .find(|token| Version::parse(token).is_ok())
+        .map(ToString::to_string)
 }
 
 fn resolve_agent_cli_binary(
@@ -4227,7 +4340,7 @@ fn validate_codex_wire_api(value: &str) -> VibexResult<()> {
 fn unsupported_model_interface(agent_id: &AgentId, wire_api: &str) -> VibexError {
     VibexError::validation(
         "agent_model_interface_unsupported",
-        "model interface is not supported by the exact Agent projection descriptor",
+        "model interface is not supported by the selected Agent projection descriptor",
     )
     .with_diagnostic("agentId", agent_id.as_str())
     .with_diagnostic("wireProtocolId", wire_api)
@@ -7190,6 +7303,21 @@ mod tests {
         path
     }
 
+    fn write_fake_executable_with_version(dir: &Path, name: &str, version: &str) -> PathBuf {
+        fs::create_dir_all(dir).unwrap();
+        let path = fake_executable_path(dir, name);
+        #[cfg(windows)]
+        fs::write(
+            &path,
+            format!("@echo off\r\necho {version}\r\nexit /b 0\r\n"),
+        )
+        .unwrap();
+        #[cfg(not(windows))]
+        fs::write(&path, format!("#!/bin/sh\nprintf '%s\\n' '{version}'\n")).unwrap();
+        make_executable(&path);
+        path
+    }
+
     fn fake_executable_path(dir: &Path, name: &str) -> PathBuf {
         #[cfg(windows)]
         {
@@ -8050,6 +8178,120 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|entry| entry.value == "removed agents are not probed")
+        );
+    }
+
+    #[test]
+    fn explicit_opencode_refresh_detects_cli_version_for_provider_projection() {
+        let _env_lock = env_mutex().lock().unwrap();
+        let dir = tempdir().unwrap();
+        let bin_dir = dir.path().join("bin");
+        write_fake_executable_with_version(&bin_dir, "opencode", "1.18.11");
+        let _path_guard = EnvVarGuard::set("PATH", &bin_dir);
+        let service = ProviderConfigService::new(dir.path().join("vibex.db"));
+        let agent_id = AgentId::parse("opencode").unwrap();
+
+        service
+            .update_agent_config(AgentUpdateConfigRequest {
+                agent_id: agent_id.clone(),
+                added: Some(true),
+                enabled: Some(true),
+                label_override: None,
+                description_override: None,
+                order_index: None,
+                command: None,
+                env: None,
+                params: None,
+            })
+            .unwrap();
+        let refreshed = service
+            .refresh_agent_snapshot(AgentRefreshSnapshotRequest {
+                agent_id: agent_id.clone(),
+                cwd_scope: None,
+            })
+            .unwrap();
+        assert!(
+            refreshed
+                .agent
+                .diagnostics
+                .iter()
+                .any(|entry| { entry.key == "version" && entry.value == "1.18.11" })
+        );
+
+        let runtime = service
+            .list_agent_runtime_profiles(&agent_id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("enabled OpenCode should have a default ACP runtime");
+        assert_eq!(
+            runtime.version_identity.agent_version.as_deref(),
+            Some("1.18.11")
+        );
+        let capability = service
+            .agent_provider_projection_capability(
+                vibex_core::AgentProviderProjectionCapabilityRequest {
+                    runtime_profile_id: runtime.id,
+                    binding_id: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            capability.match_kind,
+            vibex_core::ProjectionDescriptorMatch::SemverRange
+        );
+        assert!(
+            capability
+                .form_controls
+                .contains(&vibex_core::AgentProjectionFormControl::ApiKey)
+        );
+
+        service
+            .list_agents(AgentListRequest {
+                include_disabled: true,
+            })
+            .unwrap();
+        assert_eq!(
+            service.list_agent_runtime_profiles(&agent_id).unwrap()[0]
+                .version_identity
+                .agent_version
+                .as_deref(),
+            Some("1.18.11")
+        );
+
+        write_fake_executable(&bin_dir, "opencode");
+        let refreshed = service
+            .refresh_agent_snapshot(AgentRefreshSnapshotRequest {
+                agent_id: agent_id.clone(),
+                cwd_scope: None,
+            })
+            .unwrap();
+        assert!(refreshed.agent.diagnostics.iter().any(|entry| {
+            entry.key == "versionProbe" && entry.value == "agent_version_probe_output_invalid"
+        }));
+        let runtime = service
+            .list_agent_runtime_profiles(&agent_id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(runtime.version_identity.agent_version, None);
+        let capability = service
+            .agent_provider_projection_capability(
+                vibex_core::AgentProviderProjectionCapabilityRequest {
+                    runtime_profile_id: runtime.id,
+                    binding_id: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            capability.match_kind,
+            vibex_core::ProjectionDescriptorMatch::Conservative
+        );
+        assert!(
+            !capability
+                .form_controls
+                .contains(&vibex_core::AgentProjectionFormControl::ApiKey)
         );
     }
 

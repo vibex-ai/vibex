@@ -3,9 +3,9 @@
   "status": "passed",
   "claimScope": "manifest_and_contract",
   "realRuntimeVerification": "blocked",
-  "capturedAt": "2026-08-05T16:45:17.058Z",
+  "capturedAt": "2026-08-06T06:43:53.966Z",
   "source": {
-    "captureParentCommit": "ce14d2843515f3852789c058453d873e959fdc02",
+    "captureParentCommit": "1b47a18761ca149e6cf00612db50e84785e7a57f",
     "rustToolchain": "rustc-1.97.0",
     "sourceInputRoots": [
       "crates/core/src/acp_catalog.rs",
@@ -53,21 +53,21 @@
       "crates/vibex-ui/Cargo.toml",
       "apps/desktop/Cargo.toml"
     ],
-    "sourceInputTreeSha256": "c80b7bf7f7624c5ffde132337a7d90a94f5cc8dc56410232a3974b1591e458d2",
+    "sourceInputTreeSha256": "431664d0aeaa5264cfa34eaa1803b8d599d0d52473d846655af97509ba412959",
     "bindings": {
       "catalog": "7ad921ebb2f6b6bbc8e948a6b7ed225c2b84d301f5d6a309ce697e3cbf9592d0",
-      "manifest": "808e48b21513f4e8cb3cdbedded2bd7c6c12012e320483bf710257ead905dd35",
-      "probe": "c52da1e943cfc3dd4b85b20ca128f2bc18ce5f15bb9c20fa52b10213e320057e",
-      "database": "a3d36a7197d377d99548648c817458027a0a46c6fe125b3f7c7b3855d38c10b3",
+      "manifest": "fbb84e1bb0af51c5f4ee26de713dc96d876a29ccb569ccb13be541fc7681bf28",
+      "probe": "0cdc4d98c0fa7c16bdb9db489de08266c48e00c4de484746a895e2c3244c2c02",
+      "database": "d299ee59a1ac2160ff8c838c905e98889614c3d8e5eab0b1ae477382f1ac690a",
       "remote": "cca712dc885a20fa5dbf4ec8d0db5d603015c7b87d1f879f458d88d29cb70905",
-      "ui": "6babdec6c3043144e325825dfac7f4c850c8c4dd85bf3b4858cc3290d4de5661",
+      "ui": "34e3248029c95649c55bef039320ff88d6560b06e10088b281c8314ebcc407a2",
       "switch": "aa9ef1a461fb4adad5756ba2c7931aaae3b0de499b85d1603df5c9cdf7fe9996",
-      "scripts": "f8ee734adf65733321f5870b4496f21c7030057070601eb67923cbc28bbcfc2b",
-      "packageMetadata": "b2d5d46dcae3b52d11aba4cdbb7284a64e87b2f4fec37029f64be8a9c89feac7"
+      "scripts": "5bc4862bd12ce9003dd9755772db641653062411468dcf7bf05a869f931c5d17",
+      "packageMetadata": "578fbdba0da56b0ffbac96dbbdb182e347c730edaffd5c3d21f6b7af94f434bf"
     },
-    "cargoLockSha256": "05725820d1c20bade0212ebf149278dff90fb68840551188157673deb31ca42b",
-    "packageJsonSha256": "49b47c1791188832d51b2cc9c32632d9c0abd17d7df1c2dd8c3fad5ff7837abf",
-    "rolloutManifestSha256": "6c5af84d0818661933089d8f90fd96c6f7c46998648ff2900a995079cef08c7f"
+    "cargoLockSha256": "2b45acad3dc8405882dc74c478839b69a31c609ed8c19cc29bbca44d004c146b",
+    "packageJsonSha256": "4e1c85256422478413b0e9c5f0e046295bbe260944dd7d93a59b1c190ed7d739",
+    "rolloutManifestSha256": "23e9e61f7784ba54fcaa94dd1a064e430d21636395f6796eaed973d58dd00f3b"
   },
   "manifest": {
     "schemaVersion": "agent-provider-runtime-manifest.v1",
@@ -119,12 +119,13 @@
       },
       {
         "agentId": "opencode",
-        "catalogVersion": "1.17.9",
+        "catalogVersion": "1.18.11",
         "adapterId": "opencode-acp",
         "descriptorId": "projection_opencode_inline_provider_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
-          "kind": "exact"
+          "kind": "detected_semver",
+          "requirement": ">=1.17.9, <2.0.0"
         },
         "capabilityMode": "replaceable_provider",
         "runtimeHomeStrategy": "vibex_private",
@@ -134,7 +135,7 @@
         ],
         "modelInterfaces": [],
         "evidenceState": "documented",
-        "sourceEvidenceReference": "provider-config/opencode-environment-v1",
+        "sourceEvidenceReference": "provider-config/opencode-inline-provider-v1",
         "smokeId": "builtin-provider-opencode",
         "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
@@ -953,10 +954,10 @@
     {
       "agentId": "opencode",
       "smokeId": "builtin-provider-opencode",
-      "catalogVersion": "1.17.9",
+      "catalogVersion": "1.18.11",
       "descriptorId": "projection_opencode_inline_provider_v1",
       "descriptorVersion": "1",
-      "versionPolicy": "exact",
+      "versionPolicy": "detected_semver",
       "capabilityMode": "replaceable_provider",
       "switchBehavior": "restart_and_resume",
       "status": "blocked",
@@ -982,7 +983,7 @@
       "providerVerified": false,
       "liveSwitchVerified": false,
       "binaryOnlyVerified": false,
-      "sourceEvidenceReference": "provider-config/opencode-environment-v1",
+      "sourceEvidenceReference": "provider-config/opencode-inline-provider-v1",
       "recordedAt": null
     },
     {

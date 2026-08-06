@@ -2104,8 +2104,14 @@ agent_discovery_records(
 - `agent_refresh_snapshot` may perform low-cost filesystem/PATH detection and
   cache a discovery record for an added Agent even while it is disabled. The
   detection may update install/config status, but runtime status remains
-  `disabled` and no Agent or ACP process is spawned. Removed Agents are not
-  probed.
+  `disabled` and no Agent or ACP process is spawned. For the explicit
+  OpenCode refresh path only, Vibex may run the resolved CLI with `--version`
+  to record its detected semantic version; this is a bounded metadata probe,
+  not an ACP/runtime/session start. Removed Agents are not probed.
+- Cached detected versions survive ordinary PATH refresh only while the same
+  executable remains installed. A failed explicit version probe, changed
+  executable, or missing binary clears the active version identity so Provider
+  projection falls back to the conservative surface.
 - Discovery keeps Agent installation separate from online runtime readiness.
   For Claude and Codex, `install_status` and `binary_path` resolve the native
   `claude` / `codex` CLI (or fall back to a self-contained Adapter), while
@@ -2155,7 +2161,8 @@ agent_discovery_records(
 - Missing exact ACP route after enabled-Agent resolution ->
   `capability/provider_unregistered`.
 - Explicit refresh of an added, disabled Agent -> update filesystem/PATH
-  discovery while keeping `runtime_status = disabled`; zero runtime spawn.
+  discovery while keeping `runtime_status = disabled`; no ACP/runtime/session
+  spawn. OpenCode may additionally run its bounded `--version` metadata probe.
 - Native Claude/Codex CLI found but configured ACP command missing ->
   `install_status = installed`, `runtime_status = unavailable`, and bounded
   `acp_runtime_command_missing` diagnostics.
@@ -2178,6 +2185,9 @@ agent_discovery_records(
   and no `opencode acp` process is started.
 - Base: local-Agent search temporarily adds OpenCode in a disabled state;
   explicit refresh finds the `opencode` executable, then the UI may enable it.
+- Good: explicit OpenCode refresh records the CLI's detected semantic version,
+  the compatible range resolves, and the API Key/Endpoint/Model/Wire API
+  controls appear without pinning a bundled CLI version.
 - Base: a catalog option omits Effort/Mode; the Adapter converges defaults and
   the committed attachment still matches the selection because Model is exact.
 - Good: a configured Codex model receives only the reasoning efforts returned
@@ -2682,8 +2692,10 @@ ProviderConfigService::{
   mismatched identity returns a conservative capability that emits no automatic
   Secret or managed overlay.
 - Codex `0.146.0` accepts only `openai_responses`. Claude exposes no selectable
-  Wire API. OpenCode may expose only the adapter/protocol pairs registered in
-  its exact descriptor.
+  Wire API. PATH-launched OpenCode uses its detected CLI version and may expose
+  only the adapter/protocol pairs registered for the matching semantic-version
+  descriptor. The OpenCode inline-provider contract currently supports
+  `>=1.17.9, <2.0.0`; it was exercised against local OpenCode `1.18.11`.
 - `AgentCredential` is a discriminated union covering API key, OAuth, AWS, GCP,
   Azure, Snowflake, local, and managed-subscription credentials. Ordinary
   records contain references and status only; plaintext values are resolved
@@ -2712,7 +2724,7 @@ ProviderConfigService::{
 
 - Codex Chat at create, update, legacy TOML, binding validation, or projection ->
   `agent_model_interface_unsupported`.
-- Unknown/manual/mismatched exact identity -> conservative resolution with
+- Unknown/manual/out-of-range identity -> conservative resolution with
   `agent_projection_version_mismatch` or
   `agent_projection_version_untrusted`; no Secret projection.
 - Binding references another Agent/runtime/provider or an unavailable model ->
@@ -2739,8 +2751,13 @@ ProviderConfigService::{
 - Good: an API key is stored in approved Secret storage, resolved at ACP spawn,
   and absent from SQLite, preview JSON, `Debug`, Remote, timeline, and switch
   records.
+- Good: user-installed OpenCode `1.18.11` is detected from PATH, matches the
+  supported `1.x` descriptor, and exposes Endpoint, API Key, Model, and Wire API
+  controls without pinning the user's CLI patch/minor version.
 - Base: an unknown catalog Agent receives an explicit unverified capability and
   no fake API-key form or managed overlay.
+- Base: a future OpenCode `2.x` remains conservative until that breaking major
+  version is explicitly verified and assigned a compatible descriptor.
 - Bad: infer provider projection support from installability or ACP readiness.
 - Bad: place one global `wire_api` on the Provider or inject the same env keys
   into every Agent.
@@ -2749,7 +2766,8 @@ ProviderConfigService::{
 
 ### 6. Tests Required
 
-- Core tests assert exact-over-range resolution, descriptor uniqueness,
+- Core tests assert exact-over-range resolution, detected OpenCode range
+  matching, descriptor uniqueness,
   conservative unknown/manual behavior, all eight credential variants, and
   Codex Responses-only model binding.
 - Database tests assert v37 idempotent migration/backfill, three-entity CRUD and
@@ -2759,9 +2777,10 @@ ProviderConfigService::{
   redacted `Debug`/preview, and selective stale propagation.
 - ACP tests assert Claude/Codex/OpenCode parity, prepare-failure fencing, and
   Profile-save stale marking without process termination.
-- Backend/Remote/UI tests assert exact capability pass-through, redacted preview,
-  private entity/Secret rejection, draft preservation, eight credential
-  surfaces, and Codex Chat rejection.
+- Backend/Remote/UI tests assert version-matched capability pass-through,
+  OpenCode API-key surface selection, redacted preview, private entity/Secret
+  rejection, draft preservation, eight credential surfaces, and Codex Chat
+  rejection.
 - Run `cargo fmt --all --check`, affected crate tests,
   `cargo check --workspace --all-targets --locked`, workspace Clippy with
   `-D warnings`, `pnpm check:frontend`, and `git diff --check`.
@@ -2832,14 +2851,15 @@ check:agent-provider-runtime[:self-test]
   catalog version policy, descriptor identity, capability mode, credential/model
   shape, evidence state, smoke id, and any conservative diagnostic. Registry and
   catalog drift must fail tests instead of silently dropping an Agent.
-- An exact descriptor with `Documented` evidence still requires a real runtime
-  probe. An `Unverified` descriptor emits no automatic endpoint, Secret, model,
-  overlay, or switch projection and carries a bounded diagnostic explaining the
-  missing contract. Binary identity or ACP initialize alone never promotes it.
-- Exact identity does not override conservative evidence. A binding resolved to
-  `Unverified` stays `AgentModelProviderBindingStatus::Unverified`, stores no
-  projection fingerprint, and cannot be changed to `Ready` by refresh/stale
-  calculation. `Unsupported` follows the same rule with `Unsupported` status.
+- A descriptor with `Documented` evidence still requires a real runtime probe.
+  An `Unverified` descriptor emits no automatic endpoint, Secret, model, overlay,
+  or switch projection and carries a bounded diagnostic explaining the missing
+  contract. Binary identity or ACP initialize alone never promotes it.
+- A compatible runtime identity does not override conservative evidence. A
+  binding resolved to `Unverified` stays
+  `AgentModelProviderBindingStatus::Unverified`, stores no projection
+  fingerprint, and cannot be changed to `Ready` by refresh/stale calculation.
+  `Unsupported` follows the same rule with `Unsupported` status.
 - GLM Agent `1.1.4` projects only the documented
   `ACP_GLM_BASE_URL`/`Z_AI_API_KEY`/`ACP_GLM_MODEL` environment contract.
   CodeBuddy `2.109.0` projects only
@@ -2860,11 +2880,12 @@ check:agent-provider-runtime[:self-test]
   advertised capability alone is not evidence; method-not-found is
   `Unsupported`, other request failures are `Failed`, and invalid restore
   responses are `Failed`.
-- Provider verification requires exact descriptor match, a safe projection
-  fingerprint, passed binary/ACP/auth/session/model/provider facts, and passed
-  redaction. Live switching additionally requires `LiveSessionConfig`, a passed
-  switch compatibility fact, and proof that failed target preparation preserved
-  the source.
+- Provider verification requires an exact or semantic-version-range descriptor
+  match, a safe projection fingerprint, passed binary/ACP/auth/session/model/
+  provider facts, and passed redaction. A range match must include a detected
+  semantic Agent version. Live switching additionally requires
+  `LiveSessionConfig`, a passed switch compatibility fact, and proof that failed
+  target preparation preserved the source.
 - Effective-provider proof compares the runtime's explicit endpoint/provider
   observation with the safe normalized endpoint origins from the selected
   projection preview. The observed origin and exact target model must both
@@ -2883,7 +2904,7 @@ check:agent-provider-runtime[:self-test]
 | Missing/duplicate Agent, descriptor, or Adapter identity | `agent_rollout_manifest_*` error; gate fails. |
 | `Unverified` entry has a runtime home, credential/model interface, missing diagnostic, or non-Unverified switch | `agent_rollout_manifest_conservative_shape_invalid`. |
 | Any descriptor control or evidence is `Unverified` without the complete fail-closed shape | `agent_projection_unverified_contract_incomplete`. |
-| Exact `Unverified`/`Unsupported` binding is created or refreshed | Keep matching conservative status and `projection_fingerprint = None`. |
+| `Unverified`/`Unsupported` binding is created or refreshed | Keep matching conservative status and `projection_fingerprint = None`. |
 | Probe timeout or cancel during spawn/ACP work | Terminal typed status, process shutdown, private-root cleanup. |
 | Restore operation returns method-not-found | `SessionResume = Unsupported`; load may be tried only when negotiated. |
 | Restore response is non-object, has a non-string id, or echoes another session id | `SessionResume = Failed`; never promote resume compatibility. |
@@ -2902,7 +2923,7 @@ check:agent-provider-runtime[:self-test]
   capability diagnostic.
 - Base: a licensed Agent is unavailable on the capture machine; the manifest
   and contract gate pass while the real smoke remains explicitly blocked.
-- Bad: mark an exact descriptor `Ready` merely because version matching or ACP
+- Bad: mark a descriptor `Ready` merely because version matching or ACP
   initialize succeeded, or retain a prior fingerprint for an `Unverified`
   binding.
 - Bad: accept Profile B because it reports the requested model when the explicit
@@ -2910,9 +2931,9 @@ check:agent-provider-runtime[:self-test]
 
 ### 6. Tests Required
 
-- Core tests cover exact 38-entry catalog/descriptor/manifest identity,
-  per-entry conservative diagnostics, and the two explicit environment
-  descriptors.
+- Core tests cover exact and semantic-range 38-entry catalog/descriptor/manifest
+  identity, per-entry conservative diagnostics, and the two explicit
+  environment descriptors.
 - ACP probe tests cover duplicate isolation keys, bounded cleanup, independent
   fact aggregation, restore response identity, matching safe origins, wrong
   origins with identical model names, and missing expected identities.
@@ -2922,8 +2943,8 @@ check:agent-provider-runtime[:self-test]
   Agents, source/version drift, missing conservative diagnostics, Secret/path
   leakage, binary-only verification, false provider verification, and false live
   switching. Evidence changes are made only by the matching capture command.
-- Config-switch tests assert exact conservative evidence never produces
-  `Ready` or a projection fingerprint on create, update, or stale refresh.
+- Config-switch tests assert conservative evidence never produces `Ready` or a
+  projection fingerprint on create, update, or stale refresh.
 
 ### 7. Wrong vs Correct
 

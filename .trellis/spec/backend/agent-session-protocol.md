@@ -2319,7 +2319,8 @@ crates/agent-acp
   timeline variants.
 - Permission requests emitted through ACP use the existing `PermissionRequest`
   payload and move sessions to `needs_input` through `AgentManager`.
-- For local OpenCode `1.17.9`, Vibex treats `opencode acp` as stdio
+- For PATH-launched OpenCode in the supported `>=1.17.9, <2.0.0` range (last
+  exercised against `1.18.11`), Vibex treats `opencode acp` as stdio
   newline-delimited JSON-RPC 2.0. The minimal executable flow is
   `initialize` with ACP protocol version `1`, `session/new` with
   `{ cwd, mcpServers: [] }`, then `session/prompt`; streamed chunks arrive as

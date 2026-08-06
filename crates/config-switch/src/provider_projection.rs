@@ -172,7 +172,7 @@ impl AgentProviderProjectionEngine {
         {
             return Err(VibexError::validation(
                 "agent_projection_credential_kind_unsupported",
-                "selected credential kind is not supported by the exact projection descriptor",
+                "selected credential kind is not supported by the selected projection descriptor",
             ));
         }
         let selected_model = selected_model(model_provider, binding)?;
@@ -496,7 +496,7 @@ impl ProviderConfigService {
         if request.projection_descriptor_id != resolution.descriptor.id {
             return Err(VibexError::validation(
                 "agent_projection_descriptor_mismatch",
-                "binding descriptor does not match the exact runtime identity",
+                "binding descriptor does not match the compatible runtime identity",
             ));
         }
         let now = unix_timestamp_ms().max(1);
@@ -550,7 +550,7 @@ impl ProviderConfigService {
         if request.binding.projection_descriptor_id != resolution.descriptor.id {
             return Err(VibexError::validation(
                 "agent_projection_descriptor_mismatch",
-                "binding descriptor does not match the exact runtime identity",
+                "binding descriptor does not match the compatible runtime identity",
             ));
         }
         let mut binding = request.binding;
@@ -1483,7 +1483,7 @@ fn load_projection_input(
     if binding.projection_descriptor_id != resolution.descriptor.id {
         return Err(VibexError::validation(
             "agent_projection_descriptor_mismatch",
-            "persisted binding descriptor does not match the exact runtime identity",
+            "persisted binding descriptor does not match the compatible runtime identity",
         ));
     }
     Ok((provider, runtime, binding, resolution.descriptor))

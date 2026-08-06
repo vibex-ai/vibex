@@ -1676,7 +1676,7 @@ impl ManagementCenter {
     ) {
         if wire_api.is_some_and(|wire_api| !self.projection_editor.accepts_wire_api(wire_api)) {
             self.error = Some(
-                "agent_model_interface_unsupported: model interface is not supported by the exact Agent projection descriptor"
+                "agent_model_interface_unsupported: model interface is not supported by the selected Agent projection descriptor"
                     .to_string(),
             );
             cx.notify();
@@ -5803,9 +5803,9 @@ impl ManagementCenter {
             ProjectionCredentialSurface::Unsupported => (
                 management_locale_text("Automatic credential", "自动凭证", "自動憑證"),
                 management_locale_text(
-                    "Unsupported or unverified for this exact version",
-                    "当前精确版本不支持或尚未验证",
-                    "目前精確版本不支援或尚未驗證",
+                    "Unsupported or unverified for this compatible runtime",
+                    "当前兼容运行时不支持或尚未验证",
+                    "目前相容執行階段不支援或尚未驗證",
                 ),
             ),
             ProjectionCredentialSurface::ApiKey => unreachable!(),

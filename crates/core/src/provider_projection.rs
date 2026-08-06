@@ -39,7 +39,13 @@ const CODEX_RUNTIME_PACKAGE: &str = "@openai/codex";
 const CODEX_RUNTIME_VERSION: &str = "0.146.0";
 const OPENCODE_AGENT_ID: &str = "opencode";
 const OPENCODE_ADAPTER_ID: &str = "opencode-acp";
-const OPENCODE_VERIFIED_VERSION: &str = "1.17.9";
+/// OpenCode is installed and upgraded by the user, so the projection is
+/// matched against a supported major-version range instead of a bundled CLI
+/// patch version. The lower bound is the first version covered by the
+/// existing projection contract; the upper bound keeps a future breaking
+/// major release conservative until it is explicitly verified.
+pub const OPENCODE_COMPATIBLE_VERSION_REQUIREMENT: &str = ">=1.17.9, <2.0.0";
+pub const OPENCODE_LAST_VERIFIED_VERSION: &str = "1.18.11";
 
 const MAX_DISPLAY_NAME_LEN: usize = 160;
 const MAX_MODEL_COUNT: usize = 512;
@@ -538,7 +544,7 @@ impl AgentModelProviderBinding {
             if !supported {
                 return Err(VibexError::validation(
                     "agent_model_interface_unsupported",
-                    "model interface is not supported by the exact Agent projection descriptor",
+                    "model interface is not supported by the selected Agent projection descriptor",
                 )
                 .with_diagnostic("agentId", self.agent_id.as_str())
                 .with_diagnostic("wireProtocolId", model.wire_protocol_id.as_str()));
@@ -1466,10 +1472,10 @@ fn opencode_projection_descriptor() -> VibexResult<AgentProviderProjectionDescri
         id: AgentProviderProjectionDescriptorId::parse(OPENCODE_PROJECTION_DESCRIPTOR_ID)?,
         descriptor_version: "1".to_string(),
         route: route(OPENCODE_AGENT_ID, OPENCODE_ADAPTER_ID)?,
-        compatibility: AgentVersionCompatibility::Exact {
-            adapter_version: None,
-            agent_version: Some(OPENCODE_VERIFIED_VERSION.to_string()),
-            runtime_dependencies: BTreeMap::new(),
+        compatibility: AgentVersionCompatibility::SemverRange {
+            adapter_range: None,
+            agent_range: Some(OPENCODE_COMPATIBLE_VERSION_REQUIREMENT.to_string()),
+            runtime_dependency_ranges: BTreeMap::new(),
         },
         provider_control: AgentProviderControl::ManagedConfigOverlay {
             strategy: ConfigOverlayStrategy::OpenCodeInlineProvider,
@@ -1494,7 +1500,7 @@ fn opencode_projection_descriptor() -> VibexResult<AgentProviderProjectionDescri
         switch_behavior: ProviderSwitchBehavior::RestartAndResume,
         evidence: verified_evidence(
             "provider-config/opencode-inline-provider-v1",
-            "acp-smoke/opencode-1.17.9",
+            &format!("acp-smoke/opencode-{OPENCODE_LAST_VERIFIED_VERSION}"),
         ),
     })
 }
@@ -1617,7 +1623,7 @@ fn unique_non_empty<'a>(
 mod tests {
     use super::*;
 
-    fn exact_identity(agent: &str) -> AgentRuntimeVersionIdentity {
+    fn builtin_identity(agent: &str) -> AgentRuntimeVersionIdentity {
         match agent {
             "claude" => AgentRuntimeVersionIdentity {
                 route: route(CLAUDE_AGENT_ID, CLAUDE_ADAPTER_ID).unwrap(),
@@ -1639,7 +1645,7 @@ mod tests {
             "opencode" => AgentRuntimeVersionIdentity {
                 route: route(OPENCODE_AGENT_ID, OPENCODE_ADAPTER_ID).unwrap(),
                 adapter_version: None,
-                agent_version: Some(OPENCODE_VERIFIED_VERSION.to_string()),
+                agent_version: Some(OPENCODE_LAST_VERIFIED_VERSION.to_string()),
                 runtime_dependencies: BTreeMap::new(),
                 source: AgentVersionSource::Detected,
             },
@@ -1720,10 +1726,10 @@ mod tests {
     }
 
     #[test]
-    fn builtin_registry_resolves_exact_identity_and_fails_closed() {
+    fn builtin_registry_resolves_supported_identity_and_fails_closed() {
         let registry = AgentProviderProjectionRegistry::builtin().unwrap();
-        for agent in ["claude", "codex", "opencode"] {
-            let resolution = registry.resolve(&exact_identity(agent)).unwrap();
+        for agent in ["claude", "codex"] {
+            let resolution = registry.resolve(&builtin_identity(agent)).unwrap();
             assert_eq!(resolution.match_kind, ProjectionDescriptorMatch::Exact);
             assert_eq!(
                 resolution.descriptor.evidence.state,
@@ -1731,7 +1737,20 @@ mod tests {
             );
         }
 
-        let mut mismatch = exact_identity("codex");
+        let opencode = registry.resolve(&builtin_identity("opencode")).unwrap();
+        assert_eq!(opencode.match_kind, ProjectionDescriptorMatch::SemverRange);
+        assert!(
+            opencode
+                .descriptor
+                .credential_kinds
+                .contains(&AgentCredentialKind::ApiKey)
+        );
+        assert_eq!(
+            opencode.descriptor.evidence.state,
+            ProjectionEvidenceState::Verified
+        );
+
+        let mut mismatch = builtin_identity("codex");
         mismatch.agent_version = Some("0.145.0".to_string());
         mismatch
             .runtime_dependencies
@@ -1752,7 +1771,7 @@ mod tests {
             Some("agent_projection_version_mismatch")
         );
 
-        let mut manual = exact_identity("claude");
+        let mut manual = builtin_identity("claude");
         manual.source = AgentVersionSource::Manual;
         let resolution = registry.resolve(&manual).unwrap();
         assert_eq!(
@@ -1766,10 +1785,45 @@ mod tests {
     }
 
     #[test]
+    fn opencode_range_exposes_api_key_and_rejects_future_major_versions() {
+        let registry = AgentProviderProjectionRegistry::builtin().unwrap();
+        let supported = builtin_identity("opencode");
+        let resolution = registry.resolve(&supported).unwrap();
+        let capability = AgentProviderProjectionCapability::from_resolution(
+            &supported,
+            &resolution,
+            ProjectionAuthState::Missing,
+        );
+        assert_eq!(
+            resolution.match_kind,
+            ProjectionDescriptorMatch::SemverRange
+        );
+        assert!(
+            capability
+                .form_controls
+                .contains(&AgentProjectionFormControl::ApiKey)
+        );
+
+        let mut future = supported;
+        future.agent_version = Some("2.0.0".to_string());
+        let resolution = registry.resolve(&future).unwrap();
+        assert_eq!(
+            resolution.match_kind,
+            ProjectionDescriptorMatch::Conservative
+        );
+        assert!(
+            !resolution
+                .descriptor
+                .credential_control
+                .automatically_projects_secret()
+        );
+    }
+
+    #[test]
     fn codex_0146_descriptor_and_binding_reject_chat() {
         let registry = AgentProviderProjectionRegistry::builtin().unwrap();
         let descriptor = registry
-            .resolve(&exact_identity("codex"))
+            .resolve(&builtin_identity("codex"))
             .unwrap()
             .descriptor;
         assert_eq!(descriptor.model_interfaces.len(), 1);
@@ -1819,19 +1873,18 @@ mod tests {
     #[test]
     fn exact_descriptor_precedes_semver_range() {
         let mut registry = AgentProviderProjectionRegistry::default();
-        let mut range = opencode_projection_descriptor().unwrap();
-        range.id = AgentProviderProjectionDescriptorId::parse("projection_opencode_range").unwrap();
-        range.compatibility = AgentVersionCompatibility::SemverRange {
-            adapter_range: None,
-            agent_range: Some(">=1.17, <2".to_string()),
-            runtime_dependency_ranges: BTreeMap::new(),
+        let mut exact = opencode_projection_descriptor().unwrap();
+        exact.id = AgentProviderProjectionDescriptorId::parse("projection_opencode_exact").unwrap();
+        exact.compatibility = AgentVersionCompatibility::Exact {
+            adapter_version: None,
+            agent_version: Some(OPENCODE_LAST_VERIFIED_VERSION.to_string()),
+            runtime_dependencies: BTreeMap::new(),
         };
-        range.evidence.state = ProjectionEvidenceState::Documented;
-        registry.register(range).unwrap();
         registry
             .register(opencode_projection_descriptor().unwrap())
             .unwrap();
-        let resolution = registry.resolve(&exact_identity("opencode")).unwrap();
+        registry.register(exact).unwrap();
+        let resolution = registry.resolve(&builtin_identity("opencode")).unwrap();
         assert_eq!(resolution.match_kind, ProjectionDescriptorMatch::Exact);
         assert_eq!(
             resolution.descriptor.evidence.state,
@@ -1842,7 +1895,7 @@ mod tests {
     #[test]
     fn capabilities_distinguish_selectable_and_unverified_controls() {
         let registry = AgentProviderProjectionRegistry::builtin().unwrap();
-        let codex_identity = exact_identity("codex");
+        let codex_identity = builtin_identity("codex");
         let capability = AgentProviderProjectionCapability::from_resolution(
             &codex_identity,
             &registry.resolve(&codex_identity).unwrap(),
@@ -1859,7 +1912,7 @@ mod tests {
                 .contains(&AgentProjectionFormControl::WireProtocol)
         );
 
-        let mut unknown = exact_identity("opencode");
+        let mut unknown = builtin_identity("opencode");
         unknown.source = AgentVersionSource::Unknown;
         unknown.agent_version = None;
         let capability = AgentProviderProjectionCapability::from_resolution(

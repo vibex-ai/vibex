@@ -303,15 +303,40 @@ function safeDiagnosticCode(value, label) {
   );
 }
 
+function safeVersionRequirement(value, label) {
+  assert(
+    typeof value === "string" &&
+      value.length > 0 &&
+      value.length <= 192 &&
+      /^[0-9A-Za-z<>=~^*.,+|\-\s]+$/.test(value),
+    `${label} is not a bounded semantic-version requirement`
+  );
+}
+
+function isSemanticVersion(value) {
+  return (
+    typeof value === "string" &&
+    /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(value)
+  );
+}
+
 function validateManifestEntry(entry, label) {
   exactKeys(entry, MANIFEST_ENTRY_KEYS, label);
   for (const key of ["agentId", "catalogVersion", "adapterId", "descriptorId", "descriptorVersion", "capabilityMode", "runtimeHomeStrategy", "switchBehavior", "evidenceState", "sourceEvidenceReference", "smokeId"]) {
     safeIdentity(entry[key], `${label}.${key}`);
   }
-  exactKeys(entry.versionPolicy, ["kind"], `${label}.versionPolicy`);
-  assert(["exact", "detected_manual"].includes(entry.versionPolicy.kind), `${label}.versionPolicy is invalid`);
+  assert(entry.versionPolicy && typeof entry.versionPolicy === "object", `${label}.versionPolicy is invalid`);
+  assert(["exact", "detected_manual", "detected_semver"].includes(entry.versionPolicy.kind), `${label}.versionPolicy is invalid`);
+  exactKeys(
+    entry.versionPolicy,
+    entry.versionPolicy.kind === "detected_semver" ? ["kind", "requirement"] : ["kind"],
+    `${label}.versionPolicy`
+  );
   if (entry.versionPolicy.kind === "detected_manual") {
     assert(entry.catalogVersion === "manual", `${label} manual policy must use manual catalog version`);
+  } else if (entry.versionPolicy.kind === "detected_semver") {
+    assert(entry.catalogVersion !== "manual", `${label} semantic-version policy cannot use manual catalog version`);
+    safeVersionRequirement(entry.versionPolicy.requirement, `${label}.versionPolicy.requirement`);
   } else {
     assert(entry.catalogVersion !== "manual", `${label} exact policy cannot use manual catalog version`);
   }
@@ -467,8 +492,13 @@ function providerProjectionVerified(smoke) {
     "modelSelection",
     "providerProjection"
   ];
+  const descriptorIdentityVerified =
+    smoke.descriptorMatch === "exact" ||
+    (smoke.descriptorMatch === "semver_range" &&
+      smoke.detectedIdentity !== null &&
+      isSemanticVersion(smoke.detectedIdentity.agentVersion));
   return (
-    smoke.descriptorMatch === "exact" &&
+    descriptorIdentityVerified &&
     smoke.projectionFingerprint !== null &&
     smoke.redactionPassed === true &&
     requiredFacts.every((fact) => smoke.facts[fact] === "passed")
@@ -496,7 +526,11 @@ function validateSmoke(smoke, entry, matrix) {
     assert(smoke.execution === "real_runtime" && smoke.diagnosticCode === null, `passed smoke ${entry.agentId} has an invalid execution state`);
   }
   validateDetectedIdentity(smoke.detectedIdentity, `smoke ${entry.agentId}.detectedIdentity`);
-  assert(["not_checked", "conservative", "exact"].includes(smoke.descriptorMatch), `smoke descriptor match is invalid for ${entry.agentId}`);
+  assert(["not_checked", "conservative", "exact", "semver_range"].includes(smoke.descriptorMatch), `smoke descriptor match is invalid for ${entry.agentId}`);
+  if (smoke.descriptorMatch === "semver_range") {
+    assert(entry.versionPolicy.kind === "detected_semver", `range smoke policy is invalid for ${entry.agentId}`);
+    assert(smoke.detectedIdentity !== null && isSemanticVersion(smoke.detectedIdentity.agentVersion), `range smoke lacks a concrete semantic version for ${entry.agentId}`);
+  }
   if (smoke.projectionFingerprint !== null) safeFingerprint(smoke.projectionFingerprint, `smoke ${entry.agentId}.projectionFingerprint`);
   exactKeys(smoke.facts, FACT_KEYS, `smoke ${entry.agentId}.facts`);
   for (const key of FACT_KEYS) assert(FACT_STATUSES.has(smoke.facts[key]), `smoke ${entry.agentId}.facts.${key} is invalid`);

@@ -51,6 +51,10 @@ function selfTest() {
     ["leaked overlay", (copy) => (copy.smokes[0].overlay = "credential-material")],
     ["leaked user path", (copy) => (copy.limitations[0] = "/home/operator/.config/agent")],
     ["stale manifest version", (copy) => (copy.manifest.entries[0].catalogVersion = "9.9.9")],
+    ["invalid semantic-version policy", (copy) => {
+      const entry = copy.manifest.entries.find((candidate) => candidate.versionPolicy.kind === "detected_semver");
+      entry.versionPolicy.requirement = null;
+    }],
     ["missing conservative diagnostic", (copy) => {
       const entry = copy.manifest.entries.find((candidate) => candidate.switchBehavior === "unverified");
       entry.capabilityDiagnosticCode = null;

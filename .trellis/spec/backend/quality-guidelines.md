@@ -889,7 +889,8 @@ package, signing, host, mobile, Relay, and auto-update follow-ups explicitly.
   returns a structured `process/*`, `provider/*`, or `capability/*` error.
   After a concrete runtime client exists, failures should be more specific than
   the disabled-runtime `capability/acp_runtime_unavailable` placeholder.
-- On local OpenCode `1.17.9`, the proven ACP transport is stdio
+- For PATH-launched OpenCode in the supported `>=1.17.9, <2.0.0` range (last
+  exercised against `1.18.11`), the proven ACP transport is stdio
   newline-delimited JSON-RPC 2.0 through `opencode acp`. A successful smoke
   must exercise `AgentProvider::create_session` and
   `AgentProvider::send_turn`; `opencode serve` is reference material only and
