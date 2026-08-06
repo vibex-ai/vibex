@@ -357,6 +357,28 @@ struct ComposerSuggestionContext {
     character_range: Range<usize>,
 }
 
+fn composer_suggestion_collection_matches(
+    current: &ComposerSuggestionContext,
+    next: &ComposerSuggestionContext,
+) -> bool {
+    current.target == next.target
+        && current.request.agent_id == next.request.agent_id
+        && current.request.provider_profile_id == next.request.provider_profile_id
+        && current.request.session_id == next.request.session_id
+        && current.request.workspace_id == next.request.workspace_id
+        && current.request.trigger == next.request.trigger
+}
+
+fn composer_suggestion_description(entry: &AgentCommandEntry) -> Option<String> {
+    if entry.source_kind == AgentCommandSourceKind::Reference {
+        return None;
+    }
+    entry
+        .description
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ComposerCommandInvocation {
     command_id: Option<String>,
@@ -7331,15 +7353,23 @@ impl VibexWorkbench {
         if self.suggestion_context.as_ref() == Some(&context) {
             return;
         }
+        let preserve_rows = self
+            .suggestion_context
+            .as_ref()
+            .is_some_and(|current| composer_suggestion_collection_matches(current, &context));
 
         self.suggestion_request_serial = self.suggestion_request_serial.saturating_add(1);
         let request_serial = self.suggestion_request_serial;
         self.suggestion_context = Some(context.clone());
-        self.suggestions.clear();
-        self.suggestion_selection.dismiss();
+        if !preserve_rows {
+            self.suggestions.clear();
+            self.suggestion_selection.dismiss();
+        }
         self.suggestion_loading = true;
 
         let Some(runtime) = self.runtime.clone() else {
+            self.suggestions.clear();
+            self.suggestion_selection.dismiss();
             self.suggestion_loading = false;
             cx.notify();
             return;
@@ -23084,10 +23114,7 @@ impl VibexWorkbench {
                 let selected_entry = entry.clone();
                 let source_label = command_source_label(entry.source_kind);
                 let display_label = entry.label.trim_start_matches(['/', '$', '@']).to_string();
-                let description = entry
-                    .description
-                    .clone()
-                    .filter(|value| !value.trim().is_empty());
+                let description = composer_suggestion_description(&entry);
                 let aria_label = description
                     .as_ref()
                     .map(|description| format!("{display_label}, {description}"))
@@ -27255,15 +27282,7 @@ fn append_file_reference_commands(
                 trigger: AgentCommandTrigger::Mention,
                 source_kind: AgentCommandSourceKind::Reference,
                 label: format!("@{}", entry.path),
-                description: Some(
-                    match entry.kind {
-                        FileEntryKind::Directory => "Workspace directory reference",
-                        FileEntryKind::File => "Workspace file reference",
-                        FileEntryKind::Symlink => "Workspace symlink reference",
-                        FileEntryKind::Other => "Workspace path reference",
-                    }
-                    .to_string(),
-                ),
+                description: None,
                 insertion_text: format!("@{} ", entry.path),
                 command_name: None,
                 provider_kind: Some(ProviderKind::Acp),
@@ -33280,6 +33299,49 @@ mod tests {
         assert!(parse_slash_command_invocation("review").is_none());
         assert!(parse_slash_command_invocation("/").is_none());
         assert!(parse_slash_command_invocation("/review/now").is_none());
+    }
+
+    #[test]
+    fn suggestion_refresh_keeps_the_same_collection_open() {
+        let context = ComposerSuggestionContext {
+            target: ComposerTarget::Session,
+            request: AgentCommandDiscoverRequest {
+                agent_id: None,
+                provider_profile_id: None,
+                session_id: None,
+                workspace_id: None,
+                trigger: Some(AgentCommandTrigger::Slash),
+                query: Some("r".into()),
+                limit: Some(10),
+            },
+            character_range: 0..2,
+        };
+        let mut refined = context.clone();
+        refined.request.query = Some("re".into());
+        refined.character_range = 0..3;
+        assert!(composer_suggestion_collection_matches(&context, &refined));
+
+        refined.request.trigger = Some(AgentCommandTrigger::Mention);
+        assert!(!composer_suggestion_collection_matches(&context, &refined));
+    }
+
+    #[test]
+    fn reference_suggestions_hide_redundant_workspace_description() {
+        let reference = command_entry(
+            AgentCommandSourceKind::Reference,
+            AgentCommandTrigger::Mention,
+            None,
+        );
+        let prompt = command_entry(
+            AgentCommandSourceKind::Prompt,
+            AgentCommandTrigger::Slash,
+            Some("review"),
+        );
+        assert!(composer_suggestion_description(&reference).is_none());
+        assert_eq!(
+            composer_suggestion_description(&prompt).as_deref(),
+            Some("Review changes")
+        );
     }
 
     #[test]
