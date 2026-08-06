@@ -1097,6 +1097,11 @@ ContinueAgentTurnRequest {
   `continue_turn` suppresses the user-message timeline item.
 - `error -> running` is a valid state transition so failed sessions can start a
   continuation turn.
+- `continue_turn` treats a turn as normally complete only when the latest
+  conversational timeline segment ends with an explicit final
+  `TimelinePayload::AgentMessage { is_final: true }`. An `error` or `idle`
+  session whose latest segment has user/Agent content without that final
+  message is eligible for continuation; system notices alone are not a turn.
 - `continue_turn` reloads the same current `RuntimeBinding`, activation
   generation, effective selection, and committed ACP attachment used by the
   failed turn. Missing or mismatched authority fails closed; the fallback must
@@ -1105,9 +1110,11 @@ ContinueAgentTurnRequest {
 ### 4. Validation & Error Matrix
 
 - Missing session id or unknown session -> `validation/session_not_found`.
-- Session state is not `error` -> `conflict/agent_continue_requires_error_state`.
-- Session is already `running` -> `conflict/agent_continue_requires_error_state`
-  from the public continue guard, not a hidden second turn.
+- The latest turn ended normally, or the session state is not `idle`/`error` ->
+  `conflict/agent_continue_requires_incomplete_turn`.
+- Session is already `running` ->
+  `conflict/agent_continue_requires_incomplete_turn` from the public continue
+  guard, not a hidden second turn.
 - Imported read-only session -> `capability/imported_session_read_only`.
 - Provider fails during continuation -> append a recoverable timeline `error`,
   keep session state `error`, return the structured provider error.
@@ -1135,7 +1142,10 @@ ContinueAgentTurnRequest {
   `continue_turn` sends only through the exact committed attachment and rejects
   a missing or stale fence without restore/failover.
 - Manager unit test: `continue_turn` rejects an idle session with
-  `agent_continue_requires_error_state`.
+  an explicit final Agent message with
+  `agent_continue_requires_incomplete_turn`, and accepts an idle session whose
+  latest segment has no final Agent message far enough to reach normal runtime
+  validation.
 - Frontend typecheck: generated `ContinueAgentTurnRequest` is consumed through
   the typed API wrapper and hook.
 - Remote/router check: `RemoteAgentRequest::ContinueTurn` dispatches through

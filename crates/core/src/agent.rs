@@ -30,6 +30,21 @@ pub enum AgentSessionState {
     Archived,
 }
 
+pub fn agent_session_turn_requires_continuation(
+    state: AgentSessionState,
+    latest_turn_ended_normally: Option<bool>,
+) -> bool {
+    match state {
+        AgentSessionState::Error => latest_turn_ended_normally != Some(true),
+        AgentSessionState::Idle => latest_turn_ended_normally == Some(false),
+        AgentSessionState::Initializing
+        | AgentSessionState::Running
+        | AgentSessionState::NeedsInput
+        | AgentSessionState::Closed
+        | AgentSessionState::Archived => false,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSessionSafety {
@@ -424,6 +439,42 @@ pub struct AgentCommandExecuteResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuation_requirement_uses_turn_completion_for_idle_and_error_sessions() {
+        assert!(agent_session_turn_requires_continuation(
+            AgentSessionState::Idle,
+            Some(false)
+        ));
+        assert!(!agent_session_turn_requires_continuation(
+            AgentSessionState::Idle,
+            Some(true)
+        ));
+        assert!(!agent_session_turn_requires_continuation(
+            AgentSessionState::Idle,
+            None
+        ));
+        assert!(agent_session_turn_requires_continuation(
+            AgentSessionState::Error,
+            Some(false)
+        ));
+        assert!(agent_session_turn_requires_continuation(
+            AgentSessionState::Error,
+            None
+        ));
+        assert!(!agent_session_turn_requires_continuation(
+            AgentSessionState::Error,
+            Some(true)
+        ));
+        assert!(!agent_session_turn_requires_continuation(
+            AgentSessionState::NeedsInput,
+            Some(false)
+        ));
+        assert!(!agent_session_turn_requires_continuation(
+            AgentSessionState::Running,
+            Some(false)
+        ));
+    }
 
     #[test]
     fn durable_send_request_serializes_required_runtime_and_idempotency_key() {

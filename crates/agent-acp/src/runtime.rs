@@ -19107,9 +19107,23 @@ for line in sys.stdin:
         let initial_native_session_id = initial_attachment.fence().native_session_id.clone();
         drop(initial_attachment);
 
-        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        let mut conn = open_database(&fixture.fixture.db_path).unwrap();
         SessionRepository::update_state(&conn, &fixture.session.id, AgentSessionState::Error)
             .unwrap();
+        vibex_db::TimelineRepository::append(
+            &mut conn,
+            &fixture.session.id,
+            vibex_core::TimelineSource::Provider,
+            TimelinePayload::Error(vibex_core::TimelineErrorPayload {
+                code: "turn_stopped".into(),
+                message: "the previous turn stopped".into(),
+                recoverable: true,
+            }),
+            None,
+            None,
+            TimelineRedactionState::None,
+        )
+        .unwrap();
         drop(conn);
 
         let prompt_count = logged_request_count(&fixture.fixture.request_log(), "session/prompt");
@@ -19183,9 +19197,23 @@ for line in sys.stdin:
         let current_fence = current_attachment.fence().clone();
         drop(current_attachment);
         fixture.client.detach_attachment(&current_fence).await;
-        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        let mut conn = open_database(&fixture.fixture.db_path).unwrap();
         SessionRepository::update_state(&conn, &fixture.session.id, AgentSessionState::Error)
             .unwrap();
+        vibex_db::TimelineRepository::append(
+            &mut conn,
+            &fixture.session.id,
+            vibex_core::TimelineSource::Provider,
+            TimelinePayload::Error(vibex_core::TimelineErrorPayload {
+                code: "detached_attachment".into(),
+                message: "the current attachment was detached".into(),
+                recoverable: true,
+            }),
+            None,
+            None,
+            TimelineRedactionState::None,
+        )
+        .unwrap();
         drop(conn);
         let prompt_count = logged_request_count(&fixture.fixture.request_log(), "session/prompt");
 

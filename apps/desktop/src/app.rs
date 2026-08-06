@@ -82,7 +82,9 @@ use vibex_core::{
     SessionRuntimeOptionCatalog, SessionRuntimeSelection, SessionRuntimeSelectionStatus,
     SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest, TerminalId, TerminalSession,
     TerminalStatus, TerminalSwitchShellRequest, TimelineItem, TimelineLiveEvent, TimelinePage,
-    TimelinePayload, VibexSessionId, WorkspaceMode, WorkspaceRecord, unix_timestamp_ms,
+    TimelinePayload, VibexSessionId, WorkspaceMode, WorkspaceRecord,
+    agent_session_turn_requires_continuation, latest_timeline_turn_ended_normally,
+    unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     AgentPlanProjection, AppearanceUiState, ComposerAttachment, ComposerSuggestionSelection,
@@ -291,6 +293,17 @@ struct AutoContinueCountdown {
     session_id: VibexSessionId,
     session_updated_at_ms: i64,
     remaining_seconds: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AutoContinueTurnStatus {
+    session_updated_at_ms: i64,
+    ended_normally: Option<bool>,
+}
+
+struct AutoContinueProbeTask {
+    session_updated_at_ms: i64,
+    _task: Task<()>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2787,16 +2800,17 @@ fn composer_queue_session_blocks_dispatch(
 fn auto_continue_should_start(
     enabled: bool,
     session_state: AgentSessionState,
+    latest_turn_ended_normally: Option<bool>,
     session_turn_pending: bool,
-    current_error_paused: bool,
-    handled_error_updated_at_ms: Option<i64>,
+    current_turn_paused: bool,
+    handled_turn_updated_at_ms: Option<i64>,
     session_updated_at_ms: i64,
 ) -> bool {
     enabled
-        && session_state == AgentSessionState::Error
+        && agent_session_turn_requires_continuation(session_state, latest_turn_ended_normally)
         && !session_turn_pending
-        && !current_error_paused
-        && handled_error_updated_at_ms != Some(session_updated_at_ms)
+        && !current_turn_paused
+        && handled_turn_updated_at_ms != Some(session_updated_at_ms)
 }
 
 fn restored_auto_continue_session_ids(state: &SessionUiState) -> BTreeSet<String> {
@@ -3245,8 +3259,10 @@ pub struct VibexWorkbench {
     agent_turn_pending: bool,
     auto_continue_default_project_ids: BTreeSet<String>,
     auto_continue_session_ids: BTreeSet<String>,
-    auto_continue_paused_error_session_ids: BTreeSet<String>,
-    auto_continue_handled_errors: BTreeMap<String, i64>,
+    auto_continue_paused_turn_session_ids: BTreeSet<String>,
+    auto_continue_handled_turns: BTreeMap<String, i64>,
+    auto_continue_turn_statuses: BTreeMap<String, AutoContinueTurnStatus>,
+    auto_continue_probe_tasks: BTreeMap<String, AutoContinueProbeTask>,
     auto_continue_countdowns: BTreeMap<String, AutoContinueCountdown>,
     auto_continue_countdown_tasks: BTreeMap<String, Task<()>>,
     agent_error: Option<String>,
@@ -3775,8 +3791,10 @@ impl VibexWorkbench {
             agent_turn_pending: false,
             auto_continue_default_project_ids,
             auto_continue_session_ids,
-            auto_continue_paused_error_session_ids: BTreeSet::new(),
-            auto_continue_handled_errors: BTreeMap::new(),
+            auto_continue_paused_turn_session_ids: BTreeSet::new(),
+            auto_continue_handled_turns: BTreeMap::new(),
+            auto_continue_turn_statuses: BTreeMap::new(),
+            auto_continue_probe_tasks: BTreeMap::new(),
             auto_continue_countdowns: BTreeMap::new(),
             auto_continue_countdown_tasks: BTreeMap::new(),
             agent_error: None,
@@ -4811,9 +4829,13 @@ impl VibexWorkbench {
         }
         self.auto_continue_session_ids
             .retain(|id| valid_session_ids.contains(id));
-        self.auto_continue_paused_error_session_ids
+        self.auto_continue_paused_turn_session_ids
             .retain(|id| valid_session_ids.contains(id));
-        self.auto_continue_handled_errors
+        self.auto_continue_handled_turns
+            .retain(|id, _| valid_session_ids.contains(id));
+        self.auto_continue_turn_statuses
+            .retain(|id, _| valid_session_ids.contains(id));
+        self.auto_continue_probe_tasks
             .retain(|id, _| valid_session_ids.contains(id));
         self.auto_continue_countdowns
             .retain(|id, _| valid_session_ids.contains(id));
@@ -4880,12 +4902,24 @@ impl VibexWorkbench {
             .get(session.id.as_str())
             .copied()
             .unwrap_or_else(|| self.project_auto_continue_enabled(&session.project_id));
-        if let Some(existing) = self
+        if let Some(existing_updated_at_ms) = self
             .sessions
-            .iter_mut()
+            .iter()
             .find(|existing| existing.id == session.id)
+            .map(|existing| existing.updated_at_ms)
         {
-            *existing = session;
+            if existing_updated_at_ms != session.updated_at_ms {
+                self.auto_continue_turn_statuses.remove(session.id.as_str());
+                self.auto_continue_probe_tasks.remove(session.id.as_str());
+                self.cancel_auto_continue_countdown(&session.id);
+            }
+            if let Some(existing) = self
+                .sessions
+                .iter_mut()
+                .find(|existing| existing.id == session.id)
+            {
+                *existing = session;
+            }
         } else {
             if auto_continue_enabled {
                 self.auto_continue_session_ids
@@ -4904,7 +4938,7 @@ impl VibexWorkbench {
         if pending {
             self.pending_agent_turn_session_ids
                 .insert(session_id.as_str().to_string());
-            self.auto_continue_paused_error_session_ids
+            self.auto_continue_paused_turn_session_ids
                 .remove(session_id.as_str());
         } else {
             self.pending_agent_turn_session_ids
@@ -4964,6 +4998,124 @@ impl VibexWorkbench {
             .remove(session_id.as_str());
     }
 
+    fn cached_auto_continue_turn_status(
+        &self,
+        session_id: &VibexSessionId,
+        session_updated_at_ms: i64,
+    ) -> Option<AutoContinueTurnStatus> {
+        self.auto_continue_turn_statuses
+            .get(session_id.as_str())
+            .filter(|status| status.session_updated_at_ms == session_updated_at_ms)
+            .copied()
+    }
+
+    fn cache_auto_continue_turn_status(
+        &mut self,
+        session_id: &VibexSessionId,
+        session_updated_at_ms: i64,
+        ended_normally: Option<bool>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self
+            .sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+        else {
+            return;
+        };
+        if session.updated_at_ms != session_updated_at_ms {
+            return;
+        }
+        self.auto_continue_turn_statuses.insert(
+            session_id.as_str().to_string(),
+            AutoContinueTurnStatus {
+                session_updated_at_ms,
+                ended_normally,
+            },
+        );
+        if self
+            .auto_continue_probe_tasks
+            .get(session_id.as_str())
+            .is_some_and(|probe| probe.session_updated_at_ms == session_updated_at_ms)
+        {
+            self.auto_continue_probe_tasks.remove(session_id.as_str());
+        }
+        self.sync_auto_continue_for_session(session_id, cx);
+    }
+
+    fn probe_auto_continue_turn_status(
+        &mut self,
+        session_id: VibexSessionId,
+        session_updated_at_ms: i64,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .auto_continue_probe_tasks
+            .get(session_id.as_str())
+            .is_some_and(|probe| probe.session_updated_at_ms == session_updated_at_ms)
+        {
+            return;
+        }
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        let probe_session_id = session_id.clone();
+        let request_session_id = probe_session_id.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            runtime
+                .agent()
+                .fetch_timeline(FetchTimelineRequest {
+                    session_id: request_session_id,
+                    after_sequence: None,
+                    limit: 500,
+                })
+                .await
+        });
+        let probe_key = session_id.as_str().to_string();
+        let task_probe_key = probe_key.clone();
+        let task = cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    let probe_is_current = this
+                        .auto_continue_probe_tasks
+                        .get(&task_probe_key)
+                        .is_some_and(|probe| probe.session_updated_at_ms == session_updated_at_ms);
+                    if !probe_is_current {
+                        return;
+                    }
+                    this.auto_continue_probe_tasks.remove(&task_probe_key);
+
+                    let ended_normally = match outcome {
+                        Ok(Ok(page)) if page.session_id == probe_session_id => {
+                            Some(latest_timeline_turn_ended_normally(&page.items))
+                        }
+                        _ => this
+                            .timeline
+                            .session_id
+                            .as_ref()
+                            .filter(|timeline_session_id| *timeline_session_id == &probe_session_id)
+                            .map(|_| latest_timeline_turn_ended_normally(&this.timeline.items)),
+                    };
+                    this.cache_auto_continue_turn_status(
+                        &probe_session_id,
+                        session_updated_at_ms,
+                        ended_normally.flatten(),
+                        cx,
+                    );
+                    cx.notify();
+                });
+            },
+        );
+        self.auto_continue_probe_tasks.insert(
+            probe_key,
+            AutoContinueProbeTask {
+                session_updated_at_ms,
+                _task: task,
+            },
+        );
+    }
+
     fn set_auto_continue_enabled(
         &mut self,
         session_id: VibexSessionId,
@@ -4973,17 +5125,15 @@ impl VibexWorkbench {
         if enabled {
             self.auto_continue_session_ids
                 .insert(session_id.as_str().to_string());
-            self.auto_continue_paused_error_session_ids
+            self.auto_continue_paused_turn_session_ids
                 .remove(session_id.as_str());
-            self.auto_continue_handled_errors
-                .remove(session_id.as_str());
+            self.auto_continue_handled_turns.remove(session_id.as_str());
             self.sync_auto_continue_for_session(&session_id, cx);
         } else {
             self.auto_continue_session_ids.remove(session_id.as_str());
-            self.auto_continue_paused_error_session_ids
+            self.auto_continue_paused_turn_session_ids
                 .remove(session_id.as_str());
-            self.auto_continue_handled_errors
-                .remove(session_id.as_str());
+            self.auto_continue_handled_turns.remove(session_id.as_str());
             self.cancel_auto_continue_countdown(&session_id);
         }
         self.ui_state
@@ -5008,19 +5158,35 @@ impl VibexWorkbench {
             self.cancel_auto_continue_countdown(session_id);
             return;
         };
-        if session_state != AgentSessionState::Error {
-            self.auto_continue_paused_error_session_ids
+        let cached_status =
+            self.cached_auto_continue_turn_status(session_id, session_updated_at_ms);
+        if self.auto_continue_enabled(session_id)
+            && matches!(
+                session_state,
+                AgentSessionState::Idle | AgentSessionState::Error
+            )
+            && cached_status.is_none()
+        {
+            self.cancel_auto_continue_countdown(session_id);
+            self.probe_auto_continue_turn_status(session_id.clone(), session_updated_at_ms, cx);
+            return;
+        }
+        if !matches!(
+            session_state,
+            AgentSessionState::Idle | AgentSessionState::Error
+        ) {
+            self.auto_continue_paused_turn_session_ids
                 .remove(session_id.as_str());
-            self.auto_continue_handled_errors
-                .remove(session_id.as_str());
+            self.auto_continue_handled_turns.remove(session_id.as_str());
         }
         let should_start = auto_continue_should_start(
             self.auto_continue_enabled(session_id),
             session_state,
+            cached_status.and_then(|status| status.ended_normally),
             self.session_turn_pending(session_id),
-            self.auto_continue_paused_error_session_ids
+            self.auto_continue_paused_turn_session_ids
                 .contains(session_id.as_str()),
-            self.auto_continue_handled_errors
+            self.auto_continue_handled_turns
                 .get(session_id.as_str())
                 .copied(),
             session_updated_at_ms,
@@ -5095,17 +5261,21 @@ impl VibexWorkbench {
             .iter()
             .find(|session| session.id == countdown.session_id);
         let countdown_is_current = current_session.is_some_and(|session| {
+            let cached_status =
+                self.cached_auto_continue_turn_status(session_id, session.updated_at_ms);
             auto_continue_should_start(
                 self.auto_continue_enabled(session_id),
                 session.state,
+                cached_status.and_then(|status| status.ended_normally),
                 self.session_turn_pending(session_id),
-                self.auto_continue_paused_error_session_ids
+                self.auto_continue_paused_turn_session_ids
                     .contains(session_id.as_str()),
-                self.auto_continue_handled_errors
+                self.auto_continue_handled_turns
                     .get(session_id.as_str())
                     .copied(),
                 session.updated_at_ms,
-            ) && session.updated_at_ms == countdown.session_updated_at_ms
+            ) && cached_status.is_some()
+                && session.updated_at_ms == countdown.session_updated_at_ms
         });
         if !countdown_is_current {
             self.cancel_auto_continue_countdown(session_id);
@@ -5126,7 +5296,7 @@ impl VibexWorkbench {
         self.auto_continue_countdowns.remove(session_id.as_str());
         self.auto_continue_countdown_tasks
             .remove(session_id.as_str());
-        self.auto_continue_handled_errors.insert(
+        self.auto_continue_handled_turns.insert(
             session_id.as_str().to_string(),
             countdown.session_updated_at_ms,
         );
@@ -5140,9 +5310,9 @@ impl VibexWorkbench {
 
     fn pause_auto_continue(&mut self, session_id: &VibexSessionId, cx: &mut Context<Self>) {
         if let Some(countdown) = self.auto_continue_countdowns.remove(session_id.as_str()) {
-            self.auto_continue_paused_error_session_ids
+            self.auto_continue_paused_turn_session_ids
                 .insert(session_id.as_str().to_string());
-            self.auto_continue_handled_errors.insert(
+            self.auto_continue_handled_turns.insert(
                 session_id.as_str().to_string(),
                 countdown.session_updated_at_ms,
             );
@@ -5934,6 +6104,21 @@ impl VibexWorkbench {
             self.timeline_command_expansion.clear();
             self.agent_loading = true;
         }
+        if restored_cached_view
+            && let Some(session_updated_at_ms) = self
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .map(|session| session.updated_at_ms)
+        {
+            let ended_normally = latest_timeline_turn_ended_normally(&self.timeline.items);
+            self.cache_auto_continue_turn_status(
+                &session_id,
+                session_updated_at_ms,
+                ended_normally,
+                cx,
+            );
+        }
         self.refresh_agent_token_usage(&session_id);
         match self
             .suggestion_context
@@ -6026,6 +6211,21 @@ impl VibexWorkbench {
                             }
                             this.timeline
                                 .replace_authoritative(session_id.clone(), items);
+                            if let Some(session_updated_at_ms) = this
+                                .sessions
+                                .iter()
+                                .find(|session| session.id == session_id)
+                                .map(|session| session.updated_at_ms)
+                            {
+                                let ended_normally =
+                                    latest_timeline_turn_ended_normally(&this.timeline.items);
+                                this.cache_auto_continue_turn_status(
+                                    &session_id,
+                                    session_updated_at_ms,
+                                    ended_normally,
+                                    cx,
+                                );
+                            }
                             this.rebuild_timeline_sizes();
                             this.start_agent_poll(
                                 poll_runtime.clone(),
@@ -6374,12 +6574,12 @@ impl VibexWorkbench {
         events: Vec<TimelineLiveEvent>,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(selected_session_id) = self.selected_session_id.as_ref() else {
+        let Some(selected_session_id) = self.selected_session_id.clone() else {
             return false;
         };
         let events = events
             .into_iter()
-            .filter(|event| &event.session_id == selected_session_id)
+            .filter(|event| event.session_id == selected_session_id)
             .collect::<Vec<_>>();
         if events.is_empty() {
             return false;
@@ -6399,6 +6599,20 @@ impl VibexWorkbench {
             .flatten();
         let changed = self.timeline.apply_live_batch(events);
         if changed > 0 {
+            if let Some(session_updated_at_ms) = self
+                .sessions
+                .iter()
+                .find(|session| session.id == selected_session_id)
+                .map(|session| session.updated_at_ms)
+            {
+                let ended_normally = latest_timeline_turn_ended_normally(&self.timeline.items);
+                self.cache_auto_continue_turn_status(
+                    &selected_session_id,
+                    session_updated_at_ms,
+                    ended_normally,
+                    cx,
+                );
+            }
             let mut streaming_cache_update = None;
             if updates_existing_item {
                 self.invalidate_timeline_render_caches();
@@ -9994,29 +10208,35 @@ impl VibexWorkbench {
     fn continue_session_by_id(
         &mut self,
         session_id: VibexSessionId,
-        expected_error_updated_at_ms: Option<i64>,
+        expected_turn_updated_at_ms: Option<i64>,
         cx: &mut Context<Self>,
     ) {
         if self.agent_action_pending || self.session_turn_pending(&session_id) {
             return;
         }
-        let Some(error_updated_at_ms) = self
+        let Some((session_state, turn_updated_at_ms)) = self
             .sessions
             .iter()
-            .find(|session| session.id == session_id && session.state == AgentSessionState::Error)
-            .map(|session| session.updated_at_ms)
+            .find(|session| session.id == session_id)
+            .map(|session| (session.state, session.updated_at_ms))
         else {
             return;
         };
-        if expected_error_updated_at_ms.is_some_and(|expected| expected != error_updated_at_ms) {
+        let latest_turn_ended_normally = self
+            .cached_auto_continue_turn_status(&session_id, turn_updated_at_ms)
+            .and_then(|status| status.ended_normally);
+        if !agent_session_turn_requires_continuation(session_state, latest_turn_ended_normally) {
+            return;
+        }
+        if expected_turn_updated_at_ms.is_some_and(|expected| expected != turn_updated_at_ms) {
             return;
         }
         let Some(runtime) = self.runtime.clone() else {
             return;
         };
         self.cancel_auto_continue_countdown(&session_id);
-        self.auto_continue_handled_errors
-            .insert(session_id.as_str().to_string(), error_updated_at_ms);
+        self.auto_continue_handled_turns
+            .insert(session_id.as_str().to_string(), turn_updated_at_ms);
         self.set_session_turn_pending(&session_id, true);
         if self.selected_session_id.as_ref() == Some(&session_id) {
             self.agent_error = None;
@@ -23822,6 +24042,14 @@ impl VibexWorkbench {
         if let Some(session_id) = self.selected_session_id.clone() {
             self.sync_auto_continue_for_session(&session_id, cx);
         }
+        let auto_continue_turn_status = self.selected_session().and_then(|session| {
+            self.cached_auto_continue_turn_status(&session.id, session.updated_at_ms)
+        });
+        let continuation_available = auto_continue_turn_status.is_some_and(|status| {
+            session_state.is_some_and(|state| {
+                agent_session_turn_requires_continuation(state, status.ended_normally)
+            })
+        });
         let auto_continue_enabled = self
             .selected_session_id
             .as_ref()
@@ -23997,7 +24225,7 @@ impl VibexWorkbench {
                         ),
                 )
             })
-            .when(session_state == Some(AgentSessionState::Error), |this| {
+            .when(continuation_available, |this| {
                 this.child(
                     h_flex()
                         .w_full()
@@ -24025,9 +24253,9 @@ impl VibexWorkbench {
                                 .flex_1()
                                 .text_xs()
                                 .child(locale::text(
-                                    "The previous Agent turn stopped. Continue in this session.",
-                                    "上一次 Agent 执行已停止，请在此会话中继续。",
-                                    "上一次 Agent 執行已停止，請在此會話中繼續。",
+                                    "The previous Agent turn did not finish normally. Continue in this session.",
+                                    "上一次 Agent 执行未正常结束，请在此会话中继续。",
+                                    "上一次 Agent 執行未正常結束，請在此會話中繼續。",
                                 )),
                         )
                         .when_some(auto_continue_toggle_session_id, |this, session_id| {
@@ -24046,9 +24274,9 @@ impl VibexWorkbench {
                                                 "自動繼續",
                                             ))
                                             .tooltip(locale::text(
-                                                "Automatically continue after errors",
-                                                "错误后自动继续",
-                                                "錯誤後自動繼續",
+                                                "Automatically continue unfinished turns",
+                                                "自动继续未正常结束的回合",
+                                                "自動繼續未正常結束的回合",
                                             ))
                                             .on_click(cx.listener(move |this, enabled, _, cx| {
                                                 this.set_auto_continue_enabled(
@@ -33630,7 +33858,7 @@ mod tests {
             .expect("timeline event batching should remain inspectable");
         assert!(timeline_batch.contains("self.timeline.apply_live_batch(events)"));
         assert!(
-            timeline_batch.contains(".filter(|event| &event.session_id == selected_session_id)")
+            timeline_batch.contains(".filter(|event| event.session_id == selected_session_id)")
         );
         assert!(!timeline_batch.contains("cx.notify();"));
 
@@ -34787,7 +35015,7 @@ mod tests {
             .find(".when_some(self.agent_error.clone()")
             .expect("composer should render Agent errors");
         let interrupted_position = composer
-            .find(".when(session_state == Some(AgentSessionState::Error)")
+            .find(".when(continuation_available")
             .expect("composer should keep the interrupted-turn continuation row");
         assert!(error_position < interrupted_position);
     }
@@ -34822,10 +35050,38 @@ mod tests {
     }
 
     #[test]
-    fn auto_continue_starts_once_for_each_error_snapshot() {
+    fn auto_continue_starts_once_for_each_incomplete_turn_snapshot() {
         assert!(auto_continue_should_start(
             true,
             AgentSessionState::Error,
+            Some(false),
+            false,
+            false,
+            None,
+            42
+        ));
+        assert!(!auto_continue_should_start(
+            true,
+            AgentSessionState::Error,
+            Some(true),
+            false,
+            false,
+            None,
+            42
+        ));
+        assert!(auto_continue_should_start(
+            true,
+            AgentSessionState::Idle,
+            Some(false),
+            false,
+            false,
+            None,
+            42
+        ));
+        assert!(!auto_continue_should_start(
+            true,
+            AgentSessionState::Idle,
+            None,
             false,
             false,
             None,
@@ -34834,6 +35090,7 @@ mod tests {
         assert!(!auto_continue_should_start(
             false,
             AgentSessionState::Error,
+            Some(false),
             false,
             false,
             None,
@@ -34842,14 +35099,7 @@ mod tests {
         assert!(!auto_continue_should_start(
             true,
             AgentSessionState::Running,
-            false,
-            false,
-            None,
-            42
-        ));
-        assert!(!auto_continue_should_start(
-            true,
-            AgentSessionState::Error,
+            Some(false),
             true,
             false,
             None,
@@ -34858,6 +35108,7 @@ mod tests {
         assert!(!auto_continue_should_start(
             true,
             AgentSessionState::Error,
+            Some(false),
             false,
             true,
             None,
@@ -34866,6 +35117,7 @@ mod tests {
         assert!(!auto_continue_should_start(
             true,
             AgentSessionState::Error,
+            Some(false),
             false,
             false,
             Some(42),
@@ -34874,6 +35126,7 @@ mod tests {
         assert!(auto_continue_should_start(
             true,
             AgentSessionState::Error,
+            Some(false),
             false,
             false,
             Some(41),
@@ -34925,7 +35178,9 @@ mod tests {
             .map(|(body, _)| body)
             .expect("auto-continue state should remain inspectable");
         assert!(state.contains("auto_continue_session_ids"));
-        assert!(state.contains("auto_continue_paused_error_session_ids"));
+        assert!(state.contains("auto_continue_paused_turn_session_ids"));
+        assert!(state.contains("auto_continue_turn_statuses"));
+        assert!(state.contains("probe_auto_continue_turn_status"));
         assert!(state.contains("session_updated_at_ms"));
         assert!(state.contains("AUTO_CONTINUE_COUNTDOWN_SECONDS"));
         assert!(state.contains("this.tick_auto_continue_countdown"));
@@ -34941,6 +35196,7 @@ mod tests {
         assert!(composer.contains(".checked(auto_continue_enabled)"));
         assert!(composer.contains("button.icon(IconName::Pause)"));
         assert!(composer.contains("auto_continue_countdown_label"));
+        assert!(composer.contains("continuation_available"));
         assert!(composer.contains("auto_continue_remaining.is_none()"));
         assert!(composer.contains("this.activate_continue_button(cx)"));
 

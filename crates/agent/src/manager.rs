@@ -26,8 +26,9 @@ use vibex_core::{
     SystemNoticeLevel, SystemNoticePayload, TimelineErrorPayload, TimelineItem, TimelineLiveEvent,
     TimelinePage, TimelinePayload, TimelineRedactionState, TimelineSource, TransportKind,
     TurnExecutionAttribution, UsageExecutionId, UserMessagePayload, VibexError, VibexResult,
-    VibexSessionId, WorkspaceId, agent_id_for_provider_kind, builtin_agent_definitions,
-    unix_timestamp_ms,
+    VibexSessionId, WorkspaceId, agent_id_for_provider_kind,
+    agent_session_turn_requires_continuation, builtin_agent_definitions,
+    latest_timeline_turn_ended_normally, unix_timestamp_ms,
 };
 use vibex_db::{
     AgentConfigRepository, AgentDefaultModelProviderProfileRepository,
@@ -49,6 +50,7 @@ use crate::runtime_selection::RuntimeSelectionService;
 use crate::state_machine::validate_transition;
 
 const CONTINUE_AGENT_TURN_PROMPT: &str = "Continue from where you stopped. Review the conversation context, avoid repeating completed work, and proceed with the remaining task.";
+const CONTINUE_TURN_TIMELINE_WINDOW: u32 = 500;
 pub const PROVIDER_SELECTED_MODEL_METADATA_KEY: &str = "selectedModel";
 pub const PROVIDER_SELECTED_REASONING_EFFORT_METADATA_KEY: &str = "selectedReasoningEffort";
 
@@ -795,10 +797,18 @@ impl AgentManager {
         let session = SessionRepository::get(&conn, &request.session_id)?.ok_or_else(|| {
             VibexError::validation("session_not_found", "Agent session was not found")
         })?;
-        if session.state != AgentSessionState::Error {
+        let latest_timeline = TimelineRepository::fetch_after(
+            &conn,
+            &session.id,
+            None,
+            CONTINUE_TURN_TIMELINE_WINDOW,
+        )?;
+        let latest_turn_ended_normally =
+            latest_timeline_turn_ended_normally(&latest_timeline.items);
+        if !agent_session_turn_requires_continuation(session.state, latest_turn_ended_normally) {
             return Err(VibexError::conflict(
-                "agent_continue_requires_error_state",
-                "Agent turn continuation is only available after a failed turn",
+                "agent_continue_requires_incomplete_turn",
+                "Agent turn continuation is only available when the latest turn did not end normally",
             ));
         }
         drop(conn);
@@ -3496,6 +3506,119 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn continue_turn_uses_latest_timeline_completion_for_idle_sessions() {
+        let db_path = temp_db_path("continue-incomplete-idle");
+        let workspace_root = temp_workspace_path("continue-incomplete-idle");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let manager = AgentManager::new(&db_path).unwrap();
+        let mut conn = manager.open_migrated().unwrap();
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let agent_id = AgentId::parse("claude").unwrap();
+        let incomplete = insert_session(
+            &conn,
+            "incomplete idle turn",
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            agent_id.clone(),
+            AgentSessionState::Idle,
+        );
+        TimelineRepository::append(
+            &mut conn,
+            &incomplete.id,
+            TimelineSource::User,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "finish the task".into(),
+                attachments: Vec::new(),
+            }),
+            None,
+            None,
+            TimelineRedactionState::None,
+        )
+        .unwrap();
+        TimelineRepository::append(
+            &mut conn,
+            &incomplete.id,
+            TimelineSource::Agent,
+            TimelinePayload::AgentMessageDelta(vibex_core::AgentMessageDeltaPayload {
+                text_delta: "still working".into(),
+                chunk_index: 0,
+                phase: Some(vibex_core::AgentMessagePhase::Commentary),
+            }),
+            None,
+            None,
+            TimelineRedactionState::None,
+        )
+        .unwrap();
+
+        let finished = insert_session(
+            &conn,
+            "finished idle turn",
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            agent_id,
+            AgentSessionState::Idle,
+        );
+        TimelineRepository::append(
+            &mut conn,
+            &finished.id,
+            TimelineSource::User,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "finish the task".into(),
+                attachments: Vec::new(),
+            }),
+            None,
+            None,
+            TimelineRedactionState::None,
+        )
+        .unwrap();
+        TimelineRepository::append(
+            &mut conn,
+            &finished.id,
+            TimelineSource::Agent,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: "done".into(),
+                is_final: true,
+            }),
+            None,
+            None,
+            TimelineRedactionState::None,
+        )
+        .unwrap();
+        drop(conn);
+
+        let incomplete_error = manager
+            .continue_turn(ContinueAgentTurnRequest {
+                session_id: incomplete.id,
+                correlation_id: None,
+            })
+            .await
+            .unwrap_err();
+        assert_ne!(
+            incomplete_error.code,
+            "agent_continue_requires_incomplete_turn"
+        );
+
+        let finished_error = manager
+            .continue_turn(ContinueAgentTurnRequest {
+                session_id: finished.id,
+                correlation_id: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            finished_error.code,
+            "agent_continue_requires_incomplete_turn"
+        );
+
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
     }
 
     #[tokio::test]

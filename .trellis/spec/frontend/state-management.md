@@ -137,16 +137,17 @@ the user message and early assistant deltas. Page forward from sequence `0`, or
 from an existing cache known to start at sequence `1`, until `hasNewer` is
 false.
 
-Agent continuation after a failed turn uses a hidden provider prompt and may not
-append a visible `user_message` boundary. Timeline view-model builders must
-therefore treat persisted `error` items as completed historical segments, and
-split any later Agent/provider output into a new display turn even when no new
-user message exists. While the continue/send mutation is pending, the UI may
-derive a presentation-only `running` state from the authoritative `error`
-session state so the interruption banner closes immediately and a pending Agent
-indicator renders. Do not write this presentation state back to the session
-cache, and only show the continue banner when the latest displayed turn still
-ends in an error.
+Agent continuation after an unfinished turn uses a hidden provider prompt and
+may not append a visible `user_message` boundary. Timeline view-model builders
+must therefore treat persisted `error` items as completed historical segments,
+and split any later Agent/provider output into a new display turn even when no
+new user message exists. While the continue/send mutation is pending, the UI may
+derive a presentation-only `running` state from the authoritative `idle` or
+`error` session state so the interruption banner closes immediately and a
+pending Agent indicator renders. Do not write this presentation state back to
+the session cache. Show the continue banner for an `Idle` or `Error` session
+only after authoritative timeline reconciliation confirms that the latest
+conversational segment does not end in an explicit final Agent message.
 
 ## Scenario: Live Reasoning As Turn Progress
 
@@ -974,8 +975,12 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   Store project defaults separately from per-session boolean overrides so an
   explicit session disable survives restart even when its project default is
   enabled. Normalize and bound both collections, remove stale project/session
-  ids during authoritative UI-state cleanup, and keep countdown/handled-error
-  bookkeeping transient.
+  ids during authoritative UI-state cleanup, and keep countdown/handled-turn
+  bookkeeping transient. The trigger is not limited to `AgentSessionState::Error`:
+  after the latest session snapshot and authoritative timeline are reconciled,
+  an enabled `Idle` or `Error` session starts the countdown whenever its latest
+  conversational segment lacks an explicit final Agent message. A final Agent
+  message suppresses the countdown even if the session state is `Error`.
 - Claude/Codex JSONL support in this surface is offline import only. Adding the
   offline import crates must not introduce a Native online runtime route or
   provider-specific timeline rendering.
@@ -1015,8 +1020,10 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   attachments and show the typed/bounded error.
 - Provider dispatch fails after the backend commits session `Error` -> merge the
   latest `AgentSession`, clear local pending, then evaluate auto-continue once
-  against that error snapshot. A failed snapshot reload still surfaces the
-  submission error and must not infer `Error` from provider message text.
+  against the authoritative turn-completion snapshot. A failed snapshot reload
+  still surfaces the submission error and must not infer `Error` from provider
+  message text. The same reconciliation applies when an `Idle` session has
+  user/Agent content without a normal final message.
 - Runtime event stream lags -> keep fallback polling active and refetch the
   required authoritative projections.
 - Session search closes while indexing -> advance its generation, cancel/drop
@@ -1071,6 +1078,11 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
 - Good: an enabled auto-continue session receives a provider 429 failure; the
   completion reloads its durable `Error` snapshot, starts one countdown, and
   continues without matching the human-readable error text in GPUI.
+- Good: an enabled session becomes `Idle` after a delta-only or interrupted
+  turn; the authoritative timeline has no final Agent message, so the same
+  countdown and continuation path are offered.
+- Base: an `Idle` or `Error` session whose latest segment ends with an explicit
+  final Agent message does not show the continue banner or start auto-continue.
 - Good: choose `high` for Codex and `low` for Claude, switch between their
   new-session chips, restart the desktop, and restore each choice only while its
   exact Profile/Model and advertised values remain valid.
@@ -1141,8 +1153,11 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   native IME input, attachment drop, and permission actions.
 - GPUI regression coverage asserts a failed submission reconciles the latest
   session snapshot before clearing per-session pending state and invoking the
-  auto-continue decision; session-row context-menu tests assert the captured row
-  id and checked state drive the same session-scoped toggle as the Composer.
+  auto-continue decision. Auto-continue tests cover both incomplete `Idle` and
+  `Error` snapshots, explicit final-message suppression, per-session timeline
+  probe fencing, and session-update invalidation. Session-row context-menu tests
+  assert the captured row id and checked state drive the same session-scoped
+  toggle as the Composer.
 - `desktop-model` navigation tests assert before/after insertion plus missing-id
   and already-adjacent no-op behavior.
 - Run targeted GPUI/model tests, `cargo check --workspace --all-targets --locked`,

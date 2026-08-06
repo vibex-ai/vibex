@@ -830,6 +830,39 @@ pub struct TimelineItem {
     pub payload: TimelinePayload,
 }
 
+/// Returns whether the latest conversational turn has an explicit final Agent
+/// message. `None` means the timeline has no conversational turn to continue.
+pub fn latest_timeline_turn_ended_normally(items: &[TimelineItem]) -> Option<bool> {
+    let latest_boundary = items.iter().rposition(|item| {
+        item.kind == TimelineItemKind::UserMessage
+            || (item.kind == TimelineItemKind::Error && item.provider_correlation_id.is_none())
+    });
+    let turn_items = &items[latest_boundary.unwrap_or_default()..];
+    let has_turn_content = latest_boundary.is_some()
+        || turn_items.iter().any(|item| {
+            matches!(
+                item.source,
+                TimelineSource::Agent | TimelineSource::Provider
+            ) && item.kind != TimelineItemKind::SystemNotice
+        });
+    if !has_turn_content {
+        return None;
+    }
+
+    let latest_conversational_item = turn_items.iter().rev().find(|item| {
+        matches!(
+            item.source,
+            TimelineSource::Agent | TimelineSource::Provider
+        ) && item.kind != TimelineItemKind::SystemNotice
+    });
+    Some(latest_conversational_item.is_some_and(|item| {
+        matches!(
+            &item.payload,
+            TimelinePayload::AgentMessage(message) if message.is_final
+        )
+    }))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TimelinePage {
@@ -852,6 +885,126 @@ pub struct TimelineLiveEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn completion_item(
+        session_id: &VibexSessionId,
+        sequence: i64,
+        source: TimelineSource,
+        payload: TimelinePayload,
+    ) -> TimelineItem {
+        TimelineItem {
+            id: TimelineItemId::new(),
+            session_id: session_id.clone(),
+            sequence,
+            timestamp_ms: sequence,
+            source,
+            kind: payload.kind(),
+            correlation_id: None,
+            provider_correlation_id: None,
+            redaction_state: TimelineRedactionState::None,
+            execution_attribution: None,
+            payload,
+        }
+    }
+
+    #[test]
+    fn latest_turn_normal_end_requires_an_explicit_final_agent_message() {
+        let session_id = VibexSessionId::new();
+        let system_notice = completion_item(
+            &session_id,
+            1,
+            TimelineSource::System,
+            TimelinePayload::SystemNotice(SystemNoticePayload {
+                level: SystemNoticeLevel::Info,
+                message: "runtime ready".into(),
+            }),
+        );
+        assert_eq!(
+            latest_timeline_turn_ended_normally(std::slice::from_ref(&system_notice)),
+            None
+        );
+
+        let user_message = completion_item(
+            &session_id,
+            2,
+            TimelineSource::User,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "finish the task".into(),
+                attachments: Vec::new(),
+            }),
+        );
+        let commentary = completion_item(
+            &session_id,
+            3,
+            TimelineSource::Agent,
+            TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                text_delta: "still working".into(),
+                chunk_index: 0,
+                phase: Some(AgentMessagePhase::Commentary),
+            }),
+        );
+        assert_eq!(
+            latest_timeline_turn_ended_normally(&[
+                system_notice.clone(),
+                user_message.clone(),
+                commentary.clone(),
+            ]),
+            Some(false)
+        );
+
+        let final_message = completion_item(
+            &session_id,
+            4,
+            TimelineSource::Agent,
+            TimelinePayload::AgentMessage(AgentMessagePayload {
+                text: "done".into(),
+                is_final: true,
+            }),
+        );
+        assert_eq!(
+            latest_timeline_turn_ended_normally(&[
+                system_notice,
+                user_message,
+                commentary,
+                final_message.clone(),
+            ]),
+            Some(true)
+        );
+
+        let error = completion_item(
+            &session_id,
+            5,
+            TimelineSource::Provider,
+            TimelinePayload::Error(TimelineErrorPayload {
+                code: "turn_stopped".into(),
+                message: "stopped".into(),
+                recoverable: true,
+            }),
+        );
+        assert_eq!(
+            latest_timeline_turn_ended_normally(&[final_message.clone(), error.clone()]),
+            Some(false)
+        );
+        assert_eq!(
+            latest_timeline_turn_ended_normally(&[error, final_message.clone()]),
+            Some(true)
+        );
+
+        let trailing_delta = completion_item(
+            &session_id,
+            6,
+            TimelineSource::Agent,
+            TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                text_delta: "more work".into(),
+                chunk_index: 1,
+                phase: Some(AgentMessagePhase::Commentary),
+            }),
+        );
+        assert_eq!(
+            latest_timeline_turn_ended_normally(&[final_message, trailing_delta]),
+            Some(false)
+        );
+    }
 
     fn sample_turn_attribution() -> TurnExecutionAttribution {
         TurnExecutionAttribution::new(

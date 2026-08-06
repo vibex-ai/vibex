@@ -45,7 +45,7 @@ pub use agent::{
     CreateAgentSessionRequest, FetchTimelineRequest, ForkAgentSessionRequest,
     GetMessageSubmissionRequest, MAX_MESSAGE_IDEMPOTENCY_KEY_LEN, MessageSubmissionState,
     ProviderCapabilitiesResponse, RenameAgentSessionRequest, ResolveElicitationRequest,
-    ResolvePermissionRequest, SendAgentMessageRequest,
+    ResolvePermissionRequest, SendAgentMessageRequest, agent_session_turn_requires_continuation,
 };
 pub use agent_config::{
     AgentCatalogListResponse, AgentCommandConfig, AgentConfig, AgentConfigStatus, AgentDefinition,
@@ -346,6 +346,7 @@ pub use timeline::{
     TimelineItem, TimelineItemKind, TimelineLiveEvent, TimelinePage, TimelinePayload,
     TimelineRedactionState, TimelineSource, TodoUpdatePayload, ToolCallPayload, ToolCallStatus,
     TurnExecutionAttribution, TurnExecutionAttributionView, UserMessagePayload, WebSearchPayload,
+    latest_timeline_turn_ended_normally,
 };
 pub use usage::{
     AgentTurnUsageFact, AgentUsageAggregate, AgentUsageAnnualDay, AgentUsageAnnualProjection,
