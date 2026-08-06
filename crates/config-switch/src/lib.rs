@@ -177,6 +177,40 @@ impl ProviderConfigService {
         Ok(AgentListResponse { agents })
     }
 
+    /// Refreshes binary identities needed by descriptor-driven provider forms.
+    ///
+    /// This is deliberately separate from `list_agents`: ordinary Agent
+    /// catalog reads remain process-free, while an explicit Config Center
+    /// snapshot may verify installed versioned runtimes before resolving their
+    /// provider capabilities.
+    pub fn refresh_detected_agent_versions(&self) -> VibexResult<usize> {
+        let agents = self.list_agents(AgentListRequest {
+            include_disabled: true,
+        })?;
+        let versioned_agent_ids = vibex_core::agent_provider_rollout_manifest()?
+            .into_iter()
+            .filter(|entry| {
+                matches!(
+                    entry.version_policy,
+                    vibex_core::AgentVersionPolicy::DetectedSemver { .. }
+                )
+            })
+            .map(|entry| entry.agent_id)
+            .collect::<HashSet<_>>();
+        let mut refreshed = 0;
+        for agent in agents.agents {
+            if !agent.added || !agent.installed || !versioned_agent_ids.contains(&agent.id) {
+                continue;
+            }
+            self.refresh_agent_snapshot(AgentRefreshSnapshotRequest {
+                agent_id: agent.id,
+                cwd_scope: None,
+            })?;
+            refreshed += 1;
+        }
+        Ok(refreshed)
+    }
+
     pub fn list_agent_catalog(&self) -> VibexResult<AgentCatalogListResponse> {
         Ok(AgentCatalogListResponse {
             agents: builtin_agent_definitions(),
@@ -8204,15 +8238,18 @@ mod tests {
                 params: None,
             })
             .unwrap();
+        assert_eq!(service.refresh_detected_agent_versions().unwrap(), 1);
         let refreshed = service
-            .refresh_agent_snapshot(AgentRefreshSnapshotRequest {
-                agent_id: agent_id.clone(),
-                cwd_scope: None,
+            .list_agents(AgentListRequest {
+                include_disabled: true,
             })
+            .unwrap()
+            .agents
+            .into_iter()
+            .find(|agent| agent.id == agent_id)
             .unwrap();
         assert!(
             refreshed
-                .agent
                 .diagnostics
                 .iter()
                 .any(|entry| { entry.key == "version" && entry.value == "1.18.11" })

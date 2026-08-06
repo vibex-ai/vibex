@@ -12079,6 +12079,9 @@ async fn load_snapshot(
 ) -> VibexResult<ManagementSnapshot> {
     let management: ManagementHandle = runtime.management();
     let provider = management.providers().management();
+    // Config Center refresh is the explicit, bounded slow path for installed
+    // versioned Agent CLIs. Ordinary Agent catalog reads remain process-free.
+    provider.refresh_detected_agent_versions()?;
     let agents = provider.list_agents(AgentListRequest {
         include_disabled: true,
     })?;
@@ -12926,6 +12929,26 @@ mod tests {
         assert!(!duplicate.contains(".refresh_agent("));
         assert!(!save.contains(".refresh_agent("));
         assert!(!acp.contains(".refresh_agent("));
+    }
+
+    #[test]
+    fn config_center_snapshot_refreshes_versioned_agents_before_projection_load() {
+        let source = include_str!("management.rs");
+        let load_snapshot = source
+            .split_once("async fn load_snapshot(")
+            .and_then(|(_, tail)| tail.split_once("\nfn "))
+            .map(|(body, _)| body)
+            .expect("management snapshot loader should remain inspectable");
+        let version_refresh = load_snapshot
+            .find("provider.refresh_detected_agent_versions()?")
+            .expect("Config Center snapshot must refresh detected Agent versions");
+        let agent_list = load_snapshot
+            .find("let agents = provider.list_agents(AgentListRequest")
+            .expect("Config Center snapshot must load Agent snapshots");
+        assert!(
+            version_refresh < agent_list,
+            "versioned Agent identity must be refreshed before capability state is loaded"
+        );
     }
 
     #[test]

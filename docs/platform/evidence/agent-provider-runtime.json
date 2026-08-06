@@ -3,9 +3,9 @@
   "status": "passed",
   "claimScope": "manifest_and_contract",
   "realRuntimeVerification": "blocked",
-  "capturedAt": "2026-08-06T06:43:53.966Z",
+  "capturedAt": "2026-08-06T08:04:36.740Z",
   "source": {
-    "captureParentCommit": "1b47a18761ca149e6cf00612db50e84785e7a57f",
+    "captureParentCommit": "07d246f76bcaff56237a1d0463e1e30125d78ac8",
     "rustToolchain": "rustc-1.97.0",
     "sourceInputRoots": [
       "crates/core/src/acp_catalog.rs",
@@ -53,14 +53,14 @@
       "crates/vibex-ui/Cargo.toml",
       "apps/desktop/Cargo.toml"
     ],
-    "sourceInputTreeSha256": "431664d0aeaa5264cfa34eaa1803b8d599d0d52473d846655af97509ba412959",
+    "sourceInputTreeSha256": "e79ff71da332d4888116917eee137fa27a0628a7cf56df38096d0699fc2955a8",
     "bindings": {
       "catalog": "7ad921ebb2f6b6bbc8e948a6b7ed225c2b84d301f5d6a309ce697e3cbf9592d0",
       "manifest": "fbb84e1bb0af51c5f4ee26de713dc96d876a29ccb569ccb13be541fc7681bf28",
-      "probe": "0cdc4d98c0fa7c16bdb9db489de08266c48e00c4de484746a895e2c3244c2c02",
+      "probe": "b1bdf6b80bd0f2a912ae37d84178b1368b272a3cebfb563ce9d5793357959c4b",
       "database": "d299ee59a1ac2160ff8c838c905e98889614c3d8e5eab0b1ae477382f1ac690a",
       "remote": "cca712dc885a20fa5dbf4ec8d0db5d603015c7b87d1f879f458d88d29cb70905",
-      "ui": "34e3248029c95649c55bef039320ff88d6560b06e10088b281c8314ebcc407a2",
+      "ui": "b0b3d399fdc6f338418abb2619cf4f5298aed8eaf9d8ef187500f3ba2eb3929c",
       "switch": "aa9ef1a461fb4adad5756ba2c7931aaae3b0de499b85d1603df5c9cdf7fe9996",
       "scripts": "5bc4862bd12ce9003dd9755772db641653062411468dcf7bf05a869f931c5d17",
       "packageMetadata": "578fbdba0da56b0ffbac96dbbdb182e347c730edaffd5c3d21f6b7af94f434bf"

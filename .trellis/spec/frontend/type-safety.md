@@ -197,7 +197,7 @@ return source ? `${source.agentLabel} · ${source.providerProfileLabel} · ${sou
 
 - Trigger: rendering or refreshing Provider binding controls in GPUI Desktop,
   GPUI-WASM Web, or mobile.
-- The editor consumes the backend's exact-version capability and redacted
+- The editor consumes the backend's version-matched capability and redacted
   preview. It never parses a Provider-native options blob or invents support
   from Agent/catalog metadata.
 

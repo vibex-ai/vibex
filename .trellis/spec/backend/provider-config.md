@@ -2625,7 +2625,7 @@ await queryClient.invalidateQueries({ queryKey: ["agent", "runtime-options"] });
 The Runtime Option Catalog is derived Provider state and must be invalidated
 with its source records.
 
-## Scenario: Exact-Version Agent Provider Projection Platform
+## Scenario: Versioned Agent Provider Projection Platform
 
 ### 1. Scope / Trigger
 
@@ -2691,6 +2691,10 @@ ProviderConfigService::{
   version, Adapter version, and managed dependency identity. Unknown, manual, or
   mismatched identity returns a conservative capability that emits no automatic
   Secret or managed overlay.
+- Config Center snapshot refreshes use the explicit version-detection path for
+  installed Agents whose descriptors declare semantic-version compatibility
+  ranges before loading runtime capabilities. Ordinary Agent catalog reads stay
+  process-free.
 - Codex `0.146.0` accepts only `openai_responses`. Claude exposes no selectable
   Wire API. PATH-launched OpenCode uses its detected CLI version and may expose
   only the adapter/protocol pairs registered for the matching semantic-version

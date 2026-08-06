@@ -65,6 +65,10 @@ impl ProviderManagementFacade {
         self.service.list_agents(request)
     }
 
+    pub fn refresh_detected_agent_versions(&self) -> VibexResult<usize> {
+        self.service.refresh_detected_agent_versions()
+    }
+
     pub fn list_agent_catalog(&self) -> VibexResult<vibex_core::AgentCatalogListResponse> {
         self.service.list_agent_catalog()
     }
