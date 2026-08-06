@@ -1,4 +1,8 @@
-use std::{borrow::Cow, future::Future, sync::Arc};
+use std::{
+    borrow::Cow,
+    future::Future,
+    sync::{Arc, OnceLock},
+};
 
 use gpui::{
     AnyElement, App, Asset, AssetSource, Hsla, ImageCacheError, IntoElement, Pixels, RenderImage,
@@ -17,6 +21,24 @@ const INTER_LATIN_EXT: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../node_modules/.pnpm/@fontsource-variable+inter@5.2.8/node_modules/@fontsource-variable/inter/files/inter-latin-ext-wght-normal.woff2"
 ));
+const APP_ICON: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/app-icons/icon.png"
+));
+
+pub fn window_icon() -> Result<Arc<image::RgbaImage>, String> {
+    static WINDOW_ICON: OnceLock<Result<Arc<image::RgbaImage>, String>> = OnceLock::new();
+
+    WINDOW_ICON
+        .get_or_init(|| {
+            let image = image::load_from_memory_with_format(APP_ICON, image::ImageFormat::Png)
+                .map_err(|error| format!("failed to decode Vibex window icon: {error}"))?
+                .resize_exact(256, 256, image::imageops::FilterType::Lanczos3)
+                .into_rgba8();
+            Ok(Arc::new(image))
+        })
+        .clone()
+}
 
 const VIBEX_ASSETS: &[(&str, &[u8])] = &[
     (
@@ -855,6 +877,15 @@ fn sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_icon_is_a_high_contrast_x11_asset() {
+        let icon = window_icon().expect("bundled window icon should decode");
+
+        assert_eq!(icon.dimensions(), (256, 256));
+        assert_eq!(*icon.get_pixel(0, 0), image::Rgba([0, 0, 0, 255]));
+        assert!(icon.pixels().any(|pixel| pixel.0 == [255, 255, 255, 255]));
+    }
 
     #[test]
     fn multicolor_agent_brands_use_polychrome_image_elements() {

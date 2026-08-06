@@ -97,9 +97,14 @@ function validatePackaging() {
   ];
   for (const [channel, applicationId, productName] of channels) {
     const config = source(`apps/desktop/Packager.${channel}.toml`);
+    const desktopEntryPath = `apps/desktop/packaging/${applicationId}.desktop`;
+    const desktopEntry = source(desktopEntryPath);
     assert(config.includes(`identifier = "${applicationId}"`), `${channel} package id drifted`);
     assert(config.includes(`productName = "${productName}"`), `${channel} product name drifted`);
     assert(config.includes('assets/app-icons/icon.png'), `${channel} package does not own its icon`);
+    assert(config.includes(`packaging/${applicationId}.desktop`), `${channel} package is missing its app-id desktop entry`);
+    assert(desktopEntry.includes(`StartupWMClass=${applicationId}`), `${channel} desktop entry app id drifted`);
+    assert(desktopEntry.includes("Icon=vibex-desktop"), `${channel} desktop entry icon drifted`);
     assert(config.includes('src = "../web/dist"'), `${channel} package is missing Web assets`);
     const command = packageJson.scripts?.[`package:${channel}`] ?? "";
     assert(command.includes(`build-channel.mjs ${channel}`), `${channel} package command drifted`);

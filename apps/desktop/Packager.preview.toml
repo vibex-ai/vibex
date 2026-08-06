@@ -35,6 +35,8 @@ depends = [
   "libayatana-appindicator3-1 | libappindicator3-1",
 ]
 section = "devel"
+files = { "packaging/dev.vibex.desktop.preview.desktop" = "/usr/share/applications/dev.vibex.desktop.preview.desktop" }
 
 [appimage]
 excludedLibs = ["libpdfium.so"]
+files = { "packaging/dev.vibex.desktop.preview.desktop" = "/usr/share/applications/dev.vibex.desktop.preview.desktop" }

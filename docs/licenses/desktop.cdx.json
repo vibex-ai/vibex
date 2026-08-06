@@ -39159,7 +39159,7 @@
     },
     {
       "type": "file",
-      "bom-ref": "asset:vibex-desktop-application-icons:0d76eae3f16fa4d5",
+      "bom-ref": "asset:vibex-desktop-application-icons:938133838497e43c",
       "name": "Vibex desktop application and tray icons",
       "version": "0.1.0-rc.1",
       "licenses": [
@@ -39170,7 +39170,7 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "0d76eae3f16fa4d5dcacc6a675856663f2a8cb984d603735c556e0925ead1101"
+          "content": "938133838497e43cec2d4ae201a4c90cf187332afcb84f96ace44069421d2c7b"
         }
       ],
       "externalReferences": [
@@ -39541,7 +39541,7 @@
       "dependsOn": []
     },
     {
-      "ref": "asset:vibex-desktop-application-icons:0d76eae3f16fa4d5",
+      "ref": "asset:vibex-desktop-application-icons:938133838497e43c",
       "dependsOn": []
     },
     {
@@ -46820,7 +46820,7 @@
     {
       "ref": "cargo:vibex-desktop@0.1.0-rc.1:8be20e5fa4f9b6f0",
       "dependsOn": [
-        "asset:vibex-desktop-application-icons:0d76eae3f16fa4d5",
+        "asset:vibex-desktop-application-icons:938133838497e43c",
         "asset:vibex-desktop-reviewed-icons:c8d0b5c8e37627d4",
         "cargo:base64@0.22.1:c19b7c6f923b580a",
         "cargo:chrono@0.4.45:c19b7c6f923b580a",

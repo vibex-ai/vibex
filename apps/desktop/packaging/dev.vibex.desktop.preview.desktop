@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Vibex Preview
+Comment=Vibex preview release
+Exec=vibex-desktop
+Icon=vibex-desktop
+NoDisplay=true
+StartupWMClass=dev.vibex.desktop.preview
+Terminal=false
+Type=Application

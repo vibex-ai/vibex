@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Vibex
+Comment=Vibex stable desktop application
+Exec=vibex-desktop
+Icon=vibex-desktop
+NoDisplay=true
+StartupWMClass=dev.vibex.desktop
+Terminal=false
+Type=Application

@@ -67,7 +67,7 @@
     "e2e:workflows": "node scripts/e2e-workflows.mjs",
     "e2e:desktop-pairing": "node scripts/e2e-desktop-pairing.mjs",
     "e2e:product-pairing:android": "node scripts/e2e-product-pairing-android.mjs",
-    "dev:desktop": "cargo run -p vibex-desktop --locked",
+    "dev:desktop": "node scripts/prepare-desktop-dev-icon.mjs && cargo run -p vibex-desktop --locked",
     "dev:wasm-web": "pnpm --filter @vibex/web build && node scripts/wasm-test-server.mjs",
     "lint": "eslint apps --ext .ts,.tsx",
     "prepare:pdfium": "node scripts/prepare-pdfium-runtime.mjs",

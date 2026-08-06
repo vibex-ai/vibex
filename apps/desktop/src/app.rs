@@ -117,7 +117,7 @@ use crate::actions::{
     NavigateBack, NavigateForward, OpenSettings, RetryRuntime, SaveActiveFile, TogglePreview,
     ToggleRightRail, ToggleSidebar,
 };
-use crate::assets::{agent_brand_icon, agent_brand_logo, model_brand_icon};
+use crate::assets::{agent_brand_icon, agent_brand_logo, model_brand_icon, window_icon};
 use crate::code_workbench::{
     CodeRightRail, CodeWorkbench, CodeWorkbenchEvent, CodeWorkbenchPersistedState, RightRailMode,
 };
@@ -31229,6 +31229,7 @@ pub fn open_workbench_window(cx: &mut App) -> Result<(), String> {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitleBar::title_bar_options()),
         app_id: Some(application_id.to_string()),
+        icon: Some(window_icon()?),
         window_min_size: Some(size(px(MIN_WIDTH as f32), px(MIN_HEIGHT as f32))),
         window_decorations: Some(WindowDecorations::Client),
         #[cfg(target_os = "linux")]

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Vibex RC
+Comment=Vibex opt-in release candidate
+Exec=vibex-desktop
+Icon=vibex-desktop
+NoDisplay=true
+StartupWMClass=dev.vibex.desktop.rc
+Terminal=false
+Type=Application

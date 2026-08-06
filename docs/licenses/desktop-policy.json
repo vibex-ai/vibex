@@ -230,7 +230,7 @@
         ".png"
       ],
       "expectedFileCount": 3,
-      "treeSha256": "0d76eae3f16fa4d5dcacc6a675856663f2a8cb984d603735c556e0925ead1101",
+      "treeSha256": "938133838497e43cec2d4ae201a4c90cf187332afcb84f96ace44069421d2c7b",
       "licenseExpression": "AGPL-3.0-or-later",
       "source": "https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/app-icons"
     },

@@ -151,7 +151,13 @@ impl SystemTray {
 
         let workbench = self.workbench.clone();
         let visible_options =
-            workbench_window_options(self.application_id.clone(), self.last_window_bounds);
+            match workbench_window_options(self.application_id.clone(), self.last_window_bounds) {
+                Ok(options) => options,
+                Err(error) => {
+                    eprintln!("failed to restore Vibex from the system tray: {error}");
+                    return;
+                }
+            };
         let visible_window = match cx.open_window(visible_options, move |window, cx| {
             window.on_window_should_close(cx, handle_window_close);
             cx.new(|cx| Root::new(workbench, window, cx).bordered(false))
@@ -312,17 +318,21 @@ fn load_tray_icon() -> Result<Icon, String> {
         .map_err(|error| format!("failed to load Vibex tray icon pixels: {error}"))
 }
 
-fn workbench_window_options(application_id: String, window_bounds: WindowBounds) -> WindowOptions {
-    WindowOptions {
+fn workbench_window_options(
+    application_id: String,
+    window_bounds: WindowBounds,
+) -> Result<WindowOptions, String> {
+    Ok(WindowOptions {
         window_bounds: Some(normalized_window_bounds(window_bounds)),
         titlebar: Some(TitleBar::title_bar_options()),
         app_id: Some(application_id),
+        icon: Some(crate::assets::window_icon()?),
         window_min_size: Some(size(px(MIN_WIDTH as f32), px(MIN_HEIGHT as f32))),
         window_decorations: Some(WindowDecorations::Client),
         #[cfg(target_os = "linux")]
         window_background: WindowBackgroundAppearance::Transparent,
         ..Default::default()
-    }
+    })
 }
 
 fn normalized_window_bounds(bounds: WindowBounds) -> WindowBounds {

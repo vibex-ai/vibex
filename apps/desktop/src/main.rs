@@ -335,6 +335,10 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitleBar::title_bar_options()),
                 app_id: Some("dev.vibex.desktop.preview".to_string()),
+                icon: Some(assets::window_icon().unwrap_or_else(|error| {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                })),
                 window_min_size: Some(size(px(MIN_WIDTH as f32), px(MIN_HEIGHT as f32))),
                 window_decorations: Some(WindowDecorations::Client),
                 ..Default::default()
