@@ -1004,6 +1004,11 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   update timeline content, not the sidebar/session-state snapshot; using the
   pre-submit `Idle` or `Running` snapshot can hide the continue affordance and
   skip recovery even though storage has already committed `Error`.
+- After a successful submission reaches its turn boundary, automatic Composer
+  queue dispatch may ignore a lagging sidebar `Running` snapshot. The local
+  per-session turn-pending flag and an authoritative `NeedsInput` state remain
+  hard fences, and the dispatch must still honor the global action lock, queue
+  pause state, and Auto/Manual send mode.
 - Auto-continue is a safe local preference persisted in `DesktopUiStateV1`.
   Store project defaults separately from per-session boolean overrides so an
   explicit session disable survives restart even when its project default is

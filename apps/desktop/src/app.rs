@@ -422,6 +422,7 @@ enum ComposerQueueDispatchBehavior {
     Automatic,
     ForceNext,
     AfterInterrupt,
+    AfterCompletion,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2802,8 +2803,10 @@ fn composer_queue_dispatch_enabled(
     session_id: &VibexSessionId,
     behavior: ComposerQueueDispatchBehavior,
 ) -> bool {
-    behavior != ComposerQueueDispatchBehavior::Automatic
-        || composer_queue_auto_send_enabled(manual_session_ids, session_id)
+    matches!(
+        behavior,
+        ComposerQueueDispatchBehavior::ForceNext | ComposerQueueDispatchBehavior::AfterInterrupt
+    ) || composer_queue_auto_send_enabled(manual_session_ids, session_id)
 }
 
 fn composer_queue_session_blocks_dispatch(
@@ -2811,12 +2814,19 @@ fn composer_queue_session_blocks_dispatch(
     local_turn_pending: bool,
     session_state: Option<AgentSessionState>,
 ) -> bool {
-    local_turn_pending
-        || (behavior != ComposerQueueDispatchBehavior::AfterInterrupt
-            && matches!(
+    let session_blocks = match behavior {
+        ComposerQueueDispatchBehavior::AfterInterrupt => false,
+        ComposerQueueDispatchBehavior::AfterCompletion => {
+            matches!(session_state, Some(AgentSessionState::NeedsInput))
+        }
+        ComposerQueueDispatchBehavior::Automatic | ComposerQueueDispatchBehavior::ForceNext => {
+            matches!(
                 session_state,
                 Some(AgentSessionState::Running | AgentSessionState::NeedsInput)
-            ))
+            )
+        }
+    };
+    local_turn_pending || session_blocks
 }
 
 fn auto_continue_should_start(
@@ -7976,6 +7986,12 @@ impl VibexWorkbench {
                         &submitted_session_id,
                         if steering {
                             ComposerQueueDispatchBehavior::AfterInterrupt
+                        } else if completed {
+                            // The submission has durably completed, but the
+                            // sidebar session snapshot may still say Running
+                            // until its next refresh. The local pending flag
+                            // remains the completion fence.
+                            ComposerQueueDispatchBehavior::AfterCompletion
                         } else {
                             ComposerQueueDispatchBehavior::Automatic
                         },
@@ -35625,10 +35641,15 @@ mod tests {
             &session,
             ComposerQueueDispatchBehavior::AfterInterrupt,
         ));
+        assert!(!composer_queue_dispatch_enabled(
+            &manual_session_ids,
+            &session,
+            ComposerQueueDispatchBehavior::AfterCompletion,
+        ));
     }
 
     #[test]
-    fn composer_queue_dispatch_after_interrupt_ignores_only_the_stale_session_snapshot() {
+    fn composer_queue_dispatch_after_turn_boundary_ignores_only_the_stale_session_snapshot() {
         assert!(composer_queue_session_blocks_dispatch(
             ComposerQueueDispatchBehavior::AfterInterrupt,
             true,
@@ -35636,6 +35657,26 @@ mod tests {
         ));
         assert!(!composer_queue_session_blocks_dispatch(
             ComposerQueueDispatchBehavior::AfterInterrupt,
+            false,
+            Some(AgentSessionState::Running),
+        ));
+        assert!(composer_queue_session_blocks_dispatch(
+            ComposerQueueDispatchBehavior::AfterCompletion,
+            true,
+            Some(AgentSessionState::Running),
+        ));
+        assert!(!composer_queue_session_blocks_dispatch(
+            ComposerQueueDispatchBehavior::AfterCompletion,
+            false,
+            Some(AgentSessionState::Running),
+        ));
+        assert!(composer_queue_session_blocks_dispatch(
+            ComposerQueueDispatchBehavior::AfterCompletion,
+            false,
+            Some(AgentSessionState::NeedsInput),
+        ));
+        assert!(composer_queue_session_blocks_dispatch(
+            ComposerQueueDispatchBehavior::Automatic,
             false,
             Some(AgentSessionState::Running),
         ));
@@ -35763,6 +35804,7 @@ mod tests {
         assert!(submit.contains("if session_running || queue_paused || queue_has_messages"));
         assert!(submit.contains("self.composer_queue.push(message);"));
         assert!(submit.contains("self.set_session_turn_pending(&session_id, true);"));
+        assert!(submit.contains("ComposerQueueDispatchBehavior::AfterCompletion"));
         let clear = submit
             .find("this.set_session_turn_pending(&submitted_session_id, false);")
             .expect("submission should clear its per-session pending state");
