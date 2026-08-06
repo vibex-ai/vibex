@@ -1,5 +1,6 @@
 //! Shared desktop composition root used by the native GPUI shell.
 
+mod acp_terminal;
 mod catalog;
 mod events;
 mod fixture;
@@ -31,7 +32,8 @@ use vibex_agent_acp::{
 };
 use vibex_config_switch::{ProviderConfigService, ProviderProfileChangeListener};
 use vibex_core::{
-    AgentCommandConfig, AgentRefreshSnapshotRequest, AgentRuntimeKind, AgentSession,
+    AgentAuthCatalog, AgentAuthenticateRequest, AgentAuthenticateResult, AgentCommandConfig,
+    AgentLogoutRequest, AgentRefreshSnapshotRequest, AgentRuntimeKind, AgentSession,
     FetchTimelineRequest, OpenWorkspaceRequest, ProjectId, ProjectRecord, ProviderProfileId,
     TerminalCreateRequest, TerminalId, TerminalSession, TerminalSwitchShellRequest, TimelinePage,
     VibexError, VibexResult, WorkspaceId, WorkspaceMode, WorkspaceRecord,
@@ -48,6 +50,8 @@ use vibex_remote::{
     build_router_with_dispatcher,
 };
 use vibex_terminal::TerminalManager;
+
+use acp_terminal::DesktopAcpTerminalHost;
 
 pub use catalog::{
     RuntimeOptionCatalogService, RuntimeOptionProbeResult, RuntimeOptionSnapshotSummary,
@@ -328,6 +332,27 @@ impl AgentHandle {
 
     pub fn runtime_catalog(&self) -> Arc<RuntimeOptionCatalogService> {
         self.runtime_catalog.clone()
+    }
+
+    pub async fn list_auth_methods(
+        &self,
+        agent_id: vibex_core::AgentId,
+        provider_profile_id: Option<ProviderProfileId>,
+    ) -> VibexResult<AgentAuthCatalog> {
+        self.manager
+            .list_agent_auth_methods(agent_id, provider_profile_id)
+            .await
+    }
+
+    pub async fn authenticate(
+        &self,
+        request: AgentAuthenticateRequest,
+    ) -> VibexResult<AgentAuthenticateResult> {
+        self.manager.authenticate_agent(request).await
+    }
+
+    pub async fn logout(&self, request: AgentLogoutRequest) -> VibexResult<()> {
+        self.manager.logout_agent(request).await
     }
 
     pub async fn list_sessions(&self, include_archived: bool) -> VibexResult<Vec<AgentSession>> {
@@ -721,8 +746,17 @@ impl DesktopRuntime {
         let provider_change_listener = Arc::new(DesktopProviderProfileChangeListener {
             sender: provider_change_sender,
         });
-        let (manager, provider_config_service, acp_runtime) =
-            build_agent_manager(&config, observability.clone(), provider_change_listener)?;
+        let terminals = TerminalManager::with_raw_observation_capacity(
+            NATIVE_TERMINAL_RING_CAPACITY,
+            NATIVE_TERMINAL_RAW_CAPACITY_BYTES,
+        );
+        let terminal_host = Arc::new(DesktopAcpTerminalHost::new(terminals.clone()));
+        let (manager, provider_config_service, acp_runtime) = build_agent_manager(
+            &config,
+            observability.clone(),
+            provider_change_listener,
+            terminal_host,
+        )?;
         let runtime_probe = acp_runtime.runtime_probe_service();
         let manager = Arc::new(manager);
         let db_path = manager.database_path().to_path_buf();
@@ -731,7 +765,7 @@ impl DesktopRuntime {
         manager.install_usage_telemetry_sender(usage_sender)?;
         let runtime_switch_bridge = Arc::new(AcpRuntimeSwitchBridge::new(
             &db_path,
-            acp_runtime,
+            acp_runtime.clone(),
             manager.clone(),
         )?);
         let runtime_switch_coordinator = RuntimeSwitchCoordinator::new_with_observability(
@@ -763,14 +797,11 @@ impl DesktopRuntime {
         )?);
         message_submission.install_runtime_lifecycle(runtime_lifecycle.clone())?;
         manager.install_message_submission_coordinator(&message_submission)?;
-        let runtime_catalog = Arc::new(RuntimeOptionCatalogService::new(
+        let runtime_catalog = Arc::new(RuntimeOptionCatalogService::with_live_runtime(
             manager.clone(),
             provider_config_service.clone(),
+            acp_runtime.clone(),
         ));
-        let terminals = TerminalManager::with_raw_observation_capacity(
-            NATIVE_TERMINAL_RING_CAPACITY,
-            NATIVE_TERMINAL_RAW_CAPACITY_BYTES,
-        );
         let git = GitHandle {
             db_path: db_path.clone(),
             mutation_claims: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
@@ -1449,12 +1480,14 @@ fn build_agent_manager(
     config: &DesktopRuntimeConfig,
     observability: Arc<RuntimeObservability>,
     profile_change_listener: Arc<dyn ProviderProfileChangeListener>,
+    terminal_host: Arc<dyn vibex_agent_acp::AcpTerminalHost>,
 ) -> VibexResult<(AgentManager, ProviderConfigService, Arc<AcpRuntimeClient>)> {
     let db_path = config.database_path.clone();
     let bootstrap_config_service = ProviderConfigService::new(&db_path);
     let mut manager = AgentManager::new(&db_path)?;
-    let acp_runtime = Arc::new(AcpRuntimeClient::new_with_observability(
+    let acp_runtime = Arc::new(AcpRuntimeClient::with_terminal_host_and_observability(
         bootstrap_config_service,
+        terminal_host,
         observability,
     ));
     let acp_config_service = ProviderConfigService::new(db_path.clone())

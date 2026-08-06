@@ -301,6 +301,15 @@ impl SessionConfigPlanner {
         self
     }
 
+    /// Replaces the complete option set advertised for the current session.
+    /// ACP `ConfigOptionUpdate` notifications carry a full snapshot, so the
+    /// planner must not retain options that the Agent has withdrawn.
+    pub fn with_options(&self, options: Vec<ProviderSessionConfigOption>) -> Self {
+        let mut next = self.clone();
+        next.options = options;
+        next
+    }
+
     /// Adds a lower-priority encoding for an operation.  This is useful when a
     /// negotiated typed candidate has an explicitly versioned raw fallback;
     /// the map's primary entry remains the preferred candidate.
@@ -557,6 +566,7 @@ pub struct SessionModelCatalogEntry {
 pub struct RuntimeOptionCatalogProfileEvidence {
     pub models: Vec<SessionModelCatalogEntry>,
     pub modes: Vec<ProviderSessionConfigValue>,
+    pub reasoning_efforts: Vec<AgentReasoningEffort>,
     pub options: Vec<ProviderSessionConfigOption>,
     pub temporarily_unavailable: bool,
 }
@@ -611,6 +621,7 @@ pub fn build_runtime_option_catalog_for_agents(
         let profile_evidence = evidence.map(|entry| RuntimeOptionCatalogProfileEvidence {
             models: Vec::new(),
             modes: entry.modes.clone(),
+            reasoning_efforts: entry.reasoning_efforts.clone(),
             options: entry.options.clone(),
             temporarily_unavailable: entry.temporarily_unavailable,
         });
@@ -800,7 +811,14 @@ pub fn build_runtime_option_catalog(
                 model_label,
                 reasoning_efforts: model_evidence
                     .map(catalog_reasoning_efforts)
-                    .unwrap_or_default(),
+                    .filter(|efforts| !efforts.is_empty())
+                    .unwrap_or_else(|| {
+                        catalog_reasoning_effort_values(
+                            evidence
+                                .map(|evidence| evidence.reasoning_efforts.as_slice())
+                                .unwrap_or_default(),
+                        )
+                    }),
                 modes: modes.clone(),
                 features: features.clone(),
                 availability,
@@ -886,8 +904,13 @@ fn catalog_modes_from_values(
 }
 
 fn catalog_reasoning_efforts(model: &SessionModelCatalogEntry) -> Vec<SessionConfigValue> {
-    let mut efforts = model
-        .reasoning_efforts
+    catalog_reasoning_effort_values(&model.reasoning_efforts)
+}
+
+fn catalog_reasoning_effort_values(
+    reasoning_efforts: &[AgentReasoningEffort],
+) -> Vec<SessionConfigValue> {
+    let mut efforts = reasoning_efforts
         .iter()
         .filter_map(|effort| {
             let value = validate_effort_value(&effort.value).ok()?;
@@ -1595,6 +1618,7 @@ mod tests {
                     value: "build".to_string(),
                     label: Some("Build".to_string()),
                 }],
+                reasoning_efforts: Vec::new(),
                 options: vec![
                     catalog_option(
                         "model",
@@ -1790,6 +1814,7 @@ mod tests {
                     value: "plan".to_string(),
                     label: Some("Plan".to_string()),
                 }],
+                reasoning_efforts: Vec::new(),
                 options: vec![catalog_option(
                     "fast-mode",
                     Some("model_config"),

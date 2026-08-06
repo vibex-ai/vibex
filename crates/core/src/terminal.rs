@@ -90,6 +90,10 @@ pub struct TerminalSnapshot {
 pub struct TerminalAuthActionDescriptor {
     pub id: String,
     pub provider_profile_id: String,
+    /// Present when the desktop host launched the interactive authentication
+    /// command in a shared PTY. Remote or headless hosts may return `None`.
+    #[serde(default)]
+    pub terminal_id: Option<TerminalId>,
     pub title: String,
     pub command: String,
     pub args: Vec<String>,

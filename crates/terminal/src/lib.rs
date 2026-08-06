@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 #[cfg(target_os = "linux")]
 use std::ffi::OsStr;
+use std::fmt;
 use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -46,6 +47,47 @@ struct TerminalRuntime {
     writer: Arc<Mutex<PtyWriter>>,
     child: PtyChild,
     buffer: Arc<Mutex<TerminalBuffer>>,
+    exit_status: Option<TerminalProcessExitStatus>,
+    persist_on_shutdown: bool,
+}
+
+/// Explicit command launch used by trusted desktop integrations such as ACP
+/// terminal tools and terminal-based authentication. Arguments are passed
+/// directly to the child process; no shell interpolation is performed.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TerminalCommandRequest {
+    pub workspace_id: WorkspaceId,
+    pub title: Option<String>,
+    pub command: String,
+    pub args: Vec<String>,
+    pub cwd: Option<String>,
+    pub env: Vec<(String, String)>,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+impl fmt::Debug for TerminalCommandRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalCommandRequest")
+            .field("workspace_id", &self.workspace_id)
+            .field("has_command", &!self.command.trim().is_empty())
+            .field("argument_count", &self.args.len())
+            .field("has_cwd", &self.cwd.is_some())
+            .field(
+                "env_keys",
+                &self.env.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            )
+            .field("rows", &self.rows)
+            .field("cols", &self.cols)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalProcessExitStatus {
+    pub exit_code: Option<i32>,
+    pub signal: Option<String>,
 }
 
 #[derive(Debug)]
@@ -164,6 +206,60 @@ impl TerminalManager {
         self.spawn_runtime(cwd, session)
     }
 
+    pub fn create_command(
+        &self,
+        workspace_root: impl AsRef<Path>,
+        request: TerminalCommandRequest,
+    ) -> VibexResult<TerminalSession> {
+        let command_name = request.command.trim();
+        if command_name.is_empty() || command_name.contains(['\0', '\n', '\r']) {
+            return Err(VibexError::validation(
+                "terminal_command_invalid",
+                "terminal command must be non-empty and single-line",
+            ));
+        }
+        let mut seen_env = std::collections::HashSet::new();
+        for (key, _) in &request.env {
+            if !valid_terminal_env_key(key) || !seen_env.insert(key.as_str()) {
+                return Err(VibexError::validation(
+                    "terminal_command_env_invalid",
+                    "terminal command environment contains an invalid or duplicate key",
+                ));
+            }
+        }
+        let workspace_root = canonical_workspace_root(workspace_root.as_ref())?;
+        let cwd = resolve_cwd(&workspace_root, request.cwd.as_deref())?;
+        let rows = if request.rows == 0 { 24 } else { request.rows };
+        let cols = if request.cols == 0 { 80 } else { request.cols };
+        let title = request
+            .title
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| shell_title(command_name));
+        let now = unix_timestamp_ms();
+        let terminal_id = TerminalId::new();
+        let session = TerminalSession {
+            id: terminal_id,
+            workspace_id: request.workspace_id,
+            title,
+            shell: command_name.to_string(),
+            cwd: cwd.to_string_lossy().into_owned(),
+            rows,
+            cols,
+            status: TerminalStatus::Running,
+            created_at_ms: now,
+            updated_at_ms: now,
+            closed_at_ms: None,
+        };
+        let mut command = CommandBuilder::new(command_name);
+        command.args(&request.args);
+        command.cwd(cwd.as_os_str());
+        sanitize_terminal_environment(&mut command);
+        for (key, value) in request.env {
+            command.env(key, value);
+        }
+        self.spawn_runtime_with_command(cwd, session, command, false)
+    }
+
     pub fn restore(
         &self,
         workspace_root: impl AsRef<Path>,
@@ -210,6 +306,19 @@ impl TerminalManager {
         session: TerminalSession,
     ) -> VibexResult<TerminalSession> {
         let shell = session.shell.clone();
+        let mut command = CommandBuilder::new(&shell);
+        command.cwd(cwd.as_os_str());
+        sanitize_terminal_environment(&mut command);
+        self.spawn_runtime_with_command(cwd, session, command, true)
+    }
+
+    fn spawn_runtime_with_command(
+        &self,
+        cwd: PathBuf,
+        session: TerminalSession,
+        command: CommandBuilder,
+        persist_on_shutdown: bool,
+    ) -> VibexResult<TerminalSession> {
         let terminal_id = session.id.clone();
         let rows = session.rows;
         let cols = session.cols;
@@ -240,12 +349,8 @@ impl TerminalManager {
                     .with_diagnostic("error", err.to_string())
             })?;
 
-        let mut command = CommandBuilder::new(&shell);
-        command.cwd(cwd.as_os_str());
-        sanitize_terminal_environment(&mut command);
         let child = pair.slave.spawn_command(command).map_err(|err| {
-            VibexError::process("pty_spawn_failed", "failed to spawn PTY shell")
-                .with_diagnostic("shell", shell)
+            VibexError::process("pty_spawn_failed", "failed to spawn PTY process")
                 .with_diagnostic("cwd", cwd.display().to_string())
                 .with_diagnostic("error", err.to_string())
         })?;
@@ -265,6 +370,8 @@ impl TerminalManager {
             writer,
             child,
             buffer,
+            exit_status: None,
+            persist_on_shutdown,
         };
         self.lock_sessions()?.insert(terminal_id, runtime);
         Ok(session)
@@ -402,6 +509,15 @@ impl TerminalManager {
 
         let mut runtime = {
             let mut sessions = self.lock_sessions()?;
+            if sessions
+                .get(&request.terminal_id)
+                .is_some_and(|runtime| !runtime.persist_on_shutdown)
+            {
+                return Err(VibexError::capability(
+                    "terminal_shell_switch_unsupported",
+                    "explicit command terminals do not support shell switching",
+                ));
+            }
             sessions.remove(&request.terminal_id).ok_or_else(|| {
                 VibexError::validation("terminal_not_found", "terminal session was not found")
             })?
@@ -464,6 +580,41 @@ impl TerminalManager {
         Ok(runtime.session.clone())
     }
 
+    /// Returns `None` while the child is still running and a stable exit
+    /// result after it has terminated.
+    pub fn process_exit_status(
+        &self,
+        terminal_id: &TerminalId,
+    ) -> VibexResult<Option<TerminalProcessExitStatus>> {
+        let mut sessions = self.lock_sessions()?;
+        let runtime = sessions.get_mut(terminal_id).ok_or_else(|| {
+            VibexError::validation("terminal_not_found", "terminal session was not found")
+        })?;
+        refresh_exit_status(runtime)?;
+        Ok(runtime.exit_status.clone())
+    }
+
+    /// Releases an exited PTY from the bounded in-memory registry. Running
+    /// children must be killed explicitly so dropping a handle never silently
+    /// abandons a process.
+    pub fn release(&self, terminal_id: &TerminalId) -> VibexResult<TerminalSession> {
+        let mut sessions = self.lock_sessions()?;
+        let runtime = sessions.get_mut(terminal_id).ok_or_else(|| {
+            VibexError::validation("terminal_not_found", "terminal session was not found")
+        })?;
+        refresh_exit_status(runtime)?;
+        if runtime.session.status == TerminalStatus::Running {
+            return Err(VibexError::conflict(
+                "terminal_release_running",
+                "running terminal process must be stopped before release",
+            ));
+        }
+        let runtime = sessions
+            .remove(terminal_id)
+            .expect("terminal was validated while holding the session lock");
+        Ok(runtime.session)
+    }
+
     /// Stops every owned PTY and returns the final session snapshots for
     /// persistence by the desktop composition root.
     pub fn shutdown_all(&self) -> VibexResult<TerminalShutdownReport> {
@@ -489,7 +640,9 @@ impl TerminalManager {
             runtime.session.status = TerminalStatus::Killed;
             runtime.session.updated_at_ms = unix_timestamp_ms();
             runtime.session.closed_at_ms = Some(runtime.session.updated_at_ms);
-            stopped.push(runtime.session);
+            if runtime.persist_on_shutdown {
+                stopped.push(runtime.session);
+            }
         }
         stopped.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(TerminalShutdownReport {
@@ -672,20 +825,32 @@ fn refresh_exit_status(runtime: &mut TerminalRuntime) -> VibexResult<()> {
     if runtime.session.status != TerminalStatus::Running {
         return Ok(());
     }
-    if runtime
-        .child
-        .try_wait()
-        .map_err(|err| {
-            VibexError::process("terminal_wait_failed", "failed to inspect terminal process")
-                .with_diagnostic("error", err.to_string())
-        })?
-        .is_some()
-    {
+    if let Some(status) = runtime.child.try_wait().map_err(|err| {
+        VibexError::process("terminal_wait_failed", "failed to inspect terminal process")
+            .with_diagnostic("error", err.to_string())
+    })? {
+        let signal = status.signal().map(str::to_string);
+        runtime.exit_status = Some(TerminalProcessExitStatus {
+            exit_code: signal
+                .is_none()
+                .then(|| status.exit_code().try_into().ok())
+                .flatten(),
+            signal,
+        });
         runtime.session.status = TerminalStatus::Exited;
         runtime.session.updated_at_ms = unix_timestamp_ms();
         runtime.session.closed_at_ms = Some(runtime.session.updated_at_ms);
     }
     Ok(())
+}
+
+fn valid_terminal_env_key(value: &str) -> bool {
+    let mut characters = value.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
 fn canonical_workspace_root(root: &Path) -> VibexResult<PathBuf> {
@@ -1090,6 +1255,96 @@ mod tests {
         assert_eq!(resized.rows, 30);
         let killed = manager.kill(&session.id).unwrap();
         assert_eq!(killed.status, TerminalStatus::Killed);
+    }
+
+    #[test]
+    fn terminal_command_debug_redacts_argument_and_environment_values() {
+        let request = TerminalCommandRequest {
+            workspace_id: WorkspaceId::new(),
+            title: Some("auth".to_string()),
+            command: "agent".to_string(),
+            args: vec!["--token=secret-argument".to_string()],
+            cwd: Some("/private/auth-workspace".to_string()),
+            env: vec![("API_KEY".to_string(), "secret-environment".to_string())],
+            rows: 24,
+            cols: 80,
+        };
+        let debug = format!("{request:?}");
+        assert!(debug.contains("argument_count: 1"));
+        assert!(debug.contains("API_KEY"));
+        assert!(!debug.contains("secret-argument"));
+        assert!(!debug.contains("secret-environment"));
+        assert!(!debug.contains("/private/auth-workspace"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_terminal_command_passes_metacharacters_as_literal_arguments() {
+        let manager = TerminalManager::new();
+        let session = manager
+            .create_command(
+                std::env::temp_dir(),
+                TerminalCommandRequest {
+                    workspace_id: WorkspaceId::new(),
+                    title: Some("literal argument".to_string()),
+                    command: "printf".to_string(),
+                    args: vec!["%s".to_string(), "literal;echo-injected".to_string()],
+                    cwd: Some(std::env::temp_dir().display().to_string()),
+                    env: Vec::new(),
+                    rows: 24,
+                    cols: 80,
+                },
+            )
+            .unwrap();
+
+        for _ in 0..40 {
+            let snapshot = manager.snapshot(&session.id).unwrap();
+            let output = snapshot
+                .chunks
+                .iter()
+                .map(|chunk| chunk.data.as_str())
+                .collect::<String>();
+            if output.contains("literal;echo-injected") {
+                assert_eq!(output, "literal;echo-injected");
+                assert!(manager.process_exit_status(&session.id).unwrap().is_some());
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("explicit command output was not captured");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_terminal_commands_are_not_persisted_on_shutdown() {
+        let manager = TerminalManager::new();
+        let session = manager
+            .create_command(
+                std::env::temp_dir(),
+                TerminalCommandRequest {
+                    workspace_id: WorkspaceId::new(),
+                    title: Some("ephemeral command".to_string()),
+                    command: "sh".to_string(),
+                    args: vec!["-c".to_string(), "sleep 5".to_string()],
+                    cwd: Some(std::env::temp_dir().display().to_string()),
+                    env: Vec::new(),
+                    rows: 24,
+                    cols: 80,
+                },
+            )
+            .unwrap();
+
+        let shell_switch = manager
+            .switch_shell(&TerminalSwitchShellRequest {
+                terminal_id: session.id,
+                shell: "sh".to_string(),
+            })
+            .unwrap_err();
+        assert_eq!(shell_switch.code, "terminal_shell_switch_unsupported");
+
+        let shutdown = manager.shutdown_all().unwrap();
+        assert!(shutdown.sessions.is_empty());
+        assert!(shutdown.failures.is_empty());
     }
 
     #[test]

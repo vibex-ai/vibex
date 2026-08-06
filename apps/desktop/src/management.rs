@@ -4,7 +4,7 @@
 //! navigation, input entities, loading generations, and redacted projections;
 //! durable records and side effects stay behind `DesktopRuntime::management`.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,33 +28,33 @@ use gpui_component::{
     v_flex,
 };
 use vibex_core::{
-    AgentId, AgentListRequest, AgentSnapshotEntry, AgentUpdateConfigRequest,
-    AutomationGraphCreateRequest, AutomationGraphId, AutomationGraphListRequest,
-    AutomationGraphStatus, AutomationRun, AutomationRunCancelRequest, AutomationRunId,
-    AutomationRunListRequest, AutomationRunResumeRequest, AutomationRunStartRequest,
-    AutomationRunStatus, AutomationRunStep, AutomationRunStepListRequest, AutomationRunTrigger,
-    ProviderKind, ScheduledTask, ScheduledTaskAttentionListRequest, ScheduledTaskAuditListRequest,
-    ScheduledTaskCreateRequest, ScheduledTaskId, ScheduledTaskIntervalSchedule,
-    ScheduledTaskListRequest, ScheduledTaskRun, ScheduledTaskRunListRequest, ScheduledTaskSchedule,
-    VibexError, VibexResult, WorkspaceMode, unix_timestamp_ms,
+    AgentAuthCatalog, AgentAuthEnvironmentUpdateRequest, AgentAuthEnvironmentValue,
+    AgentAuthMethodKind, AgentAuthStatus, AgentAuthenticateRequest, AgentId, AgentListRequest,
+    AgentSnapshotEntry, AgentUpdateConfigRequest, AutomationGraphCreateRequest, AutomationGraphId,
+    AutomationGraphListRequest, AutomationGraphStatus, AutomationRun, AutomationRunCancelRequest,
+    AutomationRunId, AutomationRunListRequest, AutomationRunResumeRequest,
+    AutomationRunStartRequest, AutomationRunStatus, AutomationRunStep,
+    AutomationRunStepListRequest, AutomationRunTrigger, ProviderKind, ScheduledTask,
+    ScheduledTaskAttentionListRequest, ScheduledTaskAuditListRequest, ScheduledTaskCreateRequest,
+    ScheduledTaskId, ScheduledTaskIntervalSchedule, ScheduledTaskListRequest, ScheduledTaskRun,
+    ScheduledTaskRunListRequest, ScheduledTaskSchedule, TerminalAuthActionDescriptor, VibexError,
+    VibexResult, WorkspaceMode, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     AutomationGraphDraft, ManagementNavigation, ManagementSection, PairingContextProjection,
     ProviderCenterSnapshot, RecoveryOperationState, RedactedDiagnosticProjection,
 };
 use vibex_desktop_runtime::{
-    DesktopRuntime, ManagementHandle, RuntimeOptionProbeResult, RuntimeOptionSnapshotSummary,
-    validate_external_open_url,
+    DesktopRuntime, ManagementHandle, RuntimeOptionProbeResult, validate_external_open_url,
 };
 use vibex_markdown::code_font_weight;
-use vibex_ui::{
-    AgentProviderBindingEditorState, AgentRuntimeProbeProjection, ProjectionCredentialSurface,
-};
+use vibex_ui::{AgentProviderBindingEditorState, ProjectionCredentialSurface};
 
 use crate::assets::agent_brand_icon;
 use crate::gpui_ext::button_with_aria_label;
 use crate::locale::{self, ResolvedLocale};
 use crate::remote_access_pairing::open_remote_access_pairing;
+use crate::terminal_surface::TerminalSurface;
 
 const MANAGEMENT_SIDEBAR_WIDTH: f32 = 368.0;
 const MANAGEMENT_HEADER_HEIGHT: f32 = 48.0;
@@ -69,6 +69,7 @@ const MANAGEMENT_COMPACT_RESIZE_HANDLE_HOVER_WIDTH: f32 = 80.0;
 const MANAGEMENT_COMPACT_RESIZE_HANDLE_IDLE_THICKNESS: f32 = 3.0;
 const MANAGEMENT_COMPACT_RESIZE_HANDLE_HOVER_THICKNESS: f32 = 5.0;
 const MANAGEMENT_COMPACT_RESIZE_HANDLE_ANIMATION_MS: u64 = 140;
+const AGENT_AUTH_TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MANAGEMENT_HOST_TITLE_BAR_HEIGHT: f32 = 44.0;
 const MANAGEMENT_COMPACT_RESIZE_STEP: f32 = 16.0;
 const PROVIDER_OPTION_WEBSITE_URL: &str = "ccSwitchWebsiteUrl";
@@ -236,10 +237,8 @@ struct ManagementSnapshot {
     native_import_preview: Option<vibex_core::ProviderNativeImportPreview>,
     agent_profile_states: Vec<AgentProviderProfileState>,
     projection_states: Vec<AgentProviderProjectionState>,
-    runtime_probes: Vec<AgentRuntimeProbeProjection>,
     health_summaries: Vec<vibex_core::ProviderHealthSummary>,
     capability_summaries: Vec<vibex_core::ProviderCapabilitySummary>,
-    runtime_option_snapshots: Vec<RuntimeOptionSnapshotSummary>,
     usage_summaries: Vec<vibex_core::ProviderUsageSummary>,
     native_exports: Vec<vibex_core::ProviderNativeExportRecordSummary>,
     device_count: usize,
@@ -263,9 +262,7 @@ struct AgentProviderProfileState {
 #[derive(Clone)]
 struct AgentProviderProjectionState {
     agent_id: String,
-    runtime_profile_id: vibex_core::AgentRuntimeProfileId,
     legacy_profile_id: Option<String>,
-    binding: Option<vibex_core::AgentModelProviderBinding>,
     capability: vibex_core::AgentProviderProjectionCapability,
     preview: Option<vibex_core::AgentProviderProjectionPreview>,
 }
@@ -277,8 +274,7 @@ enum ManagementMutation {
     ProfileDelete(String),
     AcpConfig(String),
     ProviderProbe(String),
-    AgentOptionProbe(String),
-    AgentRuntimeProbe(String),
+    AgentAuth(String),
     ProviderPreview(String),
     AgentToggle(String),
     AgentDiscovery,
@@ -307,6 +303,21 @@ enum ManagementMutation {
     BackupRestore,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentAuthTerminalState {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+enum AgentAuthTerminalCompletion {
+    Authenticated {
+        catalog: Option<AgentAuthCatalog>,
+        refresh_error: Option<VibexError>,
+    },
+    AuthenticationRequired(VibexError),
+}
+
 impl ManagementMutation {
     fn key(&self) -> String {
         match self {
@@ -315,8 +326,7 @@ impl ManagementMutation {
             Self::ProfileDelete(id) => format!("profile:delete:{id}"),
             Self::AcpConfig(id) => format!("provider:acp-config:{id}"),
             Self::ProviderProbe(id) => format!("provider:probe:{id}"),
-            Self::AgentOptionProbe(id) => format!("agent:option-probe:{id}"),
-            Self::AgentRuntimeProbe(id) => format!("agent:runtime-probe:{id}"),
+            Self::AgentAuth(id) => format!("agent:auth:{id}"),
             Self::ProviderPreview(id) => format!("provider:preview:{id}"),
             Self::AgentToggle(id) => format!("agent:toggle:{id}"),
             Self::AgentDiscovery => "agent:discover".into(),
@@ -377,11 +387,9 @@ pub struct ManagementCenter {
     native_import_preview: Option<vibex_core::ProviderNativeImportPreview>,
     agent_profile_states: Vec<AgentProviderProfileState>,
     projection_states: Vec<AgentProviderProjectionState>,
-    runtime_probes: Vec<AgentRuntimeProbeProjection>,
     projection_editor: AgentProviderBindingEditorState,
     health_summaries: Vec<vibex_core::ProviderHealthSummary>,
     capability_summaries: Vec<vibex_core::ProviderCapabilitySummary>,
-    runtime_option_snapshots: Vec<RuntimeOptionSnapshotSummary>,
     usage_summaries: Vec<vibex_core::ProviderUsageSummary>,
     native_exports: Vec<vibex_core::ProviderNativeExportRecordSummary>,
     native_export_source: vibex_core::ProviderNativeExportSource,
@@ -408,6 +416,8 @@ pub struct ManagementCenter {
     generation: u64,
     refresh_task: Option<Task<()>>,
     mutation_task: Option<Task<()>>,
+    agent_auth_task: Option<Task<()>>,
+    agent_auth_terminal_monitor_task: Option<Task<()>>,
     discover_agents_after_refresh: bool,
     mcp_import_open: bool,
     skill_import_open: bool,
@@ -417,6 +427,16 @@ pub struct ManagementCenter {
     skill_validation: Option<(String, String, bool)>,
     selected_agent_id: Option<String>,
     selected_provider_profile_id: Option<String>,
+    agent_auth_scope: Option<(String, Option<String>)>,
+    agent_auth_catalog: Option<AgentAuthCatalog>,
+    agent_auth_loading: bool,
+    agent_auth_error: Option<String>,
+    agent_auth_generation: u64,
+    agent_auth_inputs: BTreeMap<String, Entity<InputState>>,
+    agent_auth_clear_values: BTreeSet<String>,
+    agent_auth_terminal: Option<TerminalAuthActionDescriptor>,
+    agent_auth_terminal_surface: Option<(String, Entity<TerminalSurface>)>,
+    agent_auth_terminal_state: Option<AgentAuthTerminalState>,
     selected_mcp_id: Option<String>,
     selected_skill_id: Option<String>,
     selected_scheduled_task_id: Option<String>,
@@ -746,11 +766,9 @@ impl ManagementCenter {
             native_import_preview: None,
             agent_profile_states: Vec::new(),
             projection_states: Vec::new(),
-            runtime_probes: Vec::new(),
             projection_editor: AgentProviderBindingEditorState::default(),
             health_summaries: Vec::new(),
             capability_summaries: Vec::new(),
-            runtime_option_snapshots: Vec::new(),
             usage_summaries: Vec::new(),
             native_exports: Vec::new(),
             native_export_source: vibex_core::ProviderNativeExportSource::Codex,
@@ -777,6 +795,8 @@ impl ManagementCenter {
             generation: 0,
             refresh_task: None,
             mutation_task: None,
+            agent_auth_task: None,
+            agent_auth_terminal_monitor_task: None,
             discover_agents_after_refresh: false,
             mcp_import_open: false,
             skill_import_open: false,
@@ -786,6 +806,16 @@ impl ManagementCenter {
             skill_validation: None,
             selected_agent_id: None,
             selected_provider_profile_id: None,
+            agent_auth_scope: None,
+            agent_auth_catalog: None,
+            agent_auth_loading: false,
+            agent_auth_error: None,
+            agent_auth_generation: 0,
+            agent_auth_inputs: BTreeMap::new(),
+            agent_auth_clear_values: BTreeSet::new(),
+            agent_auth_terminal: None,
+            agent_auth_terminal_surface: None,
+            agent_auth_terminal_state: None,
             selected_mcp_id: None,
             selected_skill_id: None,
             selected_scheduled_task_id: None,
@@ -831,6 +861,19 @@ impl ManagementCenter {
     }
 
     pub fn set_runtime(&mut self, runtime: Arc<DesktopRuntime>, cx: &mut Context<Self>) {
+        if self
+            .runtime
+            .as_ref()
+            .is_some_and(|current| !Arc::ptr_eq(current, &runtime))
+        {
+            self.agent_auth_generation = self.agent_auth_generation.saturating_add(1);
+            self.clear_agent_auth_terminal();
+            self.agent_auth_scope = None;
+            self.agent_auth_catalog = None;
+            self.agent_auth_error = None;
+            self.agent_auth_inputs.clear();
+            self.agent_auth_clear_values.clear();
+        }
         self.runtime = Some(runtime);
         self.error = None;
         self.notice = None;
@@ -935,8 +978,16 @@ impl ManagementCenter {
     }
 
     pub fn clear_runtime(&mut self, cx: &mut Context<Self>) {
+        self.clear_agent_auth_terminal();
         self.runtime = None;
         self.loading = false;
+        self.agent_auth_generation = self.agent_auth_generation.saturating_add(1);
+        self.agent_auth_loading = false;
+        self.agent_auth_scope = None;
+        self.agent_auth_catalog = None;
+        self.agent_auth_error = None;
+        self.agent_auth_inputs.clear();
+        self.agent_auth_clear_values.clear();
         self.discover_agents_after_refresh = false;
         self.mcp_import_open = false;
         self.skill_import_open = false;
@@ -1021,6 +1072,7 @@ impl ManagementCenter {
         self.acp_config_draft = None;
         self.native_export_preview = None;
         self.sync_projection_editor();
+        self.load_agent_auth(false, cx);
         cx.notify();
     }
 
@@ -1033,7 +1085,660 @@ impl ManagementCenter {
         self.acp_config_draft = None;
         self.native_export_preview = None;
         self.sync_projection_editor();
+        self.load_agent_auth(false, cx);
         cx.notify();
+    }
+
+    fn current_agent_auth_scope(&self) -> Option<(String, Option<String>)> {
+        let agent_id = self.selected_agent_id.as_ref()?;
+        self.snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.id.as_str() == agent_id && agent.added && agent.enabled)?;
+        Some((agent_id.clone(), self.selected_provider_profile_id.clone()))
+    }
+
+    fn load_agent_auth(&mut self, force: bool, cx: &mut Context<Self>) {
+        let Some(scope) = self.current_agent_auth_scope() else {
+            self.agent_auth_generation = self.agent_auth_generation.saturating_add(1);
+            self.agent_auth_scope = None;
+            self.agent_auth_catalog = None;
+            self.agent_auth_loading = false;
+            self.agent_auth_error = None;
+            self.agent_auth_inputs.clear();
+            self.agent_auth_clear_values.clear();
+            self.clear_agent_auth_terminal();
+            cx.notify();
+            return;
+        };
+        if self.agent_auth_scope.as_ref() == Some(&scope)
+            && self.agent_auth_terminal_state == Some(AgentAuthTerminalState::Running)
+        {
+            return;
+        }
+        if !force
+            && self.agent_auth_scope.as_ref() == Some(&scope)
+            && (self.agent_auth_loading || self.agent_auth_catalog.is_some())
+        {
+            return;
+        }
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        let Ok(agent_id) = AgentId::parse(scope.0.clone()) else {
+            return;
+        };
+        let provider_profile_id = match scope.1.as_ref() {
+            Some(profile_id) => match vibex_core::ProviderProfileId::parse(profile_id.clone()) {
+                Ok(profile_id) => Some(profile_id),
+                Err(error) => {
+                    self.agent_auth_error = Some(format!("{}: {}", error.code, error.message));
+                    cx.notify();
+                    return;
+                }
+            },
+            None => None,
+        };
+        let scope_changed = self.agent_auth_scope.as_ref() != Some(&scope);
+        self.agent_auth_generation = self.agent_auth_generation.saturating_add(1);
+        let generation = self.agent_auth_generation;
+        self.agent_auth_scope = Some(scope.clone());
+        self.agent_auth_loading = true;
+        self.agent_auth_error = None;
+        if scope_changed {
+            self.agent_auth_catalog = None;
+            self.agent_auth_inputs.clear();
+            self.agent_auth_clear_values.clear();
+            self.clear_agent_auth_terminal();
+        }
+        let entity = cx.weak_entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            runtime
+                .agent()
+                .list_auth_methods(agent_id, provider_profile_id)
+                .await
+        });
+        self.agent_auth_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                if this.agent_auth_generation != generation
+                    || this.agent_auth_scope.as_ref() != Some(&scope)
+                {
+                    return;
+                }
+                this.agent_auth_loading = false;
+                match outcome {
+                    Ok(Ok(catalog)) => {
+                        this.agent_auth_catalog = Some(catalog);
+                        this.agent_auth_error = None;
+                        this.agent_auth_inputs.clear();
+                        this.agent_auth_clear_values.clear();
+                    }
+                    Ok(Err(error)) => {
+                        this.agent_auth_catalog = None;
+                        this.agent_auth_error = Some(format!("{}: {}", error.code, error.message));
+                    }
+                    Err(error) => {
+                        this.agent_auth_catalog = None;
+                        this.agent_auth_error = Some(format!(
+                            "{}: {error}",
+                            management_error_text(
+                                "Authentication discovery failed",
+                                "认证方式发现失败",
+                                "驗證方式探索失敗",
+                            )
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn ensure_agent_auth_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let specs = self
+            .agent_auth_catalog
+            .as_ref()
+            .into_iter()
+            .flat_map(|catalog| catalog.methods.iter())
+            .filter(|method| method.kind == AgentAuthMethodKind::Environment)
+            .flat_map(|method| {
+                method.environment.iter().map(move |variable| {
+                    (
+                        agent_auth_input_key(&method.id, &variable.name),
+                        variable.secret,
+                        variable.configured,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let active_keys = specs
+            .iter()
+            .map(|(key, _, _)| key.clone())
+            .collect::<BTreeSet<_>>();
+        self.agent_auth_inputs
+            .retain(|key, _| active_keys.contains(key));
+        self.agent_auth_clear_values
+            .retain(|key| active_keys.contains(key));
+        for (key, secret, configured) in specs {
+            if self.agent_auth_inputs.contains_key(&key) {
+                continue;
+            }
+            let placeholder = if configured {
+                management_locale_text(
+                    "Configured - leave blank to keep",
+                    "已配置，留空则保持不变",
+                    "已設定，留空則保持不變",
+                )
+            } else {
+                management_locale_text("Enter value", "输入凭据", "輸入憑證")
+            };
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(placeholder)
+                    .masked(secret)
+            });
+            let input_for_subscription = input.clone();
+            let key_for_subscription = key.clone();
+            self._subscriptions
+                .push(cx.subscribe(&input, move |this, _, _: &InputEvent, cx| {
+                    if !input_for_subscription.read(cx).value().trim().is_empty() {
+                        this.agent_auth_clear_values.remove(&key_for_subscription);
+                    }
+                    cx.notify();
+                }));
+            self.agent_auth_inputs.insert(key, input);
+        }
+    }
+
+    fn toggle_agent_auth_clear(&mut self, key: String, cx: &mut Context<Self>) {
+        if !self.agent_auth_clear_values.remove(&key) {
+            self.agent_auth_clear_values.insert(key);
+        }
+        cx.notify();
+    }
+
+    fn authenticate_agent(&mut self, method_id: String, cx: &mut Context<Self>) {
+        if self.mutation.is_some() {
+            return;
+        }
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        let Some(scope) = self.current_agent_auth_scope() else {
+            return;
+        };
+        let Some(method) = self
+            .agent_auth_catalog
+            .as_ref()
+            .and_then(|catalog| catalog.methods.iter().find(|method| method.id == method_id))
+            .cloned()
+        else {
+            return;
+        };
+        let Ok(agent_id) = AgentId::parse(scope.0.clone()) else {
+            return;
+        };
+        let provider_profile_id = scope
+            .1
+            .as_ref()
+            .and_then(|profile_id| vibex_core::ProviderProfileId::parse(profile_id.clone()).ok());
+        if method.kind == AgentAuthMethodKind::Environment && provider_profile_id.is_none() {
+            self.agent_auth_error = Some(
+                management_error_text(
+                    "Select or create a Provider configuration before saving environment credentials",
+                    "请先选择或创建模型供应商配置，再保存环境凭据",
+                    "請先選擇或建立模型供應商設定，再儲存環境憑證",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let values = method
+            .environment
+            .iter()
+            .filter_map(|variable| {
+                let key = agent_auth_input_key(&method.id, &variable.name);
+                let value = self
+                    .agent_auth_inputs
+                    .get(&key)
+                    .map(|input| input.read(cx).value().trim().to_string())
+                    .filter(|value| !value.is_empty());
+                let clear = self.agent_auth_clear_values.contains(&key);
+                if variable.configured && value.is_none() && !clear {
+                    return None;
+                }
+                Some(AgentAuthEnvironmentValue {
+                    name: variable.name.clone(),
+                    value,
+                    secret: variable.secret,
+                    optional: variable.optional,
+                    clear,
+                })
+            })
+            .collect::<Vec<_>>();
+        let required_credential_cleared = values.iter().any(|value| value.clear && !value.optional);
+        let generation = self.agent_auth_generation;
+        self.mutation = Some(ManagementMutation::AgentAuth(method.id.clone()));
+        self.agent_auth_error = None;
+        let active_locale = locale::current_locale();
+        let entity = cx.weak_entity();
+        let method_id_for_request = method.id.clone();
+        let method_id_for_callback = method.id.clone();
+        let scope_for_callback = scope.clone();
+        let runtime_for_callback = runtime.clone();
+        let agent_id_for_monitor = agent_id.clone();
+        let provider_profile_id_for_monitor = provider_profile_id.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            if method.kind == AgentAuthMethodKind::Environment && !values.is_empty() {
+                runtime
+                    .management()
+                    .providers()
+                    .management()
+                    .update_agent_auth_environment(AgentAuthEnvironmentUpdateRequest {
+                        agent_id: agent_id.clone(),
+                        provider_profile_id: provider_profile_id
+                            .clone()
+                            .expect("environment authentication profile was validated"),
+                        method_id: method_id_for_request.clone(),
+                        values,
+                    })?;
+            }
+            if required_credential_cleared {
+                let mut catalog = runtime
+                    .agent()
+                    .list_auth_methods(agent_id, provider_profile_id)
+                    .await?;
+                catalog.status = AgentAuthStatus::AuthenticationRequired;
+                return Ok::<_, VibexError>((catalog, None, true));
+            }
+            let result = runtime
+                .agent()
+                .authenticate(AgentAuthenticateRequest {
+                    agent_id: agent_id.clone(),
+                    provider_profile_id: provider_profile_id.clone(),
+                    method_id: method_id_for_request,
+                })
+                .await?;
+            let mut catalog = runtime
+                .agent()
+                .list_auth_methods(agent_id, provider_profile_id)
+                .await?;
+            catalog.status = if result.terminal.is_some() {
+                AgentAuthStatus::Unknown
+            } else {
+                AgentAuthStatus::Authenticated
+            };
+            Ok::<_, VibexError>((catalog, result.terminal, false))
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                let operation_is_current = agent_auth_scope_matches(
+                    this.agent_auth_generation,
+                    this.agent_auth_scope.as_ref(),
+                    generation,
+                    &scope_for_callback,
+                ) && matches!(
+                    this.mutation,
+                    Some(ManagementMutation::AgentAuth(ref action))
+                        if action == &method_id_for_callback
+                );
+                if !operation_is_current {
+                    if matches!(
+                        this.mutation,
+                        Some(ManagementMutation::AgentAuth(ref action))
+                            if action == &method_id_for_callback
+                    ) {
+                        this.mutation = None;
+                    }
+                    if let Ok(Ok((_, Some(terminal), _))) = &outcome
+                        && let Some(terminal_id) = terminal.terminal_id.as_ref()
+                    {
+                        let _ = runtime_for_callback
+                            .terminals()
+                            .manager()
+                            .kill(terminal_id);
+                    }
+                    cx.notify();
+                    return;
+                }
+                this.mutation = None;
+                match outcome {
+                    Ok(Ok((catalog, terminal, credential_removed))) => {
+                        let terminal_started = terminal
+                            .as_ref()
+                            .is_some_and(|terminal| terminal.terminal_id.is_some());
+                        this.agent_auth_catalog = Some(catalog);
+                        this.agent_auth_error = None;
+                        this.agent_auth_inputs.clear();
+                        this.agent_auth_clear_values.clear();
+                        if let Some(terminal) = terminal {
+                            let terminal_id = terminal.terminal_id.clone();
+                            this.clear_agent_auth_terminal();
+                            this.agent_auth_terminal = Some(terminal);
+                            if let Some(terminal_id) = terminal_id {
+                                this.start_agent_auth_terminal_monitor(
+                                    runtime_for_callback.clone(),
+                                    scope_for_callback.clone(),
+                                    generation,
+                                    agent_id_for_monitor.clone(),
+                                    provider_profile_id_for_monitor.clone(),
+                                    terminal_id,
+                                    active_locale,
+                                    cx,
+                                );
+                            } else {
+                                if let Some(catalog) = this.agent_auth_catalog.as_mut() {
+                                    catalog.status = AgentAuthStatus::AuthenticationRequired;
+                                }
+                                this.agent_auth_terminal_state =
+                                    Some(AgentAuthTerminalState::Failed);
+                                this.agent_auth_error = Some(
+                                    "agent_terminal_auth_terminal_missing: Interactive authentication terminal was not created"
+                                        .to_string(),
+                                );
+                            }
+                        }
+                        this.notice = this.agent_auth_error.is_none().then(|| {
+                            if credential_removed {
+                                management_locale_text_for(
+                                    active_locale,
+                                    "Saved credential removed; sign-in is required",
+                                    "已移除保存的凭据，需要重新登录",
+                                    "已移除儲存的憑證，需要重新登入",
+                                )
+                            } else if terminal_started {
+                                management_locale_text_for(
+                                    active_locale,
+                                    "Interactive sign-in terminal opened",
+                                    "交互式登录终端已打开",
+                                    "互動式登入終端已開啟",
+                                )
+                            } else {
+                                management_locale_text_for(
+                                    active_locale,
+                                    "Agent authentication completed",
+                                    "Agent 认证已完成",
+                                    "Agent 驗證已完成",
+                                )
+                            }
+                            .to_string()
+                        });
+                    }
+                    Ok(Err(error)) => {
+                        this.agent_auth_error = Some(format!("{}: {}", error.code, error.message));
+                    }
+                    Err(error) => {
+                        this.agent_auth_error = Some(format!(
+                            "{}: {error}",
+                            management_error_text(
+                                "Authentication action failed",
+                                "认证操作失败",
+                                "驗證操作失敗",
+                            )
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn logout_agent(&mut self, cx: &mut Context<Self>) {
+        if self.mutation.is_some() {
+            return;
+        }
+        let (Some(runtime), Some(scope)) = (self.runtime.clone(), self.current_agent_auth_scope())
+        else {
+            return;
+        };
+        let Ok(agent_id) = AgentId::parse(scope.0.clone()) else {
+            return;
+        };
+        let provider_profile_id = scope
+            .1
+            .as_ref()
+            .and_then(|profile_id| vibex_core::ProviderProfileId::parse(profile_id.clone()).ok());
+        let generation = self.agent_auth_generation;
+        self.mutation = Some(ManagementMutation::AgentAuth("logout".to_string()));
+        self.agent_auth_error = None;
+        let active_locale = locale::current_locale();
+        let entity = cx.weak_entity();
+        let scope_for_callback = scope.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            runtime
+                .agent()
+                .logout(vibex_core::AgentLogoutRequest {
+                    agent_id: agent_id.clone(),
+                    provider_profile_id: provider_profile_id.clone(),
+                })
+                .await?;
+            let mut catalog = runtime
+                .agent()
+                .list_auth_methods(agent_id, provider_profile_id)
+                .await?;
+            catalog.status = AgentAuthStatus::AuthenticationRequired;
+            Ok::<_, VibexError>(catalog)
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                let operation_is_current = agent_auth_scope_matches(
+                    this.agent_auth_generation,
+                    this.agent_auth_scope.as_ref(),
+                    generation,
+                    &scope_for_callback,
+                ) && matches!(
+                    this.mutation,
+                    Some(ManagementMutation::AgentAuth(ref action)) if action == "logout"
+                );
+                if !operation_is_current {
+                    if matches!(
+                        this.mutation,
+                        Some(ManagementMutation::AgentAuth(ref action)) if action == "logout"
+                    ) {
+                        this.mutation = None;
+                    }
+                    cx.notify();
+                    return;
+                }
+                this.mutation = None;
+                match outcome {
+                    Ok(Ok(catalog)) => {
+                        this.agent_auth_catalog = Some(catalog);
+                        this.clear_agent_auth_terminal();
+                        this.notice = Some(
+                            management_locale_text_for(
+                                active_locale,
+                                "Agent signed out",
+                                "Agent 已退出登录",
+                                "Agent 已登出",
+                            )
+                            .to_string(),
+                        );
+                    }
+                    Ok(Err(error)) => {
+                        this.agent_auth_error = Some(format!("{}: {}", error.code, error.message));
+                    }
+                    Err(error) => {
+                        this.agent_auth_error = Some(format!(
+                            "{}: {error}",
+                            management_error_text("Logout failed", "退出登录失败", "登出失敗",)
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn clear_agent_auth_terminal(&mut self) {
+        self.agent_auth_terminal_monitor_task = None;
+        if let (Some(runtime), Some(terminal_id)) = (
+            self.runtime.as_ref(),
+            self.agent_auth_terminal
+                .as_ref()
+                .and_then(|terminal| terminal.terminal_id.as_ref()),
+        ) {
+            let _ = runtime.terminals().manager().kill(terminal_id);
+        }
+        self.agent_auth_terminal = None;
+        self.agent_auth_terminal_surface = None;
+        self.agent_auth_terminal_state = None;
+    }
+
+    fn close_agent_auth_terminal(&mut self, cx: &mut Context<Self>) {
+        self.clear_agent_auth_terminal();
+        cx.notify();
+    }
+
+    fn ensure_agent_auth_terminal_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(terminal_id) = self
+            .agent_auth_terminal
+            .as_ref()
+            .and_then(|terminal| terminal.terminal_id.clone())
+        else {
+            self.agent_auth_terminal_surface = None;
+            return;
+        };
+        if self
+            .agent_auth_terminal_surface
+            .as_ref()
+            .is_some_and(|(id, _)| id == terminal_id.as_str())
+        {
+            return;
+        }
+        let Some(runtime) = self.runtime.as_ref() else {
+            return;
+        };
+        let manager = runtime.terminals().manager();
+        let Ok(snapshot) = manager.snapshot(&terminal_id) else {
+            return;
+        };
+        let workspace_root = PathBuf::from(&snapshot.session.cwd);
+        let surface = cx.new(|cx| {
+            TerminalSurface::from_shared_session(
+                manager,
+                workspace_root,
+                snapshot.session,
+                window,
+                cx,
+            )
+        });
+        surface.update(cx, |surface, cx| surface.set_active(true, cx));
+        self.agent_auth_terminal_surface = Some((terminal_id.as_str().to_string(), surface));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_agent_auth_terminal_monitor(
+        &mut self,
+        runtime: Arc<DesktopRuntime>,
+        scope: (String, Option<String>),
+        generation: u64,
+        agent_id: AgentId,
+        provider_profile_id: Option<vibex_core::ProviderProfileId>,
+        terminal_id: vibex_core::TerminalId,
+        active_locale: ResolvedLocale,
+        cx: &mut Context<Self>,
+    ) {
+        self.agent_auth_terminal_state = Some(AgentAuthTerminalState::Running);
+        let manager = runtime.terminals().manager();
+        let terminal_id_for_runner = terminal_id.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let exit_status = loop {
+                if let Some(status) = manager.process_exit_status(&terminal_id_for_runner)? {
+                    break status;
+                }
+                tokio::time::sleep(AGENT_AUTH_TERMINAL_POLL_INTERVAL).await;
+            };
+            if let Some(error) = terminal_auth_exit_error(&exit_status) {
+                return Ok::<_, VibexError>(AgentAuthTerminalCompletion::AuthenticationRequired(
+                    error,
+                ));
+            }
+            let (catalog, refresh_error) = match runtime
+                .agent()
+                .list_auth_methods(agent_id, provider_profile_id)
+                .await
+            {
+                Ok(mut catalog) => {
+                    catalog.status = AgentAuthStatus::Authenticated;
+                    (Some(catalog), None)
+                }
+                Err(error) => (None, Some(error)),
+            };
+            Ok(AgentAuthTerminalCompletion::Authenticated {
+                catalog,
+                refresh_error,
+            })
+        });
+        let entity = cx.weak_entity();
+        self.agent_auth_terminal_monitor_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                if !agent_auth_scope_matches(
+                    this.agent_auth_generation,
+                    this.agent_auth_scope.as_ref(),
+                    generation,
+                    &scope,
+                ) || this
+                    .agent_auth_terminal
+                    .as_ref()
+                    .and_then(|terminal| terminal.terminal_id.as_ref())
+                    != Some(&terminal_id)
+                {
+                    return;
+                }
+                match outcome {
+                    Ok(Ok(AgentAuthTerminalCompletion::Authenticated {
+                        catalog,
+                        refresh_error,
+                    })) => {
+                        if let Some(catalog) = catalog {
+                            this.agent_auth_catalog = Some(catalog);
+                        } else if let Some(catalog) = this.agent_auth_catalog.as_mut() {
+                            catalog.status = AgentAuthStatus::Authenticated;
+                        }
+                        this.agent_auth_terminal_state = Some(AgentAuthTerminalState::Succeeded);
+                        this.agent_auth_error =
+                            refresh_error.map(|error| format!("{}: {}", error.code, error.message));
+                        this.notice = Some(
+                            management_locale_text_for(
+                                active_locale,
+                                "Interactive Agent sign-in completed",
+                                "Agent 交互式登录已完成",
+                                "Agent 互動式登入已完成",
+                            )
+                            .to_string(),
+                        );
+                    }
+                    Ok(Ok(AgentAuthTerminalCompletion::AuthenticationRequired(error)))
+                    | Ok(Err(error)) => {
+                        if let Some(catalog) = this.agent_auth_catalog.as_mut() {
+                            catalog.status = AgentAuthStatus::AuthenticationRequired;
+                        }
+                        this.agent_auth_terminal_state = Some(AgentAuthTerminalState::Failed);
+                        this.agent_auth_error = Some(format!("{}: {}", error.code, error.message));
+                        this.notice = None;
+                    }
+                    Err(error) => {
+                        if let Some(catalog) = this.agent_auth_catalog.as_mut() {
+                            catalog.status = AgentAuthStatus::AuthenticationRequired;
+                        }
+                        this.agent_auth_terminal_state = Some(AgentAuthTerminalState::Failed);
+                        this.agent_auth_error =
+                            Some(format!("agent_terminal_auth_monitor_failed: {error}"));
+                        this.notice = None;
+                    }
+                }
+                cx.notify();
+            });
+        }));
     }
 
     fn sync_projection_editor(&mut self) {
@@ -1211,7 +1916,6 @@ impl ManagementCenter {
         self.native_import_preview = snapshot.native_import_preview;
         self.agent_profile_states = snapshot.agent_profile_states;
         self.projection_states = snapshot.projection_states;
-        self.runtime_probes = snapshot.runtime_probes;
         if !self.snapshot.agents.iter().any(|agent| {
             agent.added && self.selected_agent_id.as_deref() == Some(agent.id.as_str())
         }) {
@@ -1287,7 +1991,6 @@ impl ManagementCenter {
         }
         self.health_summaries = snapshot.health_summaries;
         self.capability_summaries = snapshot.capability_summaries;
-        self.runtime_option_snapshots = snapshot.runtime_option_snapshots;
         self.usage_summaries = snapshot.usage_summaries;
         self.native_exports = snapshot.native_exports;
         self.device_count = snapshot.device_count;
@@ -1300,6 +2003,7 @@ impl ManagementCenter {
         self.automation_steps = snapshot.automation_steps;
         self.devices = snapshot.devices;
         self.sync_projection_editor();
+        self.load_agent_auth(false, cx);
         if self.graph_draft.graph_id.is_none() {
             if let Some(graph) = self.snapshot.graphs.first() {
                 self.graph_draft = AutomationGraphDraft::from_graph(graph);
@@ -2009,130 +2713,6 @@ impl ManagementCenter {
         );
     }
 
-    fn probe_agent_runtime_options(&mut self, cx: &mut Context<Self>) {
-        let (Some(runtime), Some(agent_id)) =
-            (self.runtime.clone(), self.selected_agent_id.clone())
-        else {
-            return;
-        };
-        let Ok(agent_id) = AgentId::parse(agent_id) else {
-            self.error = Some(
-                management_error_text("Invalid Agent id", "Agent 标识无效", "Agent 識別碼無效")
-                    .into(),
-            );
-            cx.notify();
-            return;
-        };
-        let active_locale = locale::current_locale();
-        self.begin_simple_task(
-            ManagementMutation::AgentOptionProbe(agent_id.as_str().to_string()),
-            cx,
-            async move {
-                let result = runtime
-                    .agent()
-                    .runtime_catalog()
-                    .probe_agent(&agent_id)
-                    .await?;
-                Ok(management_runtime_option_probe_message(
-                    &result,
-                    active_locale,
-                ))
-            },
-        );
-    }
-
-    fn run_agent_runtime_probe(&mut self, cx: &mut Context<Self>) {
-        let (Some(runtime), Some(projection), Some(agent_id)) = (
-            self.runtime.clone(),
-            self.current_projection_state().cloned(),
-            self.selected_agent_id.clone(),
-        ) else {
-            self.error = Some(
-                management_locale_text(
-                    "No runtime profile is available for verification",
-                    "没有可用于验证的运行时配置",
-                    "沒有可用於驗證的執行階段設定",
-                )
-                .into(),
-            );
-            cx.notify();
-            return;
-        };
-        let workspace_key = self
-            .pairing_workspace_id
-            .as_ref()
-            .map(|id| id.as_str().to_string())
-            .unwrap_or_else(|| "management-global".to_string());
-        let active_locale = locale::current_locale();
-        self.begin_simple_task(
-            ManagementMutation::AgentRuntimeProbe(format!("run:{agent_id}")),
-            cx,
-            async move {
-                let probe = runtime
-                    .management()
-                    .providers()
-                    .management()
-                    .start_agent_runtime_probe(vibex_core::AgentRuntimeProbeStartRequest {
-                        runtime_profile_id: projection.runtime_profile_id,
-                        binding_id: projection.binding.map(|binding| binding.id),
-                        workspace_key,
-                        timeout_ms: 60_000,
-                        minimal_prompt: false,
-                    })?;
-                Ok(match active_locale {
-                    ResolvedLocale::En => format!("Runtime verification started: {}", probe.id),
-                    ResolvedLocale::ZhCn => format!("运行时验证已启动：{}", probe.id),
-                    ResolvedLocale::ZhTw => format!("執行階段驗證已啟動：{}", probe.id),
-                })
-            },
-        );
-    }
-
-    fn cancel_agent_runtime_probe(
-        &mut self,
-        probe_id: String,
-        expected_revision: i64,
-        cx: &mut Context<Self>,
-    ) {
-        let (Ok(probe_id), Some(runtime)) = (
-            vibex_core::AgentRuntimeProbeId::parse(probe_id.clone()),
-            self.runtime.clone(),
-        ) else {
-            self.error = Some(
-                management_locale_text(
-                    "Runtime probe identity is invalid",
-                    "运行时探测标识无效",
-                    "執行階段探測識別碼無效",
-                )
-                .into(),
-            );
-            cx.notify();
-            return;
-        };
-        let active_locale = locale::current_locale();
-        self.begin_simple_task(
-            ManagementMutation::AgentRuntimeProbe(format!("cancel:{probe_id}")),
-            cx,
-            async move {
-                runtime
-                    .management()
-                    .providers()
-                    .management()
-                    .cancel_agent_runtime_probe(vibex_core::AgentRuntimeProbeCancelRequest {
-                        probe_id,
-                        expected_revision,
-                    })?;
-                Ok(management_locale_text_for(
-                    active_locale,
-                    "Runtime verification cancellation requested",
-                    "已请求取消运行时验证",
-                    "已要求取消執行階段驗證",
-                )
-                .to_string())
-            },
-        );
-    }
-
     fn test_provider_profile(
         &mut self,
         profile_id: String,
@@ -2836,9 +3416,7 @@ impl ManagementCenter {
                 this.mutation = None;
                 let agent_registry_changed = matches!(
                     &completed_mutation,
-                    ManagementMutation::AgentToggle(_)
-                        | ManagementMutation::AgentDiscovery
-                        | ManagementMutation::AgentOptionProbe(_)
+                    ManagementMutation::AgentToggle(_) | ManagementMutation::AgentDiscovery
                 );
                 match outcome {
                     Ok(Ok(message)) => {
@@ -5687,29 +6265,6 @@ impl ManagementCenter {
             .into_any_element()
     }
 
-    fn current_projection_state(&self) -> Option<&AgentProviderProjectionState> {
-        if self.profile_editor_open && self.editing_profile_id.is_none() {
-            return None;
-        }
-        let profile_id = self
-            .editing_profile_id
-            .as_deref()
-            .or(self.selected_provider_profile_id.as_deref());
-        profile_id
-            .and_then(|profile_id| {
-                self.projection_states
-                    .iter()
-                    .find(|projection| projection.legacy_profile_id.as_deref() == Some(profile_id))
-            })
-            .or_else(|| {
-                self.selected_agent_id.as_deref().and_then(|agent_id| {
-                    self.projection_states
-                        .iter()
-                        .find(|projection| projection.agent_id == agent_id)
-                })
-            })
-    }
-
     fn render_projection_credential_control(&self, cx: &mut Context<Self>) -> AnyElement {
         let surface = self.projection_editor.credential_surface();
         if surface == ProjectionCredentialSurface::ApiKey {
@@ -5831,339 +6386,6 @@ impl ManagementCenter {
             .into_any_element()
     }
 
-    fn render_runtime_verification_card(
-        &mut self,
-        agent_id: &str,
-        agent_enabled: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let latest = self
-            .runtime_probes
-            .iter()
-            .find(|probe| probe.agent_id == agent_id)
-            .cloned();
-        let pending = self.mutation.is_some();
-        let starting = matches!(
-            &self.mutation,
-            Some(ManagementMutation::AgentRuntimeProbe(action))
-                if action == &format!("run:{agent_id}")
-        );
-        let cancelling = latest.as_ref().is_some_and(|probe| {
-            matches!(
-                &self.mutation,
-                Some(ManagementMutation::AgentRuntimeProbe(action))
-                    if action == &format!("cancel:{}", probe.id)
-            )
-        });
-        let can_run = agent_enabled && self.current_projection_state().is_some();
-        let mut content = v_flex().w_full().min_w_0().gap_2().child(
-            h_flex()
-                .w_full()
-                .flex_wrap()
-                .items_center()
-                .justify_end()
-                .gap_2()
-                .child(
-                    Button::new("agent-runtime-verification-run")
-                        .small()
-                        .primary()
-                        .icon(IconName::CircleCheck)
-                        .label(management_locale_text(
-                            "Run verification",
-                            "运行验证",
-                            "執行驗證",
-                        ))
-                        .loading(starting)
-                        .disabled(pending || !can_run)
-                        .on_click(cx.listener(|this, _, _, cx| this.run_agent_runtime_probe(cx))),
-                )
-                .when_some(
-                    latest
-                        .as_ref()
-                        .filter(|probe| probe.can_cancel())
-                        .map(|probe| (probe.id.clone(), probe.revision)),
-                    |actions, (probe_id, revision)| {
-                        actions.child(
-                            Button::new("agent-runtime-verification-cancel")
-                                .small()
-                                .outline()
-                                .icon(IconName::CircleX)
-                                .label(management_cancel_label())
-                                .loading(cancelling)
-                                .disabled(pending)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.cancel_agent_runtime_probe(probe_id.clone(), revision, cx)
-                                })),
-                        )
-                    },
-                ),
-        );
-
-        if let Some(probe) = latest {
-            content = content
-                .child(management_projection_detail_row(
-                    management_locale_text("Status", "状态", "狀態"),
-                    format!("{:?}", probe.status),
-                    cx,
-                ))
-                .child(management_projection_detail_row(
-                    management_locale_text("Stage", "阶段", "階段"),
-                    format!("{:?}", probe.stage),
-                    cx,
-                ))
-                .child(management_projection_detail_row(
-                    management_locale_text("Descriptor", "描述符", "描述符"),
-                    format!("{} · v{}", probe.descriptor_id, probe.descriptor_version),
-                    cx,
-                ));
-            if let Some(code) = probe.diagnostic_code {
-                content = content.child(management_projection_detail_row(
-                    management_locale_text("Diagnostic", "诊断", "診斷"),
-                    code,
-                    cx,
-                ));
-            }
-            if probe.facts.is_empty() {
-                content = content.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(management_locale_text(
-                            "No verification facts recorded yet",
-                            "尚未记录验证事实",
-                            "尚未記錄驗證事實",
-                        )),
-                );
-            } else {
-                let mut facts = v_flex().w_full().gap_1();
-                for fact in probe.facts {
-                    facts = facts.child(
-                        h_flex()
-                            .w_full()
-                            .min_w_0()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_xs()
-                                    .child(format!("{:?}", fact.capability)),
-                            )
-                            .child(management_status_badge(format!("{:?}", fact.status), cx)),
-                    );
-                }
-                content = content.child(facts);
-            }
-        } else {
-            content = content.child(compact_empty_state(
-                management_locale_text(
-                    "No runtime verification",
-                    "暂无运行时验证",
-                    "暫無執行階段驗證",
-                ),
-                management_locale_text(
-                    "No evidence has been recorded for this Agent.",
-                    "此 Agent 尚未记录运行证据。",
-                    "此 Agent 尚未記錄執行證據。",
-                ),
-                cx,
-            ));
-        }
-
-        management_card(
-            management_locale_text("Runtime verification", "运行时验证", "執行階段驗證"),
-            management_locale_text(
-                "Exact Agent and Adapter evidence",
-                "精确 Agent 与适配器证据",
-                "精確 Agent 與配接器證據",
-            ),
-            content.into_any_element(),
-            cx,
-        )
-    }
-
-    fn render_projection_contract(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(capability) = self.projection_editor.capability.as_ref() else {
-            return v_flex()
-                .w_full()
-                .gap_1()
-                .border_t_1()
-                .border_color(cx.theme().border)
-                .pt_3()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_semibold()
-                        .child(management_locale_text(
-                            "Provider projection",
-                            "供应商投影",
-                            "供應商投影",
-                        )),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(management_locale_text(
-                            "No versioned projection descriptor is available for this Agent.",
-                            "此 Agent 暂无可用的版本化投影描述符。",
-                            "此 Agent 暫無可用的版本化投影描述符。",
-                        )),
-                )
-                .into_any_element();
-        };
-
-        let projection_state = self.current_projection_state();
-        let binding_status = projection_state
-            .and_then(|projection| projection.binding.as_ref())
-            .map(|binding| format!("{:?}", binding.status))
-            .unwrap_or_else(|| management_locale_text("New binding", "新绑定", "新綁定").into());
-        let descriptor = capability
-            .descriptor_id
-            .as_ref()
-            .map(|id| id.as_str())
-            .unwrap_or("unverified");
-        let detected_version = capability
-            .detected_agent_version
-            .as_deref()
-            .or(capability.detected_adapter_version.as_deref())
-            .unwrap_or("unknown");
-        let credential_surface =
-            projection_credential_surface_label(self.projection_editor.credential_surface());
-
-        let mut contract = v_flex()
-            .w_full()
-            .min_w_0()
-            .gap_2()
-            .border_t_1()
-            .border_color(cx.theme().border)
-            .pt_3()
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_semibold()
-                            .child(management_locale_text(
-                                "Provider projection",
-                                "供应商投影",
-                                "供應商投影",
-                            )),
-                    )
-                    .child(management_status_badge(binding_status, cx)),
-            )
-            .child(management_projection_detail_row(
-                management_locale_text("Descriptor", "描述符", "描述符"),
-                format!("{} · v{}", descriptor, capability.descriptor_version),
-                cx,
-            ))
-            .child(management_projection_detail_row(
-                management_locale_text("Detected version", "检测版本", "偵測版本"),
-                detected_version.to_string(),
-                cx,
-            ))
-            .child(management_projection_detail_row(
-                management_locale_text("Evidence", "证据状态", "證據狀態"),
-                format!(
-                    "{:?} · {:?}",
-                    capability.evidence_state, capability.match_kind
-                ),
-                cx,
-            ))
-            .child(management_projection_detail_row(
-                management_locale_text("Credential", "凭证", "憑證"),
-                format!("{} · {:?}", credential_surface, capability.auth_state),
-                cx,
-            ))
-            .child(management_projection_detail_row(
-                management_locale_text("Switch behavior", "切换行为", "切換行為"),
-                format!("{:?}", capability.switch_behavior),
-                cx,
-            ));
-
-        if let Some(preview) = self.projection_editor.preview.as_ref() {
-            contract = contract
-                .child(management_projection_detail_row(
-                    management_locale_text("Command", "命令摘要", "命令摘要"),
-                    preview.command_summary.clone(),
-                    cx,
-                ))
-                .child(management_projection_detail_row(
-                    management_locale_text("Effective model", "实际模型", "實際模型"),
-                    preview.effective_model.clone().unwrap_or_else(|| {
-                        management_locale_text("Agent managed", "由 Agent 管理", "由 Agent 管理")
-                            .to_string()
-                    }),
-                    cx,
-                ));
-            let mut targets = v_flex().w_full().min_w_0().gap_1();
-            for target in &preview.targets {
-                let value = if target.secret {
-                    "[redacted]".to_string()
-                } else {
-                    target.value_preview.clone()
-                };
-                targets = targets.child(management_projection_detail_row(
-                    target.field.clone(),
-                    format!("{:?} · {} · {}", target.target_kind, target.target, value),
-                    cx,
-                ));
-            }
-            if !preview.targets.is_empty() {
-                contract = contract.child(
-                    v_flex()
-                        .w_full()
-                        .gap_1()
-                        .pt_1()
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_medium()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(management_locale_text(
-                                    "Projection targets",
-                                    "投影目标",
-                                    "投影目標",
-                                )),
-                        )
-                        .child(targets),
-                );
-            }
-            if !preview.overlay_files.is_empty() {
-                contract = contract.child(management_projection_detail_row(
-                    management_locale_text("Private overlays", "私有覆盖层", "私有覆蓋層"),
-                    preview
-                        .overlay_files
-                        .iter()
-                        .map(|overlay| format!("{} ({})", overlay.relative_path, overlay.format))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    cx,
-                ));
-            }
-        } else {
-            contract = contract.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_locale_text(
-                        "A redacted runtime preview will be available after the binding is saved.",
-                        "保存绑定后将显示脱敏的运行时投影预览。",
-                        "儲存綁定後將顯示遮罩的執行階段投影預覽。",
-                    )),
-            );
-        }
-        contract.into_any_element()
-    }
-
     fn render_profile_editor_dialog(&mut self, cx: &mut Context<Self>) -> AnyElement {
         if !self.profile_editor_open {
             return div().size_full().into_any_element();
@@ -6186,7 +6408,6 @@ impl ManagementCenter {
         let credential_control = self.render_projection_credential_control(cx);
         let model_section =
             shows_model.then(|| self.render_profile_model_section(selected_agent_id, cx));
-        let projection_contract = self.render_projection_contract(cx);
         let mut form = v_flex()
             .w_full()
             .gap_3()
@@ -6227,8 +6448,7 @@ impl ManagementCenter {
                     cx,
                 ))
             })
-            .when_some(model_section, |form, section| form.child(section))
-            .child(projection_contract);
+            .when_some(model_section, |form, section| form.child(section));
         if shows_api_key && self.profile_secret_loading {
             form = form.child(status_line(
                 management_locale_text(
@@ -6313,7 +6533,444 @@ impl ManagementCenter {
             .into_any_element()
     }
 
-    fn render_providers(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn open_agent_auth_link(&mut self, url: String, cx: &mut Context<Self>) {
+        match validate_external_open_url(&url)
+            .and_then(|validated| crate::platform::open_external_url(&validated.url))
+        {
+            Ok(()) => {}
+            Err(error) => {
+                self.agent_auth_error = Some(format!("{}: {}", error.code, error.message));
+                cx.notify();
+            }
+        }
+    }
+
+    fn render_agent_authentication(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.ensure_agent_auth_inputs(window, cx);
+        self.ensure_agent_auth_terminal_surface(window, cx);
+        let pending = self.mutation.is_some()
+            || self.agent_auth_terminal_state == Some(AgentAuthTerminalState::Running);
+        let selected_profile_label = self
+            .selected_management_provider_profile()
+            .map(|profile| profile.display_name.clone());
+        let auth_available = self.runtime.is_some() && self.current_agent_auth_scope().is_some();
+        let catalog = self.agent_auth_catalog.clone();
+        let status = if !auth_available {
+            management_locale_text("Agent disabled", "Agent 已停用", "Agent 已停用")
+        } else if let Some(catalog) = catalog.as_ref() {
+            match catalog.status {
+                AgentAuthStatus::Authenticated => {
+                    management_locale_text("Signed in", "已登录", "已登入")
+                }
+                AgentAuthStatus::AuthenticationRequired => {
+                    management_locale_text("Sign-in required", "需要登录", "需要登入")
+                }
+                AgentAuthStatus::Unknown => {
+                    management_locale_text("Not verified", "尚未验证", "尚未驗證")
+                }
+            }
+        } else if self.agent_auth_error.is_some() {
+            management_locale_text("Unavailable", "暂不可用", "暫不可用")
+        } else {
+            management_locale_text("Discovering", "正在发现", "正在探索")
+        };
+        let supports_logout = catalog
+            .as_ref()
+            .is_some_and(|catalog| catalog.supports_logout);
+        let mut content = v_flex().w_full().min_w_0().gap_3().child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .flex_wrap()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .gap_1()
+                        .child(management_status_badge(status.to_string(), cx))
+                        .when_some(selected_profile_label, |header, label| {
+                            header.child(
+                                div()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!(
+                                        "{}: {label}",
+                                        management_locale_text(
+                                            "Credential profile",
+                                            "凭据配置",
+                                            "憑證設定",
+                                        )
+                                    )),
+                            )
+                        }),
+                )
+                .child(
+                    h_flex()
+                        .flex_none()
+                        .gap_2()
+                        .child(
+                            Button::new("agent-auth-refresh")
+                                .small()
+                                .outline()
+                                .icon(Icon::default().path("icons/vibex/rotate-ccw.svg"))
+                                .label(management_locale_text(
+                                    "Refresh methods",
+                                    "刷新认证方式",
+                                    "重新整理驗證方式",
+                                ))
+                                .loading(self.agent_auth_loading)
+                                .disabled(pending || self.agent_auth_loading || !auth_available)
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.load_agent_auth(true, cx)),
+                                ),
+                        )
+                        .when(supports_logout, |actions| {
+                            actions.child(
+                                Button::new("agent-auth-logout")
+                                    .small()
+                                    .danger()
+                                    .label(management_locale_text("Sign out", "退出登录", "登出"))
+                                    .loading(matches!(
+                                        self.mutation,
+                                        Some(ManagementMutation::AgentAuth(ref action))
+                                            if action == "logout"
+                                    ))
+                                    .disabled(pending)
+                                    .on_click(cx.listener(|this, _, _, cx| this.logout_agent(cx))),
+                            )
+                        }),
+                ),
+        );
+
+        if !auth_available {
+            content = content.child(status_line(
+                management_locale_text(
+                    "Enable this Agent to access its sign-in methods",
+                    "启用此 Agent 后可使用其登录方式",
+                    "啟用此 Agent 後可使用其登入方式",
+                )
+                .to_string(),
+                false,
+                cx,
+            ));
+        } else if self.agent_auth_loading && catalog.is_none() {
+            content = content.child(status_line(
+                management_locale_text(
+                    "Reading authentication methods reported by the Agent...",
+                    "正在读取 Agent 上报的认证方式...",
+                    "正在讀取 Agent 回報的驗證方式...",
+                )
+                .to_string(),
+                false,
+                cx,
+            ));
+        }
+        if let Some(error) = self.agent_auth_error.clone() {
+            content = content.child(status_line(
+                locale::localize_error_message(&error),
+                true,
+                cx,
+            ));
+        }
+
+        if let Some(catalog) = catalog {
+            if catalog.methods.is_empty() {
+                content = content.child(compact_empty_state(
+                    management_locale_text(
+                        "No sign-in method reported",
+                        "Agent 未上报认证方式",
+                        "Agent 未回報驗證方式",
+                    ),
+                    management_locale_text(
+                        "This Agent may use credentials already configured by its own CLI.",
+                        "此 Agent 可能使用其 CLI 中已有的登录状态。",
+                        "此 Agent 可能使用其 CLI 中既有的登入狀態。",
+                    ),
+                    cx,
+                ));
+            }
+            for method in catalog.methods {
+                let method_id = method.id.clone();
+                let method_loading = matches!(
+                    self.mutation,
+                    Some(ManagementMutation::AgentAuth(ref action)) if action == &method.id
+                );
+                let action_label = match method.kind {
+                    AgentAuthMethodKind::Agent => management_locale_text("Sign in", "登录", "登入"),
+                    AgentAuthMethodKind::Environment => {
+                        management_locale_text("Save and sign in", "保存并登录", "儲存並登入")
+                    }
+                    AgentAuthMethodKind::Terminal => management_locale_text(
+                        "Open sign-in terminal",
+                        "打开登录终端",
+                        "開啟登入終端",
+                    ),
+                };
+                let kind_label = match method.kind {
+                    AgentAuthMethodKind::Agent => {
+                        management_locale_text("Agent account", "Agent 账号", "Agent 帳號")
+                    }
+                    AgentAuthMethodKind::Environment => {
+                        management_locale_text("Provider credentials", "供应商凭据", "供應商憑證")
+                    }
+                    AgentAuthMethodKind::Terminal => {
+                        management_locale_text("Interactive terminal", "交互式终端", "互動式終端")
+                    }
+                };
+                let mut method_content = v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_3()
+                    .border_t_1()
+                    .border_color(cx.theme().border.opacity(0.75))
+                    .pt_3()
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .items_start()
+                            .justify_between()
+                            .gap_3()
+                            .child(
+                                v_flex()
+                                    .min_w_0()
+                                    .gap_1()
+                                    .child(div().text_sm().font_semibold().child(method.name))
+                                    .when_some(method.description, |title, description| {
+                                        title.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(description),
+                                        )
+                                    }),
+                            )
+                            .child(management_status_badge(kind_label.to_string(), cx)),
+                    );
+
+                for variable in method.environment {
+                    let key = agent_auth_input_key(&method.id, &variable.name);
+                    let Some(input) = self.agent_auth_inputs.get(&key) else {
+                        continue;
+                    };
+                    let label = variable
+                        .label
+                        .as_deref()
+                        .map(|label| format!("{label} · {}", variable.name))
+                        .unwrap_or_else(|| variable.name.clone());
+                    let input_element = if variable.secret {
+                        Input::new(input)
+                            .small()
+                            .w_full()
+                            .mask_toggle()
+                            .into_any_element()
+                    } else {
+                        Input::new(input).small().w_full().into_any_element()
+                    };
+                    let clear_key = key.clone();
+                    let clearing = self.agent_auth_clear_values.contains(&key);
+                    method_content = method_content.child(
+                        v_flex()
+                            .w_full()
+                            .gap_1()
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .min_w_0()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .child(
+                                        h_flex()
+                                            .min_w_0()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .truncate()
+                                                    .text_xs()
+                                                    .font_medium()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(label),
+                                            )
+                                            .when(variable.optional, |row| {
+                                                row.child(management_status_badge(
+                                                    management_locale_text(
+                                                        "Optional", "可选", "選填",
+                                                    )
+                                                    .to_string(),
+                                                    cx,
+                                                ))
+                                            })
+                                            .when(variable.configured && !clearing, |row| {
+                                                row.child(management_status_badge(
+                                                    management_locale_text(
+                                                        "Configured",
+                                                        "已配置",
+                                                        "已設定",
+                                                    )
+                                                    .to_string(),
+                                                    cx,
+                                                ))
+                                            }),
+                                    )
+                                    .when(variable.configured, |row| {
+                                        row.child(
+                                            Button::new(SharedString::from(format!(
+                                                "agent-auth-clear-{key}"
+                                            )))
+                                            .xsmall()
+                                            .outline()
+                                            .label(if clearing {
+                                                management_locale_text(
+                                                    "Keep saved value",
+                                                    "保留已保存值",
+                                                    "保留已儲存值",
+                                                )
+                                            } else {
+                                                management_locale_text(
+                                                    "Clear saved value",
+                                                    "清除已保存值",
+                                                    "清除已儲存值",
+                                                )
+                                            })
+                                            .disabled(pending)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.toggle_agent_auth_clear(clear_key.clone(), cx)
+                                            })),
+                                        )
+                                    }),
+                            )
+                            .child(input_element),
+                    );
+                }
+
+                if let Some(link) = method.credential_link {
+                    let open_link = link.clone();
+                    method_content = method_content.child(
+                        h_flex().w_full().justify_end().child(
+                            Button::new(SharedString::from(format!(
+                                "agent-auth-credential-link-{}",
+                                method.id
+                            )))
+                            .xsmall()
+                            .link()
+                            .label(management_locale_text(
+                                "Get credentials",
+                                "获取凭据",
+                                "取得憑證",
+                            ))
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.open_agent_auth_link(open_link.clone(), cx)
+                                },
+                            )),
+                        ),
+                    );
+                }
+                method_content = method_content.child(
+                    h_flex().w_full().justify_end().child(
+                        Button::new(SharedString::from(format!(
+                            "agent-auth-submit-{}",
+                            method.id
+                        )))
+                        .small()
+                        .primary()
+                        .label(action_label)
+                        .loading(method_loading)
+                        .disabled(
+                            pending
+                                || (method.kind == AgentAuthMethodKind::Environment
+                                    && self.selected_provider_profile_id.is_none()),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.authenticate_agent(method_id.clone(), cx)
+                        })),
+                    ),
+                );
+                content = content.child(method_content);
+            }
+        }
+
+        if let Some((_, terminal)) = self.agent_auth_terminal_surface.as_ref() {
+            let terminal_status = match self.agent_auth_terminal_state {
+                Some(AgentAuthTerminalState::Running) => {
+                    management_locale_text("Sign-in in progress", "正在登录", "正在登入")
+                }
+                Some(AgentAuthTerminalState::Succeeded) => {
+                    management_locale_text("Sign-in completed", "登录已完成", "登入已完成")
+                }
+                Some(AgentAuthTerminalState::Failed) => {
+                    management_locale_text("Sign-in failed", "登录失败", "登入失敗")
+                }
+                None => management_locale_text("Sign-in terminal", "登录终端", "登入終端"),
+            };
+            content =
+                content
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(management_status_badge(terminal_status.to_string(), cx))
+                            .child(
+                                Button::new("agent-auth-terminal-close")
+                                    .xsmall()
+                                    .ghost()
+                                    .icon(IconName::Close)
+                                    .tooltip(management_locale_text(
+                                        "Close sign-in terminal",
+                                        "关闭登录终端",
+                                        "關閉登入終端",
+                                    ))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.close_agent_auth_terminal(cx)
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text(
+                                "Agent CLI authentication session",
+                                "Agent CLI 认证会话",
+                                "Agent CLI 驗證工作階段",
+                            )),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(320.0))
+                            .min_h(px(220.0))
+                            .overflow_hidden()
+                            .rounded(px(8.0))
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .child(terminal.clone()),
+                    );
+        }
+
+        management_card(
+            management_locale_text("Authentication", "登录与认证", "登入與驗證"),
+            management_locale_text(
+                "Selected Agent authentication methods",
+                "当前 Agent 认证方式",
+                "目前 Agent 驗證方式",
+            ),
+            content.into_any_element(),
+            cx,
+        )
+    }
+
+    fn render_providers(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let copy = management_copy();
         let selected_agent = self.snapshot.agents.iter().find(|agent| {
             agent.added && self.selected_agent_id.as_deref() == Some(agent.id.as_str())
@@ -6341,50 +6998,6 @@ impl ManagementCenter {
             pending_cc_switch_import_item_ids(preview, &self.provider_profiles, &selected_agent.id)
                 .len()
         });
-        let refreshing_runtime_options = matches!(
-            &self.mutation,
-            Some(ManagementMutation::AgentOptionProbe(agent_id))
-                if agent_id == &selected_agent_id
-        );
-        let runtime_option_summary = self
-            .runtime_option_snapshots
-            .iter()
-            .find(|summary| summary.agent_id.as_str() == selected_agent_id);
-        let runtime_options_cached =
-            runtime_option_summary.is_some_and(|summary| summary.last_success_at_ms.is_some());
-        let runtime_option_rows = v_flex().w_full().gap_1().child(stat_line(
-            selected_agent.label.clone(),
-            management_runtime_option_snapshot_status(runtime_option_summary),
-            cx,
-        ));
-        let runtime_options_card = management_card(
-            management_locale_text("Runtime options", "运行选项", "執行選項"),
-            management_locale_text(
-                "Run modes, reasoning controls, and Features reported by the Agent CLI are detected once and cached for this Agent.",
-                "Agent CLI 上报的运行模式、推理控制项与 Features 只探测一次，并按 Agent 缓存。",
-                "Agent CLI 回報的執行模式、推理控制項與 Features 只探測一次，並依 Agent 快取。",
-            ),
-            v_flex()
-                .w_full()
-                .gap_2()
-                .child(
-                    h_flex().w_full().justify_end().child(
-                        Button::new("agent-runtime-options-refresh")
-                            .small()
-                            .secondary()
-                            .icon(Icon::default().path("icons/vibex/rotate-ccw.svg"))
-                            .label(management_probe_options_label())
-                            .loading(refreshing_runtime_options)
-                            .disabled(pending || !selected_agent.enabled || runtime_options_cached)
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.probe_agent_runtime_options(cx)),
-                            ),
-                    ),
-                )
-                .child(runtime_option_rows)
-                .into_any_element(),
-            cx,
-        );
         let mut profile_rows = v_flex().w_full().gap_2();
         for profile in profiles.clone() {
             let id = profile.id.clone();
@@ -6615,17 +7228,13 @@ impl ManagementCenter {
             );
         }
 
-        let runtime_verification_card =
-            self.render_runtime_verification_card(&selected_agent_id, selected_agent.enabled, cx);
-        let projection_contract = self.render_projection_contract(cx);
+        let authentication = self.render_agent_authentication(window, cx);
 
         v_flex()
             .w_full()
             .min_w_0()
             .gap_3()
-            .child(runtime_verification_card)
-            .child(runtime_options_card)
-            .child(projection_contract)
+            .child(authentication)
             .child(
                 v_flex()
                     .w_full()
@@ -10903,6 +11512,38 @@ fn agent_provider_profile_states(
         .collect()
 }
 
+fn agent_auth_input_key(method_id: &str, variable_name: &str) -> String {
+    format!("{}:{method_id}{variable_name}", method_id.len())
+}
+
+fn agent_auth_scope_matches(
+    current_generation: u64,
+    current_scope: Option<&(String, Option<String>)>,
+    expected_generation: u64,
+    expected_scope: &(String, Option<String>),
+) -> bool {
+    current_generation == expected_generation && current_scope == Some(expected_scope)
+}
+
+fn terminal_auth_exit_error(
+    status: &vibex_terminal::TerminalProcessExitStatus,
+) -> Option<VibexError> {
+    if status.exit_code == Some(0) && status.signal.is_none() {
+        return None;
+    }
+    let mut error = VibexError::process(
+        "agent_terminal_auth_failed",
+        "Interactive Agent authentication did not complete successfully",
+    );
+    if let Some(exit_code) = status.exit_code {
+        error = error.with_diagnostic("exitCode", exit_code.to_string());
+    }
+    if let Some(signal) = status.signal.as_deref() {
+        error = error.with_diagnostic("signal", signal);
+    }
+    Some(error)
+}
+
 fn management_locale_text(
     en: &'static str,
     zh_cn: &'static str,
@@ -11338,64 +11979,11 @@ fn management_status_badge(label: String, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-fn management_projection_detail_row(
-    label: impl Into<SharedString>,
-    value: impl Into<SharedString>,
-    cx: &App,
-) -> AnyElement {
-    h_flex()
-        .w_full()
-        .min_w_0()
-        .items_start()
-        .justify_between()
-        .gap_3()
-        .child(
-            div()
-                .flex_none()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(label.into()),
-        )
-        .child(
-            div()
-                .min_w_0()
-                .text_right()
-                .text_xs()
-                .font_family(cx.theme().mono_font_family.clone())
-                .font_weight(code_font_weight(cx))
-                .text_color(cx.theme().foreground)
-                .child(value.into()),
-        )
-        .into_any_element()
-}
-
 fn provider_wire_api_label(wire_api: vibex_core::ProviderModelWireApi) -> &'static str {
     match wire_api {
         vibex_core::ProviderModelWireApi::OpenaiResponses => "OpenAI Responses",
         vibex_core::ProviderModelWireApi::OpenaiChatCompletions => "Chat Completions",
         vibex_core::ProviderModelWireApi::AnthropicMessages => "Anthropic Messages",
-    }
-}
-
-fn projection_credential_surface_label(surface: ProjectionCredentialSurface) -> &'static str {
-    match surface {
-        ProjectionCredentialSurface::ApiKey => "API Key",
-        ProjectionCredentialSurface::OAuth => "OAuth",
-        ProjectionCredentialSurface::Cloud => {
-            management_locale_text("Cloud credential", "云凭证", "雲端憑證")
-        }
-        ProjectionCredentialSurface::AgentManaged => {
-            management_locale_text("Agent managed", "Agent 管理", "Agent 管理")
-        }
-        ProjectionCredentialSurface::Local => {
-            management_locale_text("Local runtime", "本地运行时", "本機執行階段")
-        }
-        ProjectionCredentialSurface::ServiceMarketplace => {
-            management_locale_text("Service marketplace", "服务市场", "服務市集")
-        }
-        ProjectionCredentialSurface::Unsupported => {
-            management_locale_text("Unsupported", "不支持", "不支援")
-        }
     }
 }
 
@@ -11924,23 +12512,6 @@ fn management_capability_probe_label() -> &'static str {
     management_locale_text("Capability check", "能力检查", "能力檢查")
 }
 
-fn management_probe_options_label() -> &'static str {
-    management_locale_text("Probe options", "探测选项", "探測選項")
-}
-
-fn management_runtime_option_snapshot_status(
-    summary: Option<&RuntimeOptionSnapshotSummary>,
-) -> String {
-    match summary {
-        Some(summary) if summary.last_success_at_ms.is_some() => {
-            management_locale_text("Detected and cached", "已探测并缓存", "已探測並快取")
-                .to_string()
-        }
-        Some(_) => management_locale_text("Probe failed", "探测失败", "探測失敗").to_string(),
-        None => management_locale_text("Not probed", "尚未探测", "尚未探測").to_string(),
-    }
-}
-
 fn management_runtime_option_probe_message(
     result: &RuntimeOptionProbeResult,
     active_locale: ResolvedLocale,
@@ -12151,9 +12722,7 @@ async fn load_snapshot(
                 )?;
                 projection_states.push(AgentProviderProjectionState {
                     agent_id: agent.id.as_str().to_string(),
-                    runtime_profile_id: runtime_profile.id,
                     legacy_profile_id: None,
-                    binding: None,
                     capability,
                     preview: None,
                 });
@@ -12176,12 +12745,10 @@ async fn load_snapshot(
                     .ok();
                 projection_states.push(AgentProviderProjectionState {
                     agent_id: agent.id.as_str().to_string(),
-                    runtime_profile_id: runtime_profile.id.clone(),
                     legacy_profile_id: binding
                         .legacy_provider_profile_id
                         .as_ref()
                         .map(|profile_id| profile_id.as_str().to_string()),
-                    binding: Some(binding.clone()),
                     capability,
                     preview,
                 });
@@ -12192,17 +12759,8 @@ async fn load_snapshot(
     let skills = provider.list_skills()?;
     let prompts = provider.list_prompts()?;
     let hooks = provider.list_hooks()?;
-    let runtime_probes = provider
-        .list_agent_runtime_probes(vibex_core::AgentRuntimeProbeListRequest {
-            runtime_profile_id: None,
-            limit: Some(100),
-        })?
-        .iter()
-        .map(AgentRuntimeProbeProjection::from_record)
-        .collect();
     let health_summaries = provider.list_health_summaries()?;
     let capability_summaries = provider.list_capability_summaries()?;
-    let runtime_option_snapshots = runtime.agent().runtime_catalog().snapshot_summaries()?;
     let usage_summaries = provider.list_usage_summaries(vibex_core::ProviderUsageListRequest {
         provider_profile_ids: None,
         include_empty: true,
@@ -12294,10 +12852,8 @@ async fn load_snapshot(
         native_import_preview,
         agent_profile_states,
         projection_states,
-        runtime_probes,
         health_summaries,
         capability_summaries,
-        runtime_option_snapshots,
         usage_summaries,
         native_exports,
         device_count: devices.len().saturating_sub(revoked_device_count),
@@ -12954,7 +13510,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_agent_option_snapshot_disables_reprobe_without_provider_gate() {
+    fn agent_settings_expose_authentication_without_internal_runtime_panels() {
         let source = include_str!("management.rs");
         let render = source
             .split_once("    fn render_providers(")
@@ -12962,17 +13518,79 @@ mod tests {
             .map(|(body, _)| body)
             .expect("Provider renderer should remain inspectable");
 
-        assert!(render.contains("summary.agent_id.as_str() == selected_agent_id"));
-        assert!(render.contains("runtime_options_cached"));
-        assert!(
-            render.contains(
-                ".disabled(pending || !selected_agent.enabled || runtime_options_cached)"
-            )
+        assert!(render.contains("render_agent_authentication(window, cx)"));
+        assert!(!render.contains("render_runtime_verification_card"));
+        assert!(!render.contains("runtime_options_card"));
+        assert!(!render.contains("render_projection_contract"));
+    }
+
+    #[test]
+    fn agent_authentication_surface_covers_dynamic_methods_and_terminal_flow() {
+        let source = include_str!("management.rs");
+        let render = source
+            .split_once("    fn render_agent_authentication(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_providers("))
+            .map(|(body, _)| body)
+            .expect("Agent authentication renderer should remain inspectable");
+
+        for expected in [
+            "for method in catalog.methods",
+            "for variable in method.environment",
+            "AgentAuthMethodKind::Agent",
+            "AgentAuthMethodKind::Environment",
+            "AgentAuthMethodKind::Terminal",
+            "agent-auth-logout",
+            "agent_auth_terminal_surface",
+            ".mask_toggle()",
+            "Clear saved value",
+        ] {
+            assert!(render.contains(expected), "missing auth flow: {expected}");
+        }
+    }
+
+    #[test]
+    fn agent_auth_input_keys_are_unambiguous() {
+        assert_ne!(
+            agent_auth_input_key("ab", "c"),
+            agent_auth_input_key("a", "bc")
         );
+    }
+
+    #[test]
+    fn agent_auth_async_results_are_fenced_by_generation_and_scope() {
+        let scope = ("opencode".to_string(), Some("profile-a".to_string()));
+        assert!(agent_auth_scope_matches(4, Some(&scope), 4, &scope));
+        assert!(!agent_auth_scope_matches(5, Some(&scope), 4, &scope));
+        assert!(!agent_auth_scope_matches(
+            4,
+            Some(&("opencode".to_string(), Some("profile-b".to_string()))),
+            4,
+            &scope,
+        ));
+        assert!(!agent_auth_scope_matches(4, None, 4, &scope));
+    }
+
+    #[test]
+    fn terminal_auth_exit_status_distinguishes_success_failure_and_signal() {
         assert!(
-            !render
-                .contains(".disabled(pending || !selected_agent.enabled || profiles.is_empty())")
+            terminal_auth_exit_error(&vibex_terminal::TerminalProcessExitStatus {
+                exit_code: Some(0),
+                signal: None,
+            })
+            .is_none()
         );
+        let nonzero = terminal_auth_exit_error(&vibex_terminal::TerminalProcessExitStatus {
+            exit_code: Some(7),
+            signal: None,
+        })
+        .expect("nonzero exit must fail authentication");
+        assert_eq!(nonzero.code, "agent_terminal_auth_failed");
+        let signaled = terminal_auth_exit_error(&vibex_terminal::TerminalProcessExitStatus {
+            exit_code: None,
+            signal: Some("SIGTERM".to_string()),
+        })
+        .expect("signal exit must fail authentication");
+        assert_eq!(signaled.code, "agent_terminal_auth_failed");
     }
 
     #[test]

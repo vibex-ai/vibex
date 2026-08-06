@@ -5,14 +5,16 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc};
 use vibex_core::{
+    AgentAuthCatalog, AgentAuthenticateRequest, AgentAuthenticateResult,
     AgentCommandDiscoverRequest, AgentCommandDiscoverResponse, AgentCommandEntry,
     AgentCommandExecuteRequest, AgentCommandExecuteResult, AgentCommandExecuteStatus,
     AgentCommandExecutionBehavior, AgentCommandSelectionBehavior, AgentCommandSourceKind,
-    AgentCommandTrigger, AgentConfig, AgentId, AgentModelListRequest, AgentModelListResponse,
-    AgentModelListSource, AgentSession, AgentSessionConfigProbe, AgentSessionRestoreMethod,
-    AgentSessionSafety, AgentSessionState, AgentUsageCounterOrigin, AgentUsageExecutionContext,
-    AgentUsageStreamAttribution, BindingState, ContinueAgentTurnRequest, CreateAgentSessionRequest,
-    ElicitationRequest, ExternalSessionContinuationStatus, ExternalSessionImportCandidate,
+    AgentCommandTrigger, AgentConfig, AgentId, AgentLogoutRequest, AgentModelListRequest,
+    AgentModelListResponse, AgentModelListSource, AgentSession, AgentSessionConfigProbe,
+    AgentSessionRestoreMethod, AgentSessionSafety, AgentSessionState, AgentUsageCounterOrigin,
+    AgentUsageExecutionContext, AgentUsageStreamAttribution, BindingState,
+    ContinueAgentTurnRequest, CreateAgentSessionRequest, ElicitationRequest,
+    ExternalSessionContinuationStatus, ExternalSessionImportCandidate,
     ExternalSessionImportCandidateStatus, ExternalSessionImportDiagnostic,
     ExternalSessionImportPreview, ExternalSessionImportPreviewRequest,
     ExternalSessionImportRequest, ExternalSessionImportResult, ExternalSessionImportSource,
@@ -2217,6 +2219,36 @@ impl AgentManager {
             self.resolve_enabled_agent(Some(agent_id.clone()), ProviderKind::Acp, false)?;
         let provider = self.runtime(&self.route_for_agent(&resolved_agent.agent_id)?)?;
         provider.probe_agent_session_config(&agent_id).await
+    }
+
+    pub async fn list_agent_auth_methods(
+        &self,
+        agent_id: AgentId,
+        provider_profile_id: Option<ProviderProfileId>,
+    ) -> VibexResult<AgentAuthCatalog> {
+        let resolved_agent =
+            self.resolve_enabled_agent(Some(agent_id.clone()), ProviderKind::Acp, true)?;
+        let provider = self.runtime(&self.route_for_agent(&resolved_agent.agent_id)?)?;
+        provider
+            .list_auth_methods(&agent_id, provider_profile_id.as_ref())
+            .await
+    }
+
+    pub async fn authenticate_agent(
+        &self,
+        request: AgentAuthenticateRequest,
+    ) -> VibexResult<AgentAuthenticateResult> {
+        let resolved_agent =
+            self.resolve_enabled_agent(Some(request.agent_id.clone()), ProviderKind::Acp, true)?;
+        let provider = self.runtime(&self.route_for_agent(&resolved_agent.agent_id)?)?;
+        provider.authenticate_agent(request).await
+    }
+
+    pub async fn logout_agent(&self, request: AgentLogoutRequest) -> VibexResult<()> {
+        let resolved_agent =
+            self.resolve_enabled_agent(Some(request.agent_id.clone()), ProviderKind::Acp, true)?;
+        let provider = self.runtime(&self.route_for_agent(&resolved_agent.agent_id)?)?;
+        provider.logout_agent(request).await
     }
 
     fn validate_import_candidate(

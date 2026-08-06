@@ -52,7 +52,9 @@ agent_list_runtime_options() -> SessionRuntimeOptionCatalog
 RuntimeOptionCatalogService::probe_agent(agent_id) -> RuntimeOptionProbeResult
 AgentProvider::probe_agent_session_config(agent_id) -> AgentSessionConfigProbe
 ProviderConfigService::get_agent_acp_runtime_config(agent_id) -> AcpProviderConfig
-build_runtime_option_catalog_for_agents(agents, profiles, evidence_by_agent)
+AcpRuntimeClient::profile_session_config_evidence()
+  -> Map<ProviderProfileId, AgentSessionConfigProbe>
+build_runtime_option_catalog(agents, profiles, evidence_by_profile)
   -> SessionRuntimeOptionCatalog
 
 agent_runtime_option_snapshots(
@@ -66,9 +68,9 @@ agent_runtime_option_snapshots(
 
 ### 3. Contracts
 
-- Store at most one successful runtime-option snapshot per `agent_id`. It
-  contains modes, reasoning controls, and generic session options only. Clear
-  `AgentSessionConfigProbe.models` before persistence even if an Adapter
+- Store at most one successful fallback runtime-option snapshot per `agent_id`.
+  It contains modes, reasoning controls, and generic session options only.
+  Clear `AgentSessionConfigProbe.models` before persistence even if an Adapter
   reports models from `session/new`.
 - An Agent-level probe launches the configured Agent command with its Agent
   args and Agent env. It must not list or load a Provider Profile, resolve a
@@ -81,15 +83,28 @@ agent_runtime_option_snapshots(
 - A successful snapshot is immutable while the Agent remains added. Later
   calls return `cached_agent_ids` without launching the CLI. Removing the
   Agent deletes its snapshot so a later re-add can probe once again.
-- Ordinary catalog reads load SQLite snapshots only and never start an ACP
-  process. Provider mutations rebuild the Profile/model projection and then
-  reuse the same cached Agent evidence; they neither clear nor replace it.
+- Ordinary catalog reads load the SQLite Agent fallback plus current in-memory
+  Profile evidence and never start an ACP process. Provider mutations rebuild
+  the Profile/model projection and reuse the Agent fallback; they do not invoke
+  `session/new` as a hidden configuration side effect.
+- A real `session/new`, `session/load`, or `session/resume` response publishes
+  its safe session configuration under the exact `provider_profile_id`.
+  `ConfigOptionUpdate` replaces that session's complete option set, including
+  removal of withdrawn options, then refreshes the Profile evidence.
+- Live Profile evidence overrides the Agent fallback only for that Profile.
+  Other Profiles continue to render immediately from the Agent snapshot until
+  one of their real sessions supplies newer evidence.
+- Profile evidence is process-memory calibration, not a second durable source
+  of Provider configuration. Remove it when the Profile changes or is deleted;
+  after restart, the catalog starts from the persisted Agent fallback again.
 - Enabled ACP Provider Profiles contribute only enabled configured model ids,
   or their configured default model when the explicit list is empty. Agent
-  discovery models and Agent probe models never populate the selector.
-- Every enabled Profile for one Agent receives the same cached modes,
-  reasoning controls, and Features. `SessionRuntimeOptionCatalog.revision` is
-  a deterministic positive revision of the ordered redacted projection.
+  discovery, Agent probe, and live session models never populate the selector.
+- Until live evidence exists, every enabled Profile for one Agent receives the
+  same fallback modes, reasoning controls, and Features. Once calibrated, each
+  Profile may expose its own current Agent-owned controls.
+  `SessionRuntimeOptionCatalog.revision` is a deterministic positive revision
+  of the ordered redacted projection.
 - `reasoningEffort = null` and `modeId = null` mean that the Adapter's
   converged defaults remain authoritative. Runtime fence matching always
   requires the exact model and compares Effort/Mode only when explicitly set.
@@ -106,6 +121,14 @@ agent_runtime_option_snapshots(
   error code; mark the Agent projection `temporarily_unavailable` and permit an
   explicit retry.
 - Adapter returns models -> clear them before the Agent snapshot write.
+- A live response or update includes models -> clear them before publishing
+  Profile evidence; Provider Profile models stay authoritative.
+- `ConfigOptionUpdate` omits the `configOptions` array -> ignore it rather than
+  erasing the current evidence.
+- `ConfigOptionUpdate` contains an empty `configOptions` array -> replace the
+  previous option set with empty; withdrawn controls must not remain selectable.
+- Live Profile evidence is absent or was invalidated -> layer the Agent fallback
+  for that Profile.
 - No Provider Profile or no configured Provider model -> probing may still
   succeed, but the joined catalog has no model option for that Profile.
 - Disabled Agent/Profile/model -> omit it; cached Agent evidence cannot revive
@@ -118,8 +141,9 @@ agent_runtime_option_snapshots(
 
 ### 5. Good/Base/Bad Cases
 
-- Good: one Agent probe succeeds, two Provider Profiles are added later, and
-  both Profiles reuse the same cached controls without another CLI launch.
+- Good: one Agent probe succeeds, two Provider Profiles render immediately from
+  the fallback, then a real session for one Profile replaces only that Profile's
+  controls and subsequent updates remove withdrawn choices.
 - Base: an Agent has no Provider Profile. Its controls can be probed and cached,
   while the session selector remains empty until a Profile supplies a model.
 - Base: a Profile has models but the Agent exposes no reasoning control; its
@@ -128,6 +152,8 @@ agent_runtime_option_snapshots(
   snapshot, or creates another snapshot keyed by `provider_profile_id`.
 - Bad: a model returned by the Agent probe appears in a Profile that did not
   configure that model.
+- Bad: a stale Profile-wide snapshot masks the full option set announced by a
+  current session, or an incremental update leaves removed options behind.
 
 ### 6. Tests Required
 
@@ -137,9 +163,11 @@ agent_runtime_option_snapshots(
   command/args/Agent-env resolution without a Provider Profile.
 - `cargo test -p vibex-agent-acp session_config::tests --locked` asserts Agent
   evidence is shared and models come only from Provider Profiles.
+- `cargo test -p vibex-agent-acp config_option_update --locked` asserts a full
+  replacement, runtime-state calibration, and model stripping.
 - `cargo test -p vibex-desktop-runtime catalog --locked` asserts one process
-  call, cached reuse, Profile mutation independence, model stripping, and
-  failure recording by Agent.
+  call, cached reuse, Profile mutation independence, live-over-fallback layering,
+  model stripping, and failure recording by Agent.
 - Desktop management tests assert Agent add/discovery/install detection invokes
   `probe_agent`, ordinary toggles and Profile saves do not, and a successful
   snapshot disables the probe button.
@@ -161,10 +189,12 @@ CLI discovery for every model configuration.
 
 ```rust
 let result = catalog.probe_agent(&agent_id).await?;
-let options = catalog.list().await?; // SQLite read plus Profile/model join
+let options = catalog.list().await?;
+// SQLite Agent fallback + current in-memory Profile evidence + Profile models.
 ```
 
-The successful Agent snapshot is reused until that Agent is removed.
+The successful Agent snapshot provides fast fallback; real sessions calibrate
+only their own Profiles without probing during a catalog read.
 
 ## Scenario: Claude ACP Extension And Transcript Compensation
 
@@ -2436,6 +2466,138 @@ crates/agent-acp
   provider-neutral manager and existing Mock behavior are not regressed.
 - `pnpm check:rust`, `pnpm check`, and `git diff --check` must pass before the
   task is completed.
+
+## Scenario: ACP Dynamic Agent Authentication
+
+### 1. Scope / Trigger
+
+- Trigger: the Management Center opens an enabled Agent and needs to discover
+  the Agent's current authentication choices after `initialize`.
+- Trigger: a user submits an Agent, environment-variable, or terminal method,
+  or invokes logout when the Agent advertises it.
+- This boundary spans ACP initialize/authenticate/logout, Provider Profile
+  secret references, the shared PTY host, and generation-fenced GPUI state.
+
+### 2. Signatures
+
+```text
+AgentProvider::list_auth_methods(agent_id, provider_profile_id?)
+  -> AgentAuthCatalog {
+       agent_id, methods[], supports_logout, status, refreshed_at_ms
+     }
+AgentProvider::authenticate_agent(AgentAuthenticateRequest)
+  -> AgentAuthenticateResult { method_id, terminal? }
+AgentProvider::logout_agent(AgentLogoutRequest) -> ()
+
+AgentAuthMethod {
+  id, name, description?, kind: agent | environment | terminal,
+  environment[], credential_link?
+}
+AgentAuthEnvironmentVariable {
+  name, label?, secret, optional, configured
+}
+```
+
+The ACP adapter also owns the wire builders:
+
+```text
+initialize -> authMethods[] and agentCapabilities.auth.logout
+authenticate({ methodId })
+logout({})
+```
+
+### 3. Contracts
+
+- `AgentAuthCatalog` is rebuilt from the selected Agent's actual
+  `initialize.authMethods`; static provider tables may supply defaults for
+  command/profile setup but never invent the visible method list.
+- Method ids remain exact and are bounded, deduplicated, and checked against
+  the same initialize result before `authenticate` is sent. Unknown method
+  shapes are ignored or conservatively treated as Agent-owned methods by the
+  typed ACP schema; malformed entries never reach the UI.
+- Agent methods call ACP `authenticate` directly. Environment methods require
+  an ACP Provider Profile, save each exact advertised key, then call
+  `authenticate` with that Profile's projected environment. Terminal methods
+  use the shared PTY host and return a redacted `TerminalAuthActionDescriptor`.
+- `supports_logout` is true only when `agentCapabilities.auth.logout` is an
+  object. Logout is optional and must be rejected as an unsupported capability
+  when the Agent did not advertise it.
+- Secret environment values never cross `AgentAuthCatalog`, descriptors,
+  errors, Debug output, or UI state. The catalog exposes only `configured`.
+- A terminal auth process advertises `clientCapabilities.auth.terminal` only
+  when a real terminal host exists. Headless hosts filter terminal methods and
+  never return a fake terminal id.
+- Auth discovery and mutation results are fenced by `(agent_id,
+  provider_profile_id?)` and a monotonically increasing UI generation. A late
+  result may not replace a newly selected Agent/Profile or reattach a terminal.
+- A terminal monitor retains the final output in the shared terminal buffer,
+  classifies exit code `0` without a signal as success, and reports non-zero or
+  signaled exits as `agent_terminal_auth_failed`. Closing or changing scope
+  kills the temporary terminal; it is not persisted as a normal workspace
+  terminal.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Agent is missing, disabled, or not ACP-enabled | `agent_auth_*_unsupported` or the normal enabled-agent validation error; no process is left running. |
+| Provider Profile is missing for an environment method | `agent_auth_profile_required`. |
+| Profile belongs to another Agent or is not ACP | `agent_auth_profile_mismatch` / `agent_auth_profile_kind_invalid`. |
+| Requested method id was not in the latest initialize catalog | `agent_auth_method_not_advertised`; do not send `authenticate`. |
+| Agent does not advertise logout | `agent_logout_not_advertised`; do not send `logout`. |
+| Terminal host is unavailable | do not expose terminal methods; never fabricate a successful descriptor. |
+| Auth terminal exits non-zero or by signal | `agent_terminal_auth_failed` with exit metadata only. |
+| Auth discovery or authenticate initialize fails | return the structured ACP/provider error and shut down the temporary process. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: an Agent advertises browser, environment, and terminal methods; the
+  UI renders all three, stores the Profile's exact environment keys, opens a
+  PTY for terminal login, and refreshes the catalog after completion.
+- Good: two Profiles for one Agent keep independent keychain references and
+  switching Profiles changes only the projected credentials used for auth.
+- Base: an Agent advertises no auth methods; the detail view shows its normal
+  unavailable/not-verified state without static login controls.
+- Bad: render a generic `API_KEY` field for every Agent, call `authenticate`
+  with a stale method id, or include an env value in a descriptor/log.
+- Bad: treat a terminal process that exits with a signal as authenticated or
+  keep its workspace terminal after the user leaves the Agent.
+
+### 6. Tests Required
+
+- `cargo test -p vibex-agent-acp auth::tests --locked` covers method parsing,
+  bounds, exact ids, logout capability, and terminal-value redaction.
+- `cargo test -p vibex-agent-acp agent_auth_methods_authenticate_terminal_and_logout_round_trip --locked`
+  covers all method kinds and exact wire calls.
+- The no-terminal-host test asserts `auth.terminal == false` and that terminal
+  methods are filtered from the catalog.
+- `cargo test -p vibex-config-switch agent_auth_environment --locked` covers
+  exact key names, blank preservation, explicit clear, keychain rollback, and
+  secret-free projections.
+- Desktop Management tests cover method rendering, masked inputs, logout
+  visibility, terminal exit classification, and Agent/Profile generation
+  fencing.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+let method = static_provider_auth(agent_id).unwrap_or(default_api_key());
+render_api_key_field(method);
+```
+
+#### Correct
+
+```rust
+let catalog = agent.list_auth_methods(agent_id, profile_id).await?;
+for method in catalog.methods {
+    render_dynamic_auth_method(method);
+}
+```
+
+The Agent owns the method contract; Vibex owns the common UI, Profile secret
+reference, `authenticate(method_id)`, and terminal lifecycle.
 
 ## Scenario: ACP Terminal Tools And Terminal Auth
 

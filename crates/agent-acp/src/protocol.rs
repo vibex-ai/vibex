@@ -43,10 +43,11 @@ use std::path::Path;
 use agent_client_protocol_schema::{
     ProtocolVersion,
     v1::{
-        CancelNotification, ClientCapabilities, ContentBlock, ElicitationCapabilities,
-        ElicitationFormCapabilities, FileSystemCapabilities, Implementation, InitializeRequest,
-        LoadSessionRequest, NewSessionRequest, PromptRequest, ResumeSessionRequest, SessionId,
-        SetSessionConfigOptionRequest, SetSessionModeRequest,
+        AuthenticateRequest, CancelNotification, ClientCapabilities, ContentBlock,
+        ElicitationCapabilities, ElicitationFormCapabilities, FileSystemCapabilities,
+        Implementation, InitializeRequest, LoadSessionRequest, LogoutRequest, NewSessionRequest,
+        PromptRequest, ResumeSessionRequest, SessionId, SetSessionConfigOptionRequest,
+        SetSessionModeRequest,
     },
 };
 use serde_json::{Value, json};
@@ -68,6 +69,7 @@ pub(crate) const JSON_RPC_METHOD_NOT_FOUND: i64 = -32601;
 pub enum AcpOperation {
     Initialize,
     Authenticate,
+    Logout,
     SessionNew,
     SessionPrompt,
     SessionCancel,
@@ -100,6 +102,7 @@ impl AcpOperation {
         match self {
             Self::Initialize => "initialize",
             Self::Authenticate => "authenticate",
+            Self::Logout => "logout",
             Self::SessionNew => "session/new",
             Self::SessionPrompt => "session/prompt",
             Self::SessionCancel => "session/cancel",
@@ -130,6 +133,7 @@ impl AcpOperation {
         match method {
             "initialize" => Self::Initialize,
             "authenticate" => Self::Authenticate,
+            "logout" => Self::Logout,
             "session/new" => Self::SessionNew,
             "session/prompt" => Self::SessionPrompt,
             "session/cancel" => Self::SessionCancel,
@@ -260,6 +264,8 @@ pub fn baseline_operation_matrix() -> Vec<AcpOperationSupport> {
         support(Op::TerminalWaitForExit, St::StableCore, Enc::Typed),
         // Capability-gated standard: initialize must declare support;
         // method-not-found downgrades only this capability.
+        support(Op::Authenticate, St::CapabilityGated, Enc::Typed),
+        support(Op::Logout, St::CapabilityGated, Enc::Typed),
         support(Op::SessionLoad, St::CapabilityGated, Enc::Typed),
         support(Op::SessionResume, St::CapabilityGated, Enc::Typed),
         support(Op::SessionSetMode, St::CapabilityGated, Enc::Typed),
@@ -749,6 +755,19 @@ pub(crate) fn build_initialize_params(
     params
 }
 
+/// Build `authenticate` params through the pinned ACP schema. Callers must
+/// first verify that `method_id` was advertised by the same initialize result.
+pub(crate) fn build_authenticate_params(method_id: &str) -> Value {
+    serde_json::to_value(AuthenticateRequest::new(method_id.to_string()))
+        .unwrap_or_else(|_| json!({ "methodId": method_id }))
+}
+
+/// Build `logout` params through the pinned ACP schema. The operation remains
+/// capability-gated by `agentCapabilities.auth.logout`.
+pub(crate) fn build_logout_params() -> Value {
+    serde_json::to_value(LogoutRequest::new()).unwrap_or_else(|_| json!({}))
+}
+
 /// Build `session/new` params: typed base (`cwd`) plus the local
 /// `mcpServers` descriptor serialization (quirk 2).
 pub(crate) fn build_session_new_params(cwd: &Path, mcp_servers: Value) -> Value {
@@ -926,6 +945,15 @@ mod tests {
             build_session_resume_params("native-1", Path::new("/tmp/w"), servers.clone()),
             json!({ "sessionId": "native-1", "cwd": "/tmp/w", "mcpServers": servers })
         );
+    }
+
+    #[test]
+    fn typed_auth_params_match_frozen_wire_shape() {
+        assert_eq!(
+            build_authenticate_params("browser-login"),
+            json!({ "methodId": "browser-login" })
+        );
+        assert_eq!(build_logout_params(), json!({}));
     }
 
     #[cfg(unix)]

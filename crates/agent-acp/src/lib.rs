@@ -28,10 +28,11 @@ use vibex_agent::{
 };
 use vibex_config_switch::{ProviderConfigService, acp_capabilities_from_config};
 use vibex_core::{
-    AcpProviderConfig, AcpProviderEnvSource, AcpProviderProfileCreateRequest,
-    AgentCommandDiscoverRequest, AgentCommandDiscoverResponse, AgentCommandEntry,
-    AgentCommandExecuteRequest, AgentCommandExecutionBehavior, AgentCommandSelectionBehavior,
-    AgentCommandSourceKind, AgentCommandTrigger, AgentEventRawExtension, AgentMessageDeltaPayload,
+    AcpProviderConfig, AcpProviderEnvSource, AcpProviderProfileCreateRequest, AgentAuthCatalog,
+    AgentAuthenticateRequest, AgentAuthenticateResult, AgentCommandDiscoverRequest,
+    AgentCommandDiscoverResponse, AgentCommandEntry, AgentCommandExecuteRequest,
+    AgentCommandExecutionBehavior, AgentCommandSelectionBehavior, AgentCommandSourceKind,
+    AgentCommandTrigger, AgentEventRawExtension, AgentLogoutRequest, AgentMessageDeltaPayload,
     AgentMessagePayload, AgentMessagePhase, AgentModelCapabilities, AgentModelListResponse,
     AgentModelListSource, AgentReasoningEffort, AgentSessionConfigProbe, AgentSessionSafety,
     AgentUsageCounterOrigin, AgentUsageExecutionContext, ElicitationRequest,
@@ -47,6 +48,7 @@ use vibex_core::{
 };
 
 mod adapter_activation;
+mod auth;
 mod bridge_contract;
 mod claude;
 mod codex;
@@ -114,7 +116,7 @@ pub use registry::{
 pub use runtime::{
     AcpRuntimeClient, AcpRuntimeLifecycleBackend, AcpRuntimeSwitchBridge, AcpTerminalAuthRequest,
     AcpTerminalCreateRequest, AcpTerminalExitStatus, AcpTerminalHost, AcpTerminalOutput,
-    DisabledAcpTerminalHost,
+    DisabledAcpTerminalHost, redacted_terminal_auth_action_descriptor,
 };
 pub use runtime_probe::{AgentRuntimeProbeReconcileReport, AgentRuntimeProbeService};
 pub use session_attachment_registry::{
@@ -380,6 +382,34 @@ pub struct AcpRuntimeSessionProbe {
 
 #[async_trait]
 pub trait AcpClient: Send + Sync {
+    async fn list_auth_methods(
+        &self,
+        _agent_id: &vibex_core::AgentId,
+        _provider_profile_id: Option<&ProviderProfileId>,
+    ) -> VibexResult<AgentAuthCatalog> {
+        Err(VibexError::capability(
+            "acp_auth_discovery_unsupported",
+            "ACP authentication discovery is not supported by this adapter",
+        ))
+    }
+
+    async fn authenticate_agent(
+        &self,
+        _request: AgentAuthenticateRequest,
+    ) -> VibexResult<AgentAuthenticateResult> {
+        Err(VibexError::capability(
+            "acp_authenticate_unsupported",
+            "ACP authentication is not supported by this adapter",
+        ))
+    }
+
+    async fn logout_agent(&self, _request: AgentLogoutRequest) -> VibexResult<()> {
+        Err(VibexError::capability(
+            "acp_logout_unsupported",
+            "ACP logout is not supported by this adapter",
+        ))
+    }
+
     async fn create_session(&self, request: AcpCreateSessionRequest) -> VibexResult<AcpSession>;
 
     async fn resume_session(&self, binding: ProviderBinding) -> VibexResult<AcpSession>;
@@ -1951,6 +1981,27 @@ impl AgentProvider for AcpAgentProvider {
         }
     }
 
+    async fn list_auth_methods(
+        &self,
+        agent_id: &vibex_core::AgentId,
+        provider_profile_id: Option<&ProviderProfileId>,
+    ) -> VibexResult<AgentAuthCatalog> {
+        self.client
+            .list_auth_methods(agent_id, provider_profile_id)
+            .await
+    }
+
+    async fn authenticate_agent(
+        &self,
+        request: AgentAuthenticateRequest,
+    ) -> VibexResult<AgentAuthenticateResult> {
+        self.client.authenticate_agent(request).await
+    }
+
+    async fn logout_agent(&self, request: AgentLogoutRequest) -> VibexResult<()> {
+        self.client.logout_agent(request).await
+    }
+
     async fn list_models(
         &self,
         provider_profile_id: Option<&ProviderProfileId>,
@@ -2929,16 +2980,26 @@ fn redacted_output_summary(output: &[u8]) -> Option<String> {
 }
 
 pub(crate) fn redacted_args_summary(args: &[String]) -> String {
+    redacted_args(args).join(" ")
+}
+
+pub(crate) fn redacted_args(args: &[String]) -> Vec<String> {
+    let mut redact_next = false;
     args.iter()
         .map(|arg| {
-            if looks_sensitive(arg) {
+            let redact_current = redact_next || looks_sensitive(arg);
+            redact_next = sensitive_option_takes_value(arg);
+            if redact_current {
                 "[redacted]".to_string()
             } else {
                 arg.clone()
             }
         })
-        .collect::<Vec<_>>()
-        .join(" ")
+        .collect()
+}
+
+fn sensitive_option_takes_value(argument: &str) -> bool {
+    argument.starts_with('-') && !argument.contains('=') && looks_sensitive(argument)
 }
 
 pub(crate) fn redact_summary(value: &str) -> String {
@@ -3697,11 +3758,14 @@ mod tests {
         let summary = redacted_args_summary(&[
             "acp".to_string(),
             "--token".to_string(),
-            "sk-secret-value".to_string(),
+            "plain-secret-value".to_string(),
+            "--mode".to_string(),
+            "safe".to_string(),
         ]);
 
         assert!(summary.contains("[redacted]"));
-        assert!(!summary.contains("sk-secret-value"));
+        assert!(!summary.contains("plain-secret-value"));
+        assert!(summary.ends_with("--mode safe"));
     }
 
     #[test]

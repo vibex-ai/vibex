@@ -622,6 +622,23 @@ Provider UI must show Vibex Provider Profiles, not raw config files. Components
 for runtime injection preview should display redacted env, headers, endpoints,
 SDK options, CLI args, and temporary config overlay paths.
 
+The Agent detail surface is a user-facing authentication and Profile-management
+surface, not a diagnostics console:
+
+- Render dynamically advertised Agent, environment, and terminal auth methods
+  before the selected Agent's Provider Profiles.
+- Keep method choices as separated rows within one authentication section; do
+  not nest decorative method cards inside an outer card.
+- Secret environment fields use masked inputs and expose only a configured
+  marker plus an explicit clear action. Optional fields are labeled; exact
+  Agent-provided environment names remain visible.
+- Render logout only when advertised. A terminal method opens the shared
+  Terminal surface with a close action and explicit running/success/failure
+  state.
+- Do not render runtime verification, runtime-option snapshots, Provider
+  projection internals, raw ACP payloads, or resolved credential values in the
+  Agent detail surface.
+
 Native export UI must always include diff, backup, atomic write, and rollback
 information.
 

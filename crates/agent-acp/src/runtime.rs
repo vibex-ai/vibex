@@ -62,18 +62,19 @@ use vibex_config_switch::{
 #[cfg(test)]
 use vibex_config_switch::{CodexProviderRuntimeConfig, codex_runtime_config_from_profile};
 use vibex_core::{
-    AcpProcessStrategy, AcpProviderConfig, AcpProviderEnvSource, ActiveWorkKind,
-    AgentEventRawOutput, AgentEventRawOutputMode, AgentId, AgentMessagePhase,
+    AcpProcessStrategy, AcpProviderConfig, AcpProviderEnvSource, ActiveWorkKind, AgentAuthCatalog,
+    AgentAuthMethodKind, AgentAuthenticateRequest, AgentAuthenticateResult, AgentEventRawOutput,
+    AgentEventRawOutputMode, AgentId, AgentLogoutRequest, AgentMessagePhase,
     AgentModelCapabilities, AgentModelListRequest, AgentModelListSource,
     AgentProviderProjectionRegistry, AgentReasoningEffort, AgentRuntimeProbeStatus,
-    AgentRuntimeRouteKey, AgentSessionRestoreCompatibility, AgentSessionRestoreCompatibilityKey,
-    AgentSessionRestoreMethod, AgentSessionRestoreOutcome, AgentSessionState, AgentTokenUsage,
-    AgentUsageCounterOrigin, AgentUsageExecution, AgentUsageExecutionContext,
-    AgentUsageExecutionStatus, AgentUsageExecutionStatusUpdate, AgentUsageObservation,
-    AgentUsageObservationSource, AgentUsageTokenValues, BindingState, ElicitationAnswerValue,
-    ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationRequest,
-    ElicitationRequestStatus, ElicitationResolutionAction, ElicitationStringFormat,
-    ExternalSessionContinuationStatus, ExternalSessionImportCandidate,
+    AgentRuntimeRouteKey, AgentSessionConfigProbe, AgentSessionRestoreCompatibility,
+    AgentSessionRestoreCompatibilityKey, AgentSessionRestoreMethod, AgentSessionRestoreOutcome,
+    AgentSessionState, AgentTokenUsage, AgentUsageCounterOrigin, AgentUsageExecution,
+    AgentUsageExecutionContext, AgentUsageExecutionStatus, AgentUsageExecutionStatusUpdate,
+    AgentUsageObservation, AgentUsageObservationSource, AgentUsageTokenValues, BindingState,
+    ElicitationAnswerValue, ElicitationField, ElicitationFieldKind, ElicitationOption,
+    ElicitationRequest, ElicitationRequestStatus, ElicitationResolutionAction,
+    ElicitationStringFormat, ExternalSessionContinuationStatus, ExternalSessionImportCandidate,
     ExternalSessionImportCandidateStatus, ExternalSessionImportSource, MAX_AGENT_USAGE_TOKEN_VALUE,
     NativeStateHomeId, PermissionActionDetail, PermissionRequest, PermissionRequestStatus,
     PermissionResponseKind, PermissionResponseOption, PermissionRiskCategory, PlanStepPayload,
@@ -98,6 +99,7 @@ use vibex_db::{
     SessionRepository, SwitchOperationRecord, apply_migrations, open_database,
 };
 
+use crate::auth::parse_initialize_auth_catalog;
 use crate::process_environment::sanitize_inherited_appimage_environment;
 use crate::process_registry::{
     AcpProcessCrash, AcpProcessHandle, AcpProcessInstanceId, AcpProcessRegistry, AcpProcessStatus,
@@ -131,7 +133,7 @@ use crate::{
     AcpClient, AcpCreateSessionRequest, AcpElicitationResolution, AcpEvent,
     AcpImportSessionRequest, AcpPermissionResolution, AcpRuntimeCommand, AcpRuntimeSessionProbe,
     AcpSendTurnRequest, AcpSession, AcpTurn, infer_permission_risk_category, looks_sensitive,
-    redact_summary, redacted_args_summary,
+    redact_summary, redacted_args, redacted_args_summary,
 };
 use crate::{
     AgentEventInput, AgentEventInputSource, ClaudeBackgroundWorkRegistry, ClaudeWorkKey,
@@ -237,8 +239,6 @@ pub(crate) const PROBE_ENV: &[(&str, &str)] = &[
 /// "unknown event" notice into the timeline.
 const IGNORED_SESSION_UPDATE_KINDS: &[&str] = &[
     "user_message_chunk",
-    "config_option_update",
-    "config_options_update",
     "session_info_update",
     "current_model_update",
 ];
@@ -264,6 +264,7 @@ impl AcpRpcFailure {
 pub(crate) enum AcpProcessPurpose {
     Session,
     Probe,
+    Authentication,
 }
 
 pub(crate) struct AcpProcessLaunch<'a> {
@@ -1295,6 +1296,8 @@ pub(crate) struct AcpProcess {
     child: tokio::sync::Mutex<Option<AsyncGroupChild>>,
     shutdown_lock: tokio::sync::Mutex<()>,
     terminal_host: Arc<dyn AcpTerminalHost>,
+    runtime_config_states: Arc<Mutex<HashMap<RuntimeBindingId, SessionRuntimeConfigState>>>,
+    profile_config_evidence: Arc<Mutex<BTreeMap<ProviderProfileId, AgentSessionConfigProbe>>>,
     terminal_tools_enabled: bool,
     terminal_auth_enabled: bool,
     mcp_servers: Vec<AcpMcpServerDescriptor>,
@@ -1382,9 +1385,9 @@ impl std::fmt::Debug for AcpTerminalAuthRequest {
             .field("provider_profile_id", &self.provider_profile_id)
             .field("method_id", &self.method_id)
             .field("title", &redact_summary(&self.title))
-            .field("command", &redact_summary(&self.command))
-            .field("args", &redacted_args_summary(&self.args))
-            .field("cwd", &self.cwd)
+            .field("has_command", &!self.command.trim().is_empty())
+            .field("argument_count", &self.args.len())
+            .field("has_cwd", &self.cwd.is_some())
             .field("env_keys", &env_keys)
             .finish()
     }
@@ -1426,7 +1429,7 @@ impl AcpSessionAttachment {
             state,
             registration_barrier,
         } = opened;
-        Self {
+        let attachment = Self {
             lease,
             logical_session_id,
             native_session_id,
@@ -1436,7 +1439,9 @@ impl AcpSessionAttachment {
             crash_receiver: Mutex::new(Some(crash_receiver)),
             crash_watcher: Mutex::new(None),
             registration_barrier: Mutex::new(registration_barrier),
-        }
+        };
+        attachment.publish_profile_config_evidence();
+        attachment
     }
 
     fn release_registration_barrier(&self) {
@@ -2280,6 +2285,146 @@ impl AcpSessionAttachment {
         }
     }
 
+    fn publish_profile_config_evidence(&self) {
+        let probe = self.state.lock().ok().and_then(|state| {
+            state
+                .session_config_state
+                .as_ref()
+                .map(agent_session_config_probe_from_state)
+        });
+        let Some(mut probe) = probe else {
+            return;
+        };
+        // Provider Profile model configuration remains authoritative in the
+        // product catalog. Session-reported models are useful attachment-local
+        // facts but never become Profile model choices through this cache.
+        probe.models.clear();
+        let process = self.process();
+        if let Ok(mut evidence) = process.profile_config_evidence.lock() {
+            evidence.insert(process.provider_profile_id.clone(), probe);
+        }
+    }
+
+    fn replace_config_options(&self, update: &Value) {
+        if config_options_array(update).is_none() {
+            return;
+        }
+        let options = extract_config_options(update);
+        let process = self.process();
+        let profile_id = process.provider_profile_id.clone();
+        let generation = self.activation_generation();
+        let mut runtime_snapshot = None;
+        if let Ok(mut state) = self.state.lock() {
+            let current_model = extract_current_model_id(update);
+            let current_mode = extract_current_mode_id(update);
+            let models = extract_config_values(model_candidates(update));
+            let modes = extract_config_values(mode_candidates(update));
+            {
+                let discovery =
+                    state
+                        .session_config_state
+                        .get_or_insert_with(|| ProviderSessionConfigState {
+                            provider_kind: ProviderKind::Acp,
+                            provider_profile_id: Some(profile_id.clone()),
+                            native_session_id: Some(self.native_session_id.clone()),
+                            current_model: None,
+                            models: Vec::new(),
+                            current_mode: None,
+                            modes: Vec::new(),
+                            options: Vec::new(),
+                            source: "native_session_config_update".to_string(),
+                            updated_at_ms: unix_timestamp_ms(),
+                            metadata: Vec::new(),
+                        });
+                discovery.options = options.clone();
+                discovery.models = models;
+                discovery.modes = modes;
+                discovery.current_model =
+                    current_model
+                        .as_ref()
+                        .map(|model| ProviderSessionConfigValue {
+                            value: model.clone(),
+                            label: None,
+                        });
+                discovery.current_mode =
+                    current_mode
+                        .as_ref()
+                        .map(|mode| ProviderSessionConfigValue {
+                            value: mode.clone(),
+                            label: None,
+                        });
+                discovery.updated_at_ms = unix_timestamp_ms();
+                discovery.source = "native_session_config_update".to_string();
+            }
+            state.current_model_id = current_model;
+            state.current_mode_id = current_mode;
+            state.model_ids = state
+                .session_config_state
+                .as_ref()
+                .map(|discovery| {
+                    discovery
+                        .models
+                        .iter()
+                        .map(|model| model.value.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if let Some(planner) = state.session_config_planner.take() {
+                let planner = planner.with_options(options.clone());
+                let previous = state.session_runtime_config_state.clone();
+                let mut next = previous.clone();
+                for value in next.config_values.values_mut() {
+                    value.effective = None;
+                }
+                next.effective_model = state.current_model_id.clone();
+                next.effective_mode = state.current_mode_id.clone();
+                next.effective_reasoning_effort = None;
+                for option in &options {
+                    let Ok(key) = planner.option_key(&option.id) else {
+                        continue;
+                    };
+                    let effective = option.current_value.clone();
+                    match key.as_str() {
+                        crate::session_config::CANONICAL_MODEL => {
+                            next.effective_model = effective.map(|value| value.value);
+                        }
+                        crate::session_config::CANONICAL_REASONING_EFFORT => {
+                            next.effective_reasoning_effort = effective.map(|value| value.value);
+                        }
+                        "mode" => {
+                            next.effective_mode = effective.map(|value| value.value);
+                        }
+                        _ => {
+                            next.config_values
+                                .entry(key.to_string())
+                                .or_default()
+                                .effective = effective;
+                        }
+                    }
+                }
+                let effective_changed = previous.effective_model != next.effective_model
+                    || previous.effective_mode != next.effective_mode
+                    || previous.effective_reasoning_effort != next.effective_reasoning_effort
+                    || previous.config_values != next.config_values;
+                if effective_changed {
+                    next.state_revision = next.state_revision.saturating_add(1);
+                }
+                next.applied_activation_generation = None;
+                next.mark_generation_if_converged(generation);
+                state.session_runtime_config_state = next.clone();
+                state.session_config_planner = Some(planner);
+                runtime_snapshot = Some(next);
+            }
+        }
+        if let Some(runtime_snapshot) = runtime_snapshot
+            && let Ok(mut states) = process.runtime_config_states.lock()
+        {
+            states.insert(self.binding_id.clone(), runtime_snapshot);
+        }
+        self.publish_profile_config_evidence();
+    }
+
     fn session_config_planner(&self) -> Option<SessionConfigPlanner> {
         self.state
             .lock()
@@ -2520,6 +2665,9 @@ impl AcpSessionAttachment {
                         message: format!("ACP agent switched to mode {mode}"),
                     });
                 }
+            }
+            "config_option_update" | "config_options_update" => {
+                self.replace_config_options(update);
             }
             "usage_update" | "token_usage" => {
                 self.merge_context_window_usage(update);
@@ -2933,12 +3081,34 @@ impl AcpTerminalHost for DisabledAcpTerminalHost {
 
     fn terminal_auth_descriptor(
         &self,
-        _request: AcpTerminalAuthRequest,
+        request: AcpTerminalAuthRequest,
     ) -> VibexResult<TerminalAuthActionDescriptor> {
-        Err(VibexError::capability(
-            "acp_terminal_auth_host_unavailable",
-            "ACP terminal authentication requires a configured terminal host",
-        ))
+        Ok(redacted_terminal_auth_action_descriptor(request))
+    }
+}
+
+pub fn redacted_terminal_auth_action_descriptor(
+    request: AcpTerminalAuthRequest,
+) -> TerminalAuthActionDescriptor {
+    let args = redacted_args(&request.args);
+    TerminalAuthActionDescriptor {
+        id: format!(
+            "agent-auth-{}-{}",
+            request.provider_profile_id.as_str(),
+            request.method_id
+        ),
+        provider_profile_id: request.provider_profile_id.into_string(),
+        terminal_id: None,
+        title: redact_summary(&request.title),
+        command: redact_summary(&request.command),
+        args,
+        cwd: request.cwd,
+        env_keys: request.env.iter().map(|(key, _)| key.clone()).collect(),
+        redacted_env_summary: request
+            .env
+            .iter()
+            .map(|(key, _)| format!("{key}=[redacted]"))
+            .collect(),
     }
 }
 
@@ -4434,7 +4604,8 @@ pub struct AcpRuntimeClient {
     pub(crate) config_service: ProviderConfigService,
     attachment_router: Arc<AcpAttachmentRouter>,
     legacy_attachment_identities: Mutex<HashMap<String, LegacyAttachmentIdentity>>,
-    runtime_config_states: Mutex<HashMap<RuntimeBindingId, SessionRuntimeConfigState>>,
+    runtime_config_states: Arc<Mutex<HashMap<RuntimeBindingId, SessionRuntimeConfigState>>>,
+    profile_config_evidence: Arc<Mutex<BTreeMap<ProviderProfileId, AgentSessionConfigProbe>>>,
     restore_compatibility_keys:
         Mutex<HashMap<RuntimeBindingId, AgentSessionRestoreCompatibilityKey>>,
     restore_results: Mutex<HashMap<String, vibex_core::AgentSessionRestoreResult>>,
@@ -6879,7 +7050,8 @@ impl AcpRuntimeClient {
                 observability.clone(),
             )),
             legacy_attachment_identities: Mutex::new(HashMap::new()),
-            runtime_config_states: Mutex::new(HashMap::new()),
+            runtime_config_states: Arc::new(Mutex::new(HashMap::new())),
+            profile_config_evidence: Arc::new(Mutex::new(BTreeMap::new())),
             restore_compatibility_keys: Mutex::new(HashMap::new()),
             restore_results: Mutex::new(HashMap::new()),
             session_operation_locks: Mutex::new(HashMap::new()),
@@ -6920,7 +7092,8 @@ impl AcpRuntimeClient {
                 observability.clone(),
             )),
             legacy_attachment_identities: Mutex::new(HashMap::new()),
-            runtime_config_states: Mutex::new(HashMap::new()),
+            runtime_config_states: Arc::new(Mutex::new(HashMap::new())),
+            profile_config_evidence: Arc::new(Mutex::new(BTreeMap::new())),
             restore_compatibility_keys: Mutex::new(HashMap::new()),
             restore_results: Mutex::new(HashMap::new()),
             session_operation_locks: Mutex::new(HashMap::new()),
@@ -6941,6 +7114,18 @@ impl AcpRuntimeClient {
 
     pub fn observability(&self) -> Arc<RuntimeObservability> {
         self.observability.clone()
+    }
+
+    /// Latest product-safe session evidence keyed by Provider Profile. The
+    /// map is in-memory and is repopulated by real new/load/resume sessions and
+    /// subsequent ConfigOptionUpdate notifications.
+    pub fn profile_session_config_evidence(
+        &self,
+    ) -> VibexResult<BTreeMap<ProviderProfileId, AgentSessionConfigProbe>> {
+        self.profile_config_evidence
+            .lock()
+            .map(|evidence| evidence.clone())
+            .map_err(|_| lock_poisoned_error("profileConfigEvidence"))
     }
 
     pub fn route_key_for_agent(&self, agent_id: &AgentId) -> AgentRuntimeRouteKey {
@@ -8494,7 +8679,14 @@ impl AcpRuntimeClient {
 
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<String>();
         let debug_log = Arc::new(Mutex::new(AcpDebugLog::default()));
-        let terminal_host = self.terminal_host_for_config(config);
+        // Authentication methods are negotiated dynamically. A terminal
+        // method reported by initialize must not be disabled by a stale
+        // catalog snapshot or hidden static runtime flag.
+        let terminal_host = if purpose == AcpProcessPurpose::Authentication {
+            self.terminal_host.clone()
+        } else {
+            self.terminal_host_for_config(config)
+        };
         let mcp_servers = if purpose == AcpProcessPurpose::Session {
             resolve_acp_mcp_descriptors(config, runtime_resources)?
         } else {
@@ -8527,8 +8719,11 @@ impl AcpRuntimeClient {
             terminal_host: terminal_host
                 .clone()
                 .unwrap_or_else(|| Arc::new(DisabledAcpTerminalHost)),
+            runtime_config_states: Arc::clone(&self.runtime_config_states),
+            profile_config_evidence: Arc::clone(&self.profile_config_evidence),
             terminal_tools_enabled: terminal_host.is_some() && terminal_tools_enabled(config),
-            terminal_auth_enabled: terminal_host.is_some() && config.terminal_auth,
+            terminal_auth_enabled: terminal_host.is_some()
+                && (purpose == AcpProcessPurpose::Authentication || config.terminal_auth),
             mcp_servers,
             process_strategy_requested: config.process_strategy,
             process_strategy_effective,
@@ -10124,6 +10319,9 @@ impl ProviderProfileChangeListener for AcpRuntimeClient {
         provider_profile_id: &ProviderProfileId,
         profile_updated_at_ms: i64,
     ) {
+        if let Ok(mut evidence) = self.profile_config_evidence.lock() {
+            evidence.remove(provider_profile_id);
+        }
         match self.refresh_profile_process_config_status(provider_profile_id) {
             Ok(changed_processes) if changed_processes > 0 => {
                 tracing::info!(
@@ -10144,6 +10342,12 @@ impl ProviderProfileChangeListener for AcpRuntimeClient {
                     "ACP process configuration refresh failed after Profile save"
                 );
             }
+        }
+    }
+
+    fn on_provider_profile_deleted(&self, provider_profile_id: &ProviderProfileId) {
+        if let Ok(mut evidence) = self.profile_config_evidence.lock() {
+            evidence.remove(provider_profile_id);
         }
     }
 }
@@ -10206,6 +10410,22 @@ fn apply_session_state_to_attachment(
         provider_profile_id,
         Some(native_session_id),
     );
+}
+
+fn agent_session_config_probe_from_state(
+    state: &ProviderSessionConfigState,
+) -> AgentSessionConfigProbe {
+    let config_options = json!({ "configOptions": &state.options });
+    AgentSessionConfigProbe {
+        models: state
+            .models
+            .iter()
+            .map(|model| model.value.clone())
+            .collect(),
+        modes: state.modes.clone(),
+        reasoning_efforts: extract_probe_reasoning_efforts(&config_options),
+        options: state.options.clone(),
+    }
 }
 
 impl AcpRuntimeClient {
@@ -11853,6 +12073,114 @@ fn agent_probe_env_overlays(config: &AcpProviderConfig) -> Vec<(String, String)>
         .collect()
 }
 
+struct AgentAuthProcess {
+    process: Arc<AcpProcess>,
+    profile_id: ProviderProfileId,
+    parsed: crate::auth::ParsedAcpAuthCatalog,
+}
+
+async fn launch_agent_auth_process(
+    client: &AcpRuntimeClient,
+    agent_id: &AgentId,
+    provider_profile_id: Option<&ProviderProfileId>,
+) -> VibexResult<AgentAuthProcess> {
+    let (profile_id, config, cwd, env_overlays) = if let Some(profile_id) = provider_profile_id {
+        let profile = client
+            .config_service
+            .get_profile(profile_id)?
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "provider_profile_not_found",
+                    "Provider Profile was not found for Agent authentication",
+                )
+                .with_diagnostic("providerProfileId", profile_id.as_str())
+            })?;
+        if profile.agent_id != *agent_id {
+            return Err(VibexError::validation(
+                "agent_auth_profile_mismatch",
+                "Provider Profile belongs to another Agent",
+            )
+            .with_diagnostic("agentId", agent_id.as_str())
+            .with_diagnostic("profileAgentId", profile.agent_id.as_str()));
+        }
+        let config = client.profile_config(profile_id)?;
+        let cwd = AcpRuntimeClient::resolve_probe_cwd(&config, None)?;
+        let env = client.resolve_env_overlays_for_profile(&profile, &config, &cwd)?;
+        (profile_id.clone(), config, cwd, env)
+    } else {
+        let config = client
+            .config_service
+            .get_agent_acp_runtime_config(agent_id)?;
+        let cwd = AcpRuntimeClient::resolve_probe_cwd(&config, None)?;
+        let env = agent_probe_env_overlays(&config);
+        (ProviderProfileId::new(), config, cwd, env)
+    };
+    let effective_args =
+        effective_acp_process_args(&config, agent_id.as_str() == OPENCODE_AGENT_ID);
+    let configured_env_keys = env_overlays
+        .iter()
+        .map(|(key, _)| key.clone())
+        .collect::<BTreeSet<_>>();
+    let resources = ProviderRuntimeResources::default();
+    let process = client
+        .spawn_process(
+            AcpProcessInstanceId::new(),
+            AcpProcessLaunch {
+                profile_id: &profile_id,
+                agent_id: Some(agent_id),
+                config: &config,
+                cwd: &cwd,
+                runtime_resources: &resources,
+                purpose: AcpProcessPurpose::Authentication,
+                process_strategy_effective: AcpProcessStrategy::PerSession,
+                pool_fallback_reason: None,
+            },
+            Some(effective_args.clone()),
+            Some(env_overlays.clone()),
+            None,
+        )
+        .await?;
+    let initialize = match process
+        .request(
+            AcpOperation::Initialize.method(),
+            build_initialize_params(false, false, false, process.terminal_auth_enabled, false),
+            ACP_PROBE_TIMEOUT,
+        )
+        .await
+    {
+        Ok(initialize) => initialize,
+        Err(error) => {
+            process.shutdown().await;
+            return Err(error);
+        }
+    };
+    let mut parsed = parse_initialize_auth_catalog(
+        agent_id.clone(),
+        &initialize,
+        &config.command,
+        &effective_args,
+        &env_overlays,
+        Some(cwd.to_string_lossy().into_owned()),
+    );
+    if !process.terminal_auth_enabled {
+        parsed
+            .catalog
+            .methods
+            .retain(|method| method.kind != AgentAuthMethodKind::Terminal);
+        parsed.terminal_methods.clear();
+    }
+    for method in &mut parsed.catalog.methods {
+        for variable in &mut method.environment {
+            variable.configured = configured_env_keys.contains(&variable.name);
+        }
+    }
+    Ok(AgentAuthProcess {
+        process,
+        profile_id,
+        parsed,
+    })
+}
+
 async fn probe_runtime_session_config_with_config(
     client: &AcpRuntimeClient,
     profile_id: &ProviderProfileId,
@@ -11916,6 +12244,128 @@ async fn probe_runtime_session_config_with_config(
 
 #[async_trait]
 impl AcpClient for AcpRuntimeClient {
+    async fn list_auth_methods(
+        &self,
+        agent_id: &AgentId,
+        provider_profile_id: Option<&ProviderProfileId>,
+    ) -> VibexResult<AgentAuthCatalog> {
+        let auth = launch_agent_auth_process(self, agent_id, provider_profile_id).await?;
+        let catalog = auth.parsed.catalog;
+        auth.process.shutdown().await;
+        Ok(catalog)
+    }
+
+    async fn authenticate_agent(
+        &self,
+        request: AgentAuthenticateRequest,
+    ) -> VibexResult<AgentAuthenticateResult> {
+        let auth = launch_agent_auth_process(
+            self,
+            &request.agent_id,
+            request.provider_profile_id.as_ref(),
+        )
+        .await?;
+        let method = auth
+            .parsed
+            .catalog
+            .methods
+            .iter()
+            .find(|method| method.id == request.method_id)
+            .cloned()
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "agent_auth_method_not_advertised",
+                    "Agent did not advertise the selected authentication method",
+                )
+                .with_diagnostic("agentId", request.agent_id.as_str())
+                .with_diagnostic("methodId", request.method_id.as_str())
+            });
+        let result = async {
+            match method {
+                Ok(method) if method.kind == AgentAuthMethodKind::Terminal => {
+                    let terminal = auth
+                        .parsed
+                        .terminal_methods
+                        .get(&request.method_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            VibexError::provider(
+                                "agent_terminal_auth_descriptor_missing",
+                                "Agent terminal authentication method is incomplete",
+                            )
+                        })?;
+                    let descriptor = auth.process.terminal_host.terminal_auth_descriptor(
+                        AcpTerminalAuthRequest {
+                            provider_profile_id: auth.profile_id.clone(),
+                            method_id: request.method_id.clone(),
+                            title: terminal.title,
+                            command: terminal.command,
+                            args: terminal.args,
+                            cwd: terminal.cwd,
+                            env: terminal.env,
+                        },
+                    )?;
+                    Ok(AgentAuthenticateResult {
+                        method_id: request.method_id,
+                        terminal: Some(descriptor),
+                    })
+                }
+                Ok(method)
+                    if method.kind == AgentAuthMethodKind::Environment
+                        && request.provider_profile_id.is_none() =>
+                {
+                    Err(VibexError::validation(
+                        "agent_auth_profile_required",
+                        "Environment authentication requires a Provider Profile",
+                    ))
+                }
+                Ok(_) => {
+                    auth.process
+                        .request(
+                            AcpOperation::Authenticate.method(),
+                            protocol::build_authenticate_params(&request.method_id),
+                            ACP_HANDSHAKE_TIMEOUT,
+                        )
+                        .await?;
+                    Ok(AgentAuthenticateResult {
+                        method_id: request.method_id,
+                        terminal: None,
+                    })
+                }
+                Err(error) => Err(error),
+            }
+        }
+        .await;
+        auth.process.shutdown().await;
+        result
+    }
+
+    async fn logout_agent(&self, request: AgentLogoutRequest) -> VibexResult<()> {
+        let auth = launch_agent_auth_process(
+            self,
+            &request.agent_id,
+            request.provider_profile_id.as_ref(),
+        )
+        .await?;
+        let result = if auth.parsed.catalog.supports_logout {
+            auth.process
+                .request(
+                    AcpOperation::Logout.method(),
+                    protocol::build_logout_params(),
+                    ACP_HANDSHAKE_TIMEOUT,
+                )
+                .await
+                .map(|_| ())
+        } else {
+            Err(VibexError::capability(
+                "agent_logout_not_advertised",
+                "Agent did not advertise logout support",
+            ))
+        };
+        auth.process.shutdown().await;
+        result
+    }
+
     async fn create_session(&self, request: AcpCreateSessionRequest) -> VibexResult<AcpSession> {
         let operation_lock = self.session_operation_lock(&request.session_id)?;
         let _operation_guard = operation_lock.lock().await;
@@ -14503,6 +14953,7 @@ mod tests {
         killed: std::sync::Mutex<Vec<TerminalId>>,
         released: std::sync::Mutex<Vec<TerminalId>>,
         waited: std::sync::Mutex<Vec<TerminalId>>,
+        auth_requests: std::sync::Mutex<Vec<AcpTerminalAuthRequest>>,
     }
 
     #[async_trait]
@@ -14550,20 +15001,8 @@ mod tests {
             &self,
             request: AcpTerminalAuthRequest,
         ) -> VibexResult<TerminalAuthActionDescriptor> {
-            Ok(TerminalAuthActionDescriptor {
-                id: request.method_id,
-                provider_profile_id: request.provider_profile_id.into_string(),
-                title: request.title,
-                command: request.command,
-                args: request.args,
-                cwd: request.cwd,
-                env_keys: request.env.iter().map(|(key, _)| key.clone()).collect(),
-                redacted_env_summary: request
-                    .env
-                    .iter()
-                    .map(|(key, _)| format!("{key}=[redacted]"))
-                    .collect(),
-            })
+            self.auth_requests.lock().unwrap().push(request.clone());
+            Ok(redacted_terminal_auth_action_descriptor(request))
         }
     }
 
@@ -14597,6 +15036,8 @@ mod tests {
             child: tokio::sync::Mutex::new(child),
             shutdown_lock: tokio::sync::Mutex::new(()),
             terminal_host,
+            runtime_config_states: Arc::new(Mutex::new(HashMap::new())),
+            profile_config_evidence: Arc::new(Mutex::new(BTreeMap::new())),
             terminal_tools_enabled,
             terminal_auth_enabled,
             mcp_servers: Vec::new(),
@@ -15167,7 +15608,11 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
                 method_id: "login".to_string(),
                 title: "Login".to_string(),
                 command: "opencode".to_string(),
-                args: vec!["auth".to_string()],
+                args: vec![
+                    "auth".to_string(),
+                    "--token".to_string(),
+                    "plain-secret-value".to_string(),
+                ],
                 cwd: Some("/tmp/workspace".to_string()),
                 env: vec![(
                     "OPENCODE_AUTH_TOKEN".to_string(),
@@ -15179,6 +15624,11 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
         let rendered = format!("{descriptor:?}");
         assert!(rendered.contains("OPENCODE_AUTH_TOKEN"));
         assert!(!rendered.contains("secret-token-value"));
+        assert!(!rendered.contains("plain-secret-value"));
+        assert_eq!(
+            descriptor.args,
+            vec!["[redacted]", "[redacted]", "[redacted]"]
+        );
     }
 
     #[test]
@@ -16744,6 +17194,7 @@ set_model_mode = os.environ.get("VIBEX_MOCK_ACP_SET_MODEL_MODE", "supported")
 prompt_mode = os.environ.get("VIBEX_MOCK_ACP_PROMPT_MODE", "success")
 restore_mode = os.environ.get("VIBEX_MOCK_ACP_RESTORE_MODE", "success")
 advertise_resume = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_RESUME") == "true"
+advertise_auth = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_AUTH") == "true"
 session_new_delay = float(os.environ.get("VIBEX_MOCK_ACP_SESSION_NEW_DELAY", "0"))
 fail_first_session_new = os.environ.get("VIBEX_MOCK_ACP_FAIL_FIRST_SESSION_NEW") == "true"
 
@@ -16769,15 +17220,42 @@ for line in sys.stdin:
         }
         if advertise_resume:
             capabilities["sessionCapabilities"] = {"resume": {}}
+        if advertise_auth:
+            capabilities["auth"] = {"logout": {}}
+        result = {
+            "protocolVersion": 1,
+            "agentCapabilities": capabilities,
+            "agentInfo": {"name": "mock-acp", "version": "1.0.0"},
+        }
+        if advertise_auth:
+            result["authMethods"] = [
+                {
+                    "id": "browser-login",
+                    "name": "Browser login",
+                    "description": "Authenticate in the browser",
+                },
+                {
+                    "type": "env_var",
+                    "id": "api-key",
+                    "name": "API key",
+                    "vars": [{"name": "MOCK_API_KEY"}],
+                    "link": "https://example.invalid/keys",
+                },
+                {
+                    "type": "terminal",
+                    "id": "terminal-login",
+                    "name": "Terminal login",
+                    "args": ["auth", "login"],
+                    "env": {"MOCK_AUTH_FLOW": "terminal"},
+                },
+            ]
         send({
             "jsonrpc": "2.0",
             "id": mid,
-            "result": {
-                "protocolVersion": 1,
-                "agentCapabilities": capabilities,
-                "agentInfo": {"name": "mock-acp", "version": "1.0.0"},
-            },
+            "result": result,
         })
+    elif method == "authenticate" or method == "logout":
+        send({"jsonrpc": "2.0", "id": mid, "result": {}})
     elif method == "model/list":
         send({
             "jsonrpc": "2.0",
@@ -17540,6 +18018,26 @@ for line in sys.stdin:
                 .unwrap();
         }
 
+        fn enable_auth_methods(&self) {
+            let service = self.service();
+            let mut config = service
+                .get_acp_profile_config(self.profile_id.clone())
+                .unwrap();
+            config.env.push(vibex_core::AcpProviderEnvReference {
+                key: "VIBEX_MOCK_ACP_ADVERTISE_AUTH".to_string(),
+                source: AcpProviderEnvSource::Literal,
+                value: Some("true".to_string()),
+                secret_lookup_key: None,
+                redacted_hint: "mock auth capability".to_string(),
+            });
+            service
+                .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                    provider_profile_id: self.profile_id.clone(),
+                    config,
+                })
+                .unwrap();
+        }
+
         fn set_session_new_delay(&self, delay_seconds: &str) {
             let service = self.service();
             let mut config = service
@@ -17599,6 +18097,121 @@ for line in sys.stdin:
         fn cleanup(self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_auth_methods_authenticate_terminal_and_logout_round_trip() {
+        let agent_id = AgentId::parse("codex").unwrap();
+        let Some(fixture) =
+            MockAcpFixture::create_for_agent("agent-auth-round-trip", Some(agent_id.clone()))
+        else {
+            return;
+        };
+        fixture.enable_auth_methods();
+        let terminal_host = Arc::new(MockTerminalHost::default());
+        let client = AcpRuntimeClient::with_terminal_host(fixture.service(), terminal_host.clone());
+
+        let catalog = client
+            .list_auth_methods(&agent_id, Some(&fixture.profile_id))
+            .await
+            .unwrap();
+        assert!(catalog.supports_logout);
+        assert_eq!(catalog.methods.len(), 3);
+        assert_eq!(catalog.methods[0].id, "browser-login");
+        assert_eq!(catalog.methods[1].kind, AgentAuthMethodKind::Environment);
+        assert!(!catalog.methods[1].environment[0].configured);
+        assert_eq!(catalog.methods[2].kind, AgentAuthMethodKind::Terminal);
+
+        let browser = client
+            .authenticate_agent(AgentAuthenticateRequest {
+                agent_id: agent_id.clone(),
+                provider_profile_id: Some(fixture.profile_id.clone()),
+                method_id: "browser-login".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(browser.terminal.is_none());
+        let environment = client
+            .authenticate_agent(AgentAuthenticateRequest {
+                agent_id: agent_id.clone(),
+                provider_profile_id: Some(fixture.profile_id.clone()),
+                method_id: "api-key".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(environment.terminal.is_none());
+        let terminal = client
+            .authenticate_agent(AgentAuthenticateRequest {
+                agent_id: agent_id.clone(),
+                provider_profile_id: Some(fixture.profile_id.clone()),
+                method_id: "terminal-login".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(terminal.terminal.is_some());
+        {
+            let auth_requests = terminal_host.auth_requests.lock().unwrap();
+            assert_eq!(auth_requests.len(), 1);
+            let terminal_request = &auth_requests[0];
+            assert_eq!(terminal_request.command, which_python().unwrap());
+            assert!(
+                terminal_request
+                    .args
+                    .ends_with(&["auth".to_string(), "login".to_string(),])
+            );
+            assert!(
+                terminal_request
+                    .env
+                    .iter()
+                    .any(|(key, value)| key == "MOCK_AUTH_FLOW" && value == "terminal")
+            );
+        }
+
+        client
+            .logout_agent(AgentLogoutRequest {
+                agent_id,
+                provider_profile_id: Some(fixture.profile_id.clone()),
+            })
+            .await
+            .unwrap();
+        let log = fixture.request_log();
+        assert_eq!(logged_request_count(&log, "authenticate"), 2);
+        assert_eq!(logged_request_count(&log, "logout"), 1);
+        assert_eq!(
+            find_logged_request(&log, "authenticate")["params"]["methodId"],
+            "browser-login"
+        );
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_auth_discovery_hides_terminal_methods_without_a_terminal_host() {
+        let agent_id = AgentId::parse("codex").unwrap();
+        let Some(fixture) =
+            MockAcpFixture::create_for_agent("agent-auth-no-terminal-host", Some(agent_id.clone()))
+        else {
+            return;
+        };
+        fixture.enable_auth_methods();
+        let client = AcpRuntimeClient::new(fixture.service());
+
+        let catalog = client
+            .list_auth_methods(&agent_id, Some(&fixture.profile_id))
+            .await
+            .unwrap();
+        assert!(
+            catalog
+                .methods
+                .iter()
+                .all(|method| method.kind != AgentAuthMethodKind::Terminal)
+        );
+        let log = fixture.request_log();
+        let initialize = find_logged_request(&log, "initialize");
+        assert_eq!(
+            initialize["params"]["clientCapabilities"]["auth"]["terminal"],
+            false
+        );
+        fixture.cleanup();
     }
 
     fn fixture_mcp_resources() -> ProviderRuntimeResources {
@@ -20395,6 +21008,80 @@ for line in sys.stdin:
                 .unwrap()
                 .contains_key(&binding_id)
         );
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn config_option_update_replaces_withdrawn_options_and_profile_evidence() {
+        let Some(fixture) = MockAcpFixture::create("config-option-update-replace") else {
+            return;
+        };
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let attachment = client.current_attachment(&session_id).unwrap();
+        let payload = attachment.payload();
+        payload.replace_config_options(&json!({
+            "configOptions": [{
+                "id": "thought_level",
+                "category": "thought_level",
+                "label": "Thought level",
+                "type": "select",
+                "currentValue": "high",
+                "options": [
+                    { "value": "low", "label": "Low" },
+                    { "value": "high", "label": "High" }
+                ]
+            }]
+        }));
+
+        let planner = {
+            let state = payload.state.lock().unwrap();
+            let discovery = state.session_config_state.as_ref().unwrap();
+            assert_eq!(discovery.options.len(), 1);
+            assert_eq!(discovery.options[0].id, "thought_level");
+            assert!(discovery.models.is_empty());
+            assert!(discovery.modes.is_empty());
+            assert!(discovery.current_model.is_none());
+            assert!(discovery.current_mode.is_none());
+            assert!(state.model_ids.is_empty());
+            assert!(state.current_model_id.is_none());
+            assert!(state.current_mode_id.is_none());
+            state.session_config_planner.clone().unwrap()
+        };
+
+        let stale_key =
+            crate::session_config::CanonicalSessionConfigKey::parse("autoApply").unwrap();
+        let current_key =
+            crate::session_config::CanonicalSessionConfigKey::parse("thought_level").unwrap();
+        assert!(planner.option_for_key(&stale_key).unwrap().is_none());
+        assert!(planner.option_for_key(&current_key).unwrap().is_some());
+
+        let evidence = client.profile_session_config_evidence().unwrap();
+        let profile_evidence = evidence.get(&fixture.profile_id).unwrap();
+        assert!(profile_evidence.models.is_empty());
+        assert!(profile_evidence.modes.is_empty());
+        assert_eq!(profile_evidence.options.len(), 1);
+        assert_eq!(
+            profile_evidence
+                .reasoning_efforts
+                .iter()
+                .map(|effort| effort.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "high"]
+        );
+
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        client.close_session(&binding).await.unwrap();
         fixture.cleanup();
     }
 

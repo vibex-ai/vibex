@@ -74,6 +74,128 @@ the Vibex session and Provider Profile. A per-turn temporary directory is only
 valid for stateless probes such as model listing; it must not be used for turns
 that later resume a native thread/session id.
 
+## Scenario: ACP Agent Authentication And Profile Secret Transactions
+
+### 1. Scope / Trigger
+
+- Trigger: an ACP Agent advertises an environment-variable authentication
+  method and the Management Center saves or clears its credentials.
+- Trigger: an authentication method must work across Agents whose environment
+  key names differ, while preserving Vibex's multi-Profile switching and
+  keychain ownership.
+- This contract crosses ACP discovery, Provider Profile persistence, OS
+  keychain writes, legacy Provider projection, and runtime process injection.
+
+### 2. Signatures
+
+```text
+update_agent_auth_environment(AgentAuthEnvironmentUpdateRequest)
+  -> ProviderProfile
+
+AgentAuthEnvironmentUpdateRequest {
+  agent_id, provider_profile_id, method_id,
+  values: AgentAuthEnvironmentValue[]
+}
+AgentAuthEnvironmentValue {
+  name, value?, secret, optional, clear
+}
+
+AcpProviderEnvReference {
+  key, source: literal | process_environment | secret_reference,
+  value?, secret_lookup_key?, redacted_hint
+}
+```
+
+### 3. Contracts
+
+- The method id and exact variable names come from the same
+  `initialize.authMethods` catalog shown to the user. The service preserves
+  the Agent's key spelling; it does not normalize every credential to
+  `API_KEY`.
+- `secret = true` stores plaintext only through the OS keychain and records an
+  opaque Profile-local `ProviderSecretReference`. The ACP config stores a
+  `SecretReference`, never the value. Non-secret values use a typed literal
+  env reference.
+- A blank value with `clear = false` preserves an existing reference. Removal
+  requires `clear = true`; clearing a required variable leaves the Profile
+  without a usable credential and the UI reports authentication required.
+- Profiles never share secret lookup keys by accident: a new key is scoped to
+  the Profile and exact environment name. Existing references are updated in
+  place so Profile switching remains stable.
+- The transaction captures previous keychain values, applies new values, then
+  commits the Profile and secret-reference rows together. A database/readback/
+  commit failure restores prior keychain values and removes newly created ones.
+  Obsolete keychain entries are deleted only after the Profile commit succeeds.
+- Legacy Provider projection may already provide an environment key. The
+  update preserves an existing projected reference when the user leaves the
+  masked field blank, and removes it only on explicit replacement/clear.
+- Runtime resolution reads the selected Profile's references at process launch;
+  authentication changes do not write native Agent config files or global user
+  home state.
+- Secret values and resolved keychain material are absent from Profile JSON,
+  diagnostics, Debug, runtime-option snapshots, and projection previews.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Profile missing | `provider_profile_not_found`. |
+| Profile Agent differs from request Agent | `agent_auth_profile_mismatch`. |
+| Profile is not ACP | `agent_auth_profile_kind_invalid`. |
+| Empty/control/oversized method id | `agent_auth_method_id_invalid`. |
+| Empty, malformed, or duplicate env key | `agent_auth_env_key_invalid`. |
+| `clear = true` and a non-empty value are both supplied | `agent_auth_env_clear_value_conflict`. |
+| Required value is absent and no existing reference is preserved | `agent_auth_env_value_required`. |
+| Keychain write/readback fails | return the storage error and restore every already-applied keychain value. |
+| Profile transaction fails after keychain writes | return the storage error and report `keychainRollbackFailures` only when restoration also fails. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: one Agent advertises `GEMINI_API_KEY`, another advertises
+  `OPENAI_API_KEY`; each Profile stores the exact key in its own reference and
+  the runtime injects only the selected Profile's value.
+- Good: editing a masked configured field while leaving it blank keeps the
+  previous keychain value; pressing Clear removes the reference explicitly.
+- Base: a non-secret project id is stored as a literal env value and appears
+  only in redacted configuration metadata.
+- Bad: write a secret into `AcpProviderConfig.value`, reuse one global lookup
+  key for every Profile, or delete the old keychain value before the DB commit.
+- Bad: save credentials by editing a native Agent config file or trigger a
+  hidden `session/new` probe for every Profile save.
+
+### 6. Tests Required
+
+- `cargo test -p vibex-config-switch agent_auth_environment_preserves_and_clears_projected_profile_secrets --locked`
+  asserts projection compatibility and explicit clear semantics.
+- `cargo test -p vibex-config-switch agent_auth_environment_preserves_blank_values_and_requires_explicit_clear --locked`
+  asserts masked-input preservation and required-field validation.
+- `cargo test -p vibex-config-switch agent_auth_environment_rolls_back_keychain_writes_when_database_commit_fails --locked`
+  asserts transaction rollback and no leaked new secret.
+- Provider projection/debug tests assert that serialized Profiles and previews
+  contain lookup metadata only, never plaintext values.
+- Runtime authentication tests assert the selected Profile's env overlay is
+  used and another Profile's secret is never injected.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+profile.provider_options.insert("API_KEY", user_input);
+```
+
+#### Correct
+
+```rust
+let lookup_key = profile_scoped_lookup_key(&profile.id, &advertised_name);
+store_keychain(&lookup_key, value)?;
+profile.env.push(secret_reference(&advertised_name, &lookup_key));
+commit_profile_or_restore_keychain(previous_values)?;
+```
+
+The Profile owns the reference and switching context; the Agent owns the exact
+environment key and the final ACP authentication decision.
+
 ## Import and Export
 
 Import existing Claude/Codex configuration in read-only mode by default. Imported

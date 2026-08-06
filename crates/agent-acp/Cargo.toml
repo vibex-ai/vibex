@@ -12,7 +12,7 @@ base64.workspace = true
 command-group.workspace = true
 # Official typed ACP wire schema. Pin upgrades so the Compatibility Registry
 # and frozen serialization contract move together.
-agent-client-protocol-schema = { version = "=1.6.0", features = ["unstable_elicitation"] }
+agent-client-protocol-schema = { version = "=1.6.0", features = ["unstable_auth_methods", "unstable_elicitation"] }
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true

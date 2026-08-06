@@ -8,9 +8,10 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 use vibex_core::{
+    AgentAuthCatalog, AgentAuthenticateRequest, AgentAuthenticateResult,
     AgentCommandDiscoverRequest, AgentCommandDiscoverResponse, AgentCommandExecuteRequest, AgentId,
-    AgentModelListResponse, AgentModelListSource, AgentSessionConfigProbe, AgentSessionSafety,
-    AgentUsageCounterOrigin, AgentUsageExecution, AgentUsageExecutionContext,
+    AgentLogoutRequest, AgentModelListResponse, AgentModelListSource, AgentSessionConfigProbe,
+    AgentSessionSafety, AgentUsageCounterOrigin, AgentUsageExecution, AgentUsageExecutionContext,
     AgentUsageExecutionStatusUpdate, AgentUsageObservation, ElicitationResolution,
     ExternalSessionImportCandidate, MessageAttachment, MessageSubmissionId, PermissionResolution,
     ProviderBinding, ProviderBindingMetadata, ProviderCapabilities, ProviderKind,
@@ -423,6 +424,34 @@ pub trait AgentProvider: Send + Sync {
         _provider_profile_id: Option<&ProviderProfileId>,
     ) -> ProviderCapabilities {
         self.capabilities()
+    }
+
+    async fn list_auth_methods(
+        &self,
+        _agent_id: &AgentId,
+        _provider_profile_id: Option<&ProviderProfileId>,
+    ) -> VibexResult<AgentAuthCatalog> {
+        Err(VibexError::capability(
+            "agent_auth_discovery_unsupported",
+            "authentication discovery is not supported by this provider",
+        ))
+    }
+
+    async fn authenticate_agent(
+        &self,
+        _request: AgentAuthenticateRequest,
+    ) -> VibexResult<AgentAuthenticateResult> {
+        Err(VibexError::capability(
+            "agent_authenticate_unsupported",
+            "authentication is not supported by this provider",
+        ))
+    }
+
+    async fn logout_agent(&self, _request: AgentLogoutRequest) -> VibexResult<()> {
+        Err(VibexError::capability(
+            "agent_logout_unsupported",
+            "logout is not supported by this provider",
+        ))
     }
 
     async fn list_models(

@@ -5,6 +5,7 @@
 
 mod acp_catalog;
 pub mod agent;
+pub mod agent_auth;
 pub mod agent_config;
 pub mod agent_provider_runtime;
 pub mod automation_graph;
@@ -46,6 +47,11 @@ pub use agent::{
     GetMessageSubmissionRequest, MAX_MESSAGE_IDEMPOTENCY_KEY_LEN, MessageSubmissionState,
     ProviderCapabilitiesResponse, RenameAgentSessionRequest, ResolveElicitationRequest,
     ResolvePermissionRequest, SendAgentMessageRequest, agent_session_turn_requires_continuation,
+};
+pub use agent_auth::{
+    AgentAuthCatalog, AgentAuthEnvironmentUpdateRequest, AgentAuthEnvironmentValue,
+    AgentAuthEnvironmentVariable, AgentAuthMethod, AgentAuthMethodKind, AgentAuthStatus,
+    AgentAuthenticateRequest, AgentAuthenticateResult, AgentLogoutRequest,
 };
 pub use agent_config::{
     AgentCatalogListResponse, AgentCommandConfig, AgentConfig, AgentConfigStatus, AgentDefinition,

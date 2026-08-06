@@ -94,6 +94,17 @@ impl ProviderManagementFacade {
         self.service.list_profiles()
     }
 
+    pub fn update_agent_auth_environment(
+        &self,
+        request: vibex_core::AgentAuthEnvironmentUpdateRequest,
+    ) -> VibexResult<vibex_core::ProviderProfile> {
+        let _claim = self.mutation_guard.claim(format!(
+            "agent:auth-env:{}:{}",
+            request.agent_id, request.provider_profile_id
+        ))?;
+        self.service.update_agent_auth_environment(request)
+    }
+
     pub fn list_model_provider_profiles(
         &self,
     ) -> VibexResult<Vec<vibex_core::ModelProviderProfile>> {

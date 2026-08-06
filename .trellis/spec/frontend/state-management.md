@@ -1542,6 +1542,130 @@ fold those aliases into the Workspace owned by a Project with a current
 checkout and aggregate their Sessions there. This compatibility projection is
 non-destructive and must not delete or rewrite stored Workspace references.
 
+## Scenario: GPUI Agent Authentication Projection
+
+### 1. Scope / Trigger
+
+- Trigger: a user selects an Agent in the Management Center and the detail
+  surface must show the current ACP authentication methods.
+- Trigger: discovery, environment save, native Agent login, terminal login,
+  logout, and terminal exit can complete out of order while the user changes
+  Agent or Provider Profile.
+- The Agent detail surface must keep authentication understandable without
+  exposing runtime verification, runtime-option, or Provider projection
+  implementation panels.
+
+### 2. Signatures
+
+```text
+auth_scope = (agent_id: String, provider_profile_id: Option<String>)
+
+ManagementCenter {
+  agent_auth_generation: u64,
+  agent_auth_scope: Option<auth_scope>,
+  agent_auth_catalog: Option<AgentAuthCatalog>,
+  agent_auth_inputs: Map<(method_id, env_name), InputState>,
+  agent_auth_terminal: Option<TerminalAuthActionDescriptor>,
+  agent_auth_terminal_state: None | Running | Succeeded | Failed
+}
+
+load_agent_auth(force) -> BackendFuture<AgentAuthCatalog>
+authenticate_agent(method_id) -> BackendFuture<(AgentAuthCatalog, terminal?)>
+logout_agent() -> BackendFuture<AgentAuthCatalog>
+```
+
+### 3. Contracts
+
+- The catalog is rendered from the Agent's dynamic `AgentAuthMethod` list.
+  `Agent`, `Environment`, and `Terminal` kinds each have their own action and
+  input treatment; the UI never creates a generic API-key field for an Agent
+  that did not advertise one.
+- An auth callback may mutate state only when its generation and exact scope
+  still match. Selecting another Agent/Profile clears inputs, errors, catalog,
+  terminal surface, and the old temporary terminal.
+- Environment inputs are keyed by an unambiguous `(method_id, env_name)` value,
+  masked when `secret`, and show only `configured` for an existing secret.
+  Empty masked input means preserve; Clear is an explicit action. Plaintext
+  values are sent only in the single backend mutation and are never copied to
+  snapshots, Debug, or notices.
+- The Agent page renders authentication first, followed by Provider Profile
+  configuration. Runtime verification, runtime-option catalogs, and Provider
+  projection internals are not rendered in the Agent detail surface.
+- Logout is rendered only when the catalog advertises `supports_logout`.
+  Discovery/auth errors are structured status text; they do not expose raw ACP
+  envelopes or credential values.
+- A terminal method opens a shared PTY surface with a bounded fixed panel size,
+  retains the final output, shows running/succeeded/failed state, and treats
+  non-zero or signaled exit as authentication failure. The temporary terminal
+  is killed on close, scope change, runtime disconnect, or stale callback and
+  is excluded from persisted workspace terminals.
+- The UI exposes refresh/retry, loading, unavailable, not-verified,
+  authentication-required, authenticated, and terminal-pending states without
+  making a hover-only primary action.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| No runtime or disabled Agent | disable auth actions and show the unavailable state. |
+| Discovery completes for an old scope/generation | ignore it; keep the current Agent/Profile state. |
+| Environment method has no Profile | keep the action disabled and show the Profile-required state. |
+| Required credential is explicitly cleared | refresh catalog, mark authentication required, and do not invoke ACP authenticate. |
+| Terminal callback is stale or terminal was closed | kill/release the old terminal if still owned; do not alter current auth state. |
+| Terminal exits non-zero or by signal | show failed state and the structured exit diagnostic only. |
+| Logout is not advertised | do not render the logout action. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: selecting a new Profile while auth discovery is in flight leaves the
+  new Profile's catalog intact when the old request returns.
+- Good: two methods both contain a variable named `TOKEN`; their input state
+  remains independent because the method id is part of the key.
+- Good: a terminal login remains visible while running, then reports its final
+  output and refreshes auth status after exit.
+- Base: an Agent advertises no methods; the page shows a compact unavailable
+  state and still allows Provider Profile management.
+- Bad: show runtime validation or projection debug cards beside auth methods,
+  fill a configured secret into an InputState, or let a stale callback replace
+  the selected Agent's credentials.
+
+### 6. Tests Required
+
+- Desktop Management tests assert that the Agent renderer includes dynamic
+  method kinds and authentication, while internal runtime panels are absent.
+- Input-key tests assert `(method_id, env_name)` cannot collide and that masked
+  configured values are represented by a placeholder only.
+- Generation/scope tests assert stale discovery, mutation, logout, and terminal
+  monitor callbacks do not mutate current state.
+- Terminal tests assert bounded surface creation, final output retention,
+  success/failure/signal classification, and temporary-terminal cleanup.
+- Run the locked `vibex-desktop`, `vibex-desktop-runtime`, and `vibex-terminal`
+  tests plus dark-mode/responsive checks for the Management Center.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+self.auth_catalog = response.catalog;
+self.auth_inputs.insert(variable.name, input);
+```
+
+#### Correct
+
+```rust
+if response.generation == self.agent_auth_generation
+    && response.scope == self.agent_auth_scope
+{
+    self.agent_auth_catalog = Some(response.catalog);
+    self.agent_auth_inputs
+        .insert((method_id, variable_name), input);
+}
+```
+
+The view owns transient presentation state; `DesktopRuntime` and the ACP
+adapter remain authoritative for authentication and credentials.
+
 ## Scenario: GPUI Management Section Lifetime
 
 ### 1. Scope / Trigger

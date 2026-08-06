@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use vibex_agent::AgentManager;
-use vibex_agent_acp::{RuntimeOptionCatalogAgentEvidence, build_runtime_option_catalog_for_agents};
+use vibex_agent_acp::{
+    AcpRuntimeClient, RuntimeOptionCatalogProfileEvidence, build_runtime_option_catalog,
+};
 use vibex_config_switch::ProviderConfigService;
 use vibex_core::{AgentId, AgentListRequest, SessionRuntimeOptionCatalog, VibexError};
 use vibex_db::{
@@ -31,6 +33,7 @@ pub struct RuntimeOptionProbeResult {
 pub struct RuntimeOptionCatalogService {
     manager: Arc<AgentManager>,
     provider_config: ProviderConfigService,
+    live_runtime: Option<Arc<AcpRuntimeClient>>,
     probe_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -39,6 +42,20 @@ impl RuntimeOptionCatalogService {
         Self {
             manager,
             provider_config,
+            live_runtime: None,
+            probe_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+
+    pub fn with_live_runtime(
+        manager: Arc<AgentManager>,
+        provider_config: ProviderConfigService,
+        live_runtime: Arc<AcpRuntimeClient>,
+    ) -> Self {
+        Self {
+            manager,
+            provider_config,
+            live_runtime: Some(live_runtime),
             probe_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -49,7 +66,7 @@ impl RuntimeOptionCatalogService {
         })?;
         let profiles = self.provider_config.list_profiles()?;
         let snapshots = self.snapshot_map()?;
-        let mut evidence = BTreeMap::new();
+        let mut fallback_by_agent = BTreeMap::new();
 
         for agent in &agents.agents {
             if !agent.added || !agent.enabled {
@@ -57,9 +74,10 @@ impl RuntimeOptionCatalogService {
             }
             let snapshot = snapshots.get(&agent.id);
             let session_probe = snapshot.and_then(|snapshot| snapshot.session_config.as_ref());
-            evidence.insert(
+            fallback_by_agent.insert(
                 agent.id.clone(),
-                RuntimeOptionCatalogAgentEvidence {
+                RuntimeOptionCatalogProfileEvidence {
+                    models: Vec::new(),
                     modes: session_probe
                         .map(|probe| probe.modes.clone())
                         .unwrap_or_default(),
@@ -76,13 +94,25 @@ impl RuntimeOptionCatalogService {
             );
         }
 
-        Ok(build_runtime_option_catalog_for_agents(
+        // Fast startup uses the persisted Agent snapshot. As soon as a real
+        // session has opened, its Profile-scoped evidence replaces that
+        // fallback and ConfigOptionUpdate keeps it current.
+        let live_by_profile = self
+            .live_runtime
+            .as_ref()
+            .map(|runtime| runtime.profile_session_config_evidence())
+            .transpose()?
+            .unwrap_or_default();
+        let evidence_by_profile =
+            layer_profile_session_evidence(&profiles, &fallback_by_agent, live_by_profile);
+
+        Ok(build_runtime_option_catalog(
             &agents.agents,
             &profiles
                 .iter()
                 .map(vibex_core::ProviderProfile::summary)
                 .collect::<Vec<_>>(),
-            &evidence,
+            &evidence_by_profile,
         ))
     }
 
@@ -277,6 +307,37 @@ impl RuntimeOptionCatalogService {
         })?;
         Ok(true)
     }
+}
+
+fn layer_profile_session_evidence(
+    profiles: &[vibex_core::ProviderProfile],
+    fallback_by_agent: &BTreeMap<AgentId, RuntimeOptionCatalogProfileEvidence>,
+    live_by_profile: BTreeMap<vibex_core::ProviderProfileId, vibex_core::AgentSessionConfigProbe>,
+) -> BTreeMap<vibex_core::ProviderProfileId, RuntimeOptionCatalogProfileEvidence> {
+    let mut evidence_by_profile = profiles
+        .iter()
+        .filter_map(|profile| {
+            fallback_by_agent
+                .get(&profile.agent_id)
+                .cloned()
+                .map(|evidence| (profile.id.clone(), evidence))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for (profile_id, probe) in live_by_profile {
+        evidence_by_profile.insert(
+            profile_id,
+            RuntimeOptionCatalogProfileEvidence {
+                // Models are always owned by the Provider Profile. A live
+                // Agent session calibrates only Agent-owned controls.
+                models: Vec::new(),
+                modes: probe.modes,
+                reasoning_efforts: probe.reasoning_efforts,
+                options: probe.options,
+                temporarily_unavailable: false,
+            },
+        );
+    }
+    evidence_by_profile
 }
 
 #[async_trait]
@@ -560,6 +621,81 @@ mod tests {
         }));
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         assert_eq!(catalog.snapshot_summaries().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn live_profile_evidence_overrides_agent_fallback_without_overriding_models() {
+        let (_directory, _catalog, provider_config, agent_id, _provider) = catalog_fixture(false);
+        let first_profile = create_profile(
+            &provider_config,
+            &agent_id,
+            "First profile",
+            vec![configured_model("configured-first")],
+        );
+        let second_profile = create_profile(
+            &provider_config,
+            &agent_id,
+            "Second profile",
+            vec![configured_model("configured-second")],
+        );
+        let fallback = BTreeMap::from([(
+            agent_id.clone(),
+            RuntimeOptionCatalogProfileEvidence {
+                models: Vec::new(),
+                modes: vec![mode("plan", Some("Plan"))],
+                reasoning_efforts: vec![effort("high")],
+                options: Vec::new(),
+                temporarily_unavailable: false,
+            },
+        )]);
+        let live = BTreeMap::from([(
+            first_profile.id.clone(),
+            AgentSessionConfigProbe {
+                models: vec!["agent-model-must-not-win".to_string()],
+                modes: vec![mode("review", Some("Review"))],
+                reasoning_efforts: vec![effort("low")],
+                options: Vec::new(),
+            },
+        )]);
+        let profiles = provider_config.list_profiles().unwrap();
+        let layered = layer_profile_session_evidence(&profiles, &fallback, live);
+        let first_evidence = layered.get(&first_profile.id).unwrap();
+        assert!(first_evidence.models.is_empty());
+        assert_eq!(first_evidence.modes[0].value, "review");
+        assert_eq!(first_evidence.reasoning_efforts[0].value, "low");
+        let second_evidence = layered.get(&second_profile.id).unwrap();
+        assert_eq!(second_evidence.modes[0].value, "plan");
+        assert_eq!(second_evidence.reasoning_efforts[0].value, "high");
+
+        let agents = provider_config
+            .list_agents(AgentListRequest {
+                include_disabled: true,
+            })
+            .unwrap();
+        let catalog = build_runtime_option_catalog(
+            &agents.agents,
+            &profiles
+                .iter()
+                .map(ProviderProfile::summary)
+                .collect::<Vec<_>>(),
+            &layered,
+        );
+        let first = catalog
+            .options
+            .iter()
+            .find(|option| option.selection.provider_profile_id == first_profile.id)
+            .unwrap();
+        assert_eq!(first.selection.model_id, "configured-first");
+        assert_eq!(first.modes[0].value, "review");
+        assert_eq!(first.reasoning_efforts[0].value, "low");
+        let second = catalog
+            .options
+            .iter()
+            .find(|option| option.selection.provider_profile_id == second_profile.id)
+            .unwrap();
+        assert_eq!(second.selection.model_id, "configured-second");
+        assert_eq!(second.modes[0].value, "plan");
+        assert_eq!(second.reasoning_efforts[0].value, "high");
     }
 
     #[tokio::test]

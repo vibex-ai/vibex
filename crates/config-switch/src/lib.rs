@@ -11,17 +11,17 @@ use semver::Version;
 use vibex_core::{
     AcpAgentCatalogEntry, AcpProcessStrategy, AcpProviderCatalogListResponse,
     AcpProviderCatalogPreset, AcpProviderConfig, AcpProviderEnvReference, AcpProviderEnvSource,
-    AcpProviderProfileCreateRequest, AcpProviderProfileUpdateRequest, AgentCatalogListResponse,
-    AgentCommandConfig, AgentConfig, AgentConfigStatus, AgentDefinition, AgentDiscoveryRecord,
-    AgentId, AgentInstallStatus, AgentListRequest, AgentListResponse,
-    AgentModelProviderDefaultRequest, AgentModelProviderDefaultSelection,
-    AgentModelProviderFailoverEntry, AgentModelProviderFailoverListRequest,
-    AgentModelProviderFailoverListResponse, AgentModelProviderFailoverSetRequest,
-    AgentModelProviderProfile, AgentModelProviderProfileCreateRequest,
-    AgentModelProviderProfileDeleteRequest, AgentModelProviderProfileFetchModelsRequest,
-    AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileListRequest,
-    AgentModelProviderProfileListResponse, AgentModelProviderProfileSecretValueRequest,
-    AgentModelProviderProfileSecretValueResponse,
+    AcpProviderProfileCreateRequest, AcpProviderProfileUpdateRequest,
+    AgentAuthEnvironmentUpdateRequest, AgentCatalogListResponse, AgentCommandConfig, AgentConfig,
+    AgentConfigStatus, AgentDefinition, AgentDiscoveryRecord, AgentId, AgentInstallStatus,
+    AgentListRequest, AgentListResponse, AgentModelProviderDefaultRequest,
+    AgentModelProviderDefaultSelection, AgentModelProviderFailoverEntry,
+    AgentModelProviderFailoverListRequest, AgentModelProviderFailoverListResponse,
+    AgentModelProviderFailoverSetRequest, AgentModelProviderProfile,
+    AgentModelProviderProfileCreateRequest, AgentModelProviderProfileDeleteRequest,
+    AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
+    AgentModelProviderProfileListRequest, AgentModelProviderProfileListResponse,
+    AgentModelProviderProfileSecretValueRequest, AgentModelProviderProfileSecretValueResponse,
     AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileTestRequest,
     AgentModelProviderProfileTestResult, AgentModelProviderProfileUpdateRequest,
     AgentModelProviderSetDefaultRequest, AgentModelProviderTestStatus, AgentRefreshSnapshotRequest,
@@ -1108,6 +1108,264 @@ impl ProviderConfigService {
             )
             .with_diagnostic("providerProfileId", profile.id.as_str())
         })
+    }
+
+    /// Persists the exact environment variables advertised by one ACP auth
+    /// method. Secret values live only in the OS keychain; the profile stores
+    /// opaque references so multiple profiles can switch independently.
+    pub fn update_agent_auth_environment(
+        &self,
+        request: AgentAuthEnvironmentUpdateRequest,
+    ) -> VibexResult<ProviderProfile> {
+        let conn = self.open_connection()?;
+        let mut profile = ProviderProfileRepository::get(&conn, &request.provider_profile_id)?
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "provider_profile_not_found",
+                    "Provider Profile was not found for Agent authentication",
+                )
+            })?;
+        if profile.agent_id != request.agent_id {
+            return Err(VibexError::validation(
+                "agent_auth_profile_mismatch",
+                "Provider Profile belongs to another Agent",
+            ));
+        }
+        if profile.kind != ProviderKind::Acp {
+            return Err(VibexError::validation(
+                "agent_auth_profile_kind_invalid",
+                "Agent environment authentication requires an ACP Provider Profile",
+            ));
+        }
+        let method_id = request.method_id.as_str();
+        if method_id.is_empty()
+            || method_id.trim().is_empty()
+            || method_id.chars().count() > 512
+            || method_id.chars().any(char::is_control)
+        {
+            return Err(VibexError::validation(
+                "agent_auth_method_id_invalid",
+                "Agent authentication method id is invalid",
+            ));
+        }
+        let mut config = acp_config_from_options(&profile.provider_options)?.ok_or_else(|| {
+            VibexError::validation(
+                "acp_config_missing",
+                "ACP Provider Profile is missing its typed runtime configuration",
+            )
+        })?;
+        let projected_secrets = self
+            .plan_legacy_agent_provider_projection(&profile.id, "agent-auth")
+            .ok()
+            .into_iter()
+            .flat_map(|plan| plan.secret_env)
+            .filter_map(|entry| {
+                entry
+                    .secret_reference
+                    .legacy_secret_reference_id
+                    .map(|secret_id| {
+                        (
+                            entry.key,
+                            (
+                                secret_id,
+                                entry.secret_reference.lookup_key,
+                                entry.secret_reference.backend,
+                            ),
+                        )
+                    })
+            })
+            .collect::<HashMap<_, _>>();
+        let mut seen = HashSet::new();
+        let mut secrets_to_delete = HashSet::new();
+        let mut secret_writes = Vec::new();
+
+        for input in request.values {
+            let name = input.name.trim();
+            if !is_valid_env_key(name) || !seen.insert(name.to_string()) {
+                return Err(VibexError::validation(
+                    "agent_auth_env_key_invalid",
+                    "Agent authentication environment variable is invalid or duplicated",
+                )
+                .with_diagnostic("envKey", name));
+            }
+            let value = input
+                .value
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if input.clear && value.is_some() {
+                return Err(VibexError::validation(
+                    "agent_auth_env_clear_value_conflict",
+                    "Agent authentication value cannot be set and cleared together",
+                )
+                .with_diagnostic("envKey", name));
+            }
+
+            let existing_reference = config
+                .env
+                .iter()
+                .find(|reference| reference.key == name)
+                .cloned();
+            let projected_secret = projected_secrets.get(name).cloned();
+            let projected_secret_is_existing =
+                projected_secret.as_ref().is_some_and(|(_, lookup_key, _)| {
+                    existing_reference
+                        .as_ref()
+                        .and_then(|reference| reference.secret_lookup_key.as_deref())
+                        == Some(lookup_key.as_str())
+                });
+            // A blank masked input means "keep the configured value". Only an
+            // explicit clear intent removes a reference from the Profile.
+            if value.is_none()
+                && !input.clear
+                && (existing_reference.is_some() || projected_secret.is_some())
+            {
+                continue;
+            }
+            if value.is_none() && !input.optional && !input.clear {
+                return Err(VibexError::validation(
+                    "agent_auth_env_value_required",
+                    "A required Agent authentication value is missing",
+                )
+                .with_diagnostic("envKey", name));
+            }
+
+            config.env.retain(|reference| reference.key != name);
+            if let Some(old_lookup) = existing_reference
+                .as_ref()
+                .and_then(|reference| reference.secret_lookup_key.as_ref())
+                .filter(|_| !input.secret || value.is_none() || input.clear)
+            {
+                secrets_to_delete.insert(old_lookup.clone());
+                profile
+                    .secrets
+                    .retain(|secret| secret.lookup_key != *old_lookup);
+            }
+            if let Some((secret_id, lookup_key, backend)) = projected_secret
+                && (input.clear || value.is_some())
+                && !projected_secret_is_existing
+            {
+                profile.secrets.retain(|secret| secret.id != secret_id);
+                if backend == ProviderSecretBackend::OsKeychain {
+                    secrets_to_delete.insert(lookup_key);
+                }
+            }
+
+            let Some(value) = value else {
+                continue;
+            };
+            if input.secret {
+                let lookup_key = existing_reference
+                    .as_ref()
+                    .and_then(|reference| reference.secret_lookup_key.clone())
+                    .filter(|lookup| !lookup.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        format!("vibex-agent-auth-{}-{}", profile.id.as_str(), name)
+                    });
+                secret_writes.push((lookup_key.clone(), value.to_string()));
+                let now = unix_timestamp_ms();
+                if let Some(secret) = profile
+                    .secrets
+                    .iter_mut()
+                    .find(|secret| secret.lookup_key == lookup_key)
+                {
+                    secret.backend = ProviderSecretBackend::OsKeychain;
+                    secret.setup_state = ProviderSecretSetupState::Available;
+                    secret.display_label = name.to_string();
+                    secret.redacted_hint = "stored in Vibex OS keychain".to_string();
+                    secret.updated_at_ms = now.max(secret.updated_at_ms.saturating_add(1));
+                } else {
+                    profile.secrets.push(ProviderSecretReference {
+                        id: RequestId::new(),
+                        provider_profile_id: profile.id.clone(),
+                        secret_kind: ProviderSecretKind::Environment,
+                        backend: ProviderSecretBackend::OsKeychain,
+                        setup_state: ProviderSecretSetupState::Available,
+                        lookup_key: lookup_key.clone(),
+                        display_label: name.to_string(),
+                        redacted_hint: "stored in Vibex OS keychain".to_string(),
+                        created_at_ms: now,
+                        updated_at_ms: now,
+                    });
+                }
+                config.env.push(AcpProviderEnvReference {
+                    key: name.to_string(),
+                    source: AcpProviderEnvSource::SecretReference,
+                    value: None,
+                    secret_lookup_key: Some(lookup_key),
+                    redacted_hint: "stored in Vibex OS keychain".to_string(),
+                });
+            } else {
+                config.env.push(AcpProviderEnvReference {
+                    key: name.to_string(),
+                    source: AcpProviderEnvSource::Literal,
+                    value: Some(value.to_string()),
+                    secret_lookup_key: None,
+                    redacted_hint: "configured".to_string(),
+                });
+            }
+        }
+
+        config.env.sort_by(|left, right| left.key.cmp(&right.key));
+        validate_acp_config(&config)?;
+        profile.provider_options = acp_config_to_options(&config)?;
+        profile.updated_at_ms = unix_timestamp_ms().max(profile.updated_at_ms.saturating_add(1));
+        let applied_secret_writes = apply_agent_auth_secret_writes(&secret_writes)?;
+        let persisted = (|| -> VibexResult<ProviderProfile> {
+            let transaction = conn.unchecked_transaction().map_err(|error| {
+                VibexError::storage(
+                    "agent_auth_environment_transaction_failed",
+                    "failed to start Agent authentication environment update",
+                )
+                .with_diagnostic("error", error.to_string())
+            })?;
+            ProviderProfileRepository::update(&transaction, &profile)?;
+            ProviderSecretReferenceRepository::replace_for_profile(
+                &transaction,
+                &profile.id,
+                &profile.secrets,
+            )?;
+            let updated =
+                ProviderProfileRepository::get(&transaction, &profile.id)?.ok_or_else(|| {
+                    VibexError::storage(
+                        "agent_auth_environment_readback_failed",
+                        "failed to read Provider Profile after Agent authentication update",
+                    )
+                })?;
+            transaction.commit().map_err(|error| {
+                VibexError::storage(
+                    "agent_auth_environment_commit_failed",
+                    "failed to commit Agent authentication environment update",
+                )
+                .with_diagnostic("error", error.to_string())
+            })?;
+            Ok(updated)
+        })();
+        let updated = match persisted {
+            Ok(updated) => updated,
+            Err(error) => {
+                let rollback_failures = rollback_agent_auth_secret_writes(&applied_secret_writes);
+                return Err(if rollback_failures == 0 {
+                    error
+                } else {
+                    error.with_diagnostic("keychainRollbackFailures", rollback_failures.to_string())
+                });
+            }
+        };
+        let projection_result = self.sync_legacy_projection(&conn, &updated);
+        self.notify_profile_saved(&updated);
+        let retained_secret_lookups = updated
+            .secrets
+            .iter()
+            .map(|secret| secret.lookup_key.as_str())
+            .collect::<HashSet<_>>();
+        for lookup_key in secrets_to_delete {
+            if !retained_secret_lookups.contains(lookup_key.as_str()) {
+                let _ = secrets::delete_provider_secret(&lookup_key);
+            }
+        }
+        projection_result?;
+        Ok(updated)
     }
 
     /// Returns the typed ACP command configuration owned by an Agent. This
@@ -4082,6 +4340,55 @@ fn resolve_acp_create_config(
     })
 }
 
+fn apply_agent_auth_secret_writes(
+    writes: &[(String, String)],
+) -> VibexResult<Vec<(String, Option<String>)>> {
+    let mut applied = Vec::with_capacity(writes.len());
+    for (lookup_key, value) in writes {
+        let previous = match secrets::resolve_provider_secret_reference(
+            ProviderSecretBackend::OsKeychain,
+            ProviderSecretSetupState::Available,
+            lookup_key,
+        ) {
+            Ok(previous) => previous,
+            Err(error) => {
+                return Err(agent_auth_secret_rollback_error(error, &applied));
+            }
+        };
+        if let Err(error) = secrets::store_provider_secret(lookup_key, value) {
+            return Err(agent_auth_secret_rollback_error(error, &applied));
+        }
+        applied.push((lookup_key.clone(), previous));
+    }
+    Ok(applied)
+}
+
+fn agent_auth_secret_rollback_error(
+    error: VibexError,
+    applied: &[(String, Option<String>)],
+) -> VibexError {
+    let failures = rollback_agent_auth_secret_writes(applied);
+    if failures == 0 {
+        error
+    } else {
+        error.with_diagnostic("keychainRollbackFailures", failures.to_string())
+    }
+}
+
+fn rollback_agent_auth_secret_writes(applied: &[(String, Option<String>)]) -> usize {
+    applied
+        .iter()
+        .rev()
+        .filter(|(lookup_key, previous)| {
+            let result = match previous {
+                Some(previous) => secrets::store_provider_secret(lookup_key, previous),
+                None => secrets::delete_provider_secret(lookup_key),
+            };
+            result.is_err()
+        })
+        .count()
+}
+
 fn inherit_agent_acp_runtime_options(
     conn: &vibex_db::DbConnection,
     agent_id: &AgentId,
@@ -4624,7 +4931,10 @@ fn validate_acp_env_reference(reference: &AcpProviderEnvReference) -> VibexResul
         }
         AcpProviderEnvSource::SecretReference => {
             let lookup_key = reference.secret_lookup_key.as_deref().unwrap_or("").trim();
-            if !is_valid_env_key(lookup_key) || reference.value.is_some() {
+            if lookup_key.is_empty()
+                || lookup_key.contains(['\0', '\n', '\r'])
+                || reference.value.is_some()
+            {
                 return Err(VibexError::validation(
                     "acp_env_secret_reference_invalid",
                     "secret ACP environment references require a lookup key and no literal value",
@@ -7178,26 +7488,27 @@ mod tests {
         );
     }
     use vibex_core::{
-        AcpProcessStrategy, AcpProviderConfig, AcpProviderProfileCreateRequest, AgentId,
-        AgentInstallStatus, AgentListRequest, AgentModelProviderFailoverSetEntry,
-        AgentModelProviderFailoverSetRequest, AgentModelProviderProfileCreateRequest,
-        AgentModelProviderProfileListRequest, AgentModelProviderProfileUpdateRequest,
-        AgentModelProviderSetDefaultRequest, AgentRefreshSnapshotRequest, AgentRuntimeStatus,
-        AgentUpdateConfigRequest, HookCreateRequest, HookEventKind, HookInstallPreviewRequest,
-        HookInstallState, HookStatus, McpSecretTarget, McpServerCreateRequest,
-        McpServerDiscoverRequest, McpServerImportRequest, McpServerImportSelection,
-        McpServerProviderMatrix, McpServerScopeKind, McpServerSecretReferenceCreateRequest,
-        McpServerStatus, McpServerTransportKind, McpServerValidateRequest,
-        McpServerValidationStatus, PromptCreateRequest, PromptKind, PromptScopeKind, PromptStatus,
-        PromptValidateRequest, PromptValidationStatus, ProviderCapabilityProbeStatus,
-        ProviderConfiguredModel, ProviderHealthProbeKind, ProviderHealthProbeResult,
-        ProviderHealthStatus, ProviderInjectionPreviewRequest, ProviderOptions,
-        ProviderProfileCreateRequest, ProviderProfileId, ProviderProfileUpdateRequest,
-        ProviderRunCapabilityProbesRequest, ProviderRunHealthProbesRequest,
-        ProviderUsageListRequest, ProviderUsageRecord, ProviderUsageUnit, ProviderUsageWindow,
-        SkillCreateRequest, SkillDiscoverRequest, SkillImportRequest, SkillImportSelection,
-        SkillProviderMatrix, SkillScopeKind, SkillSourceKind, SkillStatus, SkillValidateRequest,
-        SkillValidationStatus,
+        AcpProcessStrategy, AcpProviderConfig, AcpProviderEnvSource,
+        AcpProviderProfileCreateRequest, AgentAuthEnvironmentUpdateRequest,
+        AgentAuthEnvironmentValue, AgentId, AgentInstallStatus, AgentListRequest,
+        AgentModelProviderFailoverSetEntry, AgentModelProviderFailoverSetRequest,
+        AgentModelProviderProfileCreateRequest, AgentModelProviderProfileListRequest,
+        AgentModelProviderProfileUpdateRequest, AgentModelProviderSetDefaultRequest,
+        AgentRefreshSnapshotRequest, AgentRuntimeStatus, AgentUpdateConfigRequest,
+        HookCreateRequest, HookEventKind, HookInstallPreviewRequest, HookInstallState, HookStatus,
+        McpSecretTarget, McpServerCreateRequest, McpServerDiscoverRequest, McpServerImportRequest,
+        McpServerImportSelection, McpServerProviderMatrix, McpServerScopeKind,
+        McpServerSecretReferenceCreateRequest, McpServerStatus, McpServerTransportKind,
+        McpServerValidateRequest, McpServerValidationStatus, PromptCreateRequest, PromptKind,
+        PromptScopeKind, PromptStatus, PromptValidateRequest, PromptValidationStatus,
+        ProviderCapabilityProbeStatus, ProviderConfiguredModel, ProviderHealthProbeKind,
+        ProviderHealthProbeResult, ProviderHealthStatus, ProviderInjectionPreviewRequest,
+        ProviderOptions, ProviderProfileCreateRequest, ProviderProfileId,
+        ProviderProfileUpdateRequest, ProviderRunCapabilityProbesRequest,
+        ProviderRunHealthProbesRequest, ProviderUsageListRequest, ProviderUsageRecord,
+        ProviderUsageUnit, ProviderUsageWindow, SkillCreateRequest, SkillDiscoverRequest,
+        SkillImportRequest, SkillImportSelection, SkillProviderMatrix, SkillScopeKind,
+        SkillSourceKind, SkillStatus, SkillValidateRequest, SkillValidationStatus,
     };
     use vibex_db::{ProviderHealthRepository, ProviderUsageRepository};
 
@@ -8147,6 +8458,279 @@ mod tests {
         assert_eq!(cleared.value, None);
         assert_eq!(cleared.setup_state, ProviderSecretSetupState::Missing);
         assert_eq!(listener.calls.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn agent_auth_environment_preserves_blank_values_and_requires_explicit_clear() {
+        let dir = tempdir().unwrap();
+        let service = ProviderConfigService::new(dir.path().join("vibex.db"));
+        let agent_id = AgentId::parse("opencode").unwrap();
+        let profile = service
+            .create_acp_profile(AcpProviderProfileCreateRequest {
+                agent_id: Some(agent_id.clone()),
+                display_name: "Auth profile".to_string(),
+                account_alias: None,
+                preset_id: Some("opencode".to_string()),
+                config: None,
+            })
+            .unwrap();
+
+        let saved = service
+            .update_agent_auth_environment(AgentAuthEnvironmentUpdateRequest {
+                agent_id: agent_id.clone(),
+                provider_profile_id: profile.id.clone(),
+                method_id: "api-key".to_string(),
+                values: vec![AgentAuthEnvironmentValue {
+                    name: "OPENCODE_API_KEY".to_string(),
+                    value: Some("secret-value".to_string()),
+                    secret: true,
+                    optional: false,
+                    clear: false,
+                }],
+            })
+            .unwrap();
+        let saved_config = service.get_acp_profile_config(saved.id.clone()).unwrap();
+        let saved_reference = saved_config
+            .env
+            .iter()
+            .find(|reference| reference.key == "OPENCODE_API_KEY")
+            .unwrap();
+        assert_eq!(
+            saved_reference.source,
+            AcpProviderEnvSource::SecretReference
+        );
+        let lookup_key = saved_reference.secret_lookup_key.clone().unwrap();
+        assert_eq!(saved.secrets.len(), 1);
+        assert!(!format!("{saved:?}").contains("secret-value"));
+
+        let preserved = service
+            .update_agent_auth_environment(AgentAuthEnvironmentUpdateRequest {
+                agent_id: agent_id.clone(),
+                provider_profile_id: saved.id.clone(),
+                method_id: "api-key".to_string(),
+                values: vec![AgentAuthEnvironmentValue {
+                    name: "OPENCODE_API_KEY".to_string(),
+                    value: Some("   ".to_string()),
+                    secret: true,
+                    optional: false,
+                    clear: false,
+                }],
+            })
+            .unwrap();
+        let preserved_config = service
+            .get_acp_profile_config(preserved.id.clone())
+            .unwrap();
+        assert_eq!(
+            preserved_config
+                .env
+                .iter()
+                .find(|reference| reference.key == "OPENCODE_API_KEY")
+                .and_then(|reference| reference.secret_lookup_key.as_deref()),
+            Some(lookup_key.as_str())
+        );
+
+        let cleared = service
+            .update_agent_auth_environment(AgentAuthEnvironmentUpdateRequest {
+                agent_id,
+                provider_profile_id: preserved.id.clone(),
+                method_id: "api-key".to_string(),
+                values: vec![AgentAuthEnvironmentValue {
+                    name: "OPENCODE_API_KEY".to_string(),
+                    value: None,
+                    secret: true,
+                    optional: false,
+                    clear: true,
+                }],
+            })
+            .unwrap();
+        assert!(
+            service
+                .get_acp_profile_config(cleared.id.clone())
+                .unwrap()
+                .env
+                .iter()
+                .all(|reference| reference.key != "OPENCODE_API_KEY")
+        );
+        assert!(cleared.secrets.is_empty());
+    }
+
+    #[test]
+    fn agent_auth_environment_preserves_and_clears_projected_profile_secrets() {
+        let dir = tempdir().unwrap();
+        let service = ProviderConfigService::new(dir.path().join("vibex.db"));
+        let agent_id = AgentId::parse("codex").unwrap();
+        let profile = service
+            .create_acp_profile(AcpProviderProfileCreateRequest {
+                agent_id: Some(agent_id.clone()),
+                display_name: "Projected auth profile".to_string(),
+                account_alias: None,
+                preset_id: Some("codex-acp".to_string()),
+                config: None,
+            })
+            .unwrap();
+        service
+            .update_agent_model_provider_profile_secret_value(
+                AgentModelProviderProfileSecretValueUpdateRequest {
+                    agent_id: agent_id.clone(),
+                    provider_profile_id: profile.id.clone(),
+                    value: Some("projected-secret".to_string()),
+                    clear: false,
+                },
+            )
+            .unwrap();
+
+        let preserved = service
+            .update_agent_auth_environment(AgentAuthEnvironmentUpdateRequest {
+                agent_id: agent_id.clone(),
+                provider_profile_id: profile.id.clone(),
+                method_id: "api-key".to_string(),
+                values: vec![AgentAuthEnvironmentValue {
+                    name: "CODEX_API_KEY".to_string(),
+                    value: None,
+                    secret: true,
+                    optional: false,
+                    clear: false,
+                }],
+            })
+            .unwrap();
+        assert!(
+            service
+                .get_acp_profile_config(preserved.id.clone())
+                .unwrap()
+                .env
+                .iter()
+                .all(|reference| reference.key != "CODEX_API_KEY")
+        );
+        assert_eq!(
+            service
+                .get_agent_model_provider_profile_secret_value(
+                    AgentModelProviderProfileSecretValueRequest {
+                        agent_id: agent_id.clone(),
+                        provider_profile_id: profile.id.clone(),
+                    }
+                )
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("projected-secret")
+        );
+
+        service
+            .update_agent_auth_environment(AgentAuthEnvironmentUpdateRequest {
+                agent_id: agent_id.clone(),
+                provider_profile_id: profile.id.clone(),
+                method_id: "api-key".to_string(),
+                values: vec![AgentAuthEnvironmentValue {
+                    name: "CODEX_API_KEY".to_string(),
+                    value: None,
+                    secret: true,
+                    optional: false,
+                    clear: true,
+                }],
+            })
+            .unwrap();
+        let cleared = service
+            .get_agent_model_provider_profile_secret_value(
+                AgentModelProviderProfileSecretValueRequest {
+                    agent_id,
+                    provider_profile_id: profile.id,
+                },
+            )
+            .unwrap();
+        assert_eq!(cleared.value, None);
+        assert_eq!(cleared.setup_state, ProviderSecretSetupState::Missing);
+    }
+
+    #[test]
+    fn agent_auth_environment_rolls_back_keychain_writes_when_database_commit_fails() {
+        let dir = tempdir().unwrap();
+        let service = ProviderConfigService::new(dir.path().join("vibex.db"));
+        let agent_id = AgentId::parse("opencode").unwrap();
+        let profile = service
+            .create_acp_profile(AcpProviderProfileCreateRequest {
+                agent_id: Some(agent_id.clone()),
+                display_name: "Transactional auth profile".to_string(),
+                account_alias: None,
+                preset_id: Some("opencode".to_string()),
+                config: None,
+            })
+            .unwrap();
+        service
+            .update_agent_auth_environment(AgentAuthEnvironmentUpdateRequest {
+                agent_id: agent_id.clone(),
+                provider_profile_id: profile.id.clone(),
+                method_id: "api-key".to_string(),
+                values: vec![AgentAuthEnvironmentValue {
+                    name: "OPENCODE_API_KEY".to_string(),
+                    value: Some("original-secret".to_string()),
+                    secret: true,
+                    optional: false,
+                    clear: false,
+                }],
+            })
+            .unwrap();
+        let config = service.get_acp_profile_config(profile.id.clone()).unwrap();
+        let original_lookup = config
+            .env
+            .iter()
+            .find(|reference| reference.key == "OPENCODE_API_KEY")
+            .and_then(|reference| reference.secret_lookup_key.clone())
+            .unwrap();
+        let new_lookup = format!("vibex-agent-auth-{}-SECOND_API_TOKEN", profile.id.as_str());
+        {
+            let conn = open_database(service.database_path()).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER fail_agent_auth_profile_update \
+                 BEFORE UPDATE ON provider_profiles \
+                 BEGIN SELECT RAISE(FAIL, 'forced agent auth persistence failure'); END;",
+            )
+            .unwrap();
+        }
+
+        service
+            .update_agent_auth_environment(AgentAuthEnvironmentUpdateRequest {
+                agent_id,
+                provider_profile_id: profile.id,
+                method_id: "api-key".to_string(),
+                values: vec![
+                    AgentAuthEnvironmentValue {
+                        name: "OPENCODE_API_KEY".to_string(),
+                        value: Some("replacement-secret".to_string()),
+                        secret: true,
+                        optional: false,
+                        clear: false,
+                    },
+                    AgentAuthEnvironmentValue {
+                        name: "SECOND_API_TOKEN".to_string(),
+                        value: Some("new-secret".to_string()),
+                        secret: true,
+                        optional: false,
+                        clear: false,
+                    },
+                ],
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            secrets::resolve_provider_secret_reference(
+                ProviderSecretBackend::OsKeychain,
+                ProviderSecretSetupState::Available,
+                &original_lookup,
+            )
+            .unwrap()
+            .as_deref(),
+            Some("original-secret")
+        );
+        assert_eq!(
+            secrets::resolve_provider_secret_reference(
+                ProviderSecretBackend::OsKeychain,
+                ProviderSecretSetupState::Available,
+                &new_lookup,
+            )
+            .unwrap(),
+            None
+        );
+        secrets::delete_provider_secret(&original_lookup).unwrap();
     }
 
     fn spawn_http_probe_server(expected_path: &'static str, response_body: &'static str) -> String {
