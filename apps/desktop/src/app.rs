@@ -371,7 +371,7 @@ fn composer_suggestion_collection_matches(
 
 fn composer_suggestion_description(entry: &AgentCommandEntry) -> Option<String> {
     if entry.source_kind == AgentCommandSourceKind::Reference {
-        return None;
+        return entry.reference_path.clone();
     }
     entry
         .description
@@ -27333,8 +27333,8 @@ fn append_file_reference_commands(
     let entries = runtime.files().list_tree(&FileTreeRequest {
         workspace_id: workspace_id.clone(),
         path: None,
-        max_depth: Some(3),
-        include_hidden: false,
+        max_depth: Some(8),
+        include_hidden: true,
     })?;
     let query = request.query.as_deref().map(str::trim).unwrap_or("");
     let query_lower = query.to_lowercase();
@@ -27357,7 +27357,7 @@ fn append_file_reference_commands(
                 id: format!("reference:file:{}", entry.path),
                 trigger: AgentCommandTrigger::Mention,
                 source_kind: AgentCommandSourceKind::Reference,
-                label: format!("@{}", entry.path),
+                label: format!("@{}", entry.name),
                 description: None,
                 insertion_text: format!("@{} ", entry.path),
                 command_name: None,
@@ -33460,18 +33460,24 @@ mod tests {
     }
 
     #[test]
-    fn reference_suggestions_hide_redundant_workspace_description() {
-        let reference = command_entry(
+    fn reference_suggestions_show_path_beside_file_name() {
+        let mut reference = command_entry(
             AgentCommandSourceKind::Reference,
             AgentCommandTrigger::Mention,
             None,
         );
+        reference.label = "@app.rs".into();
+        reference.reference_path = Some("apps/desktop/src/app.rs".into());
         let prompt = command_entry(
             AgentCommandSourceKind::Prompt,
             AgentCommandTrigger::Slash,
             Some("review"),
         );
-        assert!(composer_suggestion_description(&reference).is_none());
+        assert_eq!(reference.label, "@app.rs");
+        assert_eq!(
+            composer_suggestion_description(&reference).as_deref(),
+            Some("apps/desktop/src/app.rs")
+        );
         assert_eq!(
             composer_suggestion_description(&prompt).as_deref(),
             Some("Review changes")
