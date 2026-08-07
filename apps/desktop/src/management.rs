@@ -22,6 +22,7 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
+    notification::Notification,
     scroll::ScrollableElement as _,
     switch::Switch,
     tooltip::Tooltip,
@@ -82,6 +83,8 @@ const PROVIDER_OPTION_NATIVE_SOURCE: &str = "nativeSource";
 pub(crate) enum ManagementEvent {
     AgentRegistryChanged,
 }
+
+struct ManagementCenterFeedbackNotification;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ManagementSidebarResizeDragState {
@@ -3716,6 +3719,30 @@ impl ManagementCenter {
                 }
             });
         }));
+    }
+
+    fn present_feedback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let notice = self.notice.take();
+        let notification = self
+            .error
+            .take()
+            .map(|error| Notification::error(locale::localize_error_message(&error)))
+            .or_else(|| {
+                notice.map(|notice| Notification::info(locale::localize_ui_message(&notice)))
+            });
+        let Some(notification) = notification else {
+            return;
+        };
+
+        window.defer(cx, move |window, cx| {
+            window.push_notification(
+                notification
+                    .id::<ManagementCenterFeedbackNotification>()
+                    .autohide(true)
+                    .on_click(|_, _, _| {}),
+                cx,
+            );
+        });
     }
 
     fn open_mcp_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -11845,6 +11872,7 @@ impl Render for ManagementImportDialog {
 
 impl Render for ManagementCenter {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.present_feedback(window, cx);
         let viewport = window.viewport_size();
         let viewport_width = f32::from(viewport.width);
         let viewport_height = f32::from(viewport.height);
@@ -11920,23 +11948,6 @@ impl Render for ManagementCenter {
                 .child(main)
                 .into_any_element()
         };
-        let has_feedback = self.notice.is_some() || self.error.is_some();
-        let feedback = v_flex()
-            .absolute()
-            .bottom_4()
-            .gap_2()
-            .when(wide, |feedback| feedback.right_4().w(px(420.0)))
-            .when(!wide, |feedback| feedback.left_4().right_4())
-            .when_some(self.notice.clone(), |feedback, notice| {
-                feedback.child(status_line(locale::localize_ui_message(&notice), false, cx))
-            })
-            .when_some(self.error.clone(), |feedback, error| {
-                feedback.child(status_line(
-                    locale::localize_error_message(&error),
-                    true,
-                    cx,
-                ))
-            });
         div()
             .id("management-center")
             .relative()
@@ -11949,7 +11960,6 @@ impl Render for ManagementCenter {
                 root.cursor_ns_resize()
             })
             .child(layout)
-            .when(has_feedback, |root| root.child(feedback))
     }
 }
 
@@ -13621,6 +13631,30 @@ mod tests {
             redacted_fields: Vec::new(),
             diagnostics: Vec::new(),
         }
+    }
+
+    #[test]
+    fn management_feedback_uses_the_shared_click_dismissable_autohide_notification() {
+        let source = include_str!("management.rs");
+        let presentation = source
+            .split_once("    fn present_feedback(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn open_mcp_import("))
+            .map(|(body, _)| body)
+            .expect("management feedback presenter should remain inspectable");
+
+        assert!(presentation.contains("Notification::info("));
+        assert!(presentation.contains("Notification::error("));
+        assert!(presentation.contains(".id::<ManagementCenterFeedbackNotification>()"));
+        assert!(presentation.contains(".autohide(true)"));
+        assert!(presentation.contains(".on_click(|_, _, _| {})"));
+
+        let renderer = source
+            .split_once("impl Render for ManagementCenter {")
+            .and_then(|(_, tail)| tail.split_once("\nfn management_compact_sidebar_height_limits("))
+            .map(|(body, _)| body)
+            .expect("management renderer should remain inspectable");
+        assert!(renderer.contains("self.present_feedback(window, cx);"));
+        assert!(!renderer.contains(".bottom_4()"));
     }
 
     #[test]
