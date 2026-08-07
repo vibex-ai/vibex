@@ -420,6 +420,7 @@ const AGENT_BRAND_ASSETS: &[(&str, &[u8])] = &[
     bundled_icon_asset!("agents/minion-code.svg"),
     bundled_icon_asset!("agents/mistral-vibe.svg"),
     bundled_icon_asset!("agents/nova.svg"),
+    bundled_icon_asset!("agents/pi.svg"),
     bundled_icon_asset!("agents/poolside.svg"),
     bundled_icon_asset!("agents/qoder.svg"),
     bundled_icon_asset!("agents/sigit.svg"),
@@ -530,6 +531,7 @@ const CATALOG_AGENT_BRANDS: &[(&str, BrandAsset)] = &[
         colored_agent_asset("icons/vibex/agents/mistral-vibe.svg"),
     ),
     ("nova", themed_agent_asset("icons/vibex/agents/nova.svg")),
+    ("pi", themed_agent_asset("icons/vibex/agents/pi.svg")),
     (
         "poolside",
         themed_agent_asset("icons/vibex/agents/poolside.svg"),
@@ -932,6 +934,7 @@ mod tests {
             "kilo",
             "minion-code",
             "nova",
+            "pi",
             "poolside",
             "sigit",
             "stakpak",

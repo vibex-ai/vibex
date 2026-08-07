@@ -14,8 +14,9 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const EVIDENCE_PATH = "docs/platform/evidence/agent-provider-runtime.json";
 export const EVIDENCE_SCHEMA = "agent-provider-runtime-evidence.v1";
 export const MANIFEST_SCHEMA = "agent-provider-runtime-manifest.v1";
-export const AGENT_COUNT = 38;
+export const AGENT_COUNT = 39;
 export const BUILTIN_IDS = ["claude", "codex", "opencode"];
+export const CATALOG_AGENT_COUNT = AGENT_COUNT - BUILTIN_IDS.length;
 
 const MANIFEST_ENTRY_KEYS = [
   "agentId",
@@ -366,13 +367,16 @@ export function validateManifestShape(manifest) {
   exactKeys(manifest, MANIFEST_KEYS, "rollout manifest");
   assert(manifest.schemaVersion === MANIFEST_SCHEMA, "rollout manifest schema drifted");
   assert(Array.isArray(manifest.entries), "rollout manifest entries are missing");
-  assert(manifest.entries.length === AGENT_COUNT, "rollout manifest must contain 38 entries");
+  assert(manifest.entries.length === AGENT_COUNT, `rollout manifest must contain ${AGENT_COUNT} entries`);
   const ids = manifest.entries.map((entry) => entry.agentId);
   assert(new Set(ids).size === ids.length, "rollout manifest contains duplicate Agent ids");
   for (const [index, entry] of manifest.entries.entries()) validateManifestEntry(entry, `manifest.entries[${index}]`);
   const builtinIds = ids.filter((id) => BUILTIN_IDS.includes(id)).sort();
   assert(JSON.stringify(builtinIds) === JSON.stringify([...BUILTIN_IDS].sort()), "builtin coverage drifted");
-  assert(ids.filter((id) => !BUILTIN_IDS.includes(id)).length === 35, "catalog coverage must contain 35 entries");
+  assert(
+    ids.filter((id) => !BUILTIN_IDS.includes(id)).length === CATALOG_AGENT_COUNT,
+    `catalog coverage must contain ${CATALOG_AGENT_COUNT} entries`
+  );
   return manifest;
 }
 
@@ -616,7 +620,7 @@ export function validateEvidence(evidence, manifest = loadFreshManifest()) {
   assert(typeof evidence.capturedAt === "string" && !Number.isNaN(Date.parse(evidence.capturedAt)), "capture timestamp is invalid");
   assert(canonicalJson(evidence.manifest.entries) === canonicalJson(manifest.entries), "evidence manifest does not match Rust manifest");
   exactKeys(evidence.manifest, ["schemaVersion", "totalAgents", "builtinCount", "catalogCount", "entries"], "evidence.manifest");
-  assert(evidence.manifest.schemaVersion === MANIFEST_SCHEMA && evidence.manifest.totalAgents === AGENT_COUNT && evidence.manifest.builtinCount === 3 && evidence.manifest.catalogCount === 35, "evidence manifest counts are invalid");
+  assert(evidence.manifest.schemaVersion === MANIFEST_SCHEMA && evidence.manifest.totalAgents === AGENT_COUNT && evidence.manifest.builtinCount === BUILTIN_IDS.length && evidence.manifest.catalogCount === CATALOG_AGENT_COUNT, "evidence manifest counts are invalid");
   validateSourceIdentity(evidence.source, manifest);
   validateProbeContract(evidence.probeContract);
   validateFailureMatrix(evidence.switch.failureRetentionMatrix);

@@ -2452,12 +2452,19 @@ AgentManagedInstallationRecord {
   carry a SHA-256. npm distributions must use an exact version, metadata
   integrity, and the canonical `registry.npmjs.org` tarball URL; the lockfile
   `resolved` URL must match that same canonical artifact.
+- Pi is a managed npm bundle: Vibex installs the Registry-pinned `pi-acp`
+  Adapter and the Vibex-pinned `@earendil-works/pi-coding-agent` runtime in the
+  same isolated tree. Both direct packages independently pass metadata,
+  integrity, canonical tarball, executable, and lockfile identity checks. The
+  generated launcher sets `PI_ACP_PI_COMMAND` to that tree's `.bin/pi` command;
+  it never depends on or replaces a user-global Pi installation.
 - npm Agents select Node/npm in this order: explicit
   `VIBEX_AGENT_NODE_PATH`/`VIBEX_AGENT_NPM_PATH` configuration, system
   `node`/`npm` from `PATH`, then a downloaded Vibex-managed Node.js 22 runtime.
   Explicit and system candidates must be real files, `node --version` must be
-  SemVer 22.0.0 or newer, and both version probes must succeed; rejection falls
-  through to the next candidate without activating a partial installation.
+  SemVer 22.0.0 or newer (22.19.0 or newer for Pi), and both version probes must
+  succeed; rejection falls through to the next candidate without activating a
+  partial installation.
 - npm always uses an isolated Vibex cache and blank user/global npm config,
   regardless of runtime source. The user and global config paths must be
   distinct: npm rejects one file assigned to both configuration levels as a
@@ -2497,8 +2504,9 @@ AgentManagedInstallationRecord {
 - Download or extraction timeout -> bounded process error and a persisted
   `Failed`/`UpdateAvailable` state suitable for retry.
 - Registry downgrade candidate -> `conflict/agent_install_downgrade_rejected`.
-- Missing, unexecutable, malformed, or pre-22 explicit/system Node/npm -> reject
-  that candidate and continue through system then managed runtime fallback.
+- Missing, unexecutable, malformed, pre-22 Node/npm, or pre-22.19 Node/npm for
+  Pi -> reject that candidate and continue through system then managed runtime
+  fallback.
 - Identical `npm_config_userconfig` and `npm_config_globalconfig` paths -> an
   invalid internal command configuration; construct distinct blank files and
   do not rely on npm to accept the duplicate load.
@@ -2530,7 +2538,8 @@ AgentManagedInstallationRecord {
   canonical npm sources, lockfile identity, checksum/archive limits, SemVer
   downgrade rejection, explicit/system/managed Node selection and fallback,
   malformed/old Node rejection, distinct empty user/global npm configs,
-  interrupted recovery, and uninstall cleanup.
+  Pi's dual-package lock and local launcher, interrupted recovery, and uninstall
+  cleanup.
 - `cargo test -p vibex-config-switch agent` covers removal of runtime and auth
   snapshots plus managed command/version matching.
 - `cargo test -p vibex-agent-acp runtime` covers dynamic managed identities,
@@ -3128,7 +3137,7 @@ validated code-owned overlay under the private runtime root.
 
 - Trigger: adding or upgrading a catalog Agent descriptor, running an ACP
   provider probe, or deciding whether an existing binding may switch provider.
-- The rollout manifest contains exactly three builtin and 35 catalog Agent ids.
+- The rollout manifest contains exactly three builtin and 36 catalog Agent ids.
   Catalog installability and provider verification remain separate claims.
 
 ### 2. Signatures
@@ -3194,7 +3203,7 @@ check:agent-provider-runtime[:self-test]
   projection preview. The observed origin and exact target model must both
   match. A provider string with no planned safe identity, or the same model name
   served by a different origin, remains blocked.
-- The checked evidence capture includes all 38 entries, hashes every bound
+- The checked evidence capture includes all 39 entries, hashes every bound
   implementation surface, scans forbidden Secret/native/path fields, and rejects
   binary-only or false live-switch claims. Missing accounts, licenses, cloud
   projects, or local model assets produce `blocked/not_run`; they never count as
@@ -3234,7 +3243,7 @@ check:agent-provider-runtime[:self-test]
 
 ### 6. Tests Required
 
-- Core tests cover exact and semantic-range 38-entry catalog/descriptor/manifest
+- Core tests cover exact and semantic-range 39-entry catalog/descriptor/manifest
   identity, per-entry conservative diagnostics, and the two explicit
   environment descriptors.
 - ACP probe tests cover duplicate isolation keys, bounded cleanup, independent

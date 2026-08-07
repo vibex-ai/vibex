@@ -322,6 +322,14 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         &["pool", "acp"],
     ),
     AcpAgentCatalogEntry::new(
+        "pi",
+        "Pi",
+        "Pi coding agent connected through ACP",
+        "0.0.33",
+        "https://github.com/svkozak/pi-acp",
+        &["npx", "-y", "pi-acp@0.0.33"],
+    ),
+    AcpAgentCatalogEntry::new(
         "qoder",
         "Qoder CLI",
         "AI coding assistant with agentic capabilities",
@@ -383,7 +391,7 @@ mod tests {
     #[test]
     fn catalog_ids_and_presets_are_unique_and_commands_are_complete() {
         let entries = acp_agent_catalog_entries();
-        assert_eq!(entries.len(), 35);
+        assert_eq!(entries.len(), 36);
 
         let ids = entries
             .iter()
@@ -404,6 +412,9 @@ mod tests {
                 .label,
             "Augment CLI"
         );
+        let pi = entries.iter().find(|entry| entry.id == "pi").unwrap();
+        assert_eq!(pi.version, "0.0.33");
+        assert_eq!(pi.command, &["npx", "-y", "pi-acp@0.0.33"]);
         assert!(!entries.iter().any(|entry| entry.id == "corust-agent"));
     }
 }

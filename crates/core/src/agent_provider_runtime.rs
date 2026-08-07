@@ -464,7 +464,7 @@ fn conservative_replaceable_shape(agent_id: &str) -> VibexResult<CatalogProjecti
         "copilot" | "hermes" => "agent_projection_version_detection_required",
         "deepagents" => "agent_projection_environment_contract_not_runtime_verified",
         "goose" => "agent_projection_acp_option_not_runtime_verified",
-        "grok" | "poolside" => "agent_projection_mixed_auth_boundary_not_runtime_verified",
+        "grok" | "pi" | "poolside" => "agent_projection_mixed_auth_boundary_not_runtime_verified",
         _ => {
             return Err(VibexError::validation(
                 "agent_rollout_conservative_contract_missing",
@@ -576,10 +576,10 @@ pub fn validate_rollout_manifest(entries: &[AgentProviderRolloutManifestEntry]) 
         .iter()
         .map(|entry| entry.agent_id.as_str())
         .collect::<BTreeSet<_>>();
-    if entries.len() != 38 || actual.len() != entries.len() {
+    if entries.len() != 39 || actual.len() != entries.len() {
         return Err(VibexError::conflict(
             "agent_rollout_manifest_coverage_invalid",
-            "rollout manifest must contain exactly 38 unique Agent ids",
+            "rollout manifest must contain exactly 39 unique Agent ids",
         ));
     }
     let catalog_actual = actual
@@ -1108,7 +1108,7 @@ mod tests {
     fn manifest_has_exact_catalog_coverage_and_unique_routes() {
         let manifest = agent_provider_rollout_manifest().unwrap();
         validate_rollout_manifest(&manifest).unwrap();
-        assert_eq!(manifest.len(), 38);
+        assert_eq!(manifest.len(), 39);
         assert!(
             manifest
                 .iter()
@@ -1119,6 +1119,7 @@ mod tests {
                 .iter()
                 .any(|entry| entry.agent_id.as_str() == "sigit")
         );
+        assert!(manifest.iter().any(|entry| entry.agent_id.as_str() == "pi"));
         assert!(
             manifest
                 .iter()

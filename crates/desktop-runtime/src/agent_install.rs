@@ -44,6 +44,11 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const NODE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const MINIMUM_NODE_VERSION: semver::Version = semver::Version::new(22, 0, 0);
+const PI_MINIMUM_NODE_VERSION: semver::Version = semver::Version::new(22, 19, 0);
+const PI_CODING_AGENT_PACKAGE: &str = "@earendil-works/pi-coding-agent";
+const PI_CODING_AGENT_VERSION: &str = "0.84.1";
+const PI_COMMAND_NAME: &str = "pi";
+const PI_ACP_LAUNCHER_NAME: &str = "vibex-pi-acp-launcher.cjs";
 const NODE_RELEASE_INDEX_URL: &str = "https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt";
 const AGENT_NODE_PATH_ENV: &str = "VIBEX_AGENT_NODE_PATH";
 const AGENT_NPM_PATH_ENV: &str = "VIBEX_AGENT_NPM_PATH";
@@ -341,7 +346,8 @@ impl AgentInstallService {
         let distribution = resolve_distribution(&entry)?;
         let distribution_kind = distribution.kind();
         let node_runtime = if matches!(&distribution, ResolvedDistribution::Npm(_)) {
-            Some(self.select_node_runtime().await?)
+            let minimum_node_version = minimum_node_version(&agent_id);
+            Some(self.select_node_runtime(&minimum_node_version).await?)
         } else {
             None
         };
@@ -671,27 +677,22 @@ impl AgentInstallService {
         node: NodeRuntime,
     ) -> VibexResult<InstalledAgent> {
         let (package, package_version) = parse_exact_npm_spec(&npx.package, &entry.version)?;
-        let metadata = self.fetch_npm_metadata(package, package_version).await?;
-        let integrity = metadata.dist.integrity.as_deref().ok_or_else(|| {
-            VibexError::validation(
-                "agent_npm_integrity_missing",
-                "npm package metadata has no integrity digest",
+        let package = self
+            .resolve_verified_npm_package(package, package_version)
+            .await?;
+        let runtime_package = if let Some(dependency) = npm_runtime_dependency(agent_id) {
+            Some(
+                self.resolve_verified_npm_package(dependency.package, dependency.version)
+                    .await?,
             )
-            .with_diagnostic("package", package.to_string())
-        })?;
-        validate_npm_integrity(integrity)?;
-        let tarball = validate_canonical_npm_tarball_source(
-            metadata.dist.tarball.as_deref().ok_or_else(|| {
-                VibexError::validation(
-                    "agent_npm_tarball_missing",
-                    "npm package metadata has no tarball source",
-                )
-                .with_diagnostic("package", package.to_string())
-            })?,
-            package,
-            package_version,
-        )?;
-        let bin_path = select_npm_bin(&metadata, package)?;
+        } else {
+            None
+        };
+        let adapter_script_rel = npm_package_bin_relative_path(&package)?;
+        let pi_launcher = runtime_package
+            .as_ref()
+            .map(|_| pi_acp_launcher_source(&adapter_script_rel))
+            .transpose()?;
         let args_identity = serde_json::to_string(&npx.args).map_err(|error| {
             VibexError::validation(
                 "agent_npm_args_invalid",
@@ -700,16 +701,30 @@ impl AgentInstallService {
             .with_diagnostic("error", error.to_string())
         })?;
         let node_identity = node.fingerprint_identity();
-        let fingerprint = distribution_fingerprint(&[
+        let mut fingerprint_parts = vec![
             entry.id.as_str(),
             entry.version.as_str(),
             npx.package.as_str(),
-            integrity,
-            tarball.as_str(),
-            bin_path.as_str(),
+            package.integrity.as_str(),
+            package.tarball.as_str(),
+            package.bin_path.as_str(),
             args_identity.as_str(),
             node_identity.as_str(),
-        ]);
+        ];
+        if let Some(runtime_package) = runtime_package.as_ref() {
+            fingerprint_parts.extend([
+                runtime_package.name.as_str(),
+                runtime_package.version.as_str(),
+                runtime_package.integrity.as_str(),
+                runtime_package.tarball.as_str(),
+                runtime_package.bin_path.as_str(),
+                PI_COMMAND_NAME,
+            ]);
+        }
+        if let Some(pi_launcher) = pi_launcher.as_deref() {
+            fingerprint_parts.push(pi_launcher);
+        }
+        let fingerprint = distribution_fingerprint(&fingerprint_parts);
         let target_root = self.version_root(agent_id, &entry.version, &fingerprint)?;
         if let Some(installed) = load_or_remove_cached_installation(&target_root, &fingerprint)? {
             return Ok(installed);
@@ -717,11 +732,22 @@ impl AgentInstallService {
 
         let staging = self.create_staging(agent_id)?;
         let mut staging_guard = StagingGuard::new(staging.clone());
+        let mut dependencies = serde_json::Map::new();
+        dependencies.insert(
+            package.name.clone(),
+            serde_json::Value::String(format!("={}", package.version)),
+        );
+        if let Some(runtime_package) = runtime_package.as_ref() {
+            dependencies.insert(
+                runtime_package.name.clone(),
+                serde_json::Value::String(format!("={}", runtime_package.version)),
+            );
+        }
         let package_json = serde_json::json!({
             "name": "vibex-managed-acp-agent",
             "private": true,
             "version": "0.0.0",
-            "dependencies": { (package): format!("={package_version}") }
+            "dependencies": dependencies,
         });
         write_json_private(&staging.join("package.json"), &package_json)?;
         let npm_config = write_isolated_npm_configs(&staging)?;
@@ -743,6 +769,7 @@ impl AgentInstallService {
             .arg("--registry=https://registry.npmjs.org/")
             .arg("--")
             .arg(&npx.package)
+            .args(runtime_package.as_ref().map(VerifiedNpmPackage::exact_spec))
             .current_dir(&staging)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -777,10 +804,35 @@ impl AgentInstallService {
             .with_diagnostic("status", status.to_string()));
         }
 
-        verify_npm_lock(&staging, package, package_version, integrity, &tarball)?;
-        let package_root = package_directory(&staging, package)?;
-        let script = package_root.join(safe_relative_path(&bin_path, "npm bin")?);
-        ensure_regular_file(&staging, &script, "agent_npm_bin_missing")?;
+        verify_npm_lock(
+            &staging,
+            &package.name,
+            &package.version,
+            &package.integrity,
+            &package.tarball,
+        )?;
+        let adapter_script = staging.join(&adapter_script_rel);
+        ensure_regular_file(&staging, &adapter_script, "agent_npm_bin_missing")?;
+        let script = if let (Some(runtime_package), Some(pi_launcher)) =
+            (runtime_package.as_ref(), pi_launcher.as_deref())
+        {
+            verify_npm_lock(
+                &staging,
+                &runtime_package.name,
+                &runtime_package.version,
+                &runtime_package.integrity,
+                &runtime_package.tarball,
+            )?;
+            let runtime_script = staging.join(npm_package_bin_relative_path(runtime_package)?);
+            ensure_regular_file(&staging, &runtime_script, "agent_npm_runtime_bin_missing")?;
+            let pi_command = npm_command_path(&staging, PI_COMMAND_NAME);
+            ensure_regular_file(&staging, &pi_command, "agent_npm_runtime_command_missing")?;
+            let launcher = staging.join(PI_ACP_LAUNCHER_NAME);
+            write_private_file(&launcher, pi_launcher.as_bytes())?;
+            launcher
+        } else {
+            adapter_script
+        };
         let script_rel = script.strip_prefix(&staging).map_err(|_| {
             VibexError::validation(
                 "agent_npm_bin_outside_install",
@@ -871,6 +923,41 @@ impl AgentInstallService {
             version,
         )?;
         Ok(metadata)
+    }
+
+    async fn resolve_verified_npm_package(
+        &self,
+        package: &str,
+        version: &str,
+    ) -> VibexResult<VerifiedNpmPackage> {
+        let metadata = self.fetch_npm_metadata(package, version).await?;
+        let integrity = metadata.dist.integrity.as_deref().ok_or_else(|| {
+            VibexError::validation(
+                "agent_npm_integrity_missing",
+                "npm package metadata has no integrity digest",
+            )
+            .with_diagnostic("package", package.to_string())
+        })?;
+        validate_npm_integrity(integrity)?;
+        let tarball = validate_canonical_npm_tarball_source(
+            metadata.dist.tarball.as_deref().ok_or_else(|| {
+                VibexError::validation(
+                    "agent_npm_tarball_missing",
+                    "npm package metadata has no tarball source",
+                )
+                .with_diagnostic("package", package.to_string())
+            })?,
+            package,
+            version,
+        )?;
+        let bin_path = select_npm_bin(&metadata, package)?;
+        Ok(VerifiedNpmPackage {
+            name: package.to_string(),
+            version: version.to_string(),
+            integrity: integrity.to_string(),
+            tarball,
+            bin_path,
+        })
     }
 
     async fn fetch_limited(&self, url: &str, max_bytes: usize) -> VibexResult<Vec<u8>> {
@@ -1043,15 +1130,23 @@ impl AgentInstallService {
         Ok(cached)
     }
 
-    async fn select_node_runtime(&self) -> VibexResult<NodeRuntime> {
-        if let Some(runtime) = self.select_external_node_runtime().await {
+    async fn select_node_runtime(
+        &self,
+        minimum_version: &semver::Version,
+    ) -> VibexResult<NodeRuntime> {
+        if let Some(runtime) = self.select_external_node_runtime(minimum_version).await {
             return Ok(runtime);
         }
-        self.ensure_managed_node_runtime().await
+        let runtime = self.ensure_managed_node_runtime().await?;
+        validate_minimum_node_version(&runtime.version, minimum_version)?;
+        Ok(runtime)
     }
 
-    async fn select_external_node_runtime(&self) -> Option<NodeRuntime> {
-        select_valid_external_node_runtime(self.node_runtime_candidates()).await
+    async fn select_external_node_runtime(
+        &self,
+        minimum_version: &semver::Version,
+    ) -> Option<NodeRuntime> {
+        select_valid_external_node_runtime(self.node_runtime_candidates(), minimum_version).await
     }
 
     fn node_runtime_candidates(&self) -> Vec<NodeRuntimeCandidate> {
@@ -1365,9 +1460,10 @@ fn write_isolated_npm_configs(staging: &Path) -> VibexResult<IsolatedNpmConfigs>
 
 async fn select_valid_external_node_runtime(
     candidates: Vec<NodeRuntimeCandidate>,
+    minimum_version: &semver::Version,
 ) -> Option<NodeRuntime> {
     for candidate in candidates {
-        match validate_node_runtime_candidate(candidate.clone()).await {
+        match validate_node_runtime_candidate(candidate.clone(), minimum_version).await {
             Ok(runtime) => return Some(runtime),
             Err(error) => tracing::warn!(
                 target: "vibex_desktop",
@@ -1470,6 +1566,27 @@ struct NpmDist {
 enum NpmBin {
     Single(String),
     Multiple(BTreeMap<String, String>),
+}
+
+#[derive(Debug)]
+struct VerifiedNpmPackage {
+    name: String,
+    version: String,
+    integrity: String,
+    tarball: String,
+    bin_path: String,
+}
+
+impl VerifiedNpmPackage {
+    fn exact_spec(&self) -> String {
+        format!("{}@{}", self.name, self.version)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NpmRuntimeDependency {
+    package: &'static str,
+    version: &'static str,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1635,6 +1752,21 @@ fn require_registry_id(agent_id: &AgentId) -> VibexResult<&'static str> {
     })
 }
 
+fn minimum_node_version(agent_id: &AgentId) -> semver::Version {
+    if agent_id.as_str() == "pi" {
+        PI_MINIMUM_NODE_VERSION
+    } else {
+        MINIMUM_NODE_VERSION
+    }
+}
+
+fn npm_runtime_dependency(agent_id: &AgentId) -> Option<NpmRuntimeDependency> {
+    (agent_id.as_str() == "pi").then_some(NpmRuntimeDependency {
+        package: PI_CODING_AGENT_PACKAGE,
+        version: PI_CODING_AGENT_VERSION,
+    })
+}
+
 fn resolve_distribution(entry: &RegistryEntry) -> VibexResult<ResolvedDistribution> {
     if let Some(targets) = entry.distribution.binary.as_ref()
         && let Some(target) = targets.get(current_platform_key()?)
@@ -1750,6 +1882,7 @@ fn adjacent_npm_binary(node: &Path) -> Option<PathBuf> {
 
 async fn validate_node_runtime_candidate(
     candidate: NodeRuntimeCandidate,
+    minimum_version: &semver::Version,
 ) -> VibexResult<NodeRuntime> {
     if !candidate.node.is_file() {
         return Err(VibexError::validation(
@@ -1775,14 +1908,7 @@ async fn validate_node_runtime_candidate(
     )
     .await?;
     let version = parse_node_version_output(&output.stdout)?;
-    if version < MINIMUM_NODE_VERSION {
-        return Err(VibexError::capability(
-            "agent_node_version_unsupported",
-            "Node.js candidate is older than the supported minimum",
-        )
-        .with_diagnostic("detectedVersion", version.to_string())
-        .with_diagnostic("minimumVersion", MINIMUM_NODE_VERSION.to_string()));
-    }
+    validate_minimum_node_version(&version, minimum_version)?;
 
     let npm = external_npm_launcher(&candidate.node, &candidate.npm)?;
     let runtime = NodeRuntime {
@@ -1801,6 +1927,21 @@ async fn validate_node_runtime_candidate(
     )
     .await?;
     Ok(runtime)
+}
+
+fn validate_minimum_node_version(
+    version: &semver::Version,
+    minimum_version: &semver::Version,
+) -> VibexResult<()> {
+    if version < minimum_version {
+        return Err(VibexError::capability(
+            "agent_node_version_unsupported",
+            "Node.js candidate is older than the supported minimum",
+        )
+        .with_diagnostic("detectedVersion", version.to_string())
+        .with_diagnostic("minimumVersion", minimum_version.to_string()));
+    }
+    Ok(())
 }
 
 fn external_npm_launcher(_node: &Path, npm: &Path) -> VibexResult<NpmLauncher> {
@@ -1927,6 +2068,47 @@ fn select_npm_bin(metadata: &NpmPackageMetadata, package: &str) -> VibexResult<S
     };
     let _ = safe_relative_path(selected, "npm bin")?;
     Ok(selected.clone())
+}
+
+fn npm_package_bin_relative_path(package: &VerifiedNpmPackage) -> VibexResult<PathBuf> {
+    Ok(package_directory(Path::new(""), &package.name)?
+        .join(safe_relative_path(&package.bin_path, "npm bin")?))
+}
+
+fn npm_command_path(root: &Path, command: &str) -> PathBuf {
+    #[cfg(windows)]
+    let command = format!("{command}.cmd");
+    root.join("node_modules").join(".bin").join(command)
+}
+
+fn pi_acp_launcher_source(adapter_script: &Path) -> VibexResult<String> {
+    let adapter_script = adapter_script.to_str().ok_or_else(|| {
+        VibexError::validation(
+            "agent_npm_launcher_path_invalid",
+            "Pi ACP adapter path was not valid UTF-8",
+        )
+    })?;
+    let adapter_script = serde_json::to_string(adapter_script).map_err(|error| {
+        VibexError::validation(
+            "agent_npm_launcher_path_invalid",
+            "Pi ACP adapter path could not be encoded",
+        )
+        .with_diagnostic("error", error.to_string())
+    })?;
+    Ok(format!(
+        r#""use strict";
+const path = require("node:path");
+const {{ pathToFileURL }} = require("node:url");
+
+const piCommand = process.platform === "win32" ? "pi.cmd" : "pi";
+process.env.PI_ACP_PI_COMMAND = path.join(__dirname, "node_modules", ".bin", piCommand);
+const adapter = path.join(__dirname, {adapter_script});
+import(pathToFileURL(adapter).href).catch((error) => {{
+  console.error("Failed to start pi-acp:", error);
+  process.exitCode = 1;
+}});
+"#
+    ))
 }
 
 fn canonical_npm_tarball_url(package: &str, version: &str) -> VibexResult<String> {
@@ -2855,7 +3037,7 @@ mod tests {
             npm_path: Some(explicit_npm),
         };
         let candidates = node_runtime_candidates(&options, Some(system_node), Some(system_npm));
-        let runtime = select_valid_external_node_runtime(candidates)
+        let runtime = select_valid_external_node_runtime(candidates, &MINIMUM_NODE_VERSION)
             .await
             .expect("explicit runtime should be selected");
         assert_eq!(runtime.source, NodeRuntimeSource::Explicit);
@@ -2880,11 +3062,10 @@ mod tests {
             node_path: Some(explicit_node),
             npm_path: Some(explicit_npm),
         };
-        let runtime = select_valid_external_node_runtime(node_runtime_candidates(
-            &options,
-            Some(system_node.clone()),
-            Some(system_npm),
-        ))
+        let runtime = select_valid_external_node_runtime(
+            node_runtime_candidates(&options, Some(system_node.clone()), Some(system_npm)),
+            &MINIMUM_NODE_VERSION,
+        )
         .await
         .expect("system runtime should be selected");
         assert_eq!(runtime.source, NodeRuntimeSource::System);
@@ -2910,14 +3091,49 @@ mod tests {
             npm_path: Some(explicit_npm),
         };
         assert!(
-            select_valid_external_node_runtime(node_runtime_candidates(
-                &options,
-                Some(system_node),
-                Some(system_npm),
-            ))
+            select_valid_external_node_runtime(
+                node_runtime_candidates(&options, Some(system_node), Some(system_npm)),
+                &MINIMUM_NODE_VERSION,
+            )
             .await
             .is_none()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pi_rejects_node_older_than_its_runtime_dependency() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_node = temp.path().join("old-node");
+        let old_npm = temp.path().join("old-npm");
+        let supported_node = temp.path().join("supported-node");
+        let supported_npm = temp.path().join("supported-npm");
+        write_version_probe(&old_node, "v22.18.0");
+        write_version_probe(&old_npm, "10.9.2");
+        write_version_probe(&supported_node, "v22.19.0");
+        write_version_probe(&supported_npm, "10.9.2");
+
+        let runtime = select_valid_external_node_runtime(
+            vec![
+                NodeRuntimeCandidate {
+                    source: NodeRuntimeSource::Explicit,
+                    node: old_node,
+                    npm: old_npm,
+                },
+                NodeRuntimeCandidate {
+                    source: NodeRuntimeSource::System,
+                    node: supported_node.clone(),
+                    npm: supported_npm,
+                },
+            ],
+            &minimum_node_version(&AgentId::parse("pi").unwrap()),
+        )
+        .await
+        .expect("Pi-compatible runtime should be selected");
+
+        assert_eq!(runtime.source, NodeRuntimeSource::System);
+        assert_eq!(runtime.node, supported_node);
+        assert_eq!(runtime.version, PI_MINIMUM_NODE_VERSION);
     }
 
     #[test]
@@ -2954,6 +3170,10 @@ mod tests {
             require_registry_id(&AgentId::parse("cursor").unwrap()).unwrap(),
             "cursor"
         );
+        assert_eq!(
+            require_registry_id(&AgentId::parse("pi").unwrap()).unwrap(),
+            "pi-acp"
+        );
         assert!(require_registry_id(&AgentId::parse("fast-agent").unwrap()).is_err());
     }
 
@@ -2965,6 +3185,28 @@ mod tests {
         );
         assert!(parse_exact_npm_spec("agent@^1.2.3", "1.2.3").is_err());
         assert!(parse_exact_npm_spec("agent@1.2.4", "1.2.3").is_err());
+    }
+
+    #[test]
+    fn pi_runtime_dependency_and_launcher_are_managed_locally() {
+        let dependency = npm_runtime_dependency(&AgentId::parse("pi").unwrap()).unwrap();
+        assert_eq!(dependency.package, PI_CODING_AGENT_PACKAGE);
+        assert_eq!(dependency.version, PI_CODING_AGENT_VERSION);
+        assert_eq!(
+            parse_exact_npm_spec(
+                &format!("{}@{}", dependency.package, dependency.version),
+                dependency.version
+            )
+            .unwrap(),
+            (dependency.package, dependency.version)
+        );
+        assert!(npm_runtime_dependency(&AgentId::parse("gemini").unwrap()).is_none());
+
+        let launcher =
+            pi_acp_launcher_source(Path::new("node_modules/pi-acp/dist/index.js")).unwrap();
+        assert!(launcher.contains("PI_ACP_PI_COMMAND"));
+        assert!(launcher.contains("node_modules\", \".bin"));
+        assert!(launcher.contains("node_modules/pi-acp/dist/index.js"));
     }
 
     #[test]
@@ -3115,6 +3357,62 @@ mod tests {
         )
         .unwrap();
         assert!(verify_npm_lock(temp.path(), package, version, integrity, &resolved).is_err());
+    }
+
+    #[test]
+    fn pi_npm_lock_verifies_the_adapter_and_coding_agent() {
+        let temp = tempfile::tempdir().unwrap();
+        let adapter = (
+            "pi-acp",
+            "0.0.33",
+            "sha512-vX9kY1tK14E72G4dBAx+RGCk/k7XPjTHls6dLUxA8WSkBav6B6JHuSBv3eusp50LCR/GTRsR2kIKsG0Z5jANzw==",
+        );
+        let runtime = (
+            PI_CODING_AGENT_PACKAGE,
+            PI_CODING_AGENT_VERSION,
+            "sha512-ncAqFrG+iybuPGOhMiZoEHkEzTpJgz3guYD32pD+M7ucc0WeHmauP6wa7qwP8V/KWvsZDVNa5XGsdZ7fkC7w7A==",
+        );
+        let adapter_resolved = canonical_npm_tarball_url(adapter.0, adapter.1).unwrap();
+        let runtime_resolved = canonical_npm_tarball_url(runtime.0, runtime.1).unwrap();
+        write_json_private(
+            &temp.path().join("package-lock.json"),
+            &serde_json::json!({
+                "packages": {
+                    "node_modules/pi-acp": {
+                        "version": adapter.1,
+                        "integrity": adapter.2,
+                        "resolved": adapter_resolved,
+                    },
+                    "node_modules/@earendil-works/pi-coding-agent": {
+                        "version": runtime.1,
+                        "integrity": runtime.2,
+                        "resolved": runtime_resolved,
+                    },
+                }
+            }),
+        )
+        .unwrap();
+
+        assert!(
+            verify_npm_lock(
+                temp.path(),
+                adapter.0,
+                adapter.1,
+                adapter.2,
+                &adapter_resolved
+            )
+            .is_ok()
+        );
+        assert!(
+            verify_npm_lock(
+                temp.path(),
+                runtime.0,
+                runtime.1,
+                runtime.2,
+                &runtime_resolved
+            )
+            .is_ok()
+        );
     }
 
     #[test]

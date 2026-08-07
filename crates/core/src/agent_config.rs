@@ -441,6 +441,7 @@ pub fn acp_registry_agent_id(agent_id: &AgentId) -> Option<&'static str> {
         "copilot" => return Some("github-copilot-cli"),
         "grok" => return Some("grok-build"),
         "opencode" => return Some("opencode"),
+        "pi" => return Some("pi-acp"),
         // These entries are absent from the Registry or do not currently
         // publish a binary or npm distribution that Vibex can install.
         "codewhale" | "fast-agent" | "hermes" | "kiro" | "minion-code" => {
@@ -708,6 +709,7 @@ mod tests {
             "mistral-vibe",
             "nova",
             "opencode",
+            "pi",
             "poolside",
             "qoder",
             "qwen-code",
@@ -777,6 +779,10 @@ mod tests {
             acp_registry_agent_id(&AgentId::parse("gemini").unwrap()),
             Some("gemini")
         );
+        assert_eq!(
+            acp_registry_agent_id(&AgentId::parse("pi").unwrap()),
+            Some("pi-acp")
+        );
         for managed in [
             "cortex-code",
             "crow-cli",
@@ -812,8 +818,13 @@ mod tests {
             .iter()
             .find(|definition| definition.id.as_str() == "cursor")
             .unwrap();
+        let pi = definitions
+            .iter()
+            .find(|definition| definition.id.as_str() == "pi")
+            .unwrap();
         let gemini = AgentSnapshotEntry::from_definition(gemini, None, None);
         let cursor = AgentSnapshotEntry::from_definition(cursor, None, None);
+        let pi = AgentSnapshotEntry::from_definition(pi, None, None);
         assert!(gemini.managed_install.managed);
         assert_eq!(
             gemini.managed_install.status,
@@ -822,6 +833,11 @@ mod tests {
         assert!(cursor.managed_install.managed);
         assert_eq!(
             cursor.managed_install.status,
+            AgentManagedInstallStatus::NotInstalled
+        );
+        assert!(pi.managed_install.managed);
+        assert_eq!(
+            pi.managed_install.status,
             AgentManagedInstallStatus::NotInstalled
         );
     }

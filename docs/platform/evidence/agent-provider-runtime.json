@@ -3,9 +3,9 @@
   "status": "passed",
   "claimScope": "manifest_and_contract",
   "realRuntimeVerification": "blocked",
-  "capturedAt": "2026-08-06T08:04:36.740Z",
+  "capturedAt": "2026-08-07T09:56:59.065Z",
   "source": {
-    "captureParentCommit": "07d246f76bcaff56237a1d0463e1e30125d78ac8",
+    "captureParentCommit": "d3e428d2c2cdd7df3dcbd89df4e419016b0187d1",
     "rustToolchain": "rustc-1.97.0",
     "sourceInputRoots": [
       "crates/core/src/acp_catalog.rs",
@@ -53,27 +53,27 @@
       "crates/vibex-ui/Cargo.toml",
       "apps/desktop/Cargo.toml"
     ],
-    "sourceInputTreeSha256": "e79ff71da332d4888116917eee137fa27a0628a7cf56df38096d0699fc2955a8",
+    "sourceInputTreeSha256": "c48b7cebe7f6168b715f33acffc929fd28b349770f5c9e13cc0f0b4d61b936f4",
     "bindings": {
-      "catalog": "7ad921ebb2f6b6bbc8e948a6b7ed225c2b84d301f5d6a309ce697e3cbf9592d0",
-      "manifest": "fbb84e1bb0af51c5f4ee26de713dc96d876a29ccb569ccb13be541fc7681bf28",
-      "probe": "b1bdf6b80bd0f2a912ae37d84178b1368b272a3cebfb563ce9d5793357959c4b",
-      "database": "d299ee59a1ac2160ff8c838c905e98889614c3d8e5eab0b1ae477382f1ac690a",
+      "catalog": "164f53c193e4c687d56e7df12a7f6c395a32cadb744cf46471954a25cae42bd5",
+      "manifest": "827339f122692ed3f67d5bf3d7c8822b07780b3bb3a6d05083fcab8aa58a3d71",
+      "probe": "5136cd7c379d1dbb873aee0615bdadf9d58301eab14bfbbfaa5e6aff713ce4b4",
+      "database": "b73956a31d95742232b357fd923dcf5f489a86687e4c996236f9f53f23419658",
       "remote": "cca712dc885a20fa5dbf4ec8d0db5d603015c7b87d1f879f458d88d29cb70905",
-      "ui": "b0b3d399fdc6f338418abb2619cf4f5298aed8eaf9d8ef187500f3ba2eb3929c",
+      "ui": "93c3d25efa7c7713f1cf7731542521fd43808abf866336e017cafd8bcb34cded",
       "switch": "aa9ef1a461fb4adad5756ba2c7931aaae3b0de499b85d1603df5c9cdf7fe9996",
-      "scripts": "5bc4862bd12ce9003dd9755772db641653062411468dcf7bf05a869f931c5d17",
-      "packageMetadata": "578fbdba0da56b0ffbac96dbbdb182e347c730edaffd5c3d21f6b7af94f434bf"
+      "scripts": "4b85e8061180d809d2df0d8b3de8a3e93a1724cef464c02dd9ef6870b5f4dc86",
+      "packageMetadata": "ce644f6fff1360cbac4c638cb82bec12b939e1bee1a56c6cfdb3481d4345341a"
     },
-    "cargoLockSha256": "2b45acad3dc8405882dc74c478839b69a31c609ed8c19cc29bbca44d004c146b",
+    "cargoLockSha256": "1f1bee10326503e236af53f9e5242462f871def4ccf3f665a803d4555368eced",
     "packageJsonSha256": "4e1c85256422478413b0e9c5f0e046295bbe260944dd7d93a59b1c190ed7d739",
-    "rolloutManifestSha256": "23e9e61f7784ba54fcaa94dd1a064e430d21636395f6796eaed973d58dd00f3b"
+    "rolloutManifestSha256": "b7df3c0dd5e2a3c0eaf29e721c147975c519db0b3cea2dfadedf2921193005a6"
   },
   "manifest": {
     "schemaVersion": "agent-provider-runtime-manifest.v1",
-    "totalAgents": 38,
+    "totalAgents": 39,
     "builtinCount": 3,
-    "catalogCount": 35,
+    "catalogCount": 36,
     "entries": [
       {
         "agentId": "claude",
@@ -125,7 +125,7 @@
         "descriptorVersion": "1",
         "versionPolicy": {
           "kind": "detected_semver",
-          "requirement": ">=1.17.9, <2.0.0"
+          "requirement": ">=1.17.9"
         },
         "capabilityMode": "replaceable_provider",
         "runtimeHomeStrategy": "vibex_private",
@@ -268,7 +268,8 @@
         "descriptorId": "projection_codebuddy_code_runtime_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
-          "kind": "exact"
+          "kind": "detected_semver",
+          "requirement": ">=2.109.0"
         },
         "capabilityMode": "replaceable_provider",
         "runtimeHomeStrategy": "vibex_private",
@@ -316,7 +317,8 @@
         "descriptorId": "projection_cortex_code_runtime_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
-          "kind": "exact"
+          "kind": "detected_semver",
+          "requirement": ">=1.0.73"
         },
         "capabilityMode": "cloud_credential",
         "runtimeHomeStrategy": "agent_managed",
@@ -496,7 +498,8 @@
         "descriptorId": "projection_gemini_runtime_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
-          "kind": "exact"
+          "kind": "detected_semver",
+          "requirement": ">=0.47.0"
         },
         "capabilityMode": "cloud_credential",
         "runtimeHomeStrategy": "agent_managed",
@@ -519,7 +522,8 @@
         "descriptorId": "projection_glm_acp_agent_runtime_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
-          "kind": "exact"
+          "kind": "detected_semver",
+          "requirement": ">=1.1.4"
         },
         "capabilityMode": "replaceable_provider",
         "runtimeHomeStrategy": "vibex_private",
@@ -754,6 +758,25 @@
         "evidenceState": "unverified",
         "sourceEvidenceReference": "research/acp-agent/poolside@1.0.0",
         "smokeId": "agent-provider-poolside",
+        "capabilityDiagnosticCode": "agent_projection_mixed_auth_boundary_not_runtime_verified"
+      },
+      {
+        "agentId": "pi",
+        "catalogVersion": "0.0.33",
+        "adapterId": "pi-acp",
+        "descriptorId": "projection_pi_runtime_v1",
+        "descriptorVersion": "1",
+        "versionPolicy": {
+          "kind": "exact"
+        },
+        "capabilityMode": "replaceable_provider",
+        "runtimeHomeStrategy": "none",
+        "switchBehavior": "unverified",
+        "credentialKinds": [],
+        "modelInterfaces": [],
+        "evidenceState": "unverified",
+        "sourceEvidenceReference": "research/acp-agent/pi@0.0.33",
+        "smokeId": "agent-provider-pi",
         "capabilityDiagnosticCode": "agent_projection_mixed_auth_boundary_not_runtime_verified"
       },
       {
@@ -1202,7 +1225,7 @@
       "catalogVersion": "2.109.0",
       "descriptorId": "projection_codebuddy_code_runtime_v1",
       "descriptorVersion": "1",
-      "versionPolicy": "exact",
+      "versionPolicy": "detected_semver",
       "capabilityMode": "replaceable_provider",
       "switchBehavior": "restart_and_resume",
       "status": "blocked",
@@ -1272,7 +1295,7 @@
       "catalogVersion": "1.0.73",
       "descriptorId": "projection_cortex_code_runtime_v1",
       "descriptorVersion": "1",
-      "versionPolicy": "exact",
+      "versionPolicy": "detected_semver",
       "capabilityMode": "cloud_credential",
       "switchBehavior": "restart_and_resume",
       "status": "blocked",
@@ -1587,7 +1610,7 @@
       "catalogVersion": "0.47.0",
       "descriptorId": "projection_gemini_runtime_v1",
       "descriptorVersion": "1",
-      "versionPolicy": "exact",
+      "versionPolicy": "detected_semver",
       "capabilityMode": "cloud_credential",
       "switchBehavior": "restart_and_resume",
       "status": "blocked",
@@ -1622,7 +1645,7 @@
       "catalogVersion": "1.1.4",
       "descriptorId": "projection_glm_acp_agent_runtime_v1",
       "descriptorVersion": "1",
-      "versionPolicy": "exact",
+      "versionPolicy": "detected_semver",
       "capabilityMode": "replaceable_provider",
       "switchBehavior": "restart_and_resume",
       "status": "blocked",
@@ -2037,6 +2060,41 @@
       "recordedAt": null
     },
     {
+      "agentId": "pi",
+      "smokeId": "agent-provider-pi",
+      "catalogVersion": "0.0.33",
+      "descriptorId": "projection_pi_runtime_v1",
+      "descriptorVersion": "1",
+      "versionPolicy": "exact",
+      "capabilityMode": "replaceable_provider",
+      "switchBehavior": "unverified",
+      "status": "blocked",
+      "execution": "not_run",
+      "diagnosticCode": "agent_projection_mixed_auth_boundary_not_runtime_verified",
+      "detectedIdentity": null,
+      "descriptorMatch": "not_checked",
+      "projectionFingerprint": null,
+      "facts": {
+        "binaryIdentity": "blocked",
+        "acpHandshake": "blocked",
+        "authentication": "blocked",
+        "session": "blocked",
+        "modelCatalog": "blocked",
+        "modelSelection": "blocked",
+        "providerProjection": "blocked",
+        "sessionResume": "blocked",
+        "switchCompatibility": "blocked",
+        "redaction": "blocked"
+      },
+      "redactionPassed": false,
+      "sourceSurvivedPrepareFailure": false,
+      "providerVerified": false,
+      "liveSwitchVerified": false,
+      "binaryOnlyVerified": false,
+      "sourceEvidenceReference": "research/acp-agent/pi@0.0.33",
+      "recordedAt": null
+    },
+    {
       "agentId": "qoder",
       "smokeId": "agent-provider-qoder",
       "catalogVersion": "1.0.24",
@@ -2271,8 +2329,8 @@
     "absolutePathPersisted": false
   },
   "summary": {
-    "totalAgents": 38,
-    "blockedRealSmokes": 38,
+    "totalAgents": 39,
+    "blockedRealSmokes": 39,
     "passedRealSmokes": 0,
     "providerVerifiedAgents": 0,
     "liveSwitchVerifiedAgents": 0,
