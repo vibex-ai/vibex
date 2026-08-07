@@ -15729,6 +15729,7 @@ impl VibexWorkbench {
         let display_state =
             sidebar_session_display_state(session.state, self.session_turn_pending(&session.id));
         let session_generating = display_state == AgentSessionState::Running;
+        let session_needs_approval = display_state == AgentSessionState::NeedsInput;
         let has_unread_completion = !selected
             && self
                 .unread_agent_completion_session_ids
@@ -15980,22 +15981,44 @@ impl VibexWorkbench {
                                         ),
                                 )
                             })
+                            .when(session_needs_approval, |this| {
+                                this.child(
+                                    div()
+                                        .id(format!("sidebar-session-approval-{session_id_string}"))
+                                        .size(px(16.0))
+                                        .flex()
+                                        .flex_none()
+                                        .items_center()
+                                        .justify_center()
+                                        .tooltip(|window, cx| {
+                                            Tooltip::new("Command approval required")
+                                                .build(window, cx)
+                                        })
+                                        .child(
+                                            Icon::new(IconName::TriangleAlert)
+                                                .size(px(14.0))
+                                                .text_color(cx.theme().warning),
+                                        ),
+                                )
+                            })
                             .when(!session_generating, |this| {
-                                this.when_some(state_label, |this, label| {
-                                    this.child(
-                                        div()
-                                            .h(px(16.0))
-                                            .flex_none()
-                                            .rounded(px(4.0))
-                                            .px(px(6.0))
-                                            .text_xs()
-                                            .bg(cx.theme().secondary)
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(label),
-                                    )
-                                })
-                                .when(state_label.is_none() && !has_unread_completion, |this| {
-                                    this.child(time_label)
+                                this.when(!session_needs_approval, |this| {
+                                    this.when_some(state_label, |this, label| {
+                                        this.child(
+                                            div()
+                                                .h(px(16.0))
+                                                .flex_none()
+                                                .rounded(px(4.0))
+                                                .px(px(6.0))
+                                                .text_xs()
+                                                .bg(cx.theme().secondary)
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(label),
+                                        )
+                                    })
+                                    .when(state_label.is_none() && !has_unread_completion, |this| {
+                                        this.child(time_label)
+                                    })
                                 })
                             })
                             .when(has_unread_completion, |this| {
