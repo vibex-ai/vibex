@@ -182,6 +182,7 @@ const UNSUPPORTED_RIGHT_RAIL_WEB_BUILTINS: &[&str] = &["doubao", "kimi", "yuanba
 const SIDEBAR_INLINE_TRANSITION_DURATION: Duration = Duration::from_millis(200);
 const SIDEBAR_FLOATING_TRANSITION_DURATION: Duration = Duration::from_millis(200);
 const STARTUP_LOADING_INDICATOR_DELAY: Duration = Duration::from_secs(5);
+const STARTUP_LOADING_MIN_DURATION: Duration = Duration::from_secs(1);
 // Tauri parity: submission locators poll `agent_get_message_submission` every 500ms.
 const SUBMISSION_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const RUNTIME_UI_SIGNAL_BATCH_LIMIT: usize = 256;
@@ -3403,6 +3404,7 @@ pub struct VibexWorkbench {
     optimistic_user_messages: BTreeMap<String, OptimisticUserMessage>,
     startup_loading: bool,
     startup_loading_indicator_visible: bool,
+    startup_loading_started_at: Instant,
     agent_loading: bool,
     agent_action_pending: bool,
     fork_session_pending: bool,
@@ -3443,6 +3445,7 @@ pub struct VibexWorkbench {
     right_rail_plugin_task: Option<Task<()>>,
     right_rail_plugin_mutation_task: Option<Task<()>>,
     startup_loading_indicator_task: Option<Task<()>>,
+    startup_loading_release_task: Option<Task<()>>,
     appearance_subscription: Option<Subscription>,
     quit_subscription: Option<Subscription>,
     _agent_subscriptions: Vec<Subscription>,
@@ -3939,6 +3942,7 @@ impl VibexWorkbench {
             optimistic_user_messages: BTreeMap::new(),
             startup_loading: true,
             startup_loading_indicator_visible: false,
+            startup_loading_started_at: Instant::now(),
             agent_loading: true,
             agent_action_pending: false,
             fork_session_pending: false,
@@ -3979,6 +3983,7 @@ impl VibexWorkbench {
             right_rail_plugin_task: None,
             right_rail_plugin_mutation_task: None,
             startup_loading_indicator_task: None,
+            startup_loading_release_task: None,
             appearance_subscription: None,
             quit_subscription: None,
             _agent_subscriptions: agent_subscriptions,
@@ -4075,7 +4080,7 @@ impl VibexWorkbench {
 
     fn begin_runtime_start(&mut self, cx: &mut Context<Self>) {
         let Some(config) = self.config.clone() else {
-            self.finish_startup_loading();
+            self.finish_startup_loading(cx);
             self.runtime_status = RuntimeStatus::Failed {
                 code: "desktop_runtime_config_unavailable".to_string(),
                 message: "The isolated GPUI runtime could not be configured.".to_string(),
@@ -4137,7 +4142,7 @@ impl VibexWorkbench {
                         Ok(Ok((runtime, loaded_state, persistence_note))) => {
                             eprintln!("vibex-foundation: runtime-ready");
                             this.runtime_status = RuntimeStatus::Ready;
-                            this.finish_startup_loading();
+                            this.finish_startup_loading(cx);
                             this.runtime_note =
                                 Some("Authoritative event stream connected".to_string());
                             if let Some(state) = loaded_state {
@@ -4183,14 +4188,14 @@ impl VibexWorkbench {
                         }
                         Ok(Err(error)) => {
                             eprintln!("vibex-foundation: runtime-failed code={}", error.code);
-                            this.finish_startup_loading();
+                            this.finish_startup_loading(cx);
                             this.runtime_status = RuntimeStatus::Failed {
                                 code: error.code,
                                 message: error.message,
                             };
                         }
                         Err(error) => {
-                            this.finish_startup_loading();
+                            this.finish_startup_loading(cx);
                             this.runtime_status = RuntimeStatus::Failed {
                                 code: "desktop_runtime_boot_task_failed".to_string(),
                                 message: error.to_string(),
@@ -4220,10 +4225,31 @@ impl VibexWorkbench {
         }
     }
 
-    fn finish_startup_loading(&mut self) {
+    fn finish_startup_loading(&mut self, cx: &mut Context<Self>) {
+        if !self.startup_loading {
+            return;
+        }
+        let elapsed = self.startup_loading_started_at.elapsed();
+        if elapsed < STARTUP_LOADING_MIN_DURATION {
+            let remaining = STARTUP_LOADING_MIN_DURATION - elapsed;
+            if self.startup_loading_release_task.is_none() {
+                self.startup_loading_release_task = Some(cx.spawn(
+                    async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                        cx.background_executor().timer(remaining).await;
+                        let _ = entity.update(cx, |this, cx| {
+                            this.startup_loading_release_task = None;
+                            this.finish_startup_loading(cx);
+                            cx.notify();
+                        });
+                    },
+                ));
+            }
+            return;
+        }
         self.startup_loading = false;
         self.startup_loading_indicator_visible = false;
         self.startup_loading_indicator_task = None;
+        self.startup_loading_release_task = None;
     }
 
     fn schedule_startup_loading_indicator(&mut self, cx: &mut Context<Self>) {
@@ -34700,13 +34726,13 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn finish_startup_loading("))
             .map(|(body, _)| body)
             .expect("runtime startup should remain inspectable");
-        assert!(boot.contains("self.finish_startup_loading();"));
-        assert!(boot.contains("this.finish_startup_loading();"));
+        assert!(boot.contains("self.finish_startup_loading(cx);"));
+        assert!(boot.contains("this.finish_startup_loading(cx);"));
         let ready = boot
             .find("this.runtime_status = RuntimeStatus::Ready;")
             .expect("runtime ready transition should remain inspectable");
         let release = boot[ready..]
-            .find("this.finish_startup_loading();")
+            .find("this.finish_startup_loading(cx);")
             .expect("runtime ready should release the startup overlay");
         let overview_load = boot[ready..]
             .find("this.load_agent_overview(cx);")
@@ -34747,6 +34773,7 @@ mod tests {
     #[test]
     fn startup_loading_indicator_is_delayed_for_five_seconds() {
         assert_eq!(STARTUP_LOADING_INDICATOR_DELAY, Duration::from_secs(5));
+        assert_eq!(STARTUP_LOADING_MIN_DURATION, Duration::from_secs(1));
         let source = include_str!("app.rs");
         let scheduler = source
             .split_once("    fn schedule_startup_loading_indicator(")
@@ -34765,6 +34792,21 @@ mod tests {
         assert!(overlay.contains("when(show_loading_indicator"));
         assert!(overlay.contains("Spinner::new()"));
         assert!(overlay.contains("IconName::LoaderCircle"));
+    }
+
+    #[test]
+    fn startup_loading_release_waits_for_minimum_duration() {
+        let source = include_str!("app.rs");
+        let release = source
+            .split_once("    fn finish_startup_loading(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn schedule_startup_loading_indicator("))
+            .map(|(body, _)| body)
+            .expect("startup loading release should remain inspectable");
+
+        assert!(release.contains("startup_loading_started_at.elapsed()"));
+        assert!(release.contains("STARTUP_LOADING_MIN_DURATION"));
+        assert!(release.contains("startup_loading_release_task"));
+        assert!(release.contains("background_executor().timer(remaining)"));
     }
 
     #[test]
