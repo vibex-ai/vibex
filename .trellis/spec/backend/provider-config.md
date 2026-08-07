@@ -2052,8 +2052,9 @@ provider_capability_probe_records(
 
 ### 1. Scope / Trigger
 
-- Trigger: desktop startup installs or upgrades managed ACP adapters after the
-  authoritative runtime is ready.
+- Trigger: desktop startup reconciles already-added managed ACP Agents after
+  the authoritative runtime is ready. User-driven Add/Upgrade/Uninstall work
+  remains owned by Config Center.
 - Runtime-option probing is deliberately outside startup. It belongs to Agent
   setup and must remain independent from Provider Profile reconciliation.
 
@@ -2062,7 +2063,7 @@ provider_capability_probe_records(
 ```rust
 DesktopRuntime::start(config) -> Arc<DesktopRuntime>
 DesktopRuntime::spawn_agent_bootstrap() -> VibexResult<()>
-prepare_managed_acp_adapters(config_service, db_path).await
+AgentInstallService::ensure_installed(agent_id).await
 RuntimeOptionCatalogService::probe_agent(agent_id).await
 ProviderProfileMutationEvent::{Saved, Deleted}(provider_profile_id)
 ```
@@ -2072,10 +2073,12 @@ ProviderProfileMutationEvent::{Saved, Deleted}(provider_profile_id)
 - Runtime readiness requires the local authoritative services, lifecycle,
   gateway, and startup reconciliation, but not network-backed adapter installs
   or Agent process capability probes.
-- Start managed adapter preparation only after `DesktopRuntime::activate`
-  succeeds. Own the task in `DesktopRuntime.tasks` so shutdown aborts any npm
-  child through its existing kill-on-drop lifecycle.
-- Use the listener-enabled runtime `ProviderConfigService`. Adapter command
+- Start reconciliation only after `DesktopRuntime::activate` succeeds. Own
+  the task in `DesktopRuntime.tasks` so shutdown aborts any download/npm child
+  through its existing kill-on-drop lifecycle. Bootstrap only includes Agent
+  snapshots that are both `added` and Registry-managed; a removed Agent is
+  never silently reinstalled.
+- Use the listener-enabled runtime `ProviderConfigService`. Managed command
   reconciliation must still invalidate ACP process configuration and publish
   Provider Profile changes.
 - Startup never scans for missing runtime-option snapshots and never calls an
@@ -2107,15 +2110,15 @@ ProviderProfileMutationEvent::{Saved, Deleted}(provider_profile_id)
 
 ### 5. Good/Base/Bad Cases
 
-- Good: a new adapter version downloads slowly while the workbench opens; its
-  completed command reconciliation publishes Provider changes without starting
-  an Agent option probe.
+- Good: an existing managed installation is repaired in the background while
+  the workbench opens; completed command reconciliation publishes Provider
+  changes without starting an Agent option probe.
 - Base: exact adapters are installed and an Agent has no snapshot; the
   workbench remains ready and the Config Center shows `not probed`.
 - Good: adding a Provider Profile updates models and immediately reuses the
   Agent's previously cached modes and Features.
-- Bad: `build_agent_manager` or `activate` awaits `npm install`, an ACP probe, or
-  complete catalog enrichment before reporting the runtime ready.
+- Bad: `build_agent_manager` or `activate` awaits a managed download, an ACP
+  probe, or complete catalog enrichment before reporting the runtime ready.
 - Bad: startup calls `refresh_missing`, or a Profile save calls
   `refresh_profile`/`probe_agent`.
 
@@ -2410,6 +2413,108 @@ runtime_selection.initialize_new_session(&session_id, selection).await?;
 Backend session creation owns durable enforcement; frontend catalog filtering
 is only a convenience. `ProviderKind` remains valid in configuration/provenance
 APIs but does not participate in the online route above.
+
+## Scenario: ACP Registry Managed Agent Installation Lifecycle
+
+### 1. Scope / Trigger
+
+- Trigger: the user clicks Add, Upgrade, or Uninstall for an ACP Agent whose
+  `AgentDefinition` maps to the verified ACP Registry. The right-hand Config
+  Center panel is the user-visible operation surface.
+- Agents without a verified Registry distribution remain external-CLI
+  Agents; Vibex does not download or replace their user-installed command.
+
+### 2. Signatures
+
+```text
+AgentInstallService::install(agent_id).await
+AgentInstallService::check_update(agent_id).await
+AgentInstallService::uninstall(agent_id).await
+AgentInstallService::bootstrap_agent_ids() -> Vec<AgentId>
+AgentManagedInstallationRecord {
+  agent_id, registry_agent_id, state, command, install_root, updated_at_ms
+}
+```
+
+### 3. Contracts
+
+- Config Center Add starts the managed installation. The panel shows a
+  disabled loading state until the verified command is published; only then
+  does the UI set `added = true`/`enabled = true`, refresh runtime capability
+  data, and discover authentication methods for the user to choose.
+- The upstream Registry response is cached for one hour. Binary archives must
+  carry a SHA-256. npm distributions must use an exact version, metadata
+  integrity, and the canonical `registry.npmjs.org` tarball URL; the lockfile
+  `resolved` URL must match that same canonical artifact.
+- npm Agents run from Vibex-managed Node.js 22 and an isolated npm cache. The
+  install root is content-addressed, publishes through staging, keeps healthy
+  versions side by side, and only prunes old versions after the new command is
+  durable. Archive paths, extraction budgets, and executable paths are bounded
+  and traversal-safe.
+- A usable installed SemVer may not be replaced by a lower Registry SemVer.
+  Exact-version cache hits are idempotent; an invalid cache entry is removed
+  and rebuilt. Pending install/upgrade/uninstall rows are reconciled on the
+  next startup using actual install-root and command-file checks, not only a
+  version field.
+- Uninstall owns the cross-layer transition: it marks the operation pending,
+  removes Agent config and authentication snapshots, removes managed files and
+  the installation row, and leaves the Agent disabled/deleted. If a later step
+  fails while the old command remains usable, the old command and prior
+  `added`/`enabled` state are restored; otherwise the Agent remains removed
+  with a bounded Failed state.
+- The managed installation record is the source for the actual command and
+  installed version. ACP runtime compatibility identity, event enrichers,
+  versioned operation evidence, restore policy, and process reuse may use an
+  exact static descriptor only when the command/version (and required runtime
+  dependencies) exactly match it. Adjacent or latest Registry versions use a
+  conservative dynamic identity and do not inherit old evidence.
+- Authentication catalog cleanup belongs to the configuration service as well
+  as the UI boundary, so a crash between the file operation and panel refresh
+  cannot leave stale auth methods for a removed Agent.
+
+### 4. Validation & Error Matrix
+
+- Missing Registry mapping -> `capability/agent_managed_install_unavailable`;
+  Vibex falls back to the external CLI path.
+- Registry parse, unsupported platform, missing checksum, invalid archive,
+  canonical npm source, integrity, lockfile, or executable mismatch -> a
+  structured validation/capability error; no partial install is activated.
+- Download or extraction timeout -> bounded process error and a persisted
+  `Failed`/`UpdateAvailable` state suitable for retry.
+- Registry downgrade candidate -> `conflict/agent_install_downgrade_rejected`.
+- Interrupted operation or unusable command/root -> recovery marks the row
+  failed and does not re-enable a missing process.
+- Uninstall failure -> preserve the old usable command and configuration when
+  possible; never leave an enabled Agent pointing at deleted files.
+
+### 5. Good/Base/Bad Cases
+
+- Good: clicking Add shows Downloading, verifies the package, enables the
+  Agent, detects its authentication methods, and leaves provider profiles and
+  native Agent homes untouched.
+- Good: Upgrade publishes a new side-by-side version, records the actual
+  version in runtime identity, and keeps the old version available until the
+  new command is active.
+- Base: opening Config Center reads the cached installation state without
+  downloading; an explicit Check for updates refreshes the Registry.
+- Good: removing an Agent deletes its command, installation row, and auth
+  catalog; a later startup does not reinstall it unless the user adds it again.
+- Bad: activate an Agent before checksum/lock verification, use npm's global
+  prefix or the user's preinstalled `node`, silently downgrade, or restore an
+  old exact compatibility workaround for a newer binary.
+
+### 6. Tests Required
+
+- `cargo test -p vibex-desktop-runtime agent_install` covers cache repair,
+  canonical npm sources, lockfile identity, checksum/archive limits, SemVer
+  downgrade rejection, interrupted recovery, and uninstall cleanup.
+- `cargo test -p vibex-config-switch agent` covers removal of runtime and auth
+  snapshots plus managed command/version matching.
+- `cargo test -p vibex-agent-acp runtime` covers dynamic managed identities,
+  conservative event/pool/restore/evidence behavior, and exact external
+  descriptor compatibility.
+- Desktop management tests cover Add loading, upgrade loading, failed-install
+  detail rendering, and Agent registry refresh events.
 
 ## Scenario: ACP Managed Adapter Compatibility Registry
 

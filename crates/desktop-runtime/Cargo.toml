@@ -9,16 +9,20 @@ repository.workspace = true
 [dependencies]
 async-trait.workspace = true
 base64.workspace = true
+bzip2.workspace = true
 chrono = "0.4.45"
 vibex-backup = { path = "../backup" }
 fs2 = "0.4"
+flate2 = "1"
 futures-util.workspace = true
 reqwest.workspace = true
 rusqlite = { version = "0.37", features = ["bundled"] }
+semver.workspace = true
 serde.workspace = true
 sha2.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tar = "0.4"
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 tracing.workspace = true
@@ -35,6 +39,7 @@ vibex-git = { path = "../git" }
 vibex-relay = { path = "../relay" }
 vibex-remote = { path = "../remote" }
 vibex-terminal = { path = "../terminal" }
+zip.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

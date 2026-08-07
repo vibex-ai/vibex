@@ -42,6 +42,9 @@ Plan migrations around these domain records:
   `provider_runtime_option_snapshots` table.
 - `agent_configs`, `agent_discovery_records`, and the active Agent-owned
   `agent_runtime_option_snapshots` table.
+- `agent_managed_installations`, the durable lifecycle record for verified ACP
+  Registry downloads, side-by-side versions, active commands, and crash
+  recovery state.
 - `mcp_servers`, `skills`, `skill_repos`, and `prompts`.
 - `terminals`.
 - `git_snapshots`.
@@ -137,6 +140,16 @@ an ACP process. Only an explicit user refresh or an authentication/logout action
 may query again and replace the snapshot. Failed discovery must not overwrite a
 previous success. Removing an Agent deletes all of its authentication snapshots so
 a later re-add performs fresh discovery.
+
+`agent_managed_installations` is schema migration 41. It stores the Registry
+Agent id, serialized managed install state, the exact launch command/arguments,
+the published install root, and an update timestamp. The row is not a second
+Agent enablement authority: Config Center owns `agent_configs.added/enabled`,
+while the installation service owns command/file lifecycle and removes the
+row after a successful uninstall. Pending rows are inspected on startup using
+the install root and executable files; a version string alone is insufficient
+evidence of a usable installation. The row must never contain credentials or
+native Agent configuration contents.
 
 Runtime-option payload schema v1 stores the camelCase JSON form of
 `AgentSessionConfigProbe` with an empty `models` array. Additive fields require

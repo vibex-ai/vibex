@@ -56,9 +56,10 @@ pub use agent_auth::{
 pub use agent_config::{
     AgentCatalogListResponse, AgentCommandConfig, AgentConfig, AgentConfigStatus, AgentDefinition,
     AgentDiscoveryRecord, AgentId, AgentInstallStatus, AgentListRequest, AgentListResponse,
+    AgentManagedDistributionKind, AgentManagedInstallState, AgentManagedInstallStatus,
     AgentRefreshSnapshotRequest, AgentRefreshSnapshotResponse, AgentRuntimeKind,
     AgentRuntimeStatus, AgentSnapshotEntry, AgentSourceKind, AgentUpdateConfigRequest,
-    agent_id_for_provider_kind, builtin_agent_definitions,
+    acp_registry_agent_id, agent_id_for_provider_kind, builtin_agent_definitions,
 };
 pub use agent_provider_runtime::*;
 pub use automation_graph::{

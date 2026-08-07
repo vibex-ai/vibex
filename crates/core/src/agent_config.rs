@@ -97,6 +97,80 @@ pub enum AgentInstallStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum AgentManagedDistributionKind {
+    Binary,
+    Npm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentManagedInstallStatus {
+    External,
+    NotInstalled,
+    Installing,
+    Installed,
+    UpdateAvailable,
+    Upgrading,
+    Failed,
+    Uninstalling,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentManagedInstallState {
+    pub managed: bool,
+    pub status: AgentManagedInstallStatus,
+    pub distribution_kind: Option<AgentManagedDistributionKind>,
+    pub installed_version: Option<String>,
+    pub available_version: Option<String>,
+    pub last_error_code: Option<String>,
+    pub last_error_message: Option<String>,
+    pub updated_at_ms: Option<i64>,
+}
+
+impl AgentManagedInstallState {
+    pub fn external() -> Self {
+        Self {
+            managed: false,
+            status: AgentManagedInstallStatus::External,
+            distribution_kind: None,
+            installed_version: None,
+            available_version: None,
+            last_error_code: None,
+            last_error_message: None,
+            updated_at_ms: None,
+        }
+    }
+
+    pub fn not_installed() -> Self {
+        Self {
+            managed: true,
+            status: AgentManagedInstallStatus::NotInstalled,
+            distribution_kind: None,
+            installed_version: None,
+            available_version: None,
+            last_error_code: None,
+            last_error_message: None,
+            updated_at_ms: None,
+        }
+    }
+
+    pub fn has_usable_installation(&self) -> bool {
+        matches!(
+            self.status,
+            AgentManagedInstallStatus::Installed | AgentManagedInstallStatus::UpdateAvailable
+        ) && self.installed_version.is_some()
+    }
+}
+
+impl Default for AgentManagedInstallState {
+    fn default() -> Self {
+        Self::external()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentConfigStatus {
     Unknown,
     Configured,
@@ -188,6 +262,8 @@ pub struct AgentSnapshotEntry {
     pub installed: bool,
     pub configured: bool,
     pub install_status: AgentInstallStatus,
+    #[serde(default)]
+    pub managed_install: AgentManagedInstallState,
     pub config_status: AgentConfigStatus,
     pub runtime_status: AgentRuntimeStatus,
     pub command: Option<AgentCommandConfig>,
@@ -317,6 +393,11 @@ impl AgentSnapshotEntry {
             installed: matches!(install_status, AgentInstallStatus::Installed),
             configured: matches!(config_status, AgentConfigStatus::Configured),
             install_status,
+            managed_install: if acp_registry_agent_id(&definition.id).is_some() {
+                AgentManagedInstallState::not_installed()
+            } else {
+                AgentManagedInstallState::external()
+            },
             config_status,
             runtime_status,
             command,
@@ -341,6 +422,38 @@ impl AgentSnapshotEntry {
             deleted_at_ms: config.and_then(|config| config.deleted_at_ms),
         }
     }
+
+    pub fn apply_managed_install_state(&mut self, state: AgentManagedInstallState) {
+        if self.added && state.has_usable_installation() {
+            self.installed = true;
+            self.install_status = AgentInstallStatus::Installed;
+        }
+        self.managed_install = state;
+    }
+}
+
+/// Maps Vibex's stable Agent ids onto the upstream ACP Registry identities.
+/// Agents absent from the Registry remain user-managed and retain PATH probing.
+pub fn acp_registry_agent_id(agent_id: &AgentId) -> Option<&'static str> {
+    match agent_id.as_str() {
+        "claude" => return Some("claude-acp"),
+        "codex" => return Some("codex-acp"),
+        "copilot" => return Some("github-copilot-cli"),
+        "grok" => return Some("grok-build"),
+        "opencode" => return Some("opencode"),
+        // These entries are absent, uvx-only, or currently publish binary
+        // targets without a Registry SHA-256. They stay on the external CLI
+        // path until Vibex can verify their distribution end to end.
+        "codewhale" | "cortex-code" | "crow-cli" | "cursor" | "devin" | "fast-agent" | "hermes"
+        | "junie" | "kiro" | "minion-code" | "stakpak" | "vtcode" => {
+            return None;
+        }
+        _ => {}
+    }
+    acp_agent_catalog_entries()
+        .iter()
+        .find(|entry| entry.id == agent_id.as_str())
+        .map(|entry| entry.id)
 }
 
 impl From<ProviderKind> for AgentId {
@@ -650,5 +763,53 @@ mod tests {
             Some("false")
         );
         assert_eq!(factory.params["supportsMcpServers"], false);
+    }
+
+    #[test]
+    fn managed_registry_mapping_is_explicit_and_fail_closed() {
+        assert_eq!(
+            acp_registry_agent_id(&AgentId::parse("claude").unwrap()),
+            Some("claude-acp")
+        );
+        assert_eq!(
+            acp_registry_agent_id(&AgentId::parse("copilot").unwrap()),
+            Some("github-copilot-cli")
+        );
+        assert_eq!(
+            acp_registry_agent_id(&AgentId::parse("gemini").unwrap()),
+            Some("gemini")
+        );
+        for external in ["cursor", "fast-agent", "hermes", "vtcode"] {
+            assert_eq!(
+                acp_registry_agent_id(&AgentId::parse(external).unwrap()),
+                None,
+                "{external} must remain external until its distribution is verifiable"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshots_expose_managed_install_ownership_before_installation() {
+        let definitions = builtin_agent_definitions();
+        let gemini = definitions
+            .iter()
+            .find(|definition| definition.id.as_str() == "gemini")
+            .unwrap();
+        let cursor = definitions
+            .iter()
+            .find(|definition| definition.id.as_str() == "cursor")
+            .unwrap();
+        let gemini = AgentSnapshotEntry::from_definition(gemini, None, None);
+        let cursor = AgentSnapshotEntry::from_definition(cursor, None, None);
+        assert!(gemini.managed_install.managed);
+        assert_eq!(
+            gemini.managed_install.status,
+            AgentManagedInstallStatus::NotInstalled
+        );
+        assert!(!cursor.managed_install.managed);
+        assert_eq!(
+            cursor.managed_install.status,
+            AgentManagedInstallStatus::External
+        );
     }
 }

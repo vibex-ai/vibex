@@ -27629,6 +27629,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:tar@0.4.46:c19b7c6f923b580a",
+      "name": "tar",
+      "version": "0.4.46",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/tar@0.4.46",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/composefs/tar-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:target-lexicon@0.12.16:c19b7c6f923b580a",
       "name": "target-lexicon",
       "version": "0.12.16",
@@ -36917,6 +36953,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:xattr@1.6.1:c19b7c6f923b580a",
+      "name": "xattr",
+      "version": "1.6.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/xattr@1.6.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Stebalien/xattr"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:xcb@1.7.0:c19b7c6f923b580a",
       "name": "xcb",
       "version": "1.7.0",
@@ -45768,6 +45840,14 @@
       "dependsOn": []
     },
     {
+      "ref": "cargo:tar@0.4.46:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:filetime@0.2.29:c19b7c6f923b580a",
+        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:xattr@1.6.1:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:target-lexicon@0.12.16:c19b7c6f923b580a",
       "dependsOn": []
     },
@@ -46790,14 +46870,18 @@
       "dependsOn": [
         "cargo:async-trait@0.1.89:c19b7c6f923b580a",
         "cargo:base64@0.22.1:c19b7c6f923b580a",
+        "cargo:bzip2@0.6.1:c19b7c6f923b580a",
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
+        "cargo:flate2@1.1.9:c19b7c6f923b580a",
         "cargo:fs2@0.4.3:c19b7c6f923b580a",
         "cargo:futures-util@0.3.32:c19b7c6f923b580a",
         "cargo:reqwest@0.13.4:c19b7c6f923b580a",
         "cargo:rusqlite@0.37.0:c19b7c6f923b580a",
+        "cargo:semver@1.0.28:c19b7c6f923b580a",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
         "cargo:serde_json@1.0.150:c19b7c6f923b580a",
         "cargo:sha2@0.10.9:c19b7c6f923b580a",
+        "cargo:tar@0.4.46:c19b7c6f923b580a",
         "cargo:thiserror@2.0.18:c19b7c6f923b580a",
         "cargo:tokio-tungstenite@0.28.0:c19b7c6f923b580a",
         "cargo:tokio@1.52.3:c19b7c6f923b580a",
@@ -46815,7 +46899,8 @@
         "cargo:vibex-git@0.1.0-rc.1:b6ca7a78bc73d037",
         "cargo:vibex-relay@0.1.0-rc.1:0c0a0267098c7864",
         "cargo:vibex-remote@0.1.0-rc.1:b2402acf3d0333d8",
-        "cargo:vibex-terminal@0.1.0-rc.1:73363de7836b4dd0"
+        "cargo:vibex-terminal@0.1.0-rc.1:73363de7836b4dd0",
+        "cargo:zip@8.4.0:c19b7c6f923b580a"
       ]
     },
     {
@@ -47877,6 +47962,13 @@
         "cargo:rand_core@0.6.4:c19b7c6f923b580a",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
         "cargo:zeroize@1.9.0:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:xattr@1.6.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:rustix@1.1.4:c19b7c6f923b580a"
       ]
     },
     {

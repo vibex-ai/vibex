@@ -6,23 +6,24 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Serialize, de::DeserializeOwned};
 use vibex_core::{
-    AdapterDiagnostic, AgentAuthCatalog, AgentConfig, AgentDiscoveryRecord, AgentId,
-    AgentModelListResponse, AgentModelProviderDefaultSelection, AgentModelProviderFailoverEntry,
-    AgentSession, AgentSessionConfigProbe, AgentSessionSafety, AgentSessionState, AutomationEdge,
-    AutomationEdgeCreateRequest, AutomationEdgeId, AutomationGraph, AutomationGraphCreateRequest,
-    AutomationGraphId, AutomationGraphListRequest, AutomationGraphStatus,
-    AutomationGraphUpdateRequest, AutomationNode, AutomationNodeCreateRequest, AutomationNodeId,
-    AutomationRun, AutomationRunCreateRequest, AutomationRunId, AutomationRunListRequest,
-    AutomationRunStep, AutomationRunStepCreateRequest, AutomationRunStepId,
-    AutomationRunStepListRequest, AutomationRunStepUpdateRequest, AutomationRunUpdateRequest,
-    CorrelationId, DeviceId, ElicitationRequest, ElicitationRequestStatus, ElicitationResolution,
-    ElicitationResolutionAction, GitManagedWorktreeRecord, GitManagedWorktreeStatus,
-    GitWorktreeDiagnostic, GitWorktreeOperationCheckpoint, GitWorktreeOperationDetail,
-    GitWorktreeOperationRecord, GitWorktreeOperationStatus, GitWorktreeReadinessRecord,
-    GitWorktreeReconciliationState, Hook, HookCreateRequest, HookId, HookInstallPreview,
-    HookInstallState, McpServer, McpServerAgentMatrix, McpServerCreateRequest, McpServerId,
-    McpServerProviderMatrix, McpServerSecretReference, McpServerStatus, PermissionActionDetail,
-    PermissionRequest, PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
+    AdapterDiagnostic, AgentAuthCatalog, AgentCommandConfig, AgentConfig, AgentDiscoveryRecord,
+    AgentId, AgentManagedInstallState, AgentModelListResponse, AgentModelProviderDefaultSelection,
+    AgentModelProviderFailoverEntry, AgentSession, AgentSessionConfigProbe, AgentSessionSafety,
+    AgentSessionState, AutomationEdge, AutomationEdgeCreateRequest, AutomationEdgeId,
+    AutomationGraph, AutomationGraphCreateRequest, AutomationGraphId, AutomationGraphListRequest,
+    AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationNode,
+    AutomationNodeCreateRequest, AutomationNodeId, AutomationRun, AutomationRunCreateRequest,
+    AutomationRunId, AutomationRunListRequest, AutomationRunStep, AutomationRunStepCreateRequest,
+    AutomationRunStepId, AutomationRunStepListRequest, AutomationRunStepUpdateRequest,
+    AutomationRunUpdateRequest, CorrelationId, DeviceId, ElicitationRequest,
+    ElicitationRequestStatus, ElicitationResolution, ElicitationResolutionAction,
+    GitManagedWorktreeRecord, GitManagedWorktreeStatus, GitWorktreeDiagnostic,
+    GitWorktreeOperationCheckpoint, GitWorktreeOperationDetail, GitWorktreeOperationRecord,
+    GitWorktreeOperationStatus, GitWorktreeReadinessRecord, GitWorktreeReconciliationState, Hook,
+    HookCreateRequest, HookId, HookInstallPreview, HookInstallState, McpServer,
+    McpServerAgentMatrix, McpServerCreateRequest, McpServerId, McpServerProviderMatrix,
+    McpServerSecretReference, McpServerStatus, PermissionActionDetail, PermissionRequest,
+    PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
     PermissionResponseOption, ProjectId, ProjectRecord, Prompt, PromptCreateRequest, PromptId,
     PromptStatus, ProviderCapabilityProbeResult, ProviderHealthProbeResult,
     ProviderInjectionPreview, ProviderInjectionPreviewRequest, ProviderKind,
@@ -72,7 +73,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 40;
+pub const CURRENT_SCHEMA_VERSION: i64 = 41;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -1672,6 +1673,22 @@ const MIGRATIONS: &[Migration] = &[
                 ON agent_auth_catalog_snapshots(refreshed_at_ms);
         ",
     },
+    Migration {
+        version: 41,
+        name: "agent_managed_installations",
+        sql: "
+            CREATE TABLE IF NOT EXISTS agent_managed_installations (
+                agent_id TEXT PRIMARY KEY,
+                registry_agent_id TEXT NOT NULL,
+                state_json TEXT NOT NULL,
+                command_json TEXT,
+                install_root TEXT,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_managed_installations_updated
+                ON agent_managed_installations(updated_at_ms);
+        ",
+    },
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -1698,6 +1715,7 @@ pub struct ProviderCapabilityRepository;
 pub struct ProviderRuntimeOptionSnapshotRepository;
 pub struct AgentRuntimeOptionSnapshotRepository;
 pub struct AgentAuthCatalogSnapshotRepository;
+pub struct AgentManagedInstallationRepository;
 pub struct ProviderHealthRepository;
 pub struct ProviderUsageRepository;
 pub struct ScheduledTaskRepository;
@@ -1747,6 +1765,16 @@ pub struct AgentAuthCatalogSnapshotRecord {
     pub provider_profile_id: Option<ProviderProfileId>,
     pub catalog: AgentAuthCatalog,
     pub refreshed_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentManagedInstallationRecord {
+    pub agent_id: AgentId,
+    pub registry_agent_id: String,
+    pub state: AgentManagedInstallState,
+    pub command: Option<AgentCommandConfig>,
+    pub install_root: Option<String>,
+    pub updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4141,6 +4169,118 @@ impl AgentAuthCatalogSnapshotRepository {
         })?;
         Ok(())
     }
+}
+
+impl AgentManagedInstallationRepository {
+    pub fn get(
+        conn: &Connection,
+        agent_id: &AgentId,
+    ) -> VibexResult<Option<AgentManagedInstallationRecord>> {
+        conn.query_row(
+            "SELECT agent_id, registry_agent_id, state_json, command_json,
+                    install_root, updated_at_ms
+             FROM agent_managed_installations
+             WHERE agent_id = ?1",
+            params![agent_id.as_str()],
+            map_agent_managed_installation,
+        )
+        .optional()
+        .map_err(storage_err(
+            "agent_managed_installation_get_failed",
+            "failed to read managed Agent installation",
+        ))
+    }
+
+    pub fn list(conn: &Connection) -> VibexResult<Vec<AgentManagedInstallationRecord>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT agent_id, registry_agent_id, state_json, command_json,
+                        install_root, updated_at_ms
+                 FROM agent_managed_installations
+                 ORDER BY agent_id ASC",
+            )
+            .map_err(storage_err(
+                "agent_managed_installation_list_failed",
+                "failed to list managed Agent installations",
+            ))?;
+        let rows = stmt
+            .query_map([], map_agent_managed_installation)
+            .map_err(storage_err(
+                "agent_managed_installation_list_failed",
+                "failed to list managed Agent installations",
+            ))?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(storage_err(
+                "agent_managed_installation_decode_failed",
+                "failed to decode managed Agent installation",
+            ))?);
+        }
+        Ok(records)
+    }
+
+    pub fn upsert(conn: &Connection, record: &AgentManagedInstallationRecord) -> VibexResult<()> {
+        conn.execute(
+            "INSERT INTO agent_managed_installations
+                (agent_id, registry_agent_id, state_json, command_json,
+                 install_root, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(agent_id) DO UPDATE SET
+                registry_agent_id = excluded.registry_agent_id,
+                state_json = excluded.state_json,
+                command_json = excluded.command_json,
+                install_root = excluded.install_root,
+                updated_at_ms = excluded.updated_at_ms",
+            params![
+                record.agent_id.as_str(),
+                record.registry_agent_id,
+                json_to_db(&record.state)?,
+                record.command.as_ref().map(json_to_db).transpose()?,
+                record.install_root,
+                record.updated_at_ms,
+            ],
+        )
+        .map_err(storage_err(
+            "agent_managed_installation_upsert_failed",
+            "failed to persist managed Agent installation",
+        ))?;
+        Ok(())
+    }
+
+    pub fn delete(conn: &Connection, agent_id: &AgentId) -> VibexResult<()> {
+        conn.execute(
+            "DELETE FROM agent_managed_installations WHERE agent_id = ?1",
+            params![agent_id.as_str()],
+        )
+        .map_err(storage_err(
+            "agent_managed_installation_delete_failed",
+            "failed to delete managed Agent installation",
+        ))?;
+        Ok(())
+    }
+}
+
+fn map_agent_managed_installation(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<AgentManagedInstallationRecord> {
+    Ok(AgentManagedInstallationRecord {
+        agent_id: parse_id_sql(row.get(0)?, AgentId::parse)?,
+        registry_agent_id: row.get(1)?,
+        state: json_from_db_sql(row.get(2)?)?,
+        command: row
+            .get::<_, Option<String>>(3)?
+            .map(json_from_db)
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+        install_root: row.get(4)?,
+        updated_at_ms: row.get(5)?,
+    })
 }
 
 fn map_agent_auth_catalog_snapshot(
@@ -11623,7 +11763,8 @@ mod tests {
                 "37:agent_provider_projection_platform",
                 "38:agent_runtime_provider_probe_evidence",
                 "39:agent_runtime_option_snapshots",
-                "40:agent_auth_catalog_snapshots"
+                "40:agent_auth_catalog_snapshots",
+                "41:agent_managed_installations"
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -11766,7 +11907,8 @@ mod tests {
                 "37:agent_provider_projection_platform",
                 "38:agent_runtime_provider_probe_evidence",
                 "39:agent_runtime_option_snapshots",
-                "40:agent_auth_catalog_snapshots"
+                "40:agent_auth_catalog_snapshots",
+                "41:agent_managed_installations"
             ]
         );
         assert_eq!(
@@ -13315,7 +13457,8 @@ mod tests {
                 "37:agent_provider_projection_platform",
                 "38:agent_runtime_provider_probe_evidence",
                 "39:agent_runtime_option_snapshots",
-                "40:agent_auth_catalog_snapshots"
+                "40:agent_auth_catalog_snapshots",
+                "41:agent_managed_installations"
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
@@ -14498,6 +14641,55 @@ mod tests {
         AgentAuthCatalogSnapshotRepository::delete_agent(&conn, &agent_id).unwrap();
         assert!(
             AgentAuthCatalogSnapshotRepository::get(&conn, &agent_id, Some(&profile_id))
+                .unwrap()
+                .is_none()
+        );
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn managed_agent_installation_round_trips_and_deletes() {
+        let temp = temp_db_path("managed-agent-installation");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let agent_id = AgentId::parse("gemini").unwrap();
+        let state = AgentManagedInstallState {
+            managed: true,
+            status: vibex_core::AgentManagedInstallStatus::Installed,
+            distribution_kind: Some(vibex_core::AgentManagedDistributionKind::Npm),
+            installed_version: Some("0.54.0".to_string()),
+            available_version: Some("0.54.0".to_string()),
+            last_error_code: None,
+            last_error_message: None,
+            updated_at_ms: Some(100),
+        };
+        let record = AgentManagedInstallationRecord {
+            agent_id: agent_id.clone(),
+            registry_agent_id: "gemini".to_string(),
+            state: state.clone(),
+            command: Some(AgentCommandConfig {
+                command: "/managed/node".to_string(),
+                args: vec!["/managed/gemini.js".to_string(), "--acp".to_string()],
+            }),
+            install_root: Some("/managed/gemini/0.54.0".to_string()),
+            updated_at_ms: 100,
+        };
+        AgentManagedInstallationRepository::upsert(&conn, &record).unwrap();
+        assert_eq!(
+            AgentManagedInstallationRepository::get(&conn, &agent_id)
+                .unwrap()
+                .unwrap(),
+            record
+        );
+        assert_eq!(
+            AgentManagedInstallationRepository::list(&conn)
+                .unwrap()
+                .len(),
+            1
+        );
+        AgentManagedInstallationRepository::delete(&conn, &agent_id).unwrap();
+        assert!(
+            AgentManagedInstallationRepository::get(&conn, &agent_id)
                 .unwrap()
                 .is_none()
         );

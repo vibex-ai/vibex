@@ -22,8 +22,9 @@ use vibex_core::{
 };
 
 use super::{
-    ProviderSecretReferenceRepository, enum_from_db_sql, enum_to_db, json_from_db_sql, json_to_db,
-    map_provider_profile_without_secrets, parse_id_sql, storage_err,
+    AgentManagedInstallationRepository, ProviderSecretReferenceRepository, enum_from_db_sql,
+    enum_to_db, json_from_db_sql, json_to_db, map_provider_profile_without_secrets, parse_id_sql,
+    storage_err,
 };
 
 const LEGACY_ACP_CONFIG_OPTION_KEY: &str = "acp.config.v1";
@@ -1174,42 +1175,68 @@ fn legacy_runtime_identity(
     args: &[String],
 ) -> VibexResult<AgentRuntimeVersionIdentity> {
     let agent = profile.agent_id.as_str();
-    let (adapter, adapter_version, agent_version, runtime_dependencies, source) = match agent {
-        "claude" if looks_managed_adapter_command(command, args, "claude-agent-acp") => (
-            "claude-agent-acp",
-            Some("0.64.2".to_string()),
-            None,
-            BTreeMap::new(),
-            AgentVersionSource::Managed,
-        ),
-        "codex" if looks_managed_adapter_command(command, args, "codex-acp") => (
-            "codex-acp",
-            Some("1.1.9".to_string()),
-            Some("0.146.0".to_string()),
-            BTreeMap::from([("@openai/codex".to_string(), "0.146.0".to_string())]),
-            AgentVersionSource::Managed,
-        ),
-        "opencode" if looks_native_agent_command(command, "opencode") => {
-            let detected = latest_agent_version(conn, &profile.agent_id)?;
-            let source = if detected.is_some() {
-                AgentVersionSource::Detected
-            } else {
-                AgentVersionSource::Unknown
-            };
-            ("opencode-acp", None, detected, BTreeMap::new(), source)
-        }
-        _ => {
-            let detected = latest_agent_version(conn, &profile.agent_id)?;
-            let source = if detected.is_some() {
-                AgentVersionSource::Detected
-            } else if command.trim().is_empty() {
-                AgentVersionSource::Unknown
-            } else {
-                AgentVersionSource::Manual
-            };
-            (agent, None, detected, BTreeMap::new(), source)
-        }
-    };
+    let managed_version = AgentManagedInstallationRepository::get(conn, &profile.agent_id)?
+        .filter(|record| {
+            record.command.as_ref().is_some_and(|managed| {
+                managed.command == command && managed.args.as_slice() == args
+            })
+        })
+        .and_then(|record| record.state.installed_version);
+    let (adapter, adapter_version, agent_version, runtime_dependencies, source) =
+        match (agent, managed_version) {
+            ("claude", Some(version)) => (
+                "claude-agent-acp",
+                Some(version),
+                None,
+                BTreeMap::new(),
+                AgentVersionSource::Managed,
+            ),
+            ("codex", Some(version)) => (
+                "codex-acp",
+                Some(version),
+                None,
+                BTreeMap::new(),
+                AgentVersionSource::Managed,
+            ),
+            ("claude", None)
+                if looks_managed_adapter_command(command, args, "claude-agent-acp") =>
+            {
+                (
+                    "claude-agent-acp",
+                    Some("0.64.2".to_string()),
+                    None,
+                    BTreeMap::new(),
+                    AgentVersionSource::Managed,
+                )
+            }
+            ("codex", None) if looks_managed_adapter_command(command, args, "codex-acp") => (
+                "codex-acp",
+                Some("1.1.9".to_string()),
+                Some("0.146.0".to_string()),
+                BTreeMap::from([("@openai/codex".to_string(), "0.146.0".to_string())]),
+                AgentVersionSource::Managed,
+            ),
+            ("opencode", _) if looks_native_agent_command(command, "opencode") => {
+                let detected = latest_agent_version(conn, &profile.agent_id)?;
+                let source = if detected.is_some() {
+                    AgentVersionSource::Detected
+                } else {
+                    AgentVersionSource::Unknown
+                };
+                ("opencode-acp", None, detected, BTreeMap::new(), source)
+            }
+            _ => {
+                let detected = latest_agent_version(conn, &profile.agent_id)?;
+                let source = if detected.is_some() {
+                    AgentVersionSource::Detected
+                } else if command.trim().is_empty() {
+                    AgentVersionSource::Unknown
+                } else {
+                    AgentVersionSource::Manual
+                };
+                (agent, None, detected, BTreeMap::new(), source)
+            }
+        };
     Ok(AgentRuntimeVersionIdentity {
         route: AgentRuntimeRouteKey {
             agent_id: profile.agent_id.clone(),
@@ -1839,6 +1866,87 @@ mod tests {
         }
     }
 
+    fn persist_managed_installation(
+        conn: &Connection,
+        agent_id: &str,
+        registry_agent_id: &str,
+        version: &str,
+        command: &str,
+        args: Vec<String>,
+    ) {
+        let agent_id = AgentId::parse(agent_id).unwrap();
+        AgentManagedInstallationRepository::upsert(
+            conn,
+            &crate::AgentManagedInstallationRecord {
+                agent_id: agent_id.clone(),
+                registry_agent_id: registry_agent_id.to_string(),
+                state: vibex_core::AgentManagedInstallState {
+                    managed: true,
+                    status: vibex_core::AgentManagedInstallStatus::Installed,
+                    distribution_kind: Some(vibex_core::AgentManagedDistributionKind::Npm),
+                    installed_version: Some(version.to_string()),
+                    available_version: Some(version.to_string()),
+                    last_error_code: None,
+                    last_error_message: None,
+                    updated_at_ms: Some(100),
+                },
+                command: Some(vibex_core::AgentCommandConfig {
+                    command: command.to_string(),
+                    args,
+                }),
+                install_root: Some(format!("/managed/{agent_id}")),
+                updated_at_ms: 100,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn managed_registry_versions_do_not_inherit_older_projection_evidence() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let registry = AgentProviderProjectionRegistry::builtin().unwrap();
+
+        let claude_command = "/managed/node";
+        let claude_args = vec!["/managed/claude-agent-acp.js".to_string()];
+        persist_managed_installation(
+            &conn,
+            "claude",
+            "claude-acp",
+            "0.65.0",
+            claude_command,
+            claude_args.clone(),
+        );
+        let claude_profile = ProviderProfile::local_default(ProviderKind::Claude);
+        let claude_identity =
+            legacy_runtime_identity(&conn, &claude_profile, claude_command, &claude_args).unwrap();
+        assert_eq!(claude_identity.adapter_version.as_deref(), Some("0.65.0"));
+        assert_eq!(
+            registry.resolve(&claude_identity).unwrap().match_kind,
+            ProjectionDescriptorMatch::Conservative
+        );
+
+        let codex_command = "/managed/node";
+        let codex_args = vec!["/managed/codex-acp.js".to_string()];
+        persist_managed_installation(
+            &conn,
+            "codex",
+            "codex-acp",
+            "1.1.13",
+            codex_command,
+            codex_args.clone(),
+        );
+        let codex_profile = ProviderProfile::local_default(ProviderKind::Codex);
+        let codex_identity =
+            legacy_runtime_identity(&conn, &codex_profile, codex_command, &codex_args).unwrap();
+        assert_eq!(codex_identity.adapter_version.as_deref(), Some("1.1.13"));
+        assert!(codex_identity.runtime_dependencies.is_empty());
+        assert_eq!(
+            registry.resolve(&codex_identity).unwrap().match_kind,
+            ProjectionDescriptorMatch::Conservative
+        );
+    }
+
     #[test]
     fn migration_37_backfills_v36_profiles_idempotently() {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -1865,6 +1973,7 @@ mod tests {
                 "38:agent_runtime_provider_probe_evidence",
                 "39:agent_runtime_option_snapshots",
                 "40:agent_auth_catalog_snapshots",
+                "41:agent_managed_installations",
             ]
         );
         assert_eq!(

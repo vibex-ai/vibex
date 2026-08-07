@@ -1,6 +1,7 @@
 //! Shared desktop composition root used by the native GPUI shell.
 
 mod acp_terminal;
+mod agent_install;
 mod auth_catalog;
 mod catalog;
 mod events;
@@ -28,16 +29,16 @@ use vibex_agent::{
     manager_message_dispatcher,
 };
 use vibex_agent_acp::{
-    AcpAgentProvider, AcpCompatibilityRegistry, AcpRuntimeClient, AcpRuntimeLifecycleBackend,
-    AcpRuntimeSwitchBridge, AgentRuntimeProbeService, ManagedAcpAdapterStore,
+    AcpAgentProvider, AcpRuntimeClient, AcpRuntimeLifecycleBackend, AcpRuntimeSwitchBridge,
+    AgentRuntimeProbeService,
 };
 use vibex_config_switch::{ProviderConfigService, ProviderProfileChangeListener};
 use vibex_core::{
-    AgentAuthCatalog, AgentAuthenticateRequest, AgentAuthenticateResult, AgentCommandConfig,
-    AgentLogoutRequest, AgentRefreshSnapshotRequest, AgentRuntimeKind, AgentSession,
-    FetchTimelineRequest, OpenWorkspaceRequest, ProjectId, ProjectRecord, ProviderProfileId,
-    TerminalCreateRequest, TerminalId, TerminalSession, TerminalSwitchShellRequest, TimelinePage,
-    VibexError, VibexResult, WorkspaceId, WorkspaceMode, WorkspaceRecord,
+    AgentAuthCatalog, AgentAuthenticateRequest, AgentAuthenticateResult, AgentLogoutRequest,
+    AgentRuntimeKind, AgentSession, FetchTimelineRequest, OpenWorkspaceRequest, ProjectId,
+    ProjectRecord, ProviderProfileId, TerminalCreateRequest, TerminalId, TerminalSession,
+    TerminalSwitchShellRequest, TimelinePage, VibexError, VibexResult, WorkspaceId, WorkspaceMode,
+    WorkspaceRecord,
 };
 use vibex_db::{
     TerminalSessionRepository, WorkspaceRepository, apply_migrations, default_database_path,
@@ -54,6 +55,7 @@ use vibex_terminal::TerminalManager;
 
 use acp_terminal::DesktopAcpTerminalHost;
 
+pub use agent_install::AgentInstallService;
 pub use auth_catalog::AgentAuthCatalogService;
 pub use catalog::{
     RuntimeOptionCatalogService, RuntimeOptionProbeResult, RuntimeOptionSnapshotSummary,
@@ -314,6 +316,7 @@ pub struct AgentHandle {
     message_submission: Arc<MessageSubmissionCoordinator>,
     runtime_catalog: Arc<RuntimeOptionCatalogService>,
     auth_catalog: Arc<AgentAuthCatalogService>,
+    install_service: Arc<AgentInstallService>,
 }
 
 impl AgentHandle {
@@ -357,6 +360,27 @@ impl AgentHandle {
 
     pub fn delete_auth_catalog(&self, agent_id: &vibex_core::AgentId) -> VibexResult<()> {
         self.auth_catalog.delete_agent(agent_id)
+    }
+
+    pub async fn install_managed_agent(
+        &self,
+        agent_id: vibex_core::AgentId,
+    ) -> VibexResult<vibex_core::AgentManagedInstallState> {
+        self.install_service.install(agent_id).await
+    }
+
+    pub async fn check_managed_agent_update(
+        &self,
+        agent_id: vibex_core::AgentId,
+    ) -> VibexResult<vibex_core::AgentManagedInstallState> {
+        self.install_service.check_update(agent_id).await
+    }
+
+    pub async fn uninstall_managed_agent(
+        &self,
+        agent_id: vibex_core::AgentId,
+    ) -> VibexResult<vibex_core::AgentManagedInstallState> {
+        self.install_service.uninstall(agent_id).await
     }
 
     pub async fn authenticate(
@@ -821,6 +845,11 @@ impl DesktopRuntime {
             manager.clone(),
             provider_config_service.clone(),
         ));
+        let install_service = Arc::new(AgentInstallService::new(
+            db_path.clone(),
+            config.home_dir.join("acp-agents"),
+            provider_config_service.clone(),
+        )?);
         let git = GitHandle {
             db_path: db_path.clone(),
             mutation_claims: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
@@ -885,6 +914,7 @@ impl DesktopRuntime {
                 message_submission,
                 runtime_catalog,
                 auth_catalog,
+                install_service,
             },
             providers,
             workspace: WorkspaceHandle {
@@ -997,17 +1027,31 @@ impl DesktopRuntime {
             )
         })?;
         let install_managed_adapters = self.config.install_managed_adapters;
-        let config_service = self.providers.service.clone();
-        let db_path = self.config.database_path.clone();
+        let install_service = self.agent.install_service.clone();
         tasks.push(tokio::spawn(async move {
-            if install_managed_adapters
-                && let Err(error) = prepare_managed_acp_adapters(&config_service, &db_path).await
-            {
-                tracing::warn!(
-                    target: "vibex_desktop",
-                    error_code = %error.code,
-                    "managed ACP adapter background preparation failed"
-                );
+            if install_managed_adapters {
+                let agent_ids = match install_service.bootstrap_agent_ids() {
+                    Ok(agent_ids) => agent_ids,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "vibex_desktop",
+                            error_code = %error.code,
+                            "managed ACP Agent bootstrap inventory failed"
+                        );
+                        return;
+                    }
+                };
+                for agent_id in agent_ids {
+                    let id = agent_id.as_str().to_string();
+                    if let Err(error) = install_service.ensure_installed(agent_id).await {
+                        tracing::warn!(
+                            target: "vibex_desktop",
+                            agent_id = %id,
+                            error_code = %error.code,
+                            "managed ACP Agent background preparation failed"
+                        );
+                    }
+                }
             }
         }));
         Ok(())
@@ -1528,62 +1572,6 @@ fn build_agent_manager(
     Ok((manager, acp_config_service, acp_runtime))
 }
 
-async fn prepare_managed_acp_adapters(
-    config_service: &ProviderConfigService,
-    db_path: &Path,
-) -> VibexResult<()> {
-    let managed_root = db_path
-        .parent()
-        .ok_or_else(|| {
-            VibexError::storage(
-                "acp_managed_root_parent_missing",
-                "Vibex database path has no parent for managed ACP adapters",
-            )
-        })?
-        .join("acp-adapters");
-    let store = ManagedAcpAdapterStore::new(managed_root)?;
-    let registry = AcpCompatibilityRegistry::builtin()?;
-
-    for descriptor in registry.descriptors() {
-        let fallback = descriptor
-            .command_variants
-            .first()
-            .map(|variant| AgentCommandConfig {
-                command: variant.bin_name.clone(),
-                args: variant.args.clone(),
-            })
-            .ok_or_else(|| {
-                VibexError::validation(
-                    "acp_managed_command_variant_missing",
-                    "managed ACP descriptor has no launch command variant",
-                )
-                .with_diagnostic("agentId", descriptor.agent_id.as_str())
-            })?;
-        let command = match store.install(descriptor).await {
-            Ok(installation) => AgentCommandConfig {
-                command: installation.command.program.to_string_lossy().into_owned(),
-                args: installation.command.args,
-            },
-            Err(error) => {
-                tracing::warn!(
-                    target: "vibex_desktop",
-                    agent_id = %descriptor.agent_id,
-                    adapter_id = %descriptor.adapter_id,
-                    error_code = %error.code,
-                    "managed ACP adapter installation unavailable; using PATH fallback"
-                );
-                fallback
-            }
-        };
-        config_service.reconcile_agent_acp_runtime(descriptor.agent_id.clone(), command)?;
-        config_service.refresh_agent_snapshot(AgentRefreshSnapshotRequest {
-            agent_id: descriptor.agent_id.clone(),
-            cwd_scope: None,
-        })?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1612,7 +1600,7 @@ mod tests {
             .expect("background Agent bootstrap should remain inspectable");
         let manager = source
             .split_once("fn build_agent_manager(")
-            .and_then(|(_, tail)| tail.split_once("\nasync fn prepare_managed_acp_adapters("))
+            .and_then(|(_, tail)| tail.split_once("\n#[cfg(test)]"))
             .map(|(body, _)| body)
             .expect("agent manager construction should remain inspectable");
         let provider_consumer = source
@@ -1628,8 +1616,9 @@ mod tests {
                 < start.find("runtime.spawn_agent_bootstrap()?;")
         );
         assert!(!activate.contains("refresh_missing().await"));
-        assert!(!manager.contains("prepare_managed_acp_adapters"));
-        assert!(bootstrap.contains("prepare_managed_acp_adapters"));
+        assert!(!manager.contains("install_service.install"));
+        assert!(bootstrap.contains("install_service.bootstrap_agent_ids()"));
+        assert!(bootstrap.contains("install_service.ensure_installed(agent_id)"));
         assert!(!bootstrap.contains("refresh_missing"));
         assert!(!bootstrap.contains("RuntimeOptionsChanged"));
         assert!(!provider_consumer.contains("refresh_profile"));

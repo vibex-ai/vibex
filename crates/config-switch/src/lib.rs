@@ -60,12 +60,14 @@ use vibex_core::{
     acp_agent_catalog_entries, builtin_agent_definitions, unix_timestamp_ms,
 };
 use vibex_db::{
-    AgentConfigRepository, AgentDefaultModelProviderProfileRepository, AgentDiscoveryRepository,
-    AgentModelProviderFailoverRepository, AgentRuntimeOptionSnapshotRepository, HookRepository,
-    McpServerRepository, PromptRepository, ProviderCapabilityRepository,
-    ProviderDefaultProfileRepository, ProviderHealthRepository, ProviderInjectionPreviewRepository,
-    ProviderProfileRepository, ProviderSecretReferenceRepository, ProviderUsageRepository,
-    SkillRepository, apply_migrations, open_database,
+    AgentAuthCatalogSnapshotRepository, AgentConfigRepository,
+    AgentDefaultModelProviderProfileRepository, AgentDiscoveryRepository,
+    AgentManagedInstallationRepository, AgentModelProviderFailoverRepository,
+    AgentRuntimeOptionSnapshotRepository, HookRepository, McpServerRepository, PromptRepository,
+    ProviderCapabilityRepository, ProviderDefaultProfileRepository, ProviderHealthRepository,
+    ProviderInjectionPreviewRepository, ProviderProfileRepository,
+    ProviderSecretReferenceRepository, ProviderUsageRepository, SkillRepository, apply_migrations,
+    open_database,
 };
 
 mod native_export;
@@ -160,12 +162,21 @@ impl ProviderConfigService {
         let conn = self.open_connection()?;
         let definitions = builtin_agent_definitions();
         let configs = AgentConfigRepository::list(&conn)?;
+        let managed_installations = AgentManagedInstallationRepository::list(&conn)?
+            .into_iter()
+            .map(|record| (record.agent_id.clone(), record.state))
+            .collect::<HashMap<_, _>>();
         let mut discoveries =
             AgentDiscoveryRepository::latest_by_agent(&conn, DEFAULT_AGENT_CWD_SCOPE)?;
-        let snapshots =
-            build_agent_snapshots(definitions.clone(), configs.clone(), discoveries.clone());
+        let snapshots = build_agent_snapshots(
+            definitions.clone(),
+            configs.clone(),
+            discoveries.clone(),
+            &managed_installations,
+        );
         refresh_changed_agent_discoveries(&conn, &snapshots, &mut discoveries)?;
-        let snapshots = build_agent_snapshots(definitions, configs, discoveries);
+        let snapshots =
+            build_agent_snapshots(definitions, configs, discoveries, &managed_installations);
         let agents = if request.include_disabled {
             snapshots
         } else {
@@ -284,6 +295,7 @@ impl ProviderConfigService {
         AgentConfigRepository::upsert(&conn, &config)?;
         if !added {
             AgentRuntimeOptionSnapshotRepository::delete(&conn, &config.agent_id)?;
+            AgentAuthCatalogSnapshotRepository::delete_agent(&conn, &config.agent_id)?;
         }
         if added && config.enabled && definition.runtime_kind == AgentRuntimeKind::Acp {
             self.ensure_default_acp_profile_for_agent(&conn, &definition, &config)?;
@@ -293,11 +305,25 @@ impl ProviderConfigService {
             &config.agent_id,
             DEFAULT_AGENT_CWD_SCOPE,
         )?;
-        Ok(AgentSnapshotEntry::from_definition(
-            &definition,
-            Some(&config),
-            discovery.as_ref(),
-        ))
+        let mut snapshot =
+            AgentSnapshotEntry::from_definition(&definition, Some(&config), discovery.as_ref());
+        if let Some(record) = AgentManagedInstallationRepository::get(&conn, &config.agent_id)? {
+            snapshot.apply_managed_install_state(record.state);
+        }
+        Ok(snapshot)
+    }
+
+    /// Returns the version of a Vibex-managed Agent only when the persisted
+    /// installation is the exact command selected by this runtime config.
+    pub fn managed_agent_runtime_version(
+        &self,
+        agent_id: &AgentId,
+        command: &AgentCommandConfig,
+    ) -> VibexResult<Option<String>> {
+        let conn = self.open_connection()?;
+        Ok(AgentManagedInstallationRepository::get(&conn, agent_id)?
+            .filter(|record| record.command.as_ref() == Some(command))
+            .and_then(|record| record.state.installed_version))
     }
 
     /// Converges one built-in online Agent onto its ACP command while keeping
@@ -460,13 +486,12 @@ impl ProviderConfigService {
         let mut discovery = low_cost_agent_discovery(&snapshot, &cwd_scope);
         probe_explicit_agent_version(&snapshot, &mut discovery);
         AgentDiscoveryRepository::insert(&conn, &discovery)?;
-        Ok(AgentRefreshSnapshotResponse {
-            agent: AgentSnapshotEntry::from_definition(
-                &definition,
-                config.as_ref(),
-                Some(&discovery),
-            ),
-        })
+        let mut agent =
+            AgentSnapshotEntry::from_definition(&definition, config.as_ref(), Some(&discovery));
+        if let Some(record) = AgentManagedInstallationRepository::get(&conn, &definition.id)? {
+            agent.apply_managed_install_state(record.state);
+        }
+        Ok(AgentRefreshSnapshotResponse { agent })
     }
 
     pub fn list_profiles(&self) -> VibexResult<Vec<ProviderProfile>> {
@@ -2482,7 +2507,12 @@ impl ProviderConfigService {
         let configs = AgentConfigRepository::list(&conn)?;
         let discoveries =
             AgentDiscoveryRepository::latest_by_agent(&conn, DEFAULT_AGENT_CWD_SCOPE)?;
-        let snapshots = build_agent_snapshots(definitions, configs, discoveries);
+        let managed_installations = AgentManagedInstallationRepository::list(&conn)?
+            .into_iter()
+            .map(|record| (record.agent_id.clone(), record.state))
+            .collect::<HashMap<_, _>>();
+        let snapshots =
+            build_agent_snapshots(definitions, configs, discoveries, &managed_installations);
         if let Some(source_agent_id) = source_agent_id {
             let agent = snapshots
                 .into_iter()
@@ -3419,6 +3449,7 @@ fn build_agent_snapshots(
     definitions: Vec<AgentDefinition>,
     configs: Vec<AgentConfig>,
     discoveries: HashMap<AgentId, AgentDiscoveryRecord>,
+    managed_installations: &HashMap<AgentId, vibex_core::AgentManagedInstallState>,
 ) -> Vec<AgentSnapshotEntry> {
     let configs_by_id = configs
         .iter()
@@ -3427,11 +3458,15 @@ fn build_agent_snapshots(
     let mut snapshots = definitions
         .iter()
         .map(|definition| {
-            AgentSnapshotEntry::from_definition(
+            let mut snapshot = AgentSnapshotEntry::from_definition(
                 definition,
                 configs_by_id.get(&definition.id).copied(),
                 discoveries.get(&definition.id),
-            )
+            );
+            if let Some(state) = managed_installations.get(&definition.id) {
+                snapshot.apply_managed_install_state(state.clone());
+            }
+            snapshot
         })
         .collect::<Vec<_>>();
     snapshots.sort_by(|left, right| {
@@ -9136,7 +9171,7 @@ mod tests {
     }
 
     #[test]
-    fn removing_agent_deletes_its_runtime_option_snapshot() {
+    fn removing_agent_deletes_runtime_and_auth_snapshots() {
         let dir = tempdir().unwrap();
         let service = ProviderConfigService::new(dir.path().join("vibex.db"));
         let agent_id = AgentId::parse("opencode").unwrap();
@@ -9165,6 +9200,22 @@ mod tests {
             },
         )
         .unwrap();
+        vibex_db::AgentAuthCatalogSnapshotRepository::upsert(
+            &conn,
+            &vibex_db::AgentAuthCatalogSnapshotRecord {
+                agent_id: agent_id.clone(),
+                provider_profile_id: None,
+                catalog: vibex_core::AgentAuthCatalog {
+                    agent_id: agent_id.clone(),
+                    methods: Vec::new(),
+                    supports_logout: false,
+                    status: vibex_core::AgentAuthStatus::Unknown,
+                    refreshed_at_ms: 100,
+                },
+                refreshed_at_ms: 100,
+            },
+        )
+        .unwrap();
         drop(conn);
 
         service
@@ -9187,6 +9238,65 @@ mod tests {
                 .unwrap()
                 .into_iter()
                 .all(|snapshot| snapshot.agent_id != agent_id)
+        );
+        assert!(
+            vibex_db::AgentAuthCatalogSnapshotRepository::get(&conn, &agent_id, None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn managed_runtime_version_requires_the_selected_command() {
+        let dir = tempdir().unwrap();
+        let service = ProviderConfigService::new(dir.path().join("vibex.db"));
+        let agent_id = AgentId::parse("claude").unwrap();
+        let command = AgentCommandConfig {
+            command: "/managed/node".to_string(),
+            args: vec!["/managed/claude-agent-acp.js".to_string()],
+        };
+        let conn = service.open_connection().unwrap();
+        vibex_db::AgentManagedInstallationRepository::upsert(
+            &conn,
+            &vibex_db::AgentManagedInstallationRecord {
+                agent_id: agent_id.clone(),
+                registry_agent_id: "claude-acp".to_string(),
+                state: vibex_core::AgentManagedInstallState {
+                    managed: true,
+                    status: vibex_core::AgentManagedInstallStatus::Installed,
+                    distribution_kind: Some(vibex_core::AgentManagedDistributionKind::Npm),
+                    installed_version: Some("0.65.0".to_string()),
+                    available_version: Some("0.65.0".to_string()),
+                    last_error_code: None,
+                    last_error_message: None,
+                    updated_at_ms: Some(100),
+                },
+                command: Some(command.clone()),
+                install_root: Some("/managed/claude".to_string()),
+                updated_at_ms: 100,
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            service
+                .managed_agent_runtime_version(&agent_id, &command)
+                .unwrap()
+                .as_deref(),
+            Some("0.65.0")
+        );
+        assert!(
+            service
+                .managed_agent_runtime_version(
+                    &agent_id,
+                    &AgentCommandConfig {
+                        command: "claude-agent-acp".to_string(),
+                        args: Vec::new(),
+                    }
+                )
+                .unwrap()
+                .is_none()
         );
     }
 

@@ -277,6 +277,9 @@ enum ManagementMutation {
     AgentAuth(String),
     ProviderPreview(String),
     AgentToggle(String),
+    AgentInstall(String),
+    AgentUpdateCheck(String),
+    AgentUninstall(String),
     AgentDiscovery,
     McpAction(String),
     SkillAction(String),
@@ -329,6 +332,9 @@ impl ManagementMutation {
             Self::AgentAuth(id) => format!("agent:auth:{id}"),
             Self::ProviderPreview(id) => format!("provider:preview:{id}"),
             Self::AgentToggle(id) => format!("agent:toggle:{id}"),
+            Self::AgentInstall(id) => format!("agent:install:{id}"),
+            Self::AgentUpdateCheck(id) => format!("agent:update-check:{id}"),
+            Self::AgentUninstall(id) => format!("agent:uninstall:{id}"),
             Self::AgentDiscovery => "agent:discover".into(),
             Self::McpAction(id) => format!("mcp:{id}"),
             Self::SkillAction(id) => format!("skill:{id}"),
@@ -359,6 +365,7 @@ impl ManagementMutation {
 
 #[derive(Debug, Clone)]
 enum ManagedDeleteTarget {
+    Agent { id: String, label: String },
     Provider { id: String, label: String },
     Mcp { id: String, label: String },
     Skill { id: String, label: String },
@@ -369,7 +376,8 @@ enum ManagedDeleteTarget {
 impl ManagedDeleteTarget {
     fn label(&self) -> &str {
         match self {
-            Self::Provider { label, .. }
+            Self::Agent { label, .. }
+            | Self::Provider { label, .. }
             | Self::Mcp { label, .. }
             | Self::Skill { label, .. }
             | Self::Prompt { label, .. }
@@ -1924,7 +1932,8 @@ impl ManagementCenter {
         self.agent_profile_states = snapshot.agent_profile_states;
         self.projection_states = snapshot.projection_states;
         if !self.snapshot.agents.iter().any(|agent| {
-            agent.added && self.selected_agent_id.as_deref() == Some(agent.id.as_str())
+            self.selected_agent_id.as_deref() == Some(agent.id.as_str())
+                && (agent.added || agent.managed_install.managed)
         }) {
             self.selected_agent_id = self
                 .snapshot
@@ -2856,22 +2865,35 @@ impl ManagementCenter {
         let entity = cx.weak_entity();
         let label = target.label().to_string();
         let active_locale = locale::current_locale();
-        let title = match active_locale {
-            ResolvedLocale::En => format!("Delete {label}?"),
-            ResolvedLocale::ZhCn => format!("删除“{label}”？"),
-            ResolvedLocale::ZhTw => format!("刪除「{label}」？"),
+        let uninstalling_agent = matches!(target, ManagedDeleteTarget::Agent { .. });
+        let title = match (active_locale, uninstalling_agent) {
+            (ResolvedLocale::En, true) => format!("Uninstall {label}?"),
+            (ResolvedLocale::ZhCn, true) => format!("卸载“{label}”？"),
+            (ResolvedLocale::ZhTw, true) => format!("解除安裝「{label}」？"),
+            (ResolvedLocale::En, false) => format!("Delete {label}?"),
+            (ResolvedLocale::ZhCn, false) => format!("删除“{label}”？"),
+            (ResolvedLocale::ZhTw, false) => format!("刪除「{label}」？"),
         };
         window.open_dialog(cx, move |dialog, _, _| {
             let entity = entity.clone();
             let target = target.clone();
             dialog
                 .title(title.clone())
-                .child(management_locale_text_for(
-                    active_locale,
-                    "This durable action is soft-deleted where supported and remains auditable.",
-                    "此操作会持久化；支持软删除的数据仍会保留审计记录。",
-                    "此操作會持久化；支援軟刪除的資料仍會保留稽核記錄。",
-                ))
+                .child(if uninstalling_agent {
+                    management_locale_text_for(
+                        active_locale,
+                        "The managed Agent runtime and its cached versions will be removed.",
+                        "托管的 Agent 运行时及其缓存版本将被移除。",
+                        "託管的 Agent 執行環境及其快取版本將被移除。",
+                    )
+                } else {
+                    management_locale_text_for(
+                        active_locale,
+                        "This durable action is soft-deleted where supported and remains auditable.",
+                        "此操作会持久化；支持软删除的数据仍会保留审计记录。",
+                        "此操作會持久化；支援軟刪除的資料仍會保留稽核記錄。",
+                    )
+                })
                 .footer(
                     gpui_component::dialog::DialogFooter::new()
                         .child(gpui_component::dialog::DialogClose::new().child(
@@ -2880,9 +2902,16 @@ impl ManagementCenter {
                             ),
                         ))
                         .child(gpui_component::dialog::DialogAction::new().child(
-                            Button::new("confirm-managed-delete").danger().label(
-                                management_locale_text_for(active_locale, "Delete", "删除", "刪除"),
-                            ),
+                            Button::new("confirm-managed-delete").danger().label(if uninstalling_agent {
+                                management_locale_text_for(
+                                    active_locale,
+                                    "Uninstall",
+                                    "卸载",
+                                    "解除安裝",
+                                )
+                            } else {
+                                management_locale_text_for(active_locale, "Delete", "删除", "刪除")
+                            }),
                         )),
                 )
                 .on_ok(move |_, _, cx| {
@@ -2892,6 +2921,9 @@ impl ManagementCenter {
                         };
                         let providers = runtime.management().providers().management();
                         match target.clone() {
+                            ManagedDeleteTarget::Agent { id, .. } => {
+                                this.uninstall_managed_agent(id, cx);
+                            }
                             ManagedDeleteTarget::Provider { id, .. } => {
                                 if let Ok(provider_profile_id) =
                                     vibex_core::ProviderProfileId::parse(id.clone())
@@ -3051,6 +3083,20 @@ impl ManagementCenter {
     }
 
     fn set_agent_added(&mut self, agent_id: String, added: bool, cx: &mut Context<Self>) {
+        let managed = self
+            .snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.id.as_str() == agent_id)
+            .is_some_and(|agent| agent.managed_install.managed);
+        if managed && added {
+            self.install_managed_agent(agent_id, false, cx);
+            return;
+        }
+        if managed && !added {
+            self.uninstall_managed_agent(agent_id, cx);
+            return;
+        }
         let Ok(parsed_agent_id) = AgentId::parse(agent_id.clone()) else {
             self.error = Some(
                 management_error_text("Invalid Agent id", "Agent 标识无效", "Agent 識別碼無效")
@@ -3138,6 +3184,165 @@ impl ManagementCenter {
                     )
                     .to_string())
                 }
+            },
+        );
+    }
+
+    fn install_managed_agent(&mut self, agent_id: String, upgrading: bool, cx: &mut Context<Self>) {
+        let Ok(parsed_agent_id) = AgentId::parse(agent_id.clone()) else {
+            self.error = Some(
+                management_error_text("Invalid Agent id", "Agent 标识无效", "Agent 識別碼無效")
+                    .into(),
+            );
+            cx.notify();
+            return;
+        };
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        self.selected_agent_id = Some(agent_id.clone());
+        let active_locale = locale::current_locale();
+        self.begin_simple_task(ManagementMutation::AgentInstall(agent_id), cx, async move {
+            runtime
+                .agent()
+                .install_managed_agent(parsed_agent_id.clone())
+                .await?;
+            let providers = runtime.management().providers().management();
+            providers.update_agent_config(AgentUpdateConfigRequest {
+                agent_id: parsed_agent_id.clone(),
+                added: if upgrading { None } else { Some(true) },
+                enabled: Some(true),
+                label_override: None,
+                description_override: None,
+                order_index: None,
+                command: None,
+                env: None,
+                params: None,
+            })?;
+            providers.refresh_agent_snapshot(vibex_core::AgentRefreshSnapshotRequest {
+                agent_id: parsed_agent_id.clone(),
+                cwd_scope: None,
+            })?;
+            let runtime_probe = runtime
+                .agent()
+                .runtime_catalog()
+                .probe_agent(&parsed_agent_id)
+                .await;
+            let auth_probe = runtime
+                .agent()
+                .refresh_auth_methods(parsed_agent_id, None)
+                .await;
+            let mut message = management_locale_text_for(
+                active_locale,
+                if upgrading {
+                    "Agent upgraded and enabled"
+                } else {
+                    "Agent installed and enabled"
+                },
+                if upgrading {
+                    "Agent 已升级并启用"
+                } else {
+                    "Agent 已安装并启用"
+                },
+                if upgrading {
+                    "Agent 已升級並啟用"
+                } else {
+                    "Agent 已安裝並啟用"
+                },
+            )
+            .to_string();
+            message = management_append_runtime_option_probe(message, runtime_probe, active_locale);
+            match auth_probe {
+                Ok(catalog) => {
+                    let count = catalog.methods.len();
+                    message.push_str(&match active_locale {
+                        ResolvedLocale::En => {
+                            format!("; {count} authentication method(s) detected")
+                        }
+                        ResolvedLocale::ZhCn => format!("；已检测到 {count} 种认证方式"),
+                        ResolvedLocale::ZhTw => format!("；已偵測到 {count} 種驗證方式"),
+                    });
+                }
+                Err(error) => {
+                    message.push_str(&match active_locale {
+                        ResolvedLocale::En => {
+                            format!("; authentication detection pending ({})", error.code)
+                        }
+                        ResolvedLocale::ZhCn => {
+                            format!("；认证方式待重新检测（{}）", error.code)
+                        }
+                        ResolvedLocale::ZhTw => {
+                            format!("；驗證方式待重新偵測（{}）", error.code)
+                        }
+                    });
+                }
+            }
+            Ok(message)
+        });
+    }
+
+    fn check_managed_agent_update(&mut self, agent_id: String, cx: &mut Context<Self>) {
+        let Ok(parsed_agent_id) = AgentId::parse(agent_id.clone()) else {
+            return;
+        };
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        let active_locale = locale::current_locale();
+        self.begin_simple_task(
+            ManagementMutation::AgentUpdateCheck(agent_id),
+            cx,
+            async move {
+                let state = runtime
+                    .agent()
+                    .check_managed_agent_update(parsed_agent_id)
+                    .await?;
+                Ok(
+                    if state.status == vibex_core::AgentManagedInstallStatus::UpdateAvailable {
+                        management_locale_text_for(
+                            active_locale,
+                            "Agent update available",
+                            "Agent 有可用更新",
+                            "Agent 有可用更新",
+                        )
+                        .to_string()
+                    } else {
+                        management_locale_text_for(
+                            active_locale,
+                            "Agent is up to date",
+                            "Agent 已是最新版本",
+                            "Agent 已是最新版本",
+                        )
+                        .to_string()
+                    },
+                )
+            },
+        );
+    }
+
+    fn uninstall_managed_agent(&mut self, agent_id: String, cx: &mut Context<Self>) {
+        let Ok(parsed_agent_id) = AgentId::parse(agent_id.clone()) else {
+            return;
+        };
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        let active_locale = locale::current_locale();
+        self.begin_simple_task(
+            ManagementMutation::AgentUninstall(agent_id),
+            cx,
+            async move {
+                runtime
+                    .agent()
+                    .uninstall_managed_agent(parsed_agent_id)
+                    .await?;
+                Ok(management_locale_text_for(
+                    active_locale,
+                    "Agent uninstalled",
+                    "Agent 已卸载",
+                    "Agent 已解除安裝",
+                )
+                .to_string())
             },
         );
     }
@@ -3424,7 +3629,11 @@ impl ManagementCenter {
                 this.mutation = None;
                 let agent_registry_changed = matches!(
                     &completed_mutation,
-                    ManagementMutation::AgentToggle(_) | ManagementMutation::AgentDiscovery
+                    ManagementMutation::AgentToggle(_)
+                        | ManagementMutation::AgentInstall(_)
+                        | ManagementMutation::AgentUpdateCheck(_)
+                        | ManagementMutation::AgentUninstall(_)
+                        | ManagementMutation::AgentDiscovery
                 );
                 match outcome {
                     Ok(Ok(message)) => {
@@ -3481,10 +3690,12 @@ impl ManagementCenter {
                             this.recovery.phase = "error".into();
                             this.recovery.error_code = Some(error.code.clone());
                         }
-                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        let message = format!("{}: {}", error.code, error.message);
                         if agent_registry_changed {
+                            this.refresh(cx);
                             cx.emit(ManagementEvent::AgentRegistryChanged);
                         }
+                        this.error = Some(message);
                         cx.notify();
                     }
                     Err(error) => {
@@ -3497,6 +3708,7 @@ impl ManagementCenter {
                             )
                         ));
                         if agent_registry_changed {
+                            this.refresh(cx);
                             cx.emit(ManagementEvent::AgentRegistryChanged);
                         }
                         cx.notify();
@@ -5330,13 +5542,25 @@ impl ManagementCenter {
             let keyboard_select_id = id.clone();
             let toggle_id = id.clone();
             let remove_id = id.clone();
+            let remove_label = agent.label.clone();
+            let remove_managed = agent.managed_install.managed;
             let probe_id = id.clone();
             let add_id = id.clone();
             let added = agent.added;
-            let selected = added && self.selected_agent_id.as_deref() == Some(id.as_str());
+            let managed_installing = matches!(
+                &self.mutation,
+                Some(ManagementMutation::AgentInstall(active_id)) if active_id == &id
+            );
+            let managed_uninstalling = matches!(
+                &self.mutation,
+                Some(ManagementMutation::AgentUninstall(active_id)) if active_id == &id
+            );
+            let selected = (added || agent.managed_install.managed || managed_installing)
+                && self.selected_agent_id.as_deref() == Some(id.as_str());
             let enabled = agent.enabled;
-            let show_install_prompt =
-                added && agent.install_status == vibex_core::AgentInstallStatus::Missing;
+            let show_install_prompt = added
+                && !agent.managed_install.managed
+                && agent.install_status == vibex_core::AgentInstallStatus::Missing;
             let status_missing = added
                 && (show_install_prompt
                     || (agent.enabled
@@ -5489,10 +5713,22 @@ impl ManagementCenter {
                                     .size(px(32.0))
                                     .icon(IconName::CircleX)
                                     .tooltip(copy.remove)
+                                    .loading(managed_uninstalling)
                                     .disabled(pending)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                    .on_click(cx.listener(move |this, _, window, cx| {
                                         cx.stop_propagation();
-                                        this.set_agent_added(remove_id.clone(), false, cx)
+                                        if remove_managed {
+                                            this.confirm_managed_delete(
+                                                ManagedDeleteTarget::Agent {
+                                                    id: remove_id.clone(),
+                                                    label: remove_label.clone(),
+                                                },
+                                                window,
+                                                cx,
+                                            );
+                                        } else {
+                                            this.set_agent_added(remove_id.clone(), false, cx);
+                                        }
                                     })),
                                     copy.remove,
                                 ))
@@ -5507,11 +5743,14 @@ impl ManagementCenter {
                                     .size(px(32.0))
                                     .icon(IconName::Plus)
                                     .tooltip(management_add_label())
-                                    .loading(matches!(
-                                        &self.mutation,
-                                        Some(ManagementMutation::AgentToggle(action))
-                                            if action == &format!("add:{add_id}")
-                                    ))
+                                    .loading(
+                                        managed_installing
+                                            || matches!(
+                                                &self.mutation,
+                                                Some(ManagementMutation::AgentToggle(action))
+                                                    if action == &format!("add:{add_id}")
+                                            ),
+                                    )
                                     .disabled(pending)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         cx.stop_propagation();
@@ -6981,14 +7220,303 @@ impl ManagementCenter {
         )
     }
 
+    fn render_agent_install_loading(
+        &self,
+        _agent: &AgentSnapshotEntry,
+        upgrading: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let title = if upgrading {
+            management_locale_text("Upgrading Agent", "正在升级 Agent", "正在升級 Agent")
+        } else {
+            management_locale_text("Downloading Agent", "正在下载 Agent", "正在下載 Agent")
+        };
+        let description = if upgrading {
+            management_locale_text(
+                "The verified runtime is being prepared before the new version is enabled.",
+                "正在校验并准备新运行时，完成后才会启用新版本。",
+                "正在驗證並準備新執行環境，完成後才會啟用新版本。",
+            )
+        } else {
+            management_locale_text(
+                "The Agent is downloaded and verified before it becomes available.",
+                "Agent 会先下载并校验，完成后才会正式可用。",
+                "Agent 會先下載並驗證，完成後才會正式可用。",
+            )
+        };
+        management_card(
+            title,
+            management_locale_text(
+                "Verified ACP Registry runtime",
+                "ACP Registry 托管运行时",
+                "ACP Registry 託管執行環境",
+            ),
+            v_flex()
+                .w_full()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .py(px(44.0))
+                .child(
+                    Button::new("management-agent-install-loading")
+                        .large()
+                        .ghost()
+                        .loading(true)
+                        .disabled(true)
+                        .label(title),
+                )
+                .child(
+                    div()
+                        .max_w(px(460.0))
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .text_center()
+                        .child(description),
+                )
+                .into_any_element(),
+            cx,
+        )
+    }
+
+    fn render_agent_installation_card(
+        &mut self,
+        agent: &AgentSnapshotEntry,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let state = &agent.managed_install;
+        if !state.managed {
+            let content = v_flex()
+                .w_full()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(div().text_sm().font_medium().child(management_locale_text(
+                            "External CLI",
+                            "外部 CLI",
+                            "外部 CLI",
+                        )))
+                        .child(management_status_badge(
+                            management_locale_text("Managed by user", "由用户管理", "由使用者管理")
+                                .to_string(),
+                            cx,
+                        )),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(management_locale_text(
+                            "Vibex uses the CLI already available on PATH for this Agent.",
+                            "Vibex 使用此 Agent 在 PATH 中已有的 CLI。",
+                            "Vibex 使用此 Agent 在 PATH 中已有的 CLI。",
+                        )),
+                );
+            return management_card(
+                management_locale_text("Agent installation", "Agent 安装", "Agent 安裝"),
+                management_locale_text(
+                    "This Agent is not distributed through the verified ACP Registry.",
+                    "此 Agent 暂未提供可校验的 ACP Registry 分发包。",
+                    "此 Agent 暫未提供可驗證的 ACP Registry 分發包。",
+                ),
+                content.into_any_element(),
+                cx,
+            );
+        }
+
+        let id = agent.id.as_str().to_string();
+        let healthy_installation = state.has_usable_installation();
+        let needs_install = !healthy_installation
+            && matches!(
+                state.status,
+                vibex_core::AgentManagedInstallStatus::NotInstalled
+                    | vibex_core::AgentManagedInstallStatus::Failed
+            );
+        let checking = healthy_installation
+            && matches!(
+                &self.mutation,
+                Some(ManagementMutation::AgentUpdateCheck(active_id)) if active_id == &id
+            );
+        let upgrading = matches!(
+            &self.mutation,
+            Some(ManagementMutation::AgentInstall(active_id)) if active_id == &id
+        );
+        let uninstalling = matches!(
+            &self.mutation,
+            Some(ManagementMutation::AgentUninstall(active_id)) if active_id == &id
+        );
+        let update_available =
+            state.status == vibex_core::AgentManagedInstallStatus::UpdateAvailable;
+        let mut content = v_flex().w_full().gap_2();
+        content = content.child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(management_status_badge(
+                    management_managed_install_status_label(state).to_string(),
+                    cx,
+                ))
+                .when_some(state.installed_version.clone(), |row, version| {
+                    row.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("v{version}")),
+                    )
+                }),
+        );
+        if let Some(version) = state.available_version.as_deref()
+            && state.installed_version.as_deref() != Some(version)
+        {
+            content = content.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!(
+                        "{}: v{version}",
+                        management_locale_text("Available", "可用版本", "可用版本")
+                    )),
+            );
+        }
+        if let Some(error) = state.last_error_message.as_deref() {
+            content = content.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .child(error.to_string()),
+            );
+        }
+        let pending = self.mutation.is_some();
+        let mut actions = h_flex().w_full().justify_end().gap_2();
+        if needs_install {
+            actions = actions.child(
+                Button::new(SharedString::from(format!("management-agent-install-{id}")))
+                    .small()
+                    .primary()
+                    .icon(IconName::ArrowDown)
+                    .label(management_locale_text("Install", "安装", "安裝"))
+                    .loading(upgrading)
+                    .disabled(pending)
+                    .on_click(cx.listener({
+                        let id = id.clone();
+                        move |this, _, _, cx| this.install_managed_agent(id.clone(), false, cx)
+                    })),
+            );
+        } else if healthy_installation {
+            actions = actions.child(
+                Button::new(SharedString::from(format!("management-agent-check-{id}")))
+                    .small()
+                    .outline()
+                    .icon(IconName::Search)
+                    .label(management_locale_text(
+                        "Check for updates",
+                        "检查更新",
+                        "檢查更新",
+                    ))
+                    .loading(checking)
+                    .disabled(pending)
+                    .on_click(cx.listener({
+                        let id = id.clone();
+                        move |this, _, _, cx| this.check_managed_agent_update(id.clone(), cx)
+                    })),
+            );
+        }
+        if update_available && healthy_installation {
+            actions = actions.child(
+                Button::new(SharedString::from(format!("management-agent-upgrade-{id}")))
+                    .small()
+                    .primary()
+                    .icon(IconName::ArrowUp)
+                    .label(management_locale_text("Upgrade", "升级", "升級"))
+                    .loading(upgrading)
+                    .disabled(pending)
+                    .on_click(cx.listener({
+                        let id = id.clone();
+                        move |this, _, _, cx| this.install_managed_agent(id.clone(), true, cx)
+                    })),
+            );
+        }
+        if agent.added || state.installed_version.is_some() {
+            let uninstall_label = agent.label.clone();
+            actions = actions.child(
+                Button::new(SharedString::from(format!(
+                    "management-agent-uninstall-{id}"
+                )))
+                .small()
+                .danger()
+                .icon(IconName::Delete)
+                .label(management_locale_text("Uninstall", "卸载", "解除安裝"))
+                .loading(uninstalling)
+                .disabled(pending)
+                .on_click(cx.listener({
+                    let id = id.clone();
+                    move |this, _, window, cx| {
+                        this.confirm_managed_delete(
+                            ManagedDeleteTarget::Agent {
+                                id: id.clone(),
+                                label: uninstall_label.clone(),
+                            },
+                            window,
+                            cx,
+                        )
+                    }
+                })),
+            );
+        }
+        content = content.child(actions);
+        management_card(
+            management_locale_text("Agent installation", "Agent 安装", "Agent 安裝"),
+            management_locale_text(
+                "Vibex-managed runtime",
+                "Vibex 托管运行时",
+                "Vibex 託管執行環境",
+            ),
+            content.into_any_element(),
+            cx,
+        )
+    }
+
     fn render_providers(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let copy = management_copy();
-        let selected_agent = self.snapshot.agents.iter().find(|agent| {
-            agent.added && self.selected_agent_id.as_deref() == Some(agent.id.as_str())
-        });
+        let selected_agent = self
+            .snapshot
+            .agents
+            .iter()
+            .find(|agent| self.selected_agent_id.as_deref() == Some(agent.id.as_str()));
         let Some(selected_agent) = selected_agent.cloned() else {
             return detail_empty_state(copy.no_agents, copy.no_agents_description, cx);
         };
+        let selected_id = selected_agent.id.as_str().to_string();
+        if matches!(
+            &self.mutation,
+            Some(ManagementMutation::AgentInstall(active_id)) if active_id == &selected_id
+        ) {
+            return self.render_agent_install_loading(
+                &selected_agent,
+                matches!(
+                    selected_agent.managed_install.status,
+                    vibex_core::AgentManagedInstallStatus::UpdateAvailable
+                        | vibex_core::AgentManagedInstallStatus::Upgrading
+                ),
+                cx,
+            );
+        }
+        if !selected_agent.added {
+            if selected_agent.managed_install.managed {
+                return v_flex()
+                    .w_full()
+                    .gap_3()
+                    .child(self.render_agent_installation_card(&selected_agent, window, cx))
+                    .into_any_element();
+            }
+            return detail_empty_state(copy.no_agents, copy.no_agents_description, cx);
+        }
         let selected_agent_id = selected_agent.id.as_str().to_string();
         let profiles = self
             .snapshot
@@ -7239,12 +7767,14 @@ impl ManagementCenter {
             );
         }
 
+        let installation = self.render_agent_installation_card(&selected_agent, window, cx);
         let authentication = self.render_agent_authentication(window, cx);
 
         v_flex()
             .w_full()
             .min_w_0()
             .gap_3()
+            .child(installation)
             .child(authentication)
             .child(
                 v_flex()
@@ -12194,6 +12724,24 @@ fn management_install_label() -> &'static str {
 }
 
 fn management_agent_status_label(agent: &AgentSnapshotEntry) -> &'static str {
+    match agent.managed_install.status {
+        vibex_core::AgentManagedInstallStatus::Installing
+        | vibex_core::AgentManagedInstallStatus::Upgrading => {
+            return management_locale_text("Downloading", "下载中", "下載中");
+        }
+        vibex_core::AgentManagedInstallStatus::UpdateAvailable => {
+            return management_locale_text("Update available", "有可用更新", "有可用更新");
+        }
+        vibex_core::AgentManagedInstallStatus::Failed => {
+            return management_locale_text("Install failed", "安装失败", "安裝失敗");
+        }
+        vibex_core::AgentManagedInstallStatus::Uninstalling => {
+            return management_locale_text("Uninstalling", "卸载中", "解除安裝中");
+        }
+        vibex_core::AgentManagedInstallStatus::External
+        | vibex_core::AgentManagedInstallStatus::NotInstalled
+        | vibex_core::AgentManagedInstallStatus::Installed => {}
+    }
     if !agent.added {
         return management_locale_text("Not added", "未添加", "未新增");
     }
@@ -12218,6 +12766,37 @@ fn management_agent_status_label(agent: &AgentSnapshotEntry) -> &'static str {
         }
         vibex_core::AgentRuntimeStatus::Unknown => {
             management_locale_text("Not checked", "尚未检测", "尚未檢測")
+        }
+    }
+}
+
+fn management_managed_install_status_label(
+    state: &vibex_core::AgentManagedInstallState,
+) -> &'static str {
+    match state.status {
+        vibex_core::AgentManagedInstallStatus::External => {
+            management_locale_text("External CLI", "外部 CLI", "外部 CLI")
+        }
+        vibex_core::AgentManagedInstallStatus::NotInstalled => {
+            management_locale_text("Not installed", "未安装", "未安裝")
+        }
+        vibex_core::AgentManagedInstallStatus::Installing => {
+            management_locale_text("Downloading", "下载中", "下載中")
+        }
+        vibex_core::AgentManagedInstallStatus::Installed => {
+            management_locale_text("Installed", "已安装", "已安裝")
+        }
+        vibex_core::AgentManagedInstallStatus::UpdateAvailable => {
+            management_locale_text("Update available", "有可用更新", "有可用更新")
+        }
+        vibex_core::AgentManagedInstallStatus::Upgrading => {
+            management_locale_text("Upgrading", "升级中", "升級中")
+        }
+        vibex_core::AgentManagedInstallStatus::Failed => {
+            management_locale_text("Install failed", "安装失败", "安裝失敗")
+        }
+        vibex_core::AgentManagedInstallStatus::Uninstalling => {
+            management_locale_text("Uninstalling", "卸载中", "解除安裝中")
         }
     }
 }
@@ -13491,7 +14070,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_setup_probes_options_but_ordinary_toggle_does_not() {
+    fn agent_setup_and_managed_install_probe_options_but_ordinary_toggle_does_not() {
         let source = include_str!("management.rs");
         let toggle = source
             .split_once("    fn toggle_agent(")
@@ -13500,9 +14079,14 @@ mod tests {
             .expect("Agent toggle handler should remain inspectable");
         let add = source
             .split_once("    fn set_agent_added(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn discover_local_agents("))
+            .and_then(|(_, tail)| tail.split_once("\n    fn install_managed_agent("))
             .map(|(body, _)| body)
             .expect("Agent add handler should remain inspectable");
+        let managed_install = source
+            .split_once("    fn install_managed_agent(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn check_managed_agent_update("))
+            .map(|(body, _)| body)
+            .expect("managed Agent install handler should remain inspectable");
         let discover = source
             .split_once("    fn discover_local_agents(")
             .and_then(|(_, tail)| tail.split_once("\n    fn probe_agent("))
@@ -13516,6 +14100,14 @@ mod tests {
 
         assert!(!toggle.contains(".probe_agent("));
         assert_eq!(add.matches(".probe_agent(").count(), 1);
+        assert_eq!(managed_install.matches(".probe_agent(").count(), 1);
+        assert!(managed_install.contains(".refresh_auth_methods("));
+        let selection = source
+            .split_once("fn apply_snapshot(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn export_diagnostics("))
+            .map(|(body, _)| body)
+            .expect("management snapshot application should remain inspectable");
+        assert!(selection.contains("agent.managed_install.managed"));
         assert_eq!(discover.matches(".probe_agent(").count(), 1);
         assert_eq!(detect_after_install.matches(".probe_agent(").count(), 1);
     }

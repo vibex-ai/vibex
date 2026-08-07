@@ -62,10 +62,10 @@ use vibex_config_switch::{
 #[cfg(test)]
 use vibex_config_switch::{CodexProviderRuntimeConfig, codex_runtime_config_from_profile};
 use vibex_core::{
-    AcpProcessStrategy, AcpProviderConfig, AcpProviderEnvSource, ActiveWorkKind, AgentAuthCatalog,
-    AgentAuthMethodKind, AgentAuthenticateRequest, AgentAuthenticateResult, AgentEventRawOutput,
-    AgentEventRawOutputMode, AgentId, AgentLogoutRequest, AgentMessagePhase,
-    AgentModelCapabilities, AgentModelListRequest, AgentModelListSource,
+    AcpAdapterId, AcpProcessStrategy, AcpProviderConfig, AcpProviderEnvSource, ActiveWorkKind,
+    AgentAuthCatalog, AgentAuthMethodKind, AgentAuthenticateRequest, AgentAuthenticateResult,
+    AgentCommandConfig, AgentEventRawOutput, AgentEventRawOutputMode, AgentId, AgentLogoutRequest,
+    AgentMessagePhase, AgentModelCapabilities, AgentModelListRequest, AgentModelListSource,
     AgentProviderProjectionRegistry, AgentReasoningEffort, AgentRuntimeProbeStatus,
     AgentRuntimeRouteKey, AgentSessionConfigProbe, AgentSessionRestoreCompatibility,
     AgentSessionRestoreCompatibilityKey, AgentSessionRestoreMethod, AgentSessionRestoreOutcome,
@@ -1279,6 +1279,7 @@ pub(crate) struct AcpProcess {
     process_instance_id: AcpProcessInstanceId,
     exit_reporter: Option<ProcessExitReporter<AcpProcess>>,
     provider_profile_id: ProviderProfileId,
+    adapter_version: String,
     compatibility_identity: String,
     event_enricher: AgentEventEnricherKind,
     workspace_root: PathBuf,
@@ -4623,6 +4624,15 @@ pub struct AcpRuntimeClient {
     terminal_host: Option<Arc<dyn AcpTerminalHost>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EffectiveAdapterIdentity {
+    adapter_id: AcpAdapterId,
+    adapter_version: String,
+    compatibility_identity: String,
+    exact_descriptor: bool,
+    event_enricher: AgentEventEnricherKind,
+}
+
 /// Concrete ACP adapter for the provider-neutral durable runtime-switch
 /// coordinator. Opaque process handles are only an in-memory optimization;
 /// every attachment method can rebuild from the durable intent and binding.
@@ -5022,12 +5032,15 @@ impl AcpRuntimeSwitchBridge {
         })
     }
 
-    fn expected_adapter_compatibility_identity(&self, agent_id: &vibex_core::AgentId) -> String {
+    fn expected_adapter_compatibility_identity(
+        &self,
+        agent_id: &vibex_core::AgentId,
+        config: &AcpProviderConfig,
+    ) -> String {
         self.client
-            .compatibility_registry
-            .for_agent(agent_id)
-            .map(|descriptor| descriptor.expected_compatibility_identity().to_string())
-            .unwrap_or_else(|| "unmanaged".to_string())
+            .effective_adapter_identity(agent_id, config)
+            .map(|identity| identity.compatibility_identity)
+            .unwrap_or_else(|_| "identity-unavailable".to_string())
     }
 
     fn exact_restore_compatible(
@@ -5043,7 +5056,10 @@ impl AcpRuntimeSwitchBridge {
             && binding.native_session_id.is_some()
             && binding.native_state_home_id == context.spawn_snapshot.native_state_home_id
             && binding.adapter_compatibility_identity
-                == self.expected_adapter_compatibility_identity(&intent.target_selection.agent_id)
+                == self.expected_adapter_compatibility_identity(
+                    &intent.target_selection.agent_id,
+                    &context.config,
+                )
             && binding.provider_resume_identity.as_deref() == Some("acp-session-resume-v1")
     }
 
@@ -5236,12 +5252,6 @@ impl AcpRuntimeSwitchBridge {
                 attachment.binding_id().clone(),
                 restore_compatibility_key.clone(),
             );
-        let adapter_version = self
-            .client
-            .compatibility_registry
-            .for_agent(&selection.agent_id)
-            .map(|descriptor| descriptor.distribution.exact_version.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
         let now = unix_timestamp_ms();
         Ok(RuntimeBinding {
             binding_id: attachment.binding_id().clone(),
@@ -5250,7 +5260,7 @@ impl AcpRuntimeSwitchBridge {
             transport_kind: TransportKind::Acp,
             provider_profile_id: selection.provider_profile_id.clone(),
             adapter_id: adapter_id.clone(),
-            adapter_version,
+            adapter_version: process.adapter_version.clone(),
             adapter_compatibility_identity: process.compatibility_identity.clone(),
             native_session_id: Some(native_session_id),
             native_state_home_id: context.spawn_snapshot.native_state_home_id.clone(),
@@ -7036,6 +7046,74 @@ impl AcpRuntimeClient {
         &self.config_service
     }
 
+    fn effective_adapter_identity(
+        &self,
+        agent_id: &AgentId,
+        config: &AcpProviderConfig,
+    ) -> VibexResult<EffectiveAdapterIdentity> {
+        let command = AgentCommandConfig {
+            command: config.command.clone(),
+            args: config.args.clone(),
+        };
+        let managed_version = self
+            .config_service
+            .managed_agent_runtime_version(agent_id, &command)?;
+        let descriptor = self.compatibility_registry.for_agent(agent_id);
+
+        if let Some(version) = managed_version {
+            let adapter_id = descriptor
+                .map(|descriptor| descriptor.adapter_id.clone())
+                .unwrap_or_else(|| default_adapter_for_agent(agent_id));
+            let exact_descriptor = descriptor.is_some_and(|descriptor| {
+                descriptor.distribution.exact_version.to_string() == version
+                    && descriptor.distribution.runtime_dependencies.is_empty()
+            });
+            if exact_descriptor {
+                let descriptor = descriptor.expect("exact descriptor is present");
+                let expected_identity = descriptor.expected_compatibility_identity();
+                let event_enricher = descriptor
+                    .event_enricher_for_identity(&expected_identity)
+                    .unwrap_or(AgentEventEnricherKind::Passthrough);
+                return Ok(EffectiveAdapterIdentity {
+                    adapter_id,
+                    adapter_version: version,
+                    event_enricher,
+                    compatibility_identity: expected_identity.to_string(),
+                    exact_descriptor: true,
+                });
+            }
+            return Ok(EffectiveAdapterIdentity {
+                compatibility_identity: format!("adapter={adapter_id}@{version}"),
+                adapter_id,
+                adapter_version: version,
+                exact_descriptor: false,
+                event_enricher: AgentEventEnricherKind::Passthrough,
+            });
+        }
+
+        Ok(descriptor
+            .map(|descriptor| {
+                let expected_identity = descriptor.expected_compatibility_identity();
+                let event_enricher = descriptor
+                    .event_enricher_for_identity(&expected_identity)
+                    .unwrap_or(AgentEventEnricherKind::Passthrough);
+                EffectiveAdapterIdentity {
+                    adapter_id: descriptor.adapter_id.clone(),
+                    adapter_version: descriptor.distribution.exact_version.to_string(),
+                    event_enricher,
+                    compatibility_identity: expected_identity.to_string(),
+                    exact_descriptor: true,
+                }
+            })
+            .unwrap_or_else(|| EffectiveAdapterIdentity {
+                adapter_id: default_adapter_for_agent(agent_id),
+                adapter_version: "unknown".to_string(),
+                compatibility_identity: "unmanaged".to_string(),
+                exact_descriptor: false,
+                event_enricher: AgentEventEnricherKind::Passthrough,
+            }))
+    }
+
     pub fn new(config_service: ProviderConfigService) -> Self {
         Self::new_with_observability(config_service, Arc::new(RuntimeObservability::new()))
     }
@@ -8094,16 +8172,7 @@ impl AcpRuntimeClient {
                 projection.fingerprint,
             );
         }
-        let (adapter_version, adapter_identity) = self
-            .compatibility_registry
-            .for_agent(&profile.agent_id)
-            .map(|descriptor| {
-                (
-                    descriptor.distribution.exact_version.to_string(),
-                    descriptor.expected_compatibility_identity().to_string(),
-                )
-            })
-            .unwrap_or_else(|| ("unknown".to_string(), "unmanaged".to_string()));
+        let adapter_identity = self.effective_adapter_identity(&profile.agent_id, config)?;
         let terminal_host_available = self.terminal_host_for_config(config).is_some();
         non_secret_env.insert(
             "__vibex_terminal_tools".to_string(),
@@ -8124,9 +8193,10 @@ impl AcpRuntimeClient {
         Ok(ProcessSpawnConfigSnapshot {
             agent_id: profile.agent_id.clone(),
             adapter_id: route_key.adapter_id,
-            adapter_version,
+            adapter_version: adapter_identity.adapter_version,
             adapter_binary_identity: format!(
-                "{adapter_identity};binary={}",
+                "{};binary={}",
+                adapter_identity.compatibility_identity,
                 binary_identity(&config.command)
             ),
             provider_profile_id: profile_id.clone(),
@@ -8324,9 +8394,13 @@ impl AcpRuntimeClient {
                 )
             })?;
         let descriptor = self.compatibility_registry.for_agent(&profile.agent_id);
-        let descriptor_support = descriptor.map(|value| value.safe_multi_session.support);
-        let expected_identity =
-            descriptor.map(|value| value.expected_compatibility_identity().to_string());
+        let effective_identity = self.effective_adapter_identity(&profile.agent_id, config)?;
+        let descriptor_support = descriptor
+            .filter(|_| effective_identity.exact_descriptor)
+            .map(|value| value.safe_multi_session.support);
+        let expected_identity = effective_identity
+            .exact_descriptor
+            .then_some(effective_identity.compatibility_identity);
 
         #[cfg(test)]
         let (descriptor_support, expected_identity) = self
@@ -8463,8 +8537,9 @@ impl AcpRuntimeClient {
         &self,
         process_instance_id: &AcpProcessInstanceId,
         provider_profile_id: &ProviderProfileId,
+        config: &AcpProviderConfig,
         process_spawn_fingerprint: Option<&str>,
-    ) -> RuntimeLogContext {
+    ) -> VibexResult<RuntimeLogContext> {
         let mut context = RuntimeLogContext::new("acp_process")
             .with_process_instance_id(process_instance_id.as_str())
             .with_provider_profile_id(provider_profile_id);
@@ -8473,13 +8548,12 @@ impl AcpRuntimeClient {
         }
         if let Ok(Some(profile)) = self.config_service.get_profile(provider_profile_id) {
             context = context.with_agent_id(&profile.agent_id);
-            if let Some(descriptor) = self.compatibility_registry.for_agent(&profile.agent_id) {
-                context = context
-                    .with_adapter_id(&descriptor.adapter_id)
-                    .with_adapter_version(&descriptor.distribution.exact_version);
-            }
+            let identity = self.effective_adapter_identity(&profile.agent_id, config)?;
+            context = context
+                .with_adapter_id(&identity.adapter_id)
+                .with_adapter_version(&identity.adapter_version);
         }
-        context
+        Ok(context)
     }
 
     async fn acquire_initialized_process(
@@ -8540,8 +8614,9 @@ impl AcpRuntimeClient {
         let log_context = self.process_log_context(
             &process_instance_id,
             launch.profile_id,
+            launch.config,
             process_spawn_fingerprint.as_deref(),
-        );
+        )?;
         let result = self
             .spawn_process_inner(
                 process_instance_id,
@@ -8604,19 +8679,7 @@ impl AcpRuntimeClient {
                         .expect("static fallback agent id is valid")
                 }),
         };
-        let (compatibility_identity, event_enricher) = self
-            .compatibility_registry
-            .for_agent(&agent_id)
-            .map(|descriptor| {
-                let identity = descriptor.expected_compatibility_identity();
-                (
-                    identity.to_string(),
-                    descriptor
-                        .event_enricher_for_identity(&identity)
-                        .unwrap_or(AgentEventEnricherKind::Passthrough),
-                )
-            })
-            .unwrap_or_else(|| ("unmanaged".to_string(), AgentEventEnricherKind::Passthrough));
+        let adapter_identity = self.effective_adapter_identity(&agent_id, config)?;
         let command_path = Path::new(&config.command);
         if command_path.is_absolute() && !command_path.is_file() {
             return Err(VibexError::process(
@@ -8700,8 +8763,9 @@ impl AcpRuntimeClient {
             }),
             process_instance_id,
             provider_profile_id: profile_id.clone(),
-            compatibility_identity,
-            event_enricher,
+            adapter_version: adapter_identity.adapter_version,
+            compatibility_identity: adapter_identity.compatibility_identity,
+            event_enricher: adapter_identity.event_enricher,
             workspace_root: cwd.to_path_buf(),
             command_display: config.command.clone(),
             args_display: redacted_args_summary(&process_args),
@@ -8874,6 +8938,8 @@ impl AcpRuntimeClient {
             .config_service
             .get_profile(&process.provider_profile_id)
             && let Some(descriptor) = self.compatibility_registry.for_agent(&profile.agent_id)
+            && descriptor.expected_compatibility_identity().to_string()
+                == process.compatibility_identity
         {
             for operation in [
                 AcpOperation::SessionSetModel,
@@ -9114,12 +9180,19 @@ impl AcpRuntimeClient {
         }
     }
 
-    fn restore_policy_for_profile(&self, profile_id: &ProviderProfileId) -> RestorePolicy {
+    fn restore_policy_for_profile(
+        &self,
+        profile_id: &ProviderProfileId,
+        compatibility_identity: &str,
+    ) -> RestorePolicy {
         self.config_service
             .get_profile(profile_id)
             .ok()
             .flatten()
             .and_then(|profile| self.compatibility_registry.for_agent(&profile.agent_id))
+            .filter(|descriptor| {
+                descriptor.expected_compatibility_identity().to_string() == compatibility_identity
+            })
             .map(|descriptor| descriptor.restore_policy)
             .unwrap_or(RestorePolicy::ResumeThenLoadThenNew)
     }
@@ -9235,7 +9308,10 @@ impl AcpRuntimeClient {
                 AgentSessionRestoreOutcome::Unsupported,
             ));
         }
-        let policy = self.restore_policy_for_profile(&binding.provider_profile_id);
+        let policy = self.restore_policy_for_profile(
+            &binding.provider_profile_id,
+            &process.compatibility_identity,
+        );
         let mut last_outcome = AgentSessionRestoreOutcome::Unsupported;
         let mut attempts = Vec::new();
         for method in restore_methods(policy) {
@@ -14567,6 +14643,97 @@ mod tests {
     use super::*;
     use vibex_agent::AgentProvider;
 
+    fn test_acp_config(command: &str, args: Vec<String>) -> AcpProviderConfig {
+        AcpProviderConfig {
+            command: command.to_string(),
+            args,
+            env: Vec::new(),
+            cwd_template: Some("{workspaceRoot}".to_string()),
+            process_strategy: AcpProcessStrategy::PerSession,
+            terminal_tools: false,
+            terminal_auth: false,
+            models: Vec::new(),
+            modes: Vec::new(),
+            features: Vec::new(),
+            disabled_tools: Vec::new(),
+        }
+    }
+
+    fn persist_managed_runtime(
+        conn: &vibex_db::DbConnection,
+        agent_id: &str,
+        registry_agent_id: &str,
+        version: &str,
+        config: &AcpProviderConfig,
+    ) {
+        let agent_id = AgentId::parse(agent_id).unwrap();
+        vibex_db::AgentManagedInstallationRepository::upsert(
+            conn,
+            &vibex_db::AgentManagedInstallationRecord {
+                agent_id,
+                registry_agent_id: registry_agent_id.to_string(),
+                state: vibex_core::AgentManagedInstallState {
+                    managed: true,
+                    status: vibex_core::AgentManagedInstallStatus::Installed,
+                    distribution_kind: Some(vibex_core::AgentManagedDistributionKind::Npm),
+                    installed_version: Some(version.to_string()),
+                    available_version: Some(version.to_string()),
+                    last_error_code: None,
+                    last_error_message: None,
+                    updated_at_ms: Some(1),
+                },
+                command: Some(AgentCommandConfig {
+                    command: config.command.clone(),
+                    args: config.args.clone(),
+                }),
+                install_root: Some(format!("/managed/{registry_agent_id}")),
+                updated_at_ms: 1,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn effective_adapter_identity_uses_the_managed_registry_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("vibex.db");
+        let mut conn = open_database(&db_path).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let client = AcpRuntimeClient::new(ProviderConfigService::new(&db_path));
+
+        let claude = test_acp_config(
+            "/managed/node",
+            vec!["/managed/claude-agent-acp.js".to_string()],
+        );
+        persist_managed_runtime(&conn, "claude", "claude-acp", "0.65.0", &claude);
+        let identity = client
+            .effective_adapter_identity(&AgentId::parse("claude").unwrap(), &claude)
+            .unwrap();
+        assert_eq!(identity.adapter_version, "0.65.0");
+        assert_eq!(
+            identity.compatibility_identity,
+            "adapter=claude-agent-acp@0.65.0"
+        );
+        assert!(!identity.exact_descriptor);
+        assert_eq!(identity.event_enricher, AgentEventEnricherKind::Passthrough);
+
+        let codex = test_acp_config("/managed/node", vec!["/managed/codex-acp.js".to_string()]);
+        persist_managed_runtime(&conn, "codex", "codex-acp", "1.1.9", &codex);
+        let identity = client
+            .effective_adapter_identity(&AgentId::parse("codex").unwrap(), &codex)
+            .unwrap();
+        assert_eq!(identity.adapter_version, "1.1.9");
+        assert_eq!(identity.compatibility_identity, "adapter=codex-acp@1.1.9");
+        assert!(!identity.exact_descriptor);
+
+        let external = test_acp_config("claude-agent-acp", Vec::new());
+        let identity = client
+            .effective_adapter_identity(&AgentId::parse("claude").unwrap(), &external)
+            .unwrap();
+        assert!(identity.exact_descriptor);
+        assert_eq!(identity.event_enricher, AgentEventEnricherKind::Claude);
+    }
+
     #[test]
     fn codex_reconnect_progress_requires_an_exact_bounded_counter() {
         assert_eq!(
@@ -15019,6 +15186,7 @@ mod tests {
             process_instance_id,
             exit_reporter,
             provider_profile_id: ProviderProfileId::new(),
+            adapter_version: "1.0.0".to_string(),
             compatibility_identity: "test-acp@1".to_string(),
             event_enricher: AgentEventEnricherKind::Passthrough,
             workspace_root: std::env::temp_dir(),
