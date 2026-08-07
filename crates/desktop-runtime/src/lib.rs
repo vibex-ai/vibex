@@ -1030,6 +1030,9 @@ impl DesktopRuntime {
             runtime.spawn_provider_config_consumer(provider_change_receiver)
         })?;
         runtime.activate().await?;
+        startup_stage("startup_reconciliation_spawn", || {
+            runtime.spawn_startup_reconciliation()
+        })?;
         let bootstrap_started = Instant::now();
         eprintln!("vibex-startup: stage-begin stage=managed_agent_bootstrap_spawn");
         let bootstrap = (|| {
@@ -1100,26 +1103,42 @@ impl DesktopRuntime {
             let _ = self.agent.runtime_lifecycle.stop().await;
             return Err(error);
         }
-        if let Err(error) = startup_stage_async(
-            "runtime_selection_reconcile",
-            self.agent.runtime_selection.reconcile_on_startup(),
-        )
-        .await
-        {
-            tracing::warn!(
-                target: "vibex_desktop",
-                error_code = %error.code,
-                "runtime selection startup reconciliation failed"
-            );
-        } else if let Err(error) = startup_stage("message_submission_reconcile", || {
-            self.agent.message_submission.reconcile_on_startup()
-        }) {
-            tracing::warn!(
-                target: "vibex_desktop",
-                error_code = %error.code,
-                "message submission startup reconciliation failed"
-            );
-        }
+        Ok(())
+    }
+
+    fn spawn_startup_reconciliation(&self) -> VibexResult<()> {
+        let mut tasks = self.tasks.lock().map_err(|_| {
+            VibexError::process(
+                "desktop_runtime_task_lock_failed",
+                "desktop runtime task ownership is unavailable",
+            )
+        })?;
+        let runtime_selection = self.agent.runtime_selection.clone();
+        let message_submission = self.agent.message_submission.clone();
+        tasks.push(tokio::spawn(async move {
+            if let Err(error) = startup_stage_async(
+                "runtime_selection_reconcile",
+                runtime_selection.reconcile_on_startup(),
+            )
+            .await
+            {
+                tracing::warn!(
+                    target: "vibex_desktop",
+                    error_code = %error.code,
+                    "runtime selection background reconciliation failed"
+                );
+                return;
+            }
+            if let Err(error) = startup_stage("message_submission_reconcile", || {
+                message_submission.reconcile_on_startup()
+            }) {
+                tracing::warn!(
+                    target: "vibex_desktop",
+                    error_code = %error.code,
+                    "message submission background reconciliation failed"
+                );
+            }
+        }));
         Ok(())
     }
 
@@ -1753,6 +1772,34 @@ mod tests {
         ] {
             assert!(source.contains(stage), "missing startup stage {stage}");
         }
+    }
+
+    #[test]
+    fn agent_reconciliation_preheats_after_runtime_activation_without_blocking_ready() {
+        let source = include_str!("lib.rs");
+        let start = source
+            .split_once("    async fn start_inner(")
+            .and_then(|(_, tail)| tail.split_once("\n    async fn activate("))
+            .map(|(body, _)| body)
+            .expect("runtime start should remain inspectable");
+        let activate = source
+            .split_once("    async fn activate_inner(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn spawn_startup_reconciliation("))
+            .map(|(body, _)| body)
+            .expect("blocking runtime activation should remain inspectable");
+        let background = source
+            .split_once("    fn spawn_startup_reconciliation(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn spawn_agent_bootstrap("))
+            .map(|(body, _)| body)
+            .expect("background startup reconciliation should remain inspectable");
+
+        assert!(start.contains("runtime.activate().await?;"));
+        assert!(start.contains("runtime.spawn_startup_reconciliation()"));
+        assert!(!activate.contains("runtime_selection.reconcile_on_startup()"));
+        assert!(!activate.contains("message_submission.reconcile_on_startup()"));
+        assert!(background.contains("tasks.push(tokio::spawn(async move"));
+        assert!(background.contains("runtime_selection.reconcile_on_startup()"));
+        assert!(background.contains("message_submission.reconcile_on_startup()"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

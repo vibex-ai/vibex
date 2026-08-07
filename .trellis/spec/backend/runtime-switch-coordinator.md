@@ -168,6 +168,16 @@ SwitchOperationJournalRepository::{
 
 #### Startup reconciliation
 
+- Desktop schedules runtime-selection and message-submission reconciliation as
+  a runtime-owned background preheat after the core runtime has activated. The
+  GPUI startup overlay and `runtime-ready` transition must not await Agent
+  process/session restoration. A message submitted before preheat completes
+  uses the same lifecycle materialization and session locks, so its dispatch
+  waits for restoration without reopening the application startup overlay.
+- Background preheat still follows the durable recovery table below. Moving it
+  off the startup readiness path does not permit skipping journal recovery,
+  replaying a non-idempotent operation, or treating in-memory state as proof.
+
 | Durable state | Recovery action |
 | --- | --- |
 | Requested initial switch | Claim pending ownership, then resume normal Reserve/Prepare. |
