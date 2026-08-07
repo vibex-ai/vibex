@@ -15929,7 +15929,9 @@ impl VibexWorkbench {
                                             .child(label),
                                     )
                                 })
-                                .when(state_label.is_none(), |this| this.child(time_label))
+                                .when(state_label.is_none() && !has_unread_completion, |this| {
+                                    this.child(time_label)
+                                })
                             })
                             .when(has_unread_completion, |this| {
                                 this.child(
@@ -34862,6 +34864,7 @@ mod tests {
         );
         assert!(sidebar_session.contains("sidebar-session-actions-{session_id_string}"));
         assert!(sidebar_session.contains(".group_hover(&hover_group, |style| style.visible())"));
+        assert!(sidebar_session.contains("state_label.is_none() && !has_unread_completion"));
     }
 
     #[test]
