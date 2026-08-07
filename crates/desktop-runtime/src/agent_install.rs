@@ -2570,7 +2570,8 @@ print(json.dumps({"version": distribution.version, "scripts": scripts}))
 "#;
 
     let mut command = Command::new(python);
-    command.arg("-c").arg(SCRIPT).arg(package);
+    // Ignore inherited Python configuration so metadata always comes from this venv.
+    command.arg("-I").arg("-c").arg(SCRIPT).arg(package);
     let output = run_process_probe(
         command,
         UV_PROBE_TIMEOUT,
@@ -3570,9 +3571,22 @@ fn extract_tar(reader: impl Read, destination: &Path) -> VibexResult<()> {
                 error,
             )
         })?;
-        let relative = safe_relative_path(&relative.to_string_lossy(), "archive entry")?;
-        let output = destination.join(relative);
         let kind = entry.header().entry_type();
+        let relative = match safe_relative_path(&relative.to_string_lossy(), "archive entry") {
+            Ok(relative) => relative,
+            // Release tarballs commonly begin with a `./` directory record. It has no
+            // destination-relative name, but is safe to ignore as a directory only.
+            Err(_error)
+                if kind.is_dir()
+                    && relative
+                        .components()
+                        .all(|component| matches!(component, Component::CurDir)) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let output = destination.join(relative);
         if kind.is_dir() {
             fs::create_dir_all(&output).map_err(|error| {
                 storage_error(
@@ -4543,6 +4557,30 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uvx_metadata_probe_uses_isolated_python_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let python = temp.path().join("python");
+        fs::write(
+            &python,
+            r#"#!/bin/sh
+[ "$1" = "-I" ] || exit 1
+[ "$2" = "-c" ] || exit 1
+[ "$4" = "test-package" ] || exit 1
+printf '%s\n' '{"version":"1.2.3","scripts":["test-package"]}'
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let package = inspect_uvx_package(&python, "test-package").await.unwrap();
+        assert_eq!(package.version, "1.2.3");
+        assert_eq!(package.scripts, vec!["test-package"]);
+    }
+
     #[test]
     fn invalid_cached_installations_are_removed_before_reinstall() {
         let temp = tempfile::tempdir().unwrap();
@@ -4681,12 +4719,15 @@ mod tests {
     }
 
     #[test]
-    fn tar_bz2_archives_are_extracted_and_unsupported_archives_fail_closed() {
+    fn tar_bz2_archives_accept_top_level_dot_directory_entries() {
         let temp = tempfile::tempdir().unwrap();
         let archive_path = temp.path().join("agent.tar.bz2");
         let archive_file = File::create(&archive_path).unwrap();
         let encoder = bzip2::write::BzEncoder::new(archive_file, bzip2::Compression::best());
         let mut builder = tar::Builder::new(encoder);
+        let archive_root = temp.path().join("archive-root");
+        fs::create_dir(&archive_root).unwrap();
+        builder.append_dir(".", &archive_root).unwrap();
         let payload = b"agent-binary";
         let mut header = tar::Header::new_gnu();
         header.set_size(payload.len() as u64);
