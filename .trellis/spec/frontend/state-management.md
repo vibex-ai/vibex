@@ -153,6 +153,14 @@ message in the background. The new-session page must not remain open until the
 Agent turn finishes; streamed timeline events and the final authoritative
 refetch belong on the selected session page.
 
+Once that authoritative session exists, the submitted draft remains consumed
+even if its initial Agent turn fails. Keep the persisted user message and error
+timeline authoritative, and let manual or automatic continuation resume the
+unfinished turn; never copy the submitted text or attachments into the selected
+session composer. Restore the new-session draft only when session creation
+itself fails before an authoritative session record is returned. Regression
+coverage must assert both sides of this failure boundary.
+
 Session fork follows the same authoritative-first rule. As soon as the backend
 reports the persisted `initializing` fork and copied Timeline prefix, select that
 session and show explicit runtime-preparation feedback while final ACP setup

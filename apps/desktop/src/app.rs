@@ -11668,13 +11668,6 @@ impl VibexWorkbench {
                         if let Some(error) = initial_message_error {
                             this.runtime_note =
                                 Some(format!("Session created; initial message failed: {error}"));
-                            if this.selected_session_id.as_ref() == Some(&session_id) {
-                                this.composer_input.update(cx, |input, cx| {
-                                    input.set_value(draft_raw_text.clone(), window, cx)
-                                });
-                                this.composer_attachments = draft_attachments.clone();
-                                this.composer_command_entry = draft_command_entry.clone();
-                            }
                         }
                         this.reconcile_sidebar_state();
                         this.refresh_workspace_contexts(cx);
@@ -35875,6 +35868,16 @@ mod tests {
             2,
             "both session-creation failure paths should restore the draft"
         );
+        let initial_message_failure = submit
+            .split_once("if let Some(error) = initial_message_error")
+            .and_then(|(_, tail)| tail.split_once("this.reconcile_sidebar_state();"))
+            .map(|(body, _)| body)
+            .expect("initial-message failure handling should remain inspectable");
+        assert!(initial_message_failure.contains("this.runtime_note"));
+        assert!(!initial_message_failure.contains("composer_input"));
+        assert!(!initial_message_failure.contains("draft_raw_text"));
+        assert!(!initial_message_failure.contains("draft_attachments"));
+        assert!(!initial_message_failure.contains("draft_command_entry"));
 
         let clear_draft = source
             .split_once("    fn clear_submitted_new_session_draft(")
@@ -37350,7 +37353,8 @@ mod tests {
         assert!(submit.contains(".with_expected_revision("));
         assert!(submit.contains("mark_workspace_ready(workspace.clone())"));
         assert!(submit.contains("mark_failed(error.code.clone())"));
-        assert!(submit.contains("this.composer_attachments = draft_attachments.clone()"));
+        assert!(submit.contains("this.restore_new_session_message_draft("));
+        assert!(!submit.contains("this.composer_attachments = draft_attachments.clone()"));
     }
 
     #[test]
