@@ -1,6 +1,7 @@
 //! Shared desktop composition root used by the native GPUI shell.
 
 mod acp_terminal;
+mod auth_catalog;
 mod catalog;
 mod events;
 mod fixture;
@@ -53,6 +54,7 @@ use vibex_terminal::TerminalManager;
 
 use acp_terminal::DesktopAcpTerminalHost;
 
+pub use auth_catalog::AgentAuthCatalogService;
 pub use catalog::{
     RuntimeOptionCatalogService, RuntimeOptionProbeResult, RuntimeOptionSnapshotSummary,
 };
@@ -311,6 +313,7 @@ pub struct AgentHandle {
     runtime_lifecycle: Arc<RuntimeLifecycleService>,
     message_submission: Arc<MessageSubmissionCoordinator>,
     runtime_catalog: Arc<RuntimeOptionCatalogService>,
+    auth_catalog: Arc<AgentAuthCatalogService>,
 }
 
 impl AgentHandle {
@@ -339,9 +342,21 @@ impl AgentHandle {
         agent_id: vibex_core::AgentId,
         provider_profile_id: Option<ProviderProfileId>,
     ) -> VibexResult<AgentAuthCatalog> {
-        self.manager
-            .list_agent_auth_methods(agent_id, provider_profile_id)
+        self.auth_catalog.list(agent_id, provider_profile_id).await
+    }
+
+    pub async fn refresh_auth_methods(
+        &self,
+        agent_id: vibex_core::AgentId,
+        provider_profile_id: Option<ProviderProfileId>,
+    ) -> VibexResult<AgentAuthCatalog> {
+        self.auth_catalog
+            .refresh(agent_id, provider_profile_id)
             .await
+    }
+
+    pub fn delete_auth_catalog(&self, agent_id: &vibex_core::AgentId) -> VibexResult<()> {
+        self.auth_catalog.delete_agent(agent_id)
     }
 
     pub async fn authenticate(
@@ -802,6 +817,10 @@ impl DesktopRuntime {
             provider_config_service.clone(),
             acp_runtime.clone(),
         ));
+        let auth_catalog = Arc::new(AgentAuthCatalogService::new(
+            manager.clone(),
+            provider_config_service.clone(),
+        ));
         let git = GitHandle {
             db_path: db_path.clone(),
             mutation_claims: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
@@ -865,6 +884,7 @@ impl DesktopRuntime {
                 runtime_lifecycle,
                 message_submission,
                 runtime_catalog,
+                auth_catalog,
             },
             providers,
             workspace: WorkspaceHandle {

@@ -1153,10 +1153,17 @@ impl ManagementCenter {
         }
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
-                .agent()
-                .list_auth_methods(agent_id, provider_profile_id)
-                .await
+            if force {
+                runtime
+                    .agent()
+                    .refresh_auth_methods(agent_id, provider_profile_id)
+                    .await
+            } else {
+                runtime
+                    .agent()
+                    .list_auth_methods(agent_id, provider_profile_id)
+                    .await
+            }
         });
         self.agent_auth_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
@@ -1349,7 +1356,7 @@ impl ManagementCenter {
             if required_credential_cleared {
                 let mut catalog = runtime
                     .agent()
-                    .list_auth_methods(agent_id, provider_profile_id)
+                    .refresh_auth_methods(agent_id, provider_profile_id)
                     .await?;
                 catalog.status = AgentAuthStatus::AuthenticationRequired;
                 return Ok::<_, VibexError>((catalog, None, true));
@@ -1364,7 +1371,7 @@ impl ManagementCenter {
                 .await?;
             let mut catalog = runtime
                 .agent()
-                .list_auth_methods(agent_id, provider_profile_id)
+                .refresh_auth_methods(agent_id, provider_profile_id)
                 .await?;
             catalog.status = if result.terminal.is_some() {
                 AgentAuthStatus::Unknown
@@ -1519,7 +1526,7 @@ impl ManagementCenter {
                 .await?;
             let mut catalog = runtime
                 .agent()
-                .list_auth_methods(agent_id, provider_profile_id)
+                .refresh_auth_methods(agent_id, provider_profile_id)
                 .await?;
             catalog.status = AgentAuthStatus::AuthenticationRequired;
             Ok::<_, VibexError>(catalog)
@@ -1663,7 +1670,7 @@ impl ManagementCenter {
             }
             let (catalog, refresh_error) = match runtime
                 .agent()
-                .list_auth_methods(agent_id, provider_profile_id)
+                .refresh_auth_methods(agent_id, provider_profile_id)
                 .await
             {
                 Ok(mut catalog) => {
@@ -3079,6 +3086,7 @@ impl ManagementCenter {
                     params: None,
                 })?;
                 if !added {
+                    runtime.agent().delete_auth_catalog(&parsed_agent_id)?;
                     return Ok(management_locale_text_for(
                         active_locale,
                         "Agent removed",

@@ -130,6 +130,14 @@ error code; ordinary reads never retry it.
 legacy table. Current catalog code must not read, write, invalidate, or key new
 records by `provider_profile_id`.
 
+`agent_auth_catalog_snapshots` stores the product-safe ACP authentication catalog
+for one `(agent_id, provider_profile_id)` scope. The first successful discovery
+persists the snapshot; ordinary Management Center reads reuse it without launching
+an ACP process. Only an explicit user refresh or an authentication/logout action
+may query again and replace the snapshot. Failed discovery must not overwrite a
+previous success. Removing an Agent deletes all of its authentication snapshots so
+a later re-add performs fresh discovery.
+
 Runtime-option payload schema v1 stores the camelCase JSON form of
 `AgentSessionConfigProbe` with an empty `models` array. Additive fields require
 serde defaults for old rows; incompatible payload changes require a new

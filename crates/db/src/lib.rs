@@ -6,9 +6,9 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Serialize, de::DeserializeOwned};
 use vibex_core::{
-    AdapterDiagnostic, AgentConfig, AgentDiscoveryRecord, AgentId, AgentModelListResponse,
-    AgentModelProviderDefaultSelection, AgentModelProviderFailoverEntry, AgentSession,
-    AgentSessionConfigProbe, AgentSessionSafety, AgentSessionState, AutomationEdge,
+    AdapterDiagnostic, AgentAuthCatalog, AgentConfig, AgentDiscoveryRecord, AgentId,
+    AgentModelListResponse, AgentModelProviderDefaultSelection, AgentModelProviderFailoverEntry,
+    AgentSession, AgentSessionConfigProbe, AgentSessionSafety, AgentSessionState, AutomationEdge,
     AutomationEdgeCreateRequest, AutomationEdgeId, AutomationGraph, AutomationGraphCreateRequest,
     AutomationGraphId, AutomationGraphListRequest, AutomationGraphStatus,
     AutomationGraphUpdateRequest, AutomationNode, AutomationNodeCreateRequest, AutomationNodeId,
@@ -72,7 +72,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 39;
+pub const CURRENT_SCHEMA_VERSION: i64 = 40;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -1657,6 +1657,21 @@ const MIGRATIONS: &[Migration] = &[
                 ON agent_runtime_option_snapshots(last_attempt_at_ms);
         ",
     },
+    Migration {
+        version: 40,
+        name: "agent_auth_catalog_snapshots",
+        sql: "
+            CREATE TABLE IF NOT EXISTS agent_auth_catalog_snapshots (
+                agent_id TEXT NOT NULL,
+                provider_profile_id TEXT NOT NULL,
+                catalog_json TEXT NOT NULL,
+                refreshed_at_ms INTEGER NOT NULL,
+                PRIMARY KEY(agent_id, provider_profile_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_auth_catalog_snapshots_refreshed
+                ON agent_auth_catalog_snapshots(refreshed_at_ms);
+        ",
+    },
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -1682,6 +1697,7 @@ pub struct ProviderNativeExportRepository;
 pub struct ProviderCapabilityRepository;
 pub struct ProviderRuntimeOptionSnapshotRepository;
 pub struct AgentRuntimeOptionSnapshotRepository;
+pub struct AgentAuthCatalogSnapshotRepository;
 pub struct ProviderHealthRepository;
 pub struct ProviderUsageRepository;
 pub struct ScheduledTaskRepository;
@@ -1723,6 +1739,14 @@ pub struct AgentRuntimeOptionSnapshotRecord {
     pub last_success_at_ms: Option<i64>,
     pub last_attempt_at_ms: i64,
     pub last_error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentAuthCatalogSnapshotRecord {
+    pub agent_id: AgentId,
+    pub provider_profile_id: Option<ProviderProfileId>,
+    pub catalog: AgentAuthCatalog,
+    pub refreshed_at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4046,6 +4070,95 @@ impl AgentRuntimeOptionSnapshotRepository {
         }
         Ok(records)
     }
+}
+
+impl AgentAuthCatalogSnapshotRepository {
+    pub fn get(
+        conn: &Connection,
+        agent_id: &AgentId,
+        provider_profile_id: Option<&ProviderProfileId>,
+    ) -> VibexResult<Option<AgentAuthCatalogSnapshotRecord>> {
+        conn.query_row(
+            "SELECT agent_id, provider_profile_id, catalog_json, refreshed_at_ms
+             FROM agent_auth_catalog_snapshots
+             WHERE agent_id = ?1 AND provider_profile_id = ?2",
+            params![
+                agent_id.as_str(),
+                provider_profile_id.map_or("", ProviderProfileId::as_str)
+            ],
+            map_agent_auth_catalog_snapshot,
+        )
+        .optional()
+        .map_err(|error| {
+            VibexError::storage(
+                "agent_auth_catalog_snapshot_get_failed",
+                "failed to read Agent authentication cache",
+            )
+            .with_diagnostic("error", error.to_string())
+        })
+    }
+
+    pub fn upsert(conn: &Connection, record: &AgentAuthCatalogSnapshotRecord) -> VibexResult<()> {
+        let catalog_json = json_to_db(&record.catalog)?;
+        conn.execute(
+            "INSERT INTO agent_auth_catalog_snapshots
+                (agent_id, provider_profile_id, catalog_json, refreshed_at_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(agent_id, provider_profile_id) DO UPDATE SET
+                catalog_json = excluded.catalog_json,
+                refreshed_at_ms = excluded.refreshed_at_ms",
+            params![
+                record.agent_id.as_str(),
+                record
+                    .provider_profile_id
+                    .as_ref()
+                    .map_or("", ProviderProfileId::as_str),
+                catalog_json,
+                record.refreshed_at_ms,
+            ],
+        )
+        .map_err(|error| {
+            VibexError::storage(
+                "agent_auth_catalog_snapshot_upsert_failed",
+                "failed to persist Agent authentication cache",
+            )
+            .with_diagnostic("error", error.to_string())
+        })?;
+        Ok(())
+    }
+
+    pub fn delete_agent(conn: &Connection, agent_id: &AgentId) -> VibexResult<()> {
+        conn.execute(
+            "DELETE FROM agent_auth_catalog_snapshots WHERE agent_id = ?1",
+            params![agent_id.as_str()],
+        )
+        .map_err(|error| {
+            VibexError::storage(
+                "agent_auth_catalog_snapshot_delete_failed",
+                "failed to delete Agent authentication cache",
+            )
+            .with_diagnostic("error", error.to_string())
+        })?;
+        Ok(())
+    }
+}
+
+fn map_agent_auth_catalog_snapshot(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<AgentAuthCatalogSnapshotRecord> {
+    Ok(AgentAuthCatalogSnapshotRecord {
+        agent_id: parse_id_sql(row.get(0)?, AgentId::parse)?,
+        provider_profile_id: {
+            let value: String = row.get(1)?;
+            (!value.is_empty())
+                .then_some(value)
+                .map(ProviderProfileId::parse)
+                .transpose()
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
+        },
+        catalog: json_from_db_sql(row.get(2)?)?,
+        refreshed_at_ms: row.get(3)?,
+    })
 }
 
 impl ProviderHealthRepository {
@@ -11509,7 +11622,8 @@ mod tests {
                 "36:agent_elicitation_requests",
                 "37:agent_provider_projection_platform",
                 "38:agent_runtime_provider_probe_evidence",
-                "39:agent_runtime_option_snapshots"
+                "39:agent_runtime_option_snapshots",
+                "40:agent_auth_catalog_snapshots"
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -11651,7 +11765,8 @@ mod tests {
                 "36:agent_elicitation_requests",
                 "37:agent_provider_projection_platform",
                 "38:agent_runtime_provider_probe_evidence",
-                "39:agent_runtime_option_snapshots"
+                "39:agent_runtime_option_snapshots",
+                "40:agent_auth_catalog_snapshots"
             ]
         );
         assert_eq!(
@@ -13199,7 +13314,8 @@ mod tests {
                 "36:agent_elicitation_requests",
                 "37:agent_provider_projection_platform",
                 "38:agent_runtime_provider_probe_evidence",
-                "39:agent_runtime_option_snapshots"
+                "39:agent_runtime_option_snapshots",
+                "40:agent_auth_catalog_snapshots"
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
@@ -14342,6 +14458,48 @@ mod tests {
             AgentRuntimeOptionSnapshotRepository::list(&conn)
                 .unwrap()
                 .is_empty()
+        );
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn agent_auth_catalog_snapshot_round_trips_by_agent_and_profile() {
+        let temp = temp_db_path("agent-auth-catalog-snapshot");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let agent_id = AgentId::parse("opencode").unwrap();
+        let profile_id = ProviderProfileId::new();
+        let catalog = AgentAuthCatalog {
+            agent_id: agent_id.clone(),
+            methods: Vec::new(),
+            supports_logout: true,
+            status: vibex_core::AgentAuthStatus::Unknown,
+            refreshed_at_ms: 100,
+        };
+        AgentAuthCatalogSnapshotRepository::upsert(
+            &conn,
+            &AgentAuthCatalogSnapshotRecord {
+                agent_id: agent_id.clone(),
+                provider_profile_id: Some(profile_id.clone()),
+                catalog: catalog.clone(),
+                refreshed_at_ms: 100,
+            },
+        )
+        .unwrap();
+        let cached = AgentAuthCatalogSnapshotRepository::get(&conn, &agent_id, Some(&profile_id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(cached.catalog, catalog);
+        assert!(
+            AgentAuthCatalogSnapshotRepository::get(&conn, &agent_id, None)
+                .unwrap()
+                .is_none()
+        );
+        AgentAuthCatalogSnapshotRepository::delete_agent(&conn, &agent_id).unwrap();
+        assert!(
+            AgentAuthCatalogSnapshotRepository::get(&conn, &agent_id, Some(&profile_id))
+                .unwrap()
+                .is_none()
         );
         cleanup_db(temp);
     }
