@@ -15,9 +15,11 @@ mod workbench;
 mod worktree;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc};
@@ -99,6 +101,41 @@ pub const RELEASE_STABLE_HOME_DIRECTORY: &str = "desktop-stable";
 pub const NATIVE_TERMINAL_RING_CAPACITY: usize = 2_000;
 pub const NATIVE_TERMINAL_RAW_CAPACITY_BYTES: usize = 10 * 1024 * 1024;
 pub const DESKTOP_UI_STATE_FILE: &str = "desktop-ui-state.json";
+
+fn startup_stage<T>(
+    stage: &'static str,
+    operation: impl FnOnce() -> VibexResult<T>,
+) -> VibexResult<T> {
+    let started = Instant::now();
+    eprintln!("vibex-startup: stage-begin stage={stage}");
+    let outcome = operation();
+    log_startup_stage_end(stage, started, outcome.as_ref().err());
+    outcome
+}
+
+async fn startup_stage_async<T>(
+    stage: &'static str,
+    operation: impl Future<Output = VibexResult<T>>,
+) -> VibexResult<T> {
+    let started = Instant::now();
+    eprintln!("vibex-startup: stage-begin stage={stage}");
+    let outcome = operation.await;
+    log_startup_stage_end(stage, started, outcome.as_ref().err());
+    outcome
+}
+
+fn log_startup_stage_end(stage: &str, started: Instant, error: Option<&VibexError>) {
+    let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    match error {
+        Some(error) => eprintln!(
+            "vibex-startup: stage-end stage={stage} result=failed error_code={} duration_ms={duration_ms}",
+            error.code
+        ),
+        None => eprintln!(
+            "vibex-startup: stage-end stage={stage} result=success duration_ms={duration_ms}"
+        ),
+    }
+}
 
 #[derive(Debug, Clone)]
 enum ProviderProfileMutationEvent {
@@ -770,22 +807,36 @@ pub struct DesktopRuntime {
 
 impl DesktopRuntime {
     pub async fn start(config: DesktopRuntimeConfig) -> VibexResult<Arc<Self>> {
-        config.validate()?;
-        std::fs::create_dir_all(&config.home_dir).map_err(|error| {
-            VibexError::storage(
-                "desktop_runtime_home_create_failed",
-                "failed to create desktop runtime home",
-            )
-            .with_diagnostic("errorKind", format!("{:?}", error.kind()))
+        let runtime_started = Instant::now();
+        eprintln!("vibex-startup: stage-begin stage=desktop_runtime_start");
+        let result = Self::start_inner(config).await;
+        log_startup_stage_end(
+            "desktop_runtime_start",
+            runtime_started,
+            result.as_ref().err(),
+        );
+        result
+    }
+
+    async fn start_inner(config: DesktopRuntimeConfig) -> VibexResult<Arc<Self>> {
+        startup_stage("runtime_config_validate", || config.validate())?;
+        let home_lock = startup_stage("runtime_home_prepare", || {
+            std::fs::create_dir_all(&config.home_dir).map_err(|error| {
+                VibexError::storage(
+                    "desktop_runtime_home_create_failed",
+                    "failed to create desktop runtime home",
+                )
+                .with_diagnostic("errorKind", format!("{:?}", error.kind()))
+            })?;
+            if config.acquire_home_lock {
+                Ok(Some(DesktopHomeLock::acquire(
+                    &config.home_dir,
+                    &config.application_id,
+                )?))
+            } else {
+                Ok(None)
+            }
         })?;
-        let home_lock = if config.acquire_home_lock {
-            Some(DesktopHomeLock::acquire(
-                &config.home_dir,
-                &config.application_id,
-            )?)
-        } else {
-            None
-        };
         let observability = Arc::new(RuntimeObservability::new());
         let (provider_change_sender, provider_change_receiver) = mpsc::unbounded_channel();
         let provider_change_listener = Arc::new(DesktopProviderProfileChangeListener {
@@ -796,12 +847,15 @@ impl DesktopRuntime {
             NATIVE_TERMINAL_RAW_CAPACITY_BYTES,
         );
         let terminal_host = Arc::new(DesktopAcpTerminalHost::new(terminals.clone()));
-        let (manager, provider_config_service, acp_runtime) = build_agent_manager(
-            &config,
-            observability.clone(),
-            provider_change_listener,
-            terminal_host,
-        )?;
+        let (manager, provider_config_service, acp_runtime) =
+            startup_stage("agent_service_initialize", || {
+                build_agent_manager(
+                    &config,
+                    observability.clone(),
+                    provider_change_listener,
+                    terminal_host,
+                )
+            })?;
         let runtime_probe = acp_runtime.runtime_probe_service();
         let manager = Arc::new(manager);
         let db_path = manager.database_path().to_path_buf();
@@ -969,54 +1023,97 @@ impl DesktopRuntime {
             home_lock: Mutex::new(home_lock),
             shutting_down: AtomicBool::new(false),
         });
-        runtime.spawn_usage_consumer(usage_receiver)?;
-        runtime.spawn_provider_config_consumer(provider_change_receiver)?;
+        startup_stage("usage_consumer_start", || {
+            runtime.spawn_usage_consumer(usage_receiver)
+        })?;
+        startup_stage("provider_config_consumer_start", || {
+            runtime.spawn_provider_config_consumer(provider_change_receiver)
+        })?;
         runtime.activate().await?;
-        runtime.spawn_agent_bootstrap()?;
+        let bootstrap_started = Instant::now();
+        eprintln!("vibex-startup: stage-begin stage=managed_agent_bootstrap_spawn");
+        let bootstrap = (|| {
+            runtime.spawn_agent_bootstrap()?;
+            Ok(())
+        })();
+        log_startup_stage_end(
+            "managed_agent_bootstrap_spawn",
+            bootstrap_started,
+            bootstrap.as_ref().err(),
+        );
+        bootstrap?;
         Ok(runtime)
     }
 
     async fn activate(self: &Arc<Self>) -> VibexResult<()> {
-        if let Err(error) = self.git.reconcile_worktrees_on_startup() {
+        let activate_started = Instant::now();
+        eprintln!("vibex-startup: stage-begin stage=runtime_activate");
+        let result = self.activate_inner().await;
+        log_startup_stage_end("runtime_activate", activate_started, result.as_ref().err());
+        result
+    }
+
+    async fn activate_inner(self: &Arc<Self>) -> VibexResult<()> {
+        if let Err(error) = startup_stage("worktree_reconcile", || {
+            self.git.reconcile_worktrees_on_startup()
+        }) {
             tracing::warn!(
                 target: "vibex_desktop",
                 error_code = %error.code,
                 "managed worktree startup reconciliation failed"
             );
         }
-        self.agent
-            .runtime_lifecycle
-            .start(&tokio::runtime::Handle::current())?;
-        if let Err(error) = self.providers.runtime_probe.reconcile_on_startup() {
+        startup_stage("runtime_lifecycle_start", || {
+            self.agent
+                .runtime_lifecycle
+                .start(&tokio::runtime::Handle::current())
+        })?;
+        if let Err(error) = startup_stage("runtime_probe_reconcile", || {
+            self.providers.runtime_probe.reconcile_on_startup()
+        }) {
             tracing::warn!(
                 target: "vibex_desktop",
                 error_code = %error.code,
                 "Agent runtime probe startup reconciliation failed"
             );
         }
-        if let Err(error) = self.remote.gateway.start().await {
+        if let Err(error) =
+            startup_stage_async("remote_gateway_start", self.remote.gateway.start()).await
+        {
             let _ = self.agent.runtime_lifecycle.stop().await;
             return Err(error);
         }
-        if let Err(error) = self.remote.connectivity.reconcile_on_startup().await {
+        if let Err(error) = startup_stage_async(
+            "remote_connectivity_reconcile",
+            self.remote.connectivity.reconcile_on_startup(),
+        )
+        .await
+        {
             tracing::warn!(
                 target: "vibex_desktop",
                 error_code = %error.code,
                 "remote connectivity startup reconciliation failed"
             );
         }
-        if let Err(error) = self.spawn_event_bridges() {
+        if let Err(error) = startup_stage("event_bridges_start", || self.spawn_event_bridges()) {
             let _ = self.remote.gateway.stop().await;
             let _ = self.agent.runtime_lifecycle.stop().await;
             return Err(error);
         }
-        if let Err(error) = self.agent.runtime_selection.reconcile_on_startup().await {
+        if let Err(error) = startup_stage_async(
+            "runtime_selection_reconcile",
+            self.agent.runtime_selection.reconcile_on_startup(),
+        )
+        .await
+        {
             tracing::warn!(
                 target: "vibex_desktop",
                 error_code = %error.code,
                 "runtime selection startup reconciliation failed"
             );
-        } else if let Err(error) = self.agent.message_submission.reconcile_on_startup() {
+        } else if let Err(error) = startup_stage("message_submission_reconcile", || {
+            self.agent.message_submission.reconcile_on_startup()
+        }) {
             tracing::warn!(
                 target: "vibex_desktop",
                 error_code = %error.code,
@@ -1631,6 +1728,31 @@ mod tests {
         assert!(!provider_consumer.contains("refresh_profile"));
         assert!(!provider_consumer.contains("invalidate_profile_snapshot"));
         assert!(!provider_consumer.contains("RuntimeOptionsChanged"));
+    }
+
+    #[test]
+    fn startup_logs_use_stable_stage_boundaries_and_durations() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains("vibex-startup: stage-begin stage={stage}"));
+        assert!(
+            source.contains("stage-end stage={stage} result=success duration_ms={duration_ms}")
+        );
+        assert!(source.contains("result=failed error_code={} duration_ms={duration_ms}"));
+        for stage in [
+            "runtime_config_validate",
+            "runtime_home_prepare",
+            "agent_service_initialize",
+            "runtime_activate",
+            "worktree_reconcile",
+            "runtime_lifecycle_start",
+            "runtime_probe_reconcile",
+            "remote_gateway_start",
+            "remote_connectivity_reconcile",
+            "runtime_selection_reconcile",
+            "message_submission_reconcile",
+        ] {
+            assert!(source.contains(stage), "missing startup stage {stage}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

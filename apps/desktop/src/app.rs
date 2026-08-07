@@ -4018,10 +4018,20 @@ impl VibexWorkbench {
         self.runtime_note = None;
         self.event_task = None;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let runtime = DesktopRuntime::start(config).await?;
+            let boot_started = Instant::now();
+            eprintln!("vibex-startup: stage-begin stage=desktop_boot");
+            let runtime = match DesktopRuntime::start(config).await {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    Self::log_desktop_startup_stage_end("desktop_boot", boot_started, Some(&error));
+                    return Err(error);
+                }
+            };
             // The runtime owns the home lock at this point.  Keep all UI-state
             // reads/writes behind that lock so two runtimes cannot race on
             // SQLite references or the versioned UI-state file.
+            let ui_state_started = Instant::now();
+            eprintln!("vibex-startup: stage-begin stage=ui_state_load");
             let (loaded_state, persistence_note) = match UiStateStore::new(runtime.ui_state_path())
                 .load_or_default(unix_timestamp_ms())
             {
@@ -4036,6 +4046,8 @@ impl VibexWorkbench {
                     Some(format!("UI state load failed: {}", error.stable_code())),
                 ),
             };
+            Self::log_desktop_startup_stage_end("ui_state_load", ui_state_started, None);
+            Self::log_desktop_startup_stage_end("desktop_boot", boot_started, None);
             Ok::<_, vibex_core::VibexError>((runtime, loaded_state, persistence_note))
         });
         self.boot_task = Some(cx.spawn(
@@ -4110,6 +4122,23 @@ impl VibexWorkbench {
                 });
             },
         ));
+    }
+
+    fn log_desktop_startup_stage_end(
+        stage: &str,
+        started: Instant,
+        error: Option<&vibex_core::VibexError>,
+    ) {
+        let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        match error {
+            Some(error) => eprintln!(
+                "vibex-startup: stage-end stage={stage} result=failed error_code={} duration_ms={duration_ms}",
+                error.code
+            ),
+            None => eprintln!(
+                "vibex-startup: stage-end stage={stage} result=success duration_ms={duration_ms}"
+            ),
+        }
     }
 
     fn finish_startup_loading(&mut self) {
@@ -34237,6 +34266,21 @@ mod tests {
         assert!(
             render.contains("startup_loading_overlay(self.startup_loading_indicator_visible, cx)")
         );
+    }
+
+    #[test]
+    fn desktop_boot_logs_runtime_and_ui_state_stage_boundaries() {
+        let source = include_str!("app.rs");
+        let boot = source
+            .split_once("    fn begin_runtime_start(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn finish_startup_loading("))
+            .map(|(body, _)| body)
+            .expect("runtime startup should remain inspectable");
+
+        assert!(boot.contains("stage=desktop_boot"));
+        assert!(boot.contains("stage=ui_state_load"));
+        assert!(boot.contains("Self::log_desktop_startup_stage_end(\"desktop_boot\""));
+        assert!(boot.contains("Self::log_desktop_startup_stage_end(\"ui_state_load\""));
     }
 
     #[test]
