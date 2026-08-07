@@ -902,6 +902,11 @@ pub struct RuntimeSwitchEventProjection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSessionRuntimeSelectionEvent {
+    /// Identity of the logical session whose authoritative state is carried by
+    /// this event. The optional switch projection may be absent for an
+    /// initialized or otherwise unchanged runtime state, so consumers must
+    /// not use it as the session identity.
+    pub session_id: VibexSessionId,
     pub state: AgentSessionRuntimeSelectionState,
     pub event: Option<RuntimeSwitchEventProjection>,
 }
@@ -1860,6 +1865,25 @@ mod tests {
         assert_eq!(encoded["idempotencyKey"], "selection-1");
         assert_eq!(encoded["expectedSelectionRevision"], 7);
         assert_eq!(encoded["interaction"], "seamless");
+
+        let authoritative = AgentSessionRuntimeSelectionEvent {
+            session_id: session_id.clone(),
+            state: AgentSessionRuntimeSelectionState {
+                desired: request.desired.clone(),
+                effective: request.desired.clone(),
+                status: SessionRuntimeSelectionStatus::Ready,
+                session_revision: 4,
+                selection_revision: 7,
+                current_binding_id: None,
+                activation_generation: 1,
+                pending_switch_id: None,
+                actionable_error: None,
+            },
+            event: None,
+        };
+        let encoded = serde_json::to_value(authoritative).unwrap();
+        assert_eq!(encoded["sessionId"], session_id.as_str());
+        assert!(encoded["event"].is_null());
 
         let event = RuntimeSwitchEventProjection {
             event_id: EventId::new(),

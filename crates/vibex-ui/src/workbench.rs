@@ -70,9 +70,7 @@ fn agent_event_is_relevant_live(selected: Option<&VibexSessionId>, event: &Backe
     match event {
         BackendEvent::Timeline(event) => selected == Some(&event.session_id),
         BackendEvent::Runtime(event) => selected == Some(&event.session_id),
-        BackendEvent::RuntimeSelection(event) => {
-            event.event.as_ref().map(|event| &event.session_id) == selected
-        }
+        BackendEvent::RuntimeSelection(event) => selected == Some(&event.session_id),
         BackendEvent::Lagged {
             refetch,
             observed_live: true,
@@ -3902,5 +3900,36 @@ mod tests {
             observed_live: false,
         };
         assert!(!agent_event_is_relevant_live(Some(&selected), &recovery));
+    }
+
+    #[test]
+    fn runtime_selection_event_without_switch_projection_is_scoped_by_session_id() {
+        let selected = VibexSessionId::new();
+        let other = VibexSessionId::new();
+        let selection = vibex_core::SessionRuntimeSelection {
+            agent_id: AgentId::parse("claude").unwrap(),
+            provider_profile_id: ProviderProfileId::new(),
+            model_id: "claude-sonnet".into(),
+            reasoning_effort: None,
+            mode_id: None,
+            config_values: Default::default(),
+        };
+        let event = BackendEvent::RuntimeSelection(vibex_core::AgentSessionRuntimeSelectionEvent {
+            session_id: selected.clone(),
+            state: vibex_core::AgentSessionRuntimeSelectionState {
+                desired: selection.clone(),
+                effective: selection,
+                status: vibex_core::SessionRuntimeSelectionStatus::Ready,
+                session_revision: 2,
+                selection_revision: 1,
+                current_binding_id: None,
+                activation_generation: 1,
+                pending_switch_id: None,
+                actionable_error: None,
+            },
+            event: None,
+        });
+        assert!(agent_event_is_relevant_live(Some(&selected), &event));
+        assert!(!agent_event_is_relevant_live(Some(&other), &event));
     }
 }

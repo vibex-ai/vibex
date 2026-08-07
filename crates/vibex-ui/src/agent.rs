@@ -1040,10 +1040,7 @@ impl AgentWorkflowController {
                 AgentEventDecision::Applied
             }
             BackendEvent::RuntimeSelection(event) => {
-                let Some(session_id) = event.event.as_ref().map(|event| &event.session_id) else {
-                    return AgentEventDecision::NeedsAuthoritativeRefetch;
-                };
-                if self.state.selected_session_id.as_ref() != Some(session_id) {
+                if self.state.selected_session_id.as_ref() != Some(&event.session_id) {
                     return AgentEventDecision::IgnoredStale;
                 }
                 self.state.runtime_selection.resolve(event.state);
@@ -1511,6 +1508,44 @@ mod tests {
         assert!(controller.apply_session_snapshot(&current, Ok(snapshot)));
         assert_eq!(controller.state.timeline.items.len(), 2);
         assert_eq!(controller.state.conversation_turns().len(), 1);
+    }
+
+    #[test]
+    fn runtime_selection_event_without_switch_projection_applies_to_selected_session() {
+        let session = session();
+        let selection = SessionRuntimeSelection {
+            agent_id: AgentId::parse("claude").unwrap(),
+            provider_profile_id: ProviderProfileId::new(),
+            model_id: "claude-sonnet".into(),
+            reasoning_effort: None,
+            mode_id: None,
+            config_values: Default::default(),
+        };
+        let backend = Arc::new(MockAgentBackend::new(session.clone(), Vec::new()));
+        let mut controller = AgentWorkflowController::new(backend, capabilities());
+        controller.state.selected_session_id = Some(session.id.clone());
+        controller.state.runtime_selection.begin();
+
+        let decision = controller.apply_event(BackendEvent::RuntimeSelection(
+            vibex_core::AgentSessionRuntimeSelectionEvent {
+                session_id: session.id.clone(),
+                state: AgentSessionRuntimeSelectionState {
+                    desired: selection.clone(),
+                    effective: selection,
+                    status: vibex_core::SessionRuntimeSelectionStatus::Ready,
+                    session_revision: 2,
+                    selection_revision: 1,
+                    current_binding_id: None,
+                    activation_generation: 1,
+                    pending_switch_id: None,
+                    actionable_error: None,
+                },
+                event: None,
+            },
+        ));
+
+        assert_eq!(decision, AgentEventDecision::Applied);
+        assert_eq!(controller.state.runtime_selection.phase, AsyncPhase::Ready);
     }
 
     #[test]

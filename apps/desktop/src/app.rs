@@ -7210,19 +7210,9 @@ impl VibexWorkbench {
                 agent_projection_should_repaint(&self.ui_state.workbench.active_tab, changed)
             }
             DesktopEvent::RuntimeSelection(event) => {
-                let changed = if let Some(session_id) = event
-                    .event
-                    .as_ref()
-                    .filter(|projection| {
-                        self.selected_session_id.as_ref() == Some(&projection.session_id)
-                    })
-                    .map(|projection| projection.session_id.clone())
-                {
+                let changed = if self.selected_session_id.as_ref() == Some(&event.session_id) {
+                    let session_id = event.session_id.clone();
                     self.apply_runtime_selection_state(&session_id, event.state, cx)
-                } else if event.event.is_none() {
-                    self.timeline.mark_lagged();
-                    self.refresh_selected_agent_timeline(cx);
-                    true
                 } else {
                     false
                 };
@@ -34402,11 +34392,13 @@ mod tests {
             .map(|(body, _)| body)
             .expect("desktop event refreshes should remain inspectable");
         assert!(!events.contains("select_session"));
+        // Runtime-selection events are scoped by their required session id;
+        // only an actual timeline recovery path refreshes the selected session.
         assert_eq!(
             events
                 .matches("self.refresh_selected_agent_timeline(cx);")
                 .count(),
-            2
+            1
         );
     }
 

@@ -528,6 +528,7 @@ impl RuntimeSelectionService {
             .transpose()?
             .flatten();
         Ok(AgentSessionRuntimeSelectionEvent {
+            session_id: session_id.clone(),
             state: AgentSessionRuntimeSelectionState {
                 desired,
                 effective,

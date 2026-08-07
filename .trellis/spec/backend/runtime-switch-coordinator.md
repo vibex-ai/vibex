@@ -309,6 +309,12 @@ RuntimeSelectionService::{
 RuntimeSelectionResolver::{
     resolve(session_id, desired, preferred_adapter_id),
 }
+
+AgentSessionRuntimeSelectionEvent {
+    session_id: VibexSessionId,
+    state: AgentSessionRuntimeSelectionState,
+    event: Option<RuntimeSwitchEventProjection>,
+}
 ```
 
 Desktop boundary:
@@ -372,6 +378,11 @@ agent://runtime-selection-event
 - Requested/Prepared/Committed and normal restore/config facts are audit or
   internal events. Only bounded actionable terminal failure is user notice;
   no normal runtime switch row becomes a conversation Timeline item.
+- Every authoritative runtime-selection event carries its Logical Session id
+  at the top level, independently of the optional switch-event projection.
+  Desktop and shared UI consumers route by this required `session_id`; an
+  absent `event` still applies the authoritative state and must not trigger a
+  generic Timeline refetch.
 
 ### 4. Validation & Error Matrix
 
@@ -386,6 +397,7 @@ agent://runtime-selection-event
 | Current attachment config not converged to its generation | `runtime_switch_configuration_unavailable`. |
 | Materialized binding/generation is stale, desired differs from effective, or a switch is pending | Preserve `FailedUsingPrevious`; do not reopen prompt admission. |
 | Failed selection retries the already effective runtime | Materialize the exact current runtime; return `Ready` only after the strict recovery CAS succeeds. |
+| Runtime-selection event targets another Logical Session | Ignore it for the selected session; do not mutate its runtime state or mark its Timeline lagged. |
 | Desired/session revision is stale | `desired_selection_revision_conflict` / `runtime_switch_revision_conflict`. |
 | Same idempotency key has another target | `runtime_selection_idempotency_payload_conflict`. |
 | Seamless Wait expires | FailedUsingPrevious, source current, prompt gate reopened. |
@@ -402,6 +414,9 @@ agent://runtime-selection-event
   quarantined attachment and activates it only after durable Commit.
 - Good: restart restores a durable preferred Model, persists the replayed local
   state, then a no-op requested config CAS succeeds against the same baseline.
+- Good: initial background materialization publishes `Ready` with `event = None`;
+  the selected session applies it using the event's required `session_id` and
+  leaves Preparing without a refetch.
 - Base: setting the already effective selection with no current intent returns
   Ready without spawning a process or creating a native session.
 - Base: retrying that same selection from `FailedUsingPrevious` revalidates the
@@ -410,6 +425,8 @@ agent://runtime-selection-event
   selection and the switch journal from the returned attachment.
 - Bad: terminal creation permission completes but active-work probe ignores the
   terminal because only pending terminal-create requests are counted.
+- Bad: UI code derives event identity from `event?.session_id`, drops a valid
+  projection-less Ready event, and leaves the session permanently Preparing.
 
 ### 6. Tests Required
 
@@ -429,6 +446,9 @@ agent://runtime-selection-event
   config-baseline CAS.
 - Terminal tests assert create makes the probe active; successful kill,
   release and wait each clear it; detach clears remaining ownership.
+- Core serde and shared UI tests assert top-level `sessionId` is present,
+  `event = null` Ready updates apply to the selected session, and another
+  session's event is ignored without a Timeline recovery refresh.
 - Binding export check, desktop typed invoke mock, TypeScript typecheck and
   desktop build must pass.
 
@@ -447,11 +467,16 @@ repository.backfill_runtime_state_after_external_create(&attachment)?;
 let switch = repository.enqueue_initial_runtime_switch(session, desired)?;
 let outcome = coordinator.drive_switch(&switch.switch_id).await?;
 assert_eq!(outcome.status, RuntimeSwitchStatus::Committed);
+
+if selected_session_id == event.session_id {
+    runtime_selection.resolve(event.state);
+}
 ```
 
 The first form leaves an unjournaled external session if the process crashes
 between the two lines. The second makes recovery possible before any external
-side effect.
+side effect. Runtime-selection consumers must likewise use the required
+top-level identity rather than `event.event?.session_id`.
 
 ## Scenario: Incremental Context Bridge Prepare And Historical Resume
 
