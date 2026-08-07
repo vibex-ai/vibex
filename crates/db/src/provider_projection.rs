@@ -1225,6 +1225,13 @@ fn legacy_runtime_identity(
                 };
                 ("opencode-acp", None, detected, BTreeMap::new(), source)
             }
+            (_, Some(version)) => (
+                agent,
+                None,
+                Some(version),
+                BTreeMap::new(),
+                AgentVersionSource::Managed,
+            ),
             _ => {
                 let detected = latest_agent_version(conn, &profile.agent_id)?;
                 let source = if detected.is_some() {
@@ -1902,7 +1909,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_registry_versions_do_not_inherit_older_projection_evidence() {
+    fn managed_registry_versions_at_or_above_verified_baselines_keep_projection_compatible() {
         let mut conn = Connection::open_in_memory().unwrap();
         apply_migrations(&mut conn).unwrap();
         let registry = AgentProviderProjectionRegistry::builtin().unwrap();
@@ -1923,7 +1930,7 @@ mod tests {
         assert_eq!(claude_identity.adapter_version.as_deref(), Some("0.65.0"));
         assert_eq!(
             registry.resolve(&claude_identity).unwrap().match_kind,
-            ProjectionDescriptorMatch::Conservative
+            ProjectionDescriptorMatch::SemverRange
         );
 
         let codex_command = "/managed/node";
@@ -1943,7 +1950,32 @@ mod tests {
         assert!(codex_identity.runtime_dependencies.is_empty());
         assert_eq!(
             registry.resolve(&codex_identity).unwrap().match_kind,
-            ProjectionDescriptorMatch::Conservative
+            ProjectionDescriptorMatch::SemverRange
+        );
+
+        let codebuddy_command = "/managed/codebuddy";
+        let codebuddy_args = vec!["--acp".to_string()];
+        persist_managed_installation(
+            &conn,
+            "codebuddy-code",
+            "codebuddy-code",
+            "2.110.0",
+            codebuddy_command,
+            codebuddy_args.clone(),
+        );
+        let mut codebuddy_profile = ProviderProfile::local_default(ProviderKind::Acp);
+        codebuddy_profile.agent_id = AgentId::parse("codebuddy-code").unwrap();
+        let codebuddy_identity = legacy_runtime_identity(
+            &conn,
+            &codebuddy_profile,
+            codebuddy_command,
+            &codebuddy_args,
+        )
+        .unwrap();
+        assert_eq!(codebuddy_identity.agent_version.as_deref(), Some("2.110.0"));
+        assert_eq!(
+            registry.resolve(&codebuddy_identity).unwrap().match_kind,
+            ProjectionDescriptorMatch::SemverRange
         );
     }
 

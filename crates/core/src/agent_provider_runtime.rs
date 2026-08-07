@@ -231,6 +231,23 @@ fn exact_or_manual(version: &str) -> (AgentVersionPolicy, AgentVersionCompatibil
     }
 }
 
+fn at_least_or_manual(version: &str) -> (AgentVersionPolicy, AgentVersionCompatibility) {
+    if version.eq_ignore_ascii_case("manual") {
+        return exact_or_manual(version);
+    }
+    let requirement = format!(">={version}");
+    (
+        AgentVersionPolicy::DetectedSemver {
+            requirement: requirement.clone(),
+        },
+        AgentVersionCompatibility::SemverRange {
+            adapter_range: None,
+            agent_range: Some(requirement),
+            runtime_dependency_ranges: BTreeMap::new(),
+        },
+    )
+}
+
 fn mode_for(agent_id: &str) -> AgentProviderCapabilityMode {
     match agent_id {
         "agoragentic-acp" => AgentProviderCapabilityMode::ServiceMarketplace,
@@ -257,6 +274,28 @@ struct CatalogProjectionShape {
     switch_behavior: ProviderSwitchBehavior,
     evidence_state: ProjectionEvidenceState,
     capability_diagnostic_code: Option<&'static str>,
+}
+
+impl CatalogProjectionShape {
+    fn supports_vibex_model_provider_projection(&self) -> bool {
+        matches!(
+            self.provider_control,
+            AgentProviderControl::Environment { .. }
+                | AgentProviderControl::ManagedConfigOverlay { .. }
+                | AgentProviderControl::AdvertisedSessionOption { .. }
+        )
+    }
+}
+
+fn catalog_version_compatibility(
+    version: &str,
+    shape: &CatalogProjectionShape,
+) -> (AgentVersionPolicy, AgentVersionCompatibility) {
+    if shape.supports_vibex_model_provider_projection() {
+        at_least_or_manual(version)
+    } else {
+        exact_or_manual(version)
+    }
 }
 
 fn catalog_projection_shape(
@@ -452,8 +491,8 @@ fn catalog_manifest_entry(
 ) -> VibexResult<AgentProviderRolloutManifestEntry> {
     let agent_id = AgentId::parse(id)?;
     let mode = mode_for(id);
-    let (version_policy, _) = exact_or_manual(version);
     let shape = catalog_projection_shape(id, mode)?;
+    let (version_policy, _) = catalog_version_compatibility(version, &shape);
     let entry = AgentProviderRolloutManifestEntry {
         agent_id: agent_id.clone(),
         catalog_version: version.to_string(),
@@ -579,8 +618,7 @@ pub fn catalog_projection_descriptors() -> VibexResult<Vec<AgentProviderProjecti
         let agent_id = AgentId::parse(entry.id)?;
         let mode = mode_for(entry.id);
         let shape = catalog_projection_shape(entry.id, mode)?;
-        let (version_policy, compatibility) = exact_or_manual(entry.version);
-        let _ = version_policy;
+        let (_, compatibility) = catalog_version_compatibility(entry.version, &shape);
         result.push(AgentProviderProjectionDescriptor {
             id: descriptor_id(&agent_id),
             descriptor_version: "1".to_string(),
@@ -719,10 +757,13 @@ impl AgentRuntimeProbeEvidence {
     pub fn provider_projection_verified(&self) -> bool {
         let version_identity_verified = match self.descriptor_match {
             ProjectionDescriptorMatch::Exact => true,
-            ProjectionDescriptorMatch::SemverRange => self
-                .agent_version
-                .as_deref()
-                .is_some_and(|version| Version::parse(version).is_ok()),
+            ProjectionDescriptorMatch::SemverRange => [
+                self.agent_version.as_deref(),
+                self.adapter_version.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|version| Version::parse(version).is_ok()),
             ProjectionDescriptorMatch::Conservative => false,
         };
         version_identity_verified
@@ -1094,6 +1135,21 @@ mod tests {
                 requirement: OPENCODE_COMPATIBLE_VERSION_REQUIREMENT.to_string()
             }
         );
+        for (agent_id, requirement) in [
+            ("codebuddy-code", ">=2.109.0"),
+            ("glm-acp-agent", ">=1.1.4"),
+        ] {
+            assert_eq!(
+                manifest
+                    .iter()
+                    .find(|entry| entry.agent_id.as_str() == agent_id)
+                    .unwrap()
+                    .version_policy,
+                AgentVersionPolicy::DetectedSemver {
+                    requirement: requirement.to_string(),
+                }
+            );
+        }
 
         let mut unsafe_conservative = manifest
             .into_iter()
@@ -1195,7 +1251,7 @@ mod tests {
     }
 
     #[test]
-    fn semver_range_evidence_requires_a_detected_agent_version() {
+    fn semver_range_evidence_requires_a_detected_version_identity() {
         let mut evidence = AgentRuntimeProbeEvidence {
             schema_version: AGENT_RUNTIME_PROBE_SCHEMA_VERSION,
             agent_id: AgentId::parse("fixture").unwrap(),
@@ -1229,7 +1285,10 @@ mod tests {
         assert!(!evidence.provider_projection_verified());
         evidence.agent_version = Some("1.18.11".to_string());
         assert!(evidence.provider_projection_verified());
-        evidence.agent_version = Some("not-semver".to_string());
+        evidence.agent_version = None;
+        evidence.adapter_version = Some("1.1.13".to_string());
+        assert!(evidence.provider_projection_verified());
+        evidence.adapter_version = Some("not-semver".to_string());
         assert!(!evidence.provider_projection_verified());
     }
 
@@ -1299,6 +1358,14 @@ mod tests {
                 key: "CODEBUDDY_MODEL".to_string()
             }
         );
+        assert_eq!(
+            codebuddy.compatibility,
+            AgentVersionCompatibility::SemverRange {
+                adapter_range: None,
+                agent_range: Some(">=2.109.0".to_string()),
+                runtime_dependency_ranges: BTreeMap::new(),
+            }
+        );
         let glm = descriptors
             .iter()
             .find(|descriptor| descriptor.route.agent_id.as_str() == "glm-acp-agent")
@@ -1322,6 +1389,34 @@ mod tests {
                 key: "ACP_GLM_MODEL".to_string()
             }
         );
+        assert_eq!(
+            glm.compatibility,
+            AgentVersionCompatibility::SemverRange {
+                adapter_range: None,
+                agent_range: Some(">=1.1.4".to_string()),
+                runtime_dependency_ranges: BTreeMap::new(),
+            }
+        );
+        for descriptor in descriptors.iter().filter(|descriptor| {
+            matches!(
+                descriptor.provider_control,
+                AgentProviderControl::Environment { .. }
+                    | AgentProviderControl::ManagedConfigOverlay { .. }
+                    | AgentProviderControl::AdvertisedSessionOption { .. }
+            ) && !matches!(
+                descriptor.compatibility,
+                AgentVersionCompatibility::ManualVersionUnverified
+            )
+        }) {
+            assert!(
+                matches!(
+                    descriptor.compatibility,
+                    AgentVersionCompatibility::SemverRange { .. }
+                ),
+                "{}",
+                descriptor.route.agent_id
+            );
+        }
 
         for descriptor in descriptors {
             let mode = mode_for(descriptor.route.agent_id.as_str());

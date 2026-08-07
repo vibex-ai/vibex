@@ -32,19 +32,19 @@ pub const OPENCODE_PROJECTION_DESCRIPTOR_ID: &str = "projection_opencode_inline_
 const CLAUDE_AGENT_ID: &str = "claude";
 const CLAUDE_ADAPTER_ID: &str = "claude-agent-acp";
 const CLAUDE_ADAPTER_VERSION: &str = "0.64.2";
+pub const CLAUDE_COMPATIBLE_ADAPTER_VERSION_REQUIREMENT: &str = ">=0.64.2";
 const CODEX_AGENT_ID: &str = "codex";
 const CODEX_ADAPTER_ID: &str = "codex-acp";
 const CODEX_ADAPTER_VERSION: &str = "1.1.9";
+pub const CODEX_COMPATIBLE_ADAPTER_VERSION_REQUIREMENT: &str = ">=1.1.9";
+#[cfg(test)]
 const CODEX_RUNTIME_PACKAGE: &str = "@openai/codex";
 const CODEX_RUNTIME_VERSION: &str = "0.146.0";
 const OPENCODE_AGENT_ID: &str = "opencode";
 const OPENCODE_ADAPTER_ID: &str = "opencode-acp";
-/// OpenCode is installed and upgraded by the user, so the projection is
-/// matched against a supported major-version range instead of a bundled CLI
-/// patch version. The lower bound is the first version covered by the
-/// existing projection contract; the upper bound keeps a future breaking
-/// major release conservative until it is explicitly verified.
-pub const OPENCODE_COMPATIBLE_VERSION_REQUIREMENT: &str = ">=1.17.9, <2.0.0";
+/// Automatic provider projection remains available after an Agent upgrade
+/// once the runtime is at least the first verified version for its descriptor.
+pub const OPENCODE_COMPATIBLE_VERSION_REQUIREMENT: &str = ">=1.17.9";
 pub const OPENCODE_LAST_VERIFIED_VERSION: &str = "1.18.11";
 
 const MAX_DISPLAY_NAME_LEN: usize = 160;
@@ -1389,10 +1389,10 @@ fn claude_projection_descriptor() -> VibexResult<AgentProviderProjectionDescript
         id: AgentProviderProjectionDescriptorId::parse(CLAUDE_PROJECTION_DESCRIPTOR_ID)?,
         descriptor_version: "1".to_string(),
         route: route(CLAUDE_AGENT_ID, CLAUDE_ADAPTER_ID)?,
-        compatibility: AgentVersionCompatibility::Exact {
-            adapter_version: Some(CLAUDE_ADAPTER_VERSION.to_string()),
-            agent_version: None,
-            runtime_dependencies: BTreeMap::new(),
+        compatibility: AgentVersionCompatibility::SemverRange {
+            adapter_range: Some(CLAUDE_COMPATIBLE_ADAPTER_VERSION_REQUIREMENT.to_string()),
+            agent_range: None,
+            runtime_dependency_ranges: BTreeMap::new(),
         },
         provider_control: AgentProviderControl::Environment {
             base_url_key: Some("ANTHROPIC_BASE_URL".to_string()),
@@ -1419,7 +1419,7 @@ fn claude_projection_descriptor() -> VibexResult<AgentProviderProjectionDescript
         switch_behavior: ProviderSwitchBehavior::RestartAndResume,
         evidence: verified_evidence(
             "provider-config/claude-environment-v1",
-            "acp-smoke/claude-agent-acp-0.64.2",
+            &format!("acp-smoke/claude-agent-acp-{CLAUDE_ADAPTER_VERSION}"),
         ),
     })
 }
@@ -1429,13 +1429,13 @@ fn codex_projection_descriptor() -> VibexResult<AgentProviderProjectionDescripto
         id: AgentProviderProjectionDescriptorId::parse(CODEX_PROJECTION_DESCRIPTOR_ID)?,
         descriptor_version: "1".to_string(),
         route: route(CODEX_AGENT_ID, CODEX_ADAPTER_ID)?,
-        compatibility: AgentVersionCompatibility::Exact {
-            adapter_version: Some(CODEX_ADAPTER_VERSION.to_string()),
-            agent_version: Some(CODEX_RUNTIME_VERSION.to_string()),
-            runtime_dependencies: BTreeMap::from([(
-                CODEX_RUNTIME_PACKAGE.to_string(),
-                CODEX_RUNTIME_VERSION.to_string(),
-            )]),
+        compatibility: AgentVersionCompatibility::SemverRange {
+            // Managed installation records expose the Adapter package version.
+            // Use it as the compatible runtime identity rather than requiring
+            // transient nested Codex package metadata at process launch.
+            adapter_range: Some(CODEX_COMPATIBLE_ADAPTER_VERSION_REQUIREMENT.to_string()),
+            agent_range: None,
+            runtime_dependency_ranges: BTreeMap::new(),
         },
         provider_control: AgentProviderControl::ManagedConfigOverlay {
             strategy: ConfigOverlayStrategy::CodexStableHome,
@@ -1462,7 +1462,7 @@ fn codex_projection_descriptor() -> VibexResult<AgentProviderProjectionDescripto
         switch_behavior: ProviderSwitchBehavior::RestartAndResume,
         evidence: verified_evidence(
             "provider-config/codex-stable-home-v1",
-            "acp-smoke/codex-acp-1.1.9-codex-0.146.0",
+            &format!("acp-smoke/codex-acp-{CODEX_ADAPTER_VERSION}-codex-{CODEX_RUNTIME_VERSION}"),
         ),
     })
 }
@@ -1726,11 +1726,14 @@ mod tests {
     }
 
     #[test]
-    fn builtin_registry_resolves_supported_identity_and_fails_closed() {
+    fn builtin_registry_resolves_at_or_above_verified_identities_and_fails_closed() {
         let registry = AgentProviderProjectionRegistry::builtin().unwrap();
         for agent in ["claude", "codex"] {
             let resolution = registry.resolve(&builtin_identity(agent)).unwrap();
-            assert_eq!(resolution.match_kind, ProjectionDescriptorMatch::Exact);
+            assert_eq!(
+                resolution.match_kind,
+                ProjectionDescriptorMatch::SemverRange
+            );
             assert_eq!(
                 resolution.descriptor.evidence.state,
                 ProjectionEvidenceState::Verified
@@ -1750,11 +1753,17 @@ mod tests {
             ProjectionEvidenceState::Verified
         );
 
+        let mut upgraded_codex = builtin_identity("codex");
+        upgraded_codex.adapter_version = Some("1.1.13".to_string());
+        upgraded_codex.agent_version = None;
+        upgraded_codex.runtime_dependencies.clear();
+        assert_eq!(
+            registry.resolve(&upgraded_codex).unwrap().match_kind,
+            ProjectionDescriptorMatch::SemverRange
+        );
+
         let mut mismatch = builtin_identity("codex");
-        mismatch.agent_version = Some("0.145.0".to_string());
-        mismatch
-            .runtime_dependencies
-            .insert(CODEX_RUNTIME_PACKAGE.to_string(), "0.145.0".to_string());
+        mismatch.adapter_version = Some("1.1.8".to_string());
         let resolution = registry.resolve(&mismatch).unwrap();
         assert_eq!(
             resolution.match_kind,
@@ -1785,7 +1794,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode_range_exposes_api_key_and_rejects_future_major_versions() {
+    fn opencode_range_exposes_api_key_at_or_above_the_verified_version() {
         let registry = AgentProviderProjectionRegistry::builtin().unwrap();
         let supported = builtin_identity("opencode");
         let resolution = registry.resolve(&supported).unwrap();
@@ -1807,6 +1816,20 @@ mod tests {
         let mut future = supported;
         future.agent_version = Some("2.0.0".to_string());
         let resolution = registry.resolve(&future).unwrap();
+        assert_eq!(
+            resolution.match_kind,
+            ProjectionDescriptorMatch::SemverRange
+        );
+        assert!(
+            resolution
+                .descriptor
+                .credential_control
+                .automatically_projects_secret()
+        );
+
+        let mut older = future;
+        older.agent_version = Some("1.17.8".to_string());
+        let resolution = registry.resolve(&older).unwrap();
         assert_eq!(
             resolution.match_kind,
             ProjectionDescriptorMatch::Conservative
