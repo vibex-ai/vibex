@@ -76,10 +76,11 @@ agent_runtime_option_snapshots(
   args and Agent env. It must not list or load a Provider Profile, resolve a
   Provider secret, materialize a Provider projection, or use a Provider model.
   A synthetic `ProviderProfileId` may exist only as in-process bookkeeping.
-- Trigger the probe when an installed Agent is added, discovered in bulk, or
-  detected after installation. A failed first attempt may be retried by an
-  explicit Agent action. Startup, ordinary enable/disable, and Provider
-  Profile create/update/delete never trigger an Agent option probe.
+- Trigger the probe when an installed Agent is added, discovered in bulk,
+  detected after installation, or enabled and installed at desktop startup without a
+  successful persisted snapshot. A failed first attempt may be retried by the
+  next startup bootstrap or an explicit Agent action. Ordinary enable/disable
+  and Provider Profile create/update/delete never trigger an Agent option probe.
 - A successful snapshot is immutable while the Agent remains added. Later
   calls return `cached_agent_ids` without launching the CLI. Removing the
   Agent deletes its snapshot so a later re-add can probe once again.

@@ -2055,8 +2055,9 @@ provider_capability_probe_records(
 - Trigger: desktop startup reconciles already-added managed ACP Agents after
   the authoritative runtime is ready. User-driven Add/Upgrade/Uninstall work
   remains owned by Config Center.
-- Runtime-option probing is deliberately outside startup. It belongs to Agent
-  setup and must remain independent from Provider Profile reconciliation.
+- Runtime-option probing runs in the post-activation background bootstrap for
+  already-enabled, installed Agents that have no successful persisted snapshot.
+  It remains independent from Provider Profile reconciliation.
 
 ### 2. Signatures
 
@@ -2081,9 +2082,11 @@ ProviderProfileMutationEvent::{Saved, Deleted}(provider_profile_id)
 - Use the listener-enabled runtime `ProviderConfigService`. Managed command
   reconciliation must still invalidate ACP process configuration and publish
   Provider Profile changes.
-- Startup never scans for missing runtime-option snapshots and never calls an
-  Agent CLI for catalog enrichment. Existing Agent snapshots remain ordinary
-  SQLite cache reads.
+- After managed-install reconciliation, startup scans added, enabled, installed
+  Agents for a missing successful runtime-option snapshot. Each missing or
+  previously failed snapshot is probed in the background; existing successful
+  snapshots remain ordinary SQLite cache reads. A successful probe publishes
+  `RuntimeOptionsChanged` so open clients refresh their runtime catalog.
 - Provider Profile save/delete consumers publish `ProfilesChanged` only. They
   must not clear Agent snapshots, call `probe_agent`, enqueue a Profile-scoped
   refresh, or publish `RuntimeOptionsChanged` as a consequence of the Provider
@@ -2103,8 +2106,9 @@ ProviderProfileMutationEvent::{Saved, Deleted}(provider_profile_id)
   probe.
 - Provider save/delete succeeds -> publish one coalesced `ProfilesChanged`
   event and remote Provider invalidation only.
-- Agent has no runtime-option snapshot at startup -> leave it `not probed`;
-  startup must not create a failed attempt record.
+- Agent has no successful runtime-option snapshot at startup -> probe it in the
+  background and persist either the option snapshot or the failed-attempt
+  record. A probe failure must not make the runtime unavailable.
 - Agent has a successful snapshot while a Provider changes -> preserve the
   snapshot and reuse it in the rebuilt catalog.
 
@@ -2114,20 +2118,21 @@ ProviderProfileMutationEvent::{Saved, Deleted}(provider_profile_id)
   the workbench opens; completed command reconciliation publishes Provider
   changes without starting an Agent option probe.
 - Base: exact adapters are installed and an Agent has no snapshot; the
-  workbench remains ready and the Config Center shows `not probed`.
+  workbench remains ready while the background probe persists options and
+  refreshes the runtime catalog.
 - Good: adding a Provider Profile updates models and immediately reuses the
   Agent's previously cached modes and Features.
 - Bad: `build_agent_manager` or `activate` awaits a managed download, an ACP
   probe, or complete catalog enrichment before reporting the runtime ready.
-- Bad: startup calls `refresh_missing`, or a Profile save calls
-  `refresh_profile`/`probe_agent`.
+- Bad: a Profile save calls `refresh_profile`/`probe_agent`.
 
 ### 6. Tests Required
 
 - `vibex-desktop-runtime` asserts activation precedes background bootstrap and
   manager construction contains no adapter installation.
-- Runtime source assertions reject `refresh_missing` and
-  `RuntimeOptionsChanged` in bootstrap and Provider mutation consumers.
+- Runtime source assertions require missing-snapshot probing and
+  `RuntimeOptionsChanged` in the background bootstrap, while rejecting profile
+  refreshes and runtime-option events in Provider mutation consumers.
 - Provider mutation tests assert `ProfilesChanged` is published and no later
   `RuntimeOptionsChanged` arrives.
 - Runtime catalog tests assert startup/list paths perform no provider or Agent

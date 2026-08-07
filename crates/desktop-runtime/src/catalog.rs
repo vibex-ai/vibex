@@ -116,6 +116,38 @@ impl RuntimeOptionCatalogService {
         ))
     }
 
+    /// Fills missing Agent-owned option snapshots after the runtime is ready.
+    /// Successful snapshots are skipped, while failed or absent probes are retried.
+    pub(crate) async fn probe_missing_enabled_agents(
+        &self,
+    ) -> Result<RuntimeOptionProbeResult, VibexError> {
+        let agents = self.provider_config.list_agents(AgentListRequest {
+            include_disabled: true,
+        })?;
+        let snapshots = self.snapshot_map()?;
+        let agent_ids = agents
+            .agents
+            .into_iter()
+            .filter(|agent| {
+                agent.added
+                    && agent.enabled
+                    && agent.installed
+                    && snapshots
+                        .get(&agent.id)
+                        .is_none_or(|snapshot| snapshot.last_success_at_ms.is_none())
+            })
+            .map(|agent| agent.id)
+            .collect::<Vec<_>>();
+        let mut result = RuntimeOptionProbeResult::default();
+        for agent_id in agent_ids {
+            let probe = self.probe_agent(&agent_id).await?;
+            result.probed_agent_ids.extend(probe.probed_agent_ids);
+            result.failed_agent_ids.extend(probe.failed_agent_ids);
+            result.cached_agent_ids.extend(probe.cached_agent_ids);
+        }
+        Ok(result)
+    }
+
     /// Performs the one-time Agent-owned runtime option probe. A successful
     /// snapshot is immutable until the Agent is removed; adding or editing a
     /// Provider Profile never reaches this method.
@@ -449,6 +481,27 @@ mod tests {
                 params: None,
             })
             .unwrap();
+        provider_config
+            .refresh_agent_snapshot(vibex_core::AgentRefreshSnapshotRequest {
+                agent_id: agent_id.clone(),
+                cwd_scope: None,
+            })
+            .unwrap();
+        for disabled_agent_id in ["claude", "codex"] {
+            provider_config
+                .update_agent_config(AgentUpdateConfigRequest {
+                    agent_id: AgentId::parse(disabled_agent_id).unwrap(),
+                    added: Some(false),
+                    enabled: Some(false),
+                    label_override: None,
+                    description_override: None,
+                    order_index: None,
+                    command: None,
+                    env: None,
+                    params: None,
+                })
+                .unwrap();
+        }
         let provider = Arc::new(CountingProvider {
             calls: AtomicUsize::new(0),
             fail_probe,
@@ -569,6 +622,9 @@ mod tests {
         );
         let cached_probe = catalog.probe_agent(&agent_id).await.unwrap();
         assert_eq!(cached_probe.cached_agent_ids, vec![agent_id.clone()]);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        let bootstrap_probe = catalog.probe_missing_enabled_agents().await.unwrap();
+        assert_eq!(bootstrap_probe, RuntimeOptionProbeResult::default());
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
 
         let options = catalog.list().await.unwrap().options;
@@ -756,7 +812,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_probe_is_recorded_by_agent_and_only_explicitly_retried() {
+    async fn failed_probe_is_recorded_by_agent_and_retried_by_startup_bootstrap() {
         let (_directory, catalog, provider_config, agent_id, provider) = catalog_fixture(true);
         create_profile(
             &provider_config,
@@ -780,6 +836,10 @@ mod tests {
         let _ = catalog.list().await.unwrap();
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         assert_eq!(catalog.snapshot_summaries().unwrap(), first_attempt);
+
+        let bootstrap_result = catalog.probe_missing_enabled_agents().await.unwrap();
+        assert_eq!(bootstrap_result.failed_agent_ids, vec![agent_id.clone()]);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
 
         catalog.delete_agent_snapshot(&agent_id).unwrap();
         assert!(catalog.snapshot_summaries().unwrap().is_empty());

@@ -127,7 +127,8 @@ controls, and generic session options; model ids must be empty because models
 are owned by Provider Profiles. A successful row is reused without a process
 launch until the Agent is removed. Removing an Agent deletes the row so a later
 re-add can probe again. A failed first attempt records its timestamp and stable
-error code; ordinary reads never retry it.
+error code; ordinary reads never retry it, while the desktop startup bootstrap
+may retry enabled, installed Agents without a successful row.
 
 `provider_runtime_option_snapshots` is retained only as a migration-compatible
 legacy table. Current catalog code must not read, write, invalidate, or key new

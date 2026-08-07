@@ -1151,6 +1151,9 @@ impl DesktopRuntime {
         })?;
         let install_managed_adapters = self.config.install_managed_adapters;
         let install_service = self.agent.install_service.clone();
+        let runtime_catalog = self.agent.runtime_catalog();
+        let runtime_option_events = self.events.clone();
+        let runtime_option_gateway = self.remote.gateway.clone();
         tasks.push(tokio::spawn(async move {
             if install_managed_adapters {
                 let agent_ids = match install_service.bootstrap_agent_ids() {
@@ -1174,6 +1177,39 @@ impl DesktopRuntime {
                             "managed ACP Agent background preparation failed"
                         );
                     }
+                }
+            }
+            match runtime_catalog.probe_missing_enabled_agents().await {
+                Ok(result) => {
+                    if !result.probed_agent_ids.is_empty() {
+                        let _ = runtime_option_events.send(DesktopEvent::ProviderConfigChanged(
+                            ProviderConfigChangedEvent {
+                                provider_profile_ids: Vec::new(),
+                                phase: ProviderConfigChangePhase::RuntimeOptionsChanged,
+                            },
+                        ));
+                        if let Err(error) = runtime_option_gateway.publish_provider_invalidation() {
+                            tracing::warn!(
+                                target: "vibex_desktop",
+                                error_code = %error.code,
+                                "Remote runtime option catalog invalidation failed"
+                            );
+                        }
+                    }
+                    if !result.failed_agent_ids.is_empty() {
+                        tracing::warn!(
+                            target: "vibex_desktop",
+                            failed_agent_count = result.failed_agent_ids.len(),
+                            "Agent runtime option background probing failed"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "vibex_desktop",
+                        error_code = %error.code,
+                        "Agent runtime option bootstrap failed"
+                    );
                 }
             }
         }));
@@ -1743,7 +1779,8 @@ mod tests {
         assert!(bootstrap.contains("install_service.bootstrap_agent_ids()"));
         assert!(bootstrap.contains("install_service.ensure_installed(agent_id)"));
         assert!(!bootstrap.contains("refresh_missing"));
-        assert!(!bootstrap.contains("RuntimeOptionsChanged"));
+        assert!(bootstrap.contains("runtime_catalog.probe_missing_enabled_agents().await"));
+        assert!(bootstrap.contains("ProviderConfigChangePhase::RuntimeOptionsChanged"));
         assert!(!provider_consumer.contains("refresh_profile"));
         assert!(!provider_consumer.contains("invalidate_profile_snapshot"));
         assert!(!provider_consumer.contains("RuntimeOptionsChanged"));
@@ -1821,9 +1858,24 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn provider_mutations_publish_only_profile_changes() {
         let home = tempfile::tempdir().unwrap();
-        let runtime = DesktopRuntime::start(DesktopRuntimeConfig::isolated_test(home.path()))
-            .await
-            .unwrap();
+        let config = DesktopRuntimeConfig::isolated_test(home.path());
+        let provider_config = ProviderConfigService::new(&config.database_path);
+        for agent_id in ["claude", "codex"] {
+            provider_config
+                .update_agent_config(vibex_core::AgentUpdateConfigRequest {
+                    agent_id: vibex_core::AgentId::parse(agent_id).unwrap(),
+                    added: Some(false),
+                    enabled: Some(false),
+                    label_override: None,
+                    description_override: None,
+                    order_index: None,
+                    command: None,
+                    env: None,
+                    params: None,
+                })
+                .unwrap();
+        }
+        let runtime = DesktopRuntime::start(config).await.unwrap();
         let mut events = runtime.subscribe();
         let profile = runtime
             .management()
