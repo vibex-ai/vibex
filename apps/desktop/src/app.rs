@@ -1687,6 +1687,7 @@ enum RuntimeUiSignal {
 #[derive(Debug)]
 enum AgentPollSignal {
     Timeline(TimelinePage),
+    Session(AgentSession),
     RuntimeSelection(Box<AgentSessionRuntimeSelectionState>),
     RuntimeUsage {
         session_id: VibexSessionId,
@@ -6583,6 +6584,11 @@ impl VibexWorkbench {
                     if !page.items.is_empty() {
                         received_items = true;
                         let _ = signal_tx.send(AgentPollSignal::Timeline(page));
+                        if let Ok(session) =
+                            runtime.agent().manager().get_session(&session_id).await
+                        {
+                            let _ = signal_tx.send(AgentPollSignal::Session(session));
+                        }
                     }
                 }
                 idle_poll_count = if received_items {
@@ -6641,6 +6647,18 @@ impl VibexWorkbench {
                                         .collect(),
                                     cx,
                                 ),
+                                AgentPollSignal::Session(session) => {
+                                    let changed = this
+                                        .sessions
+                                        .iter()
+                                        .find(|existing| existing.id == session.id)
+                                        .is_none_or(|existing| existing != &session);
+                                    if changed {
+                                        this.upsert_session_snapshot(session);
+                                        this.reconcile_sidebar_state();
+                                    }
+                                    changed
+                                }
                                 AgentPollSignal::RuntimeSelection(state) => {
                                     let changed = if this.runtime_selection.as_ref()
                                         == Some(state.as_ref())
@@ -34233,6 +34251,30 @@ mod tests {
             "DesktopEvent::Timeline(event) => self.apply_live_timeline_batch(vec![event], cx)"
         ));
         assert!(!event_handler.contains("cx.notify();"));
+    }
+
+    #[test]
+    fn timeline_poll_reconciles_the_authoritative_session_snapshot() {
+        let source = include_str!("app.rs");
+        let poll = source
+            .split_once("    fn start_agent_poll(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn apply_live_timeline_batch("))
+            .map(|(body, _)| body)
+            .expect("agent timeline poll should remain inspectable");
+        assert!(poll.contains("manager().get_session(&session_id).await"));
+        assert!(poll.contains("AgentPollSignal::Session(session)"));
+
+        let handler = source
+            .split_once("AgentPollSignal::Session(session) => {")
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n                                AgentPollSignal::RuntimeSelection",
+                )
+            })
+            .map(|(body, _)| body)
+            .expect("session snapshot signal handler should remain inspectable");
+        assert!(handler.contains("this.upsert_session_snapshot(session)"));
+        assert!(handler.contains("this.reconcile_sidebar_state()"));
     }
 
     #[test]
