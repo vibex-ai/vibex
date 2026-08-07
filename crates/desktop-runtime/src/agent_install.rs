@@ -602,13 +602,7 @@ impl AgentInstallService {
         target: RegistryBinaryTarget,
     ) -> VibexResult<InstalledAgent> {
         validate_https_url(&target.archive, "Agent binary")?;
-        let sha256 = validate_sha256(target.sha256.as_deref().ok_or_else(|| {
-            VibexError::validation(
-                "agent_binary_checksum_missing",
-                "ACP Registry binary has no SHA-256 and cannot be trusted",
-            )
-            .with_diagnostic("registryAgentId", entry.id.clone())
-        })?)?;
+        let sha256 = optional_sha256(target.sha256.as_deref())?;
         let args_identity = serde_json::to_string(&target.args).map_err(|error| {
             VibexError::validation(
                 "agent_binary_args_invalid",
@@ -620,7 +614,7 @@ impl AgentInstallService {
             entry.id.as_str(),
             entry.version.as_str(),
             target.archive.as_str(),
-            sha256.as_str(),
+            sha256.as_deref().unwrap_or_default(),
             target.cmd.as_str(),
             args_identity.as_str(),
         ]);
@@ -629,7 +623,9 @@ impl AgentInstallService {
             return Ok(installed);
         }
 
-        let archive = self.download_verified(&target.archive, &sha256).await?;
+        let archive = self
+            .download_verified(&target.archive, sha256.as_deref())
+            .await?;
         let staging = self.create_staging(agent_id)?;
         let mut staging_guard = StagingGuard::new(staging.clone());
         let archive_url = target.archive.clone();
@@ -926,7 +922,11 @@ impl AgentInstallService {
         Ok(bytes)
     }
 
-    async fn download_verified(&self, url: &str, expected_sha256: &str) -> VibexResult<PathBuf> {
+    async fn download_verified(
+        &self,
+        url: &str,
+        expected_sha256: Option<&str>,
+    ) -> VibexResult<PathBuf> {
         validate_https_url(url, "Agent archive")?;
         let cache_dir = self.root.join("cache/downloads");
         fs::create_dir_all(&cache_dir).map_err(|error| {
@@ -936,8 +936,14 @@ impl AgentInstallService {
                 error,
             )
         })?;
-        let cached = cache_dir.join(expected_sha256);
-        if cached.is_file() && sha256_file(&cached)? == expected_sha256 {
+        let cache_key = expected_sha256
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("url-{}", distribution_fingerprint(&[url])));
+        let cached = cache_dir.join(cache_key);
+        if cached.is_file()
+            && expected_sha256
+                .is_none_or(|expected| sha256_file(&cached).is_ok_and(|actual| actual == expected))
+        {
             return Ok(cached);
         }
         if fs::symlink_metadata(&cached).is_ok() {
@@ -1014,13 +1020,16 @@ impl AgentInstallService {
         })?;
         drop(file);
         let actual = format!("{:x}", hasher.finalize());
-        if actual != expected_sha256 {
+        if expected_sha256.is_some_and(|expected| actual != expected) {
             let _ = tokio::fs::remove_file(&temp).await;
             return Err(VibexError::validation(
                 "agent_download_checksum_mismatch",
                 "Agent archive SHA-256 did not match the Registry",
             )
-            .with_diagnostic("expectedSha256", expected_sha256.to_string())
+            .with_diagnostic(
+                "expectedSha256",
+                expected_sha256.unwrap_or_default().to_string(),
+            )
             .with_diagnostic("actualSha256", actual));
         }
         fs::rename(&temp, &cached).map_err(|error| {
@@ -1108,7 +1117,7 @@ impl AgentInstallService {
         }
 
         let url = format!("https://nodejs.org/dist/v{version}/{filename}");
-        let archive = self.download_verified(&url, &sha256).await?;
+        let archive = self.download_verified(&url, Some(&sha256)).await?;
         let staging_parent = self.root.join("runtimes/node/.staging");
         fs::create_dir_all(&staging_parent).map_err(|error| {
             storage_error(
@@ -1629,7 +1638,6 @@ fn require_registry_id(agent_id: &AgentId) -> VibexResult<&'static str> {
 fn resolve_distribution(entry: &RegistryEntry) -> VibexResult<ResolvedDistribution> {
     if let Some(targets) = entry.distribution.binary.as_ref()
         && let Some(target) = targets.get(current_platform_key()?)
-        && target.sha256.as_deref().is_some_and(is_sha256)
     {
         return Ok(ResolvedDistribution::Binary(target.clone()));
     }
@@ -2280,6 +2288,13 @@ fn validate_sha256(value: &str) -> VibexResult<String> {
             "Agent binary SHA-256 was invalid",
         ))
     }
+}
+
+fn optional_sha256(value: Option<&str>) -> VibexResult<Option<String>> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(validate_sha256)
+        .transpose()
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -2935,7 +2950,10 @@ mod tests {
             require_registry_id(&AgentId::parse("copilot").unwrap()).unwrap(),
             "github-copilot-cli"
         );
-        assert!(require_registry_id(&AgentId::parse("cursor").unwrap()).is_err());
+        assert_eq!(
+            require_registry_id(&AgentId::parse("cursor").unwrap()).unwrap(),
+            "cursor"
+        );
         assert!(require_registry_id(&AgentId::parse("fast-agent").unwrap()).is_err());
     }
 
@@ -2950,7 +2968,7 @@ mod tests {
     }
 
     #[test]
-    fn distribution_requires_platform_checksum_or_exact_npm_fallback() {
+    fn distribution_accepts_platform_binary_without_checksum() {
         let key = current_platform_key().unwrap().to_string();
         let entry = RegistryEntry {
             id: "test-agent".to_string(),
@@ -2968,15 +2986,25 @@ mod tests {
                 npx: None,
             },
         };
-        assert!(resolve_distribution(&entry).is_err());
+        assert!(matches!(
+            resolve_distribution(&entry).unwrap(),
+            ResolvedDistribution::Binary(_)
+        ));
+        assert_eq!(optional_sha256(None).unwrap(), None);
+        assert_eq!(optional_sha256(Some("")).unwrap(), None);
+        assert_eq!(
+            optional_sha256(Some(&"A".repeat(64))).unwrap(),
+            Some("a".repeat(64))
+        );
+        assert!(optional_sha256(Some("not-a-checksum")).is_err());
 
         let fallback = RegistryEntry {
             distribution: RegistryDistribution {
+                binary: None,
                 npx: Some(RegistryNpxDistribution {
                     package: "test-agent@1.2.3".to_string(),
                     args: Vec::new(),
                 }),
-                ..entry.distribution.clone()
             },
             ..entry
         };

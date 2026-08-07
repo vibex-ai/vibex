@@ -441,11 +441,9 @@ pub fn acp_registry_agent_id(agent_id: &AgentId) -> Option<&'static str> {
         "copilot" => return Some("github-copilot-cli"),
         "grok" => return Some("grok-build"),
         "opencode" => return Some("opencode"),
-        // These entries are absent, uvx-only, or currently publish binary
-        // targets without a Registry SHA-256. They stay on the external CLI
-        // path until Vibex can verify their distribution end to end.
-        "codewhale" | "cortex-code" | "crow-cli" | "cursor" | "devin" | "fast-agent" | "hermes"
-        | "junie" | "kiro" | "minion-code" | "stakpak" | "vtcode" => {
+        // These entries are absent from the Registry or do not currently
+        // publish a binary or npm distribution that Vibex can install.
+        "codewhale" | "fast-agent" | "hermes" | "kiro" | "minion-code" => {
             return None;
         }
         _ => {}
@@ -779,11 +777,26 @@ mod tests {
             acp_registry_agent_id(&AgentId::parse("gemini").unwrap()),
             Some("gemini")
         );
-        for external in ["cursor", "fast-agent", "hermes", "vtcode"] {
+        for managed in [
+            "cortex-code",
+            "crow-cli",
+            "cursor",
+            "devin",
+            "junie",
+            "stakpak",
+            "vtcode",
+        ] {
+            assert_eq!(
+                acp_registry_agent_id(&AgentId::parse(managed).unwrap()),
+                Some(managed),
+                "{managed} must use its Registry binary distribution"
+            );
+        }
+        for external in ["codewhale", "fast-agent", "hermes", "kiro", "minion-code"] {
             assert_eq!(
                 acp_registry_agent_id(&AgentId::parse(external).unwrap()),
                 None,
-                "{external} must remain external until its distribution is verifiable"
+                "{external} must remain external until the Registry publishes an installable distribution"
             );
         }
     }
@@ -806,10 +819,10 @@ mod tests {
             gemini.managed_install.status,
             AgentManagedInstallStatus::NotInstalled
         );
-        assert!(!cursor.managed_install.managed);
+        assert!(cursor.managed_install.managed);
         assert_eq!(
             cursor.managed_install.status,
-            AgentManagedInstallStatus::External
+            AgentManagedInstallStatus::NotInstalled
         );
     }
 }
