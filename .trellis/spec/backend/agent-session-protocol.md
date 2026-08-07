@@ -3420,6 +3420,12 @@ agent_message_submission_payloads(
 - An error after `AboutToPrompt` without a complete durable result fence is
   `AmbiguousPromptDispatch`; startup never calls the provider again. Completed
   retries reconstruct the response from the durable Timeline range.
+- Submission delivery and Agent turn success are separate outcomes. If dispatch
+  returns an error after the submitted user item and non-error Agent/Provider
+  output have already been persisted beyond the pre-dispatch Timeline fence,
+  reconstruct that exact range and complete the submission. Preserve any turn
+  error in the authoritative Timeline/session state; do not also classify the
+  already-observed delivery as ambiguous or surface a message-send failure.
 - Prompt text, attachments, payload references, provider/native ids, tokens,
   workspace paths, and idempotency key values do not appear in Debug, tracing,
   errors, or public submission projections beyond the query contract's key.
@@ -3438,6 +3444,7 @@ agent_message_submission_payloads(
 | Current committed ACP attachment missing or mismatched | `turn_execution_identity_mismatch`; no `session/prompt`. |
 | Installed ACP coordinator weak reference cannot upgrade | `message_submission_coordinator_unavailable`; no direct fallback or user Timeline item. |
 | Provider/receipt uncertainty after AboutToPrompt | `message_submission_prompt_dispatch_ambiguous`; never replay automatically. |
+| Dispatch returns an error after durable Agent/Provider output | Record the fenced Timeline range as Completed; retain the separate turn error/state. |
 | Startup sees AboutToPrompt with complete result fence | Advance Dispatched then Completed without provider work. |
 
 ### 5. Good/Base/Bad Cases

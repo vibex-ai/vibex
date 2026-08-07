@@ -599,6 +599,10 @@ impl MessageSubmissionCoordinator {
         }
         let expected_user_text = payload.request.text.clone();
         let expected_user_attachments = payload.request.attachments.clone();
+        let dispatch_start_sequence = {
+            let conn = self.open_connection()?;
+            TimelineRepository::latest_sequence(&conn, &record.session_id)?
+        };
         let lifecycle = self
             .runtime_lifecycle
             .lock()
@@ -637,6 +641,19 @@ impl MessageSubmissionCoordinator {
         let items = match result {
             Ok(items) => items,
             Err(_) => {
+                if let Some(items) = self.persisted_dispatch_result(
+                    record,
+                    dispatch_start_sequence,
+                    &expected_user_text,
+                    &expected_user_attachments,
+                )? {
+                    return self.complete_dispatch(
+                        record,
+                        &expected_user_text,
+                        &expected_user_attachments,
+                        &items,
+                    );
+                }
                 let conn = self.open_connection()?;
                 MessageSubmissionRepository::mark_ambiguous(
                     &conn,
@@ -647,6 +664,59 @@ impl MessageSubmissionCoordinator {
                 return Ok(());
             }
         };
+        self.complete_dispatch(
+            record,
+            &expected_user_text,
+            &expected_user_attachments,
+            &items,
+        )
+    }
+
+    fn persisted_dispatch_result(
+        &self,
+        record: &MessageSubmissionRecord,
+        dispatch_start_sequence: i64,
+        expected_user_text: &str,
+        expected_user_attachments: &[vibex_core::MessageAttachment],
+    ) -> VibexResult<Option<Vec<TimelineItem>>> {
+        let conn = self.open_connection()?;
+        let last_sequence = TimelineRepository::latest_sequence(&conn, &record.session_id)?;
+        if last_sequence <= dispatch_start_sequence {
+            return Ok(None);
+        }
+        let items = TimelineRepository::fetch_range(
+            &conn,
+            &record.session_id,
+            dispatch_start_sequence + 1,
+            last_sequence,
+        )?;
+        let matching_user_index = items.iter().position(|item| {
+            matches!(
+                &item.payload,
+                TimelinePayload::UserMessage(payload)
+                    if payload.text == expected_user_text
+                        && payload.attachments == expected_user_attachments
+            )
+        });
+        let Some(matching_user_index) = matching_user_index else {
+            return Ok(None);
+        };
+        let provider_output_persisted = items[matching_user_index + 1..].iter().any(|item| {
+            matches!(
+                item.source,
+                vibex_core::TimelineSource::Agent | vibex_core::TimelineSource::Provider
+            ) && !matches!(item.payload, TimelinePayload::Error(_))
+        });
+        Ok(provider_output_persisted.then_some(items))
+    }
+
+    fn complete_dispatch(
+        &self,
+        record: &MessageSubmissionRecord,
+        expected_user_text: &str,
+        expected_user_attachments: &[vibex_core::MessageAttachment],
+        items: &[TimelineItem],
+    ) -> VibexResult<()> {
         if items
             .iter()
             .any(|item| item.session_id != record.session_id)
@@ -1018,6 +1088,7 @@ mod tests {
         release: Notify,
         dispatched: Mutex<Vec<(VibexSessionId, String, String)>>,
         failure_message: Mutex<Option<String>>,
+        fail_after_output: AtomicBool,
     }
 
     #[async_trait]
@@ -1037,7 +1108,10 @@ mod tests {
             if self.block.swap(false, Ordering::SeqCst) {
                 self.release.notified().await;
             }
-            if let Some(message) = self.failure_message.lock().unwrap().take() {
+            let failure_message = self.failure_message.lock().unwrap().take();
+            if let Some(message) = failure_message.as_ref()
+                && !self.fail_after_output.load(Ordering::SeqCst)
+            {
                 return Err(VibexError::provider("mock_dispatch_failed", message));
             }
             let mut conn = open_database(&self.db_path)?;
@@ -1065,6 +1139,9 @@ mod tests {
                 Some("mock-dispatch"),
                 TimelineRedactionState::None,
             )?;
+            if let Some(message) = failure_message {
+                return Err(VibexError::provider("mock_dispatch_failed", message));
+            }
             Ok(vec![user, agent])
         }
     }
@@ -1164,6 +1241,7 @@ mod tests {
             release: Notify::new(),
             dispatched: Mutex::new(Vec::new()),
             failure_message: Mutex::new(None),
+            fail_after_output: AtomicBool::new(false),
         });
         let dispatcher_trait: Arc<dyn MessageDispatchExecutor> = dispatcher.clone();
         let coordinator = Arc::new(
@@ -1685,6 +1763,45 @@ mod tests {
             Some(AMBIGUOUS_PROMPT_ERROR_DETAIL)
         );
         assert!(!format!("{:?}", record.state()).contains(SENSITIVE_SENTINEL));
+        cleanup_db(db_path);
+    }
+
+    #[tokio::test]
+    async fn persisted_agent_output_completes_submission_after_dispatch_error() {
+        let db_path = temp_db_path("output-before-dispatch-error");
+        let initial = selection("gpt-5");
+        let session_id = seed_session(&db_path, "output-before-dispatch-error", initial.clone());
+        let (coordinator, _runtime, dispatcher) =
+            harness(&db_path, &session_id, initial.clone(), false);
+        dispatcher.fail_after_output.store(true, Ordering::SeqCst);
+        *dispatcher.failure_message.lock().unwrap() =
+            Some("turn cleanup failed after output".to_string());
+
+        let items = coordinator
+            .submit(request(
+                &session_id,
+                "output-before-dispatch-error",
+                initial,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().any(|item| {
+            matches!(
+                &item.payload,
+                TimelinePayload::AgentMessage(message)
+                    if message.text == "completed" && message.is_final
+            )
+        }));
+        let state = coordinator
+            .get_submission(&GetMessageSubmissionRequest {
+                session_id,
+                message_idempotency_key: "output-before-dispatch-error".to_string(),
+            })
+            .unwrap();
+        assert_eq!(state.status, MessageSubmissionStatus::Completed);
+        assert!(state.error_code.is_none());
         cleanup_db(db_path);
     }
 
