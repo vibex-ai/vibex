@@ -161,7 +161,9 @@ impl RuntimeSelectionService {
         &self,
         session_id: &VibexSessionId,
     ) -> VibexResult<AgentSessionRuntimeSelectionState> {
-        Ok(self.authoritative_event(session_id)?.state)
+        let event = self.authoritative_event(session_id)?;
+        self.converge_initial_session_lifecycle(session_id, &event.state)?;
+        Ok(event.state)
     }
 
     /// Materializes the first ACP Runtime through the same durable switch
@@ -173,6 +175,47 @@ impl RuntimeSelectionService {
         session_id: &VibexSessionId,
         desired: SessionRuntimeSelection,
     ) -> VibexResult<AgentSessionRuntimeSelectionState> {
+        let record = self
+            .enqueue_initial_runtime_switch(session_id, desired)
+            .await?;
+        let outcome = self
+            .inner
+            .coordinator
+            .drive_switch(&record.switch_id)
+            .await?;
+        if outcome.status != RuntimeSwitchStatus::Committed {
+            return Err(VibexError::process(
+                "runtime_selection_initialization_failed",
+                "initial ACP runtime did not commit",
+            )
+            .with_diagnostic("switchId", outcome.switch_id.as_str())
+            .with_diagnostic("status", format!("{:?}", outcome.status)));
+        }
+        Ok(self.emit_authoritative(session_id)?.state)
+    }
+
+    /// Persists the initial ACP runtime intent and lets the normal switch
+    /// watcher materialize it in the background. Queued messages can safely
+    /// wait on the resulting `Preparing` state before any provider prompt is
+    /// dispatched.
+    pub async fn initialize_new_session_deferred(
+        &self,
+        session_id: &VibexSessionId,
+        desired: SessionRuntimeSelection,
+    ) -> VibexResult<AgentSessionRuntimeSelectionState> {
+        let record = self
+            .enqueue_initial_runtime_switch(session_id, desired)
+            .await?;
+        let event = self.emit_authoritative(session_id)?;
+        self.start_watcher(&record)?;
+        Ok(event.state)
+    }
+
+    async fn enqueue_initial_runtime_switch(
+        &self,
+        session_id: &VibexSessionId,
+        desired: SessionRuntimeSelection,
+    ) -> VibexResult<RuntimeSwitchRecord> {
         let resolved = self
             .inner
             .resolver
@@ -199,20 +242,7 @@ impl RuntimeSelectionService {
                 },
             )?
         };
-        let outcome = self
-            .inner
-            .coordinator
-            .drive_switch(&record.switch_id)
-            .await?;
-        if outcome.status != RuntimeSwitchStatus::Committed {
-            return Err(VibexError::process(
-                "runtime_selection_initialization_failed",
-                "initial ACP runtime did not commit",
-            )
-            .with_diagnostic("switchId", outcome.switch_id.as_str())
-            .with_diagnostic("status", format!("{:?}", outcome.status)));
-        }
-        Ok(self.emit_authoritative(session_id)?.state)
+        Ok(record)
     }
 
     pub async fn initialize_runtime_selection(
@@ -452,12 +482,25 @@ impl RuntimeSelectionService {
                 "Agent session desired runtime selection is not initialized",
             )
         })?;
-        let effective = state.effective_runtime_selection.clone().ok_or_else(|| {
-            VibexError::conflict(
-                "session_runtime_selection_uninitialized",
-                "Agent session effective runtime selection is not initialized",
-            )
-        })?;
+        // Initial session creation persists its desired selection before ACP
+        // materialization creates the first binding. Project that target as
+        // effective only while the switch is explicitly Preparing; callers
+        // still gate provider work on the status and binding below.
+        let effective = state
+            .effective_runtime_selection
+            .clone()
+            .or_else(|| {
+                (state.runtime_selection_status == Some(SessionRuntimeSelectionStatus::Preparing)
+                    && state.current_binding_id.is_none()
+                    && state.selection_revision == 1)
+                    .then(|| desired.clone())
+            })
+            .ok_or_else(|| {
+                VibexError::conflict(
+                    "session_runtime_selection_uninitialized",
+                    "Agent session effective runtime selection is not initialized",
+                )
+            })?;
         let latest = RuntimeSwitchRepository::get_latest_for_selection_revision(
             &conn,
             session_id,
@@ -564,11 +607,12 @@ impl RuntimeSelectionService {
             let mut previous = service.authoritative_event(&session_id).ok();
             loop {
                 sleep(service.inner.config.poll_interval).await;
-                if let Ok(next) = service.authoritative_event(&session_id)
-                    && previous.as_ref() != Some(&next)
-                {
-                    let _ = service.inner.events.send(next.clone());
-                    previous = Some(next);
+                if let Ok(next) = service.authoritative_event(&session_id) {
+                    let _ = service.converge_initial_session_lifecycle(&session_id, &next.state);
+                    if previous.as_ref() != Some(&next) {
+                        let _ = service.inner.events.send(next.clone());
+                        previous = Some(next);
+                    }
                 }
                 match service.get_switch(&switch_id) {
                     Ok(Some(current)) if !current.status.is_terminal() => {}
@@ -1497,6 +1541,56 @@ mod tests {
         let conn = open_database(&env.db_path).unwrap();
         let stored = SessionRepository::get(&conn, &session.id).unwrap().unwrap();
         assert_eq!(stored.state, AgentSessionState::Idle);
+    }
+
+    #[tokio::test]
+    async fn deferred_initial_switch_returns_preparing_before_session_becomes_idle() {
+        let env = TestEnvironment::new("deferred-initial-lifecycle", 500);
+        let conn = open_database(&env.db_path).unwrap();
+        let template = SessionRepository::get(&conn, &env.session_id)
+            .unwrap()
+            .unwrap();
+        let session_id = VibexSessionId::new();
+        let mut session = template;
+        session.id = session_id.clone();
+        session.title = "deferred initial switch".to_string();
+        session.state = AgentSessionState::Initializing;
+        SessionRepository::insert(&conn, &session).unwrap();
+        drop(conn);
+
+        let preparing = env
+            .service
+            .initialize_new_session_deferred(&session_id, env.effective.clone())
+            .await
+            .unwrap();
+        assert_eq!(preparing.status, SessionRuntimeSelectionStatus::Preparing);
+        assert_eq!(preparing.desired, env.effective);
+        assert_eq!(preparing.effective, env.effective);
+        let conn = open_database(&env.db_path).unwrap();
+        assert_eq!(
+            SessionRepository::get(&conn, &session_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            AgentSessionState::Initializing
+        );
+        drop(conn);
+
+        let ready = wait_for_status(
+            &env.service,
+            &session_id,
+            SessionRuntimeSelectionStatus::Ready,
+        )
+        .await;
+        assert_eq!(ready.desired, ready.effective);
+        let conn = open_database(&env.db_path).unwrap();
+        assert_eq!(
+            SessionRepository::get(&conn, &session_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            AgentSessionState::Idle
+        );
     }
 
     #[tokio::test]

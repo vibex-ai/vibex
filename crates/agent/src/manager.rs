@@ -121,6 +121,12 @@ enum ProviderTurnAttemptOutcome {
     Failure(ProviderTurnAttemptFailure),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitialRuntimeMaterialization {
+    WaitForReady,
+    Deferred,
+}
+
 impl AgentManager {
     pub fn new(db_path: impl Into<PathBuf>) -> VibexResult<Self> {
         let db_path = db_path.into();
@@ -348,6 +354,23 @@ impl AgentManager {
         self.create_session_with_timeline(request, Vec::new()).await
     }
 
+    /// Creates the durable Logical Session and queues its initial ACP runtime
+    /// materialization without waiting for process startup or `session/new`.
+    /// Callers that submit a first message must use the durable message queue,
+    /// which waits for the runtime selection to become ready before dispatch.
+    pub async fn create_session_deferred(
+        &self,
+        request: CreateAgentSessionRequest,
+    ) -> VibexResult<AgentSession> {
+        self.create_session_with_timeline_and_materialization(
+            request,
+            Vec::new(),
+            |_| {},
+            InitialRuntimeMaterialization::Deferred,
+        )
+        .await
+    }
+
     async fn create_session_with_timeline(
         &self,
         request: CreateAgentSessionRequest,
@@ -362,6 +385,25 @@ impl AgentManager {
         request: CreateAgentSessionRequest,
         initial_timeline: Vec<TimelineAppend>,
         on_created: F,
+    ) -> VibexResult<AgentSession>
+    where
+        F: FnOnce(AgentSession) + Send,
+    {
+        self.create_session_with_timeline_and_materialization(
+            request,
+            initial_timeline,
+            on_created,
+            InitialRuntimeMaterialization::WaitForReady,
+        )
+        .await
+    }
+
+    async fn create_session_with_timeline_and_materialization<F>(
+        &self,
+        request: CreateAgentSessionRequest,
+        initial_timeline: Vec<TimelineAppend>,
+        on_created: F,
+        materialization: InitialRuntimeMaterialization,
     ) -> VibexResult<AgentSession>
     where
         F: FnOnce(AgentSession) + Send,
@@ -453,14 +495,33 @@ impl AgentManager {
                     "ACP runtime selection service is not installed",
                 )
             })?;
-        if let Err(err) = runtime_selection
-            .initialize_new_session(&session.id, desired)
-            .await
-        {
+        let initialization = match materialization {
+            InitialRuntimeMaterialization::WaitForReady => {
+                runtime_selection
+                    .initialize_new_session(&session.id, desired)
+                    .await
+            }
+            InitialRuntimeMaterialization::Deferred => {
+                runtime_selection
+                    .initialize_new_session_deferred(&session.id, desired)
+                    .await
+            }
+        };
+        if let Err(err) = initialization {
             let mut conn = self.open_migrated()?;
             self.transition(&conn, &session, AgentSessionState::Error)?;
             self.append_provider_error(&mut conn, &session.id, &err)?;
             return Err(err);
+        }
+
+        if materialization == InitialRuntimeMaterialization::Deferred {
+            let conn = self.open_migrated()?;
+            return SessionRepository::get(&conn, &session.id)?.ok_or_else(|| {
+                VibexError::storage(
+                    "session_missing_after_deferred_create",
+                    "deferred session could not be reloaded",
+                )
+            });
         }
 
         let mut conn = self.open_migrated()?;

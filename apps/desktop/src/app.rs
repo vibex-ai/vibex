@@ -81,10 +81,10 @@ use vibex_core::{
     SessionRuntimeFeature, SessionRuntimeFeatureKind, SessionRuntimeOption,
     SessionRuntimeOptionCatalog, SessionRuntimeSelection, SessionRuntimeSelectionStatus,
     SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest, TerminalId, TerminalSession,
-    TerminalStatus, TerminalSwitchShellRequest, TimelineItem, TimelineLiveEvent, TimelinePage,
-    TimelinePayload, VibexSessionId, WorkspaceMode, WorkspaceRecord,
-    agent_session_turn_requires_continuation, latest_timeline_turn_ended_normally,
-    unix_timestamp_ms,
+    TerminalStatus, TerminalSwitchShellRequest, TimelineItem, TimelineItemId, TimelineLiveEvent,
+    TimelinePage, TimelinePayload, TimelineRedactionState, TimelineSource, UserMessagePayload,
+    VibexSessionId, WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation,
+    latest_timeline_turn_ended_normally, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     AgentPlanProjection, AppearanceUiState, ComposerAttachment, ComposerSuggestionSelection,
@@ -2178,6 +2178,7 @@ struct ConversationTurnsCacheKey {
     session_state: Option<AgentSessionState>,
     agent_turn_pending: bool,
     pending_edit: Option<(VibexSessionId, i64, i64)>,
+    optimistic_message: Option<(VibexSessionId, String, i64)>,
 }
 
 fn conversation_turn_start_index(
@@ -2218,6 +2219,8 @@ fn refresh_conversation_turns_cache_incrementally(
         || next_key.session_id != timeline.session_id
         || previous_key.pending_edit.is_some()
         || next_key.pending_edit.is_some()
+        || previous_key.optimistic_message.is_some()
+        || next_key.optimistic_message.is_some()
         || previous_key.item_count > next_key.item_count
         || next_key.item_count != timeline.items.len()
     {
@@ -2533,6 +2536,74 @@ impl PendingUserMessageEdit {
         message.attachments.clone_from(&self.attachments);
         user_item.timestamp_ms = self.submitted_at_ms;
         items.truncate(user_item_index + 1);
+        Some(items)
+    }
+}
+
+/// Presentation-only user message retained until the authoritative timeline
+/// receives the durable row. The backend remains the source of truth.
+#[derive(Clone)]
+struct OptimisticUserMessage {
+    session_id: VibexSessionId,
+    item_id: TimelineItemId,
+    after_sequence: i64,
+    submitted_at_ms: i64,
+    text: String,
+    attachments: Vec<MessageAttachment>,
+}
+
+impl OptimisticUserMessage {
+    fn cache_key(&self) -> (VibexSessionId, String, i64) {
+        (
+            self.session_id.clone(),
+            self.item_id.as_str().to_string(),
+            self.submitted_at_ms,
+        )
+    }
+
+    fn is_confirmed_by(&self, timeline: &TimelineModel) -> bool {
+        timeline.session_id.as_ref() == Some(&self.session_id)
+            && timeline.items.iter().any(|item| {
+                item.sequence > self.after_sequence
+                    && matches!(
+                        &item.payload,
+                        TimelinePayload::UserMessage(message)
+                            if message.text.trim() == self.text.trim()
+                                && message.attachments == self.attachments
+                    )
+            })
+    }
+
+    fn projected_items(&self, timeline: &TimelineModel) -> Option<Vec<TimelineItem>> {
+        if timeline
+            .session_id
+            .as_ref()
+            .is_some_and(|session_id| session_id != &self.session_id)
+            || self.is_confirmed_by(timeline)
+        {
+            return None;
+        }
+        let mut items = timeline.items.clone();
+        let payload = TimelinePayload::UserMessage(UserMessagePayload {
+            text: self.text.clone(),
+            attachments: self.attachments.clone(),
+        });
+        items.push(TimelineItem {
+            id: self.item_id.clone(),
+            session_id: self.session_id.clone(),
+            sequence: items
+                .last()
+                .map(|item| item.sequence.saturating_add(1))
+                .unwrap_or(1),
+            timestamp_ms: self.submitted_at_ms,
+            source: TimelineSource::User,
+            kind: payload.kind(),
+            correlation_id: None,
+            provider_correlation_id: None,
+            redaction_state: TimelineRedactionState::None,
+            execution_attribution: None,
+            payload,
+        });
         Some(items)
     }
 }
@@ -3102,6 +3173,7 @@ enum NewSessionCreateSignal {
         AgentSession,
         Option<Vec<(ProjectRecord, WorkspaceRecord)>>,
         bool,
+        Option<OptimisticUserMessage>,
     ),
 }
 
@@ -3286,6 +3358,8 @@ pub struct VibexWorkbench {
     runtime_catalog: Option<SessionRuntimeOptionCatalog>,
     runtime_provider_profiles: Vec<ProviderProfileSummary>,
     runtime_selection: Option<AgentSessionRuntimeSelectionState>,
+    optimistic_runtime_selections: BTreeMap<String, SessionRuntimeSelection>,
+    runtime_selection_requests_in_flight: BTreeSet<String>,
     runtime_preference_write_fence: RuntimePreferenceWriteFence,
     token_usage: Option<AgentTokenUsage>,
     composer_runtime_menu_open: bool,
@@ -3326,6 +3400,7 @@ pub struct VibexWorkbench {
     active_composer_terminal_surface_id: Option<String>,
     inline_user_message_edit: Option<InlineUserMessageEdit>,
     pending_user_message_edit: Option<PendingUserMessageEdit>,
+    optimistic_user_messages: BTreeMap<String, OptimisticUserMessage>,
     startup_loading: bool,
     startup_loading_indicator_visible: bool,
     agent_loading: bool,
@@ -3819,6 +3894,8 @@ impl VibexWorkbench {
             runtime_catalog: None,
             runtime_provider_profiles: Vec::new(),
             runtime_selection: None,
+            optimistic_runtime_selections: BTreeMap::new(),
+            runtime_selection_requests_in_flight: BTreeSet::new(),
             runtime_preference_write_fence: RuntimePreferenceWriteFence::default(),
             token_usage: None,
             composer_runtime_menu_open: false,
@@ -3859,6 +3936,7 @@ impl VibexWorkbench {
             active_composer_terminal_surface_id: None,
             inline_user_message_edit: None,
             pending_user_message_edit: None,
+            optimistic_user_messages: BTreeMap::new(),
             startup_loading: true,
             startup_loading_indicator_visible: false,
             agent_loading: true,
@@ -4670,11 +4748,12 @@ impl VibexWorkbench {
         &self,
         agent_id: &AgentId,
     ) -> Option<SessionRuntimeSelection> {
+        let selected_runtime = self.selected_runtime_selection();
         new_session_runtime_preference_for_agent(
             agent_id,
             self.new_session_runtime_selection.as_ref(),
             &self.ui_state.composer.runtime_selections_by_agent,
-            self.runtime_selection.as_ref().map(|state| &state.desired),
+            selected_runtime.as_ref(),
         )
     }
 
@@ -5610,9 +5689,7 @@ impl VibexWorkbench {
             return;
         };
         let runtime_selection = self
-            .runtime_selection
-            .as_ref()
-            .map(|state| state.desired.clone())
+            .selected_runtime_selection()
             .or_else(|| self.new_session_runtime_selection.clone())
             .or_else(|| {
                 self.runtime_catalog.as_ref().and_then(|catalog| {
@@ -6046,6 +6123,264 @@ impl VibexWorkbench {
         true
     }
 
+    fn selected_runtime_selection(&self) -> Option<SessionRuntimeSelection> {
+        let session_id = self.selected_session_id.as_ref()?;
+        self.optimistic_runtime_selections
+            .get(session_id.as_str())
+            .cloned()
+            .or_else(|| {
+                self.runtime_selection
+                    .as_ref()
+                    .map(|state| state.desired.clone())
+            })
+    }
+
+    fn install_optimistic_user_message(&mut self, message: OptimisticUserMessage) {
+        let session_id = message.session_id.clone();
+        self.optimistic_user_messages
+            .insert(session_id.as_str().to_string(), message);
+        if self.selected_session_id.as_ref() == Some(&session_id) {
+            self.invalidate_timeline_render_caches();
+            self.rebuild_timeline_sizes();
+            self.request_timeline_scroll_to_latest();
+        }
+    }
+
+    fn discard_optimistic_user_message(&mut self, session_id: &VibexSessionId) -> bool {
+        if self
+            .optimistic_user_messages
+            .remove(session_id.as_str())
+            .is_none()
+        {
+            return false;
+        }
+        if self.selected_session_id.as_ref() == Some(session_id) {
+            self.invalidate_timeline_render_caches();
+            self.rebuild_timeline_sizes();
+        }
+        true
+    }
+
+    fn reconcile_optimistic_user_message(&mut self) -> bool {
+        let Some(session_id) = self.selected_session_id.clone() else {
+            return false;
+        };
+        let confirmed = self
+            .optimistic_user_messages
+            .get(session_id.as_str())
+            .is_some_and(|message| message.is_confirmed_by(&self.timeline));
+        if !confirmed {
+            return false;
+        }
+        self.optimistic_user_messages.remove(session_id.as_str());
+        self.invalidate_timeline_render_caches();
+        true
+    }
+
+    fn optimistic_user_message_attachments_for_row(
+        &self,
+        row: &TimelineRow,
+    ) -> Option<Vec<MessageAttachment>> {
+        let session_id = self.selected_session_id.as_ref()?;
+        let message = self.optimistic_user_messages.get(session_id.as_str())?;
+        row.item_ids
+            .iter()
+            .any(|item_id| item_id == message.item_id.as_str())
+            .then(|| message.attachments.clone())
+    }
+
+    fn apply_runtime_selection_state(
+        &mut self,
+        session_id: &VibexSessionId,
+        state: AgentSessionRuntimeSelectionState,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let selected = self.selected_session_id.as_ref() == Some(session_id);
+        let changed = if selected {
+            if self.runtime_selection.as_ref() == Some(&state) {
+                false
+            } else {
+                self.runtime_selection = Some(state.clone());
+                self.refresh_active_suggestions(ComposerTarget::Session, cx);
+                true
+            }
+        } else if let Some(entry) = self.agent_session_view_cache.get_mut(session_id.as_str()) {
+            let changed = entry.runtime_selection.as_ref() != Some(&state);
+            entry.runtime_selection = Some(state.clone());
+            changed
+        } else {
+            false
+        };
+        self.reconcile_optimistic_runtime_selection(session_id, &state, cx);
+        changed
+    }
+
+    fn reconcile_optimistic_runtime_selection(
+        &mut self,
+        session_id: &VibexSessionId,
+        state: &AgentSessionRuntimeSelectionState,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(desired) = self
+            .optimistic_runtime_selections
+            .get(session_id.as_str())
+            .cloned()
+        else {
+            return;
+        };
+        if desired == state.desired
+            && !self
+                .runtime_selection_requests_in_flight
+                .contains(session_id.as_str())
+        {
+            self.optimistic_runtime_selections
+                .remove(session_id.as_str());
+            return;
+        }
+        self.request_pending_runtime_selection(session_id, state, false, cx);
+    }
+
+    fn request_pending_runtime_selection(
+        &mut self,
+        session_id: &VibexSessionId,
+        state: &AgentSessionRuntimeSelectionState,
+        force: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .runtime_selection_requests_in_flight
+            .contains(session_id.as_str())
+        {
+            return;
+        }
+        let Some(desired) = self
+            .optimistic_runtime_selections
+            .get(session_id.as_str())
+            .cloned()
+        else {
+            return;
+        };
+        if !force && desired == state.desired {
+            self.optimistic_runtime_selections
+                .remove(session_id.as_str());
+            return;
+        }
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+
+        let session_key = session_id.as_str().to_string();
+        let requested_session_id = session_id.clone();
+        let runner_session_id = requested_session_id.clone();
+        let requested_desired = desired.clone();
+        let expected_revision = state.session_revision;
+        let expected_selection_revision = state.selection_revision;
+        let preference_epoch = self.runtime_preference_write_fence.begin(&desired.agent_id);
+        self.runtime_selection_requests_in_flight
+            .insert(session_key.clone());
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let outcome = runtime
+                .agent()
+                .runtime_selection()
+                .set_desired_runtime(SetDesiredAgentSessionRuntimeRequest {
+                    session_id: runner_session_id.clone(),
+                    idempotency_key: format!("desktop-runtime:{}", unix_timestamp_ms()),
+                    expected_revision,
+                    expected_selection_revision,
+                    desired,
+                    interaction: RuntimeSelectionInteraction::Seamless,
+                })
+                .await;
+            let observed = outcome
+                .is_err()
+                .then(|| {
+                    runtime
+                        .agent()
+                        .runtime_selection()
+                        .get_selection_state(&runner_session_id)
+                        .ok()
+                })
+                .flatten();
+            (outcome, observed)
+        });
+        cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let result = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.runtime_selection_requests_in_flight
+                        .remove(&session_key);
+                    match result {
+                        Ok((outcome, observed)) => match outcome {
+                            Ok(state) => {
+                                let persisted = state.desired.clone();
+                                this.apply_runtime_selection_state(
+                                    &requested_session_id,
+                                    state,
+                                    cx,
+                                );
+                                this.remember_runtime_selection_if_current(
+                                    &persisted,
+                                    preference_epoch,
+                                );
+                            }
+                            Err(error) => {
+                                if let Some(state) = observed {
+                                    this.apply_runtime_selection_state(
+                                        &requested_session_id,
+                                        state,
+                                        cx,
+                                    );
+                                }
+                                let target_is_still_current = this
+                                    .optimistic_runtime_selections
+                                    .get(requested_session_id.as_str())
+                                    == Some(&requested_desired);
+                                if target_is_still_current
+                                    && !matches!(
+                                        error.code.as_str(),
+                                        "runtime_switch_revision_conflict"
+                                            | "desired_selection_revision_conflict"
+                                    )
+                                {
+                                    this.optimistic_runtime_selections
+                                        .remove(requested_session_id.as_str());
+                                    if this.selected_session_id.as_ref()
+                                        == Some(&requested_session_id)
+                                    {
+                                        this.agent_error =
+                                            Some(format!("{}: {}", error.code, error.message));
+                                        this.refresh_active_suggestions(
+                                            ComposerTarget::Session,
+                                            cx,
+                                        );
+                                    }
+                                }
+                            }
+                        },
+                        Err(error) => {
+                            if this
+                                .optimistic_runtime_selections
+                                .get(requested_session_id.as_str())
+                                == Some(&requested_desired)
+                            {
+                                this.optimistic_runtime_selections
+                                    .remove(requested_session_id.as_str());
+                                if this.selected_session_id.as_ref() == Some(&requested_session_id)
+                                {
+                                    this.agent_error =
+                                        Some(format!("runtime switch failed: {error}"));
+                                    this.refresh_active_suggestions(ComposerTarget::Session, cx);
+                                }
+                            }
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        )
+        .detach();
+    }
+
     fn selected_agent_session_state(&self) -> Option<AgentSessionState> {
         let selected_session_id = self.selected_session_id.as_ref()?;
         let state = self
@@ -6068,6 +6403,18 @@ impl VibexWorkbench {
         {
             return timeline_conversation_turns(&items, Some(AgentSessionState::Running), true);
         }
+        if let Some(items) = self
+            .selected_session_id
+            .as_ref()
+            .and_then(|session_id| self.optimistic_user_messages.get(session_id.as_str()))
+            .and_then(|message| message.projected_items(&self.timeline))
+        {
+            return timeline_conversation_turns(
+                &items,
+                self.selected_agent_session_state(),
+                self.agent_turn_pending,
+            );
+        }
         self.timeline
             .conversation_turns(self.selected_agent_session_state(), self.agent_turn_pending)
     }
@@ -6084,6 +6431,11 @@ impl VibexWorkbench {
                 .pending_user_message_edit
                 .as_ref()
                 .map(PendingUserMessageEdit::cache_key),
+            optimistic_message: self
+                .selected_session_id
+                .as_ref()
+                .and_then(|session_id| self.optimistic_user_messages.get(session_id.as_str()))
+                .map(OptimisticUserMessage::cache_key),
         }
     }
 
@@ -6267,6 +6619,7 @@ impl VibexWorkbench {
         if runtime_initializing {
             self.agent_projection_task = None;
             self.runtime_heartbeat_task = None;
+            self.load_agent_session_projection(runtime.clone(), session_id.clone(), generation, cx);
             if let Some(previous_session_id) = previous_session_id
                 && previous_session_id != session_id
             {
@@ -6325,6 +6678,7 @@ impl VibexWorkbench {
                             }
                             this.timeline
                                 .replace_authoritative(session_id.clone(), items);
+                            this.reconcile_optimistic_user_message();
                             if let Some(session_updated_at_ms) = this
                                 .sessions
                                 .iter()
@@ -6413,8 +6767,7 @@ impl VibexWorkbench {
                     }
                     match outcome {
                         Ok(Ok(selection)) => {
-                            this.runtime_selection = Some(selection);
-                            this.refresh_active_suggestions(ComposerTarget::Session, cx);
+                            this.apply_runtime_selection_state(&session_id, selection, cx);
                         }
                         Ok(Err(error)) => {
                             this.agent_error = Some(format!("{}: {}", error.code, error.message));
@@ -6559,6 +6912,9 @@ impl VibexWorkbench {
     ) {
         let policy = runtime.polling_policy();
         let (signal_tx, mut signal_rx) = mpsc::unbounded_channel();
+        let poll_session_id = session_id.clone();
+        let session_id = session_id;
+        let runner_session_id = poll_session_id.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             let mut after_sequence = after_sequence;
             let mut idle_poll_count = 0_u16;
@@ -6610,7 +6966,7 @@ impl VibexWorkbench {
                     }
                     if let Ok(usage) = runtime_token_usage_snapshot(&runtime, &session_id) {
                         let _ = signal_tx.send(AgentPollSignal::RuntimeUsage {
-                            session_id: session_id.clone(),
+                            session_id: runner_session_id.clone(),
                             usage,
                         });
                     }
@@ -6660,18 +7016,11 @@ impl VibexWorkbench {
                                     changed
                                 }
                                 AgentPollSignal::RuntimeSelection(state) => {
-                                    let changed = if this.runtime_selection.as_ref()
-                                        == Some(state.as_ref())
-                                    {
-                                        false
-                                    } else {
-                                        this.runtime_selection = Some(*state);
-                                        this.refresh_active_suggestions(
-                                            ComposerTarget::Session,
-                                            cx,
-                                        );
-                                        true
-                                    };
+                                    let changed = this.apply_runtime_selection_state(
+                                        &poll_session_id,
+                                        *state,
+                                        cx,
+                                    );
                                     agent_projection_should_repaint(
                                         &this.ui_state.workbench.active_tab,
                                         changed,
@@ -6749,6 +7098,7 @@ impl VibexWorkbench {
             .then(|| agent_streaming_delta_updates(&events))
             .flatten();
         let changed = self.timeline.apply_live_batch(events);
+        let optimistic_reconciled = changed > 0 && self.reconcile_optimistic_user_message();
         if changed > 0 {
             if let Some(session_updated_at_ms) = self
                 .sessions
@@ -6765,7 +7115,7 @@ impl VibexWorkbench {
                 );
             }
             let mut streaming_cache_update = None;
-            if updates_existing_item {
+            if updates_existing_item || optimistic_reconciled {
                 self.invalidate_timeline_render_caches();
             } else if !self.timeline.needs_authoritative_refetch
                 && let Some(updates) = streaming_updates.as_deref()
@@ -6834,16 +7184,15 @@ impl VibexWorkbench {
                 agent_projection_should_repaint(&self.ui_state.workbench.active_tab, changed)
             }
             DesktopEvent::RuntimeSelection(event) => {
-                let changed = if event.event.as_ref().is_some_and(|projection| {
-                    self.selected_session_id.as_ref() == Some(&projection.session_id)
-                }) {
-                    if self.runtime_selection.as_ref() == Some(&event.state) {
-                        false
-                    } else {
-                        self.runtime_selection = Some(event.state);
-                        self.refresh_active_suggestions(ComposerTarget::Session, cx);
-                        true
-                    }
+                let changed = if let Some(session_id) = event
+                    .event
+                    .as_ref()
+                    .filter(|projection| {
+                        self.selected_session_id.as_ref() == Some(&projection.session_id)
+                    })
+                    .map(|projection| projection.session_id.clone())
+                {
+                    self.apply_runtime_selection_state(&session_id, event.state, cx)
                 } else if event.event.is_none() {
                     self.timeline.mark_lagged();
                     self.refresh_selected_agent_timeline(cx);
@@ -7463,13 +7812,14 @@ impl VibexWorkbench {
                     cx.notify();
                     return;
                 };
+                let selection = self.selected_runtime_selection();
                 (
-                    self.runtime_selection
+                    selection
                         .as_ref()
-                        .map(|state| state.desired.agent_id.clone()),
-                    self.runtime_selection
+                        .map(|selection| selection.agent_id.clone()),
+                    selection
                         .as_ref()
-                        .map(|state| state.desired.provider_profile_id.clone()),
+                        .map(|selection| selection.provider_profile_id.clone()),
                     Some(session.id),
                     Some(session.workspace_id),
                 )
@@ -7884,11 +8234,7 @@ impl VibexWorkbench {
         }
         let runtime = self.runtime.clone()?;
         let session_id = self.selected_session_id.clone()?;
-        let Some(selection) = self
-            .runtime_selection
-            .as_ref()
-            .map(|state| state.desired.clone())
-        else {
+        let Some(selection) = self.selected_runtime_selection() else {
             self.agent_error = Some("Runtime selection is not ready".into());
             return None;
         };
@@ -10909,9 +11255,8 @@ impl VibexWorkbench {
             self.new_session_attachments.clear();
             self.new_session_command_entry = None;
             let preferred_agent = self
-                .runtime_selection
-                .as_ref()
-                .map(|state| state.desired.agent_id.clone())
+                .selected_runtime_selection()
+                .map(|selection| selection.agent_id)
                 .or_else(|| self.new_session_agent_id.clone());
             self.new_session_agent_id =
                 default_new_session_agent_id(&self.agent_snapshots, preferred_agent.as_ref());
@@ -11288,26 +11633,24 @@ impl VibexWorkbench {
         value: String,
         cx: &mut Context<Self>,
     ) {
-        if self.agent_action_pending {
+        if self.agent_action_pending && matches!(target, RuntimeFeatureTarget::NewSession) {
             return;
         }
         let selection = match target {
-            RuntimeFeatureTarget::NewSession => self.new_session_runtime_selection.as_ref(),
-            RuntimeFeatureTarget::ActiveSession => {
-                self.runtime_selection.as_ref().map(|state| &state.desired)
-            }
+            RuntimeFeatureTarget::NewSession => self.new_session_runtime_selection.clone(),
+            RuntimeFeatureTarget::ActiveSession => self.selected_runtime_selection(),
         };
         let (Some(catalog), Some(selection)) = (self.runtime_catalog.as_ref(), selection) else {
             return;
         };
-        let Some(feature) = runtime_feature_for_selection(catalog, selection, feature_id) else {
+        let Some(feature) = runtime_feature_for_selection(catalog, &selection, feature_id) else {
             return;
         };
         if !feature.accepts_value(&value) {
             return;
         }
         self.runtime_choice_menu_open = None;
-        let mut next = selection.clone();
+        let mut next = selection;
         next.config_values.insert(feature.id.clone(), value);
         match target {
             RuntimeFeatureTarget::NewSession => {
@@ -11539,6 +11882,9 @@ impl VibexWorkbench {
         );
         let title = session_title_from_first_message(&text);
         let has_initial_message = !text.trim().is_empty() || !attachments.is_empty();
+        let deferred_creation = command_invocation.is_none();
+        let optimistic_item_id = TimelineItemId::new();
+        let optimistic_submitted_at_ms = unix_timestamp_ms();
         self.new_session_workspace.begin_submission();
         self.agent_action_pending = true;
         self.new_session_error = None;
@@ -11572,28 +11918,49 @@ impl VibexWorkbench {
                     ensure_temporary_session_root()
                         .map(|root| (root, WorkspaceMode::CurrentCheckout))
                 })?;
-            let session = runtime
-                .agent()
-                .manager()
-                .create_session(CreateAgentSessionRequest {
-                    runtime: selection.clone(),
-                    workspace_root,
-                    workspace_mode,
-                    title,
-                    safety: None,
-                })
-                .await?;
+            let create_request = CreateAgentSessionRequest {
+                runtime: selection.clone(),
+                workspace_root,
+                workspace_mode,
+                title,
+                safety: None,
+            };
+            let session = if deferred_creation {
+                runtime
+                    .agent()
+                    .manager()
+                    .create_session_deferred(create_request)
+                    .await?
+            } else {
+                runtime
+                    .agent()
+                    .manager()
+                    .create_session(create_request)
+                    .await?
+            };
             let workspaces = runtime.workspace().list().ok();
             let session_id = session.id.clone();
             let message_runtime = runtime.clone();
+            let optimistic_message =
+                (has_initial_message && deferred_creation).then(|| OptimisticUserMessage {
+                    session_id: session.id.clone(),
+                    item_id: optimistic_item_id,
+                    after_sequence: 0,
+                    submitted_at_ms: optimistic_submitted_at_ms,
+                    text: text.clone(),
+                    attachments: attachments.clone(),
+                });
             let initial_message = if has_initial_message {
+                let initial_text = text;
+                let initial_attachments = attachments;
+                let initial_selection = selection.clone();
                 Some(async move {
                     let desired_runtime = message_runtime
                         .agent()
                         .runtime_selection()
                         .get_selection_state(&session_id)
                         .map(|state| state.effective)
-                        .unwrap_or(selection);
+                        .unwrap_or(initial_selection);
                     let reasoning_effort = desired_runtime.reasoning_effort.clone();
                     if let Some(invocation) = command_invocation {
                         message_runtime
@@ -11608,7 +11975,7 @@ impl VibexWorkbench {
                                 command_name: invocation.command_name,
                                 arguments: invocation.arguments,
                                 prompt_id: invocation.prompt_id,
-                                attachments,
+                                attachments: initial_attachments.clone(),
                                 reasoning_effort,
                                 correlation_id: None,
                             })
@@ -11626,8 +11993,8 @@ impl VibexWorkbench {
                                     unix_timestamp_ms()
                                 ),
                                 desired_runtime,
-                                text,
-                                attachments,
+                                text: initial_text,
+                                attachments: initial_attachments,
                                 reasoning_effort,
                                 correlation_id: None,
                             })
@@ -11644,6 +12011,7 @@ impl VibexWorkbench {
                     session.clone(),
                     workspaces,
                     has_initial_message,
+                    optimistic_message,
                 ),
                 initial_message,
             )
@@ -11695,6 +12063,7 @@ impl VibexWorkbench {
                         session,
                         workspaces,
                         has_initial_message,
+                        optimistic_message,
                     ) => {
                         let update = entity.update_in(cx, |this, window, cx| {
                             if let Some(workspaces) = workspaces {
@@ -11715,7 +12084,7 @@ impl VibexWorkbench {
                                         } else {
                                             NewSessionSubmissionStage::StartingAgent
                                         });
-                                    this.select_session_with_history(session_id, false, cx);
+                                    this.select_session_with_history(session_id.clone(), false, cx);
                                     if has_initial_message {
                                         this.rebuild_timeline_sizes();
                                         Some(this.session_generation)
@@ -11726,6 +12095,9 @@ impl VibexWorkbench {
                                     this.agent_action_pending = false;
                                     None
                                 };
+                            if let Some(optimistic_message) = optimistic_message {
+                                this.install_optimistic_user_message(optimistic_message);
+                            }
                             this.clear_submitted_new_session_draft(window, cx);
                             this.refresh_workspace_contexts(cx);
                             cx.notify();
@@ -11752,6 +12124,9 @@ impl VibexWorkbench {
                         initial_message_error,
                         refreshed_session,
                     ))) => {
+                        if initial_message_error.is_some() {
+                            this.discard_optimistic_user_message(&session_id);
+                        }
                         if let Some(session) = refreshed_session {
                             this.upsert_session_snapshot(session);
                         }
@@ -11775,6 +12150,9 @@ impl VibexWorkbench {
                         this.refresh_workspace_contexts(cx);
                     }
                     Ok(Err(error)) => {
+                        if let Some(session_id) = created_session_id.as_ref() {
+                            this.discard_optimistic_user_message(session_id);
+                        }
                         if this.session_generation == generation && this.new_session_open {
                             this.restore_new_session_message_draft(
                                 draft_raw_text.clone(),
@@ -11789,6 +12167,9 @@ impl VibexWorkbench {
                         }
                     }
                     Err(error) => {
+                        if let Some(session_id) = created_session_id.as_ref() {
+                            this.discard_optimistic_user_message(session_id);
+                        }
                         if this.session_generation == generation && this.new_session_open {
                             this.restore_new_session_message_draft(
                                 draft_raw_text,
@@ -11827,10 +12208,7 @@ impl VibexWorkbench {
         self.composer_runtime_menu_open = open;
         if open {
             self.runtime_choice_menu_open = None;
-            let selection = self
-                .runtime_selection
-                .as_ref()
-                .map(|state| state.desired.clone());
+            let selection = self.selected_runtime_selection();
             self.composer_runtime_menu_view = if selection.is_some() {
                 ComposerRuntimeMenuView::Model
             } else {
@@ -11938,82 +12316,24 @@ impl VibexWorkbench {
         retry_same_desired: bool,
         cx: &mut Context<Self>,
     ) {
-        if self.agent_action_pending {
-            return;
-        }
-        let (Some(runtime), Some(session_id), Some(state)) = (
-            self.runtime.clone(),
+        let (Some(session_id), Some(state)) = (
             self.selected_session_id.clone(),
             self.runtime_selection.clone(),
         ) else {
             return;
         };
-        if !retry_same_desired && desired == state.desired {
+        let request_in_flight = self
+            .runtime_selection_requests_in_flight
+            .contains(session_id.as_str());
+        if !retry_same_desired && desired == state.desired && !request_in_flight {
             self.remember_runtime_selection(&desired);
             return;
         }
-        let runtime_preference_epoch = self.runtime_preference_write_fence.begin(&desired.agent_id);
-        self.agent_action_pending = true;
-        let generation = self.session_generation;
-        let requested_session_id = session_id.clone();
-        let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
-                .agent()
-                .runtime_selection()
-                .set_desired_runtime(SetDesiredAgentSessionRuntimeRequest {
-                    session_id,
-                    idempotency_key: format!("desktop-runtime:{}", unix_timestamp_ms()),
-                    expected_revision: state.session_revision,
-                    expected_selection_revision: state.selection_revision,
-                    desired,
-                    interaction: RuntimeSelectionInteraction::Seamless,
-                })
-                .await
-        });
-        self.agent_action_task = Some(cx.spawn(
-            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let outcome = runner.await;
-                let _ = entity.update(cx, |this, cx| {
-                    let active = this.session_generation == generation
-                        && this.selected_session_id.as_ref() == Some(&requested_session_id);
-                    match outcome {
-                        Ok(Ok(state)) if active => {
-                            this.agent_action_pending = false;
-                            let desired = state.desired.clone();
-                            this.runtime_selection = Some(state);
-                            this.remember_runtime_selection_if_current(
-                                &desired,
-                                runtime_preference_epoch,
-                            );
-                            this.refresh_active_suggestions(ComposerTarget::Session, cx);
-                        }
-                        Ok(Ok(state)) => {
-                            let desired = state.desired.clone();
-                            if let Some(entry) = this
-                                .agent_session_view_cache
-                                .get_mut(requested_session_id.as_str())
-                            {
-                                entry.runtime_selection = Some(state);
-                            }
-                            this.remember_runtime_selection_if_current(
-                                &desired,
-                                runtime_preference_epoch,
-                            );
-                        }
-                        Ok(Err(error)) if active => {
-                            this.agent_action_pending = false;
-                            this.agent_error = Some(format!("{}: {}", error.code, error.message));
-                        }
-                        Err(error) if active => {
-                            this.agent_action_pending = false;
-                            this.agent_error = Some(format!("runtime switch failed: {error}"));
-                        }
-                        Ok(Err(_)) | Err(_) => {}
-                    }
-                    cx.notify();
-                });
-            },
-        ));
+        self.optimistic_runtime_selections
+            .insert(session_id.as_str().to_string(), desired);
+        self.refresh_active_suggestions(ComposerTarget::Session, cx);
+        self.request_pending_runtime_selection(&session_id, &state, retry_same_desired, cx);
+        cx.notify();
     }
 
     fn cancel_runtime_switch(&mut self, cx: &mut Context<Self>) {
@@ -12029,8 +12349,11 @@ impl VibexWorkbench {
         ) else {
             return;
         };
+        self.optimistic_runtime_selections
+            .remove(session_id.as_str());
         self.agent_action_pending = true;
         let generation = self.session_generation;
+        let requested_session_id = session_id.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             runtime
                 .agent()
@@ -12051,8 +12374,7 @@ impl VibexWorkbench {
                     this.agent_action_pending = false;
                     match outcome {
                         Ok(Ok(state)) => {
-                            this.runtime_selection = Some(state);
-                            this.refresh_active_suggestions(ComposerTarget::Session, cx);
+                            this.apply_runtime_selection_state(&requested_session_id, state, cx);
                         }
                         Ok(Err(error)) => {
                             this.agent_error = Some(format!("{}: {}", error.code, error.message));
@@ -12638,13 +12960,10 @@ impl VibexWorkbench {
         let mut results = Vec::new();
         for session in sessions {
             let selected = self.selected_session_id.as_ref() == Some(&session.id);
-            let selected_desired_agent_id = selected
-                .then(|| {
-                    self.runtime_selection
-                        .as_ref()
-                        .map(|state| &state.desired.agent_id)
-                })
-                .flatten();
+            let selected_runtime = selected.then(|| self.selected_runtime_selection());
+            let selected_desired_agent_id = selected_runtime
+                .as_ref()
+                .and_then(|selection| selection.as_ref().map(|selection| &selection.agent_id));
             let cached_desired_agent_id = self
                 .agent_session_view_cache
                 .get(session.id.as_str())
@@ -15624,13 +15943,10 @@ impl VibexWorkbench {
                 );
                 (tooltip, lifecycle_state)
             });
-        let selected_desired_agent_id = selected
-            .then(|| {
-                self.runtime_selection
-                    .as_ref()
-                    .map(|state| &state.desired.agent_id)
-            })
-            .flatten();
+        let selected_runtime = selected.then(|| self.selected_runtime_selection());
+        let selected_desired_agent_id = selected_runtime
+            .as_ref()
+            .and_then(|selection| selection.as_ref().map(|selection| &selection.agent_id));
         let cached_desired_agent_id = self
             .agent_session_view_cache
             .get(&session_id_string)
@@ -18681,6 +18997,21 @@ impl VibexWorkbench {
         let Some(state) = self.runtime_selection.clone() else {
             return div().into_any_element();
         };
+        if self.selected_session_id.as_ref().is_some_and(|session_id| {
+            self.optimistic_runtime_selections
+                .contains_key(session_id.as_str())
+        }) {
+            return div().into_any_element();
+        }
+        if self.agent_turn_pending
+            && matches!(
+                state.status,
+                SessionRuntimeSelectionStatus::Preparing
+                    | SessionRuntimeSelectionStatus::WaitingForCurrentWork
+            )
+        {
+            return div().into_any_element();
+        }
         // The selected runtime is already visible in the composer selectors;
         // avoid reserving a persistent banner for the normal ready state.
         if !runtime_status_banner_is_visible(state.status) {
@@ -21222,6 +21553,12 @@ impl VibexWorkbench {
                     _ => None,
                 })
                 .unwrap_or_default()
+        };
+        let attachments = if attachments.is_empty() {
+            self.optimistic_user_message_attachments_for_row(row)
+                .unwrap_or(attachments)
+        } else {
+            attachments
         };
         let edit_attachments = attachments.clone();
         let timestamp = self.timeline_row_timestamp(row);
@@ -24252,8 +24589,9 @@ impl VibexWorkbench {
         if self.composer_terminal_mode {
             return self.render_composer_terminal(cx);
         }
+        let selected_runtime = self.selected_runtime_selection();
         let can_send = self.selected_session_id.is_some()
-            && self.runtime_selection.is_some()
+            && selected_runtime.is_some()
             && !self.agent_action_pending
             && (!self.composer_input.read(cx).value().trim().is_empty()
                 || !self.composer_attachments.is_empty());
@@ -24283,12 +24621,12 @@ impl VibexWorkbench {
         );
         let auto_continue_toggle_session_id = self.selected_session_id.clone();
         let session_running = agent_turn_is_active(self.agent_turn_pending, session_state);
-        let runtime_projection = self.runtime_selection.as_ref().and_then(|state| {
+        let runtime_projection = selected_runtime.as_ref().and_then(|selection| {
             self.runtime_catalog.as_ref().map(|catalog| {
                 (
-                    state.desired.clone(),
+                    selection.clone(),
                     catalog.clone(),
-                    RuntimeCascadeProjection::from_catalog(catalog, &state.desired),
+                    RuntimeCascadeProjection::from_catalog(catalog, selection),
                 )
             })
         });
@@ -30054,9 +30392,8 @@ impl ExternalImportDialog {
             .workbench
             .read_with(cx, |workbench, _| {
                 workbench
-                    .runtime_selection
-                    .as_ref()
-                    .map(|state| state.desired.provider_profile_id.clone())
+                    .selected_runtime_selection()
+                    .map(|selection| selection.provider_profile_id)
             })
             .ok()
             .flatten();
@@ -32339,6 +32676,7 @@ mod tests {
             session_state: Some(AgentSessionState::Running),
             agent_turn_pending: false,
             pending_edit: None,
+            optimistic_message: None,
         };
         let session_id = timeline.session_id.clone().unwrap();
         let item = timeline_item_with_payload(
@@ -32364,6 +32702,7 @@ mod tests {
             session_state: Some(AgentSessionState::Running),
             agent_turn_pending: false,
             pending_edit: None,
+            optimistic_message: None,
         };
 
         assert!(refresh_conversation_turns_cache_incrementally(
@@ -36175,8 +36514,10 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn cancel_runtime_switch("))
             .map(|(body, _)| body)
             .expect("runtime selection should remain inspectable");
-        assert!(runtime_switch.contains("if self.agent_action_pending"));
+        assert!(!runtime_switch.contains("if self.agent_action_pending"));
         assert!(!runtime_switch.contains("agent_turn_pending"));
+        assert!(runtime_switch.contains("self.optimistic_runtime_selections"));
+        assert!(runtime_switch.contains("request_pending_runtime_selection"));
     }
 
     #[test]
@@ -37590,6 +37931,45 @@ mod tests {
     }
 
     #[test]
+    fn optimistic_user_message_projects_until_matching_authoritative_row_arrives() {
+        let session_id = VibexSessionId::parse("session_optimistic_message").unwrap();
+        let attachment = MessageAttachment {
+            label: "notes.txt".into(),
+            mime_type: Some("text/plain".into()),
+            uri: None,
+            inline_text_offset: None,
+        };
+        let optimistic = OptimisticUserMessage {
+            session_id: session_id.clone(),
+            item_id: TimelineItemId::new(),
+            after_sequence: 1,
+            submitted_at_ms: 20,
+            text: "  first prompt  ".into(),
+            attachments: vec![attachment.clone()],
+        };
+        let timeline = TimelineModel::default();
+        let projected = optimistic.projected_items(&timeline).unwrap();
+        assert_eq!(projected.len(), 1);
+        assert_eq!(timeline.items.len(), 0);
+        assert_eq!(projected[0].sequence, 1);
+
+        let mut timeline = TimelineModel::default();
+        timeline.replace_authoritative(
+            session_id.clone(),
+            [timeline_item_with_payload(
+                &session_id,
+                2,
+                TimelineSource::User,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "first prompt".into(),
+                    attachments: vec![attachment.clone()],
+                }),
+            )],
+        );
+        assert!(optimistic.projected_items(&timeline).is_none());
+    }
+
+    #[test]
     fn title_bar_uses_the_workspace_leaf_name() {
         assert_eq!(workspace_display_name("/home/user/code/vibex"), "vibex");
         assert_eq!(workspace_display_name("/home/user/code/vibex/"), "vibex");
@@ -37610,10 +37990,11 @@ mod tests {
             .find("NewSessionCreateSignal::WorkspaceReady")
             .expect("authoritative Workspace should be announced immediately");
         let session_create = submit
-            .find(".create_session(CreateAgentSessionRequest")
+            .find(".create_session_deferred(create_request)")
             .expect("Session should be created after the Workspace is ready");
         assert!(worktree_create < workspace_ready);
         assert!(workspace_ready < session_create);
+        assert!(submit.contains(".create_session(create_request)"));
         assert!(submit.contains(".with_idempotency_key("));
         assert!(submit.contains(".with_expected_revision("));
         assert!(submit.contains("mark_workspace_ready(workspace.clone())"));
