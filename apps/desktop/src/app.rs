@@ -2326,6 +2326,36 @@ fn agent_text_append_batch(events: &[TimelineLiveEvent]) -> bool {
         })
 }
 
+fn update_unread_agent_completions(
+    unread_session_ids: &mut BTreeSet<String>,
+    selected_session_id: Option<&VibexSessionId>,
+    events: &[TimelineLiveEvent],
+) -> bool {
+    let previous_len = unread_session_ids.len();
+    for event in events {
+        if selected_session_id == Some(&event.session_id)
+            || event.sequence != event.item.sequence
+            || event.session_id != event.item.session_id
+        {
+            continue;
+        }
+        if matches!(
+            &event.item.payload,
+            TimelinePayload::AgentMessage(message) if message.is_final
+        ) {
+            unread_session_ids.insert(event.session_id.as_str().to_string());
+        }
+    }
+    unread_session_ids.len() != previous_len
+}
+
+fn mark_agent_session_read(
+    unread_session_ids: &mut BTreeSet<String>,
+    session_id: &VibexSessionId,
+) -> bool {
+    unread_session_ids.remove(session_id.as_str())
+}
+
 fn record_timeline_row_endpoint(item_ids: &mut Vec<String>, item_id: String) {
     match item_ids.len() {
         0 => item_ids.push(item_id),
@@ -3288,6 +3318,7 @@ pub struct VibexWorkbench {
     agent_action_pending: bool,
     fork_session_pending: bool,
     pending_agent_turn_session_ids: BTreeSet<String>,
+    unread_agent_completion_session_ids: BTreeSet<String>,
     agent_turn_pending: bool,
     auto_continue_default_project_ids: BTreeSet<String>,
     auto_continue_session_ids: BTreeSet<String>,
@@ -3820,6 +3851,7 @@ impl VibexWorkbench {
             agent_action_pending: false,
             fork_session_pending: false,
             pending_agent_turn_session_ids: BTreeSet::new(),
+            unread_agent_completion_session_ids: BTreeSet::new(),
             agent_turn_pending: false,
             auto_continue_default_project_ids,
             auto_continue_session_ids,
@@ -6061,6 +6093,7 @@ impl VibexWorkbench {
     ) {
         self.new_session_open = false;
         self.new_session_error = None;
+        mark_agent_session_read(&mut self.unread_agent_completion_session_ids, &session_id);
         let Some(runtime) = self.runtime.clone() else {
             return;
         };
@@ -6612,15 +6645,20 @@ impl VibexWorkbench {
         events: Vec<TimelineLiveEvent>,
         cx: &mut Context<Self>,
     ) -> bool {
+        let unread_changed = update_unread_agent_completions(
+            &mut self.unread_agent_completion_session_ids,
+            self.selected_session_id.as_ref(),
+            &events,
+        );
         let Some(selected_session_id) = self.selected_session_id.clone() else {
-            return false;
+            return unread_changed;
         };
         let events = events
             .into_iter()
             .filter(|event| event.session_id == selected_session_id)
             .collect::<Vec<_>>();
         if events.is_empty() {
-            return false;
+            return unread_changed;
         }
 
         let previous_end_sequence = self.timeline.authoritative_end_sequence;
@@ -6701,7 +6739,7 @@ impl VibexWorkbench {
         if needs_refetch {
             self.refresh_selected_agent_timeline(cx);
         }
-        changed > 0 || needs_refetch
+        unread_changed || changed > 0 || needs_refetch
     }
 
     fn apply_desktop_event(&mut self, event: DesktopEvent, cx: &mut Context<Self>) -> bool {
@@ -12250,6 +12288,8 @@ impl VibexWorkbench {
             .retain(|session_id| !session_ids.contains(session_id));
         self.pending_agent_turn_session_ids
             .retain(|session_id| !session_ids.contains(session_id));
+        self.unread_agent_completion_session_ids
+            .retain(|session_id| !session_ids.contains(session_id));
         self.session_search_index
             .retain(|session_id, _| !session_ids.contains(session_id));
         if self
@@ -15631,6 +15671,10 @@ impl VibexWorkbench {
         let display_state =
             sidebar_session_display_state(session.state, self.session_turn_pending(&session.id));
         let session_generating = display_state == AgentSessionState::Running;
+        let has_unread_completion = !selected
+            && self
+                .unread_agent_completion_session_ids
+                .contains(session.id.as_str());
         let state_label = (display_state != AgentSessionState::Error)
             .then(|| sidebar_session_state_label(display_state, strings))
             .flatten();
@@ -15893,6 +15937,16 @@ impl VibexWorkbench {
                                     )
                                 })
                                 .when(state_label.is_none(), |this| this.child(time_label))
+                            })
+                            .when(has_unread_completion, |this| {
+                                this.child(
+                                    div()
+                                        .id(format!("sidebar-session-unread-{session_id_string}"))
+                                        .size(px(7.0))
+                                        .flex_none()
+                                        .rounded_full()
+                                        .bg(cx.theme().primary),
+                                )
                             }),
                     ),
             )
@@ -32086,6 +32140,64 @@ mod tests {
         let updates = agent_streaming_delta_updates(&events).unwrap();
         assert_eq!(updates.len(), 1);
         assert!(!updates[0].conclusion);
+    }
+
+    #[test]
+    fn unread_completion_tracks_only_final_messages_from_background_sessions() {
+        let selected_session_id = VibexSessionId::new();
+        let background_session_id = VibexSessionId::new();
+        let final_item = indexed_timeline_item(&background_session_id, 1, "done");
+        let final_event = TimelineLiveEvent {
+            session_id: background_session_id.clone(),
+            sequence: final_item.sequence,
+            item: final_item,
+        };
+        let streaming_item = timeline_item_with_payload(
+            &background_session_id,
+            2,
+            TimelineSource::Agent,
+            TimelinePayload::AgentMessage(AgentMessagePayload {
+                text: "still working".into(),
+                is_final: false,
+            }),
+        );
+        let streaming_event = TimelineLiveEvent {
+            session_id: background_session_id.clone(),
+            sequence: streaming_item.sequence,
+            item: streaming_item,
+        };
+        let mut unread = BTreeSet::new();
+
+        assert!(!update_unread_agent_completions(
+            &mut unread,
+            Some(&selected_session_id),
+            &[streaming_event]
+        ));
+        assert!(update_unread_agent_completions(
+            &mut unread,
+            Some(&selected_session_id),
+            std::slice::from_ref(&final_event)
+        ));
+        assert!(unread.contains(background_session_id.as_str()));
+        assert!(!update_unread_agent_completions(
+            &mut unread,
+            Some(&selected_session_id),
+            std::slice::from_ref(&final_event)
+        ));
+        assert!(mark_agent_session_read(&mut unread, &background_session_id));
+        assert!(unread.is_empty());
+
+        let selected_item = indexed_timeline_item(&selected_session_id, 1, "visible");
+        assert!(!update_unread_agent_completions(
+            &mut unread,
+            Some(&selected_session_id),
+            &[TimelineLiveEvent {
+                session_id: selected_session_id.clone(),
+                sequence: selected_item.sequence,
+                item: selected_item,
+            }]
+        ));
+        assert!(unread.is_empty());
     }
 
     #[test]
