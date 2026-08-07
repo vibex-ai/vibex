@@ -2871,7 +2871,11 @@ fn select_npm_bin(metadata: &NpmPackageMetadata, package: &str) -> VibexResult<S
         NpmBin::Multiple(bins) => {
             let preferred = package.rsplit('/').next().unwrap_or(package);
             bins.get(preferred)
-                .or_else(|| (bins.len() == 1).then(|| bins.values().next()).flatten())
+                .or_else(|| {
+                    let mut paths = bins.values();
+                    let path = paths.next()?;
+                    paths.all(|candidate| candidate == path).then_some(path)
+                })
                 .ok_or_else(|| {
                     VibexError::validation(
                         "agent_npm_bin_missing",
@@ -4474,6 +4478,27 @@ mod tests {
             ]))),
         };
         assert!(select_npm_bin(&metadata, "@scope/agent").is_err());
+    }
+
+    #[test]
+    fn npm_executable_selection_accepts_aliases_for_the_same_path() {
+        let metadata = NpmPackageMetadata {
+            name: "@tencent-ai/codebuddy-code".to_string(),
+            version: "2.106.7".to_string(),
+            dist: NpmDist {
+                integrity: None,
+                tarball: None,
+            },
+            bin: Some(NpmBin::Multiple(BTreeMap::from([
+                ("cbc".to_string(), "bin/codebuddy".to_string()),
+                ("codebuddy".to_string(), "bin/codebuddy".to_string()),
+            ]))),
+        };
+
+        assert_eq!(
+            select_npm_bin(&metadata, "@tencent-ai/codebuddy-code").unwrap(),
+            "bin/codebuddy"
+        );
     }
 
     #[cfg(unix)]
