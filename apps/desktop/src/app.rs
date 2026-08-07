@@ -23079,13 +23079,7 @@ impl VibexWorkbench {
             self.last_visibility.layout.viewport_width as f32,
             self.last_visibility.layout.viewport_height as f32,
         );
-        let mut content = h_flex()
-            .min_w_0()
-            .max_w_full()
-            .flex_wrap()
-            .items_baseline()
-            .whitespace_normal()
-            .text_sm();
+        let mut content = user_message_inline_layout();
 
         for (index, segment) in user_message_inline_segments(&text, &attachments)
             .into_iter()
@@ -32049,6 +32043,16 @@ fn render_user_message_text_segment(
         .whitespace_normal()
 }
 
+fn user_message_inline_layout() -> gpui::Div {
+    h_flex()
+        .min_w_0()
+        .max_w_full()
+        .flex_wrap()
+        .items_start()
+        .whitespace_normal()
+        .text_sm()
+}
+
 fn render_user_message_bubble(
     body: AnyElement,
     background: gpui::Hsla,
@@ -33040,6 +33044,11 @@ mod tests {
         measured_height: Rc<Cell<f32>>,
     }
 
+    struct UserMessageInlineLayoutProbe {
+        attachment_top: Rc<Cell<f32>>,
+        text_top: Rc<Cell<f32>>,
+    }
+
     impl Render for UserMessageBubbleLayoutProbe {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let measured_width = self.measured_width.clone();
@@ -33068,6 +33077,33 @@ mod tests {
                     // The hidden hover actions still participate in the row's intrinsic width.
                     .child(div().w(px(132.0)).h(px(24.0))),
             )
+        }
+    }
+
+    impl Render for UserMessageInlineLayoutProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let attachment_top = self.attachment_top.clone();
+            let text_top = self.text_top.clone();
+            user_message_inline_layout()
+                .w(px(320.0))
+                .child(div().w(px(148.0)).h(px(26.0)).flex_none().on_prepaint(
+                    move |bounds, _, _| {
+                        attachment_top.set(f32::from(bounds.origin.y));
+                    },
+                ))
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .on_prepaint(move |bounds, _, _| {
+                            text_top.set(f32::from(bounds.origin.y));
+                        })
+                        .child(render_user_message_text_segment(
+                            "user-message-inline-layout-probe",
+                            "这段正文需要换成两行，附件仍应与正文第一行顶部对齐。".into(),
+                            None,
+                        )),
+                )
         }
     }
 
@@ -37854,6 +37890,33 @@ mod tests {
             observed_height.get() <= 44.5,
             "single-line bubble height: {}",
             observed_height.get()
+        );
+    }
+
+    #[gpui::test]
+    fn user_message_attachment_stays_aligned_with_the_first_text_line(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let attachment_top = Rc::new(Cell::new(-1.0));
+        let text_top = Rc::new(Cell::new(-1.0));
+        let observed_attachment_top = attachment_top.clone();
+        let observed_text_top = text_top.clone();
+        let (_, cx) = cx.add_window_view(|_, _| UserMessageInlineLayoutProbe {
+            attachment_top,
+            text_top,
+        });
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        assert!(observed_attachment_top.get() >= 0.0);
+        assert!(observed_text_top.get() >= 0.0);
+        assert!(
+            (observed_attachment_top.get() - observed_text_top.get()).abs() <= 0.5,
+            "attachment top: {}, text top: {}",
+            observed_attachment_top.get(),
+            observed_text_top.get()
         );
     }
 
