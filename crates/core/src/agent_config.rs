@@ -100,6 +100,7 @@ pub enum AgentInstallStatus {
 pub enum AgentManagedDistributionKind {
     Binary,
     Npm,
+    Uvx,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -443,8 +444,8 @@ pub fn acp_registry_agent_id(agent_id: &AgentId) -> Option<&'static str> {
         "opencode" => return Some("opencode"),
         "pi" => return Some("pi-acp"),
         // These entries are absent from the Registry or do not currently
-        // publish a binary or npm distribution that Vibex can install.
-        "codewhale" | "fast-agent" | "hermes" | "kiro" | "minion-code" => {
+        // publish a supported distribution that Vibex can install.
+        "codewhale" | "hermes" | "kiro" => {
             return None;
         }
         _ => {}
@@ -783,6 +784,13 @@ mod tests {
             acp_registry_agent_id(&AgentId::parse("pi").unwrap()),
             Some("pi-acp")
         );
+        for managed in ["fast-agent", "minion-code"] {
+            assert_eq!(
+                acp_registry_agent_id(&AgentId::parse(managed).unwrap()),
+                Some(managed),
+                "{managed} must use its Registry uvx distribution"
+            );
+        }
         for managed in [
             "cortex-code",
             "crow-cli",
@@ -798,7 +806,7 @@ mod tests {
                 "{managed} must use its Registry binary distribution"
             );
         }
-        for external in ["codewhale", "fast-agent", "hermes", "kiro", "minion-code"] {
+        for external in ["codewhale", "hermes", "kiro"] {
             assert_eq!(
                 acp_registry_agent_id(&AgentId::parse(external).unwrap()),
                 None,

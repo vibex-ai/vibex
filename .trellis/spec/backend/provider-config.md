@@ -2437,6 +2437,7 @@ AgentInstallService::check_update(agent_id).await
 AgentInstallService::uninstall(agent_id).await
 AgentInstallService::bootstrap_agent_ids() -> Vec<AgentId>
 AgentNodeRuntimeOptions { node_path, npm_path }
+AgentUvRuntimeOptions { uv_path }
 AgentManagedInstallationRecord {
   agent_id, registry_agent_id, state, command, install_root, updated_at_ms
 }
@@ -2452,6 +2453,11 @@ AgentManagedInstallationRecord {
   carry a SHA-256. npm distributions must use an exact version, metadata
   integrity, and the canonical `registry.npmjs.org` tarball URL; the lockfile
   `resolved` URL must match that same canonical artifact.
+- Registry `uvx` distributions must use an exact package version in either
+  `package==version` or `package@version` form. The package name is a plain
+  PyPI identity, the version must be exact SemVer, and it must equal the
+  Registry entry version; ranges, URLs, VCS references, and local paths are
+  rejected before `uv` runs.
 - Pi is a managed npm bundle: Vibex installs the Registry-pinned `pi-acp`
   Adapter and the Vibex-pinned `@earendil-works/pi-coding-agent` runtime in the
   same isolated tree. Both direct packages independently pass metadata,
@@ -2465,6 +2471,24 @@ AgentManagedInstallationRecord {
   SemVer 22.0.0 or newer (22.19.0 or newer for Pi), and both version probes must
   succeed; rejection falls through to the next candidate without activating a
   partial installation.
+- `uvx` Agents select `uv` in this order: explicit `VIBEX_AGENT_UV_PATH`, the
+  system `uv` from `PATH`, then a Vibex-managed archive downloaded from the
+  official Astral release endpoint. Every candidate must be a real file and
+  pass `uv --version` with SemVer 0.5.0 or newer. Invalid explicit/system
+  candidates are logged and skipped before managed fallback.
+- Managed `uv` archives fetch the matching `.sha256` sidecar and verify the
+  archive digest before extraction. Verified releases are cached side by side
+  under the Vibex runtime root by detected version and platform; corrupt cache
+  entries are discarded and rebuilt.
+- `uvx` package installs use a Vibex-owned `UV_CACHE_DIR` and managed Python
+  install directory. User/project `UV_*`, `PIP_*`, `PYTHONPATH`, and virtual
+  environment settings are removed; the install uses the PyPI default index,
+  disables keyring providers, and copies packages instead of linking them.
+  Each package is installed into a Python 3.12 relocatable venv inside the
+  staged Agent version. Vibex verifies installed metadata has the exact
+  Registry version and an unambiguous console entry point, then launches it
+  through a metadata-based Python launcher so staging publication does not
+  leave absolute paths behind.
 - npm always uses an isolated Vibex cache and blank user/global npm config,
   regardless of runtime source. The user and global config paths must be
   distinct: npm rejects one file assigned to both configuration levels as a
@@ -2507,6 +2531,10 @@ AgentManagedInstallationRecord {
 - Missing, unexecutable, malformed, pre-22 Node/npm, or pre-22.19 Node/npm for
   Pi -> reject that candidate and continue through system then managed runtime
   fallback.
+- Missing, unexecutable, malformed, or pre-0.5 `uv` -> reject that candidate
+  and continue through system then managed runtime fallback. Missing or
+  non-exact `uvx` package specs, installed-version mismatches, and ambiguous
+  console entry points fail closed without activating a partial install.
 - Identical `npm_config_userconfig` and `npm_config_globalconfig` paths -> an
   invalid internal command configuration; construct distinct blank files and
   do not rely on npm to accept the duplicate load.
@@ -2529,8 +2557,9 @@ AgentManagedInstallationRecord {
   catalog; a later startup does not reinstall it unless the user adds it again.
 - Bad: activate an Agent before checksum/lock verification, use npm's global
   state, assign one blank npm config file to both user and global levels,
-  accept an unprobed or pre-22 Node/npm candidate, silently downgrade, or
-  restore an old exact compatibility workaround for a newer binary.
+  accept an unprobed or pre-22 Node/npm candidate, silently downgrade, accept
+  an unprobed or pre-0.5 `uv`, install a ranged/URL `uvx` package, or restore
+  an old exact compatibility workaround for a newer binary.
 
 ### 6. Tests Required
 
@@ -2538,8 +2567,9 @@ AgentManagedInstallationRecord {
   canonical npm sources, lockfile identity, checksum/archive limits, SemVer
   downgrade rejection, explicit/system/managed Node selection and fallback,
   malformed/old Node rejection, distinct empty user/global npm configs,
-  Pi's dual-package lock and local launcher, interrupted recovery, and uninstall
-  cleanup.
+  Pi's dual-package lock and local launcher, explicit/system/managed `uv`
+  selection and fallback, exact `uvx` parsing, metadata entry-point validation,
+  relocatable Python cache recovery, interrupted recovery, and uninstall cleanup.
 - `cargo test -p vibex-config-switch agent` covers removal of runtime and auth
   snapshots plus managed command/version matching.
 - `cargo test -p vibex-agent-acp runtime` covers dynamic managed identities,

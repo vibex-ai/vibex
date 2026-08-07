@@ -43,15 +43,20 @@ const ARCHIVE_MAX_UNPACKED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const NODE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const UV_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const MINIMUM_NODE_VERSION: semver::Version = semver::Version::new(22, 0, 0);
+const MINIMUM_UV_VERSION: semver::Version = semver::Version::new(0, 5, 0);
 const PI_MINIMUM_NODE_VERSION: semver::Version = semver::Version::new(22, 19, 0);
 const PI_CODING_AGENT_PACKAGE: &str = "@earendil-works/pi-coding-agent";
 const PI_CODING_AGENT_VERSION: &str = "0.84.1";
 const PI_COMMAND_NAME: &str = "pi";
 const PI_ACP_LAUNCHER_NAME: &str = "vibex-pi-acp-launcher.cjs";
 const NODE_RELEASE_INDEX_URL: &str = "https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt";
+const UV_RELEASE_DOWNLOAD_BASE: &str = "https://github.com/astral-sh/uv/releases/latest/download";
 const AGENT_NODE_PATH_ENV: &str = "VIBEX_AGENT_NODE_PATH";
 const AGENT_NPM_PATH_ENV: &str = "VIBEX_AGENT_NPM_PATH";
+const AGENT_UV_PATH_ENV: &str = "VIBEX_AGENT_UV_PATH";
+const UV_MANAGED_PYTHON_REQUEST: &str = "3.12";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -69,12 +74,26 @@ impl AgentNodeRuntimeOptions {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentUvRuntimeOptions {
+    pub uv_path: Option<PathBuf>,
+}
+
+impl AgentUvRuntimeOptions {
+    pub fn from_environment() -> Self {
+        Self {
+            uv_path: nonempty_environment_path(AGENT_UV_PATH_ENV),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AgentInstallService {
     db_path: PathBuf,
     root: PathBuf,
     config_service: ProviderConfigService,
     node_runtime_options: AgentNodeRuntimeOptions,
+    uv_runtime_options: AgentUvRuntimeOptions,
     client: Client,
     operation_lock: Arc<Mutex<()>>,
 }
@@ -85,11 +104,12 @@ impl AgentInstallService {
         root: impl Into<PathBuf>,
         config_service: ProviderConfigService,
     ) -> VibexResult<Self> {
-        Self::new_with_node_runtime_options(
+        Self::new_with_runtime_options(
             db_path,
             root,
             config_service,
             AgentNodeRuntimeOptions::default(),
+            AgentUvRuntimeOptions::default(),
         )
     }
 
@@ -98,6 +118,22 @@ impl AgentInstallService {
         root: impl Into<PathBuf>,
         config_service: ProviderConfigService,
         node_runtime_options: AgentNodeRuntimeOptions,
+    ) -> VibexResult<Self> {
+        Self::new_with_runtime_options(
+            db_path,
+            root,
+            config_service,
+            node_runtime_options,
+            AgentUvRuntimeOptions::from_environment(),
+        )
+    }
+
+    pub fn new_with_runtime_options(
+        db_path: impl Into<PathBuf>,
+        root: impl Into<PathBuf>,
+        config_service: ProviderConfigService,
+        node_runtime_options: AgentNodeRuntimeOptions,
+        uv_runtime_options: AgentUvRuntimeOptions,
     ) -> VibexResult<Self> {
         let db_path = db_path.into();
         let root = root.into();
@@ -138,6 +174,7 @@ impl AgentInstallService {
             root,
             config_service,
             node_runtime_options,
+            uv_runtime_options,
             client,
             operation_lock: Arc::new(Mutex::new(())),
         };
@@ -185,9 +222,11 @@ impl AgentInstallService {
         let distribution = resolve_distribution(&entry)?;
         let now = unix_timestamp_ms();
         let existing = self.read_record(&agent_id)?;
-        let existing_is_usable = existing
-            .as_ref()
-            .is_some_and(record_has_usable_installation);
+        let distribution_kind = distribution.kind();
+        let existing_is_usable = existing.as_ref().is_some_and(|record| {
+            record_has_usable_installation(record)
+                && record_matches_distribution(record, distribution_kind)
+        });
         let installed_version = existing_is_usable
             .then(|| {
                 existing
@@ -205,7 +244,7 @@ impl AgentInstallService {
         let state = AgentManagedInstallState {
             managed: true,
             status,
-            distribution_kind: Some(distribution.kind()),
+            distribution_kind: Some(distribution_kind),
             installed_version,
             available_version: Some(entry.version.clone()),
             last_error_code: None,
@@ -345,11 +384,16 @@ impl AgentInstallService {
         let entry = registry.require_agent(registry_id)?.clone();
         let distribution = resolve_distribution(&entry)?;
         let distribution_kind = distribution.kind();
-        let node_runtime = if matches!(&distribution, ResolvedDistribution::Npm(_)) {
-            let minimum_node_version = minimum_node_version(&agent_id);
-            Some(self.select_node_runtime(&minimum_node_version).await?)
-        } else {
-            None
+        let (node_runtime, uv_runtime) = match &distribution {
+            ResolvedDistribution::Npm(_) => (
+                Some(
+                    self.select_node_runtime(&minimum_node_version(&agent_id))
+                        .await?,
+                ),
+                None,
+            ),
+            ResolvedDistribution::Uvx(_) => (None, Some(self.select_uv_runtime().await?)),
+            ResolvedDistribution::Binary(_) => (None, None),
         };
         let previous = self.read_record(&agent_id)?;
         let previous_is_usable = previous
@@ -364,11 +408,12 @@ impl AgentInstallService {
         }
 
         if previous.as_ref().is_some_and(|record| {
-            record.state.installed_version.as_deref() == Some(entry.version.as_str())
-                && record
-                    .install_root
-                    .as_deref()
-                    .is_some_and(|root| Path::new(root).is_dir())
+            record_matches_distribution(record, distribution_kind)
+                && record.state.installed_version.as_deref() == Some(entry.version.as_str())
+                && record.install_root.as_deref().is_some_and(|root| {
+                    Path::new(root).is_dir()
+                        && installed_distribution_kind(Path::new(root)) == Some(distribution_kind)
+                })
                 && record.command.as_ref().is_some_and(command_is_available)
                 && node_runtime.as_ref().is_none_or(|runtime| {
                     record.command.as_ref().is_some_and(|command| {
@@ -424,7 +469,7 @@ impl AgentInstallService {
         })?;
 
         let installed = self
-            .install_distribution(&agent_id, &entry, distribution, node_runtime)
+            .install_distribution(&agent_id, &entry, distribution, node_runtime, uv_runtime)
             .await
             .and_then(|installed| {
                 verify_required_external_commands(&agent_id)?;
@@ -584,6 +629,7 @@ impl AgentInstallService {
         entry: &RegistryEntry,
         distribution: ResolvedDistribution,
         node_runtime: Option<NodeRuntime>,
+        uv_runtime: Option<UvRuntime>,
     ) -> VibexResult<InstalledAgent> {
         match distribution {
             ResolvedDistribution::Binary(target) => {
@@ -597,6 +643,15 @@ impl AgentInstallService {
                     )
                 })?;
                 self.install_npm(agent_id, entry, npx, node_runtime).await
+            }
+            ResolvedDistribution::Uvx(uvx) => {
+                let uv_runtime = uv_runtime.ok_or_else(|| {
+                    VibexError::capability(
+                        "agent_uv_runtime_unselected",
+                        "uvx Agent installation has no selected uv runtime",
+                    )
+                })?;
+                self.install_uvx(agent_id, entry, uvx, uv_runtime).await
             }
         }
     }
@@ -848,6 +903,141 @@ impl AgentInstallService {
                 node: node.node.to_string_lossy().into_owned(),
                 script: script_rel.to_string_lossy().into_owned(),
                 args: npx.args,
+            },
+        };
+        write_json_private(&staging.join("vibex-install.json"), &manifest)?;
+        publish_staging(&staging, &target_root)?;
+        staging_guard.disarm();
+        load_installed_agent(&target_root, &fingerprint)
+    }
+
+    async fn install_uvx(
+        &self,
+        agent_id: &AgentId,
+        entry: &RegistryEntry,
+        uvx: RegistryUvxDistribution,
+        uv: UvRuntime,
+    ) -> VibexResult<InstalledAgent> {
+        let package = parse_exact_uvx_spec(&uvx.package, &entry.version)?;
+        let args_identity = serde_json::to_string(&uvx.args).map_err(|error| {
+            VibexError::validation(
+                "agent_uvx_args_invalid",
+                "ACP Registry uvx arguments could not be verified",
+            )
+            .with_diagnostic("error", error.to_string())
+        })?;
+        let uv_identity = uv.fingerprint_identity();
+        let fingerprint = distribution_fingerprint(&[
+            entry.id.as_str(),
+            entry.version.as_str(),
+            uvx.package.as_str(),
+            package.name.as_str(),
+            package.version.as_str(),
+            args_identity.as_str(),
+            uv_identity.as_str(),
+        ]);
+        let target_root = self.version_root(agent_id, &entry.version, &fingerprint)?;
+        if let Some(installed) = load_or_remove_cached_installation(&target_root, &fingerprint)? {
+            return Ok(installed);
+        }
+
+        let staging = self.create_staging(agent_id)?;
+        let mut staging_guard = StagingGuard::new(staging.clone());
+        let cache_dir = self.root.join("cache/uv");
+        let python_dir = self.root.join("runtimes/python");
+        ensure_uv_cache_directories(&cache_dir, &python_dir)?;
+
+        let venv = staging.join("venv");
+        let mut venv_command = uv.command();
+        configure_isolated_uv_command(&mut venv_command, &cache_dir, &python_dir);
+        venv_command
+            .arg("venv")
+            .arg("--no-config")
+            .arg("--managed-python")
+            .arg("--python")
+            .arg(UV_MANAGED_PYTHON_REQUEST)
+            .arg("--relocatable")
+            .arg(&venv)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        run_install_command(
+            venv_command,
+            "agent_uvx_venv_timeout",
+            "agent_uvx_venv_spawn_failed",
+            "agent_uvx_venv_failed",
+            "managed uvx virtual environment could not be created",
+        )
+        .await?;
+
+        let python = uv_venv_python(&venv);
+        ensure_managed_uv_python(&self.root, &staging, &python)?;
+        let mut install_command = uv.command();
+        configure_isolated_uv_command(&mut install_command, &cache_dir, &python_dir);
+        install_command
+            .arg("pip")
+            .arg("install")
+            .arg("--no-config")
+            .arg("--python")
+            .arg(&python)
+            .arg("--default-index")
+            .arg("https://pypi.org/simple")
+            .arg("--keyring-provider")
+            .arg("disabled")
+            .arg("--link-mode")
+            .arg("copy")
+            .arg(package.exact_spec())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        run_install_command(
+            install_command,
+            "agent_uvx_install_timeout",
+            "agent_uvx_install_spawn_failed",
+            "agent_uvx_install_failed",
+            "managed uvx installation failed",
+        )
+        .await?;
+
+        let installed_package = inspect_uvx_package(&python, &package.name).await?;
+        if installed_package.version != package.version {
+            return Err(VibexError::validation(
+                "agent_uvx_package_version_mismatch",
+                "uvx installed package version did not match the ACP Registry",
+            )
+            .with_diagnostic("package", package.name)
+            .with_diagnostic("expectedVersion", package.version)
+            .with_diagnostic("actualVersion", installed_package.version));
+        }
+        let executable = select_uvx_entry_point(&package.name, &installed_package.scripts)?;
+        let launcher = staging.join("vibex-uvx-launcher.py");
+        let launcher_source = uvx_launcher_source(&package.name, &executable)?;
+        write_private_file(&launcher, launcher_source.as_bytes())?;
+        ensure_regular_file(&staging, &launcher, "agent_uvx_launcher_missing")?;
+
+        let python_rel = python.strip_prefix(&staging).map_err(|_| {
+            VibexError::validation(
+                "agent_uvx_python_outside_install",
+                "uvx virtual environment escaped the managed installation",
+            )
+        })?;
+        let launcher_rel = launcher.strip_prefix(&staging).map_err(|_| {
+            VibexError::validation(
+                "agent_uvx_launcher_outside_install",
+                "uvx launcher escaped the managed installation",
+            )
+        })?;
+        let manifest = InstallManifest {
+            registry_agent_id: entry.id.clone(),
+            version: entry.version.clone(),
+            fingerprint: fingerprint.clone(),
+            distribution_kind: AgentManagedDistributionKind::Uvx,
+            launch: ManifestLaunch::Python {
+                python: python_rel.to_string_lossy().into_owned(),
+                script: launcher_rel.to_string_lossy().into_owned(),
+                args: uvx.args,
             },
         };
         write_json_private(&staging.join("vibex-install.json"), &manifest)?;
@@ -1280,6 +1470,123 @@ impl AgentInstallService {
         node_runtime_at(&target, version)
     }
 
+    async fn select_uv_runtime(&self) -> VibexResult<UvRuntime> {
+        if let Some(runtime) = self.select_external_uv_runtime().await {
+            return Ok(runtime);
+        }
+        self.ensure_managed_uv_runtime().await
+    }
+
+    async fn select_external_uv_runtime(&self) -> Option<UvRuntime> {
+        select_valid_external_uv_runtime(self.uv_runtime_candidates()).await
+    }
+
+    fn uv_runtime_candidates(&self) -> Vec<UvRuntimeCandidate> {
+        uv_runtime_candidates(&self.uv_runtime_options, resolve_system_binary("uv"))
+    }
+
+    async fn ensure_managed_uv_runtime(&self) -> VibexResult<UvRuntime> {
+        let filename = uv_archive_filename()?;
+        let checksum_url = format!("{UV_RELEASE_DOWNLOAD_BASE}/{filename}.sha256");
+        let checksum = parse_uv_release_checksum(
+            &self.fetch_limited(&checksum_url, 16 * 1024).await?,
+            filename,
+        )?;
+        let archive_url = format!("{UV_RELEASE_DOWNLOAD_BASE}/{filename}");
+        let archive = self
+            .download_verified(&archive_url, Some(&checksum))
+            .await?;
+        let staging_parent = self.root.join("runtimes/uv/.staging");
+        fs::create_dir_all(&staging_parent).map_err(|error| {
+            storage_error(
+                "agent_uv_staging_create_failed",
+                "uv staging directory could not be created",
+                error,
+            )
+        })?;
+        let staging = staging_parent.join(format!(
+            "{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&staging).map_err(|error| {
+            storage_error(
+                "agent_uv_staging_create_failed",
+                "uv staging directory could not be created",
+                error,
+            )
+        })?;
+        let mut staging_guard = StagingGuard::new(staging.clone());
+        let archive_for_extract = archive.clone();
+        let archive_url_for_extract = archive_url.clone();
+        let staging_for_extract = staging.clone();
+        tokio::task::spawn_blocking(move || {
+            extract_archive(
+                &archive_for_extract,
+                &archive_url_for_extract,
+                &staging_for_extract,
+            )
+        })
+        .await
+        .map_err(|error| {
+            VibexError::process("agent_uv_extract_join_failed", "uv extraction task failed")
+                .with_diagnostic("error", error.to_string())
+        })??;
+
+        let archive_root = staging.join(strip_archive_suffix(filename));
+        if !archive_root.is_dir() {
+            return Err(VibexError::validation(
+                "agent_uv_archive_layout_invalid",
+                "uv archive did not contain its expected root directory",
+            ));
+        }
+        let staging_runtime = validate_uv_runtime_candidate(UvRuntimeCandidate {
+            source: UvRuntimeSource::Managed,
+            uv: uv_binary_at(&archive_root),
+        })
+        .await?;
+        let target = self
+            .root
+            .join("runtimes/uv")
+            .join(staging_runtime.version.to_string())
+            .join(current_platform_key()?);
+        if let Ok(runtime) = validate_uv_runtime_candidate(UvRuntimeCandidate {
+            source: UvRuntimeSource::Managed,
+            uv: uv_binary_at(&target),
+        })
+        .await
+        {
+            return Ok(runtime);
+        }
+        if fs::symlink_metadata(&target).is_ok() {
+            remove_path(&target)
+                .map_err(|error| error.with_diagnostic("cacheKind", "uv-runtime"))?;
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                storage_error(
+                    "agent_uv_runtime_parent_failed",
+                    "uv runtime directory could not be created",
+                    error,
+                )
+            })?;
+        }
+        fs::rename(&archive_root, &target).map_err(|error| {
+            storage_error(
+                "agent_uv_publish_failed",
+                "verified uv runtime could not be published",
+                error,
+            )
+        })?;
+        staging_guard.disarm();
+        let _ = fs::remove_dir_all(&staging);
+        validate_uv_runtime_candidate(UvRuntimeCandidate {
+            source: UvRuntimeSource::Managed,
+            uv: uv_binary_at(&target),
+        })
+        .await
+    }
+
     fn open_connection(&self) -> VibexResult<vibex_db::DbConnection> {
         open_database(&self.db_path)
     }
@@ -1447,6 +1754,26 @@ fn node_runtime_candidates(
     candidates
 }
 
+fn uv_runtime_candidates(
+    options: &AgentUvRuntimeOptions,
+    system_uv: Option<PathBuf>,
+) -> Vec<UvRuntimeCandidate> {
+    let mut candidates = Vec::new();
+    if let Some(uv) = options.uv_path.clone() {
+        candidates.push(UvRuntimeCandidate {
+            source: UvRuntimeSource::Explicit,
+            uv,
+        });
+    }
+    if let Some(uv) = system_uv {
+        candidates.push(UvRuntimeCandidate {
+            source: UvRuntimeSource::System,
+            uv,
+        });
+    }
+    candidates
+}
+
 fn write_isolated_npm_configs(staging: &Path) -> VibexResult<IsolatedNpmConfigs> {
     // npm rejects loading one file as both its user and global configuration.
     let configs = IsolatedNpmConfigs {
@@ -1470,6 +1797,23 @@ async fn select_valid_external_node_runtime(
                 node_source = candidate.source.as_str(),
                 error_code = %error.code,
                 "ACP Agent Node.js candidate was rejected"
+            ),
+        }
+    }
+    None
+}
+
+async fn select_valid_external_uv_runtime(
+    candidates: Vec<UvRuntimeCandidate>,
+) -> Option<UvRuntime> {
+    for candidate in candidates {
+        match validate_uv_runtime_candidate(candidate.clone()).await {
+            Ok(runtime) => return Some(runtime),
+            Err(error) => tracing::warn!(
+                target: "vibex_desktop",
+                uv_source = candidate.source.as_str(),
+                error_code = %error.code,
+                "ACP Agent uv candidate was rejected"
             ),
         }
     }
@@ -1514,6 +1858,7 @@ struct RegistryEntry {
 struct RegistryDistribution {
     binary: Option<BTreeMap<String, RegistryBinaryTarget>>,
     npx: Option<RegistryNpxDistribution>,
+    uvx: Option<RegistryUvxDistribution>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1532,10 +1877,18 @@ struct RegistryNpxDistribution {
     args: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct RegistryUvxDistribution {
+    package: String,
+    #[serde(default)]
+    args: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 enum ResolvedDistribution {
     Binary(RegistryBinaryTarget),
     Npm(RegistryNpxDistribution),
+    Uvx(RegistryUvxDistribution),
 }
 
 impl ResolvedDistribution {
@@ -1543,6 +1896,7 @@ impl ResolvedDistribution {
         match self {
             Self::Binary(_) => AgentManagedDistributionKind::Binary,
             Self::Npm(_) => AgentManagedDistributionKind::Npm,
+            Self::Uvx(_) => AgentManagedDistributionKind::Uvx,
         }
     }
 }
@@ -1575,6 +1929,24 @@ struct VerifiedNpmPackage {
     integrity: String,
     tarball: String,
     bin_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerifiedUvxPackage {
+    name: String,
+    version: String,
+}
+
+impl VerifiedUvxPackage {
+    fn exact_spec(&self) -> String {
+        format!("{}=={}", self.name, self.version)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct InstalledUvxPackage {
+    version: String,
+    scripts: Vec<String>,
 }
 
 impl VerifiedNpmPackage {
@@ -1611,6 +1983,11 @@ enum ManifestLaunch {
         script: String,
         args: Vec<String>,
     },
+    Python {
+        python: String,
+        script: String,
+        args: Vec<String>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1630,6 +2007,23 @@ enum NodeRuntimeSource {
     Explicit,
     System,
     Managed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UvRuntimeSource {
+    Explicit,
+    System,
+    Managed,
+}
+
+impl UvRuntimeSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::System => "system",
+            Self::Managed => "managed",
+        }
+    }
 }
 
 impl NodeRuntimeSource {
@@ -1694,6 +2088,34 @@ struct NodeRuntimeCandidate {
     source: NodeRuntimeSource,
     node: PathBuf,
     npm: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct UvRuntime {
+    uv: PathBuf,
+    version: semver::Version,
+    source: UvRuntimeSource,
+}
+
+impl UvRuntime {
+    fn command(&self) -> Command {
+        Command::new(&self.uv)
+    }
+
+    fn fingerprint_identity(&self) -> String {
+        format!(
+            "{}\0{}\0{}",
+            self.source.as_str(),
+            self.version,
+            self.uv.to_string_lossy()
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct UvRuntimeCandidate {
+    source: UvRuntimeSource,
+    uv: PathBuf,
 }
 
 struct StagingGuard {
@@ -1776,6 +2198,9 @@ fn resolve_distribution(entry: &RegistryEntry) -> VibexResult<ResolvedDistributi
     if let Some(npx) = entry.distribution.npx.clone() {
         return Ok(ResolvedDistribution::Npm(npx));
     }
+    if let Some(uvx) = entry.distribution.uvx.clone() {
+        return Ok(ResolvedDistribution::Uvx(uvx));
+    }
     Err(VibexError::capability(
         "agent_managed_distribution_unavailable",
         "No verified Agent distribution is available for this platform",
@@ -1835,6 +2260,21 @@ fn node_archive_suffix() -> VibexResult<&'static str> {
     }
 }
 
+fn uv_archive_filename() -> VibexResult<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => Ok("uv-x86_64-unknown-linux-gnu.tar.gz"),
+        ("linux", "aarch64") => Ok("uv-aarch64-unknown-linux-gnu.tar.gz"),
+        ("macos", "x86_64") => Ok("uv-x86_64-apple-darwin.tar.gz"),
+        ("macos", "aarch64") => Ok("uv-aarch64-apple-darwin.tar.gz"),
+        ("windows", "x86_64") => Ok("uv-x86_64-pc-windows-msvc.zip"),
+        ("windows", "aarch64") => Ok("uv-aarch64-pc-windows-msvc.zip"),
+        _ => Err(VibexError::capability(
+            "agent_uv_platform_unsupported",
+            "managed uv is unavailable on this platform",
+        )),
+    }
+}
+
 fn node_runtime_at(root: &Path, version: semver::Version) -> VibexResult<NodeRuntime> {
     #[cfg(windows)]
     let node = root.join("node.exe");
@@ -1856,6 +2296,28 @@ fn node_runtime_at(root: &Path, version: semver::Version) -> VibexResult<NodeRun
         version,
         source: NodeRuntimeSource::Managed,
     })
+}
+
+fn uv_binary_at(root: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        root.join("uv.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        root.join("uv")
+    }
+}
+
+fn uv_venv_python(venv: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        venv.join("Scripts/python.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        venv.join("bin/python")
+    }
 }
 
 fn nonempty_environment_path(key: &str) -> Option<PathBuf> {
@@ -1929,6 +2391,39 @@ async fn validate_node_runtime_candidate(
     Ok(runtime)
 }
 
+async fn validate_uv_runtime_candidate(candidate: UvRuntimeCandidate) -> VibexResult<UvRuntime> {
+    if !candidate.uv.is_file() {
+        return Err(VibexError::validation(
+            "agent_uv_binary_missing",
+            "uv candidate does not point to a file",
+        ));
+    }
+    let mut version_command = Command::new(&candidate.uv);
+    version_command.arg("--version");
+    let output = run_process_probe(
+        version_command,
+        UV_PROBE_TIMEOUT,
+        "agent_uv_version_probe_timeout",
+        "agent_uv_version_probe_failed",
+        "uv version could not be detected",
+    )
+    .await?;
+    let version = parse_uv_version_output(&output.stdout)?;
+    if version < MINIMUM_UV_VERSION {
+        return Err(VibexError::capability(
+            "agent_uv_version_unsupported",
+            "uv candidate is older than the supported minimum",
+        )
+        .with_diagnostic("detectedVersion", version.to_string())
+        .with_diagnostic("minimumVersion", MINIMUM_UV_VERSION.to_string()));
+    }
+    Ok(UvRuntime {
+        uv: candidate.uv,
+        version,
+        source: candidate.source,
+    })
+}
+
 fn validate_minimum_node_version(
     version: &semver::Version,
     minimum_version: &semver::Version,
@@ -1968,12 +2463,29 @@ fn external_npm_launcher(_node: &Path, npm: &Path) -> VibexResult<NpmLauncher> {
 }
 
 async fn run_node_probe(
-    mut command: Command,
+    command: Command,
     timeout_code: &str,
     failure_code: &str,
     message: &str,
 ) -> VibexResult<Output> {
-    let output = timeout(NODE_PROBE_TIMEOUT, command.output())
+    run_process_probe(
+        command,
+        NODE_PROBE_TIMEOUT,
+        timeout_code,
+        failure_code,
+        message,
+    )
+    .await
+}
+
+async fn run_process_probe(
+    mut command: Command,
+    probe_timeout: Duration,
+    timeout_code: &str,
+    failure_code: &str,
+    message: &str,
+) -> VibexResult<Output> {
+    let output = timeout(probe_timeout, command.output())
         .await
         .map_err(|_| VibexError::process(timeout_code, message))?
         .map_err(|error| process_error(failure_code, message, error))?;
@@ -1982,6 +2494,24 @@ async fn run_node_probe(
             .with_diagnostic("status", output.status.to_string()));
     }
     Ok(output)
+}
+
+async fn run_install_command(
+    mut command: Command,
+    timeout_code: &str,
+    spawn_code: &str,
+    failure_code: &str,
+    message: &str,
+) -> VibexResult<()> {
+    let status = timeout(INSTALL_TIMEOUT, command.status())
+        .await
+        .map_err(|_| VibexError::process(timeout_code, message))?
+        .map_err(|error| process_error(spawn_code, message, error))?;
+    if !status.success() {
+        return Err(VibexError::process(failure_code, message)
+            .with_diagnostic("status", status.to_string()));
+    }
+    Ok(())
 }
 
 fn parse_node_version_output(output: &[u8]) -> VibexResult<semver::Version> {
@@ -1999,6 +2529,253 @@ fn parse_node_version_output(output: &[u8]) -> VibexResult<semver::Version> {
         )
         .with_diagnostic("error", error.to_string())
     })
+}
+
+fn parse_uv_version_output(output: &[u8]) -> VibexResult<semver::Version> {
+    let output = std::str::from_utf8(output).map_err(|error| {
+        VibexError::validation(
+            "agent_uv_version_output_invalid",
+            "uv version output was not UTF-8",
+        )
+        .with_diagnostic("error", error.to_string())
+    })?;
+    let version = output
+        .split_whitespace()
+        .nth(1)
+        .filter(|_| output.trim_start().starts_with("uv "))
+        .ok_or_else(|| {
+            VibexError::validation(
+                "agent_uv_version_output_invalid",
+                "uv version output was invalid",
+            )
+        })?;
+    semver::Version::parse(version.trim_start_matches('v')).map_err(|error| {
+        VibexError::validation(
+            "agent_uv_version_output_invalid",
+            "uv version output was invalid",
+        )
+        .with_diagnostic("error", error.to_string())
+    })
+}
+
+async fn inspect_uvx_package(python: &Path, package: &str) -> VibexResult<InstalledUvxPackage> {
+    const SCRIPT: &str = r#"
+import importlib.metadata as metadata
+import json
+import sys
+
+distribution = metadata.distribution(sys.argv[1])
+scripts = sorted({entry.name for entry in distribution.entry_points if entry.group == "console_scripts"})
+print(json.dumps({"version": distribution.version, "scripts": scripts}))
+"#;
+
+    let mut command = Command::new(python);
+    command.arg("-c").arg(SCRIPT).arg(package);
+    let output = run_process_probe(
+        command,
+        UV_PROBE_TIMEOUT,
+        "agent_uvx_metadata_probe_timeout",
+        "agent_uvx_metadata_probe_failed",
+        "installed uvx package metadata could not be read",
+    )
+    .await?;
+    serde_json::from_slice(&output.stdout).map_err(|error| {
+        VibexError::validation(
+            "agent_uvx_metadata_invalid",
+            "installed uvx package metadata was invalid",
+        )
+        .with_diagnostic("error", error.to_string())
+    })
+}
+
+fn select_uvx_entry_point(package: &str, scripts: &[String]) -> VibexResult<String> {
+    let expected = normalize_python_package_name(package);
+    let matching = scripts
+        .iter()
+        .filter(|script| normalize_python_package_name(script) == expected)
+        .collect::<Vec<_>>();
+    let selected = match matching.as_slice() {
+        [script] => (*script).clone(),
+        [] if scripts.len() == 1 => scripts[0].clone(),
+        _ => {
+            return Err(VibexError::validation(
+                "agent_uvx_entry_point_ambiguous",
+                "uvx package did not expose an unambiguous executable",
+            )
+            .with_diagnostic("package", package.to_string()));
+        }
+    };
+    if selected.is_empty()
+        || !selected
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(VibexError::validation(
+            "agent_uvx_entry_point_invalid",
+            "uvx package executable name was invalid",
+        ));
+    }
+    Ok(selected)
+}
+
+fn normalize_python_package_name(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut previous_separator = false;
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() {
+            normalized.push(byte.to_ascii_lowercase() as char);
+            previous_separator = false;
+        } else if !previous_separator {
+            normalized.push('-');
+            previous_separator = true;
+        }
+    }
+    normalized.trim_matches('-').to_string()
+}
+
+fn uvx_launcher_source(package: &str, executable: &str) -> VibexResult<String> {
+    let package = serde_json::to_string(package).map_err(|error| {
+        VibexError::validation(
+            "agent_uvx_launcher_encode_failed",
+            "uvx package identity could not be encoded",
+        )
+        .with_diagnostic("error", error.to_string())
+    })?;
+    let executable = serde_json::to_string(executable).map_err(|error| {
+        VibexError::validation(
+            "agent_uvx_launcher_encode_failed",
+            "uvx executable identity could not be encoded",
+        )
+        .with_diagnostic("error", error.to_string())
+    })?;
+    Ok(format!(
+        r#"from importlib.metadata import distribution
+import sys
+
+_distribution = distribution({package})
+_entry_point = next(
+    (
+        entry
+        for entry in _distribution.entry_points
+        if entry.group == "console_scripts" and entry.name == {executable}
+    ),
+    None,
+)
+if _entry_point is None:
+    raise SystemExit("Managed uvx executable is unavailable")
+sys.exit(_entry_point.load()())
+"#
+    ))
+}
+
+fn ensure_uv_cache_directories(cache_dir: &Path, python_dir: &Path) -> VibexResult<()> {
+    for (path, code, message) in [
+        (
+            cache_dir,
+            "agent_uv_cache_create_failed",
+            "managed uv cache could not be created",
+        ),
+        (
+            python_dir,
+            "agent_uv_python_cache_create_failed",
+            "managed uv Python cache could not be created",
+        ),
+    ] {
+        fs::create_dir_all(path).map_err(|error| storage_error(code, message, error))?;
+    }
+    Ok(())
+}
+
+fn configure_isolated_uv_command(command: &mut Command, cache_dir: &Path, python_dir: &Path) {
+    for key in [
+        "UV_CONFIG_FILE",
+        "UV_INDEX",
+        "UV_INDEX_URL",
+        "UV_EXTRA_INDEX",
+        "UV_EXTRA_INDEX_URL",
+        "UV_FIND_LINKS",
+        "UV_INSECURE_HOST",
+        "UV_KEYRING_PROVIDER",
+        "UV_PYTHON",
+        "UV_PYTHON_DOWNLOADS",
+        "UV_TOOL_DIR",
+        "UV_TOOL_BIN_DIR",
+        "UV_PROJECT_ENVIRONMENT",
+        "VIRTUAL_ENV",
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "PIP_CONFIG_FILE",
+        "PIP_INDEX_URL",
+        "PIP_EXTRA_INDEX_URL",
+        "PIP_FIND_LINKS",
+        "PIP_TRUSTED_HOST",
+    ] {
+        command.env_remove(key);
+    }
+    command
+        .env("UV_CACHE_DIR", cache_dir)
+        .env("UV_PYTHON_INSTALL_DIR", python_dir)
+        .env("UV_NO_CONFIG", "1")
+        .env("UV_NO_ENV_FILE", "1")
+        .env("UV_DEFAULT_INDEX", "https://pypi.org/simple")
+        .env("UV_KEYRING_PROVIDER", "disabled")
+        .env("UV_LINK_MODE", "copy")
+        .env("UV_PYTHON_DOWNLOADS", "automatic");
+}
+
+fn ensure_managed_uv_python(
+    managed_root: &Path,
+    install_root: &Path,
+    python: &Path,
+) -> VibexResult<()> {
+    if !python.starts_with(install_root) || !python.is_file() {
+        return Err(VibexError::validation(
+            "agent_uvx_python_missing",
+            "managed uvx Python runtime was missing",
+        ));
+    }
+    let python_root = managed_root.join("runtimes/python");
+    let canonical_python_root = fs::canonicalize(&python_root).map_err(|error| {
+        storage_error(
+            "agent_uv_python_cache_canonicalize_failed",
+            "managed uv Python cache could not be verified",
+            error,
+        )
+    })?;
+    let canonical_python = fs::canonicalize(python).map_err(|error| {
+        storage_error(
+            "agent_uvx_python_canonicalize_failed",
+            "managed uvx Python runtime could not be verified",
+            error,
+        )
+    })?;
+    if !canonical_python.starts_with(canonical_python_root) {
+        return Err(VibexError::validation(
+            "agent_uvx_python_escape",
+            "managed uvx Python runtime escaped the managed cache",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_managed_uv_python_for_install(install_root: &Path, python: &Path) -> VibexResult<()> {
+    let service_root = install_root
+        .ancestors()
+        .nth(3)
+        .filter(|_| {
+            install_root
+                .ancestors()
+                .nth(2)
+                .and_then(Path::file_name)
+                .is_some_and(|name| name == "agents")
+        })
+        .ok_or_else(|| {
+            VibexError::validation(
+                "agent_uvx_install_root_invalid",
+                "managed uvx installation root was invalid",
+            )
+        })?;
+    ensure_managed_uv_python(service_root, install_root, python)
 }
 
 fn prepend_node_to_path(command: &mut Command, node: &Path) {
@@ -2043,6 +2820,43 @@ fn parse_exact_npm_spec<'a>(spec: &'a str, expected: &str) -> VibexResult<(&'a s
         .with_diagnostic("error", error.to_string())
     })?;
     Ok((package, version))
+}
+
+fn parse_exact_uvx_spec(spec: &str, expected: &str) -> VibexResult<VerifiedUvxPackage> {
+    let (package, version) = if let Some((package, version)) = spec.rsplit_once("==") {
+        (package, version)
+    } else if let Some((package, version)) = spec.rsplit_once('@') {
+        (package, version)
+    } else {
+        return Err(VibexError::validation(
+            "agent_uvx_spec_not_exact",
+            "ACP Registry uvx package must include an exact version",
+        ));
+    };
+    if package.is_empty()
+        || version.is_empty()
+        || version != expected
+        || package.contains("..")
+        || !package
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(VibexError::validation(
+            "agent_uvx_spec_invalid",
+            "ACP Registry uvx package identity was invalid",
+        ));
+    }
+    semver::Version::parse(version).map_err(|error| {
+        VibexError::validation(
+            "agent_uvx_version_invalid",
+            "ACP Registry uvx package version was not exact semver",
+        )
+        .with_diagnostic("error", error.to_string())
+    })?;
+    Ok(VerifiedUvxPackage {
+        name: package.to_string(),
+        version: version.to_string(),
+    })
 }
 
 fn select_npm_bin(metadata: &NpmPackageMetadata, package: &str) -> VibexResult<String> {
@@ -2304,6 +3118,22 @@ fn load_installed_agent(root: &Path, expected_fingerprint: &str) -> VibexResult<
                 args: launch_args,
             }
         }
+        ManifestLaunch::Python {
+            python,
+            script,
+            args,
+        } => {
+            let python = root.join(safe_relative_path(&python, "uvx Python runtime")?);
+            ensure_managed_uv_python_for_install(root, &python)?;
+            let script = root.join(safe_relative_path(&script, "uvx launcher")?);
+            ensure_regular_file(root, &script, "agent_uvx_launcher_missing")?;
+            let mut launch_args = vec![script.to_string_lossy().into_owned()];
+            launch_args.extend(args);
+            AgentCommandConfig {
+                command: python.to_string_lossy().into_owned(),
+                args: launch_args,
+            }
+        }
     };
     Ok(InstalledAgent {
         kind: manifest.distribution_kind,
@@ -2375,6 +3205,24 @@ fn installation_files_are_usable(record: &AgentManagedInstallationRecord) -> boo
         && record.command.as_ref().is_some_and(command_is_available)
 }
 
+fn installed_distribution_kind(root: &Path) -> Option<AgentManagedDistributionKind> {
+    fs::read(root.join("vibex-install.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<InstallManifest>(&bytes).ok())
+        .map(|manifest| manifest.distribution_kind)
+}
+
+fn record_matches_distribution(
+    record: &AgentManagedInstallationRecord,
+    expected: AgentManagedDistributionKind,
+) -> bool {
+    record.state.distribution_kind == Some(expected)
+        && record
+            .install_root
+            .as_deref()
+            .is_some_and(|root| installed_distribution_kind(Path::new(root)) == Some(expected))
+}
+
 fn reject_semver_downgrade(installed: &str, available: &str) -> VibexResult<()> {
     let (Ok(installed_version), Ok(available_version)) = (
         semver::Version::parse(installed),
@@ -2405,12 +3253,18 @@ fn version_is_newer(installed: &str, available: &str) -> bool {
 
 fn command_is_available(command: &AgentCommandConfig) -> bool {
     let program = Path::new(&command.command);
+    let script_runtime = program.file_stem().is_some_and(|name| {
+        matches!(
+            name.to_string_lossy().as_ref(),
+            "node" | "python" | "python3"
+        )
+    });
     program.is_file()
-        && command
-            .args
-            .first()
-            .filter(|_| program.file_stem().is_some_and(|name| name == "node"))
-            .is_none_or(|script| Path::new(script).is_file())
+        && (!script_runtime
+            || command
+                .args
+                .first()
+                .is_some_and(|script| Path::new(script).is_file()))
 }
 
 fn verify_required_external_commands(agent_id: &AgentId) -> VibexResult<()> {
@@ -2477,6 +3331,32 @@ fn optional_sha256(value: Option<&str>) -> VibexResult<Option<String>> {
         .filter(|value| !value.is_empty())
         .map(validate_sha256)
         .transpose()
+}
+
+fn parse_uv_release_checksum(bytes: &[u8], filename: &str) -> VibexResult<String> {
+    let text = std::str::from_utf8(bytes).map_err(|error| {
+        VibexError::validation(
+            "agent_uv_checksum_invalid",
+            "uv checksum response was not UTF-8",
+        )
+        .with_diagnostic("error", error.to_string())
+    })?;
+    let checksum = text
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let checksum = fields.next()?;
+            let artifact = fields.next()?.trim_start_matches('*');
+            (artifact == filename && fields.next().is_none()).then_some(checksum)
+        })
+        .next()
+        .ok_or_else(|| {
+            VibexError::validation(
+                "agent_uv_checksum_missing",
+                "uv checksum response did not include the requested archive",
+            )
+        })?;
+    validate_sha256(checksum)
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -3020,6 +3900,17 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn write_uv_version_probe(path: &Path, version: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' 'uv {version}'; exit 0; fi\nexit 1\n"
+        );
+        fs::write(path, script).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn node_runtime_selection_prefers_valid_explicit_candidate() {
         let temp = tempfile::tempdir().unwrap();
@@ -3102,6 +3993,51 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn uv_runtime_selection_prefers_valid_explicit_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let explicit_uv = temp.path().join("explicit-uv");
+        let system_uv = temp.path().join("system-uv");
+        write_uv_version_probe(&explicit_uv, "0.11.4");
+        write_uv_version_probe(&system_uv, "0.10.0");
+
+        let runtime = select_valid_external_uv_runtime(uv_runtime_candidates(
+            &AgentUvRuntimeOptions {
+                uv_path: Some(explicit_uv.clone()),
+            },
+            Some(system_uv),
+        ))
+        .await
+        .expect("explicit uv runtime should be selected");
+
+        assert_eq!(runtime.source, UvRuntimeSource::Explicit);
+        assert_eq!(runtime.uv, explicit_uv);
+        assert_eq!(runtime.version, semver::Version::new(0, 11, 4));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invalid_explicit_uv_falls_back_to_valid_system_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let explicit_uv = temp.path().join("explicit-uv");
+        let system_uv = temp.path().join("system-uv");
+        write_uv_version_probe(&explicit_uv, "0.4.0");
+        write_uv_version_probe(&system_uv, "0.11.4");
+
+        let runtime = select_valid_external_uv_runtime(uv_runtime_candidates(
+            &AgentUvRuntimeOptions {
+                uv_path: Some(explicit_uv),
+            },
+            Some(system_uv.clone()),
+        ))
+        .await
+        .expect("system uv runtime should be selected");
+
+        assert_eq!(runtime.source, UvRuntimeSource::System);
+        assert_eq!(runtime.uv, system_uv);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn pi_rejects_node_older_than_its_runtime_dependency() {
         let temp = tempfile::tempdir().unwrap();
         let old_node = temp.path().join("old-node");
@@ -3146,6 +4082,15 @@ mod tests {
     }
 
     #[test]
+    fn uv_version_probe_parses_and_rejects_malformed_output() {
+        assert_eq!(
+            parse_uv_version_output(b"uv 0.11.4 (x86_64-unknown-linux-gnu)\n").unwrap(),
+            semver::Version::new(0, 11, 4)
+        );
+        assert!(parse_uv_version_output(b"0.11.4\n").is_err());
+    }
+
+    #[test]
     fn isolated_npm_configs_use_distinct_empty_files() {
         let temp = tempfile::tempdir().unwrap();
 
@@ -3174,17 +4119,14 @@ mod tests {
             require_registry_id(&AgentId::parse("pi").unwrap()).unwrap(),
             "pi-acp"
         );
-        assert!(require_registry_id(&AgentId::parse("fast-agent").unwrap()).is_err());
-    }
-
-    #[test]
-    fn exact_npm_specs_reject_ranges_and_identity_drift() {
         assert_eq!(
-            parse_exact_npm_spec("@scope/agent@1.2.3", "1.2.3").unwrap(),
-            ("@scope/agent", "1.2.3")
+            require_registry_id(&AgentId::parse("fast-agent").unwrap()).unwrap(),
+            "fast-agent"
         );
-        assert!(parse_exact_npm_spec("agent@^1.2.3", "1.2.3").is_err());
-        assert!(parse_exact_npm_spec("agent@1.2.4", "1.2.3").is_err());
+        assert_eq!(
+            require_registry_id(&AgentId::parse("minion-code").unwrap()).unwrap(),
+            "minion-code"
+        );
     }
 
     #[test]
@@ -3210,6 +4152,36 @@ mod tests {
     }
 
     #[test]
+    fn exact_npm_specs_reject_ranges_and_identity_drift() {
+        assert_eq!(
+            parse_exact_npm_spec("@scope/agent@1.2.3", "1.2.3").unwrap(),
+            ("@scope/agent", "1.2.3")
+        );
+        assert!(parse_exact_npm_spec("agent@^1.2.3", "1.2.3").is_err());
+        assert!(parse_exact_npm_spec("agent@1.2.4", "1.2.3").is_err());
+    }
+
+    #[test]
+    fn exact_uvx_specs_accept_registry_forms_and_reject_ranges() {
+        assert_eq!(
+            parse_exact_uvx_spec("fast-agent-acp==0.9.30", "0.9.30").unwrap(),
+            VerifiedUvxPackage {
+                name: "fast-agent-acp".to_string(),
+                version: "0.9.30".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_exact_uvx_spec("minion-code@0.1.44", "0.1.44")
+                .unwrap()
+                .exact_spec(),
+            "minion-code==0.1.44"
+        );
+        assert!(parse_exact_uvx_spec("agent>=1.2.3", "1.2.3").is_err());
+        assert!(parse_exact_uvx_spec("agent@1.2.4", "1.2.3").is_err());
+        assert!(parse_exact_uvx_spec("agent@https://example.com/agent.whl", "1.2.3").is_err());
+    }
+
+    #[test]
     fn distribution_accepts_platform_binary_without_checksum() {
         let key = current_platform_key().unwrap().to_string();
         let entry = RegistryEntry {
@@ -3226,6 +4198,7 @@ mod tests {
                     },
                 )])),
                 npx: None,
+                uvx: None,
             },
         };
         assert!(matches!(
@@ -3247,12 +4220,29 @@ mod tests {
                     package: "test-agent@1.2.3".to_string(),
                     args: Vec::new(),
                 }),
+                uvx: None,
             },
             ..entry
         };
         assert!(matches!(
             resolve_distribution(&fallback).unwrap(),
             ResolvedDistribution::Npm(_)
+        ));
+
+        let uvx = RegistryEntry {
+            distribution: RegistryDistribution {
+                binary: None,
+                npx: None,
+                uvx: Some(RegistryUvxDistribution {
+                    package: "test-agent==1.2.3".to_string(),
+                    args: vec!["acp".to_string()],
+                }),
+            },
+            ..fallback
+        };
+        assert!(matches!(
+            resolve_distribution(&uvx).unwrap(),
+            ResolvedDistribution::Uvx(_)
         ));
     }
 
@@ -3278,6 +4268,60 @@ mod tests {
         );
         assert!(validate_npm_integrity(&npm_integrity).is_ok());
         assert!(validate_npm_integrity("sha512-not-base64").is_err());
+    }
+
+    #[test]
+    fn uv_release_checksum_requires_the_requested_artifact() {
+        let checksum = "a".repeat(64);
+        assert_eq!(
+            parse_uv_release_checksum(
+                format!("{checksum}  uv-x86_64-unknown-linux-gnu.tar.gz\n").as_bytes(),
+                "uv-x86_64-unknown-linux-gnu.tar.gz"
+            )
+            .unwrap(),
+            checksum
+        );
+        assert!(
+            parse_uv_release_checksum(
+                b"not-a-checksum  uv-x86_64-unknown-linux-gnu.tar.gz\n",
+                "uv-x86_64-unknown-linux-gnu.tar.gz"
+            )
+            .is_err()
+        );
+        assert!(parse_uv_release_checksum(
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  another.tar.gz\n",
+            "uv-x86_64-unknown-linux-gnu.tar.gz"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn uvx_entry_point_selection_is_deterministic_and_fail_closed() {
+        assert_eq!(
+            select_uvx_entry_point(
+                "fast-agent-acp",
+                &["fast_agent_acp".to_string(), "another".to_string()]
+            )
+            .unwrap(),
+            "fast_agent_acp"
+        );
+        assert_eq!(
+            select_uvx_entry_point("package", &["run-agent".to_string()]).unwrap(),
+            "run-agent"
+        );
+        assert!(
+            select_uvx_entry_point("package", &["first".to_string(), "second".to_string()])
+                .is_err()
+        );
+        assert!(select_uvx_entry_point("package", &["../escape".to_string()]).is_err());
+    }
+
+    #[test]
+    fn uvx_launcher_uses_metadata_entry_point_without_shell_interpolation() {
+        let launcher = uvx_launcher_source("minion-code", "minion-code").unwrap();
+        assert!(launcher.contains("distribution(\"minion-code\")"));
+        assert!(launcher.contains("entry.group == \"console_scripts\""));
+        assert!(!launcher.contains("subprocess"));
     }
 
     #[test]
@@ -3430,6 +4474,48 @@ mod tests {
             ]))),
         };
         assert!(select_npm_bin(&metadata, "@scope/agent").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uvx_cached_installation_recovers_a_relocatable_python_launcher() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let service_root = temp.path().join("managed-agents");
+        let python = service_root.join("runtimes/python/cpython/bin/python");
+        fs::create_dir_all(python.parent().unwrap()).unwrap();
+        write_version_probe(&python, "3.12.13");
+
+        let install_root = service_root.join("agents/fast-agent/0.9.30-fixture");
+        let venv_python = install_root.join("venv/bin/python");
+        fs::create_dir_all(venv_python.parent().unwrap()).unwrap();
+        symlink(&python, &venv_python).unwrap();
+        let launcher = install_root.join("vibex-uvx-launcher.py");
+        fs::write(&launcher, b"raise SystemExit(0)\n").unwrap();
+        let manifest = InstallManifest {
+            registry_agent_id: "fast-agent".to_string(),
+            version: "0.9.30".to_string(),
+            fingerprint: "fixture".to_string(),
+            distribution_kind: AgentManagedDistributionKind::Uvx,
+            launch: ManifestLaunch::Python {
+                python: "venv/bin/python".to_string(),
+                script: "vibex-uvx-launcher.py".to_string(),
+                args: vec!["-x".to_string()],
+            },
+        };
+        write_json_private(&install_root.join("vibex-install.json"), &manifest).unwrap();
+
+        let installed = load_installed_agent(&install_root, "fixture").unwrap();
+        assert_eq!(installed.kind, AgentManagedDistributionKind::Uvx);
+        assert_eq!(
+            installed.command.command,
+            venv_python.to_string_lossy().into_owned()
+        );
+        assert_eq!(
+            installed.command.args,
+            vec![launcher.to_string_lossy().into_owned(), "-x".to_string()]
+        );
     }
 
     #[test]

@@ -57,7 +57,7 @@ use vibex_terminal::TerminalManager;
 
 use acp_terminal::DesktopAcpTerminalHost;
 
-pub use agent_install::{AgentInstallService, AgentNodeRuntimeOptions};
+pub use agent_install::{AgentInstallService, AgentNodeRuntimeOptions, AgentUvRuntimeOptions};
 pub use auth_catalog::AgentAuthCatalogService;
 pub use catalog::{
     RuntimeOptionCatalogService, RuntimeOptionProbeResult, RuntimeOptionSnapshotSummary,
@@ -182,6 +182,7 @@ pub struct DesktopRuntimeConfig {
     pub event_capacity: usize,
     pub install_managed_adapters: bool,
     pub agent_node_runtime: AgentNodeRuntimeOptions,
+    pub agent_uv_runtime: AgentUvRuntimeOptions,
     pub acquire_home_lock: bool,
     pub remote_gateway: RemoteGatewayConfig,
 }
@@ -206,6 +207,7 @@ impl DesktopRuntimeConfig {
             event_capacity: 512,
             install_managed_adapters: true,
             agent_node_runtime: AgentNodeRuntimeOptions::from_environment(),
+            agent_uv_runtime: AgentUvRuntimeOptions::from_environment(),
             acquire_home_lock: true,
             remote_gateway: RemoteGatewayConfig::default(),
         })
@@ -221,6 +223,7 @@ impl DesktopRuntimeConfig {
             event_capacity: 512,
             install_managed_adapters: true,
             agent_node_runtime: AgentNodeRuntimeOptions::from_environment(),
+            agent_uv_runtime: AgentUvRuntimeOptions::from_environment(),
             acquire_home_lock: true,
             remote_gateway: RemoteGatewayConfig::default(),
         }
@@ -243,6 +246,7 @@ impl DesktopRuntimeConfig {
             event_capacity: 512,
             install_managed_adapters: true,
             agent_node_runtime: AgentNodeRuntimeOptions::from_environment(),
+            agent_uv_runtime: AgentUvRuntimeOptions::from_environment(),
             acquire_home_lock: true,
             remote_gateway: RemoteGatewayConfig::default(),
         }
@@ -266,6 +270,7 @@ impl DesktopRuntimeConfig {
             event_capacity: 512,
             install_managed_adapters: true,
             agent_node_runtime: AgentNodeRuntimeOptions::from_environment(),
+            agent_uv_runtime: AgentUvRuntimeOptions::from_environment(),
             acquire_home_lock: true,
             remote_gateway: RemoteGatewayConfig::default(),
         }
@@ -286,6 +291,7 @@ impl DesktopRuntimeConfig {
             event_capacity: 32,
             install_managed_adapters: false,
             agent_node_runtime: AgentNodeRuntimeOptions::default(),
+            agent_uv_runtime: AgentUvRuntimeOptions::default(),
             acquire_home_lock: true,
             remote_gateway: RemoteGatewayConfig::default(),
         }
@@ -905,11 +911,12 @@ impl DesktopRuntime {
             manager.clone(),
             provider_config_service.clone(),
         ));
-        let install_service = Arc::new(AgentInstallService::new_with_node_runtime_options(
+        let install_service = Arc::new(AgentInstallService::new_with_runtime_options(
             db_path.clone(),
             config.home_dir.join("acp-agents"),
             provider_config_service.clone(),
             config.agent_node_runtime.clone(),
+            config.agent_uv_runtime.clone(),
         )?);
         let git = GitHandle {
             db_path: db_path.clone(),
