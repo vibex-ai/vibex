@@ -6592,6 +6592,7 @@ impl ManagementCenter {
                 .child(
                     v_flex()
                         .min_w_0()
+                        .flex_1()
                         .gap_1()
                         .child(management_status_badge(status.to_string(), cx))
                         .when_some(selected_profile_label, |header, label| {
@@ -6741,6 +6742,7 @@ impl ManagementCenter {
                             .child(
                                 v_flex()
                                     .min_w_0()
+                                    .flex_1()
                                     .gap_1()
                                     .child(div().text_sm().font_semibold().child(method.name))
                                     .when_some(method.description, |title, description| {
@@ -6790,6 +6792,7 @@ impl ManagementCenter {
                                     .child(
                                         h_flex()
                                             .min_w_0()
+                                            .flex_1()
                                             .gap_2()
                                             .child(
                                                 div()
