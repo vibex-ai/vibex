@@ -6915,6 +6915,12 @@ impl VibexWorkbench {
         true
     }
 
+    fn invalidate_timeline_layout_measurements(&mut self) {
+        self.timeline_measured_turn_heights.clear();
+        self.timeline_pending_turn_heights.clear();
+        self.timeline_estimated_turn_heights.clear();
+    }
+
     fn refresh_last_timeline_size(&mut self) -> bool {
         self.timeline_pending_turn_heights.clear();
         let turns = self.conversation_turns_cached();
@@ -7066,6 +7072,10 @@ impl VibexWorkbench {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         turn.complete.hash(&mut hasher);
         process_expansion.hash(&mut hasher);
+        self.ui_state
+            .session
+            .enhanced_command_execution_display
+            .hash(&mut hasher);
         for row in turn
             .user_row
             .iter()
@@ -7090,6 +7100,15 @@ impl VibexWorkbench {
                 .hash(&mut hasher);
         }
         for group in &turn.process_activity_groups {
+            group.id.hash(&mut hasher);
+            group.start_row.hash(&mut hasher);
+            group.end_row.hash(&mut hasher);
+            self.timeline_command_expansion
+                .get(&group.id)
+                .copied()
+                .hash(&mut hasher);
+        }
+        for group in &turn.process_activity_groups_with_commands {
             group.id.hash(&mut hasher);
             group.start_row.hash(&mut hasher);
             group.end_row.hash(&mut hasher);
@@ -14275,6 +14294,7 @@ impl VibexWorkbench {
 
     fn set_session_content_width(&mut self, mode: SessionContentWidthMode, cx: &mut Context<Self>) {
         self.ui_state.session.content_width = mode;
+        self.invalidate_timeline_layout_measurements();
         self.rebuild_timeline_sizes();
         self.queue_ui_state();
         cx.notify();
@@ -14282,6 +14302,7 @@ impl VibexWorkbench {
 
     fn set_enhanced_command_execution_display(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.ui_state.session.enhanced_command_execution_display = enabled;
+        self.invalidate_timeline_layout_measurements();
         self.rebuild_timeline_sizes();
         self.queue_ui_state();
         cx.notify();
@@ -37090,6 +37111,47 @@ mod tests {
         assert!(
             row_renderer.contains("TimelineRowKind::Command => self.render_process_activity_line")
         );
+    }
+
+    #[test]
+    fn session_layout_changes_invalidate_timeline_measurements() {
+        let source = include_str!("app.rs");
+        let content_width = source
+            .split_once("    fn set_session_content_width(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn set_enhanced_command_execution_display(")
+            })
+            .map(|(body, _)| body)
+            .expect("content width setter should remain inspectable");
+        let command_display = source
+            .split_once("    fn set_enhanced_command_execution_display(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn set_close_to_tray("))
+            .map(|(body, _)| body)
+            .expect("command display setter should remain inspectable");
+        let invalidation = source
+            .split_once("    fn invalidate_timeline_layout_measurements(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn refresh_last_timeline_size("))
+            .map(|(body, _)| body)
+            .expect("timeline layout invalidation should remain inspectable");
+
+        assert!(content_width.contains("self.invalidate_timeline_layout_measurements();"));
+        assert!(command_display.contains("self.invalidate_timeline_layout_measurements();"));
+        assert!(invalidation.contains("self.timeline_measured_turn_heights.clear();"));
+        assert!(invalidation.contains("self.timeline_pending_turn_heights.clear();"));
+        assert!(invalidation.contains("self.timeline_estimated_turn_heights.clear();"));
+    }
+
+    #[test]
+    fn timeline_height_signature_tracks_command_card_layout() {
+        let source = include_str!("app.rs");
+        let signature = source
+            .split_once("    fn timeline_turn_estimate_signature(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn record_timeline_turn_height("))
+            .map(|(body, _)| body)
+            .expect("timeline estimate signature should remain inspectable");
+
+        assert!(signature.contains("enhanced_command_execution_display"));
+        assert!(signature.contains("process_activity_groups_with_commands"));
     }
 
     #[test]
