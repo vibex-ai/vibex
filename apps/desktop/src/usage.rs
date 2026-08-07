@@ -961,27 +961,7 @@ impl UsageView {
                     .into_any_element(),
             );
         }
-        if !self.stale || self.statistics.is_none() {
-            return None;
-        }
-        Some(
-            h_flex()
-                .w_full()
-                .min_h(px(34.0))
-                .items_center()
-                .gap_2()
-                .rounded(px(6.0))
-                .bg(cx.theme().muted.opacity(0.28))
-                .px_3()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(locale::text(
-                    "Refreshing after new usage was committed",
-                    "新用量已提交，正在刷新",
-                    "新用量已提交，正在重新整理",
-                ))
-                .into_any_element(),
-        )
+        None
     }
 }
 
@@ -2615,6 +2595,19 @@ mod tests {
             usage_content_state(None, false, true),
             UsageContentState::Unavailable
         );
+    }
+
+    #[test]
+    fn retained_data_refresh_does_not_insert_a_transient_status_row() {
+        let source = include_str!("usage.rs");
+        let status = source
+            .split_once("    fn render_status(")
+            .and_then(|(_, tail)| tail.split_once("\n}\n\nimpl Render for UsageView"))
+            .map(|(body, _)| body)
+            .expect("usage status rendering should remain inspectable");
+
+        assert!(!status.contains("self.stale"));
+        assert!(!status.contains("Refreshing after new usage was committed"));
     }
 
     #[test]

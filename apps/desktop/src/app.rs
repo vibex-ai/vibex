@@ -1695,6 +1695,19 @@ enum AgentPollSignal {
     Terminals(Vec<TerminalSession>),
 }
 
+fn agent_projection_should_repaint(active_tab: &str, changed: bool) -> bool {
+    changed && active_tab == "agent"
+}
+
+fn timeline_batch_should_repaint(
+    active_tab: &str,
+    unread_changed: bool,
+    timeline_changed: bool,
+    needs_refetch: bool,
+) -> bool {
+    unread_changed || agent_projection_should_repaint(active_tab, timeline_changed || needs_refetch)
+}
+
 /// Position lookup for `TimelineModel::items` keyed by item id.
 ///
 /// Row/turn renderers resolve payloads from item ids on every frame; a linear
@@ -6600,7 +6613,9 @@ impl VibexWorkbench {
                                     cx,
                                 ),
                                 AgentPollSignal::RuntimeSelection(state) => {
-                                    if this.runtime_selection.as_ref() == Some(state.as_ref()) {
+                                    let changed = if this.runtime_selection.as_ref()
+                                        == Some(state.as_ref())
+                                    {
                                         false
                                     } else {
                                         this.runtime_selection = Some(*state);
@@ -6609,20 +6624,33 @@ impl VibexWorkbench {
                                             cx,
                                         );
                                         true
-                                    }
+                                    };
+                                    agent_projection_should_repaint(
+                                        &this.ui_state.workbench.active_tab,
+                                        changed,
+                                    )
                                 }
                                 AgentPollSignal::RuntimeUsage { session_id, usage } => {
-                                    if this.selected_session_id.as_ref() != Some(&session_id)
+                                    let changed = if this.selected_session_id.as_ref()
+                                        != Some(&session_id)
                                         || this.token_usage == usage
                                     {
                                         false
                                     } else {
                                         this.token_usage = usage;
                                         true
-                                    }
+                                    };
+                                    agent_projection_should_repaint(
+                                        &this.ui_state.workbench.active_tab,
+                                        changed,
+                                    )
                                 }
                                 AgentPollSignal::Terminals(terminals) => {
-                                    this.sync_terminal_sessions(terminals, cx)
+                                    let changed = this.sync_terminal_sessions(terminals, cx);
+                                    agent_projection_should_repaint(
+                                        &this.ui_state.workbench.active_tab,
+                                        changed,
+                                    )
                                 }
                             };
                             if dirty {
@@ -6739,20 +6767,27 @@ impl VibexWorkbench {
         if needs_refetch {
             self.refresh_selected_agent_timeline(cx);
         }
-        unread_changed || changed > 0 || needs_refetch
+        timeline_batch_should_repaint(
+            &self.ui_state.workbench.active_tab,
+            unread_changed,
+            changed > 0,
+            needs_refetch,
+        )
     }
 
     fn apply_desktop_event(&mut self, event: DesktopEvent, cx: &mut Context<Self>) -> bool {
         match event {
             DesktopEvent::Timeline(event) => self.apply_live_timeline_batch(vec![event], cx),
             DesktopEvent::Runtime(event) => {
-                self.selected_session_id
+                let changed = self
+                    .selected_session_id
                     .as_ref()
                     .is_some_and(|selected| selected == &event.session_id)
-                    && self.refresh_agent_token_usage(&event.session_id)
+                    && self.refresh_agent_token_usage(&event.session_id);
+                agent_projection_should_repaint(&self.ui_state.workbench.active_tab, changed)
             }
             DesktopEvent::RuntimeSelection(event) => {
-                if event.event.as_ref().is_some_and(|projection| {
+                let changed = if event.event.as_ref().is_some_and(|projection| {
                     self.selected_session_id.as_ref() == Some(&projection.session_id)
                 }) {
                     if self.runtime_selection.as_ref() == Some(&event.state) {
@@ -6768,7 +6803,8 @@ impl VibexWorkbench {
                     true
                 } else {
                     false
-                }
+                };
+                agent_projection_should_repaint(&self.ui_state.workbench.active_tab, changed)
             }
             DesktopEvent::ProviderConfigChanged(event) => {
                 self.management_view
@@ -34029,6 +34065,25 @@ mod tests {
             .map(|(body, _)| body)
             .expect("session selection should remain inspectable");
         assert!(selection.contains("self.stash_current_agent_session_view();"));
+    }
+
+    #[test]
+    fn hidden_agent_projections_update_without_repainting_other_routes() {
+        assert!(agent_projection_should_repaint("agent", true));
+        assert!(!agent_projection_should_repaint("usage", true));
+        assert!(!agent_projection_should_repaint("management", true));
+        assert!(!agent_projection_should_repaint("agent", false));
+
+        assert!(timeline_batch_should_repaint("usage", true, false, false));
+        assert!(timeline_batch_should_repaint("agent", false, true, false));
+        assert!(timeline_batch_should_repaint("agent", false, false, true));
+        assert!(!timeline_batch_should_repaint("usage", false, true, false));
+        assert!(!timeline_batch_should_repaint(
+            "management",
+            false,
+            false,
+            true
+        ));
     }
 
     #[test]

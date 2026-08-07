@@ -90,6 +90,9 @@ session entry is a standard `gpui_component::button::Button` wrapped with
   the table is not a nested vertical scroll surface. Summary columns adapt for
   narrow windows and toolbar controls wrap without overlap.
 - Loading, empty, unsupported/error, ready, and stale states are explicit.
+  When retained statistics refresh in the background, keep the content geometry
+  stable and expose progress through the fixed-size header refresh control rather
+  than inserting a transient in-flow status row.
   Partial coverage remains available in affected table rows and their tooltips.
   All visible strings and accessibility labels use the existing English/Simplified
   Chinese/Traditional Chinese locale helper. All colors use semantic theme tokens.
