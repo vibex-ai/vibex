@@ -2454,11 +2454,13 @@ AgentManagedInstallationRecord {
   SemVer 22.0.0 or newer, and both version probes must succeed; rejection falls
   through to the next candidate without activating a partial installation.
 - npm always uses an isolated Vibex cache and blank user/global npm config,
-  regardless of runtime source. The install root is content-addressed by the
-  selected runtime identity, publishes through staging, keeps healthy versions
-  side by side, and only prunes old versions after the new command is durable.
-  Archive paths, extraction budgets, and executable paths are bounded and
-  traversal-safe.
+  regardless of runtime source. The user and global config paths must be
+  distinct: npm rejects one file assigned to both configuration levels as a
+  duplicate load before package resolution begins. The install root is
+  content-addressed by the selected runtime identity, publishes through
+  staging, keeps healthy versions side by side, and only prunes old versions
+  after the new command is durable. Archive paths, extraction budgets, and
+  executable paths are bounded and traversal-safe.
 - A usable installed SemVer may not be replaced by a lower Registry SemVer.
   Exact-version cache hits are idempotent; an invalid cache entry is removed
   and rebuilt. Pending install/upgrade/uninstall rows are reconciled on the
@@ -2492,6 +2494,9 @@ AgentManagedInstallationRecord {
 - Registry downgrade candidate -> `conflict/agent_install_downgrade_rejected`.
 - Missing, unexecutable, malformed, or pre-22 explicit/system Node/npm -> reject
   that candidate and continue through system then managed runtime fallback.
+- Identical `npm_config_userconfig` and `npm_config_globalconfig` paths -> an
+  invalid internal command configuration; construct distinct blank files and
+  do not rely on npm to accept the duplicate load.
 - Interrupted operation or unusable command/root -> recovery marks the row
   failed and does not re-enable a missing process.
 - Uninstall failure -> preserve the old usable command and configuration when
@@ -2510,15 +2515,17 @@ AgentManagedInstallationRecord {
 - Good: removing an Agent deletes its command, installation row, and auth
   catalog; a later startup does not reinstall it unless the user adds it again.
 - Bad: activate an Agent before checksum/lock verification, use npm's global
-  state, accept an unprobed or pre-22 Node/npm candidate, silently downgrade,
-  or restore an old exact compatibility workaround for a newer binary.
+  state, assign one blank npm config file to both user and global levels,
+  accept an unprobed or pre-22 Node/npm candidate, silently downgrade, or
+  restore an old exact compatibility workaround for a newer binary.
 
 ### 6. Tests Required
 
 - `cargo test -p vibex-desktop-runtime agent_install` covers cache repair,
   canonical npm sources, lockfile identity, checksum/archive limits, SemVer
   downgrade rejection, explicit/system/managed Node selection and fallback,
-  malformed/old Node rejection, interrupted recovery, and uninstall cleanup.
+  malformed/old Node rejection, distinct empty user/global npm configs,
+  interrupted recovery, and uninstall cleanup.
 - `cargo test -p vibex-config-switch agent` covers removal of runtime and auth
   snapshots plus managed command/version matching.
 - `cargo test -p vibex-agent-acp runtime` covers dynamic managed identities,
@@ -2526,6 +2533,30 @@ AgentManagedInstallationRecord {
   descriptor compatibility.
 - Desktop management tests cover Add loading, upgrade loading, failed-install
   detail rendering, and Agent registry refresh events.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+command
+    .env("npm_config_userconfig", &blank_config)
+    .env("npm_config_globalconfig", &blank_config);
+```
+
+npm exits during configuration loading because the same path is assigned to
+two configuration levels.
+
+#### Correct
+
+```rust
+command
+    .env("npm_config_userconfig", &blank_user_config)
+    .env("npm_config_globalconfig", &blank_global_config);
+```
+
+Both files are private and empty, so the selected explicit, system, or managed
+Node/npm runtime stays isolated without triggering npm's duplicate-load guard.
 
 ## Scenario: ACP Managed Adapter Compatibility Registry
 

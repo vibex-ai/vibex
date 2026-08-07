@@ -728,8 +728,7 @@ impl AgentInstallService {
             "dependencies": { (package): format!("={package_version}") }
         });
         write_json_private(&staging.join("package.json"), &package_json)?;
-        let npm_user_config = staging.join("npmrc");
-        write_private_file(&npm_user_config, b"")?;
+        let npm_config = write_isolated_npm_configs(&staging)?;
         fs::create_dir_all(self.root.join("cache/npm")).map_err(|error| {
             storage_error(
                 "agent_npm_cache_create_failed",
@@ -754,8 +753,8 @@ impl AgentInstallService {
             .stderr(Stdio::null())
             .kill_on_drop(true)
             .env("npm_config_cache", self.root.join("cache/npm"))
-            .env("npm_config_userconfig", &npm_user_config)
-            .env("npm_config_globalconfig", &npm_user_config)
+            .env("npm_config_userconfig", &npm_config.user)
+            .env("npm_config_globalconfig", &npm_config.global)
             .env("npm_config_update_notifier", "false")
             .env_remove("NPM_TOKEN")
             .env_remove("NODE_AUTH_TOKEN");
@@ -1344,6 +1343,17 @@ fn node_runtime_candidates(
     candidates
 }
 
+fn write_isolated_npm_configs(staging: &Path) -> VibexResult<IsolatedNpmConfigs> {
+    // npm rejects loading one file as both its user and global configuration.
+    let configs = IsolatedNpmConfigs {
+        user: staging.join("npm-user-config"),
+        global: staging.join("npm-global-config"),
+    };
+    write_private_file(&configs.user, b"")?;
+    write_private_file(&configs.global, b"")?;
+    Ok(configs)
+}
+
 async fn select_valid_external_node_runtime(
     candidates: Vec<NodeRuntimeCandidate>,
 ) -> Option<NodeRuntime> {
@@ -1481,6 +1491,12 @@ enum ManifestLaunch {
 #[serde(rename_all = "camelCase")]
 struct RegistryCacheMetadata {
     fetched_at_ms: i64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct IsolatedNpmConfigs {
+    user: PathBuf,
+    global: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2896,6 +2912,17 @@ mod tests {
             semver::Version::new(22, 14, 0)
         );
         assert!(parse_node_version_output(b"node-22\n").is_err());
+    }
+
+    #[test]
+    fn isolated_npm_configs_use_distinct_empty_files() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let configs = write_isolated_npm_configs(temp.path()).unwrap();
+
+        assert_ne!(configs.user, configs.global);
+        assert_eq!(fs::read(configs.user).unwrap(), b"");
+        assert_eq!(fs::read(configs.global).unwrap(), b"");
     }
 
     #[test]
