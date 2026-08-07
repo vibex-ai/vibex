@@ -2431,6 +2431,7 @@ AgentInstallService::install(agent_id).await
 AgentInstallService::check_update(agent_id).await
 AgentInstallService::uninstall(agent_id).await
 AgentInstallService::bootstrap_agent_ids() -> Vec<AgentId>
+AgentNodeRuntimeOptions { node_path, npm_path }
 AgentManagedInstallationRecord {
   agent_id, registry_agent_id, state, command, install_root, updated_at_ms
 }
@@ -2446,11 +2447,18 @@ AgentManagedInstallationRecord {
   carry a SHA-256. npm distributions must use an exact version, metadata
   integrity, and the canonical `registry.npmjs.org` tarball URL; the lockfile
   `resolved` URL must match that same canonical artifact.
-- npm Agents run from Vibex-managed Node.js 22 and an isolated npm cache. The
-  install root is content-addressed, publishes through staging, keeps healthy
-  versions side by side, and only prunes old versions after the new command is
-  durable. Archive paths, extraction budgets, and executable paths are bounded
-  and traversal-safe.
+- npm Agents select Node/npm in this order: explicit
+  `VIBEX_AGENT_NODE_PATH`/`VIBEX_AGENT_NPM_PATH` configuration, system
+  `node`/`npm` from `PATH`, then a downloaded Vibex-managed Node.js 22 runtime.
+  Explicit and system candidates must be real files, `node --version` must be
+  SemVer 22.0.0 or newer, and both version probes must succeed; rejection falls
+  through to the next candidate without activating a partial installation.
+- npm always uses an isolated Vibex cache and blank user/global npm config,
+  regardless of runtime source. The install root is content-addressed by the
+  selected runtime identity, publishes through staging, keeps healthy versions
+  side by side, and only prunes old versions after the new command is durable.
+  Archive paths, extraction budgets, and executable paths are bounded and
+  traversal-safe.
 - A usable installed SemVer may not be replaced by a lower Registry SemVer.
   Exact-version cache hits are idempotent; an invalid cache entry is removed
   and rebuilt. Pending install/upgrade/uninstall rows are reconciled on the
@@ -2482,6 +2490,8 @@ AgentManagedInstallationRecord {
 - Download or extraction timeout -> bounded process error and a persisted
   `Failed`/`UpdateAvailable` state suitable for retry.
 - Registry downgrade candidate -> `conflict/agent_install_downgrade_rejected`.
+- Missing, unexecutable, malformed, or pre-22 explicit/system Node/npm -> reject
+  that candidate and continue through system then managed runtime fallback.
 - Interrupted operation or unusable command/root -> recovery marks the row
   failed and does not re-enable a missing process.
 - Uninstall failure -> preserve the old usable command and configuration when
@@ -2500,14 +2510,15 @@ AgentManagedInstallationRecord {
 - Good: removing an Agent deletes its command, installation row, and auth
   catalog; a later startup does not reinstall it unless the user adds it again.
 - Bad: activate an Agent before checksum/lock verification, use npm's global
-  prefix or the user's preinstalled `node`, silently downgrade, or restore an
-  old exact compatibility workaround for a newer binary.
+  state, accept an unprobed or pre-22 Node/npm candidate, silently downgrade,
+  or restore an old exact compatibility workaround for a newer binary.
 
 ### 6. Tests Required
 
 - `cargo test -p vibex-desktop-runtime agent_install` covers cache repair,
   canonical npm sources, lockfile identity, checksum/archive limits, SemVer
-  downgrade rejection, interrupted recovery, and uninstall cleanup.
+  downgrade rejection, explicit/system/managed Node selection and fallback,
+  malformed/old Node rejection, interrupted recovery, and uninstall cleanup.
 - `cargo test -p vibex-config-switch agent` covers removal of runtime and auth
   snapshots plus managed command/version matching.
 - `cargo test -p vibex-agent-acp runtime` covers dynamic managed identities,

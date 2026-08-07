@@ -1,10 +1,11 @@
 //! Verified, side-by-side ACP Agent installations owned by the desktop runtime.
 
 use std::collections::{BTreeMap, HashSet};
+use std::env;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -41,14 +42,34 @@ const ARCHIVE_MAX_ENTRIES: usize = 100_000;
 const ARCHIVE_MAX_UNPACKED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const NODE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const MINIMUM_NODE_VERSION: semver::Version = semver::Version::new(22, 0, 0);
 const NODE_RELEASE_INDEX_URL: &str = "https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt";
+const AGENT_NODE_PATH_ENV: &str = "VIBEX_AGENT_NODE_PATH";
+const AGENT_NPM_PATH_ENV: &str = "VIBEX_AGENT_NPM_PATH";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentNodeRuntimeOptions {
+    pub node_path: Option<PathBuf>,
+    pub npm_path: Option<PathBuf>,
+}
+
+impl AgentNodeRuntimeOptions {
+    pub fn from_environment() -> Self {
+        Self {
+            node_path: nonempty_environment_path(AGENT_NODE_PATH_ENV),
+            npm_path: nonempty_environment_path(AGENT_NPM_PATH_ENV),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AgentInstallService {
     db_path: PathBuf,
     root: PathBuf,
     config_service: ProviderConfigService,
+    node_runtime_options: AgentNodeRuntimeOptions,
     client: Client,
     operation_lock: Arc<Mutex<()>>,
 }
@@ -58,6 +79,20 @@ impl AgentInstallService {
         db_path: impl Into<PathBuf>,
         root: impl Into<PathBuf>,
         config_service: ProviderConfigService,
+    ) -> VibexResult<Self> {
+        Self::new_with_node_runtime_options(
+            db_path,
+            root,
+            config_service,
+            AgentNodeRuntimeOptions::default(),
+        )
+    }
+
+    pub fn new_with_node_runtime_options(
+        db_path: impl Into<PathBuf>,
+        root: impl Into<PathBuf>,
+        config_service: ProviderConfigService,
+        node_runtime_options: AgentNodeRuntimeOptions,
     ) -> VibexResult<Self> {
         let db_path = db_path.into();
         let root = root.into();
@@ -97,6 +132,7 @@ impl AgentInstallService {
             db_path,
             root,
             config_service,
+            node_runtime_options,
             client,
             operation_lock: Arc::new(Mutex::new(())),
         };
@@ -304,6 +340,11 @@ impl AgentInstallService {
         let entry = registry.require_agent(registry_id)?.clone();
         let distribution = resolve_distribution(&entry)?;
         let distribution_kind = distribution.kind();
+        let node_runtime = if matches!(&distribution, ResolvedDistribution::Npm(_)) {
+            Some(self.select_node_runtime().await?)
+        } else {
+            None
+        };
         let previous = self.read_record(&agent_id)?;
         let previous_is_usable = previous
             .as_ref()
@@ -323,6 +364,11 @@ impl AgentInstallService {
                     .as_deref()
                     .is_some_and(|root| Path::new(root).is_dir())
                 && record.command.as_ref().is_some_and(command_is_available)
+                && node_runtime.as_ref().is_none_or(|runtime| {
+                    record.command.as_ref().is_some_and(|command| {
+                        Path::new(&command.command) == runtime.node.as_path()
+                    })
+                })
         }) {
             let mut record = previous.expect("matching managed record exists");
             verify_required_external_commands(&agent_id)?;
@@ -372,7 +418,7 @@ impl AgentInstallService {
         })?;
 
         let installed = self
-            .install_distribution(&agent_id, &entry, distribution)
+            .install_distribution(&agent_id, &entry, distribution, node_runtime)
             .await
             .and_then(|installed| {
                 verify_required_external_commands(&agent_id)?;
@@ -531,12 +577,21 @@ impl AgentInstallService {
         agent_id: &AgentId,
         entry: &RegistryEntry,
         distribution: ResolvedDistribution,
+        node_runtime: Option<NodeRuntime>,
     ) -> VibexResult<InstalledAgent> {
         match distribution {
             ResolvedDistribution::Binary(target) => {
                 self.install_binary(agent_id, entry, target).await
             }
-            ResolvedDistribution::Npm(npx) => self.install_npm(agent_id, entry, npx).await,
+            ResolvedDistribution::Npm(npx) => {
+                let node_runtime = node_runtime.ok_or_else(|| {
+                    VibexError::capability(
+                        "agent_node_runtime_unselected",
+                        "npm Agent installation has no selected Node.js runtime",
+                    )
+                })?;
+                self.install_npm(agent_id, entry, npx, node_runtime).await
+            }
         }
     }
 
@@ -617,6 +672,7 @@ impl AgentInstallService {
         agent_id: &AgentId,
         entry: &RegistryEntry,
         npx: RegistryNpxDistribution,
+        node: NodeRuntime,
     ) -> VibexResult<InstalledAgent> {
         let (package, package_version) = parse_exact_npm_spec(&npx.package, &entry.version)?;
         let metadata = self.fetch_npm_metadata(package, package_version).await?;
@@ -647,6 +703,7 @@ impl AgentInstallService {
             )
             .with_diagnostic("error", error.to_string())
         })?;
+        let node_identity = node.fingerprint_identity();
         let fingerprint = distribution_fingerprint(&[
             entry.id.as_str(),
             entry.version.as_str(),
@@ -655,13 +712,13 @@ impl AgentInstallService {
             tarball.as_str(),
             bin_path.as_str(),
             args_identity.as_str(),
+            node_identity.as_str(),
         ]);
         let target_root = self.version_root(agent_id, &entry.version, &fingerprint)?;
         if let Some(installed) = load_or_remove_cached_installation(&target_root, &fingerprint)? {
             return Ok(installed);
         }
 
-        let node = self.ensure_node_runtime().await?;
         let staging = self.create_staging(agent_id)?;
         let mut staging_guard = StagingGuard::new(staging.clone());
         let package_json = serde_json::json!({
@@ -681,9 +738,8 @@ impl AgentInstallService {
             )
         })?;
 
-        let mut command = Command::new(&node.node);
+        let mut command = node.npm_command();
         command
-            .arg(&node.npm_cli)
             .arg("install")
             .arg("--ignore-scripts")
             .arg("--no-audit")
@@ -979,7 +1035,26 @@ impl AgentInstallService {
         Ok(cached)
     }
 
-    async fn ensure_node_runtime(&self) -> VibexResult<NodeRuntime> {
+    async fn select_node_runtime(&self) -> VibexResult<NodeRuntime> {
+        if let Some(runtime) = self.select_external_node_runtime().await {
+            return Ok(runtime);
+        }
+        self.ensure_managed_node_runtime().await
+    }
+
+    async fn select_external_node_runtime(&self) -> Option<NodeRuntime> {
+        select_valid_external_node_runtime(self.node_runtime_candidates()).await
+    }
+
+    fn node_runtime_candidates(&self) -> Vec<NodeRuntimeCandidate> {
+        node_runtime_candidates(
+            &self.node_runtime_options,
+            resolve_system_binary("node"),
+            resolve_system_binary("npm"),
+        )
+    }
+
+    async fn ensure_managed_node_runtime(&self) -> VibexResult<NodeRuntime> {
         let sums = self
             .fetch_limited(NODE_RELEASE_INDEX_URL, 512 * 1024)
             .await?;
@@ -1012,9 +1087,20 @@ impl AgentInstallService {
                 )
             })?;
         validate_safe_segment(version, "Node.js version")?;
+        let version = semver::Version::parse(version).map_err(|error| {
+            VibexError::validation(
+                "agent_node_release_version_invalid",
+                "Node.js release version was invalid",
+            )
+            .with_diagnostic("error", error.to_string())
+        })?;
         let platform = current_platform_key()?;
-        let target = self.root.join("runtimes/node").join(version).join(platform);
-        if let Ok(runtime) = node_runtime_at(&target) {
+        let target = self
+            .root
+            .join("runtimes/node")
+            .join(version.to_string())
+            .join(platform);
+        if let Ok(runtime) = node_runtime_at(&target, version.clone()) {
             return Ok(runtime);
         }
         if fs::symlink_metadata(&target).is_ok() {
@@ -1088,7 +1174,7 @@ impl AgentInstallService {
         }
         staging_guard.disarm();
         let _ = fs::remove_dir_all(&staging);
-        node_runtime_at(&target)
+        node_runtime_at(&target, version)
     }
 
     fn open_connection(&self) -> VibexResult<vibex_db::DbConnection> {
@@ -1225,6 +1311,56 @@ impl AgentInstallService {
     }
 }
 
+fn node_runtime_candidates(
+    options: &AgentNodeRuntimeOptions,
+    system_node: Option<PathBuf>,
+    system_npm: Option<PathBuf>,
+) -> Vec<NodeRuntimeCandidate> {
+    let mut candidates = Vec::new();
+
+    if options.node_path.is_some() || options.npm_path.is_some() {
+        let node = options.node_path.clone().or_else(|| system_node.clone());
+        let npm = options
+            .npm_path
+            .clone()
+            .or_else(|| node.as_deref().and_then(adjacent_npm_binary))
+            .or_else(|| system_npm.clone());
+        if let (Some(node), Some(npm)) = (node, npm) {
+            candidates.push(NodeRuntimeCandidate {
+                source: NodeRuntimeSource::Explicit,
+                node,
+                npm,
+            });
+        }
+    }
+
+    if let (Some(node), Some(npm)) = (system_node, system_npm) {
+        candidates.push(NodeRuntimeCandidate {
+            source: NodeRuntimeSource::System,
+            node,
+            npm,
+        });
+    }
+    candidates
+}
+
+async fn select_valid_external_node_runtime(
+    candidates: Vec<NodeRuntimeCandidate>,
+) -> Option<NodeRuntime> {
+    for candidate in candidates {
+        match validate_node_runtime_candidate(candidate.clone()).await {
+            Ok(runtime) => return Some(runtime),
+            Err(error) => tracing::warn!(
+                target: "vibex_desktop",
+                node_source = candidate.source.as_str(),
+                error_code = %error.code,
+                "ACP Agent Node.js candidate was rejected"
+            ),
+        }
+    }
+    None
+}
+
 #[derive(Debug)]
 struct InstalledAgent {
     kind: AgentManagedDistributionKind,
@@ -1347,10 +1483,75 @@ struct RegistryCacheMetadata {
     fetched_at_ms: i64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeRuntimeSource {
+    Explicit,
+    System,
+    Managed,
+}
+
+impl NodeRuntimeSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::System => "system",
+            Self::Managed => "managed",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum NpmLauncher {
+    NodeScript(PathBuf),
+    Executable(PathBuf),
+}
+
+impl NpmLauncher {
+    fn path(&self) -> &Path {
+        match self {
+            Self::NodeScript(path) | Self::Executable(path) => path,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct NodeRuntime {
     node: PathBuf,
-    npm_cli: PathBuf,
+    npm: NpmLauncher,
+    version: semver::Version,
+    source: NodeRuntimeSource,
+}
+
+impl NodeRuntime {
+    fn npm_command(&self) -> Command {
+        let mut command = match &self.npm {
+            NpmLauncher::NodeScript(script) => {
+                let mut command = Command::new(&self.node);
+                command.arg(script);
+                command
+            }
+            NpmLauncher::Executable(executable) => Command::new(executable),
+        };
+        prepend_node_to_path(&mut command, &self.node);
+        command
+    }
+
+    fn fingerprint_identity(&self) -> String {
+        format!(
+            "{}\0{}\0{}\0{}",
+            self.source.as_str(),
+            self.version,
+            self.node.to_string_lossy(),
+            self.npm.path().to_string_lossy()
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NodeRuntimeCandidate {
+    source: NodeRuntimeSource,
+    node: PathBuf,
+    npm: PathBuf,
 }
 
 struct StagingGuard {
@@ -1478,7 +1679,7 @@ fn node_archive_suffix() -> VibexResult<&'static str> {
     }
 }
 
-fn node_runtime_at(root: &Path) -> VibexResult<NodeRuntime> {
+fn node_runtime_at(root: &Path, version: semver::Version) -> VibexResult<NodeRuntime> {
     #[cfg(windows)]
     let node = root.join("node.exe");
     #[cfg(not(windows))]
@@ -1493,7 +1694,160 @@ fn node_runtime_at(root: &Path) -> VibexResult<NodeRuntime> {
             "managed Node.js runtime is incomplete",
         ));
     }
-    Ok(NodeRuntime { node, npm_cli })
+    Ok(NodeRuntime {
+        node,
+        npm: NpmLauncher::NodeScript(npm_cli),
+        version,
+        source: NodeRuntimeSource::Managed,
+    })
+}
+
+fn nonempty_environment_path(key: &str) -> Option<PathBuf> {
+    env::var_os(key)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn resolve_system_binary(command: &str) -> Option<PathBuf> {
+    vibex_config_switch::resolve_binary_path(command).map(PathBuf::from)
+}
+
+fn adjacent_npm_binary(node: &Path) -> Option<PathBuf> {
+    let parent = node.parent()?;
+    #[cfg(windows)]
+    let names = ["npm.cmd", "npm.exe", "npm"];
+    #[cfg(not(windows))]
+    let names = ["npm"];
+    names
+        .into_iter()
+        .map(|name| parent.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+async fn validate_node_runtime_candidate(
+    candidate: NodeRuntimeCandidate,
+) -> VibexResult<NodeRuntime> {
+    if !candidate.node.is_file() {
+        return Err(VibexError::validation(
+            "agent_node_binary_missing",
+            "Node.js candidate does not point to a file",
+        ));
+    }
+    if !candidate.npm.is_file() {
+        return Err(VibexError::validation(
+            "agent_npm_binary_missing",
+            "npm candidate does not point to a file",
+        ));
+    }
+
+    let mut version_command = Command::new(&candidate.node);
+    version_command.arg("--version");
+    prepend_node_to_path(&mut version_command, &candidate.node);
+    let output = run_node_probe(
+        version_command,
+        "agent_node_version_probe_timeout",
+        "agent_node_version_probe_failed",
+        "Node.js version could not be detected",
+    )
+    .await?;
+    let version = parse_node_version_output(&output.stdout)?;
+    if version < MINIMUM_NODE_VERSION {
+        return Err(VibexError::capability(
+            "agent_node_version_unsupported",
+            "Node.js candidate is older than the supported minimum",
+        )
+        .with_diagnostic("detectedVersion", version.to_string())
+        .with_diagnostic("minimumVersion", MINIMUM_NODE_VERSION.to_string()));
+    }
+
+    let npm = external_npm_launcher(&candidate.node, &candidate.npm)?;
+    let runtime = NodeRuntime {
+        node: candidate.node,
+        npm,
+        version,
+        source: candidate.source,
+    };
+    let mut npm_command = runtime.npm_command();
+    npm_command.arg("--version");
+    run_node_probe(
+        npm_command,
+        "agent_npm_version_probe_timeout",
+        "agent_npm_version_probe_failed",
+        "npm version could not be detected",
+    )
+    .await?;
+    Ok(runtime)
+}
+
+fn external_npm_launcher(_node: &Path, npm: &Path) -> VibexResult<NpmLauncher> {
+    if npm.extension().is_some_and(|extension| extension == "js") {
+        return Ok(NpmLauncher::NodeScript(npm.to_path_buf()));
+    }
+    #[cfg(windows)]
+    if npm.extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+    }) {
+        let npm_cli = _node
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join("node_modules/npm/bin/npm-cli.js");
+        if !npm_cli.is_file() {
+            return Err(VibexError::validation(
+                "agent_npm_cli_missing",
+                "npm command script has no adjacent npm CLI",
+            ));
+        }
+        return Ok(NpmLauncher::NodeScript(npm_cli));
+    }
+    Ok(NpmLauncher::Executable(npm.to_path_buf()))
+}
+
+async fn run_node_probe(
+    mut command: Command,
+    timeout_code: &str,
+    failure_code: &str,
+    message: &str,
+) -> VibexResult<Output> {
+    let output = timeout(NODE_PROBE_TIMEOUT, command.output())
+        .await
+        .map_err(|_| VibexError::process(timeout_code, message))?
+        .map_err(|error| process_error(failure_code, message, error))?;
+    if !output.status.success() {
+        return Err(VibexError::process(failure_code, message)
+            .with_diagnostic("status", output.status.to_string()));
+    }
+    Ok(output)
+}
+
+fn parse_node_version_output(output: &[u8]) -> VibexResult<semver::Version> {
+    let output = std::str::from_utf8(output).map_err(|error| {
+        VibexError::validation(
+            "agent_node_version_output_invalid",
+            "Node.js version output was not UTF-8",
+        )
+        .with_diagnostic("error", error.to_string())
+    })?;
+    semver::Version::parse(output.trim().trim_start_matches('v')).map_err(|error| {
+        VibexError::validation(
+            "agent_node_version_output_invalid",
+            "Node.js version output was invalid",
+        )
+        .with_diagnostic("error", error.to_string())
+    })
+}
+
+fn prepend_node_to_path(command: &mut Command, node: &Path) {
+    let Some(node_directory) = node.parent() else {
+        return;
+    };
+    let paths = std::iter::once(node_directory.to_path_buf()).chain(
+        env::var_os("PATH")
+            .into_iter()
+            .flat_map(|value| env::split_paths(&value).collect::<Vec<_>>()),
+    );
+    if let Ok(path) = env::join_paths(paths) {
+        command.env("PATH", path);
+    }
 }
 
 fn parse_exact_npm_spec<'a>(spec: &'a str, expected: &str) -> VibexResult<(&'a str, &'a str)> {
@@ -2440,6 +2794,109 @@ fn process_error(code: &str, message: &str, error: impl ToString) -> VibexError 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn write_version_probe(path: &Path, version: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' '{version}'; exit 0; fi\nexit 1\n"
+        );
+        fs::write(path, script).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn node_runtime_selection_prefers_valid_explicit_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let explicit_node = temp.path().join("explicit-node");
+        let explicit_npm = temp.path().join("explicit-npm");
+        let system_node = temp.path().join("system-node");
+        let system_npm = temp.path().join("system-npm");
+        write_version_probe(&explicit_node, "v22.14.0");
+        write_version_probe(&explicit_npm, "10.9.2");
+        write_version_probe(&system_node, "v22.13.0");
+        write_version_probe(&system_npm, "10.9.1");
+
+        let options = AgentNodeRuntimeOptions {
+            node_path: Some(explicit_node.clone()),
+            npm_path: Some(explicit_npm),
+        };
+        let candidates = node_runtime_candidates(&options, Some(system_node), Some(system_npm));
+        let runtime = select_valid_external_node_runtime(candidates)
+            .await
+            .expect("explicit runtime should be selected");
+        assert_eq!(runtime.source, NodeRuntimeSource::Explicit);
+        assert_eq!(runtime.node, explicit_node);
+        assert_eq!(runtime.version, semver::Version::new(22, 14, 0));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invalid_explicit_node_falls_back_to_valid_system_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let explicit_node = temp.path().join("explicit-node");
+        let explicit_npm = temp.path().join("explicit-npm");
+        let system_node = temp.path().join("system-node");
+        let system_npm = temp.path().join("system-npm");
+        write_version_probe(&explicit_node, "v18.20.4");
+        write_version_probe(&explicit_npm, "10.9.2");
+        write_version_probe(&system_node, "v22.14.0");
+        write_version_probe(&system_npm, "10.9.2");
+
+        let options = AgentNodeRuntimeOptions {
+            node_path: Some(explicit_node),
+            npm_path: Some(explicit_npm),
+        };
+        let runtime = select_valid_external_node_runtime(node_runtime_candidates(
+            &options,
+            Some(system_node.clone()),
+            Some(system_npm),
+        ))
+        .await
+        .expect("system runtime should be selected");
+        assert_eq!(runtime.source, NodeRuntimeSource::System);
+        assert_eq!(runtime.node, system_node);
+        assert_eq!(runtime.version, semver::Version::new(22, 14, 0));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invalid_explicit_and_system_runtime_candidates_allow_managed_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let explicit_node = temp.path().join("explicit-node");
+        let explicit_npm = temp.path().join("explicit-npm");
+        let system_node = temp.path().join("system-node");
+        let system_npm = temp.path().join("system-npm");
+        write_version_probe(&explicit_node, "v18.20.4");
+        write_version_probe(&explicit_npm, "10.9.2");
+        write_version_probe(&system_node, "v20.19.0");
+        write_version_probe(&system_npm, "10.9.2");
+
+        let options = AgentNodeRuntimeOptions {
+            node_path: Some(explicit_node),
+            npm_path: Some(explicit_npm),
+        };
+        assert!(
+            select_valid_external_node_runtime(node_runtime_candidates(
+                &options,
+                Some(system_node),
+                Some(system_npm),
+            ))
+            .await
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn node_version_probe_parses_v_prefix_and_rejects_malformed_output() {
+        assert_eq!(
+            parse_node_version_output(b"v22.14.0\n").unwrap(),
+            semver::Version::new(22, 14, 0)
+        );
+        assert!(parse_node_version_output(b"node-22\n").is_err());
+    }
 
     #[test]
     fn registry_aliases_and_external_agents_are_explicit() {
