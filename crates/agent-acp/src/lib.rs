@@ -107,11 +107,11 @@ pub use registry::{
     AdapterCompatibilityIdentity, AgentEventEnricherKind, BridgeContractCase,
     BridgeContractCaseResult, BridgeContractEvidenceKind, BridgeContractRequirement,
     BridgeContractStatus, BridgeContractSummary, CapabilityEvidence, CapabilityResolutionInput,
-    CapabilitySupport, CommandVariant, CompatibilitySupport, ManagedRuntimeDependency,
-    NativeStateHomePolicy, ResolvedCapability, RestorePolicy, TranscriptStrategy,
-    VersionedAgentQuirk, VersionedOperationDescriptor, agent_supports_session_config_probe,
-    fallback_reasoning_efforts, fallback_session_modes, known_reasoning_effort_values,
-    known_session_mode_values,
+    CapabilitySupport, CommandVariant, CompatibilitySupport, ConfigOptionAliasCompatibility,
+    ManagedRuntimeDependency, NativeStateHomePolicy, ResolvedCapability, RestorePolicy,
+    TranscriptStrategy, VersionedAgentQuirk, VersionedOperationDescriptor,
+    agent_supports_session_config_probe, fallback_reasoning_efforts, fallback_session_modes,
+    known_reasoning_effort_values, known_session_mode_values,
 };
 pub use runtime::{
     AcpRuntimeClient, AcpRuntimeLifecycleBackend, AcpRuntimeSwitchBridge, AcpTerminalAuthRequest,

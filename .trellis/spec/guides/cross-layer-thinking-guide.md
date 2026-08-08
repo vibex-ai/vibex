@@ -139,6 +139,13 @@ After implementation:
 - [ ] Checked that identity/version matches are not reused as capability or
       readiness proof; downstream status, fingerprints, controls, and evidence
       must all preserve the source capability's conservative state
+- [ ] Split external-version policy by behavior: exact artifact/integrity,
+      tested ranges for stable protocol semantics, and exact identity for
+      quirks or event codecs; add boundary tests for each policy
+- [ ] When failure rollback copies a nullable persisted field, tested both an
+      established effective value and the first-initialization `NULL` case;
+      query projection must retain the durable intent and original actionable
+      error instead of reporting an unrelated uninitialized state
 
 ---
 

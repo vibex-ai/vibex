@@ -2739,7 +2739,10 @@ impl RuntimeSwitchRepository {
             RuntimeSwitchStatus::Failed | RuntimeSwitchStatus::AmbiguousExternalEffect => {
                 tx.execute(
                     "UPDATE agent_sessions
-                     SET desired_runtime_selection_json = effective_runtime_selection_json,
+                     SET desired_runtime_selection_json = COALESCE(
+                             effective_runtime_selection_json,
+                             desired_runtime_selection_json
+                         ),
                          runtime_selection_status = ?3,
                          runtime_selection_error_code = ?4,
                          updated_at_ms = ?5
@@ -5850,6 +5853,52 @@ mod tests {
         assert!(rollback_state.current_binding_id.is_none());
         assert!(rollback_state.desired_runtime_selection.is_none());
         assert!(rollback_state.effective_runtime_selection.is_none());
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn initial_switch_failure_preserves_desired_without_fabricating_effective() {
+        let temp = temp_db_path("initial-switch-failure-selection");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let session_id = seeded_session(&conn, "initial-switch-failure-selection");
+        let desired = sample_selection();
+        let request =
+            desired_enqueue_request(&session_id, "initial-switch-failure", 0, desired.clone());
+        let record = AgentSessionRuntimeRepository::enqueue_initial_runtime_switch(
+            &mut conn,
+            RuntimeSwitchId::new(),
+            &request,
+        )
+        .unwrap();
+        assert_eq!(record.source_binding_id, None);
+        assert_eq!(
+            RuntimeSwitchRepository::claim_requested(&mut conn, &record.switch_id).unwrap(),
+            RequestedSwitchClaimOutcome::Claimed
+        );
+
+        RuntimeSwitchRepository::fail(
+            &mut conn,
+            &session_id,
+            &record.switch_id,
+            "runtime_switch_configuration_unavailable",
+            Some("redacted configuration failure"),
+        )
+        .unwrap();
+        let state = AgentSessionRuntimeRepository::get_runtime_state(&conn, &session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.desired_runtime_selection, Some(desired));
+        assert_eq!(state.effective_runtime_selection, None);
+        assert_eq!(state.current_binding_id, None);
+        assert_eq!(
+            state.runtime_selection_status,
+            Some(SessionRuntimeSelectionStatus::FailedUsingPrevious)
+        );
+        assert_eq!(
+            state.runtime_selection_error_code.as_deref(),
+            Some("runtime_switch_configuration_unavailable")
+        );
         cleanup_db(temp);
     }
 

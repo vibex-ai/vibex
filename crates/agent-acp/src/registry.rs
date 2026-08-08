@@ -25,12 +25,14 @@ pub const CLAUDE_ADAPTER_ID: &str = "claude-agent-acp";
 pub const CLAUDE_ADAPTER_PACKAGE: &str = "@agentclientprotocol/claude-agent-acp";
 pub const CLAUDE_ADAPTER_VERSION: &str = "0.64.2";
 pub const CLAUDE_ADAPTER_INTEGRITY: &str = "sha512-REZ6FxfUF//GqGMqCEHfHLuuzd2ZJwupgfBmIQIm5gcMrkppuhrRlThwbn2RNasCWoMSnqRMHvnXDpl/HctM/g==";
+pub const CLAUDE_CONFIG_ALIAS_VERSION_REQUIREMENT: &str = ">=0.64.2";
 
 pub const CODEX_AGENT_ID: &str = "codex";
 pub const CODEX_ADAPTER_ID: &str = "codex-acp";
 pub const CODEX_ADAPTER_PACKAGE: &str = "@agentclientprotocol/codex-acp";
 pub const CODEX_ADAPTER_VERSION: &str = "1.1.9";
 pub const CODEX_ADAPTER_INTEGRITY: &str = "sha512-T78vetAQJ+XpP+0zT18ceEPTD10tqYvouDh0ht7mpCQjXuW3Vm5MzcuMRJMVBA2MwfCvGFXfOhGA7ogMSeOpFQ==";
+pub const CODEX_CONFIG_ALIAS_VERSION_REQUIREMENT: &str = "=1.1.9";
 pub const CODEX_RUNTIME_PACKAGE: &str = "@openai/codex";
 pub const CODEX_RUNTIME_DECLARED_REQUIREMENT: &str = "^0.145.0";
 pub const CODEX_RUNTIME_PIN: &str = "0.146.0";
@@ -50,6 +52,15 @@ pub enum CapabilitySupport {
 pub struct CompatibilitySupport {
     pub support: CapabilitySupport,
     pub evidence: String,
+}
+
+/// Compatibility boundary for stable session-config option semantics.
+/// Package installation and adapter quirks retain their separate exact-version
+/// policies; this range only controls whether registered option aliases apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigOptionAliasCompatibility {
+    pub adapter_version_requirement: VersionReq,
+    pub requires_exact_compatibility_identity: bool,
 }
 
 impl CompatibilitySupport {
@@ -317,6 +328,7 @@ pub struct AcpAgentCompatibility {
     pub restore_policy: RestorePolicy,
     pub operation_support: BTreeMap<AcpOperation, VersionedOperationDescriptor>,
     pub native_state_home_policy: NativeStateHomePolicy,
+    pub config_option_alias_compatibility: ConfigOptionAliasCompatibility,
     pub config_option_aliases: BTreeMap<String, Vec<String>>,
     pub transcript_strategy: TranscriptStrategy,
     pub event_enricher: AgentEventEnricherKind,
@@ -365,17 +377,27 @@ impl AcpAgentCompatibility {
         (&self.expected_compatibility_identity() == identity).then_some(self.event_enricher)
     }
 
-    pub fn config_aliases_for_identity<'a>(
-        &'a self,
-        identity: &AdapterCompatibilityIdentity,
-        canonical_key: &str,
-    ) -> Option<&'a [String]> {
-        if &self.expected_compatibility_identity() != identity {
+    pub fn config_option_aliases_for_runtime(
+        &self,
+        adapter_version: &str,
+        compatibility_identity: &str,
+    ) -> Option<&BTreeMap<String, Vec<String>>> {
+        let adapter_version = Version::parse(adapter_version).ok()?;
+        if !self
+            .config_option_alias_compatibility
+            .adapter_version_requirement
+            .matches(&adapter_version)
+        {
             return None;
         }
-        self.config_option_aliases
-            .get(canonical_key)
-            .map(Vec::as_slice)
+        if self
+            .config_option_alias_compatibility
+            .requires_exact_compatibility_identity
+            && self.expected_compatibility_identity().as_str() != compatibility_identity
+        {
+            return None;
+        }
+        Some(&self.config_option_aliases)
     }
 
     fn validate(&self) -> VibexResult<()> {
@@ -497,6 +519,17 @@ impl AcpAgentCompatibility {
                     "ACP descriptor operation key does not match its value",
                 ));
             }
+        }
+        if !self
+            .config_option_alias_compatibility
+            .adapter_version_requirement
+            .matches(&self.distribution.exact_version)
+        {
+            return Err(VibexError::validation(
+                "acp_registry_config_alias_version_invalid",
+                "ACP config option alias requirement excludes the managed adapter baseline",
+            )
+            .with_diagnostic("adapterId", self.adapter_id.to_string()));
         }
         validate_contract_cases(&self.bridge_contract)?;
         let expected_identity = self.expected_compatibility_identity();
@@ -846,11 +879,22 @@ fn claude_descriptor() -> VibexResult<AcpAgentCompatibility> {
         restore_policy: RestorePolicy::LoadThenNew,
         operation_support: base_operation_support(),
         native_state_home_policy: NativeStateHomePolicy::ClaudeConfigDirectory,
+        config_option_alias_compatibility: ConfigOptionAliasCompatibility {
+            adapter_version_requirement: parse_requirement(
+                CLAUDE_CONFIG_ALIAS_VERSION_REQUIREMENT,
+                CLAUDE_ADAPTER_ID,
+            )?,
+            requires_exact_compatibility_identity: false,
+        },
         config_option_aliases: BTreeMap::from([
             ("model".to_string(), vec!["model".to_string()]),
             (
                 "reasoning_effort".to_string(),
-                vec!["effort".to_string(), "thinking_level".to_string()],
+                vec![
+                    "effort".to_string(),
+                    "thinking_level".to_string(),
+                    "thought_level".to_string(),
+                ],
             ),
         ]),
         transcript_strategy: TranscriptStrategy::ClaudeJsonl,
@@ -914,6 +958,13 @@ fn codex_descriptor() -> VibexResult<AcpAgentCompatibility> {
         restore_policy: RestorePolicy::ResumeThenLoadThenNew,
         operation_support: base_operation_support(),
         native_state_home_policy: NativeStateHomePolicy::StableCodexHome,
+        config_option_alias_compatibility: ConfigOptionAliasCompatibility {
+            adapter_version_requirement: parse_requirement(
+                CODEX_CONFIG_ALIAS_VERSION_REQUIREMENT,
+                CODEX_ADAPTER_ID,
+            )?,
+            requires_exact_compatibility_identity: true,
+        },
         config_option_aliases: BTreeMap::from([
             ("model".to_string(), vec!["model".to_string()]),
             (
@@ -1216,7 +1267,44 @@ mod tests {
     }
 
     #[test]
-    fn quirks_aliases_and_enrichers_require_exact_identity() {
+    fn claude_config_aliases_accept_the_baseline_and_newer_adapter_versions() {
+        let registry = registry();
+        let claude = registry
+            .for_agent(&AgentId::parse(CLAUDE_AGENT_ID).unwrap())
+            .unwrap();
+        let identity_for = |version: &str| {
+            AdapterCompatibilityIdentity::new(
+                &claude.adapter_id,
+                &Version::parse(version).unwrap(),
+                &BTreeMap::new(),
+            )
+        };
+
+        let below = identity_for("0.64.1");
+        assert!(
+            claude
+                .config_option_aliases_for_runtime("0.64.1", below.as_str())
+                .is_none()
+        );
+        for version in ["0.64.2", "0.65.0"] {
+            let identity = identity_for(version);
+            let aliases = claude
+                .config_option_aliases_for_runtime(version, identity.as_str())
+                .unwrap();
+            assert!(
+                aliases["reasoning_effort"]
+                    .iter()
+                    .any(|alias| alias == "thought_level")
+            );
+        }
+
+        let newer = identity_for("0.65.0");
+        assert!(claude.quirks_for_identity(&newer).is_empty());
+        assert_eq!(claude.event_enricher_for_identity(&newer), None);
+    }
+
+    #[test]
+    fn codex_quirks_aliases_and_enrichers_require_exact_identity() {
         let registry = registry();
         let codex = registry
             .for_agent(&AgentId::parse(CODEX_AGENT_ID).unwrap())
@@ -1229,8 +1317,19 @@ mod tests {
         );
         assert!(
             codex
-                .config_aliases_for_identity(&exact, "reasoning_effort")
+                .config_option_aliases_for_runtime("1.1.9", exact.as_str())
                 .is_some()
+        );
+
+        let incomplete_identity = AdapterCompatibilityIdentity::new(
+            &codex.adapter_id,
+            &codex.distribution.exact_version,
+            &BTreeMap::new(),
+        );
+        assert!(
+            codex
+                .config_option_aliases_for_runtime("1.1.9", incomplete_identity.as_str())
+                .is_none()
         );
 
         let adjacent = AdapterCompatibilityIdentity::new(
@@ -1243,9 +1342,10 @@ mod tests {
         );
         assert!(codex.quirks_for_identity(&adjacent).is_empty());
         assert_eq!(codex.event_enricher_for_identity(&adjacent), None);
-        assert_eq!(
-            codex.config_aliases_for_identity(&adjacent, "reasoning_effort"),
-            None
+        assert!(
+            codex
+                .config_option_aliases_for_runtime("1.1.1", adjacent.as_str())
+                .is_none()
         );
     }
 

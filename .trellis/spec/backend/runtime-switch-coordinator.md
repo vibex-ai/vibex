@@ -362,6 +362,13 @@ agent://runtime-selection-event
   materialization activates that exact binding and generation, a storage CAS
   may restore `Ready` only when desired equals effective, no switch is pending,
   and the binding row is still Current. The failed switch stays in the journal.
+- If the initial switch fails before any binding commits, SQLite retains the
+  desired selection and a null effective selection. The non-optional product
+  projection exposes that same-revision durable target as effective only while
+  status is `Preparing` or `FailedUsingPrevious`; the missing current binding
+  and non-ready status continue to block all provider work. Query may recover a
+  desired value cleared by older builds only from that switch's validated
+  `requestedSessionConfig.effectiveSelection`.
 - Re-selecting the already effective runtime while `FailedUsingPrevious` is an
   explicit recovery request, not an ordinary `NoChange`: the selection service
   must materialize the exact current runtime before rebuilding authoritative
@@ -392,7 +399,7 @@ agent://runtime-selection-event
 | Session already has current/desired/effective/pending state | `runtime_selection_initial_enqueue_conflict`; preserve existing state. |
 | Same initial idempotency key has another target | `runtime_selection_idempotency_payload_conflict`; preserve first intent. |
 | Runtime selection service missing during create | `runtime_selection_service_unavailable`; no direct create fallback. |
-| Initial switch terminates without Commit | `runtime_selection_initialization_failed`; session becomes recoverable `error`. |
+| Initial switch terminates without Commit | Preserve desired, null effective/current binding, and the original actionable switch error; synchronous initialization may return `runtime_selection_initialization_failed` and the session becomes recoverable `error`. |
 | Current ACP attachment missing/uncommitted | `runtime_selection_current_attachment_missing` / `_uncommitted`. |
 | Current attachment config not converged to its generation | `runtime_switch_configuration_unavailable`. |
 | Materialized binding/generation is stale, desired differs from effective, or a switch is pending | Preserve `FailedUsingPrevious`; do not reopen prompt admission. |
@@ -417,6 +424,9 @@ agent://runtime-selection-event
 - Good: initial background materialization publishes `Ready` with `event = None`;
   the selected session applies it using the event's required `session_id` and
   leaves Preparing without a refetch.
+- Good: initial configuration replay fails before Commit; the API returns
+  `FailedUsingPrevious` plus the original actionable code without converting
+  the state into `session_runtime_selection_uninitialized`.
 - Base: setting the already effective selection with no current intent returns
   Ready without spawning a process or creating a native session.
 - Base: retrying that same selection from `FailedUsingPrevious` revalidates the
@@ -433,6 +443,10 @@ agent://runtime-selection-event
 - DB tests assert initial desired selection plus `Requested` switch insertion
   is atomic/idempotent, requires an empty revision-0 session, has a null source,
   and creates no current binding before the driver runs.
+- DB and selection-service tests assert initial failure keeps durable desired,
+  leaves durable effective/current null, projects the original actionable
+  error, and recovers the pre-fix cleared-desired shape from the same-revision
+  switch journal.
 - Selection service tests cover Requested/Waiting/Preparing/terminal mapping,
   initial crash recovery, broadcast recovery, latest-revision convergence,
   cancellation separation, timeout fallback, and failed same-selection retry
@@ -466,7 +480,11 @@ repository.backfill_runtime_state_after_external_create(&attachment)?;
 ```rust
 let switch = repository.enqueue_initial_runtime_switch(session, desired)?;
 let outcome = coordinator.drive_switch(&switch.switch_id).await?;
-assert_eq!(outcome.status, RuntimeSwitchStatus::Committed);
+if outcome.status != RuntimeSwitchStatus::Committed {
+    let state = AgentSessionRuntimeRepository::get_runtime_state(conn, session)?.unwrap();
+    assert!(state.desired_runtime_selection.is_some());
+    assert!(state.effective_runtime_selection.is_none());
+}
 
 if selected_session_id == event.session_id {
     runtime_selection.resolve(event.state);

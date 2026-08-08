@@ -80,8 +80,8 @@ impl CanonicalSessionConfigKey {
 }
 
 /// Normalizes identifiers without guessing semantic meaning.  A semantic
-/// alias still has to be explicitly registered by the exact adapter
-/// compatibility descriptor.
+/// alias still has to be explicitly registered by the adapter compatibility
+/// descriptor for the active version boundary.
 pub fn normalize_identifier(value: &str) -> String {
     let mut output = String::new();
     let mut separator = false;
@@ -99,7 +99,7 @@ pub fn normalize_identifier(value: &str) -> String {
     output.trim_matches('_').to_string()
 }
 
-/// Resolves an Agent option id using explicit exact-identity aliases.  The
+/// Resolves an Agent option id using explicit version-compatible aliases.  The
 /// four canonical spellings are safe on their own; alternate spellings need
 /// a Registry alias and collisions fail closed.
 pub fn resolve_canonical_option_key(
@@ -332,13 +332,50 @@ impl SessionConfigPlanner {
         resolve_canonical_option_key(option_id, &self.aliases)
     }
 
+    /// Resolves a complete advertised option. A registered semantic category
+    /// may identify a future option id, while two conflicting semantic claims
+    /// fail closed instead of silently preferring either field.
+    pub fn option_key_for_option(
+        &self,
+        option: &ProviderSessionConfigOption,
+    ) -> Result<CanonicalSessionConfigKey, CanonicalKeyError> {
+        let id_key = self.option_key(&option.id)?;
+        let Some(category) = option.category.as_deref() else {
+            return Ok(id_key);
+        };
+        let category_key = self.option_key(category)?;
+        let id_is_semantic = self.is_registered_semantic_key(&id_key);
+        let category_is_semantic = self.is_registered_semantic_key(&category_key);
+        if id_is_semantic && category_is_semantic && id_key != category_key {
+            return Err(CanonicalKeyError::Ambiguous(
+                BTreeSet::from([id_key, category_key])
+                    .into_iter()
+                    .map(|key| key.to_string())
+                    .collect(),
+            ));
+        }
+        if category_is_semantic {
+            return Ok(category_key);
+        }
+        Ok(id_key)
+    }
+
+    fn is_registered_semantic_key(&self, key: &CanonicalSessionConfigKey) -> bool {
+        key.is_reserved()
+            || key.as_str() == "mode"
+            || self
+                .aliases
+                .keys()
+                .any(|canonical| normalize_identifier(canonical) == key.as_str())
+    }
+
     pub fn option_for_key(
         &self,
         key: &CanonicalSessionConfigKey,
     ) -> Result<Option<&ProviderSessionConfigOption>, CanonicalKeyError> {
         let mut found = None;
         for option in &self.options {
-            if self.option_key(&option.id)? == *key {
+            if self.option_key_for_option(option)? == *key {
                 if found.is_some() {
                     return Err(CanonicalKeyError::Ambiguous(vec![key.to_string()]));
                 }
@@ -1315,6 +1352,45 @@ mod tests {
         )]);
         assert!(matches!(
             resolve_canonical_option_key(CANONICAL_MODEL, &reserved_collision),
+            Err(CanonicalKeyError::Ambiguous(_))
+        ));
+    }
+
+    #[test]
+    fn registered_category_maps_future_option_ids_and_conflicts_fail_closed() {
+        let aliases = BTreeMap::from([
+            (CANONICAL_MODEL.to_string(), vec!["model".to_string()]),
+            (
+                CANONICAL_REASONING_EFFORT.to_string(),
+                vec!["effort".to_string(), "thought_level".to_string()],
+            ),
+        ]);
+        let mut future_effort = option("adaptive_effort_v2", "high");
+        future_effort.category = Some("thought_level".to_string());
+        let planner = SessionConfigPlanner::new(
+            "adapter=test@2",
+            1,
+            aliases.clone(),
+            BTreeMap::new(),
+            vec![future_effort],
+        );
+        let reasoning_key = CanonicalSessionConfigKey::parse(CANONICAL_REASONING_EFFORT).unwrap();
+        assert_eq!(
+            planner.option_for_key(&reasoning_key).unwrap().unwrap().id,
+            "adaptive_effort_v2"
+        );
+
+        let mut conflicting = option(CANONICAL_MODEL, "model-1");
+        conflicting.category = Some("thought_level".to_string());
+        let planner = SessionConfigPlanner::new(
+            "adapter=test@2",
+            1,
+            aliases,
+            BTreeMap::new(),
+            vec![conflicting],
+        );
+        assert!(matches!(
+            planner.option_for_key(&reasoning_key),
             Err(CanonicalKeyError::Ambiguous(_))
         ));
     }

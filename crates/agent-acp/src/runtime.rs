@@ -2382,7 +2382,7 @@ impl AcpSessionAttachment {
                 next.effective_mode = state.current_mode_id.clone();
                 next.effective_reasoning_effort = None;
                 for option in &options {
-                    let Ok(key) = planner.option_key(&option.id) else {
+                    let Ok(key) = planner.option_key_for_option(option) else {
                         continue;
                     };
                     let effective = option.current_value.clone();
@@ -10517,11 +10517,13 @@ impl AcpRuntimeClient {
             .ok()
             .flatten()
             .and_then(|profile| self.compatibility_registry.for_agent(&profile.agent_id))
-            .filter(|descriptor| {
-                descriptor.expected_compatibility_identity().to_string()
-                    == process.compatibility_identity
+            .and_then(|descriptor| {
+                descriptor.config_option_aliases_for_runtime(
+                    &process.adapter_version,
+                    &process.compatibility_identity,
+                )
             })
-            .map(|descriptor| descriptor.config_option_aliases.clone())
+            .cloned()
             .unwrap_or_default();
         let mut operations = process.operation_evidence(generation);
         if !discovery.options.is_empty() {
@@ -10673,7 +10675,7 @@ impl AcpRuntimeClient {
             runtime_state.preferred_mode = runtime_state.effective_mode.clone();
         }
         for option in &discovery.options {
-            let Ok(key) = planner.option_key(&option.id) else {
+            let Ok(key) = planner.option_key_for_option(option) else {
                 continue;
             };
             if key.as_str() == crate::session_config::CANONICAL_MODEL

@@ -476,37 +476,53 @@ impl RuntimeSelectionService {
             .ok_or_else(|| {
                 VibexError::validation("session_not_found", "Agent session was not found")
             })?;
-        let desired = state.desired_runtime_selection.clone().ok_or_else(|| {
-            VibexError::conflict(
-                "session_runtime_selection_uninitialized",
-                "Agent session desired runtime selection is not initialized",
-            )
-        })?;
-        // Initial session creation persists its desired selection before ACP
-        // materialization creates the first binding. Project that target as
-        // effective only while the switch is explicitly Preparing; callers
-        // still gate provider work on the status and binding below.
-        let effective = state
-            .effective_runtime_selection
-            .clone()
-            .or_else(|| {
-                (state.runtime_selection_status == Some(SessionRuntimeSelectionStatus::Preparing)
-                    && state.current_binding_id.is_none()
-                    && state.selection_revision == 1)
-                    .then(|| desired.clone())
-            })
-            .ok_or_else(|| {
-                VibexError::conflict(
-                    "session_runtime_selection_uninitialized",
-                    "Agent session effective runtime selection is not initialized",
-                )
-            })?;
         let latest = RuntimeSwitchRepository::get_latest_for_selection_revision(
             &conn,
             session_id,
             state.selection_revision,
             false,
         )?;
+        let projects_initial_target = state.current_binding_id.is_none()
+            && state.effective_runtime_selection.is_none()
+            && state.selection_revision == 1
+            && matches!(
+                state.runtime_selection_status,
+                Some(
+                    SessionRuntimeSelectionStatus::Preparing
+                        | SessionRuntimeSelectionStatus::FailedUsingPrevious
+                )
+            )
+            && latest
+                .as_ref()
+                .is_some_and(|record| record.source_binding_id.is_none());
+        let desired = match state.desired_runtime_selection.clone() {
+            Some(desired) => desired,
+            None if projects_initial_target => durable_effective_selection(
+                latest
+                    .as_ref()
+                    .expect("initial target projection requires a durable switch"),
+            )?,
+            None => {
+                return Err(VibexError::conflict(
+                    "session_runtime_selection_uninitialized",
+                    "Agent session desired runtime selection is not initialized",
+                ));
+            }
+        };
+        // The product API has a non-optional effective field. Before the first
+        // binding exists, expose the durable initial target for Preparing and
+        // terminal failure states; status and binding gates still prohibit
+        // provider work, and SQLite retains a null effective selection.
+        let effective = state
+            .effective_runtime_selection
+            .clone()
+            .or_else(|| projects_initial_target.then(|| desired.clone()))
+            .ok_or_else(|| {
+                VibexError::conflict(
+                    "session_runtime_selection_uninitialized",
+                    "Agent session effective runtime selection is not initialized",
+                )
+            })?;
         let status = selection_status(&state, latest.as_ref(), &desired, &effective);
         let pending_switch_id = latest
             .as_ref()
@@ -1592,6 +1608,80 @@ mod tests {
                 .state,
             AgentSessionState::Idle
         );
+    }
+
+    #[tokio::test]
+    async fn initial_failure_returns_actionable_state_and_recovers_legacy_cleared_desired() {
+        let env = TestEnvironment::new("initial-failure-projection", 500);
+        let conn = open_database(&env.db_path).unwrap();
+        let mut session = SessionRepository::get(&conn, &env.session_id)
+            .unwrap()
+            .unwrap();
+        let session_id = VibexSessionId::new();
+        session.id = session_id.clone();
+        session.title = "failed initial switch".to_string();
+        session.state = AgentSessionState::Initializing;
+        SessionRepository::insert(&conn, &session).unwrap();
+        drop(conn);
+
+        let record = env
+            .service
+            .enqueue_initial_runtime_switch(&session_id, env.effective.clone())
+            .await
+            .unwrap();
+        let mut conn = open_database(&env.db_path).unwrap();
+        assert_eq!(
+            RuntimeSwitchRepository::claim_requested(&mut conn, &record.switch_id).unwrap(),
+            vibex_db::RequestedSwitchClaimOutcome::Claimed
+        );
+        RuntimeSwitchRepository::fail(
+            &mut conn,
+            &session_id,
+            &record.switch_id,
+            "runtime_switch_configuration_unavailable",
+            Some("redacted configuration failure"),
+        )
+        .unwrap();
+        let stored = AgentSessionRuntimeRepository::get_runtime_state(&conn, &session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.desired_runtime_selection.as_ref(),
+            Some(&env.effective)
+        );
+        assert!(stored.effective_runtime_selection.is_none());
+        drop(conn);
+
+        let failed = env.service.get_selection_state(&session_id).unwrap();
+        assert_eq!(
+            failed.status,
+            SessionRuntimeSelectionStatus::FailedUsingPrevious
+        );
+        assert_eq!(failed.desired, env.effective);
+        assert_eq!(failed.effective, env.effective);
+        assert!(failed.current_binding_id.is_none());
+        assert_eq!(
+            failed
+                .actionable_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("runtime_switch_configuration_unavailable")
+        );
+
+        // Versions before this fix cleared the initial desired value while
+        // retaining the switch journal. The same-revision request remains the
+        // durable recovery source for those sessions.
+        let conn = open_database(&env.db_path).unwrap();
+        conn.execute(
+            "UPDATE agent_sessions
+             SET desired_runtime_selection_json = NULL
+             WHERE session_id = ?1",
+            [session_id.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+        let recovered = env.service.get_selection_state(&session_id).unwrap();
+        assert_eq!(recovered, failed);
     }
 
     #[tokio::test]

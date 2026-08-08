@@ -2966,6 +2966,11 @@ AcpRuntimeClient::update_session_runtime_config(request)
 RuntimeBindingRepository::compare_and_set_session_runtime_config_state(
     conn, binding_id, expected_state, expected_activation_generation, next_state
 ) -> ()
+AcpAgentCompatibility::config_option_aliases_for_runtime(
+    adapter_version, compatibility_identity
+) -> Option<&BTreeMap<String, Vec<String>>>
+SessionConfigPlanner::option_key_for_option(option)
+    -> Result<CanonicalSessionConfigKey, CanonicalKeyError>
 ```
 
 `model`, `reasoning_effort`, `approval_mode`, and `sandbox_mode` are reserved
@@ -2999,9 +3004,12 @@ is written back in the dual shape.
   or an equivalent unsupported diagnostic) advances to the next candidate.
   Authentication, permission, timeout, transport, malformed response, and
   provider errors stop fallback for that field.
-- Alias mapping is explicit and exact-identity scoped. Normalized labels or
-  value containment are never semantic evidence; duplicate mappings fail
-  closed as an ambiguity.
+- Alias mapping is explicit and scoped by the descriptor's adapter-version
+  requirement. Stable config semantics may use a tested minimum-version range;
+  quirks, extensions, and event decoders remain exact-identity scoped.
+  An explicitly registered option `category` may map a future option id to its
+  canonical key. Normalized labels or value containment are never semantic
+  evidence, and conflicting id/category claims fail closed as an ambiguity.
 - A new/load/rebuilt attachment seeds effective values only from that response.
   The same `RuntimeBindingId` retains preferred state across a crash and gets a
   new activation generation. Intentional close or replacement removes the
@@ -3024,8 +3032,9 @@ is written back in the dual shape.
   active turn or pending host work -> `Busy` outcome.
 - Unknown/reserved key, set-and-clear conflict, empty/overlong value, or
   invalid effort spelling -> `validation/acp_session_config_*` error.
-- No exact alias or ambiguous alias -> `validation/acp_session_config_key_*`;
-  labels and selected values never trigger a reserved mapping.
+- No version-compatible alias or ambiguous id/category alias ->
+  `validation/acp_session_config_key_*`; labels and selected values never
+  trigger a reserved mapping.
 - No candidate or advertised value -> `Unavailable`; a descriptor startup
   projection -> `RestartRequired` without replacing the process.
 - ACP method-not-found/explicit unsupported -> mark only that operation
@@ -3043,6 +3052,9 @@ is written back in the dual shape.
 - Good: a four-field patch emits `session/set_model`, then effort, then mode,
   then sorted generic options; one capability-negative Model response falls
   back to its exact advertised config option while an auth error does not.
+- Good: a Claude adapter at or above the tested config baseline maps an
+  `effort` option with category `thought_level` to `reasoning_effort`, while a
+  newer identity still receives no baseline-only event decoder or quirk.
 - Good: after a crash, the same binding retains preferred Model, loads a new
   generation's observed Model/Mode, replays only differences, and blocks prompt
   dispatch while an unavailable known preference remains unconverged.
@@ -3061,9 +3073,10 @@ is written back in the dual shape.
   revision monotonicity, and generation convergence.
 - DB tests cover successful CAS, identical-state no-write, stale JSON/revision,
   stale activation generation, and missing binding with zero writes.
-- Planner tests cover exact aliases/collisions, typed/raw/config-option/
-  extension/restart/unavailable priority, generation-scoped observed negative,
-  deterministic field order, and catalog no-fabrication.
+- Registry and planner tests cover the minimum-version boundary, exact-only
+  policies, category-based future ids, id/category collisions, typed/raw/
+  config-option/extension/restart/unavailable priority, generation-scoped
+  observed negative, deterministic field order, and catalog no-fabrication.
 - ACP mock tests cover Model/Mode/Effort/generic wire shapes, partial success,
   response mismatch, capability-only fallback, auth/timeout no-fallback,
   busy/stale-process zero side effects, pooled attachment isolation, close
@@ -3089,7 +3102,8 @@ set_model fails for any reason
 ```text
 validate current fence + idle/process gate
   -> CAS preferred (revision + 1)
-  -> choose exact-identity candidate
+  -> map config semantics through the descriptor's version policy
+  -> reserve exact identity for quirks/extensions/event decoding
   -> fallback only on capability negative
   -> revalidate fence + revision
   -> CAS effective / mark generation applied
