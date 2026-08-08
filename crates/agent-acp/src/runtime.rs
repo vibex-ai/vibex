@@ -2671,8 +2671,9 @@ impl AcpSessionAttachment {
                         // same terminal provider text.  Recognize it before
                         // appending an Assistant delta; otherwise `end_turn`
                         // manufactures a normal final Agent message.
-                        if self.record_codex_terminal_http_error(&text)
-                            || self.record_codex_terminal_text_error(&text)
+                        if phase.is_none()
+                            && (self.record_codex_terminal_http_error(&text)
+                                || self.record_codex_terminal_text_error(&text))
                         {
                             return;
                         }
