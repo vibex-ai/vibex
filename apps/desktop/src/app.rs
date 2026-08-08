@@ -1710,6 +1710,10 @@ fn timeline_batch_should_repaint(
     unread_changed || agent_projection_should_repaint(active_tab, timeline_changed || needs_refetch)
 }
 
+fn timeline_virtual_rows_need_rebuild(turn_count: usize, row_size_count: usize) -> bool {
+    turn_count != row_size_count
+}
+
 /// Position lookup for `TimelineModel::items` keyed by item id.
 ///
 /// Row/turn renderers resolve payloads from item ids on every frame; a linear
@@ -7030,6 +7034,15 @@ impl VibexWorkbench {
                                     cx,
                                 ),
                                 AgentPollSignal::Session(session) => {
+                                    let selected_projection_changed = this
+                                        .selected_session_id
+                                        .as_ref()
+                                        .is_some_and(|selected| selected == &session.id)
+                                        && this
+                                            .sessions
+                                            .iter()
+                                            .find(|existing| existing.id == session.id)
+                                            .is_none_or(|existing| existing.state != session.state);
                                     let changed = this
                                         .sessions
                                         .iter()
@@ -7038,6 +7051,9 @@ impl VibexWorkbench {
                                     if changed {
                                         this.upsert_session_snapshot(session);
                                         this.reconcile_sidebar_state();
+                                    }
+                                    if selected_projection_changed {
+                                        this.refresh_last_timeline_size();
                                     }
                                     changed
                                 }
@@ -18759,7 +18775,11 @@ impl VibexWorkbench {
         self.apply_pending_timeline_row_heights();
         self.apply_pending_timeline_scroll();
         let selected = self.selected_session().cloned();
-        let turns = self.conversation_turns_cached();
+        let mut turns = self.conversation_turns_cached();
+        if timeline_virtual_rows_need_rebuild(turns.len(), self.timeline_row_sizes.len()) {
+            self.rebuild_timeline_sizes();
+            turns = self.conversation_turns_cached();
+        }
         let turns_summary = self.conversation_turns_summary;
         self.sync_timeline_duration_tick(turns_summary.has_incomplete_turn, cx);
         let rendered_turns = turns.clone();
@@ -34632,6 +34652,24 @@ mod tests {
             .expect("session snapshot signal handler should remain inspectable");
         assert!(handler.contains("this.upsert_session_snapshot(session)"));
         assert!(handler.contains("this.reconcile_sidebar_state()"));
+        assert!(handler.contains("selected_projection_changed"));
+        assert!(handler.contains("this.refresh_last_timeline_size();"));
+    }
+
+    #[test]
+    fn timeline_virtual_rows_rebuild_when_turn_projection_count_changes() {
+        assert!(!timeline_virtual_rows_need_rebuild(2, 2));
+        assert!(timeline_virtual_rows_need_rebuild(2, 1));
+        assert!(timeline_virtual_rows_need_rebuild(1, 2));
+
+        let source = include_str!("app.rs");
+        let workbench = source
+            .split_once("    fn render_agent_workbench(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_controls("))
+            .map(|(body, _)| body)
+            .expect("agent workbench renderer should remain inspectable");
+        assert!(workbench.contains("timeline_virtual_rows_need_rebuild("));
+        assert!(workbench.contains("self.rebuild_timeline_sizes();"));
     }
 
     #[test]
