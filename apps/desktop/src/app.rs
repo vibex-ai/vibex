@@ -105,8 +105,9 @@ use vibex_desktop_runtime::{
     ProviderConfigChangePhase, RC_APP_ID, STABLE_DESKTOP_APP_ID, validate_external_open_url,
 };
 use vibex_markdown::{
-    MarkdownInput, MarkdownLimits, MarkdownPresentation, MarkdownSurface, MarkdownView,
-    ResolvedResource, ResourceKind, apply_code_font_weight, code_font_weight,
+    Block, BlockNode, Inline, InlineNode, MarkdownDocument, MarkdownInput, MarkdownLimits,
+    MarkdownPresentation, MarkdownSurface, MarkdownView, NodeId, ResolvedResource, ResourceKind,
+    ResourceRole, SourceRange, apply_code_font_weight, code_font_weight,
     parse_markdown_with_limits, utf8_prefix,
 };
 use vibex_ui::{
@@ -4574,7 +4575,38 @@ impl VibexWorkbench {
                             this.runtime_provider_profiles = profiles;
                             this.agent_snapshots = agents;
                             this.sessions = sessions;
+                            // Rehydrate both project defaults and explicit
+                            // session overrides for every authoritative row.
+                            // `restored_auto_continue_session_ids` only knows
+                            // about persisted per-session `true` values, so a
+                            // project-enabled session must be added here too.
+                            this.auto_continue_session_ids = this
+                                .sessions
+                                .iter()
+                                .filter(|session| {
+                                    this.ui_state
+                                        .session
+                                        .auto_continue_session_overrides
+                                        .get(session.id.as_str())
+                                        .copied()
+                                        .unwrap_or_else(|| {
+                                            this.project_auto_continue_enabled(&session.project_id)
+                                        })
+                                })
+                                .map(|session| session.id.as_str().to_string())
+                                .collect();
                             this.workspaces = workspaces;
+                            let auto_continue_sessions = this
+                                .sessions
+                                .iter()
+                                .filter(|session| {
+                                    this.auto_continue_session_ids.contains(session.id.as_str())
+                                })
+                                .map(|session| session.id.clone())
+                                .collect::<Vec<_>>();
+                            for session_id in auto_continue_sessions {
+                                this.sync_auto_continue_for_session(&session_id, cx);
+                            }
                             this.reconcile_sidebar_state();
                             this.refresh_workspace_contexts(cx);
                             if this.reconcile_new_session_runtime_selection()
@@ -7049,8 +7081,10 @@ impl VibexWorkbench {
                                         .find(|existing| existing.id == session.id)
                                         .is_none_or(|existing| existing != &session);
                                     if changed {
+                                        let session_id = session.id.clone();
                                         this.upsert_session_snapshot(session);
                                         this.reconcile_sidebar_state();
+                                        this.sync_auto_continue_for_session(&session_id, cx);
                                     }
                                     if selected_projection_changed {
                                         this.refresh_last_timeline_size();
@@ -23466,134 +23500,25 @@ impl VibexWorkbench {
             .into_any_element();
         }
 
-        let (preview_width, preview_height) = composer_image_hover_preview_max_size(
-            self.last_visibility.layout.viewport_width as f32,
-            self.last_visibility.layout.viewport_height as f32,
-        );
-        let mut content = user_message_inline_layout();
-
-        for (index, segment) in user_message_inline_segments(&text, &attachments)
-            .into_iter()
-            .enumerate()
-        {
-            match segment {
-                UserMessageInlineSegment::Text(value) => {
-                    if !value.is_empty() {
-                        content = content.child(render_user_message_text_segment(
-                            format!("user-message-text:{message_id}:{index}"),
-                            value,
-                            highlight_query,
-                        ));
-                    }
-                }
-                UserMessageInlineSegment::Attachment(attachment) => {
-                    let composer_attachment = composer_attachment_from_message(
-                        &attachment,
-                        format!("message:{message_id}:{index}"),
-                    );
-                    let label = if attachment.label.trim().is_empty() {
-                        locale::text("Image", "图片", "圖片").to_string()
-                    } else {
-                        attachment.label
-                    };
-                    let is_image = composer_attachment.is_image();
-                    let preview_source = composer_attachment
-                        .path
-                        .as_ref()
-                        .filter(|_| is_image)
-                        .map(|path| {
-                            Arc::<std::path::Path>::from(
-                                std::path::PathBuf::from(path).into_boxed_path(),
-                            )
-                        });
-                    let preview_attachment = composer_attachment.clone();
-                    let preview_label = format!(
-                        "{}: {label}",
-                        locale::text("Preview image", "预览图片", "預覽圖片")
-                    );
-                    content = content.child(
-                        h_flex()
-                            .id(format!("message-image-attachment-{message_id}-{index}"))
-                            .flex_none()
-                            .min_w_0()
-                            .max_w(px(256.0))
-                            .h(px(26.0))
-                            .items_center()
-                            .gap(px(5.5))
-                            .mx(px(2.0))
-                            .overflow_hidden()
-                            .rounded(px(6.0))
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .bg(cx.theme().muted)
-                            .px(px(7.0))
-                            .text_sm()
-                            .font_weight(FontWeight(600.0))
-                            .text_color(cx.theme().foreground)
-                            .role(Role::Button)
-                            .aria_label(preview_label)
-                            .when(is_image, |this| {
-                                this.cursor_pointer().hover(|style| {
-                                    style
-                                        .bg(cx.theme().accent)
-                                        .border_color(cx.theme().primary.opacity(0.45))
-                                        .text_color(cx.theme().accent_foreground)
-                                })
-                            })
-                            .child(
-                                if is_image {
-                                    Icon::default().path("icons/vibex/image.svg")
-                                } else {
-                                    Icon::new(IconName::File)
-                                }
-                                .size(px(13.0))
-                                .text_color(cx.theme().foreground.opacity(0.80)),
-                            )
-                            .child(div().min_w_0().truncate().child(label))
-                            .when_some(preview_source, |this, image_source| {
-                                let tooltip_source = image_source.clone();
-                                this.tooltip(move |window, cx| {
-                                    let image_source = tooltip_source.clone();
-                                    Tooltip::element(move |_, cx| {
-                                        div()
-                                            .max_w(px(preview_width
-                                                - COMPOSER_IMAGE_HOVER_PREVIEW_PADDING * 2.0))
-                                            .max_h(px(preview_height
-                                                - COMPOSER_IMAGE_HOVER_PREVIEW_PADDING * 2.0))
-                                            .overflow_hidden()
-                                            .rounded(px(9.0))
-                                            .bg(cx.theme().popover)
-                                            .child(
-                                                img(image_source.clone())
-                                                    .max_w_full()
-                                                    .max_h(px(preview_height
-                                                        - COMPOSER_IMAGE_HOVER_PREVIEW_PADDING
-                                                            * 2.0))
-                                                    .object_fit(ObjectFit::Contain),
-                                            )
-                                    })
-                                    .m_0()
-                                    .rounded(px(12.0))
-                                    .p(px(6.0))
-                                    .shadow_lg()
-                                    .build(window, cx)
-                                })
-                                .on_click(cx.listener(
-                                    move |this, _, window, cx| {
-                                        this.open_attachment_preview(
-                                            preview_attachment.clone(),
-                                            window,
-                                            cx,
-                                        )
-                                    },
-                                ))
-                            }),
-                    );
-                }
-            }
-        }
-
-        content.into_any_element()
+        let (document, image_attachments) =
+            user_message_inline_document(&text, &attachments, self.resolved_locale());
+        let view = cx.entity().downgrade();
+        MarkdownView::from_document(format!("user-message-text:{message_id}"), document)
+            .presentation(MarkdownPresentation::Agent)
+            .search_query(highlight_query.map(Arc::<str>::from))
+            .on_open_resource(move |resource, window, cx| {
+                let Some(attachment) = image_attachments.get(&resource.source).cloned() else {
+                    return;
+                };
+                let _ = view.update(cx, |this, cx| {
+                    this.open_attachment_preview(attachment, window, cx);
+                });
+            })
+            .w_auto()
+            .min_w_0()
+            .max_w_full()
+            .whitespace_normal()
+            .into_any_element()
     }
 
     fn render_composer_suggestions(
@@ -32434,14 +32359,109 @@ fn render_user_message_text_segment(
         .whitespace_normal()
 }
 
-fn user_message_inline_layout() -> gpui::Div {
-    h_flex()
-        .min_w_0()
-        .max_w_full()
-        .flex_wrap()
-        .items_start()
-        .whitespace_normal()
-        .text_sm()
+fn user_message_inline_document(
+    text: &str,
+    attachments: &[MessageAttachment],
+    locale: locale::ResolvedLocale,
+) -> (
+    Arc<MarkdownDocument>,
+    Arc<BTreeMap<String, ComposerAttachment>>,
+) {
+    let mut source = String::with_capacity(text.len());
+    let mut inlines = Vec::new();
+    let mut image_attachments = BTreeMap::new();
+    let mut next_node_id = 1;
+
+    for segment in user_message_inline_segments(text, attachments) {
+        match segment {
+            UserMessageInlineSegment::Text(value) => {
+                if value.is_empty() {
+                    continue;
+                }
+                let start = source.len();
+                source.push_str(&value);
+                inlines.push(InlineNode {
+                    id: NodeId(next_node_id),
+                    range: SourceRange::new(start, source.len()),
+                    kind: Inline::Text(value),
+                });
+                next_node_id = next_node_id.saturating_add(1);
+            }
+            UserMessageInlineSegment::Attachment(attachment) => {
+                let label = if attachment.label.trim().is_empty() {
+                    locale::text_for(locale, "Image", "图片", "圖片").to_string()
+                } else {
+                    attachment.label.clone()
+                };
+                if label.is_empty() {
+                    continue;
+                }
+                let composer_attachment = composer_attachment_from_message(
+                    &attachment,
+                    format!("message-attachment:{next_node_id}"),
+                );
+                let start = source.len();
+                source.push_str(&label);
+                let range = SourceRange::new(start, source.len());
+                let text_node = InlineNode {
+                    id: NodeId(next_node_id),
+                    range,
+                    kind: Inline::Text(label.clone()),
+                };
+                next_node_id = next_node_id.saturating_add(1);
+                let marked_label = InlineNode {
+                    id: NodeId(next_node_id),
+                    range,
+                    kind: Inline::Mark(vec![text_node]),
+                };
+                next_node_id = next_node_id.saturating_add(1);
+                let kind = if composer_attachment.is_image() {
+                    let image_key = format!("vibex-attachment:{next_node_id}");
+                    let resolved = composer_attachment.path.clone();
+                    image_attachments.insert(image_key.clone(), composer_attachment);
+                    Inline::Link {
+                        destination: ResolvedResource {
+                            role: ResourceRole::Link,
+                            source: image_key,
+                            kind: ResourceKind::Workspace,
+                            resolved,
+                            label: Some(label),
+                            error_code: None,
+                        },
+                        title: None,
+                        children: vec![marked_label],
+                    }
+                } else {
+                    marked_label.kind
+                };
+                inlines.push(InlineNode {
+                    id: NodeId(next_node_id),
+                    range,
+                    kind,
+                });
+                next_node_id = next_node_id.saturating_add(1);
+            }
+        }
+    }
+
+    let range = SourceRange::new(0, source.len());
+    let document = MarkdownDocument {
+        source: Arc::from(source),
+        base_path: Arc::from(""),
+        revision: 0,
+        blocks: vec![BlockNode {
+            id: NodeId(0),
+            range,
+            kind: Block::Paragraph(inlines),
+        }]
+        .into(),
+        outline: Arc::default(),
+        footnotes: Default::default(),
+        resources: Arc::default(),
+        diagnostics: Arc::default(),
+        truncated: false,
+    };
+    (Arc::new(document), Arc::new(image_attachments))
 }
 
 fn render_user_message_bubble(
@@ -33437,11 +33457,6 @@ mod tests {
         measured_height: Rc<Cell<f32>>,
     }
 
-    struct UserMessageInlineLayoutProbe {
-        attachment_top: Rc<Cell<f32>>,
-        text_top: Rc<Cell<f32>>,
-    }
-
     impl Render for UserMessageBubbleLayoutProbe {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let measured_width = self.measured_width.clone();
@@ -33470,33 +33485,6 @@ mod tests {
                     // The hidden hover actions still participate in the row's intrinsic width.
                     .child(div().w(px(132.0)).h(px(24.0))),
             )
-        }
-    }
-
-    impl Render for UserMessageInlineLayoutProbe {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            let attachment_top = self.attachment_top.clone();
-            let text_top = self.text_top.clone();
-            user_message_inline_layout()
-                .w(px(320.0))
-                .child(div().w(px(148.0)).h(px(26.0)).flex_none().on_prepaint(
-                    move |bounds, _, _| {
-                        attachment_top.set(f32::from(bounds.origin.y));
-                    },
-                ))
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .on_prepaint(move |bounds, _, _| {
-                            text_top.set(f32::from(bounds.origin.y));
-                        })
-                        .child(render_user_message_text_segment(
-                            "user-message-inline-layout-probe",
-                            "这段正文需要换成两行，附件仍应与正文第一行顶部对齐。".into(),
-                            None,
-                        )),
-                )
         }
     }
 
@@ -34652,6 +34640,7 @@ mod tests {
             .expect("session snapshot signal handler should remain inspectable");
         assert!(handler.contains("this.upsert_session_snapshot(session)"));
         assert!(handler.contains("this.reconcile_sidebar_state()"));
+        assert!(handler.contains("this.sync_auto_continue_for_session(&session_id, cx);"));
         assert!(handler.contains("selected_projection_changed"));
         assert!(handler.contains("this.refresh_last_timeline_size();"));
     }
@@ -35999,6 +35988,21 @@ mod tests {
     }
 
     #[test]
+    fn auto_continue_startup_hydrates_project_defaults_for_loaded_sessions() {
+        let source = include_str!("app.rs");
+        let overview = source
+            .split_once("    fn load_agent_overview(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    pub(crate) fn refresh_workspace_contexts(")
+            })
+            .map(|(body, _)| body)
+            .expect("agent overview should remain inspectable");
+        assert!(overview.contains("project_auto_continue_enabled(&session.project_id)"));
+        assert!(overview.contains("auto_continue_session_overrides"));
+        assert!(overview.contains("this.auto_continue_session_ids = this"));
+    }
+
+    #[test]
     fn auto_continue_ui_supports_session_scoping_countdown_and_pause() {
         let source = include_str!("app.rs");
         assert!(source.contains("auto_continue_default_project_ids"));
@@ -37326,6 +37330,31 @@ mod tests {
     }
 
     #[test]
+    fn user_message_inline_document_keeps_attachment_in_one_text_flow() {
+        let attachment = message_attachment("paste", Some(5));
+        let (document, image_attachments) = user_message_inline_document(
+            "alpha tail",
+            std::slice::from_ref(&attachment),
+            locale::ResolvedLocale::En,
+        );
+
+        assert!(!document.source.contains('\n'));
+        assert_eq!(image_attachments.len(), 1);
+        let [block] = document.blocks.as_ref() else {
+            panic!("inline attachment document should contain one paragraph");
+        };
+        let Block::Paragraph(inlines) = &block.kind else {
+            panic!("inline attachment document should render a paragraph");
+        };
+        assert!(
+            inlines
+                .iter()
+                .any(|inline| { matches!(inline.kind, Inline::Link { .. }) })
+        );
+        assert_eq!(document.plain_text(), "alphapastetail");
+    }
+
+    #[test]
     fn user_message_segments_preserve_original_whitespace_without_attachments() {
         let text = "first line\n\n  indented text  \nlast line";
 
@@ -38385,33 +38414,6 @@ mod tests {
             observed_height.get() <= 44.5,
             "single-line bubble height: {}",
             observed_height.get()
-        );
-    }
-
-    #[gpui::test]
-    fn user_message_attachment_stays_aligned_with_the_first_text_line(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
-        let attachment_top = Rc::new(Cell::new(-1.0));
-        let text_top = Rc::new(Cell::new(-1.0));
-        let observed_attachment_top = attachment_top.clone();
-        let observed_text_top = text_top.clone();
-        let (_, cx) = cx.add_window_view(|_, _| UserMessageInlineLayoutProbe {
-            attachment_top,
-            text_top,
-        });
-
-        cx.run_until_parked();
-        cx.update(|window, cx| {
-            let _ = window.draw(cx);
-        });
-
-        assert!(observed_attachment_top.get() >= 0.0);
-        assert!(observed_text_top.get() >= 0.0);
-        assert!(
-            (observed_attachment_top.get() - observed_text_top.get()).abs() <= 0.5,
-            "attachment top: {}, text top: {}",
-            observed_attachment_top.get(),
-            observed_text_top.get()
         );
     }
 

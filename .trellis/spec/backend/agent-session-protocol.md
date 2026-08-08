@@ -1189,9 +1189,10 @@ ContinueAgentTurnRequest {
 - ACP compatibility adapters must not promote a provider-side terminal failure
   into that final Agent message. Codex terminal text delivered as an
   unattributed `agent_message_chunk` (no `messageId`) is structured Provider
-  error evidence even when the adapter subsequently returns `end_turn`;
-  classification uses the missing message attribution, not a human error
-  sentence.
+  error evidence even when the adapter subsequently returns `end_turn`. Some
+  adapter versions attach a `messageId` to the same account, capacity, rate,
+  or upstream failure; those known terminal error forms must be normalized the
+  same way before `end_turn` can synthesize a final Agent message.
 - `continue_turn` reloads the same current `RuntimeBinding`, activation
   generation, effective selection, and committed ACP attachment used by the
   failed turn. Missing or mismatched authority fails closed; the fallback must

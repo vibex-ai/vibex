@@ -56,8 +56,9 @@ use vibex_agent::{
     SwitchTargetExecutor, default_adapter_for_agent,
 };
 use vibex_config_switch::{
-    CODEX_MODEL_PROVIDER_ID_OPTION_KEY, ProviderConfigService, ProviderProfileChangeListener,
-    provider_option_value, secrets::resolve_provider_secret,
+    CODEX_MODEL_PROVIDER_ID_OPTION_KEY, LegacyAgentProviderProjectionRuntimePlan,
+    ProviderConfigService, ProviderProfileChangeListener, provider_option_value,
+    secrets::resolve_provider_secret,
 };
 #[cfg(test)]
 use vibex_config_switch::{CodexProviderRuntimeConfig, codex_runtime_config_from_profile};
@@ -988,6 +989,59 @@ fn codex_terminal_http_status(text: &str) -> Option<u16> {
     (400..=599).contains(&status).then_some(status)
 }
 
+/// Some ACP adapters surface a terminal provider failure as an ordinary
+/// `agent_message_chunk` and still complete the prompt with `end_turn`.  The
+/// absence of `messageId` is the strongest signal, but Codex has also emitted
+/// attributed chunks for account, capacity, and upstream failures.  Keep a
+/// small provider-error vocabulary here so those chunks cannot be promoted to
+/// a normal final Agent message.
+fn provider_terminal_error_text(text: &str) -> bool {
+    if codex_terminal_http_status(text).is_some() {
+        return true;
+    }
+    let lower = text.to_ascii_lowercase();
+    let trimmed = lower.trim_start();
+    if [
+        "error",
+        "failed",
+        "failure",
+        "unable to",
+        "could not",
+        "request failed",
+        "api error",
+        "network error",
+        "connection error",
+    ]
+    .iter()
+    .any(|prefix| trimmed.starts_with(prefix))
+    {
+        return true;
+    }
+    [
+        "high demand",
+        "at capacity",
+        "insufficient account balance",
+        "insufficient balance",
+        "insufficient credit",
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "quota exceeded",
+        "service unavailable",
+        "temporarily unavailable",
+        "internal server error",
+        "bad gateway",
+        "gateway timeout",
+        "payment required",
+        "invalid api key",
+        "authentication required",
+        "unauthorized",
+        "forbidden",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 fn append_bounded_assistant_text(buffer: &mut String, truncated: &mut bool, text: &str) {
     if buffer.len() >= ACP_ACTIVE_MESSAGE_LIMIT {
         *truncated = true;
@@ -1838,6 +1892,23 @@ impl AcpSessionAttachment {
         true
     }
 
+    fn record_codex_terminal_text_error(&self, text: &str) -> bool {
+        if !provider_terminal_error_text(text) {
+            return false;
+        }
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let Some(turn) = state.active_turn.as_mut() else {
+            return false;
+        };
+        turn.codex_terminal_error = Some(
+            VibexError::provider(CODEX_UNATTRIBUTED_ERROR_CODE, redact_summary(text))
+                .with_recovery_hint("Continue the session to retry from the failed turn"),
+        );
+        true
+    }
+
     fn record_codex_unattributed_error(&self, text: &str) -> bool {
         let Ok(mut state) = self.state.lock() else {
             return false;
@@ -2596,6 +2667,15 @@ impl AcpSessionAttachment {
                         self.record_codex_unattributed_error(&text);
                         return;
                     } else if is_codex {
+                        // A few Codex ACP versions attach a message id to the
+                        // same terminal provider text.  Recognize it before
+                        // appending an Assistant delta; otherwise `end_turn`
+                        // manufactures a normal final Agent message.
+                        if self.record_codex_terminal_http_error(&text)
+                            || self.record_codex_terminal_text_error(&text)
+                        {
+                            return;
+                        }
                         self.clear_codex_reconnect();
                     }
                     self.record_opencode_stream_progress();
@@ -4831,7 +4911,7 @@ impl AcpRuntimeSwitchBridge {
         let (process_strategy_effective, pool_fallback_reason) = self
             .client
             .pool_decision(&selection.provider_profile_id, &config)?;
-        let (_, materialization) = self.client.process_launch_materialization(
+        let spawn_snapshot = self.client.process_spawn_config_snapshot(
             &selection.provider_profile_id,
             &config,
             &cwd,
@@ -4844,7 +4924,7 @@ impl AcpRuntimeSwitchBridge {
             runtime_resources,
             process_strategy_effective,
             pool_fallback_reason,
-            spawn_snapshot: materialization.snapshot,
+            spawn_snapshot,
         })
     }
 
@@ -7868,12 +7948,15 @@ impl AcpRuntimeClient {
             })
     }
 
-    fn resolve_env_overlays_for_profile(
+    fn resolve_env_overlays_for_profile_with_projection(
         &self,
         profile: &ProviderProfile,
         config: &AcpProviderConfig,
         cwd: &Path,
-    ) -> VibexResult<Vec<(String, String)>> {
+    ) -> VibexResult<(
+        Vec<(String, String)>,
+        Option<vibex_config_switch::ResolvedAgentProviderProjection>,
+    )> {
         let mut overlays = Vec::new();
         for reference in &config.env {
             let key = reference.key.trim();
@@ -7902,16 +7985,33 @@ impl AcpRuntimeClient {
         }
         let projection = self
             .config_service
-            .resolve_legacy_agent_provider_projection(&profile.id, &workspace_runtime_key(cwd))?;
-        for (key, value) in projection.child_environment() {
-            upsert_env_overlay(&mut overlays, key, value);
+            .resolve_legacy_agent_provider_projection(&profile.id, &workspace_runtime_key(cwd));
+        let projection = match projection {
+            Ok(projection) => Some(projection),
+            Err(error) if error.code == "agent_projection_legacy_binding_missing" => None,
+            Err(error) => return Err(error),
+        };
+        if let Some(projection) = &projection {
+            for (key, value) in projection.child_environment() {
+                upsert_env_overlay(&mut overlays, key, value);
+            }
+            upsert_env_overlay(
+                &mut overlays,
+                PROVIDER_PROJECTION_FINGERPRINT_ENV.to_string(),
+                projection.fingerprint.clone(),
+            );
         }
-        upsert_env_overlay(
-            &mut overlays,
-            PROVIDER_PROJECTION_FINGERPRINT_ENV.to_string(),
-            projection.fingerprint,
-        );
-        Ok(overlays)
+        Ok((overlays, projection))
+    }
+
+    fn resolve_env_overlays_for_profile(
+        &self,
+        profile: &ProviderProfile,
+        config: &AcpProviderConfig,
+        cwd: &Path,
+    ) -> VibexResult<Vec<(String, String)>> {
+        self.resolve_env_overlays_for_profile_with_projection(profile, config, cwd)
+            .map(|(overlays, _)| overlays)
     }
 
     fn resolve_env_overlays(
@@ -8088,7 +8188,8 @@ impl AcpRuntimeClient {
             })?;
         // Resolve the actual environment exactly once. The resulting values
         // are passed to the child only; the snapshot keeps reference metadata.
-        let env_overlays = self.resolve_env_overlays_for_profile(&profile, config, cwd)?;
+        let (env_overlays, projection) =
+            self.resolve_env_overlays_for_profile_with_projection(&profile, config, cwd)?;
         let snapshot = self.process_spawn_config_snapshot_from_profile(
             profile_id,
             &profile,
@@ -8096,6 +8197,9 @@ impl AcpRuntimeClient {
             cwd,
             runtime_resources,
             Some(&env_overlays),
+            projection
+                .as_ref()
+                .map(|projection| projection.process_args.as_slice()),
         )?;
         let workspace_scope = WorkspaceScope::from_canonical(cwd.to_path_buf())?;
         let route_key = self.route_key_for_profile(&profile);
@@ -8138,6 +8242,7 @@ impl AcpRuntimeClient {
             cwd,
             runtime_resources,
             None,
+            None,
         )
     }
 
@@ -8149,26 +8254,43 @@ impl AcpRuntimeClient {
         cwd: &Path,
         runtime_resources: &ProviderRuntimeResources,
         effective_env: Option<&[(String, String)]>,
+        projection_args: Option<&[String]>,
     ) -> VibexResult<ProcessSpawnConfigSnapshot> {
         let route_key = self.route_key_for_profile(profile);
-        let process_args =
+        let workspace_key = workspace_runtime_key(cwd);
+        let legacy_projection = self
+            .config_service
+            .legacy_agent_provider_projection_runtime_plan(profile_id, &workspace_key)?;
+        let mut process_args =
             effective_acp_process_args(config, profile.agent_id.as_str() == OPENCODE_AGENT_ID);
+        let projection_args = match projection_args {
+            Some(args) => args.to_vec(),
+            None => legacy_projection
+                .as_ref()
+                .map(|projection| projection.process_args.clone())
+                .unwrap_or_default(),
+        };
+        append_projection_process_args(
+            profile.agent_id.as_str(),
+            &mut process_args,
+            &projection_args,
+        );
         let mut non_secret_env = BTreeMap::new();
         let mut secret_reference_versions = BTreeMap::new();
         self.populate_env_snapshot(
             profile,
             config,
             effective_env,
+            legacy_projection.as_ref(),
             &mut non_secret_env,
             &mut secret_reference_versions,
         )?;
-        if !non_secret_env.contains_key(PROVIDER_PROJECTION_FINGERPRINT_ENV) {
-            let projection = self
-                .config_service
-                .plan_legacy_agent_provider_projection(profile_id, &workspace_runtime_key(cwd))?;
+        if let Some(projection) = &legacy_projection
+            && !non_secret_env.contains_key(PROVIDER_PROJECTION_FINGERPRINT_ENV)
+        {
             non_secret_env.insert(
                 PROVIDER_PROJECTION_FINGERPRINT_ENV.to_string(),
-                projection.fingerprint,
+                projection.plan.fingerprint.clone(),
             );
         }
         let adapter_identity = self.effective_adapter_identity(&profile.agent_id, config)?;
@@ -8227,6 +8349,7 @@ impl AcpRuntimeClient {
         profile: &ProviderProfile,
         config: &AcpProviderConfig,
         effective_env: Option<&[(String, String)]>,
+        legacy_projection: Option<&LegacyAgentProviderProjectionRuntimePlan>,
         non_secret_env: &mut BTreeMap<String, String>,
         secret_reference_versions: &mut BTreeMap<String, String>,
     ) -> VibexResult<()> {
@@ -8318,6 +8441,30 @@ impl AcpRuntimeClient {
                 if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
                     non_secret_env.insert(key.to_string(), value);
                 }
+            }
+        }
+
+        if let Some(projection) = legacy_projection {
+            if effective_env.is_none() {
+                for (key, value) in &projection.non_secret_env {
+                    if key == OPENCODE_INLINE_CONFIG_ENV
+                        || looks_sensitive(key)
+                        || value.trim().is_empty()
+                    {
+                        continue;
+                    }
+                    non_secret_env.insert(key.to_string(), value.clone());
+                }
+            }
+            for secret in &projection.plan.secret_env {
+                secret_reference_versions.insert(
+                    secret.key.clone(),
+                    secret_reference_version(
+                        &secret.secret_reference.lookup_key,
+                        provider_secret_backend_name(secret.secret_reference.backend),
+                        secret.secret_reference.revision,
+                    )?,
+                );
             }
         }
 
@@ -8689,8 +8836,26 @@ impl AcpRuntimeClient {
         }
 
         let opencode_error_bridge_enabled = agent_id.as_str() == OPENCODE_AGENT_ID;
-        let process_args = materialized_args
-            .unwrap_or_else(|| effective_acp_process_args(config, opencode_error_bridge_enabled));
+        let process_args = match materialized_args {
+            Some(args) => args,
+            None => {
+                let mut args = effective_acp_process_args(config, opencode_error_bridge_enabled);
+                if let Some(projection) = self
+                    .config_service
+                    .legacy_agent_provider_projection_runtime_plan(
+                        profile_id,
+                        &workspace_runtime_key(cwd),
+                    )?
+                {
+                    append_projection_process_args(
+                        agent_id.as_str(),
+                        &mut args,
+                        &projection.process_args,
+                    );
+                }
+                args
+            }
+        };
         let env_overlays = match materialized_env {
             Some(env) => env,
             None => self.resolve_env_overlays(profile_id, config, cwd)?,
@@ -11703,6 +11868,29 @@ fn effective_acp_process_args(config: &AcpProviderConfig, is_opencode: bool) -> 
         args.push("ERROR".to_string());
     }
     args
+}
+
+fn append_projection_process_args(
+    agent_id: &str,
+    args: &mut Vec<String>,
+    projection_args: &[String],
+) {
+    if projection_args.is_empty()
+        || args
+            .windows(projection_args.len())
+            .any(|window| window == projection_args)
+    {
+        return;
+    }
+    // Stakpak parses profile/config as root command arguments, before `acp`.
+    // Crow's `--config-dir` belongs to its ACP subcommand and remains appended.
+    if agent_id == "stakpak"
+        && let Some(acp_index) = args.iter().position(|argument| argument == "acp")
+    {
+        args.splice(acp_index..acp_index, projection_args.iter().cloned());
+    } else {
+        args.extend(projection_args.iter().cloned());
+    }
 }
 
 fn binary_identity(command: &str) -> String {
@@ -14779,6 +14967,26 @@ mod tests {
     }
 
     #[test]
+    fn provider_terminal_error_text_covers_attributed_codex_failures() {
+        for text in [
+            "403 Insufficient account balance",
+            "The service is currently at high demand",
+            "Selected model is at capacity. Please try a different model.",
+            "429 Too Many Requests",
+            "The upstream service is temporarily unavailable",
+        ] {
+            assert!(provider_terminal_error_text(text), "{text}");
+        }
+        assert!(!provider_terminal_error_text(
+            "I can explain HTTP 503 responses."
+        ));
+        assert!(!provider_terminal_error_text("model stream recovered"));
+        assert!(provider_terminal_error_text(
+            "Error: provider request failed"
+        ));
+    }
+
+    #[test]
     fn standard_context_and_prompt_usage_are_merged_without_losing_fields() {
         let context = decode_context_window_usage(&json!({ "used": 12_500, "size": 200_000 }));
         assert!(context.diagnostics.is_empty());
@@ -16212,6 +16420,44 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
             "--log-level=INFO".to_string(),
         ];
         assert_eq!(effective_acp_process_args(&config, true), config.args);
+    }
+
+    #[test]
+    fn projection_process_args_preserve_stakpak_root_argument_order() {
+        let projection_args = vec![
+            "--profile".to_string(),
+            "vibex".to_string(),
+            "--config".to_string(),
+            "/private/runtime/stakpak.toml".to_string(),
+        ];
+        let mut stakpak_args = vec!["--verbose".to_string(), "acp".to_string()];
+        let expected_stakpak_args = vec![
+            "--verbose",
+            "--profile",
+            "vibex",
+            "--config",
+            "/private/runtime/stakpak.toml",
+            "acp",
+        ];
+
+        append_projection_process_args("stakpak", &mut stakpak_args, &projection_args);
+        assert_eq!(stakpak_args, expected_stakpak_args);
+
+        append_projection_process_args("stakpak", &mut stakpak_args, &projection_args);
+        assert_eq!(stakpak_args, expected_stakpak_args);
+
+        let mut crow_args = vec!["acp".to_string()];
+        append_projection_process_args("crow-cli", &mut crow_args, &projection_args);
+        assert_eq!(
+            crow_args,
+            vec![
+                "acp",
+                "--profile",
+                "vibex",
+                "--config",
+                "/private/runtime/stakpak.toml",
+            ]
+        );
     }
 
     #[test]
@@ -17826,6 +18072,7 @@ for line in sys.stdin:
                     "sessionId": session_id,
                     "update": {
                         "sessionUpdate": "agent_message_chunk",
+                        "messageId": "codex-attributed-http-error",
                         "content": {
                             "type": "text",
                             "text": "400 Bad Request\\n\\nnginx\\n",
@@ -23015,6 +23262,7 @@ for line in sys.stdin:
                 &cwd,
                 &ProviderRuntimeResources::default(),
                 None,
+                None,
             )
             .unwrap();
         assert_ne!(
@@ -23024,6 +23272,55 @@ for line in sys.stdin:
         let rendered = format!("{with_secret:?}");
         assert!(!rendered.contains("fixture-api-key-reference"));
         assert!(!rendered.contains("secret-value"));
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn ordinary_acp_profile_without_legacy_binding_has_no_projection_snapshot() {
+        let Some(fixture) = MockAcpFixture::create("ordinary-profile-without-binding") else {
+            return;
+        };
+        let client = fixture.client();
+        let config = client.profile_config(&fixture.profile_id).unwrap();
+        let cwd =
+            AcpRuntimeClient::resolve_workspace_cwd(&config, &fixture.workspace.to_string_lossy())
+                .unwrap();
+        let mut profile = client
+            .config_service
+            .get_profile(&fixture.profile_id)
+            .unwrap()
+            .unwrap();
+        // Keep the ordinary ACP shape while using an id that has no
+        // compatibility binding yet, as happens during legacy migration.
+        profile.id = ProviderProfileId::new();
+
+        let (overlays, projection) = client
+            .resolve_env_overlays_for_profile_with_projection(&profile, &config, &cwd)
+            .unwrap();
+        assert!(projection.is_none());
+        assert!(
+            overlays
+                .iter()
+                .any(|(key, _)| key == "VIBEX_MOCK_ACP_REQUEST_LOG")
+        );
+
+        let snapshot = client
+            .process_spawn_config_snapshot_from_profile(
+                &profile.id,
+                &profile,
+                &config,
+                &cwd,
+                &ProviderRuntimeResources::default(),
+                Some(&overlays),
+                None,
+            )
+            .unwrap();
+        assert!(
+            !snapshot
+                .non_secret_env
+                .contains_key(PROVIDER_PROJECTION_FINGERPRINT_ENV)
+        );
+        assert!(!format!("{snapshot:?}").contains(PROVIDER_PROJECTION_FINGERPRINT_ENV));
         fixture.cleanup();
     }
 
