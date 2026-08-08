@@ -7066,7 +7066,6 @@ impl AcpRuntimeClient {
                 .unwrap_or_else(|| default_adapter_for_agent(agent_id));
             let exact_descriptor = descriptor.is_some_and(|descriptor| {
                 descriptor.distribution.exact_version.to_string() == version
-                    && descriptor.distribution.runtime_dependencies.is_empty()
             });
             if exact_descriptor {
                 let descriptor = descriptor.expect("exact descriptor is present");
@@ -14725,8 +14724,12 @@ mod tests {
             .effective_adapter_identity(&AgentId::parse("codex").unwrap(), &codex)
             .unwrap();
         assert_eq!(identity.adapter_version, "1.1.9");
-        assert_eq!(identity.compatibility_identity, "adapter=codex-acp@1.1.9");
-        assert!(!identity.exact_descriptor);
+        assert_eq!(
+            identity.compatibility_identity,
+            "adapter=codex-acp@1.1.9;runtime=@openai/codex@0.146.0"
+        );
+        assert!(identity.exact_descriptor);
+        assert_eq!(identity.event_enricher, AgentEventEnricherKind::Codex);
 
         let external = test_acp_config("claude-agent-acp", Vec::new());
         let identity = client
