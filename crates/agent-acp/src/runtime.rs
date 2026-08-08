@@ -289,6 +289,17 @@ struct ProcessLaunchMaterialization {
     env_overlays: Vec<(String, String)>,
 }
 
+struct ProcessEnvironmentMaterialization {
+    env_overlays: Vec<(String, String)>,
+    projection: Option<vibex_config_switch::ResolvedAgentProviderProjection>,
+}
+
+#[derive(Default)]
+struct ProcessSnapshotLaunchInputs<'a> {
+    effective_env: Option<&'a [(String, String)]>,
+    projection_args: Option<&'a [String]>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AcpDebugDirection {
     Outgoing,
@@ -7954,10 +7965,7 @@ impl AcpRuntimeClient {
         profile: &ProviderProfile,
         config: &AcpProviderConfig,
         cwd: &Path,
-    ) -> VibexResult<(
-        Vec<(String, String)>,
-        Option<vibex_config_switch::ResolvedAgentProviderProjection>,
-    )> {
+    ) -> VibexResult<ProcessEnvironmentMaterialization> {
         let mut overlays = Vec::new();
         for reference in &config.env {
             let key = reference.key.trim();
@@ -8002,7 +8010,10 @@ impl AcpRuntimeClient {
                 projection.fingerprint.clone(),
             );
         }
-        Ok((overlays, projection))
+        Ok(ProcessEnvironmentMaterialization {
+            env_overlays: overlays,
+            projection,
+        })
     }
 
     fn resolve_env_overlays_for_profile(
@@ -8012,7 +8023,7 @@ impl AcpRuntimeClient {
         cwd: &Path,
     ) -> VibexResult<Vec<(String, String)>> {
         self.resolve_env_overlays_for_profile_with_projection(profile, config, cwd)
-            .map(|(overlays, _)| overlays)
+            .map(|materialization| materialization.env_overlays)
     }
 
     fn resolve_env_overlays(
@@ -8189,18 +8200,22 @@ impl AcpRuntimeClient {
             })?;
         // Resolve the actual environment exactly once. The resulting values
         // are passed to the child only; the snapshot keeps reference metadata.
-        let (env_overlays, projection) =
-            self.resolve_env_overlays_for_profile_with_projection(&profile, config, cwd)?;
+        let ProcessEnvironmentMaterialization {
+            env_overlays,
+            projection,
+        } = self.resolve_env_overlays_for_profile_with_projection(&profile, config, cwd)?;
         let snapshot = self.process_spawn_config_snapshot_from_profile(
             profile_id,
             &profile,
             config,
             cwd,
             runtime_resources,
-            Some(&env_overlays),
-            projection
-                .as_ref()
-                .map(|projection| projection.process_args.as_slice()),
+            ProcessSnapshotLaunchInputs {
+                effective_env: Some(&env_overlays),
+                projection_args: projection
+                    .as_ref()
+                    .map(|projection| projection.process_args.as_slice()),
+            },
         )?;
         let workspace_scope = WorkspaceScope::from_canonical(cwd.to_path_buf())?;
         let route_key = self.route_key_for_profile(&profile);
@@ -8242,8 +8257,7 @@ impl AcpRuntimeClient {
             config,
             cwd,
             runtime_resources,
-            None,
-            None,
+            ProcessSnapshotLaunchInputs::default(),
         )
     }
 
@@ -8254,9 +8268,12 @@ impl AcpRuntimeClient {
         config: &AcpProviderConfig,
         cwd: &Path,
         runtime_resources: &ProviderRuntimeResources,
-        effective_env: Option<&[(String, String)]>,
-        projection_args: Option<&[String]>,
+        launch_inputs: ProcessSnapshotLaunchInputs<'_>,
     ) -> VibexResult<ProcessSpawnConfigSnapshot> {
+        let ProcessSnapshotLaunchInputs {
+            effective_env,
+            projection_args,
+        } = launch_inputs;
         let route_key = self.route_key_for_profile(profile);
         let workspace_key = workspace_runtime_key(cwd);
         let legacy_projection = self
@@ -11848,7 +11865,10 @@ fn acp_process_strategy_name(strategy: AcpProcessStrategy) -> &'static str {
     }
 }
 
-fn effective_acp_process_args(config: &AcpProviderConfig, is_opencode: bool) -> Vec<String> {
+pub(super) fn effective_acp_process_args(
+    config: &AcpProviderConfig,
+    is_opencode: bool,
+) -> Vec<String> {
     let mut args = config.args.clone();
     if !is_opencode {
         return args;
@@ -11871,7 +11891,7 @@ fn effective_acp_process_args(config: &AcpProviderConfig, is_opencode: bool) -> 
     args
 }
 
-fn append_projection_process_args(
+pub(super) fn append_projection_process_args(
     agent_id: &str,
     args: &mut Vec<String>,
     projection_args: &[String],
@@ -23262,8 +23282,7 @@ for line in sys.stdin:
                 &config,
                 &cwd,
                 &ProviderRuntimeResources::default(),
-                None,
-                None,
+                ProcessSnapshotLaunchInputs::default(),
             )
             .unwrap();
         assert_ne!(
@@ -23295,12 +23314,13 @@ for line in sys.stdin:
         // compatibility binding yet, as happens during legacy migration.
         profile.id = ProviderProfileId::new();
 
-        let (overlays, projection) = client
+        let materialization = client
             .resolve_env_overlays_for_profile_with_projection(&profile, &config, &cwd)
             .unwrap();
-        assert!(projection.is_none());
+        assert!(materialization.projection.is_none());
         assert!(
-            overlays
+            materialization
+                .env_overlays
                 .iter()
                 .any(|(key, _)| key == "VIBEX_MOCK_ACP_REQUEST_LOG")
         );
@@ -23312,8 +23332,10 @@ for line in sys.stdin:
                 &config,
                 &cwd,
                 &ProviderRuntimeResources::default(),
-                Some(&overlays),
-                None,
+                ProcessSnapshotLaunchInputs {
+                    effective_env: Some(&materialization.env_overlays),
+                    projection_args: None,
+                },
             )
             .unwrap();
         assert!(

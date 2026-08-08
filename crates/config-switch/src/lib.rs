@@ -201,10 +201,9 @@ impl ProviderConfigService {
         let versioned_agent_ids = vibex_core::agent_provider_rollout_manifest()?
             .into_iter()
             .filter(|entry| {
-                matches!(
-                    entry.version_policy,
-                    vibex_core::AgentVersionPolicy::DetectedSemver { .. }
-                )
+                entry.capability_mode
+                    == vibex_core::AgentProviderCapabilityMode::ReplaceableProvider
+                    && entry.evidence_state == vibex_core::ProjectionEvidenceState::Documented
             })
             .map(|entry| entry.agent_id)
             .collect::<HashSet<_>>();
@@ -486,10 +485,29 @@ impl ProviderConfigService {
         let mut discovery = low_cost_agent_discovery(&snapshot, &cwd_scope);
         probe_explicit_agent_version(&snapshot, &mut discovery);
         AgentDiscoveryRepository::insert(&conn, &discovery)?;
+
+        // A detected version changes the runtime identity used by the legacy
+        // ACP compatibility rows. Reconcile those rows in the same refresh so
+        // Config Center immediately exposes the typed projector and computes
+        // the new launch fingerprint. Collect first to avoid holding a DB
+        // iterator while each sync opens its own transaction.
+        let legacy_profiles =
+            ProviderProfileRepository::list_by_agent(&conn, &definition.id, true)?
+                .into_iter()
+                .filter(|profile| {
+                    profile.kind == ProviderKind::Acp && !is_local_default_profile(&profile.id)
+                })
+                .collect::<Vec<_>>();
+        for profile in &legacy_profiles {
+            self.sync_legacy_projection(&conn, profile)?;
+        }
         let mut agent =
             AgentSnapshotEntry::from_definition(&definition, config.as_ref(), Some(&discovery));
         if let Some(record) = AgentManagedInstallationRepository::get(&conn, &definition.id)? {
             agent.apply_managed_install_state(record.state);
+        }
+        for profile in &legacy_profiles {
+            self.notify_profile_saved(profile);
         }
         Ok(AgentRefreshSnapshotResponse { agent })
     }
@@ -3621,26 +3639,32 @@ fn low_cost_agent_discovery(
     }
 }
 
-/// Explicit Config Center refreshes may identify a PATH-launched OpenCode CLI
-/// without starting its ACP runtime or creating a session. Ordinary list and
-/// cached-discovery paths never call this helper.
+/// Explicit Config Center refreshes may identify a trusted PATH-launched Agent
+/// CLI without starting its ACP runtime or creating a session. Ordinary list
+/// and cached-discovery paths never call this helper.
 fn probe_explicit_agent_version(
     snapshot: &AgentSnapshotEntry,
     discovery: &mut AgentDiscoveryRecord,
 ) {
-    if snapshot.id.as_str() != "opencode"
-        || discovery.install_status != AgentInstallStatus::Installed
-    {
+    if discovery.install_status != AgentInstallStatus::Installed {
         return;
     }
+    let Some(trusted_binary_names) = trusted_version_probe_binary_names(snapshot.id.as_str())
+    else {
+        return;
+    };
     let Some(binary_path) = discovery.binary_path.as_deref() else {
         return;
     };
-    if Path::new(binary_path)
+    let trusted = Path::new(binary_path)
         .file_stem()
         .and_then(|name| name.to_str())
-        .is_none_or(|name| !name.eq_ignore_ascii_case("opencode"))
-    {
+        .is_some_and(|name| {
+            trusted_binary_names
+                .iter()
+                .any(|trusted| name.eq_ignore_ascii_case(trusted))
+        });
+    if !trusted {
         discovery.diagnostics.push(ProviderBindingMetadata {
             key: "versionProbe".to_string(),
             value: "agent_version_probe_command_untrusted".to_string(),
@@ -3659,6 +3683,25 @@ fn probe_explicit_agent_version(
             key: "versionProbe".to_string(),
             value: code.to_string(),
         }),
+    }
+}
+
+fn trusted_version_probe_binary_names(agent_id: &str) -> Option<&'static [&'static str]> {
+    match agent_id {
+        "opencode" => Some(&["opencode"]),
+        "copilot" => Some(&["copilot"]),
+        "codewhale" => Some(&["codewhale"]),
+        "crow-cli" => Some(&["crow-cli"]),
+        "goose" => Some(&["goose"]),
+        "grok" => Some(&["grok"]),
+        "hermes" => Some(&["hermes"]),
+        "kilo" => Some(&["kilo"]),
+        "kimi" => Some(&["kimi"]),
+        "mistral-vibe" => Some(&["vibe-acp"]),
+        "poolside" => Some(&["pool"]),
+        "stakpak" => Some(&["stakpak"]),
+        "vtcode" => Some(&["vtcode"]),
+        _ => None,
     }
 }
 
@@ -8887,7 +8930,7 @@ mod tests {
                 params: None,
             })
             .unwrap();
-        assert_eq!(service.refresh_detected_agent_versions().unwrap(), 1);
+        assert!(service.refresh_detected_agent_versions().unwrap() >= 1);
         let refreshed = service
             .list_agents(AgentListRequest {
                 include_disabled: true,
@@ -8979,6 +9022,35 @@ mod tests {
                 .form_controls
                 .contains(&vibex_core::AgentProjectionFormControl::ApiKey)
         );
+    }
+
+    #[test]
+    fn typed_catalog_system_agents_have_trusted_version_probe_binaries() {
+        let expected = [
+            ("copilot", "copilot"),
+            ("codewhale", "codewhale"),
+            ("crow-cli", "crow-cli"),
+            ("goose", "goose"),
+            ("grok", "grok"),
+            ("hermes", "hermes"),
+            ("kilo", "kilo"),
+            ("kimi", "kimi"),
+            ("mistral-vibe", "vibe-acp"),
+            ("poolside", "pool"),
+            ("stakpak", "stakpak"),
+            ("vtcode", "vtcode"),
+        ];
+
+        for (agent_id, binary_name) in expected {
+            assert_eq!(
+                trusted_version_probe_binary_names(agent_id),
+                Some(&[binary_name][..]),
+                "{agent_id} must only probe its code-owned executable name"
+            );
+        }
+        for pinned_agent in ["dirac", "factory-droid", "fast-agent", "pi", "qwen-code"] {
+            assert_eq!(trusted_version_probe_binary_names(pinned_agent), None);
+        }
     }
 
     #[test]

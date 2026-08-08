@@ -3161,6 +3161,211 @@ spawn_acp_child(resolved.child_environment())?;
 Only the authoritative runtime resolves the Secret, and every file target is a
 validated code-owned overlay under the private runtime root.
 
+## Scenario: Exact-Version Catalog Agent Runtime Projection
+
+### 1. Scope / Trigger
+
+- Trigger: Config Center creates or updates an ACP Provider Profile for one of
+  these 17 catalog Agents: `copilot`, `codewhale`, `crow-cli`, `dirac`,
+  `factory-droid`, `fast-agent`, `goose`, `grok`, `hermes`, `kilo`, `kimi`,
+  `mistral-vibe`, `poolside`, `pi`, `qwen-code`, `stakpak`, or `vtcode`.
+- Trigger: an explicit Config Center refresh changes the detected Agent
+  version, or a session/probe must start with the selected Profile's endpoint,
+  API key, model, and Wire API.
+- This path crosses catalog identity, legacy Profile compatibility records,
+  typed projection, late Secret resolution, private overlay materialization,
+  ACP process fingerprints, and restart-and-resume switching.
+
+### 2. Signatures
+
+```text
+ProviderConfigService::refresh_detected_agent_versions() -> VibexResult<usize>
+ProviderConfigService::refresh_agent_snapshot(AgentRefreshSnapshotRequest)
+  -> VibexResult<AgentRefreshSnapshotResponse>
+ProviderConfigService::sync_legacy_projection(connection, profile)
+  -> VibexResult<()>
+
+AgentProviderProjectionEngine::plan(provider, runtime, binding, descriptor, workspace_key)
+  -> VibexResult<AgentProviderProjectionPlan>
+AgentProviderProjectionEngine::non_secret_environment_for_plan(plan, runtime_root, workspace_key)
+  -> VibexResult<BTreeMap<String, String>>
+AgentProviderProjectionEngine::process_args_for_plan(plan, runtime_root, workspace_key)
+  -> VibexResult<Vec<String>>
+AgentProviderProjectionEngine::resolve_and_materialize(plan, runtime_root, workspace_key)
+  -> VibexResult<ResolvedAgentProviderProjection>
+
+AgentProviderProjectionPlan {
+  non_secret_env,
+  secret_env: ProjectionSecretEnvReference[],
+  overlay_files: ManagedProjectionOverlay[],
+  runtime_home_env_key?,
+  process_args, // `{projectionRoot}` templates
+  effective_model,
+  switch_behavior,
+  fingerprint
+}
+ResolvedAgentProviderProjection {
+  non_secret_env,
+  secret_env,
+  overlay_root,
+  overlay_files,
+  process_args, // materialized absolute private paths
+  effective_model,
+  fingerprint
+}
+```
+
+### 3. Contracts
+
+- The 17 descriptors match only their exact catalog versions: Copilot `1.0.78`,
+  CodeWhale `0.8.55`, crow-cli `0.1.23`, Dirac `0.4.1`, Factory Droid
+  `0.153.1`, fast-agent `0.7.21`, Goose `1.33.1`, Grok `0.2.11`, Hermes
+  `0.19.0`, Kilo `7.2.40`, Kimi `0.11.0`, Mistral Vibe `2.9.3`, Poolside
+  `1.0.0`, Pi `0.0.33`, Qwen Code `0.18.4`, Stakpak `0.3.80`, and VT Code
+  `0.96.14`. A future or unknown version never inherits these schemas.
+- Explicit refresh may run `<binary> --version` only for these trusted binary
+  names: `copilot`, `codewhale`, `crow-cli`, `goose`, `grok`, `hermes`, `kilo`,
+  `kimi`, `vibe-acp`, `pool`, `stakpak`, and `vtcode`. Dirac, Factory Droid,
+  fast-agent, Pi, and Qwen Code derive the catalog version only when the
+  complete `npx`/`uvx` command and argument vector exactly match the pinned
+  catalog entry. Ordinary catalog reads remain process-free.
+- The five environment projectors use these process contracts:
+
+| Agent | Endpoint / Secret / Model | Additional selection or state |
+| --- | --- | --- |
+| Copilot | `COPILOT_PROVIDER_BASE_URL` / `COPILOT_PROVIDER_API_KEY` / `COPILOT_MODEL` | `COPILOT_HOME` points at the private projection root. |
+| CodeWhale | `CODEWHALE_BASE_URL` / `OPENAI_API_KEY` / `CODEWHALE_MODEL` | `CODEWHALE_PROVIDER=openai`; `CODEWHALE_HOME` is private. |
+| fast-agent | `GENERIC_BASE_URL` / `GENERIC_API_KEY` / `FAST_AGENT_MODEL` | The model is normalized to `generic.<model>`. |
+| Kimi | `KIMI_MODEL_BASE_URL` / `KIMI_MODEL_API_KEY` / `KIMI_MODEL_NAME` | `KIMI_MODEL_PROVIDER_TYPE` follows the Wire API; `KIMI_CODE_HOME` is private. |
+| Poolside | `POOLSIDE_STANDALONE_BASE_URL` / `POOLSIDE_API_KEY` / `POOLSIDE_STANDALONE_MODEL` | A trailing `/v1` is removed before launch. |
+
+- The other 12 use code-owned typed overlays; serializers, relative paths,
+  Secret environment keys, and selection controls are fixed in code:
+
+| Agent | Overlay and Secret reference | Private selection boundary |
+| --- | --- | --- |
+| crow-cli | `config.yaml`, `${VIBEX_CROW_API_KEY}` | Append `--config-dir <projectionRoot>` after `acp`. |
+| Dirac | `data/globalState.json`, child `OPENAI_API_KEY` | `DIRAC_DIR=<projectionRoot>`. |
+| Factory Droid | `settings.json`, `${VIBEX_FACTORY_DROID_API_KEY}` | `FACTORY_HOME_OVERRIDE=<projectionRoot>`. |
+| Goose | `config/custom_providers/vibex.json`, `VIBEX_GOOSE_API_KEY` by name | `GOOSE_PATH_ROOT`, `GOOSE_PROVIDER`, and `GOOSE_MODEL` select the injected entry. |
+| Grok | `config.toml`, `env_key=VIBEX_GROK_API_KEY` | `GROK_HOME`; `[models].default` selects the injected model. |
+| Hermes | `config.yaml`, `key_env=VIBEX_HERMES_API_KEY` | `HERMES_HOME=<projectionRoot>`. |
+| Kilo | `kilo.json`, `{env:VIBEX_KILO_API_KEY}` | The same JSON is supplied through `KILO_CONFIG_CONTENT`. |
+| Mistral Vibe | `config.toml`, `api_key_env_var=VIBEX_MISTRAL_VIBE_API_KEY` | `VIBE_HOME=<projectionRoot>`. |
+| Pi | `models.json`, `apiKey=$VIBEX_PI_API_KEY` | `PI_CODING_AGENT_DIR=<projectionRoot>`. |
+| Qwen Code | `settings.json`, `envKey=VIBEX_QWEN_CODE_API_KEY` | `QWEN_HOME=<projectionRoot>`. |
+| Stakpak | `stakpak.toml`, child `OPENAI_API_KEY` | Insert `--profile vibex --config <projectionRoot>/stakpak.toml` before root `acp`. |
+| VT Code | `vtcode.toml`, `api_key_env=VIBEX_VTCODE_API_KEY` | `VTCODE_CONFIG_PATH` is the materialized file path. |
+
+- Overlay content may contain only an environment-key reference, never the
+  resolved API key. Secret lookup occurs once immediately before launch; the
+  value is passed only to the target child. Snapshots and fingerprints retain
+  opaque Secret-reference versions, not values.
+- Overlay roots are deterministic per binding and workspace, owner-only, and
+  validated before atomic writes. Environment-only and inline projectors never
+  write the user's Agent home. Agent-specific home variables and launch
+  arguments point only at this root.
+- Planning, process acquisition, and spawn use one projection identity.
+  Materialized non-Secret env and process args enter the process snapshot;
+  those exact args/env launch the child. Runtime Probe uses the same resolved
+  child environment and argument-order helper as a real session.
+- A Config Center version refresh re-synchronizes every non-local ACP Profile
+  for that Agent before notifying Profile listeners. Profile endpoint, Secret
+  reference, model, Wire API, overlay, home-key, or process-argument changes
+  alter the fingerprint and mark the old process stale.
+- All 17 descriptors use `RestartAndResume`. A save does not mutate or kill the
+  current process in place; the switch coordinator prepares the new projection,
+  restores the logical session when supported, commits the new binding, and
+  then drains the old runtime.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Agent version is absent, manual, future, or differs from the exact catalog version | Conservative capability with `agent_projection_version_untrusted` or `agent_projection_version_mismatch`; inject nothing. |
+| PATH binary basename is not the Agent's trusted name | Record `agent_version_probe_command_untrusted`; do not execute it or enable the projector. |
+| Pinned `npx`/`uvx` command or any argument differs | Do not infer the catalog version; automatic projection remains closed. |
+| Model Wire API is not in the descriptor's interface list | `agent_model_interface_unsupported`; preserve the current binding/process. |
+| Required Secret reference or resolved value is missing | `agent_projection_secret_reference_missing` or `agent_projection_secret_missing`; do not spawn the target. |
+| Legacy ACP Profile has no compatibility binding | `agent_projection_legacy_binding_missing`; retain the ordinary ACP Profile path without pretending projection succeeded. |
+| Workspace key, overlay path, directory, or symlink is unsafe | The matching `agent_projection_workspace_key_invalid`, `agent_projection_overlay_path_unsafe`, `agent_projection_runtime_directory_invalid`, or `agent_projection_overlay_symlink_rejected` error. |
+| Process snapshot fingerprint differs after a Profile/version refresh | Mark the process stale; new attachment returns `acp_process_config_stale` until restart-and-resume converges. |
+| Crow or Stakpak projection args are already present | Keep one ordered copy; never duplicate config/profile flags. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: Profile A and Profile B configure different endpoints, credentials, and
+  models for Goose. Switching to B creates a new private overlay, sets
+  `GOOSE_PROVIDER`/`GOOSE_MODEL` to B's generated entry, resumes the logical
+  session on the new process, and leaves A's Secret out of B's child.
+- Good: Grok registers a custom model and sets `[models].default` to that model;
+  Crow and Stakpak probes receive the same materialized config arguments as
+  real sessions.
+- Base: Copilot, fast-agent, or Poolside needs no config file. The process
+  receives only its typed endpoint/key/model environment plus safe runtime
+  metadata.
+- Bad: apply a `1.33.1` Goose overlay to an unrecognized future Goose version,
+  or treat successful ACP `initialize` as proof that the endpoint was selected.
+- Bad: register a Goose custom provider without selecting it, register a Grok
+  custom model without `[models].default`, write an API key into an overlay, or
+  materialize one set of args for the fingerprint and spawn another set.
+
+### 6. Tests Required
+
+- Core `catalog_projection_contracts_are_explicit_and_conservative` asserts all
+  17 ids, exact-version compatibility, typed provider/model boundaries,
+  `VibexPrivate`, and `RestartAndResume`; the six blocked Agents remain
+  conservative.
+- DB `pinned_catalog_commands_supply_exact_versions_only_for_full_command_matches`
+  asserts the five fixed-command identities and fail-closed mismatches.
+- Config-switch
+  `all_typed_catalog_projectors_map_provider_env_secret_model_and_private_state`
+  parses every JSON/TOML/YAML overlay, checks all 17 endpoint/key/model
+  projections, Goose/Grok selection, home paths, Crow/Stakpak args, fingerprint
+  drift, and Secret redaction. Version-probe tests assert the 12 trusted system
+  binary names.
+- ACP `projection_process_args_preserve_stakpak_root_argument_order` and
+  `probe_process_args_use_materialized_probe_overlay_paths` assert real/probe
+  argument parity, ordering, and deduplication. Process snapshot tests assert
+  resolved Secret values never enter snapshots or diagnostics.
+- Run `cargo fmt --all --check`, tests for `vibex-core`, `vibex-db`,
+  `vibex-config-switch`, and `vibex-agent-acp`, scoped Clippy with
+  `-D warnings`, `cargo check -p vibex-desktop --locked`, and
+  `git diff --check` before commit.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+let snapshot = process_spawn_config_snapshot(profile, base_agent_args)?;
+let projection = resolve_projection(profile)?;
+spawn(base_agent_args, projection.child_environment())?;
+```
+
+This fingerprints the base command but launches a different process, and it
+omits Crow/Stakpak config arguments from process acquisition.
+
+#### Correct
+
+```rust
+let (key, materialized) = process_launch_materialization(
+    profile_id,
+    config,
+    workspace,
+    runtime_resources,
+)?;
+spawn_with_snapshot(
+    key,
+    materialized.snapshot.args.clone(),
+    materialized.env_overlays,
+)?;
+```
+
+One materialization supplies the process key, snapshot, ordered arguments, and
+child environment. Profile switching therefore compares and launches the same
+effective runtime configuration.
+
 ## Scenario: Agent Provider Runtime Verification Rollout
 
 ### 1. Scope / Trigger

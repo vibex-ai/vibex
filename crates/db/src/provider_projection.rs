@@ -18,7 +18,7 @@ use vibex_core::{
     ProviderConfiguredModel, ProviderModelWireApi, ProviderProfile, ProviderProfileId,
     ProviderProfileStatus, ProviderSecretKind, ProviderSecretSetupState, TransportKind, VibexError,
     VibexResult, WIRE_PROTOCOL_ANTHROPIC_MESSAGES, WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
-    WIRE_PROTOCOL_OPENAI_RESPONSES, builtin_agent_definitions,
+    WIRE_PROTOCOL_OPENAI_RESPONSES, acp_agent_catalog_entries, builtin_agent_definitions,
 };
 
 use super::{
@@ -1182,8 +1182,9 @@ fn legacy_runtime_identity(
             })
         })
         .and_then(|record| record.state.installed_version);
+    let pinned_catalog_version = pinned_catalog_command_version(agent, command, args);
     let (adapter, adapter_version, agent_version, runtime_dependencies, source) =
-        match (agent, managed_version) {
+        match (agent, managed_version.or(pinned_catalog_version)) {
             ("claude", Some(version)) => (
                 "claude-agent-acp",
                 Some(version),
@@ -1259,6 +1260,24 @@ fn legacy_runtime_identity(
         runtime_dependencies,
         source,
     })
+}
+
+fn pinned_catalog_command_version(
+    agent_id: &str,
+    command: &str,
+    args: &[String],
+) -> Option<String> {
+    let entry = acp_agent_catalog_entries()
+        .iter()
+        .find(|entry| entry.id == agent_id)?;
+    if entry.version.eq_ignore_ascii_case("manual")
+        || !matches!(entry.command.first().copied(), Some("npx" | "uvx"))
+        || entry.command.first().copied() != Some(command)
+        || entry.command.get(1..).unwrap_or_default() != args
+    {
+        return None;
+    }
+    Some(entry.version.to_string())
 }
 
 fn upsert_legacy_model_provider(
@@ -1541,7 +1560,7 @@ fn legacy_configured_model_bindings(
         .into_iter()
         .enumerate()
         .map(|(index, model)| {
-            let wire_protocol_id = legacy_wire_protocol(profile, model.wire_api);
+            let wire_protocol_id = legacy_wire_protocol(profile, model.wire_api, interfaces);
             let sdk_adapter_id = interfaces
                 .iter()
                 .find(|interface| interface.wire_protocol_id == wire_protocol_id)
@@ -1650,6 +1669,7 @@ fn builtin_acp_config(agent_id: &AgentId) -> Option<AcpProviderConfig> {
 fn legacy_wire_protocol(
     profile: &ProviderProfile,
     wire_api: Option<ProviderModelWireApi>,
+    interfaces: &[vibex_core::AgentModelInterfaceDescriptor],
 ) -> String {
     match wire_api {
         Some(ProviderModelWireApi::OpenaiResponses) => WIRE_PROTOCOL_OPENAI_RESPONSES,
@@ -1669,7 +1689,12 @@ fn legacy_wire_protocol(
                 WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS
             }
         }
-        None => WIRE_PROTOCOL_OPENAI_RESPONSES,
+        None => interfaces
+            .iter()
+            .find(|interface| interface.wire_protocol_id == WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS)
+            .or_else(|| interfaces.first())
+            .map(|interface| interface.wire_protocol_id.as_str())
+            .unwrap_or(WIRE_PROTOCOL_OPENAI_RESPONSES),
     }
     .to_string()
 }
@@ -1977,6 +2002,42 @@ mod tests {
             registry.resolve(&codebuddy_identity).unwrap().match_kind,
             ProjectionDescriptorMatch::SemverRange
         );
+    }
+
+    #[test]
+    fn pinned_catalog_commands_supply_exact_versions_only_for_full_command_matches() {
+        for (agent_id, expected_version) in [
+            ("dirac", "0.4.1"),
+            ("factory-droid", "0.153.1"),
+            ("fast-agent", "0.7.21"),
+            ("pi", "0.0.33"),
+            ("qwen-code", "0.18.4"),
+        ] {
+            let entry = acp_agent_catalog_entries()
+                .iter()
+                .find(|entry| entry.id == agent_id)
+                .unwrap_or_else(|| panic!("missing catalog entry for {agent_id}"));
+            let command = entry.command[0];
+            let args = entry.command[1..]
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                pinned_catalog_command_version(agent_id, command, &args).as_deref(),
+                Some(expected_version)
+            );
+
+            let mut changed_args = args.clone();
+            changed_args.push("--unexpected".to_string());
+            assert_eq!(
+                pinned_catalog_command_version(agent_id, command, &changed_args),
+                None
+            );
+            assert_eq!(
+                pinned_catalog_command_version(agent_id, "untrusted-runner", &args),
+                None
+            );
+        }
     }
 
     #[test]

@@ -13,7 +13,7 @@ use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 
 use crate::provider_projection::{
-    OPENCODE_COMPATIBLE_VERSION_REQUIREMENT, OPENCODE_LAST_VERIFIED_VERSION,
+    ConfigOverlayStrategy, OPENCODE_COMPATIBLE_VERSION_REQUIREMENT, OPENCODE_LAST_VERIFIED_VERSION,
 };
 use crate::{
     AcpAdapterId, AgentCredentialControl, AgentCredentialKind, AgentId, AgentModelControl,
@@ -21,7 +21,8 @@ use crate::{
     AgentProviderProjectionDescriptorId, AgentRuntimeHomeStrategy, AgentVersionCompatibility,
     ProjectionDescriptorMatch, ProjectionEvidenceReference, ProjectionEvidenceState,
     ProviderSecretKind, ProviderSwitchBehavior, VibexError, VibexResult,
-    WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, acp_agent_catalog_entries,
+    WIRE_PROTOCOL_ANTHROPIC_MESSAGES, WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+    WIRE_PROTOCOL_OPENAI_RESPONSES, acp_agent_catalog_entries,
 };
 use crate::{AgentModelProviderBindingId, AgentRuntimeProbeId, AgentRuntimeProfileId};
 
@@ -288,10 +289,18 @@ impl CatalogProjectionShape {
 }
 
 fn catalog_version_compatibility(
+    agent_id: &str,
     version: &str,
     shape: &CatalogProjectionShape,
 ) -> (AgentVersionPolicy, AgentVersionCompatibility) {
-    if shape.supports_vibex_model_provider_projection() {
+    // The two legacy environment projectors predate this catalog rollout and
+    // have documented compatibility ranges. The newly typed catalog
+    // projectors are pinned to the exact source version until a newer schema
+    // has its own evidence; applying a future schema silently would inject
+    // credentials into an incompatible process.
+    if matches!(agent_id, "codebuddy-code" | "glm-acp-agent")
+        && shape.supports_vibex_model_provider_projection()
+    {
         at_least_or_manual(version)
     } else {
         exact_or_manual(version)
@@ -313,6 +322,143 @@ fn catalog_projection_shape(
                 "ACP_GLM_BASE_URL",
                 "Z_AI_API_KEY",
                 "ACP_GLM_MODEL",
+            )),
+            "copilot" => Ok(environment_projection_shape(
+                "COPILOT_PROVIDER_BASE_URL",
+                "COPILOT_PROVIDER_API_KEY",
+                "COPILOT_MODEL",
+            )),
+            "codewhale" => Ok(environment_projection_shape(
+                "CODEWHALE_BASE_URL",
+                "OPENAI_API_KEY",
+                "CODEWHALE_MODEL",
+            )),
+            "fast-agent" => Ok(environment_projection_shape(
+                "GENERIC_BASE_URL",
+                "GENERIC_API_KEY",
+                "FAST_AGENT_MODEL",
+            )),
+            "kimi" => Ok(environment_projection_shape_with_interfaces(
+                "KIMI_MODEL_BASE_URL",
+                "KIMI_MODEL_API_KEY",
+                "KIMI_MODEL_NAME",
+                vec![
+                    catalog_interface(WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, true, true),
+                    catalog_interface(WIRE_PROTOCOL_ANTHROPIC_MESSAGES, true, true),
+                ],
+            )),
+            "poolside" => Ok(environment_projection_shape(
+                "POOLSIDE_STANDALONE_BASE_URL",
+                "POOLSIDE_API_KEY",
+                "POOLSIDE_STANDALONE_MODEL",
+            )),
+            "crow-cli" => Ok(overlay_projection_shape(
+                ConfigOverlayStrategy::CrowCliYaml,
+                "VIBEX_CROW_API_KEY",
+                vec![catalog_interface(
+                    WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+                    false,
+                    true,
+                )],
+            )),
+            "dirac" => Ok(overlay_projection_shape(
+                ConfigOverlayStrategy::DiracToml,
+                "OPENAI_API_KEY",
+                vec![catalog_interface(
+                    WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+                    false,
+                    true,
+                )],
+            )),
+            "factory-droid" => Ok(overlay_projection_shape(
+                ConfigOverlayStrategy::FactoryDroidJson,
+                "VIBEX_FACTORY_DROID_API_KEY",
+                vec![
+                    catalog_interface(WIRE_PROTOCOL_OPENAI_RESPONSES, true, true),
+                    catalog_interface(WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, true, true),
+                    catalog_interface(WIRE_PROTOCOL_ANTHROPIC_MESSAGES, true, true),
+                ],
+            )),
+            "goose" => Ok(overlay_projection_shape(
+                ConfigOverlayStrategy::GooseJson,
+                "VIBEX_GOOSE_API_KEY",
+                vec![catalog_interface(
+                    WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+                    false,
+                    true,
+                )],
+            )),
+            "grok" => Ok(overlay_projection_shape(
+                ConfigOverlayStrategy::GrokToml,
+                "VIBEX_GROK_API_KEY",
+                vec![
+                    catalog_interface(WIRE_PROTOCOL_OPENAI_RESPONSES, true, true),
+                    catalog_interface(WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, true, true),
+                    catalog_interface(WIRE_PROTOCOL_ANTHROPIC_MESSAGES, true, true),
+                ],
+            )),
+            "hermes" => Ok(overlay_projection_shape(
+                ConfigOverlayStrategy::HermesYaml,
+                "VIBEX_HERMES_API_KEY",
+                vec![catalog_interface(
+                    WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+                    false,
+                    true,
+                )],
+            )),
+            "kilo" => Ok(overlay_projection_shape(
+                ConfigOverlayStrategy::KiloInlineJson,
+                "VIBEX_KILO_API_KEY",
+                vec![catalog_interface(
+                    WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+                    false,
+                    true,
+                )],
+            )),
+            "mistral-vibe" => Ok(overlay_projection_shape(
+                ConfigOverlayStrategy::MistralVibeToml,
+                "VIBEX_MISTRAL_VIBE_API_KEY",
+                vec![
+                    catalog_interface(WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, true, true),
+                    catalog_interface(WIRE_PROTOCOL_OPENAI_RESPONSES, true, true),
+                    catalog_interface(WIRE_PROTOCOL_ANTHROPIC_MESSAGES, true, true),
+                ],
+            )),
+            "pi" => Ok(overlay_projection_shape(
+                ConfigOverlayStrategy::PiModelsJson,
+                "VIBEX_PI_API_KEY",
+                vec![
+                    catalog_interface(WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, true, true),
+                    catalog_interface(WIRE_PROTOCOL_OPENAI_RESPONSES, true, true),
+                    catalog_interface(WIRE_PROTOCOL_ANTHROPIC_MESSAGES, true, true),
+                ],
+            )),
+            "qwen-code" => Ok(overlay_projection_shape(
+                ConfigOverlayStrategy::QwenCodeJson,
+                "VIBEX_QWEN_CODE_API_KEY",
+                vec![catalog_interface(
+                    WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+                    false,
+                    true,
+                )],
+            )),
+            "stakpak" => Ok(overlay_projection_shape(
+                ConfigOverlayStrategy::StakpakToml,
+                "OPENAI_API_KEY",
+                vec![catalog_interface(
+                    WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+                    false,
+                    true,
+                )],
+            )),
+            "vtcode" => Ok(overlay_projection_shape(
+                ConfigOverlayStrategy::VtcodeToml,
+                "VIBEX_VTCODE_API_KEY",
+                vec![catalog_interface(
+                    WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+                    false,
+                    true,
+                )],
             )),
             _ => conservative_replaceable_shape(agent_id),
         };
@@ -426,6 +572,24 @@ fn environment_projection_shape(
     secret_env_key: &str,
     model_env_key: &str,
 ) -> CatalogProjectionShape {
+    environment_projection_shape_with_interfaces(
+        base_url_key,
+        secret_env_key,
+        model_env_key,
+        vec![catalog_interface(
+            WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+            false,
+            true,
+        )],
+    )
+}
+
+fn environment_projection_shape_with_interfaces(
+    base_url_key: &str,
+    secret_env_key: &str,
+    model_env_key: &str,
+    model_interfaces: Vec<AgentModelInterfaceDescriptor>,
+) -> CatalogProjectionShape {
     CatalogProjectionShape {
         provider_control: AgentProviderControl::Environment {
             base_url_key: Some(base_url_key.to_string()),
@@ -438,13 +602,7 @@ fn environment_projection_shape(
             key: model_env_key.to_string(),
         },
         credential_kinds: vec![AgentCredentialKind::ApiKey],
-        model_interfaces: vec![AgentModelInterfaceDescriptor {
-            wire_protocol_id: WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
-            sdk_adapter_id: None,
-            transport: "https".to_string(),
-            user_selectable: false,
-            process_scoped: true,
-        }],
+        model_interfaces,
         runtime_home_strategy: AgentRuntimeHomeStrategy::VibexPrivate,
         switch_behavior: ProviderSwitchBehavior::RestartAndResume,
         evidence_state: ProjectionEvidenceState::Documented,
@@ -452,19 +610,50 @@ fn environment_projection_shape(
     }
 }
 
+fn overlay_projection_shape(
+    strategy: ConfigOverlayStrategy,
+    secret_env_key: &str,
+    model_interfaces: Vec<AgentModelInterfaceDescriptor>,
+) -> CatalogProjectionShape {
+    CatalogProjectionShape {
+        provider_control: AgentProviderControl::ManagedConfigOverlay {
+            strategy: strategy.clone(),
+        },
+        credential_control: AgentCredentialControl::Environment {
+            secret_env_key: secret_env_key.to_string(),
+            accepted_secret_kinds: vec![ProviderSecretKind::ApiKey],
+        },
+        model_control: AgentModelControl::ManagedConfigOverlay { strategy },
+        credential_kinds: vec![AgentCredentialKind::ApiKey],
+        model_interfaces,
+        runtime_home_strategy: AgentRuntimeHomeStrategy::VibexPrivate,
+        switch_behavior: ProviderSwitchBehavior::RestartAndResume,
+        evidence_state: ProjectionEvidenceState::Documented,
+        capability_diagnostic_code: Some("agent_projection_runtime_verification_required"),
+    }
+}
+
+fn catalog_interface(
+    wire_protocol_id: &str,
+    user_selectable: bool,
+    process_scoped: bool,
+) -> AgentModelInterfaceDescriptor {
+    AgentModelInterfaceDescriptor {
+        wire_protocol_id: wire_protocol_id.to_string(),
+        sdk_adapter_id: None,
+        transport: "https".to_string(),
+        user_selectable,
+        process_scoped,
+    }
+}
+
 fn conservative_replaceable_shape(agent_id: &str) -> VibexResult<CatalogProjectionShape> {
     let diagnostic = match agent_id {
-        "autohand" | "codewhale" | "crow-cli" | "dimcode" | "factory-droid" | "fast-agent"
-        | "kimi" | "mistral-vibe" | "qwen-code" | "stakpak" | "vtcode" => {
-            "agent_projection_typed_projector_not_implemented"
-        }
-        "cline" | "dirac" | "kilo" | "minion-code" | "nova" => {
+        "autohand" => "agent_projection_typed_projector_not_implemented",
+        "cline" | "dimcode" | "minion-code" | "nova" => {
             "agent_projection_auth_boundary_not_runtime_verified"
         }
-        "copilot" | "hermes" => "agent_projection_version_detection_required",
         "deepagents" => "agent_projection_environment_contract_not_runtime_verified",
-        "goose" => "agent_projection_acp_option_not_runtime_verified",
-        "grok" | "pi" | "poolside" => "agent_projection_mixed_auth_boundary_not_runtime_verified",
         _ => {
             return Err(VibexError::validation(
                 "agent_rollout_conservative_contract_missing",
@@ -492,7 +681,7 @@ fn catalog_manifest_entry(
     let agent_id = AgentId::parse(id)?;
     let mode = mode_for(id);
     let shape = catalog_projection_shape(id, mode)?;
-    let (version_policy, _) = catalog_version_compatibility(version, &shape);
+    let (version_policy, _) = catalog_version_compatibility(id, version, &shape);
     let entry = AgentProviderRolloutManifestEntry {
         agent_id: agent_id.clone(),
         catalog_version: version.to_string(),
@@ -618,7 +807,7 @@ pub fn catalog_projection_descriptors() -> VibexResult<Vec<AgentProviderProjecti
         let agent_id = AgentId::parse(entry.id)?;
         let mode = mode_for(entry.id);
         let shape = catalog_projection_shape(entry.id, mode)?;
-        let (_, compatibility) = catalog_version_compatibility(entry.version, &shape);
+        let (_, compatibility) = catalog_version_compatibility(entry.id, entry.version, &shape);
         result.push(AgentProviderProjectionDescriptor {
             id: descriptor_id(&agent_id),
             descriptor_version: "1".to_string(),
@@ -1398,23 +1587,46 @@ mod tests {
                 runtime_dependency_ranges: BTreeMap::new(),
             }
         );
-        for descriptor in descriptors.iter().filter(|descriptor| {
-            matches!(
-                descriptor.provider_control,
-                AgentProviderControl::Environment { .. }
-                    | AgentProviderControl::ManagedConfigOverlay { .. }
-                    | AgentProviderControl::AdvertisedSessionOption { .. }
-            ) && !matches!(
-                descriptor.compatibility,
-                AgentVersionCompatibility::ManualVersionUnverified
-            )
-        }) {
+        let typed_projectors = [
+            "copilot",
+            "codewhale",
+            "crow-cli",
+            "dirac",
+            "factory-droid",
+            "fast-agent",
+            "goose",
+            "grok",
+            "hermes",
+            "kilo",
+            "kimi",
+            "mistral-vibe",
+            "poolside",
+            "pi",
+            "qwen-code",
+            "stakpak",
+            "vtcode",
+        ];
+        let blocked_projectors = [
+            "autohand",
+            "cline",
+            "deepagents",
+            "dimcode",
+            "minion-code",
+            "nova",
+        ];
+        assert_eq!(typed_projectors.len(), 17);
+        assert_eq!(blocked_projectors.len(), 6);
+
+        for descriptor in descriptors
+            .iter()
+            .filter(|descriptor| typed_projectors.contains(&descriptor.route.agent_id.as_str()))
+        {
             assert!(
                 matches!(
                     descriptor.compatibility,
-                    AgentVersionCompatibility::SemverRange { .. }
+                    AgentVersionCompatibility::Exact { .. }
                 ),
-                "{}",
+                "{} must fail closed outside its verified catalog version",
                 descriptor.route.agent_id
             );
         }
@@ -1427,24 +1639,44 @@ mod tests {
             if matches!(
                 descriptor.route.agent_id.as_str(),
                 "codebuddy-code" | "glm-acp-agent"
-            ) {
+            ) || typed_projectors.contains(&descriptor.route.agent_id.as_str())
+            {
                 assert!(matches!(
                     descriptor.provider_control,
                     AgentProviderControl::Environment { .. }
+                        | AgentProviderControl::ManagedConfigOverlay { .. }
                 ));
                 assert!(matches!(
                     descriptor.credential_control,
                     AgentCredentialControl::Environment { .. }
                 ));
-                assert!(matches!(
-                    descriptor.model_control,
-                    AgentModelControl::ProcessEnvironment { .. }
-                ));
+                match (descriptor.provider_control, descriptor.model_control) {
+                    (
+                        AgentProviderControl::Environment { .. },
+                        AgentModelControl::ProcessEnvironment { .. },
+                    )
+                    | (
+                        AgentProviderControl::ManagedConfigOverlay { .. },
+                        AgentModelControl::ManagedConfigOverlay { .. },
+                    ) => {}
+                    (provider_control, model_control) => panic!(
+                        "provider/model projection controls must share a typed boundary: provider={provider_control:?} model={model_control:?}"
+                    ),
+                }
                 assert_eq!(
                     descriptor.evidence.state,
                     ProjectionEvidenceState::Documented
                 );
+                assert_eq!(
+                    descriptor.runtime_home_strategy,
+                    AgentRuntimeHomeStrategy::VibexPrivate
+                );
+                assert_eq!(
+                    descriptor.switch_behavior,
+                    ProviderSwitchBehavior::RestartAndResume
+                );
             } else {
+                assert!(blocked_projectors.contains(&descriptor.route.agent_id.as_str()));
                 assert_eq!(
                     descriptor.provider_control,
                     AgentProviderControl::Unverified

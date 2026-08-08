@@ -35,7 +35,8 @@ use crate::protocol::{
 };
 use crate::runtime::{
     ACP_PROBE_TIMEOUT, AcpProcess, AcpProcessLaunch, AcpProcessPurpose, AcpRuntimeClient,
-    extract_current_model_id, extract_model_ids, validate_restore_response,
+    append_projection_process_args, effective_acp_process_args, extract_current_model_id,
+    extract_model_ids, validate_restore_response,
 };
 
 const PROBE_SOURCE_REVISION: &str = "runtime-probe-v2";
@@ -431,6 +432,11 @@ impl AcpRuntimeClient {
                 )
             })?;
         let config = self.profile_config(&profile_id)?;
+        let process_args = materialized_probe_process_args(
+            profile.agent_id.as_str(),
+            &config,
+            projection_context.projection.as_ref(),
+        );
         let mut env = self.resolve_probe_config_env(&profile, &config)?;
         if let Some(projection) = &projection_context.projection {
             env.extend(projection.child_environment());
@@ -461,7 +467,7 @@ impl AcpRuntimeClient {
                         process_strategy_effective: strategy,
                         pool_fallback_reason: fallback,
                     },
-                    None,
+                    Some(process_args),
                     Some(env),
                     None,
                 ),
@@ -1350,6 +1356,18 @@ fn safe_identity_value(value: &str) -> String {
         .collect()
 }
 
+fn materialized_probe_process_args(
+    agent_id: &str,
+    config: &vibex_core::AcpProviderConfig,
+    projection: Option<&vibex_config_switch::ResolvedAgentProviderProjection>,
+) -> Vec<String> {
+    let mut args = effective_acp_process_args(config, agent_id == "opencode");
+    if let Some(projection) = projection {
+        append_projection_process_args(agent_id, &mut args, &projection.process_args);
+    }
+    args
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1357,8 +1375,9 @@ mod tests {
     use tempfile::tempdir;
     use vibex_config_switch::ResolvedAgentProviderProjection;
     use vibex_core::{
-        AGENT_RUNTIME_PROBE_SCHEMA_VERSION, AcpAdapterId, AgentId, AgentModelProviderBindingId,
-        AgentProviderProjectionDescriptorId, AgentRuntimeProbeEvidence,
+        AGENT_RUNTIME_PROBE_SCHEMA_VERSION, AcpAdapterId, AcpProcessStrategy, AcpProviderConfig,
+        AgentId, AgentModelProviderBindingId, AgentProviderProjectionDescriptorId,
+        AgentRuntimeProbeEvidence,
     };
 
     use super::*;
@@ -1423,6 +1442,7 @@ mod tests {
             secret_env: Vec::new(),
             overlay_root: PathBuf::from("probe-root"),
             overlay_files: Vec::new(),
+            process_args: Vec::new(),
             session_config: Vec::new(),
             effective_model: Some("target-model".to_string()),
             switch_behavior: ProviderSwitchBehavior::RestartAndResume,
@@ -1514,6 +1534,74 @@ mod tests {
         fs::write(root.join("overlay/config.json"), b"fixture").unwrap();
         drop(ProbeRootGuard::new(root.clone()));
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn probe_process_args_use_materialized_probe_overlay_paths() {
+        let config = AcpProviderConfig {
+            command: "fixture".to_string(),
+            args: vec!["--verbose".to_string(), "acp".to_string()],
+            env: Vec::new(),
+            cwd_template: Some("{workspaceRoot}".to_string()),
+            process_strategy: AcpProcessStrategy::PerSession,
+            terminal_tools: false,
+            terminal_auth: false,
+            models: Vec::new(),
+            modes: Vec::new(),
+            features: Vec::new(),
+            disabled_tools: Vec::new(),
+        };
+        let probe_root = PathBuf::from("probe-root")
+            .join("binding")
+            .join("workspace");
+
+        let crow_projection = ResolvedAgentProviderProjection {
+            binding_id: AgentModelProviderBindingId::new(),
+            non_secret_env: BTreeMap::new(),
+            secret_env: Vec::new(),
+            overlay_root: probe_root.clone(),
+            overlay_files: Vec::new(),
+            process_args: vec![
+                "--config-dir".to_string(),
+                probe_root.to_string_lossy().into_owned(),
+            ],
+            session_config: Vec::new(),
+            effective_model: Some("target-model".to_string()),
+            switch_behavior: ProviderSwitchBehavior::RestartAndResume,
+            fingerprint: "sha256:crow".to_string(),
+        };
+        assert_eq!(
+            materialized_probe_process_args("crow-cli", &config, Some(&crow_projection)),
+            vec![
+                "--verbose",
+                "acp",
+                "--config-dir",
+                probe_root.to_string_lossy().as_ref(),
+            ]
+        );
+
+        let stakpak_config_path = probe_root.join("stakpak.toml");
+        let stakpak_projection = ResolvedAgentProviderProjection {
+            process_args: vec![
+                "--profile".to_string(),
+                "vibex".to_string(),
+                "--config".to_string(),
+                stakpak_config_path.to_string_lossy().into_owned(),
+            ],
+            fingerprint: "sha256:stakpak".to_string(),
+            ..crow_projection
+        };
+        assert_eq!(
+            materialized_probe_process_args("stakpak", &config, Some(&stakpak_projection)),
+            vec![
+                "--verbose",
+                "--profile",
+                "vibex",
+                "--config",
+                stakpak_config_path.to_string_lossy().as_ref(),
+                "acp",
+            ]
+        );
     }
 
     #[test]

@@ -623,6 +623,18 @@ pub enum ConfigOverlayStrategy {
     StructuredJsonOverlay,
     StructuredTomlOverlay,
     StructuredYamlOverlay,
+    CrowCliYaml,
+    DiracToml,
+    FactoryDroidJson,
+    GooseJson,
+    GrokToml,
+    HermesYaml,
+    KiloInlineJson,
+    MistralVibeToml,
+    PiModelsJson,
+    QwenCodeJson,
+    StakpakToml,
+    VtcodeToml,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1266,6 +1278,12 @@ pub struct AgentProviderProjectionPlan {
     pub non_secret_env: BTreeMap<String, String>,
     pub secret_env: Vec<ProjectionSecretEnvReference>,
     pub overlay_files: Vec<ManagedProjectionOverlay>,
+    /// Optional agent-specific home override populated during materialization.
+    /// The value is an environment key, never a filesystem path.
+    pub runtime_home_env_key: Option<String>,
+    /// Relative launch-argument templates. `{projectionRoot}` is replaced
+    /// with the private binding/workspace root immediately before spawn.
+    pub process_args: Vec<String>,
     pub session_config: Vec<ProviderBindingMetadata>,
     pub effective_model: Option<String>,
     pub switch_behavior: ProviderSwitchBehavior,
@@ -1293,6 +1311,11 @@ impl fmt::Debug for AgentProviderProjectionPlan {
                     .collect::<Vec<_>>(),
             )
             .field("overlay_files", &self.overlay_files)
+            .field("runtime_home_env_key", &self.runtime_home_env_key)
+            .field(
+                "process_args",
+                &format_args!("{} args", self.process_args.len()),
+            )
             .field("session_config", &self.session_config)
             .field("effective_model", &self.effective_model)
             .field("switch_behavior", &self.switch_behavior)

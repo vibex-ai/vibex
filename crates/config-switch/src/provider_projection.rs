@@ -85,10 +85,22 @@ pub struct ResolvedAgentProviderProjection {
     pub secret_env: Vec<ResolvedProjectionSecretEnv>,
     pub overlay_root: PathBuf,
     pub overlay_files: Vec<PathBuf>,
+    pub process_args: Vec<String>,
     pub session_config: Vec<ProviderBindingMetadata>,
     pub effective_model: Option<String>,
     pub switch_behavior: ProviderSwitchBehavior,
     pub fingerprint: String,
+}
+
+/// Stable, non-secret launch identity for a legacy provider profile binding.
+/// A missing compatibility binding is represented as `None` by the service
+/// method that creates this value, so ordinary ACP profiles retain their
+/// existing environment-only launch path.
+#[derive(Clone)]
+pub struct LegacyAgentProviderProjectionRuntimePlan {
+    pub plan: AgentProviderProjectionPlan,
+    pub non_secret_env: BTreeMap<String, String>,
+    pub process_args: Vec<String>,
 }
 
 impl ResolvedAgentProviderProjection {
@@ -123,6 +135,7 @@ impl fmt::Debug for ResolvedAgentProviderProjection {
                     .collect::<Vec<_>>(),
             )
             .field("overlay_file_count", &self.overlay_files.len())
+            .field("process_arg_count", &self.process_args.len())
             .field("effective_model", &self.effective_model)
             .field("switch_behavior", &self.switch_behavior)
             .field("fingerprint", &self.fingerprint)
@@ -134,6 +147,43 @@ impl fmt::Debug for ResolvedAgentProviderProjection {
 pub struct AgentProviderProjectionEngine;
 
 impl AgentProviderProjectionEngine {
+    /// Resolve the non-secret portion of a projection without materializing
+    /// overlay files or looking up credentials. Process snapshots use this
+    /// same calculation as the eventual launch so their fingerprint remains
+    /// stable across acquisition and spawn.
+    pub fn non_secret_environment_for_plan(
+        plan: &AgentProviderProjectionPlan,
+        runtime_root: &Path,
+        workspace_key: &str,
+    ) -> VibexResult<BTreeMap<String, String>> {
+        validate_workspace_key(workspace_key)?;
+        let overlay_root = projection_overlay_root(runtime_root, &plan.binding_id, workspace_key);
+        let mut non_secret_env = plan.non_secret_env.clone();
+        if let Some(key) = plan.runtime_home_env_key.as_deref() {
+            non_secret_env.insert(
+                key.to_string(),
+                runtime_home_env_value(key, &overlay_root, &plan.overlay_files),
+            );
+        }
+        Ok(non_secret_env)
+    }
+
+    /// Resolve launch argument templates without resolving credentials or
+    /// writing files. The returned paths are deterministic for a binding and
+    /// workspace, so process snapshots and actual launches share one identity.
+    pub fn process_args_for_plan(
+        plan: &AgentProviderProjectionPlan,
+        runtime_root: &Path,
+        workspace_key: &str,
+    ) -> VibexResult<Vec<String>> {
+        validate_workspace_key(workspace_key)?;
+        let overlay_root = projection_overlay_root(runtime_root, &plan.binding_id, workspace_key);
+        Ok(process_args_for_overlay_root(
+            &plan.process_args,
+            &overlay_root,
+        ))
+    }
+
     pub fn plan(
         model_provider: &ModelProviderProfile,
         runtime: &AgentRuntimeProfile,
@@ -211,6 +261,17 @@ impl AgentProviderProjectionEngine {
             &mut session_config,
             &mut targets,
         );
+        apply_agent_projection_defaults(
+            descriptor,
+            model_provider,
+            selected_model,
+            endpoint,
+            &mut non_secret_env,
+        );
+
+        let runtime_home_env_key =
+            private_home_env_key(descriptor.route.agent_id.as_str()).map(ToOwned::to_owned);
+        let process_args = projection_process_arg_templates(descriptor.route.agent_id.as_str());
 
         if let ModelProviderProxyPolicy::Endpoint(proxy) = &model_provider.proxy_policy {
             non_secret_env.insert("HTTPS_PROXY".to_string(), proxy.clone());
@@ -253,6 +314,8 @@ impl AgentProviderProjectionEngine {
             &non_secret_env,
             &secret_env,
             &overlays,
+            runtime_home_env_key.as_deref(),
+            &process_args,
         )?;
         let overlay_previews = overlays
             .iter()
@@ -282,6 +345,8 @@ impl AgentProviderProjectionEngine {
             non_secret_env,
             secret_env,
             overlay_files: overlays,
+            runtime_home_env_key,
+            process_args,
             session_config,
             effective_model,
             switch_behavior: descriptor.switch_behavior,
@@ -330,23 +395,16 @@ impl AgentProviderProjectionEngine {
             write_private_file_atomic(&path, overlay.content.as_bytes())?;
             overlay_files.push(path);
         }
-        let mut non_secret_env = plan.non_secret_env.clone();
-        if plan
-            .overlay_files
-            .iter()
-            .any(|overlay| overlay.relative_path == "config.toml")
-        {
-            non_secret_env.insert(
-                "CODEX_HOME".to_string(),
-                overlay_root.to_string_lossy().into_owned(),
-            );
-        }
+        let non_secret_env =
+            Self::non_secret_environment_for_plan(plan, runtime_root, workspace_key)?;
+        let process_args = process_args_for_overlay_root(&plan.process_args, &overlay_root);
         Ok(ResolvedAgentProviderProjection {
             binding_id: plan.binding_id.clone(),
             non_secret_env,
             secret_env,
             overlay_root,
             overlay_files,
+            process_args,
             session_config: plan.session_config.clone(),
             effective_model: plan.effective_model.clone(),
             switch_behavior: plan.switch_behavior,
@@ -640,6 +698,40 @@ impl ProviderConfigService {
         AgentProviderProjectionEngine::resolve_and_materialize(&plan, &runtime_root, workspace_key)
     }
 
+    /// Return the projection launch identity when a legacy profile is backed
+    /// by an Agent/model-provider binding. ACP profiles that have not been
+    /// migrated into that compatibility path deliberately return `None`.
+    pub fn legacy_agent_provider_projection_runtime_plan(
+        &self,
+        provider_profile_id: &vibex_core::ProviderProfileId,
+        workspace_key: &str,
+    ) -> VibexResult<Option<LegacyAgentProviderProjectionRuntimePlan>> {
+        let plan =
+            match self.plan_legacy_agent_provider_projection(provider_profile_id, workspace_key) {
+                Ok(plan) => plan,
+                Err(error) if error.code == "agent_projection_legacy_binding_missing" => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+        let runtime_root = self.projection_runtime_root()?;
+        let non_secret_env = AgentProviderProjectionEngine::non_secret_environment_for_plan(
+            &plan,
+            &runtime_root,
+            workspace_key,
+        )?;
+        let process_args = AgentProviderProjectionEngine::process_args_for_plan(
+            &plan,
+            &runtime_root,
+            workspace_key,
+        )?;
+        Ok(Some(LegacyAgentProviderProjectionRuntimePlan {
+            plan,
+            non_secret_env,
+            process_args,
+        }))
+    }
+
     pub fn plan_legacy_agent_provider_projection(
         &self,
         provider_profile_id: &vibex_core::ProviderProfileId,
@@ -920,7 +1012,14 @@ fn project_provider_control(
             }
         }
         AgentProviderControl::ManagedConfigOverlay { strategy } => {
-            let overlay = build_overlay(strategy, provider, binding, endpoint, model)?;
+            let overlay = build_overlay(
+                strategy,
+                provider,
+                binding,
+                endpoint,
+                model,
+                descriptor_secret_env_key(descriptor),
+            )?;
             if *strategy == ConfigOverlayStrategy::OpenCodeInlineProvider {
                 env.insert(OPENCODE_CONFIG_ENV.to_string(), overlay.content.clone());
             } else if *strategy == ConfigOverlayStrategy::CodexStableHome {
@@ -937,6 +1036,8 @@ fn project_provider_control(
                     CODEX_DEFAULT_AUTH_REQUEST_ENV.to_string(),
                     CODEX_DEFAULT_API_KEY_AUTH_REQUEST.to_string(),
                 );
+            } else if let Some(key) = inline_overlay_env_key(strategy) {
+                env.insert(key.to_string(), overlay.content.clone());
             }
             targets.push(ProjectionTargetPreview {
                 field: "endpoint".to_string(),
@@ -1116,12 +1217,152 @@ fn project_model_control(
     }
 }
 
+fn descriptor_secret_env_key(descriptor: &AgentProviderProjectionDescriptor) -> Option<&str> {
+    match &descriptor.credential_control {
+        AgentCredentialControl::Environment { secret_env_key, .. } => Some(secret_env_key),
+        _ => None,
+    }
+}
+
+fn inline_overlay_env_key(strategy: &ConfigOverlayStrategy) -> Option<&'static str> {
+    match strategy {
+        ConfigOverlayStrategy::KiloInlineJson => Some("KILO_CONFIG_CONTENT"),
+        _ => None,
+    }
+}
+
+fn private_home_env_key(agent_id: &str) -> Option<&'static str> {
+    match agent_id {
+        "copilot" => Some("COPILOT_HOME"),
+        "codewhale" => Some("CODEWHALE_HOME"),
+        "codex" => Some("CODEX_HOME"),
+        "crow-cli" => None,
+        "dirac" => Some("DIRAC_DIR"),
+        "factory-droid" => Some("FACTORY_HOME_OVERRIDE"),
+        "goose" => Some("GOOSE_PATH_ROOT"),
+        "grok" => Some("GROK_HOME"),
+        "hermes" => Some("HERMES_HOME"),
+        "kilo" => None,
+        "kimi" => Some("KIMI_CODE_HOME"),
+        "mistral-vibe" => Some("VIBE_HOME"),
+        "pi" => Some("PI_CODING_AGENT_DIR"),
+        "qwen-code" => Some("QWEN_HOME"),
+        "stakpak" => None,
+        "vtcode" => Some("VTCODE_CONFIG_PATH"),
+        _ => None,
+    }
+}
+
+fn runtime_home_env_value(
+    key: &str,
+    overlay_root: &Path,
+    overlays: &[ManagedProjectionOverlay],
+) -> String {
+    if key == "VTCODE_CONFIG_PATH"
+        && overlays
+            .iter()
+            .any(|overlay| overlay.relative_path == "vtcode.toml")
+    {
+        return overlay_root
+            .join("vtcode.toml")
+            .to_string_lossy()
+            .into_owned();
+    }
+    overlay_root.to_string_lossy().into_owned()
+}
+
+fn process_args_for_overlay_root(args: &[String], overlay_root: &Path) -> Vec<String> {
+    let root = overlay_root.to_string_lossy();
+    args.iter()
+        .map(|argument| argument.replace("{projectionRoot}", &root))
+        .collect()
+}
+
+fn projection_process_arg_templates(agent_id: &str) -> Vec<String> {
+    match agent_id {
+        "crow-cli" => vec!["--config-dir".to_string(), "{projectionRoot}".to_string()],
+        "stakpak" => vec![
+            "--profile".to_string(),
+            "vibex".to_string(),
+            "--config".to_string(),
+            "{projectionRoot}/stakpak.toml".to_string(),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+fn apply_agent_projection_defaults(
+    descriptor: &AgentProviderProjectionDescriptor,
+    provider: &ModelProviderProfile,
+    model: Option<&AgentConfiguredModelBinding>,
+    endpoint: Option<&ModelProviderEndpoint>,
+    env: &mut BTreeMap<String, String>,
+) {
+    let agent_id = descriptor.route.agent_id.as_str();
+    match agent_id {
+        "codewhale" => {
+            env.insert("CODEWHALE_PROVIDER".to_string(), "openai".to_string());
+        }
+        "goose" => {
+            env.insert("GOOSE_PROVIDER".to_string(), goose_provider_id(provider));
+            env.insert(
+                "GOOSE_MODEL".to_string(),
+                projection_model_id(model)
+                    .unwrap_or("vibex-model")
+                    .to_string(),
+            );
+        }
+        "fast-agent" => {
+            if let Some(model) = projection_model_id(model) {
+                let model = model.strip_prefix("generic.").unwrap_or(model);
+                env.insert("FAST_AGENT_MODEL".to_string(), format!("generic.{model}"));
+            }
+        }
+        "kimi" => {
+            let provider_type = match projection_wire_protocol(model) {
+                vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => "anthropic",
+                _ => "openai",
+            };
+            env.insert(
+                "KIMI_MODEL_PROVIDER_TYPE".to_string(),
+                provider_type.to_string(),
+            );
+        }
+        "poolside" => {
+            if let Some(endpoint) = endpoint {
+                env.insert(
+                    "POOLSIDE_STANDALONE_BASE_URL".to_string(),
+                    normalize_poolside_base_url(&endpoint.url),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_poolside_base_url(value: &str) -> String {
+    let trimmed = value.trim().trim_end_matches('/');
+    if let Ok(mut url) = reqwest::Url::parse(trimmed) {
+        let path = url.path().trim_end_matches('/');
+        if path == "/v1" {
+            url.set_path("");
+        }
+        return url.to_string().trim_end_matches('/').to_string();
+    }
+    trimmed
+        .strip_suffix("/v1")
+        .unwrap_or(trimmed)
+        .trim_end_matches('/')
+        .to_string()
+}
+
 fn build_overlay(
     strategy: &ConfigOverlayStrategy,
     provider: &ModelProviderProfile,
     binding: &AgentModelProviderBinding,
     endpoint: Option<&ModelProviderEndpoint>,
     model: Option<&AgentConfiguredModelBinding>,
+    secret_env_key: Option<&str>,
 ) -> VibexResult<ManagedProjectionOverlay> {
     let (relative_path, format, content, contains_secret_reference) = match strategy {
         ConfigOverlayStrategy::CodexStableHome => (
@@ -1156,6 +1397,133 @@ fn build_overlay(
             "yaml",
             structured_yaml_overlay(provider, endpoint, model)?,
             false,
+        ),
+        ConfigOverlayStrategy::CrowCliYaml => (
+            "config.yaml",
+            "yaml",
+            crow_cli_overlay(
+                provider,
+                endpoint,
+                model,
+                require_secret_env_key(secret_env_key)?,
+            )?,
+            true,
+        ),
+        ConfigOverlayStrategy::DiracToml => (
+            "data/globalState.json",
+            "json",
+            dirac_overlay(provider, endpoint, model)?,
+            false,
+        ),
+        ConfigOverlayStrategy::FactoryDroidJson => (
+            "settings.json",
+            "json",
+            factory_droid_overlay(
+                provider,
+                endpoint,
+                model,
+                require_secret_env_key(secret_env_key)?,
+            )?,
+            true,
+        ),
+        ConfigOverlayStrategy::GooseJson => (
+            "config/custom_providers/vibex.json",
+            "json",
+            goose_overlay(
+                provider,
+                endpoint,
+                model,
+                require_secret_env_key(secret_env_key)?,
+            )?,
+            true,
+        ),
+        ConfigOverlayStrategy::GrokToml => (
+            "config.toml",
+            "toml",
+            grok_overlay(
+                provider,
+                endpoint,
+                model,
+                require_secret_env_key(secret_env_key)?,
+            )?,
+            true,
+        ),
+        ConfigOverlayStrategy::HermesYaml => (
+            "config.yaml",
+            "yaml",
+            hermes_overlay(
+                provider,
+                endpoint,
+                model,
+                require_secret_env_key(secret_env_key)?,
+            )?,
+            true,
+        ),
+        ConfigOverlayStrategy::KiloInlineJson => (
+            "kilo.json",
+            "json",
+            kilo_overlay(
+                provider,
+                endpoint,
+                model,
+                require_secret_env_key(secret_env_key)?,
+            )?,
+            true,
+        ),
+        ConfigOverlayStrategy::MistralVibeToml => (
+            "config.toml",
+            "toml",
+            mistral_vibe_overlay(
+                provider,
+                endpoint,
+                model,
+                require_secret_env_key(secret_env_key)?,
+            )?,
+            true,
+        ),
+        ConfigOverlayStrategy::PiModelsJson => (
+            "models.json",
+            "json",
+            pi_overlay(
+                provider,
+                endpoint,
+                model,
+                require_secret_env_key(secret_env_key)?,
+            )?,
+            true,
+        ),
+        ConfigOverlayStrategy::QwenCodeJson => (
+            "settings.json",
+            "json",
+            qwen_code_overlay(
+                provider,
+                endpoint,
+                model,
+                require_secret_env_key(secret_env_key)?,
+            )?,
+            true,
+        ),
+        ConfigOverlayStrategy::StakpakToml => (
+            "stakpak.toml",
+            "toml",
+            stakpak_overlay(
+                provider,
+                endpoint,
+                model,
+                require_secret_env_key(secret_env_key)?,
+            )?,
+            false,
+        ),
+        ConfigOverlayStrategy::VtcodeToml => (
+            "vtcode.toml",
+            "toml",
+            vtcode_overlay(
+                provider,
+                endpoint,
+                model,
+                require_secret_env_key(secret_env_key)?,
+            )?,
+            true,
         ),
         ConfigOverlayStrategy::ClaudeEnvironment
         | ConfigOverlayStrategy::GenericEnvironmentDescriptor => {
@@ -1336,6 +1704,539 @@ fn opencode_provider_identity<'a>(
     (provider_id, npm)
 }
 
+fn require_secret_env_key(key: Option<&str>) -> VibexResult<&str> {
+    key.map(str::trim)
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| {
+            VibexError::validation(
+                "agent_projection_secret_env_key_missing",
+                "typed Agent overlay is missing its code-owned Secret environment key",
+            )
+        })
+}
+
+fn projection_model_id(model: Option<&AgentConfiguredModelBinding>) -> Option<&str> {
+    model
+        .map(|model| model.agent_model_id.trim())
+        .filter(|model| !model.is_empty())
+}
+
+fn projection_wire_protocol(model: Option<&AgentConfiguredModelBinding>) -> &str {
+    model
+        .map(|model| model.wire_protocol_id.as_str())
+        .unwrap_or(vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS)
+}
+
+fn wire_style(model: Option<&AgentConfiguredModelBinding>) -> &'static str {
+    match projection_wire_protocol(model) {
+        vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES => "responses",
+        vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => "messages",
+        _ => "chat_completions",
+    }
+}
+
+fn grok_api_backend(model: Option<&AgentConfiguredModelBinding>) -> &'static str {
+    match projection_wire_protocol(model) {
+        vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES => "responses",
+        vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => "messages",
+        _ => "chat_completions",
+    }
+}
+
+fn mistral_vibe_api_style(model: Option<&AgentConfiguredModelBinding>) -> &'static str {
+    match projection_wire_protocol(model) {
+        vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES => "openai-responses",
+        vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => "anthropic",
+        _ => "openai",
+    }
+}
+
+fn pi_api_kind(model: Option<&AgentConfiguredModelBinding>) -> &'static str {
+    match projection_wire_protocol(model) {
+        vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES => "openai-responses",
+        vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => "anthropic-messages",
+        _ => "openai-completions",
+    }
+}
+
+fn factory_droid_provider_kind(model: Option<&AgentConfiguredModelBinding>) -> &'static str {
+    match projection_wire_protocol(model) {
+        vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES => "openai",
+        vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => "anthropic",
+        _ => "generic-chat-completion-api",
+    }
+}
+
+fn json_string_if_present(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: Option<&str>,
+) {
+    if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+        object.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
+}
+
+fn serialized_json(value: serde_json::Value) -> VibexResult<String> {
+    serde_json::to_string(&value).map_err(encode_error)
+}
+
+fn serialized_toml(value: serde_json::Value) -> VibexResult<String> {
+    toml::to_string(&value).map_err(|error| {
+        VibexError::validation(
+            "agent_projection_overlay_encode_failed",
+            "typed Agent TOML overlay could not be encoded",
+        )
+        .with_diagnostic("format", "toml")
+        .with_diagnostic("error", error.to_string())
+    })
+}
+
+fn serialized_yaml(value: serde_json::Value) -> VibexResult<String> {
+    serde_yaml::to_string(&value).map_err(|error| {
+        VibexError::validation(
+            "agent_projection_overlay_encode_failed",
+            "typed Agent YAML overlay could not be encoded",
+        )
+        .with_diagnostic("format", "yaml")
+        .with_diagnostic("error", error.to_string())
+    })
+}
+
+fn crow_cli_overlay(
+    provider: &ModelProviderProfile,
+    endpoint: Option<&ModelProviderEndpoint>,
+    model: Option<&AgentConfiguredModelBinding>,
+    secret_env_key: &str,
+) -> VibexResult<String> {
+    let provider_id = sanitize_provider_id(
+        provider
+            .vendor_hint
+            .as_deref()
+            .unwrap_or_else(|| provider.id.as_str()),
+    );
+    let mut provider_config = serde_json::Map::new();
+    provider_config.insert(
+        "base_url".to_string(),
+        endpoint.map_or(serde_json::Value::Null, |endpoint| {
+            serde_json::Value::String(endpoint.url.clone())
+        }),
+    );
+    provider_config.insert(
+        "api_key".to_string(),
+        serde_json::Value::String(format!("${{{secret_env_key}}}")),
+    );
+    let mut providers = serde_json::Map::new();
+    providers.insert(
+        provider_id.clone(),
+        serde_json::Value::Object(provider_config),
+    );
+    let model_id = projection_model_id(model).unwrap_or("vibex-model");
+    let mut models = serde_json::Map::new();
+    models.insert(
+        model_id.to_string(),
+        serde_json::json!({"provider": provider_id, "model": model_id}),
+    );
+    serialized_yaml(serde_json::json!({
+        "providers": providers,
+        "models": models,
+    }))
+}
+
+fn dirac_overlay(
+    _provider: &ModelProviderProfile,
+    endpoint: Option<&ModelProviderEndpoint>,
+    model: Option<&AgentConfiguredModelBinding>,
+) -> VibexResult<String> {
+    let endpoint = endpoint.map(|endpoint| endpoint.url.as_str()).unwrap_or("");
+    let model_id = projection_model_id(model).unwrap_or("vibex-model");
+    serialized_json(serde_json::json!({
+        "actModeApiProvider": "openai",
+        "planModeApiProvider": "openai",
+        "openAiBaseUrl": endpoint,
+        "actModeOpenAiModelId": model_id,
+        "planModeOpenAiModelId": model_id,
+    }))
+}
+
+fn factory_droid_overlay(
+    provider: &ModelProviderProfile,
+    endpoint: Option<&ModelProviderEndpoint>,
+    model: Option<&AgentConfiguredModelBinding>,
+    secret_env_key: &str,
+) -> VibexResult<String> {
+    let model_id = projection_model_id(model).unwrap_or("vibex-model");
+    let custom_id = sanitize_provider_id(&format!(
+        "vibex-{}-{model_id}",
+        provider
+            .vendor_hint
+            .as_deref()
+            .unwrap_or_else(|| provider.id.as_str())
+    ));
+    let mut custom = serde_json::Map::new();
+    custom.insert("id".to_string(), serde_json::json!(custom_id));
+    custom.insert("model".to_string(), serde_json::json!(model_id));
+    json_string_if_present(
+        &mut custom,
+        "baseUrl",
+        endpoint.map(|endpoint| endpoint.url.as_str()),
+    );
+    custom.insert(
+        "provider".to_string(),
+        serde_json::json!(factory_droid_provider_kind(model)),
+    );
+    custom.insert(
+        "apiKey".to_string(),
+        serde_json::json!(format!("${{{secret_env_key}}}")),
+    );
+    serialized_json(serde_json::json!({
+        "customModels": [custom],
+        "model": format!("custom:{custom_id}"),
+    }))
+}
+
+fn goose_overlay(
+    provider: &ModelProviderProfile,
+    endpoint: Option<&ModelProviderEndpoint>,
+    model: Option<&AgentConfiguredModelBinding>,
+    secret_env_key: &str,
+) -> VibexResult<String> {
+    let provider_id = goose_provider_id(provider);
+    let model_id = projection_model_id(model).unwrap_or("vibex-model");
+    let mut root = serde_json::Map::new();
+    root.insert("name".to_string(), serde_json::json!(provider_id));
+    root.insert("engine".to_string(), serde_json::json!("openai"));
+    root.insert(
+        "display_name".to_string(),
+        serde_json::json!(provider.display_name),
+    );
+    root.insert("api_key_env".to_string(), serde_json::json!(secret_env_key));
+    json_string_if_present(
+        &mut root,
+        "base_url",
+        endpoint.map(|endpoint| endpoint.url.as_str()),
+    );
+    root.insert(
+        "models".to_string(),
+        serde_json::json!([{
+            "name": model_id,
+            "context_limit": 128000,
+        }]),
+    );
+    root.insert("supports_streaming".to_string(), serde_json::json!(true));
+    root.insert("requires_auth".to_string(), serde_json::json!(true));
+    serialized_json(serde_json::Value::Object(root))
+}
+
+fn grok_overlay(
+    provider: &ModelProviderProfile,
+    endpoint: Option<&ModelProviderEndpoint>,
+    model: Option<&AgentConfiguredModelBinding>,
+    secret_env_key: &str,
+) -> VibexResult<String> {
+    let model_id = projection_model_id(model).unwrap_or("vibex-model");
+    let mut config = serde_json::Map::new();
+    config.insert("model".to_string(), serde_json::json!(model_id));
+    json_string_if_present(
+        &mut config,
+        "base_url",
+        endpoint.map(|endpoint| endpoint.url.as_str()),
+    );
+    config.insert("name".to_string(), serde_json::json!(provider.display_name));
+    config.insert("env_key".to_string(), serde_json::json!(secret_env_key));
+    config.insert(
+        "api_backend".to_string(),
+        serde_json::json!(grok_api_backend(model)),
+    );
+    config.insert(
+        "auth_scheme".to_string(),
+        serde_json::json!(if projection_wire_protocol(model)
+            == vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES
+        {
+            "x_api_key"
+        } else {
+            "bearer"
+        }),
+    );
+    serialized_toml(serde_json::json!({
+        "model": {model_id: config},
+        "models": {"default": model_id},
+    }))
+}
+
+fn goose_provider_id(provider: &ModelProviderProfile) -> String {
+    sanitize_provider_id(
+        provider
+            .vendor_hint
+            .as_deref()
+            .unwrap_or_else(|| provider.id.as_str()),
+    )
+}
+
+fn hermes_overlay(
+    provider: &ModelProviderProfile,
+    endpoint: Option<&ModelProviderEndpoint>,
+    model: Option<&AgentConfiguredModelBinding>,
+    secret_env_key: &str,
+) -> VibexResult<String> {
+    let model_id = projection_model_id(model).unwrap_or("vibex-model");
+    let provider_id = "vibex";
+    let mut provider_config = serde_json::Map::new();
+    json_string_if_present(
+        &mut provider_config,
+        "base_url",
+        endpoint.map(|endpoint| endpoint.url.as_str()),
+    );
+    json_string_if_present(
+        &mut provider_config,
+        "name",
+        Some(provider.display_name.as_str()),
+    );
+    json_string_if_present(&mut provider_config, "key_env", Some(secret_env_key));
+    json_string_if_present(&mut provider_config, "model", Some(model_id));
+    json_string_if_present(&mut provider_config, "default_model", Some(model_id));
+    json_string_if_present(&mut provider_config, "transport", Some(wire_style(model)));
+    provider_config.insert(
+        "models".to_string(),
+        serde_json::json!({model_id: {"context_length": 128000}}),
+    );
+    serialized_yaml(serde_json::json!({
+        "providers": {provider_id: provider_config},
+        "model": {"provider": provider_id, "default": model_id},
+    }))
+}
+
+fn kilo_overlay(
+    provider: &ModelProviderProfile,
+    endpoint: Option<&ModelProviderEndpoint>,
+    model: Option<&AgentConfiguredModelBinding>,
+    secret_env_key: &str,
+) -> VibexResult<String> {
+    let model_id = projection_model_id(model).unwrap_or("vibex-model");
+    let provider_id = sanitize_provider_id(
+        provider
+            .vendor_hint
+            .as_deref()
+            .unwrap_or_else(|| provider.id.as_str()),
+    );
+    let mut options = serde_json::Map::new();
+    json_string_if_present(
+        &mut options,
+        "baseURL",
+        endpoint.map(|endpoint| endpoint.url.as_str()),
+    );
+    options.insert(
+        "apiKey".to_string(),
+        serde_json::json!(format!("{{env:{secret_env_key}}}")),
+    );
+    let mut model_provider = serde_json::Map::new();
+    model_provider.insert(
+        "npm".to_string(),
+        serde_json::json!("@ai-sdk/openai-compatible"),
+    );
+    json_string_if_present(
+        &mut model_provider,
+        "api",
+        endpoint.map(|endpoint| endpoint.url.as_str()),
+    );
+    let mut models = serde_json::Map::new();
+    models.insert(
+        model_id.to_string(),
+        serde_json::json!({
+            "name": model_id,
+            "provider": model_provider,
+        }),
+    );
+    let mut entry = serde_json::Map::new();
+    entry.insert("name".to_string(), serde_json::json!(provider.display_name));
+    entry.insert("options".to_string(), serde_json::Value::Object(options));
+    entry.insert("models".to_string(), serde_json::Value::Object(models));
+    serialized_json(serde_json::json!({
+        "provider": {provider_id.clone(): entry},
+        "model": format!("{provider_id}/{model_id}"),
+    }))
+}
+
+fn mistral_vibe_overlay(
+    provider: &ModelProviderProfile,
+    endpoint: Option<&ModelProviderEndpoint>,
+    model: Option<&AgentConfiguredModelBinding>,
+    secret_env_key: &str,
+) -> VibexResult<String> {
+    let provider_id = sanitize_provider_id(
+        provider
+            .vendor_hint
+            .as_deref()
+            .unwrap_or_else(|| provider.id.as_str()),
+    );
+    let model_id = projection_model_id(model).unwrap_or("vibex-model");
+    let mut provider_config = serde_json::Map::new();
+    provider_config.insert("name".to_string(), serde_json::json!(provider_id));
+    json_string_if_present(
+        &mut provider_config,
+        "api_base",
+        endpoint.map(|endpoint| endpoint.url.as_str()),
+    );
+    provider_config.insert(
+        "api_key_env_var".to_string(),
+        serde_json::json!(secret_env_key),
+    );
+    provider_config.insert(
+        "api_style".to_string(),
+        serde_json::json!(mistral_vibe_api_style(model)),
+    );
+    provider_config.insert("backend".to_string(), serde_json::json!("generic"));
+    let model_config = serde_json::json!({
+        "name": model_id,
+        "provider": provider_id,
+        "alias": model_id,
+    });
+    serialized_toml(serde_json::json!({
+        "active_model": model_id,
+        "providers": [provider_config],
+        "models": [model_config],
+    }))
+}
+
+fn pi_overlay(
+    provider: &ModelProviderProfile,
+    endpoint: Option<&ModelProviderEndpoint>,
+    model: Option<&AgentConfiguredModelBinding>,
+    secret_env_key: &str,
+) -> VibexResult<String> {
+    let model_id = projection_model_id(model).unwrap_or("vibex-model");
+    let provider_id = sanitize_provider_id(
+        provider
+            .vendor_hint
+            .as_deref()
+            .unwrap_or_else(|| provider.id.as_str()),
+    );
+    let mut entry = serde_json::Map::new();
+    json_string_if_present(
+        &mut entry,
+        "baseUrl",
+        endpoint.map(|endpoint| endpoint.url.as_str()),
+    );
+    entry.insert(
+        "apiKey".to_string(),
+        serde_json::json!(format!("${secret_env_key}")),
+    );
+    entry.insert("api".to_string(), serde_json::json!(pi_api_kind(model)));
+    entry.insert(
+        "models".to_string(),
+        serde_json::json!([{
+            "id": model_id,
+            "name": model_id,
+            "reasoning": false,
+            "input": ["text"],
+            "contextWindow": 128000,
+            "maxTokens": 16384,
+            "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+            },
+        }]),
+    );
+    serialized_json(serde_json::json!({
+        "providers": {provider_id: entry},
+    }))
+}
+
+fn qwen_code_overlay(
+    _provider: &ModelProviderProfile,
+    endpoint: Option<&ModelProviderEndpoint>,
+    model: Option<&AgentConfiguredModelBinding>,
+    secret_env_key: &str,
+) -> VibexResult<String> {
+    let model_id = projection_model_id(model).unwrap_or("vibex-model");
+    let mut entry = serde_json::Map::new();
+    entry.insert("id".to_string(), serde_json::json!(model_id));
+    entry.insert("name".to_string(), serde_json::json!(model_id));
+    json_string_if_present(
+        &mut entry,
+        "baseUrl",
+        endpoint.map(|endpoint| endpoint.url.as_str()),
+    );
+    entry.insert("envKey".to_string(), serde_json::json!(secret_env_key));
+    serialized_json(serde_json::json!({
+        "modelProviders": {"openai": [entry]},
+        "security": {"auth": {"selectedType": "openai"}},
+        "model": {"name": model_id},
+    }))
+}
+
+fn stakpak_overlay(
+    _provider: &ModelProviderProfile,
+    endpoint: Option<&ModelProviderEndpoint>,
+    model: Option<&AgentConfiguredModelBinding>,
+    secret_env_key: &str,
+) -> VibexResult<String> {
+    let model_id = projection_model_id(model).unwrap_or("vibex-model");
+    let provider_id = "openai";
+    let mut provider = serde_json::Map::new();
+    provider.insert("type".to_string(), serde_json::json!("openai"));
+    json_string_if_present(
+        &mut provider,
+        "api_endpoint",
+        endpoint.map(|endpoint| endpoint.url.as_str()),
+    );
+    let mut profile = serde_json::Map::new();
+    profile.insert("provider".to_string(), serde_json::json!("local"));
+    profile.insert(
+        "model".to_string(),
+        serde_json::json!(format!("{provider_id}/{model_id}")),
+    );
+    profile.insert(
+        "providers".to_string(),
+        serde_json::json!({provider_id: provider}),
+    );
+    let _ = secret_env_key;
+    serialized_toml(serde_json::json!({
+        "profiles": {"vibex": profile},
+    }))
+}
+
+fn vtcode_overlay(
+    provider: &ModelProviderProfile,
+    endpoint: Option<&ModelProviderEndpoint>,
+    model: Option<&AgentConfiguredModelBinding>,
+    secret_env_key: &str,
+) -> VibexResult<String> {
+    let model_id = projection_model_id(model).unwrap_or("vibex-model");
+    let provider_id = sanitize_provider_id(&format!(
+        "vibex-{}",
+        provider
+            .vendor_hint
+            .as_deref()
+            .unwrap_or_else(|| provider.id.as_str())
+    ));
+    let mut entry = serde_json::Map::new();
+    entry.insert("name".to_string(), serde_json::json!(provider_id));
+    entry.insert(
+        "display_name".to_string(),
+        serde_json::json!(provider.display_name),
+    );
+    json_string_if_present(
+        &mut entry,
+        "base_url",
+        endpoint.map(|endpoint| endpoint.url.as_str()),
+    );
+    entry.insert("model".to_string(), serde_json::json!(model_id));
+    entry.insert("api_key_env".to_string(), serde_json::json!(secret_env_key));
+    serialized_toml(serde_json::json!({
+        "agent": {
+            "provider": provider_id,
+            "default_model": model_id,
+        },
+        "custom_providers": [entry],
+    }))
+}
+
 fn structured_map(
     provider: &ModelProviderProfile,
     endpoint: Option<&ModelProviderEndpoint>,
@@ -1403,6 +2304,8 @@ fn projection_fingerprint(
     env: &BTreeMap<String, String>,
     secrets: &[ProjectionSecretEnvReference],
     overlays: &[ManagedProjectionOverlay],
+    runtime_home_env_key: Option<&str>,
+    process_args: &[String],
 ) -> VibexResult<String> {
     let process_model = model.filter(|model| {
         model.process_scoped
@@ -1453,6 +2356,8 @@ fn projection_fingerprint(
         "command": runtime.command,
         "args": runtime.args,
         "safeEnvReferences": runtime.safe_env_references,
+        "runtimeHomeEnvKey": runtime_home_env_key,
+        "processArgs": process_args,
         "providerId": provider.id,
         "providerStatus": provider.status,
         "endpoint": selected_endpoint(provider, binding)?.map(|value| &value.url),
@@ -1889,7 +2794,7 @@ fn sanitize_provider_id(value: &str) -> String {
             break;
         }
     }
-    let output = output.trim_matches('-');
+    let output = output.trim_matches(['-', '_']);
     if output.is_empty() {
         "vibex".to_string()
     } else {
@@ -1931,8 +2836,9 @@ mod tests {
         AgentProviderProjectionOverrides, AgentRuntimeHomeStrategy, AgentRuntimeResourcePolicy,
         AgentRuntimeRouteKey, AgentRuntimeVersionIdentity, AgentVersionCompatibility,
         AgentVersionSource, ModelProviderCatalogEntry, ModelProviderEndpointKind,
-        ModelProviderProfileStatus, ProjectionEvidenceReference, ProviderNetworkDefaults,
-        ProviderPermissionDefaults, ProviderSandboxDefaults, ProviderSecretKind, TransportKind,
+        ModelProviderProfileStatus, ProjectionEvidenceReference, ProjectionSecretReference,
+        ProviderNetworkDefaults, ProviderPermissionDefaults, ProviderSandboxDefaults,
+        ProviderSecretKind, ProviderSecretSetupState, TransportKind,
         WIRE_PROTOCOL_OPENAI_RESPONSES,
     };
 
@@ -2063,6 +2969,705 @@ mod tests {
             deleted_at_ms: None,
         };
         (provider, runtime, binding, descriptor)
+    }
+
+    const TYPED_SECRET_LOOKUP: &str = "opaque-typed-projection-secret";
+    const TYPED_SECRET_SENTINEL: &str = "typed-projection-secret-must-not-leak";
+
+    #[derive(Debug, Clone, Copy)]
+    struct TypedProjectionExpectation {
+        agent_id: &'static str,
+        base_url_key: Option<&'static str>,
+        secret_env_key: &'static str,
+        model_env_key: Option<&'static str>,
+        overlay_path: Option<&'static str>,
+        overlay_format: Option<&'static str>,
+        runtime_home_env_key: Option<&'static str>,
+    }
+
+    fn typed_projection_expectations() -> [TypedProjectionExpectation; 17] {
+        [
+            TypedProjectionExpectation {
+                agent_id: "copilot",
+                base_url_key: Some("COPILOT_PROVIDER_BASE_URL"),
+                secret_env_key: "COPILOT_PROVIDER_API_KEY",
+                model_env_key: Some("COPILOT_MODEL"),
+                overlay_path: None,
+                overlay_format: None,
+                runtime_home_env_key: Some("COPILOT_HOME"),
+            },
+            TypedProjectionExpectation {
+                agent_id: "codewhale",
+                base_url_key: Some("CODEWHALE_BASE_URL"),
+                secret_env_key: "OPENAI_API_KEY",
+                model_env_key: Some("CODEWHALE_MODEL"),
+                overlay_path: None,
+                overlay_format: None,
+                runtime_home_env_key: Some("CODEWHALE_HOME"),
+            },
+            TypedProjectionExpectation {
+                agent_id: "crow-cli",
+                base_url_key: None,
+                secret_env_key: "VIBEX_CROW_API_KEY",
+                model_env_key: None,
+                overlay_path: Some("config.yaml"),
+                overlay_format: Some("yaml"),
+                runtime_home_env_key: None,
+            },
+            TypedProjectionExpectation {
+                agent_id: "dirac",
+                base_url_key: None,
+                secret_env_key: "OPENAI_API_KEY",
+                model_env_key: None,
+                overlay_path: Some("data/globalState.json"),
+                overlay_format: Some("json"),
+                runtime_home_env_key: Some("DIRAC_DIR"),
+            },
+            TypedProjectionExpectation {
+                agent_id: "factory-droid",
+                base_url_key: None,
+                secret_env_key: "VIBEX_FACTORY_DROID_API_KEY",
+                model_env_key: None,
+                overlay_path: Some("settings.json"),
+                overlay_format: Some("json"),
+                runtime_home_env_key: Some("FACTORY_HOME_OVERRIDE"),
+            },
+            TypedProjectionExpectation {
+                agent_id: "fast-agent",
+                base_url_key: Some("GENERIC_BASE_URL"),
+                secret_env_key: "GENERIC_API_KEY",
+                model_env_key: Some("FAST_AGENT_MODEL"),
+                overlay_path: None,
+                overlay_format: None,
+                runtime_home_env_key: None,
+            },
+            TypedProjectionExpectation {
+                agent_id: "goose",
+                base_url_key: None,
+                secret_env_key: "VIBEX_GOOSE_API_KEY",
+                model_env_key: None,
+                overlay_path: Some("config/custom_providers/vibex.json"),
+                overlay_format: Some("json"),
+                runtime_home_env_key: Some("GOOSE_PATH_ROOT"),
+            },
+            TypedProjectionExpectation {
+                agent_id: "grok",
+                base_url_key: None,
+                secret_env_key: "VIBEX_GROK_API_KEY",
+                model_env_key: None,
+                overlay_path: Some("config.toml"),
+                overlay_format: Some("toml"),
+                runtime_home_env_key: Some("GROK_HOME"),
+            },
+            TypedProjectionExpectation {
+                agent_id: "hermes",
+                base_url_key: None,
+                secret_env_key: "VIBEX_HERMES_API_KEY",
+                model_env_key: None,
+                overlay_path: Some("config.yaml"),
+                overlay_format: Some("yaml"),
+                runtime_home_env_key: Some("HERMES_HOME"),
+            },
+            TypedProjectionExpectation {
+                agent_id: "kilo",
+                base_url_key: None,
+                secret_env_key: "VIBEX_KILO_API_KEY",
+                model_env_key: None,
+                overlay_path: Some("kilo.json"),
+                overlay_format: Some("json"),
+                runtime_home_env_key: None,
+            },
+            TypedProjectionExpectation {
+                agent_id: "kimi",
+                base_url_key: Some("KIMI_MODEL_BASE_URL"),
+                secret_env_key: "KIMI_MODEL_API_KEY",
+                model_env_key: Some("KIMI_MODEL_NAME"),
+                overlay_path: None,
+                overlay_format: None,
+                runtime_home_env_key: Some("KIMI_CODE_HOME"),
+            },
+            TypedProjectionExpectation {
+                agent_id: "mistral-vibe",
+                base_url_key: None,
+                secret_env_key: "VIBEX_MISTRAL_VIBE_API_KEY",
+                model_env_key: None,
+                overlay_path: Some("config.toml"),
+                overlay_format: Some("toml"),
+                runtime_home_env_key: Some("VIBE_HOME"),
+            },
+            TypedProjectionExpectation {
+                agent_id: "poolside",
+                base_url_key: Some("POOLSIDE_STANDALONE_BASE_URL"),
+                secret_env_key: "POOLSIDE_API_KEY",
+                model_env_key: Some("POOLSIDE_STANDALONE_MODEL"),
+                overlay_path: None,
+                overlay_format: None,
+                runtime_home_env_key: None,
+            },
+            TypedProjectionExpectation {
+                agent_id: "pi",
+                base_url_key: None,
+                secret_env_key: "VIBEX_PI_API_KEY",
+                model_env_key: None,
+                overlay_path: Some("models.json"),
+                overlay_format: Some("json"),
+                runtime_home_env_key: Some("PI_CODING_AGENT_DIR"),
+            },
+            TypedProjectionExpectation {
+                agent_id: "qwen-code",
+                base_url_key: None,
+                secret_env_key: "VIBEX_QWEN_CODE_API_KEY",
+                model_env_key: None,
+                overlay_path: Some("settings.json"),
+                overlay_format: Some("json"),
+                runtime_home_env_key: Some("QWEN_HOME"),
+            },
+            TypedProjectionExpectation {
+                agent_id: "stakpak",
+                base_url_key: None,
+                secret_env_key: "OPENAI_API_KEY",
+                model_env_key: None,
+                overlay_path: Some("stakpak.toml"),
+                overlay_format: Some("toml"),
+                runtime_home_env_key: None,
+            },
+            TypedProjectionExpectation {
+                agent_id: "vtcode",
+                base_url_key: None,
+                secret_env_key: "VIBEX_VTCODE_API_KEY",
+                model_env_key: None,
+                overlay_path: Some("vtcode.toml"),
+                overlay_format: Some("toml"),
+                runtime_home_env_key: Some("VTCODE_CONFIG_PATH"),
+            },
+        ]
+    }
+
+    fn typed_projection_fixture(
+        descriptor: &AgentProviderProjectionDescriptor,
+    ) -> (
+        ModelProviderProfile,
+        AgentRuntimeProfile,
+        AgentModelProviderBinding,
+    ) {
+        let now = 1;
+        let provider_id = ModelProviderProfileId::new();
+        let runtime_id = AgentRuntimeProfileId::new();
+        let credential_id = RequestId::new();
+        let interface = descriptor
+            .model_interfaces
+            .first()
+            .expect("typed projector has a model interface");
+        let provider = ModelProviderProfile {
+            id: provider_id.clone(),
+            legacy_provider_profile_id: None,
+            display_name: "Matrix Provider".to_string(),
+            vendor_hint: Some("matrix-provider".to_string()),
+            endpoints: vec![ModelProviderEndpoint {
+                id: "api".to_string(),
+                kind: ModelProviderEndpointKind::Api,
+                url: "https://provider.example.invalid/v1/".to_string(),
+            }],
+            proxy_policy: ModelProviderProxyPolicy::InheritSystem,
+            credentials: vec![ModelProviderCredentialReference {
+                id: credential_id.clone(),
+                display_name: "Matrix API key".to_string(),
+                status: AgentCredentialStatus::Referenced,
+                credential: AgentCredential::ApiKey {
+                    secret: ProjectionSecretReference {
+                        id: credential_id,
+                        backend: ProviderSecretBackend::Placeholder,
+                        setup_state: ProviderSecretSetupState::Missing,
+                        lookup_key: TYPED_SECRET_LOOKUP.to_string(),
+                        redacted_hint: "configured".to_string(),
+                        revision: 7,
+                        legacy_secret_reference_id: None,
+                    },
+                    target_hint: Some(interface.wire_protocol_id.clone()),
+                },
+                revision: 1,
+            }],
+            configured_models: vec![ModelProviderCatalogEntry {
+                id: "provider-model".to_string(),
+                display_name: Some("Matrix Model".to_string()),
+                enabled: true,
+                metadata: Vec::new(),
+            }],
+            default_model_id: Some("provider-model".to_string()),
+            headers: Vec::new(),
+            status: ModelProviderProfileStatus::Enabled,
+            revision: 1,
+            created_at_ms: now,
+            updated_at_ms: now,
+            deleted_at_ms: None,
+        };
+        let runtime = AgentRuntimeProfile {
+            id: runtime_id.clone(),
+            legacy_provider_profile_id: None,
+            version_identity: AgentRuntimeVersionIdentity {
+                route: descriptor.route.clone(),
+                adapter_version: Some("1.0.0".to_string()),
+                agent_version: Some("1.0.0".to_string()),
+                runtime_dependencies: BTreeMap::new(),
+                source: AgentVersionSource::Detected,
+            },
+            command: format!("/managed/{}", descriptor.route.agent_id),
+            args: vec!["acp".to_string()],
+            safe_env_references: Vec::new(),
+            cwd_template: Some("{workspaceRoot}".to_string()),
+            process_strategy: AcpProcessStrategy::PerSession,
+            runtime_home_strategy: descriptor.runtime_home_strategy.clone(),
+            host_capabilities: AgentHostCapabilities::default(),
+            resource_policy: AgentRuntimeResourcePolicy {
+                sandbox: ProviderSandboxDefaults::workspace_write_ask_on_risk(),
+                network: ProviderNetworkDefaults::local_default(),
+                permissions: ProviderPermissionDefaults::ask_on_risk(),
+            },
+            revision: 1,
+            created_at_ms: now,
+            updated_at_ms: now,
+            deleted_at_ms: None,
+        };
+        let binding = AgentModelProviderBinding {
+            id: vibex_core::AgentModelProviderBindingId::new(),
+            legacy_provider_profile_id: None,
+            agent_id: descriptor.route.agent_id.clone(),
+            runtime_profile_id: runtime_id,
+            model_provider_profile_id: provider_id,
+            projection_descriptor_id: descriptor.id.clone(),
+            projection_overrides: AgentProviderProjectionOverrides::default(),
+            configured_models: vec![AgentConfiguredModelBinding {
+                id: AgentConfiguredModelBindingId::new(),
+                provider_model_id: "provider-model".to_string(),
+                agent_model_id: "agent-model".to_string(),
+                wire_protocol_id: interface.wire_protocol_id.clone(),
+                sdk_adapter_id: interface.sdk_adapter_id.clone(),
+                deployment: None,
+                enabled: true,
+                process_scoped: interface.process_scoped,
+            }],
+            projection_fingerprint: None,
+            status: AgentModelProviderBindingStatus::Ready,
+            verification: ProjectionVerificationState {
+                state: descriptor.evidence.state,
+                descriptor_version: descriptor.descriptor_version.clone(),
+                source_evidence_reference: descriptor.evidence.source_reference.clone(),
+                runtime_evidence_reference: descriptor.evidence.runtime_reference.clone(),
+                verified_at_ms: None,
+            },
+            revision: 1,
+            created_at_ms: now,
+            updated_at_ms: now,
+            deleted_at_ms: None,
+        };
+        (provider, runtime, binding)
+    }
+
+    fn assert_overlay_schema(agent_id: &str, overlay: &ManagedProjectionOverlay) {
+        match overlay.format.as_str() {
+            "json" => {
+                let value: serde_json::Value = serde_json::from_str(&overlay.content).unwrap();
+                assert!(
+                    value.is_object(),
+                    "{agent_id} JSON overlay must be an object"
+                );
+            }
+            "toml" => {
+                let value: toml::Value = toml::from_str(&overlay.content).unwrap();
+                assert!(value.is_table(), "{agent_id} TOML overlay must be a table");
+            }
+            "yaml" => {
+                let value: serde_yaml::Value = serde_yaml::from_str(&overlay.content).unwrap();
+                assert!(
+                    value.is_mapping(),
+                    "{agent_id} YAML overlay must be a mapping"
+                );
+            }
+            format => panic!("unexpected typed overlay format {format}"),
+        }
+        assert!(!overlay.content.contains(TYPED_SECRET_LOOKUP));
+        assert!(!overlay.content.contains(TYPED_SECRET_SENTINEL));
+    }
+
+    fn assert_typed_overlay_contract(agent_id: &str, overlay: &ManagedProjectionOverlay) {
+        const ENDPOINT: &str = "https://provider.example.invalid/v1/";
+        match agent_id {
+            "crow-cli" => {
+                let value: serde_yaml::Value = serde_yaml::from_str(&overlay.content).unwrap();
+                assert_eq!(value["providers"]["matrix-provider"]["base_url"], ENDPOINT);
+                assert_eq!(
+                    value["providers"]["matrix-provider"]["api_key"],
+                    "${VIBEX_CROW_API_KEY}"
+                );
+                assert_eq!(
+                    value["models"]["agent-model"]["provider"],
+                    "matrix-provider"
+                );
+                assert_eq!(value["models"]["agent-model"]["model"], "agent-model");
+            }
+            "dirac" => {
+                let value: serde_json::Value = serde_json::from_str(&overlay.content).unwrap();
+                assert_eq!(value["actModeApiProvider"], "openai");
+                assert_eq!(value["planModeApiProvider"], "openai");
+                assert_eq!(value["openAiBaseUrl"], ENDPOINT);
+                assert_eq!(value["actModeOpenAiModelId"], "agent-model");
+                assert_eq!(value["planModeOpenAiModelId"], "agent-model");
+            }
+            "factory-droid" => {
+                let value: serde_json::Value = serde_json::from_str(&overlay.content).unwrap();
+                let custom = &value["customModels"][0];
+                assert_eq!(custom["id"], "vibex-matrix-provider-agent-model");
+                assert_eq!(custom["model"], "agent-model");
+                assert_eq!(custom["baseUrl"], ENDPOINT);
+                assert_eq!(custom["provider"], "openai");
+                assert_eq!(custom["apiKey"], "${VIBEX_FACTORY_DROID_API_KEY}");
+                assert_eq!(value["model"], "custom:vibex-matrix-provider-agent-model");
+                assert!(custom.get("name").is_none());
+                assert!(custom.get("protocol").is_none());
+                assert!(value.get("defaultModel").is_none());
+            }
+            "goose" => {
+                let value: serde_json::Value = serde_json::from_str(&overlay.content).unwrap();
+                assert_eq!(value["name"], "matrix-provider");
+                assert_eq!(value["engine"], "openai");
+                assert_eq!(value["api_key_env"], "VIBEX_GOOSE_API_KEY");
+                assert_eq!(value["base_url"], ENDPOINT);
+                assert_eq!(value["models"][0]["name"], "agent-model");
+            }
+            "grok" => {
+                let value: toml::Value = toml::from_str(&overlay.content).unwrap();
+                let model = &value["model"]["agent-model"];
+                assert_eq!(value["models"]["default"].as_str(), Some("agent-model"));
+                assert_eq!(model["model"].as_str(), Some("agent-model"));
+                assert_eq!(model["base_url"].as_str(), Some(ENDPOINT));
+                assert_eq!(model["env_key"].as_str(), Some("VIBEX_GROK_API_KEY"));
+                assert_eq!(model["api_backend"].as_str(), Some("responses"));
+                assert_eq!(model["auth_scheme"].as_str(), Some("bearer"));
+            }
+            "hermes" => {
+                let value: serde_yaml::Value = serde_yaml::from_str(&overlay.content).unwrap();
+                let provider = &value["providers"]["vibex"];
+                assert_eq!(provider["base_url"], ENDPOINT);
+                assert_eq!(provider["key_env"], "VIBEX_HERMES_API_KEY");
+                assert_eq!(provider["default_model"], "agent-model");
+                assert_eq!(provider["transport"], "chat_completions");
+                assert_eq!(value["model"]["provider"], "vibex");
+                assert_eq!(value["model"]["default"], "agent-model");
+            }
+            "kilo" => {
+                let value: serde_json::Value = serde_json::from_str(&overlay.content).unwrap();
+                let provider = &value["provider"]["matrix-provider"];
+                assert_eq!(provider["options"]["baseURL"], ENDPOINT);
+                assert_eq!(provider["options"]["apiKey"], "{env:VIBEX_KILO_API_KEY}");
+                assert_eq!(provider["models"]["agent-model"]["name"], "agent-model");
+                assert_eq!(
+                    provider["models"]["agent-model"]["provider"]["npm"],
+                    "@ai-sdk/openai-compatible"
+                );
+                assert_eq!(
+                    provider["models"]["agent-model"]["provider"]["api"],
+                    ENDPOINT
+                );
+                assert_eq!(value["model"], "matrix-provider/agent-model");
+                assert!(value.get("providers").is_none());
+            }
+            "mistral-vibe" => {
+                let value: toml::Value = toml::from_str(&overlay.content).unwrap();
+                assert_eq!(value["active_model"].as_str(), Some("agent-model"));
+                assert_eq!(
+                    value["providers"][0]["name"].as_str(),
+                    Some("matrix-provider")
+                );
+                assert_eq!(value["providers"][0]["api_base"].as_str(), Some(ENDPOINT));
+                assert_eq!(
+                    value["providers"][0]["api_key_env_var"].as_str(),
+                    Some("VIBEX_MISTRAL_VIBE_API_KEY")
+                );
+                assert_eq!(value["providers"][0]["api_style"].as_str(), Some("openai"));
+                assert_eq!(
+                    value["models"][0]["provider"].as_str(),
+                    Some("matrix-provider")
+                );
+            }
+            "pi" => {
+                let value: serde_json::Value = serde_json::from_str(&overlay.content).unwrap();
+                let provider = &value["providers"]["matrix-provider"];
+                assert_eq!(provider["baseUrl"], ENDPOINT);
+                assert_eq!(provider["apiKey"], "$VIBEX_PI_API_KEY");
+                assert_eq!(provider["api"], "openai-completions");
+                let model = &provider["models"][0];
+                assert_eq!(model["id"], "agent-model");
+                assert_eq!(model["reasoning"], false);
+                assert_eq!(model["input"], serde_json::json!(["text"]));
+                assert_eq!(model["contextWindow"], 128000);
+                assert_eq!(model["maxTokens"], 16384);
+                assert_eq!(
+                    model["cost"],
+                    serde_json::json!({
+                        "input": 0,
+                        "output": 0,
+                        "cacheRead": 0,
+                        "cacheWrite": 0,
+                    })
+                );
+                assert!(model.get("api").is_none());
+                assert!(model.get("provider").is_none());
+                assert!(model.get("baseUrl").is_none());
+                assert!(value.get("defaultModel").is_none());
+            }
+            "qwen-code" => {
+                let value: serde_json::Value = serde_json::from_str(&overlay.content).unwrap();
+                let model = &value["modelProviders"]["openai"][0];
+                assert_eq!(model["id"], "agent-model");
+                assert_eq!(model["name"], "agent-model");
+                assert_eq!(model["baseUrl"], ENDPOINT);
+                assert_eq!(model["envKey"], "VIBEX_QWEN_CODE_API_KEY");
+                assert_eq!(value["security"]["auth"]["selectedType"], "openai");
+                assert_eq!(value["model"]["name"], "agent-model");
+                assert!(model.get("model").is_none());
+                assert!(value["security"]["auth"].get("apiKey").is_none());
+            }
+            "stakpak" => {
+                assert!(!overlay.contains_secret_reference);
+                let value: toml::Value = toml::from_str(&overlay.content).unwrap();
+                let profile = &value["profiles"]["vibex"];
+                assert_eq!(profile["provider"].as_str(), Some("local"));
+                assert_eq!(profile["model"].as_str(), Some("openai/agent-model"));
+                assert_eq!(
+                    profile["providers"]["openai"]["type"].as_str(),
+                    Some("openai")
+                );
+                assert_eq!(
+                    profile["providers"]["openai"]["api_endpoint"].as_str(),
+                    Some(ENDPOINT)
+                );
+                assert!(profile["providers"]["openai"].get("api_key").is_none());
+            }
+            "vtcode" => {
+                let value: toml::Value = toml::from_str(&overlay.content).unwrap();
+                assert_eq!(
+                    value["agent"]["provider"].as_str(),
+                    Some("vibex-matrix-provider")
+                );
+                assert_eq!(
+                    value["agent"]["default_model"].as_str(),
+                    Some("agent-model")
+                );
+                let provider = &value["custom_providers"][0];
+                assert_eq!(provider["name"].as_str(), Some("vibex-matrix-provider"));
+                assert_eq!(provider["base_url"].as_str(), Some(ENDPOINT));
+                assert_eq!(provider["model"].as_str(), Some("agent-model"));
+                assert_eq!(
+                    provider["api_key_env"].as_str(),
+                    Some("VIBEX_VTCODE_API_KEY")
+                );
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn all_typed_catalog_projectors_map_provider_env_secret_model_and_private_state() {
+        let descriptors = vibex_core::catalog_projection_descriptors().unwrap();
+        let expectations = typed_projection_expectations();
+        assert_eq!(expectations.len(), 17);
+
+        for expected in expectations {
+            let descriptor = descriptors
+                .iter()
+                .find(|descriptor| descriptor.route.agent_id.as_str() == expected.agent_id)
+                .unwrap_or_else(|| panic!("missing descriptor for {}", expected.agent_id));
+            assert_eq!(
+                descriptor.evidence.state,
+                ProjectionEvidenceState::Documented
+            );
+            assert_eq!(
+                descriptor.runtime_home_strategy,
+                AgentRuntimeHomeStrategy::VibexPrivate
+            );
+            assert_eq!(
+                descriptor.switch_behavior,
+                ProviderSwitchBehavior::RestartAndResume
+            );
+
+            let descriptor_secret_key = match &descriptor.credential_control {
+                AgentCredentialControl::Environment { secret_env_key, .. } => {
+                    secret_env_key.as_str()
+                }
+                control => panic!(
+                    "{} has unexpected credential control {control:?}",
+                    expected.agent_id
+                ),
+            };
+            assert_eq!(descriptor_secret_key, expected.secret_env_key);
+
+            match (&descriptor.provider_control, expected.base_url_key) {
+                (AgentProviderControl::Environment { base_url_key }, Some(expected_key)) => {
+                    assert_eq!(base_url_key.as_deref(), Some(expected_key))
+                }
+                (AgentProviderControl::ManagedConfigOverlay { .. }, None) => {}
+                (control, expected_key) => panic!(
+                    "{} provider control {control:?} does not match base URL expectation {expected_key:?}",
+                    expected.agent_id
+                ),
+            }
+            match (&descriptor.model_control, expected.model_env_key) {
+                (AgentModelControl::ProcessEnvironment { key }, Some(expected_key)) => {
+                    assert_eq!(key, expected_key)
+                }
+                (AgentModelControl::ManagedConfigOverlay { .. }, None) => {}
+                (control, expected_key) => panic!(
+                    "{} model control {control:?} does not match model env expectation {expected_key:?}",
+                    expected.agent_id
+                ),
+            }
+
+            let (provider, runtime, binding) = typed_projection_fixture(descriptor);
+            let plan = AgentProviderProjectionEngine::plan(
+                &provider,
+                &runtime,
+                &binding,
+                descriptor,
+                "typed-matrix",
+            )
+            .unwrap_or_else(|error| panic!("{} projection failed: {error:?}", expected.agent_id));
+            assert_eq!(plan.secret_env.len(), 1, "{}", expected.agent_id);
+            assert_eq!(plan.secret_env[0].key, expected.secret_env_key);
+            assert_eq!(plan.effective_model.as_deref(), Some("agent-model"));
+            assert_eq!(
+                plan.overlay_files.len(),
+                if expected.overlay_path.is_some() {
+                    1
+                } else {
+                    0
+                }
+            );
+            if let Some((path, format)) = expected.overlay_path.zip(expected.overlay_format) {
+                let overlay = &plan.overlay_files[0];
+                assert_eq!(overlay.relative_path, path, "{}", expected.agent_id);
+                assert_eq!(overlay.format, format, "{}", expected.agent_id);
+                assert_overlay_schema(expected.agent_id, overlay);
+                assert_typed_overlay_contract(expected.agent_id, overlay);
+            }
+
+            let rendered = format!("{plan:?}");
+            assert!(!rendered.contains(TYPED_SECRET_LOOKUP));
+            assert!(!rendered.contains(TYPED_SECRET_SENTINEL));
+            let preview = serde_json::to_string(&plan.preview).unwrap();
+            assert!(!preview.contains(TYPED_SECRET_LOOKUP));
+            assert!(!preview.contains(TYPED_SECRET_SENTINEL));
+
+            let runtime_root = tempdir().unwrap();
+            let non_secret_env = AgentProviderProjectionEngine::non_secret_environment_for_plan(
+                &plan,
+                runtime_root.path(),
+                "typed-matrix",
+            )
+            .unwrap();
+            if let Some(home_key) = expected.runtime_home_env_key {
+                let home = non_secret_env.get(home_key).unwrap();
+                assert!(home.starts_with(runtime_root.path().to_string_lossy().as_ref()));
+                if expected.agent_id == "vtcode" {
+                    assert!(home.ends_with("vtcode.toml"));
+                }
+            }
+            if let Some(base_url_key) = expected.base_url_key {
+                let base_url = non_secret_env.get(base_url_key).unwrap();
+                if expected.agent_id == "poolside" {
+                    assert_eq!(base_url, "https://provider.example.invalid");
+                } else {
+                    assert_eq!(base_url, "https://provider.example.invalid/v1/");
+                }
+            }
+            if let Some(model_key) = expected.model_env_key {
+                let model = non_secret_env.get(model_key).unwrap();
+                assert_eq!(
+                    model,
+                    if expected.agent_id == "fast-agent" {
+                        "generic.agent-model"
+                    } else {
+                        "agent-model"
+                    }
+                );
+            }
+            match expected.agent_id {
+                "codewhale" => assert_eq!(
+                    non_secret_env.get("CODEWHALE_PROVIDER").map(String::as_str),
+                    Some("openai")
+                ),
+                "goose" => {
+                    assert_eq!(
+                        non_secret_env.get("GOOSE_PROVIDER").map(String::as_str),
+                        Some("matrix-provider")
+                    );
+                    assert_eq!(
+                        non_secret_env.get("GOOSE_MODEL").map(String::as_str),
+                        Some("agent-model")
+                    );
+                }
+                "kimi" => assert_eq!(
+                    non_secret_env
+                        .get("KIMI_MODEL_PROVIDER_TYPE")
+                        .map(String::as_str),
+                    Some("openai")
+                ),
+                _ => {}
+            }
+            if expected.agent_id == "kilo" {
+                let inline = non_secret_env.get("KILO_CONFIG_CONTENT").unwrap();
+                let value: serde_json::Value = serde_json::from_str(inline).unwrap();
+                assert!(value.get("provider").is_some());
+                assert_eq!(inline, &plan.overlay_files[0].content);
+                assert!(!inline.contains(TYPED_SECRET_LOOKUP));
+            }
+
+            let process_args = AgentProviderProjectionEngine::process_args_for_plan(
+                &plan,
+                runtime_root.path(),
+                "typed-matrix",
+            )
+            .unwrap();
+            match expected.agent_id {
+                "crow-cli" => {
+                    assert_eq!(
+                        process_args.first().map(String::as_str),
+                        Some("--config-dir")
+                    );
+                    assert!(
+                        process_args[1].starts_with(runtime_root.path().to_string_lossy().as_ref())
+                    );
+                }
+                "stakpak" => {
+                    assert_eq!(process_args.len(), 4);
+                    assert_eq!(process_args[0], "--profile");
+                    assert_eq!(process_args[1], "vibex");
+                    assert_eq!(process_args[2], "--config");
+                    assert!(process_args[3].ends_with("/stakpak.toml"));
+                }
+                _ => assert!(process_args.is_empty(), "{}", expected.agent_id),
+            }
+
+            let mut changed_provider = provider.clone();
+            if let AgentCredential::ApiKey { secret, .. } =
+                &mut changed_provider.credentials[0].credential
+            {
+                secret.revision += 1;
+            }
+            let changed = AgentProviderProjectionEngine::plan(
+                &changed_provider,
+                &runtime,
+                &binding,
+                descriptor,
+                "typed-matrix",
+            )
+            .unwrap();
+            assert_ne!(
+                plan.fingerprint, changed.fingerprint,
+                "{}",
+                expected.agent_id
+            );
+            assert!(plan.fingerprint.starts_with("sha256:"));
+        }
     }
 
     #[test]
