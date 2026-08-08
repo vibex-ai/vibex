@@ -32372,22 +32372,37 @@ fn user_message_inline_document(
     let mut image_attachments = BTreeMap::new();
     let mut next_node_id = 1;
 
-    for segment in user_message_inline_segments(text, attachments) {
+    let segments = user_message_inline_segments(text, attachments);
+    for (segment_index, segment) in segments.iter().enumerate() {
         match segment {
             UserMessageInlineSegment::Text(value) => {
                 if value.is_empty() {
                     continue;
                 }
                 let start = source.len();
-                source.push_str(&value);
+                source.push_str(value);
                 inlines.push(InlineNode {
                     id: NodeId(next_node_id),
                     range: SourceRange::new(start, source.len()),
-                    kind: Inline::Text(value),
+                    kind: Inline::Text(value.clone()),
                 });
                 next_node_id = next_node_id.saturating_add(1);
             }
             UserMessageInlineSegment::Attachment(attachment) => {
+                if source
+                    .chars()
+                    .next_back()
+                    .is_some_and(|character| !character.is_whitespace())
+                {
+                    let start = source.len();
+                    source.push(' ');
+                    inlines.push(InlineNode {
+                        id: NodeId(next_node_id),
+                        range: SourceRange::new(start, source.len()),
+                        kind: Inline::Text(" ".to_string()),
+                    });
+                    next_node_id = next_node_id.saturating_add(1);
+                }
                 let label = if attachment.label.trim().is_empty() {
                     locale::text_for(locale, "Image", "图片", "圖片").to_string()
                 } else {
@@ -32440,6 +32455,26 @@ fn user_message_inline_document(
                     kind,
                 });
                 next_node_id = next_node_id.saturating_add(1);
+                let next_starts_with_text =
+                    segments
+                        .get(segment_index + 1)
+                        .is_some_and(|segment| match segment {
+                            UserMessageInlineSegment::Text(value) => value
+                                .chars()
+                                .next()
+                                .is_some_and(|character| !character.is_whitespace()),
+                            UserMessageInlineSegment::Attachment(_) => true,
+                        });
+                if next_starts_with_text {
+                    let start = source.len();
+                    source.push(' ');
+                    inlines.push(InlineNode {
+                        id: NodeId(next_node_id),
+                        range: SourceRange::new(start, source.len()),
+                        kind: Inline::Text(" ".to_string()),
+                    });
+                    next_node_id = next_node_id.saturating_add(1);
+                }
             }
         }
     }
@@ -37351,7 +37386,7 @@ mod tests {
                 .iter()
                 .any(|inline| { matches!(inline.kind, Inline::Link { .. }) })
         );
-        assert_eq!(document.plain_text(), "alphapastetail");
+        assert_eq!(document.plain_text(), "alpha paste tail");
     }
 
     #[test]
