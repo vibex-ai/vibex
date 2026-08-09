@@ -6158,7 +6158,10 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
 #[async_trait]
 impl SwitchTargetExecutor for AcpRuntimeSwitchBridge {
     fn restore_failure_allows_fresh(&self, error: &VibexError) -> bool {
-        error.code == "acp_restore_fresh_allowed"
+        matches!(
+            error.code.as_str(),
+            "acp_restore_fresh_allowed" | "acp_restore_fatal_failure"
+        )
     }
 
     async fn assess_target(&self, intent: &SwitchIntent) -> VibexResult<SwitchTargetAssessment> {
@@ -18669,6 +18672,27 @@ for line in sys.stdin:
             ProviderConfigService::new(self.db_path.clone())
         }
 
+        fn create_switch_profile(
+            &self,
+            display_name: &str,
+            agent_id: AgentId,
+        ) -> ProviderProfileId {
+            let service = self.service();
+            let config = service
+                .get_acp_profile_config(self.profile_id.clone())
+                .unwrap();
+            service
+                .create_acp_profile(vibex_core::AcpProviderProfileCreateRequest {
+                    agent_id: Some(agent_id),
+                    display_name: display_name.to_string(),
+                    account_alias: None,
+                    preset_id: None,
+                    config: Some(config),
+                })
+                .unwrap()
+                .id
+        }
+
         fn client(&self) -> AcpRuntimeClient {
             let service = self.service();
             let client = AcpRuntimeClient::new(service);
@@ -19236,12 +19260,17 @@ for line in sys.stdin:
             observability.clone(),
         ));
         let provider_client: Arc<dyn AcpClient> = client.clone();
-        let provider =
-            crate::AcpAgentProvider::with_config_service(provider_client, fixture.service());
+        let provider: Arc<dyn AgentProvider> = Arc::new(
+            crate::AcpAgentProvider::with_config_service(provider_client, fixture.service()),
+        );
         let agent_id = vibex_core::AgentId::parse(OPENCODE_AGENT_ID).unwrap();
+        let alternate_agent_id = vibex_core::AgentId::parse("codex").unwrap();
         let mut manager = AgentManager::new(&fixture.db_path).unwrap();
         manager
-            .register_runtime(client.route_key_for_agent(&agent_id), Arc::new(provider))
+            .register_runtime(client.route_key_for_agent(&agent_id), provider.clone())
+            .unwrap();
+        manager
+            .register_runtime(client.route_key_for_agent(&alternate_agent_id), provider)
             .unwrap();
         let manager = Arc::new(manager);
         let bridge = Arc::new(
@@ -19398,6 +19427,99 @@ for line in sys.stdin:
         }
     }
 
+    async fn send_runtime_switch_message(
+        fixture: &RuntimeSwitchFixture,
+        selection: SessionRuntimeSelection,
+        key: &str,
+        text: &str,
+    ) -> Vec<vibex_core::TimelineItem> {
+        fixture
+            .message_submission
+            .submit(vibex_core::SendAgentMessageRequest {
+                session_id: fixture.session.id.clone(),
+                message_idempotency_key: key.to_string(),
+                reasoning_effort: selection.reasoning_effort.clone(),
+                desired_runtime: selection,
+                text: text.to_string(),
+                attachments: Vec::new(),
+                correlation_id: None,
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn switch_runtime_selection_and_wait(
+        fixture: &RuntimeSwitchFixture,
+        desired: SessionRuntimeSelection,
+        key: &str,
+    ) -> (
+        RuntimeSwitchId,
+        vibex_core::AgentSessionRuntimeSelectionState,
+    ) {
+        let current = fixture
+            .runtime_selection
+            .get_selection_state(&fixture.session.id)
+            .unwrap();
+        let pending = fixture
+            .runtime_selection
+            .set_desired_runtime(vibex_core::SetDesiredAgentSessionRuntimeRequest {
+                session_id: fixture.session.id.clone(),
+                idempotency_key: key.to_string(),
+                expected_revision: current.session_revision,
+                expected_selection_revision: current.selection_revision,
+                desired: desired.clone(),
+                interaction: vibex_core::RuntimeSelectionInteraction::Seamless,
+            })
+            .await
+            .unwrap();
+        let switch_id = pending
+            .pending_switch_id
+            .clone()
+            .expect("runtime selection change must enqueue a switch");
+        let state = timeout(Duration::from_secs(15), async {
+            loop {
+                let state = fixture
+                    .runtime_selection
+                    .get_selection_state(&fixture.session.id)
+                    .unwrap();
+                if state.status == vibex_core::SessionRuntimeSelectionStatus::Ready
+                    && state.effective == desired
+                {
+                    break state;
+                }
+                assert_ne!(
+                    state.status,
+                    vibex_core::SessionRuntimeSelectionStatus::FailedUsingPrevious,
+                    "runtime switch failed: {:?}",
+                    state.actionable_error
+                );
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("runtime selection did not become ready");
+        (switch_id, state)
+    }
+
+    fn assert_latest_prompt_contains(fixture: &RuntimeSwitchFixture, expected: &[&str]) {
+        let prompt = fixture
+            .fixture
+            .request_log()
+            .into_iter()
+            .rev()
+            .find(|entry| entry["method"] == "session/prompt")
+            .expect("latest session/prompt request");
+        let text = prompt["params"]["prompt"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<String>();
+        for expected in expected {
+            assert!(text.contains(expected), "missing prompt text: {expected}");
+        }
+    }
+
     async fn force_fresh_context_bridge_target(
         fixture: &RuntimeSwitchFixture,
         key_prefix: &str,
@@ -19504,6 +19626,212 @@ for line in sys.stdin:
         assert_eq!(fixture.source_binding.binding_state, BindingState::Current);
         assert!(fixture.source_binding.created_by_switch_id.is_some());
         drop(conn);
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fatal_restore_during_option_switch_falls_back_to_fresh_and_continues() {
+        use vibex_agent::runtime_switch::OP_CREATE_SESSION;
+        use vibex_db::SwitchOperationJournalRepository;
+
+        let Some(fixture) = runtime_switch_fixture("switch-fatal-restore-fresh").await else {
+            return;
+        };
+        send_runtime_switch_message(
+            &fixture,
+            fixture.selection.clone(),
+            "fatal-restore-source-message",
+            "history before option switch",
+        )
+        .await;
+        fixture.fixture.set_restore_mode("provider_failure", false);
+
+        let mut target = fixture.selection.clone();
+        target.model_id = "mock/model-2".to_string();
+        target.mode_id = Some("review".to_string());
+        let (switch_id, ready) = switch_runtime_selection_and_wait(
+            &fixture,
+            target.clone(),
+            "fatal-restore-option-switch",
+        )
+        .await;
+        assert_eq!(ready.effective, target);
+        let operations = SwitchOperationJournalRepository::list_by_switch(
+            &open_database(&fixture.fixture.db_path).unwrap(),
+            &switch_id,
+        )
+        .unwrap();
+        assert!(operations.iter().any(|operation| {
+            operation.operation_kind == OP_RESTORE_SESSION
+                && operation.status == vibex_core::SwitchOperationStatus::Failed
+        }));
+        assert!(operations.iter().any(|operation| {
+            operation.operation_kind == OP_CREATE_SESSION
+                && operation.status == vibex_core::SwitchOperationStatus::Succeeded
+        }));
+
+        send_runtime_switch_message(
+            &fixture,
+            ready.effective,
+            "fatal-restore-target-message",
+            "continue after option switch",
+        )
+        .await;
+        assert_latest_prompt_contains(
+            &fixture,
+            &[
+                "VIBEX_CONTEXT_BRIDGE_BEGIN",
+                "history before option switch",
+                "continue after option switch",
+            ],
+        );
+
+        drop(fixture.message_submission);
+        drop(fixture.runtime_selection);
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn provider_profile_switch_uses_fresh_context_bridge_and_continues() {
+        use vibex_agent::runtime_switch::OP_CREATE_SESSION;
+        use vibex_db::SwitchOperationJournalRepository;
+
+        let Some(fixture) = runtime_switch_fixture("switch-provider-profile").await else {
+            return;
+        };
+        send_runtime_switch_message(
+            &fixture,
+            fixture.selection.clone(),
+            "provider-switch-source-message",
+            "history before provider switch",
+        )
+        .await;
+        let target_profile = fixture.fixture.create_switch_profile(
+            "Mock ACP alternate provider",
+            fixture.selection.agent_id.clone(),
+        );
+        let mut target = fixture.selection.clone();
+        target.provider_profile_id = target_profile;
+        target.model_id = "mock/model-2".to_string();
+        target.mode_id = Some("review".to_string());
+
+        let (switch_id, ready) =
+            switch_runtime_selection_and_wait(&fixture, target.clone(), "provider-profile-switch")
+                .await;
+        let operations = SwitchOperationJournalRepository::list_by_switch(
+            &open_database(&fixture.fixture.db_path).unwrap(),
+            &switch_id,
+        )
+        .unwrap();
+        assert!(
+            !operations
+                .iter()
+                .any(|operation| operation.operation_kind == OP_RESTORE_SESSION)
+        );
+        assert!(operations.iter().any(|operation| {
+            operation.operation_kind == OP_CREATE_SESSION
+                && operation.status == vibex_core::SwitchOperationStatus::Succeeded
+        }));
+        assert_ne!(
+            ready.current_binding_id,
+            Some(fixture.source_binding.binding_id.clone())
+        );
+
+        send_runtime_switch_message(
+            &fixture,
+            ready.effective,
+            "provider-switch-target-message",
+            "continue after provider switch",
+        )
+        .await;
+        assert_latest_prompt_contains(
+            &fixture,
+            &[
+                "VIBEX_CONTEXT_BRIDGE_BEGIN",
+                "history before provider switch",
+                "continue after provider switch",
+            ],
+        );
+
+        drop(fixture.message_submission);
+        drop(fixture.runtime_selection);
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_switch_uses_fresh_context_bridge_and_continues() {
+        use vibex_agent::runtime_switch::OP_CREATE_SESSION;
+        use vibex_db::SwitchOperationJournalRepository;
+
+        let Some(fixture) = runtime_switch_fixture("switch-agent").await else {
+            return;
+        };
+        send_runtime_switch_message(
+            &fixture,
+            fixture.selection.clone(),
+            "agent-switch-source-message",
+            "history before agent switch",
+        )
+        .await;
+        let target_agent = AgentId::parse("codex").unwrap();
+        let target_profile = fixture
+            .fixture
+            .create_switch_profile("Mock Codex ACP", target_agent.clone());
+        let mut target = fixture.selection.clone();
+        target.agent_id = target_agent;
+        target.provider_profile_id = target_profile;
+        target.model_id = "mock/model-2".to_string();
+        target.mode_id = Some("review".to_string());
+
+        let (switch_id, ready) =
+            switch_runtime_selection_and_wait(&fixture, target.clone(), "agent-switch").await;
+        let operations = SwitchOperationJournalRepository::list_by_switch(
+            &open_database(&fixture.fixture.db_path).unwrap(),
+            &switch_id,
+        )
+        .unwrap();
+        assert!(
+            !operations
+                .iter()
+                .any(|operation| operation.operation_kind == OP_RESTORE_SESSION)
+        );
+        assert!(operations.iter().any(|operation| {
+            operation.operation_kind == OP_CREATE_SESSION
+                && operation.status == vibex_core::SwitchOperationStatus::Succeeded
+        }));
+        assert_eq!(ready.effective.agent_id, target.agent_id);
+        assert_ne!(
+            ready.current_binding_id,
+            Some(fixture.source_binding.binding_id.clone())
+        );
+
+        send_runtime_switch_message(
+            &fixture,
+            ready.effective,
+            "agent-switch-target-message",
+            "continue after agent switch",
+        )
+        .await;
+        assert_latest_prompt_contains(
+            &fixture,
+            &[
+                "VIBEX_CONTEXT_BRIDGE_BEGIN",
+                "history before agent switch",
+                "continue after agent switch",
+            ],
+        );
+
+        drop(fixture.message_submission);
+        drop(fixture.runtime_selection);
         drop(fixture.manager);
         drop(fixture.bridge);
         drop(fixture.client);

@@ -3201,7 +3201,12 @@ RuntimeSwitchRepository::compare_and_set_restore_compatibility_result(...)
 - Fresh uses a new transient binding id and `nativeSessionId=None` acquire key;
   it must not reuse an old native-id key. Auth/permission, timeout,
   transport/process crash, malformed response, route mismatch, and provider
-  failures stop the chain and preserve the source current attachment.
+  failures stop the ordinary restore chain and preserve the source current
+  attachment. A deliberate runtime hot switch is the bounded exception: after
+  a fatal resume/load failure with no prompt side effect, its journaled
+  coordinator may create a quarantined fresh target and bridge the
+  authoritative Logical Session timeline. Authentication and transient
+  failures still stop the switch.
 - Success revalidates the complete fence before config replay or CAS. Stale or
   missing binding/switch rows perform zero writes. The switch result JSON seam
   is an optional bounded cache, not current-binding authority; P5 commit and
@@ -3224,7 +3229,9 @@ RuntimeSwitchRepository::compare_and_set_restore_compatibility_result(...)
   `FatalFailure` with no fresh fallback.
 - Auth/permission -> `AuthenticationRequired`; timeout/transport/process ->
   `TransientFailure`; malformed response/native mismatch/provider error ->
-  `FatalFailure`; none may fresh-fallback.
+  `FatalFailure`; ordinary restore may not fresh-fallback. A deliberate runtime
+  hot switch may fresh-and-bridge only the fatal outcome after journaling the
+  failed restore operation.
 - Binding/switch identity, generation, revision, status, or expected-result CAS
   mismatch -> structured conflict with zero writes.
 
@@ -3237,6 +3244,10 @@ RuntimeSwitchRepository::compare_and_set_restore_compatibility_result(...)
 - Good: Codex reports a missing rollout only in `error.data`; Vibex records the
   redacted `resource_not_found` kind, tries resume/load once each, then creates
   one fresh native session while retaining the Logical Session timeline.
+- Good: a same-Profile runtime option change cannot restore the old Codex ACP
+  native session; the hot-switch journal records the fatal restore, creates a
+  quarantined fresh session, applies the selected options, bridges history,
+  commits it, and only then admits the queued message.
 - Base: static/unknown capability returns probe-required instead of guessing an
   encoding.
 - Base: an unrelated `-32603` on `session/prompt` remains a provider failure
@@ -3259,6 +3270,10 @@ RuntimeSwitchRepository::compare_and_set_restore_compatibility_result(...)
   `-32603` + `error.data.details=no rollout found for thread id ...` shape and
   assert one resume, one load, one fresh session, and no raw native id in the
   classified error state.
+- Runtime-switch ACP tests separately cover fatal-restore fresh-and-bridge plus
+  message continuation for same-Profile option/model, cross-Profile Provider,
+  and cross-Agent selections. The ordinary restore tests above must continue to
+  reject fatal fallback.
 - DB tests cover typed key round-trip, identical no-write, stale generation,
   and switch restore-result CAS/query. Run targeted and workspace checks,
   bindings/frontend checks, fmt, clippy, and Trellis validation.
