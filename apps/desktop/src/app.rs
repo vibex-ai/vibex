@@ -9748,12 +9748,19 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(target) = resource.resolved else {
-            return;
-        };
         match resource.kind {
-            ResourceKind::Workspace => self.open_code_file(target, window, cx),
+            ResourceKind::Workspace => {
+                let workspace_root = self
+                    .selected_session()
+                    .map(|session| session.workspace_root.as_str());
+                if let Some(target) = agent_markdown_preview_path(&resource, workspace_root) {
+                    self.open_code_file(target, window, cx);
+                }
+            }
             ResourceKind::Http => {
+                let Some(target) = resource.resolved else {
+                    return;
+                };
                 if let Err(error) = validate_external_open_url(&target)
                     .and_then(|validated| crate::platform::open_external_url(&validated.url))
                 {
@@ -32354,6 +32361,30 @@ fn agent_markdown_summary(source: &str) -> (String, Vec<String>) {
     (document.plain_text(), paths)
 }
 
+fn agent_markdown_preview_path(
+    resource: &ResolvedResource,
+    workspace_root: Option<&str>,
+) -> Option<String> {
+    if resource.kind != ResourceKind::Workspace {
+        return None;
+    }
+    let target = resource.resolved.as_deref()?.trim_matches('/');
+    if target.is_empty() {
+        return None;
+    }
+    let source = resource.source.trim().replace('\\', "/");
+    if !source.starts_with('/') {
+        return Some(target.to_string());
+    }
+    let workspace_root = workspace_root.unwrap_or_default().replace('\\', "/");
+    let workspace_root = workspace_root.trim_matches('/');
+    let relative = (!workspace_root.is_empty())
+        .then(|| format!("{workspace_root}/"))
+        .and_then(|prefix| target.strip_prefix(&prefix))
+        .unwrap_or(target);
+    (!relative.is_empty()).then(|| relative.to_string())
+}
+
 fn render_user_message_text_segment(
     id: impl Into<ElementId>,
     value: String,
@@ -38664,10 +38695,44 @@ mod tests {
     #[test]
     fn agent_markdown_workspace_links_resolve_to_preview_paths() {
         let paths = agent_markdown_summary(
-            "Open [the editor](src/editor.rs) and [docs](https://example.com).",
+            "Open [the editor](src/editor.rs:42) and [docs](https://example.com).",
         )
         .1;
         assert_eq!(paths, ["src/editor.rs"]);
+    }
+
+    #[test]
+    fn agent_markdown_absolute_links_resolve_relative_to_the_session_workspace() {
+        let workspace_root = "/work/vibex";
+        let document = parse_markdown_with_limits(
+            MarkdownInput::new(
+                "[app.rs](/work/vibex/apps/desktop/src/app.rs:9755:8)",
+                "",
+                0,
+            )
+            .surface(MarkdownSurface::Agent),
+            MarkdownLimits::default(),
+        );
+        let resource = document.resources.first().expect("workspace link");
+
+        assert_eq!(
+            agent_markdown_preview_path(resource, Some(workspace_root)).as_deref(),
+            Some("apps/desktop/src/app.rs")
+        );
+    }
+
+    #[test]
+    fn agent_markdown_workspace_root_links_keep_their_relative_target() {
+        let document = parse_markdown_with_limits(
+            MarkdownInput::new("[README.md](/README.md)", "", 0).surface(MarkdownSurface::Agent),
+            MarkdownLimits::default(),
+        );
+        let resource = document.resources.first().expect("workspace link");
+
+        assert_eq!(
+            agent_markdown_preview_path(resource, Some("/work/vibex")).as_deref(),
+            Some("README.md")
+        );
     }
 
     #[test]

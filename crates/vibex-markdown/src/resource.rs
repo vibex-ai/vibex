@@ -186,6 +186,7 @@ fn resolve_workspace_resource(base_path: &str, source: &str) -> Option<String> {
         return None;
     }
     let source = source.split(['?', '#']).next().unwrap_or(source);
+    let source = strip_editor_location(source);
     let mut segments = if source.starts_with('/') {
         Vec::new()
     } else {
@@ -206,6 +207,23 @@ fn resolve_workspace_resource(base_path: &str, source: &str) -> Option<String> {
         }
     }
     (!segments.is_empty()).then(|| segments.join("/"))
+}
+
+fn strip_editor_location(source: &str) -> &str {
+    let Some((without_last_number, last_number)) = source.rsplit_once(':') else {
+        return source;
+    };
+    if last_number.is_empty() || !last_number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return source;
+    }
+    let Some((without_line, line)) = without_last_number.rsplit_once(':') else {
+        return without_last_number;
+    };
+    if !line.is_empty() && line.bytes().all(|byte| byte.is_ascii_digit()) {
+        without_line
+    } else {
+        without_last_number
+    }
 }
 
 fn is_valid_fragment(source: &str) -> bool {
@@ -287,5 +305,27 @@ mod tests {
         assert_eq!(resource.kind, ResourceKind::DataImage);
         assert_eq!(resource.source, source);
         assert_eq!(resource.resolved.as_deref(), Some(resource.source.as_str()));
+    }
+
+    #[test]
+    fn policy_resolves_workspace_file_links_with_editor_locations() {
+        let policy = ResourcePolicy::new("");
+
+        for (source, expected) in [
+            ("src/lib.rs:42", "src/lib.rs"),
+            ("src/lib.rs:42:7", "src/lib.rs"),
+            ("/workspace/src/lib.rs:42", "workspace/src/lib.rs"),
+        ] {
+            let resource = policy.resolve(ResourceRole::Link, source, None);
+            assert_eq!(resource.kind, ResourceKind::Workspace);
+            assert_eq!(resource.resolved.as_deref(), Some(expected));
+        }
+
+        assert_eq!(
+            policy
+                .resolve(ResourceRole::Link, "src/name:archive", None)
+                .kind,
+            ResourceKind::Blocked
+        );
     }
 }

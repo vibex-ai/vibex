@@ -2698,6 +2698,7 @@ parse_markdown(MarkdownInput) -> MarkdownDocument
 ResourcePolicy::resolve(ResourceRole, source, label) -> ResolvedResource
 MarkdownView::new(ElementId, MarkdownInput) -> MarkdownView
 MarkdownView::from_document(ElementId, Arc<MarkdownDocument>) -> MarkdownView
+agent_markdown_preview_path(&ResolvedResource, Option<&str>) -> Option<String>
 
 ArtifactController::schedule(ArtifactRequest) -> ArtifactSchedule
 ArtifactController::complete(request, result, view_id, revision, live_nodes)
@@ -2725,6 +2726,13 @@ pnpm check:code-workbench   -> offline identity/contract check and negative self
   `Fragment`, `Workspace`, `DataImage`, `Http`, or `Blocked`. Raw HTML is inert and
   per-tag/per-attribute allowlisted; event attributes, script/style/forms, unsafe
   schemes, active embeds, and workspace escapes never reach GPUI.
+- A workspace file link may carry an editor location suffix (`:line` or
+  `:line:column`). `ResourcePolicy` removes that suffix from `resolved` while
+  preserving the original `source`. When an Agent link uses the current session's
+  absolute workspace prefix, the click boundary removes that prefix before calling
+  the workspace-scoped preview backend; a leading-slash workspace-root link such as
+  `/README.md` keeps its existing root-relative meaning. Do not pre-rewrite the
+  Markdown source for one product surface.
 - Artifact admission is bounded by source bytes, active slots, queue length, cache
   entries/bytes, timeout, circuit breaker, and stale fencing. Timeout handling uses
   one process-lifetime `OnceLock` worker per engine family with a bounded sync
@@ -2751,6 +2759,7 @@ pnpm check:code-workbench   -> offline identity/contract check and negative self
 | --- | --- |
 | Source exceeds bytes/nodes/depth or parsing is incomplete/malformed | Return a bounded diagnostic and readable literal/last-valid content; never blank or panic. |
 | Resource has unsafe scheme, invalid data image, active HTML attribute/tag, or workspace escape | Return `Blocked` plus a stable diagnostic/disabled affordance; preserve readable label/source. |
+| Workspace file link carries `:line[:column]` or the current session's absolute workspace prefix | Resolve it as `Workspace`, remove only the editor location, and open the workspace-relative preview target. |
 | Artifact source/queue/cache/SVG limit is exceeded | Return a typed local error and source fallback; perform no network request. |
 | Artifact times out or completes for a stale revision/node | Ignore the late result, advance bounded queue state, and never create a residual per-request worker thread. |
 | SVG has DTD/entity, `script`, `foreignObject`, external URL/reference, unsafe CSS, duplicate root, or invalid dimensions | Reject before GPUI rasterization. |
@@ -2765,10 +2774,14 @@ pnpm check:code-workbench   -> offline identity/contract check and negative self
   local PlantUML subset, footnotes/ToC, callouts, definitions, tasks/progress,
   details, and safe HTML through the same document and resource policy in both
   product surfaces.
+- Good: `[app.rs](/work/vibex/src/app.rs:42)` in an Agent session rooted at
+  `/work/vibex` opens `src/app.rs` in the existing preview surface.
 - Good: a timed-out math job remains isolated on the fixed math worker; later work
   is queue-bounded/circuit-broken and stale output cannot replace a newer revision.
 - Base: unknown code language or unsupported diagram syntax renders readable source
   with a bounded diagnostic and working copy action.
+- Base: `[README](/README.md)` remains a workspace-root-relative link rather than
+  being mistaken for an external filesystem read.
 - Bad: pre-rewrite Markdown links for one surface, trust engine SVG because it was
   generated locally, interpret a `viewBox="0 -1500 6000 2000"` as 12 million raster
   pixels despite bounded intrinsic dimensions, or spawn a detached timeout thread
@@ -2780,6 +2793,9 @@ pnpm check:code-workbench   -> offline identity/contract check and negative self
   malformed and bounded fallback, HTML/resource attacks, SVG sanitization, local
   engines, artifact queue/cache/circuit/stale behavior, native GPUI rendering,
   mouse selection, clipboard copy, anchors, details state, theme, and narrow layout.
+- Desktop regression tests must parse real Agent Markdown and assert that relative
+  `:line[:column]`, absolute current-workspace, and leading-slash workspace-root
+  links all produce the exact workspace-relative target passed to Preview.
 - Run `cargo clippy -p vibex-markdown --all-targets -- -D warnings`, the affected
   desktop model/GPUI tests, `wasm32-unknown-unknown` no-default-feature check, and
   `rg -n 'TextView::markdown|project_markdown_for_host' apps/desktop crates/desktop-model`.
@@ -2802,6 +2818,8 @@ std::thread::spawn(move || render_local_artifact(&request, policy));
 
 let raster_pixels = view_box.width * view_box.height;
 TextView::markdown(project_markdown_for_host(source, path).rendered_source)
+let desktop_source = source.replace(workspace_root, "");
+// Surface-specific source rewriting bypasses the canonical resource decision.
 ```
 
 #### Correct
@@ -2814,6 +2832,8 @@ worker.sender.try_send((request, policy, completion))?;
 validate_view_box(view_box, limits.max_svg_dimension)?;
 validate_pixel_area(intrinsic_width, intrinsic_height, limits.max_svg_pixels)?;
 MarkdownView::from_document(id, Arc::new(parse_markdown(input)))
+let resource = ResourcePolicy::new("").resolve(ResourceRole::Link, target, label);
+let preview_path = agent_markdown_preview_path(&resource, Some(workspace_root));
 ```
 
 ## Scenario: GPUI Bounded Office Preview Surface
