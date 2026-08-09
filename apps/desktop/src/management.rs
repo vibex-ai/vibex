@@ -236,6 +236,7 @@ fn management_copy() -> ManagementCopy {
 struct ManagementSnapshot {
     center: ProviderCenterSnapshot,
     provider_profiles: Vec<vibex_core::ProviderProfile>,
+    model_provider_agent_ids: BTreeSet<String>,
     acp_configs: Vec<(String, vibex_core::AcpProviderConfig)>,
     native_import_preview: Option<vibex_core::ProviderNativeImportPreview>,
     agent_profile_states: Vec<AgentProviderProfileState>,
@@ -394,6 +395,7 @@ pub struct ManagementCenter {
     navigation: ManagementNavigation,
     snapshot: ProviderCenterSnapshot,
     provider_profiles: Vec<vibex_core::ProviderProfile>,
+    model_provider_agent_ids: BTreeSet<String>,
     acp_configs: Vec<(String, vibex_core::AcpProviderConfig)>,
     native_import_preview: Option<vibex_core::ProviderNativeImportPreview>,
     agent_profile_states: Vec<AgentProviderProfileState>,
@@ -773,6 +775,7 @@ impl ManagementCenter {
             navigation: ManagementNavigation::default(),
             snapshot: ProviderCenterSnapshot::default(),
             provider_profiles: Vec::new(),
+            model_provider_agent_ids: BTreeSet::new(),
             acp_configs: Vec::new(),
             native_import_preview: None,
             agent_profile_states: Vec::new(),
@@ -1930,6 +1933,7 @@ impl ManagementCenter {
     fn apply_snapshot(&mut self, snapshot: ManagementSnapshot, cx: &mut Context<Self>) {
         self.snapshot = snapshot.center;
         self.provider_profiles = snapshot.provider_profiles;
+        self.model_provider_agent_ids = snapshot.model_provider_agent_ids;
         self.acp_configs = snapshot.acp_configs;
         self.native_import_preview = snapshot.native_import_preview;
         self.agent_profile_states = snapshot.agent_profile_states;
@@ -5626,6 +5630,8 @@ impl ManagementCenter {
                 .iter()
                 .filter(|profile| profile.agent_id == id)
                 .count();
+            let model_provider_configuration_supported =
+                self.model_provider_agent_ids.contains(&id);
             let row =
                 v_flex()
                     .id(SharedString::from(format!("management-agent-row-{id}")))
@@ -5793,7 +5799,7 @@ impl ManagementCenter {
                             .truncate()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(if added {
+                            .child(if added && model_provider_configuration_supported {
                                 management_profile_count(profile_count)
                             } else {
                                 status_label.to_string()
@@ -7545,6 +7551,15 @@ impl ManagementCenter {
             return detail_empty_state(copy.no_agents, copy.no_agents_description, cx);
         }
         let selected_agent_id = selected_agent.id.as_str().to_string();
+        if !self.model_provider_agent_ids.contains(&selected_agent_id) {
+            return v_flex()
+                .w_full()
+                .min_w_0()
+                .gap_3()
+                .child(self.render_agent_installation_card(&selected_agent, window, cx))
+                .child(self.render_agent_authentication(window, cx))
+                .into_any_element();
+        }
         let profiles = self
             .snapshot
             .profiles
@@ -13249,6 +13264,10 @@ async fn load_snapshot(
         include_disabled: true,
     })?;
     let catalog = provider.list_agent_catalog()?;
+    let model_provider_agent_ids = vibex_core::model_provider_configurable_agent_ids()?
+        .into_iter()
+        .map(|agent_id| agent_id.as_str().to_string())
+        .collect();
     let profiles = provider.list_profiles()?;
     let native_import_preview = provider
         .preview_native_import(vibex_core::ProviderNativeImportPreviewRequest {
@@ -13448,6 +13467,7 @@ async fn load_snapshot(
             graphs,
         },
         provider_profiles: profiles,
+        model_provider_agent_ids,
         acp_configs,
         native_import_preview,
         agent_profile_states,
@@ -14159,6 +14179,34 @@ mod tests {
         assert!(!render.contains("render_runtime_verification_card"));
         assert!(!render.contains("runtime_options_card"));
         assert!(!render.contains("render_projection_contract"));
+    }
+
+    #[test]
+    fn agent_settings_show_model_provider_configuration_only_when_supported() {
+        let source = include_str!("management.rs");
+        let render = source
+            .split_once("    fn render_providers(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_mcp("))
+            .map(|(body, _)| body)
+            .expect("Provider renderer should remain inspectable");
+        let capability_gate = render
+            .find(".model_provider_agent_ids")
+            .expect("Provider rendering must consult the shared capability set");
+        let profile_projection = render
+            .find("let profiles = self")
+            .expect("supported Agents should still render Provider profiles");
+
+        assert!(capability_gate < profile_projection);
+        assert!(render.contains("render_agent_installation_card(&selected_agent, window, cx)"));
+        assert!(render.contains("render_agent_authentication(window, cx)"));
+
+        let sidebar = source
+            .split_once("    fn render_agents(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_mcp_sidebar("))
+            .map(|(body, _)| body)
+            .expect("Agent sidebar renderer should remain inspectable");
+        assert!(sidebar.contains("model_provider_configuration_supported"));
+        assert!(sidebar.contains("added && model_provider_configuration_supported"));
     }
 
     #[test]

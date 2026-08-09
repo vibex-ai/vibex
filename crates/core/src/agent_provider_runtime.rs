@@ -185,6 +185,12 @@ impl AgentProviderRolloutManifestEntry {
     pub fn is_runtime_verified(&self) -> bool {
         self.evidence_state == ProjectionEvidenceState::Verified
     }
+
+    pub fn supports_model_provider_configuration(&self) -> bool {
+        self.capability_mode == AgentProviderCapabilityMode::ReplaceableProvider
+            && self.evidence_state != ProjectionEvidenceState::Unverified
+            && self.switch_behavior != ProviderSwitchBehavior::Unverified
+    }
 }
 
 /// Runtime route derivation is shared by the ACP manager, the compatibility
@@ -752,6 +758,14 @@ pub fn agent_provider_rollout_manifest() -> VibexResult<Vec<AgentProviderRollout
     }
     validate_rollout_manifest(&entries)?;
     Ok(entries)
+}
+
+pub fn model_provider_configurable_agent_ids() -> VibexResult<BTreeSet<AgentId>> {
+    Ok(agent_provider_rollout_manifest()?
+        .into_iter()
+        .filter(AgentProviderRolloutManifestEntry::supports_model_provider_configuration)
+        .map(|entry| entry.agent_id)
+        .collect())
 }
 
 pub fn validate_rollout_manifest(entries: &[AgentProviderRolloutManifestEntry]) -> VibexResult<()> {
@@ -1704,6 +1718,31 @@ mod tests {
                     ProviderSwitchBehavior::Unverified
                 );
             }
+        }
+    }
+
+    #[test]
+    fn model_provider_configuration_support_follows_the_rollout_contract() {
+        let supported = model_provider_configurable_agent_ids().unwrap();
+
+        for agent_id in [
+            "claude",
+            "codex",
+            "opencode",
+            "glm-acp-agent",
+            "copilot",
+            "qwen-code",
+        ] {
+            assert!(
+                supported.contains(&AgentId::parse(agent_id).unwrap()),
+                "{agent_id} has a typed model-provider projector"
+            );
+        }
+        for agent_id in ["gemini", "sigit", "agoragentic-acp", "cline"] {
+            assert!(
+                !supported.contains(&AgentId::parse(agent_id).unwrap()),
+                "{agent_id} must not expose model-provider configuration"
+            );
         }
     }
 

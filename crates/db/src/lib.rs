@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -2861,6 +2861,22 @@ impl ProviderProfileRepository {
     }
 
     pub fn list(conn: &Connection) -> VibexResult<Vec<ProviderProfile>> {
+        let configurable_agent_ids = vibex_core::model_provider_configurable_agent_ids()?;
+        Self::list_internal(conn, Some(&configurable_agent_ids))
+    }
+
+    /// Lists every persisted ACP-compatible profile for runtime catalog
+    /// construction. The Config Center uses [`Self::list`] so unsupported
+    /// Agents stay out of the model-provider editor, but their Agent-owned
+    /// runtime profiles must remain available to session startup.
+    pub fn list_all(conn: &Connection) -> VibexResult<Vec<ProviderProfile>> {
+        Self::list_internal(conn, None)
+    }
+
+    fn list_internal(
+        conn: &Connection,
+        configurable_agent_ids: Option<&BTreeSet<AgentId>>,
+    ) -> VibexResult<Vec<ProviderProfile>> {
         Self::ensure_local_defaults(conn)?;
         let mut stmt = conn
             .prepare(
@@ -2873,7 +2889,6 @@ impl ProviderProfileRepository {
                     deleted_at_ms
                 FROM provider_profiles
                 WHERE deleted_at_ms IS NULL
-                    AND agent_id IN ('claude', 'codex', 'opencode')
                     AND provider_kind IN ('claude', 'codex', 'acp')
                 ORDER BY provider_kind ASC, updated_at_ms DESC
                 ",
@@ -2894,6 +2909,11 @@ impl ProviderProfileRepository {
                 "provider_profile_decode_failed",
                 "failed to decode provider profile",
             ))?;
+            if configurable_agent_ids
+                .is_some_and(|agent_ids| !agent_ids.contains(&profile.agent_id))
+            {
+                continue;
+            }
             profile.secrets =
                 ProviderSecretReferenceRepository::list_for_profile(conn, &profile.id)?;
             profiles.push(profile);
@@ -13787,6 +13807,47 @@ mod tests {
             &preview,
         )
         .unwrap();
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn provider_profile_list_uses_model_provider_capability_whitelist() {
+        let temp = temp_db_path("provider-capability-whitelist");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let mut supported = ProviderProfile::local_default(ProviderKind::Acp);
+        supported.id = ProviderProfileId::new();
+        supported.agent_id = AgentId::parse("glm-acp-agent").unwrap();
+        supported.display_name = "GLM custom provider".to_string();
+        supported.status = ProviderProfileStatus::Enabled;
+        ProviderProfileRepository::insert(&conn, &supported).unwrap();
+
+        let mut unsupported = ProviderProfile::local_default(ProviderKind::Acp);
+        unsupported.id = ProviderProfileId::new();
+        unsupported.agent_id = AgentId::parse("gemini").unwrap();
+        unsupported.display_name = "Gemini internal profile".to_string();
+        unsupported.status = ProviderProfileStatus::Enabled;
+        ProviderProfileRepository::insert(&conn, &unsupported).unwrap();
+
+        let listed = ProviderProfileRepository::list(&conn).unwrap();
+        assert!(listed.iter().any(|profile| profile.id == supported.id));
+        assert!(!listed.iter().any(|profile| profile.id == unsupported.id));
+        assert!(
+            ProviderProfileRepository::list_all(&conn)
+                .unwrap()
+                .iter()
+                .any(|profile| profile.id == unsupported.id),
+            "runtime profile listing must retain unsupported Agent profiles"
+        );
+        assert!(
+            ProviderProfileRepository::list_by_agent(&conn, &unsupported.agent_id, true)
+                .unwrap()
+                .iter()
+                .any(|profile| profile.id == unsupported.id),
+            "non-configurable Agents retain their internal runtime profiles"
+        );
 
         cleanup_db(temp);
     }

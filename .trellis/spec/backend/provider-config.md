@@ -2193,6 +2193,15 @@ SessionRuntimeSelection {
 CreateAgentSessionRequest { runtime: SessionRuntimeSelection, ... }
 build_runtime_option_catalog(agents, profiles, evidenceByProfile)
   -> SessionRuntimeOptionCatalog
+AgentProviderRolloutManifestEntry::supports_model_provider_configuration()
+  -> bool
+model_provider_configurable_agent_ids() -> BTreeSet<AgentId>
+ProviderProfileRepository::list()
+  -> profiles owned by model-provider-configurable Agents
+ProviderProfileRepository::list_all()
+  -> every ACP-compatible runtime profile
+ProviderConfigService::list_runtime_profiles()
+  -> ProviderProfileRepository::list_all()
 ```
 
 Tauri commands:
@@ -2242,6 +2251,25 @@ agent_discovery_records(
   and unadded Agents come last; each group sorts case-insensitively by display
   name. Unadded Agents expose their Add action on the card instead of a
   separate catalog dropdown.
+- The rollout manifest is the only Agent-level authority for model-provider
+  configuration visibility. An entry supports the surface only when its
+  capability mode is `ReplaceableProvider` and its evidence/switch contract is
+  not `Unverified`. Database and GPUI code must consume
+  `model_provider_configurable_agent_ids()` instead of repeating Agent ids.
+- `ProviderProfileRepository::list` returns local defaults and profiles whose
+  Agent belongs to that capability-derived set. `list_by_agent` remains able to
+  read internal ACP runtime profiles for Agent-managed, cloud-credential,
+  local-model, marketplace, and conservative Agents; hiding a model-provider
+  editor must not delete or make those runtime records unreadable.
+- Runtime Option Catalog construction uses `list_runtime_profiles` (backed by
+  `ProviderProfileRepository::list_all`) rather than the Config Center list, so
+  Agent-owned ACP profiles continue to produce session options even when their
+  model-provider editor is intentionally hidden.
+- For an added Agent outside the capability-derived set, Config Center keeps
+  the installation and Agent-owned authentication surfaces but omits the
+  provider count, model-provider card, profile rows, import action, and create
+  action. A supported Agent keeps the card even when it currently has zero
+  profiles so the user can create the first one.
 - The GPUI Config Center Agent surface does not load, render, or mutate Provider
   failover recommendations or queues. Backend failover storage and service
   contracts remain independent of this presentation rule.
@@ -2300,6 +2328,12 @@ agent_discovery_records(
   `validation/provider_profile_route_mismatch`.
 - Non-ACP profile during catalog construction -> omit it; never reinterpret it
   as an online profile.
+- `AgentProviderCapabilityMode != ReplaceableProvider`, unverified projection
+  evidence, or unverified switching -> omit the Agent from model-provider
+  configuration lists and controls; retain its internal per-Agent profiles.
+- Rollout manifest validation failure while deriving the configuration set ->
+  propagate the structured manifest error; do not fall back to a stale static
+  Agent whitelist.
 - Agent list storage failures -> `storage/agent_config_*` or
   `storage/agent_discovery_*`.
 - Missing exact ACP route after enabled-Agent resolution ->
@@ -2332,6 +2366,15 @@ agent_discovery_records(
 - Good: explicit OpenCode refresh records the CLI's detected semantic version,
   the compatible range resolves, and the API Key/Endpoint/Model/Wire API
   controls appear without pinning a bundled CLI version.
+- Good: GLM, Copilot, Qwen Code, and other Agents with documented typed
+  projectors appear in the model-provider list without adding their ids to SQL
+  or GPUI constants.
+- Base: Gemini uses its Agent-owned cloud credential flow; Config Center shows
+  installation/authentication but no model-provider card, while its seeded ACP
+  runtime profile remains available through `list_by_agent`.
+- Bad: a newly supported typed projector persists successfully but disappears
+  after refresh because `ProviderProfileRepository::list` still contains only
+  `claude`, `codex`, and `opencode`.
 - Base: a catalog option omits Effort/Mode; the Adapter converges defaults and
   the committed attachment still matches the selection because Model is exact.
 - Good: a configured Codex model receives only the reasoning efforts returned
@@ -2347,8 +2390,16 @@ agent_discovery_records(
 ### 6. Tests Required
 
 - `cargo test -p vibex-core agent` covers `AgentId` validation.
+- `cargo test -p vibex-core model_provider_configuration_support_follows_the_rollout_contract --locked`
+  asserts built-in/typed support and managed/cloud/local/conservative exclusion.
 - `cargo test -p vibex-db agent` covers config/discovery persistence and latest
   discovery selection.
+- `cargo test -p vibex-db provider_profile_list_uses_model_provider_capability_whitelist --locked`
+  asserts a typed catalog Agent is globally visible while an unsupported
+  Agent's internal profile remains readable only through its Agent-scoped path.
+- `cargo test -p vibex-desktop-runtime runtime_catalog_keeps_agent_owned_profiles_visible --locked`
+  asserts runtime option catalog construction retains an unsupported Agent's
+  ACP profile through the full runtime listing path.
 - `cargo test -p vibex-config-switch agent` covers registry merge, enabled
   filtering, low-cost PATH refresh for an added disabled Agent, removed-Agent
   skip behavior, native CLI versus ACP runtime readiness, profile-kind
@@ -2359,6 +2410,9 @@ agent_discovery_records(
   ids and optional Effort/Mode effective-config matching.
 - `cargo test -p vibex-desktop management` covers the unified Agent list order,
   card actions, and absence of the catalog drawer and failover controls.
+- `cargo test -p vibex-desktop agent_settings_show_model_provider_configuration_only_when_supported --locked`
+  asserts capability gating precedes profile rendering and preserves the
+  installation/authentication surfaces.
 - `cargo test -p vibex-desktop agent` and
   `pnpm --dir apps/desktop typecheck` and frontend builds
   cover Runtime Option Catalog/create contract consumption.
@@ -2376,6 +2430,11 @@ let installed = resolve_binary_path(&runtime_command).is_some();
 let agent_id = agent_id_for_provider_kind(request.provider_kind);
 let provider = self.provider(request.provider_kind)?;
 provider.create_session(request).await?;
+
+const MODEL_PROVIDER_AGENTS: &[&str] = &["claude", "codex", "opencode"];
+if snapshot.added {
+    render_model_provider_configuration();
+}
 ```
 
 #### Correct
@@ -2413,6 +2472,13 @@ if profile.agent_id != selection.agent_id
 let route = self.route_for_agent(&agent.agent_id)?;
 self.runtime(&route)?;
 runtime_selection.initialize_new_session(&session_id, selection).await?;
+
+let configurable_agents = model_provider_configurable_agent_ids()?;
+if configurable_agents.contains(&agent.id) {
+    render_model_provider_configuration();
+} else {
+    render_agent_installation_and_authentication();
+}
 ```
 
 Backend session creation owns durable enforcement; frontend catalog filtering

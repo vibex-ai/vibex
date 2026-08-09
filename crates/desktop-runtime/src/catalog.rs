@@ -64,7 +64,7 @@ impl RuntimeOptionCatalogService {
         let agents = self.provider_config.list_agents(AgentListRequest {
             include_disabled: true,
         })?;
-        let profiles = self.provider_config.list_profiles()?;
+        let profiles = self.provider_config.list_runtime_profiles()?;
         let snapshots = self.snapshot_map()?;
         let mut fallback_by_agent = BTreeMap::new();
 
@@ -390,11 +390,11 @@ mod tests {
         ProviderTurnResult,
     };
     use vibex_core::{
-        AgentCommandConfig, AgentModelProviderProfileCreateRequest, AgentReasoningEffort,
-        AgentRuntimeRouteKey, AgentSessionConfigProbe, AgentUpdateConfigRequest, ProviderBinding,
-        ProviderCapabilities, ProviderConfiguredModel, ProviderProfile,
-        ProviderSessionConfigOption, ProviderSessionConfigOptionKind, ProviderSessionConfigValue,
-        TransportKind, VibexResult,
+        AcpProcessStrategy, AcpProviderConfig, AcpProviderProfileCreateRequest, AgentCommandConfig,
+        AgentModelProviderProfileCreateRequest, AgentReasoningEffort, AgentRuntimeRouteKey,
+        AgentSessionConfigProbe, AgentUpdateConfigRequest, ProviderBinding, ProviderCapabilities,
+        ProviderConfiguredModel, ProviderProfile, ProviderSessionConfigOption,
+        ProviderSessionConfigOptionKind, ProviderSessionConfigValue, TransportKind, VibexResult,
     };
 
     struct CountingProvider {
@@ -461,10 +461,23 @@ mod tests {
         AgentId,
         Arc<CountingProvider>,
     ) {
+        catalog_fixture_for_agent("opencode", fail_probe)
+    }
+
+    fn catalog_fixture_for_agent(
+        agent_name: &str,
+        fail_probe: bool,
+    ) -> (
+        TempDir,
+        RuntimeOptionCatalogService,
+        ProviderConfigService,
+        AgentId,
+        Arc<CountingProvider>,
+    ) {
         let directory = tempfile::tempdir().unwrap();
         let database_path = directory.path().join("vibex.db");
         let provider_config = ProviderConfigService::new(&database_path);
-        let agent_id = AgentId::parse("opencode").unwrap();
+        let agent_id = AgentId::parse(agent_name).unwrap();
         provider_config
             .update_agent_config(AgentUpdateConfigRequest {
                 agent_id: agent_id.clone(),
@@ -591,6 +604,41 @@ mod tests {
                 values: Vec::new(),
             }],
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_catalog_keeps_agent_owned_profiles_visible() {
+        let (_directory, catalog, provider_config, agent_id, _provider) =
+            catalog_fixture_for_agent("gemini", false);
+        let profile = provider_config
+            .create_acp_profile(AcpProviderProfileCreateRequest {
+                agent_id: Some(agent_id.clone()),
+                display_name: "Gemini ACP".to_string(),
+                account_alias: None,
+                preset_id: None,
+                config: Some(AcpProviderConfig {
+                    command: "/bin/true".to_string(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    cwd_template: Some("{workspaceRoot}".to_string()),
+                    process_strategy: AcpProcessStrategy::default(),
+                    terminal_tools: false,
+                    terminal_auth: false,
+                    models: vec!["gemini-pro".to_string()],
+                    modes: Vec::new(),
+                    features: Vec::new(),
+                    disabled_tools: Vec::new(),
+                }),
+            })
+            .unwrap();
+
+        let options = catalog.list().await.unwrap().options;
+        assert!(
+            options
+                .iter()
+                .any(|option| option.selection.provider_profile_id == profile.id),
+            "runtime catalog must retain Agent-owned profiles hidden from Config Center"
+        );
     }
 
     #[tokio::test]

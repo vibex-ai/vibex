@@ -517,6 +517,14 @@ impl ProviderConfigService {
         ProviderProfileRepository::list(&conn)
     }
 
+    /// Returns all ACP-compatible profiles needed by runtime option catalog
+    /// construction, including Agent-owned profiles that are intentionally
+    /// hidden from the model-provider Config Center surface.
+    pub fn list_runtime_profiles(&self) -> VibexResult<Vec<ProviderProfile>> {
+        let conn = self.open_connection()?;
+        ProviderProfileRepository::list_all(&conn)
+    }
+
     pub fn get_profile(
         &self,
         provider_profile_id: &ProviderProfileId,
