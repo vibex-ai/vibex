@@ -3808,11 +3808,16 @@ impl ManagementCenter {
     }
 
     fn present_feedback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let agent_auth_error = self.agent_auth_error.take();
         let notice = self.notice.take();
         let notification = self
             .error
             .take()
             .map(|error| Notification::error(locale::localize_error_message(&error)))
+            .or_else(|| {
+                agent_auth_error
+                    .map(|error| Notification::error(locale::localize_error_message(&error)))
+            })
             .or_else(|| {
                 notice.map(|notice| Notification::info(locale::localize_ui_message(&notice)))
             });
@@ -6973,7 +6978,7 @@ impl ManagementCenter {
                     management_locale_text("Not verified", "尚未验证", "尚未驗證")
                 }
             }
-        } else if self.agent_auth_error.is_some() {
+        } else if !self.agent_auth_loading {
             management_locale_text("Unavailable", "暂不可用", "暫不可用")
         } else {
             management_locale_text("Discovering", "正在发现", "正在探索")
@@ -7073,14 +7078,6 @@ impl ManagementCenter {
                 cx,
             ));
         }
-        if let Some(error) = self.agent_auth_error.clone() {
-            content = content.child(status_line(
-                locale::localize_error_message(&error),
-                true,
-                cx,
-            ));
-        }
-
         if let Some(catalog) = catalog {
             if catalog.methods.is_empty() {
                 content = content.child(compact_empty_state(
@@ -13853,6 +13850,7 @@ mod tests {
         );
         assert!(presentation.contains("Notification::info("));
         assert!(presentation.contains("Notification::error("));
+        assert!(presentation.contains("let agent_auth_error = self.agent_auth_error.take();"));
         assert!(presentation.contains(".id::<ManagementCenterFeedbackNotification>()"));
         assert!(presentation.contains(".autohide(true)"));
         assert!(presentation.contains(".on_click(|_, _, _| {})"));
@@ -14406,6 +14404,8 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_providers("))
             .map(|(body, _)| body)
             .expect("Agent authentication renderer should remain inspectable");
+
+        assert!(!render.contains("if let Some(error) = self.agent_auth_error.clone()"));
 
         for expected in [
             "for method in catalog.methods",
