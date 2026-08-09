@@ -498,16 +498,23 @@ impl ProviderConfigService {
                     profile.kind == ProviderKind::Acp && !is_local_default_profile(&profile.id)
                 })
                 .collect::<Vec<_>>();
+        let mut projection_changed = false;
         for profile in &legacy_profiles {
-            self.sync_legacy_projection(&conn, profile)?;
+            projection_changed |= self.sync_legacy_projection(&conn, profile)?;
         }
         let mut agent =
             AgentSnapshotEntry::from_definition(&definition, config.as_ref(), Some(&discovery));
         if let Some(record) = AgentManagedInstallationRepository::get(&conn, &definition.id)? {
             agent.apply_managed_install_state(record.state);
         }
-        for profile in &legacy_profiles {
-            self.notify_profile_saved(profile);
+        // Version discovery is normally idempotent. Only publish a profile
+        // event when reconciling the detected identity actually changed the
+        // effective projection; otherwise Config Center refresh would call
+        // this method again and create a probe/event feedback loop.
+        if projection_changed {
+            for profile in &legacy_profiles {
+                self.notify_profile_saved(profile);
+            }
         }
         Ok(AgentRefreshSnapshotResponse { agent })
     }
@@ -9029,6 +9036,57 @@ mod tests {
             !capability
                 .form_controls
                 .contains(&vibex_core::AgentProjectionFormControl::ApiKey)
+        );
+    }
+
+    #[test]
+    fn repeated_detected_agent_refresh_is_silent_when_projection_is_unchanged() {
+        let _env_lock = env_mutex().lock().unwrap();
+        let dir = tempdir().unwrap();
+        let bin_dir = dir.path().join("bin");
+        write_fake_executable_with_version(&bin_dir, "opencode", "1.18.11");
+        let _path_guard = EnvVarGuard::set("PATH", &bin_dir);
+        let listener = Arc::new(RecordingProfileListener::default());
+        let service = ProviderConfigService::new(dir.path().join("vibex.db"))
+            .with_profile_change_listener(listener.clone());
+        let agent_id = AgentId::parse("opencode").unwrap();
+
+        service
+            .update_agent_config(AgentUpdateConfigRequest {
+                agent_id: agent_id.clone(),
+                added: Some(true),
+                enabled: Some(true),
+                label_override: None,
+                description_override: None,
+                order_index: None,
+                command: None,
+                env: None,
+                params: None,
+            })
+            .unwrap();
+        service
+            .create_acp_profile(AcpProviderProfileCreateRequest {
+                agent_id: Some(agent_id),
+                display_name: "OpenCode ACP".to_string(),
+                account_alias: None,
+                preset_id: Some("opencode".to_string()),
+                config: None,
+            })
+            .unwrap();
+        let profile_mutation_calls = listener.calls.lock().unwrap().len();
+
+        service.refresh_detected_agent_versions().unwrap();
+        let calls_after_first_refresh = listener.calls.lock().unwrap().len();
+        assert!(
+            calls_after_first_refresh > profile_mutation_calls,
+            "the first detected version must invalidate the changed projection"
+        );
+
+        service.refresh_detected_agent_versions().unwrap();
+        assert_eq!(
+            listener.calls.lock().unwrap().len(),
+            calls_after_first_refresh,
+            "an idempotent version refresh must not publish ProfilesChanged"
         );
     }
 

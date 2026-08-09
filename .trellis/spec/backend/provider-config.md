@@ -2091,9 +2091,17 @@ ProviderProfileMutationEvent::{Saved, Deleted}(provider_profile_id)
   must not clear Agent snapshots, call `probe_agent`, enqueue a Profile-scoped
   refresh, or publish `RuntimeOptionsChanged` as a consequence of the Provider
   mutation.
+- Explicit detected-version refresh may reconcile legacy projection rows, but
+  it publishes a profile event only when the effective compatibility rows or
+  projection state changed. An idempotent refresh is silent; otherwise the
+  `ProfilesChanged` consumer would start the same version probe again.
 - After a Provider mutation, clients rebuild the Profile/model projection and
   read the unchanged Agent snapshot. A newly configured model therefore gains
   the Agent's cached controls without another probe.
+- While a client fetches the updated Profile/model projection, it retains the
+  last complete runtime catalog. A provisional catalog with empty Agent
+  evidence is allowed only when no catalog exists yet; it must never replace
+  visible reasoning, mode, or feature controls during an asynchronous refresh.
 
 ### 4. Validation & Error Matrix
 
@@ -2106,6 +2114,8 @@ ProviderProfileMutationEvent::{Saved, Deleted}(provider_profile_id)
   probe.
 - Provider save/delete succeeds -> publish one coalesced `ProfilesChanged`
   event and remote Provider invalidation only.
+- Repeating an explicit detected-version refresh without a projection change
+  -> publish no additional `ProfilesChanged` event.
 - Agent has no successful runtime-option snapshot at startup -> probe it in the
   background and persist either the option snapshot or the failed-attempt
   record. A probe failure must not make the runtime unavailable.
@@ -2122,9 +2132,13 @@ ProviderProfileMutationEvent::{Saved, Deleted}(provider_profile_id)
   refreshes the runtime catalog.
 - Good: adding a Provider Profile updates models and immediately reuses the
   Agent's previously cached modes and Features.
+- Good: a repeated Config Center snapshot with the same detected CLI version
+  leaves the Profile listener quiet and does not start another refresh cycle.
 - Bad: `build_agent_manager` or `activate` awaits a managed download, an ACP
   probe, or complete catalog enrichment before reporting the runtime ready.
 - Bad: a Profile save calls `refresh_profile`/`probe_agent`.
+- Bad: a Profile event installs a catalog built from an empty evidence map over
+  an existing enriched catalog, causing non-model controls to disappear.
 
 ### 6. Tests Required
 
@@ -2135,6 +2149,8 @@ ProviderProfileMutationEvent::{Saved, Deleted}(provider_profile_id)
   refreshes and runtime-option events in Provider mutation consumers.
 - Provider mutation tests assert `ProfilesChanged` is published and no later
   `RuntimeOptionsChanged` arrives.
+- Config-switch tests assert the first detected-version projection change emits
+  an event while the next identical refresh emits none.
 - Runtime catalog tests assert startup/list paths perform no provider or Agent
   process call and Provider changes preserve the Agent snapshot.
 - Desktop tests assert the startup brand overlay is released before overview and

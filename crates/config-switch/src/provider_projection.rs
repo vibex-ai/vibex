@@ -836,9 +836,20 @@ impl ProviderConfigService {
         &self,
         conn: &vibex_db::DbConnection,
         legacy: &vibex_core::ProviderProfile,
-    ) -> VibexResult<()> {
+    ) -> VibexResult<bool> {
+        let previous_model_provider =
+            ModelProviderProfileRepository::get_by_legacy_profile(conn, &legacy.id)?;
+        let previous_agent_runtime =
+            AgentRuntimeProfileRepository::get_by_legacy_profile(conn, &legacy.id)?;
+        let previous_binding =
+            AgentModelProviderBindingRepository::get_by_legacy_profile(conn, &legacy.id)?;
         let records = ProviderProjectionCompatibilityRepository::sync_legacy_profile(conn, legacy)?;
-        self.refresh_one_binding(conn, records.binding)
+        let projection_rows_changed = previous_model_provider.as_ref()
+            != Some(&records.model_provider)
+            || previous_agent_runtime.as_ref() != Some(&records.agent_runtime)
+            || previous_binding.as_ref() != Some(&records.binding);
+        let projection_state_changed = self.refresh_one_binding(conn, records.binding)?;
+        Ok(projection_rows_changed || projection_state_changed)
     }
 
     pub(crate) fn mark_legacy_projection_deleted(
@@ -894,7 +905,7 @@ impl ProviderConfigService {
         &self,
         conn: &vibex_db::DbConnection,
         mut binding: AgentModelProviderBinding,
-    ) -> VibexResult<()> {
+    ) -> VibexResult<bool> {
         let provider = require_model_provider(conn, &binding.model_provider_profile_id)?;
         let runtime = require_runtime(conn, &binding.runtime_profile_id)?;
         let resolution =
@@ -2497,13 +2508,13 @@ fn persist_projection_state_if_changed(
     conn: &vibex_db::DbConnection,
     binding: &AgentModelProviderBinding,
     fingerprint: Option<&str>,
-) -> VibexResult<()> {
+) -> VibexResult<bool> {
     let existing = require_binding(conn, &binding.id)?;
     if existing.projection_fingerprint.as_deref() == fingerprint
         && existing.status == binding.status
         && existing.verification == binding.verification
     {
-        return Ok(());
+        return Ok(false);
     }
     AgentModelProviderBindingRepository::set_projection_state(
         conn,
@@ -2514,7 +2525,7 @@ fn persist_projection_state_if_changed(
         &binding.verification,
         unix_timestamp_ms().max(existing.updated_at_ms.saturating_add(1)),
     )?;
-    Ok(())
+    Ok(true)
 }
 
 fn projection_auth_state(provider: &ModelProviderProfile) -> ProjectionAuthState {

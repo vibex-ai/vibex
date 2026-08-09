@@ -4451,11 +4451,19 @@ impl VibexWorkbench {
                                 &agents,
                                 preferred_new_session_agent.as_ref(),
                             );
-                            this.runtime_catalog = Some(build_runtime_option_catalog_for_agents(
-                                &agents,
-                                &profiles,
-                                &BTreeMap::new(),
-                            ));
+                            // Keep the last complete catalog visible while a
+                            // profile-only refresh fetches the authoritative
+                            // runtime snapshot. Replacing it with an empty
+                            // evidence map would hide modes, effort and
+                            // feature controls for the duration of the load.
+                            if this.runtime_catalog.is_none() {
+                                this.runtime_catalog =
+                                    Some(build_runtime_option_catalog_for_agents(
+                                        &agents,
+                                        &profiles,
+                                        &BTreeMap::new(),
+                                    ));
+                            }
                             this.runtime_provider_profiles = profiles;
                             this.agent_snapshots = agents;
                             if this.reconcile_new_session_runtime_selection()
@@ -4564,7 +4572,9 @@ impl VibexWorkbench {
                                 &agents,
                                 preferred_new_session_agent.as_ref(),
                             );
-                            if this.agent_catalog_generation == catalog_generation {
+                            if this.agent_catalog_generation == catalog_generation
+                                && this.runtime_catalog.is_none()
+                            {
                                 this.runtime_catalog =
                                     Some(build_runtime_option_catalog_for_agents(
                                         &agents,
@@ -37137,6 +37147,7 @@ mod tests {
                 .count(),
             1
         );
+        assert!(overview.contains("this.runtime_catalog.is_none()"));
         assert!(overview.contains("self.agent_catalog_generation = self.agent_catalog_generation"));
         assert!(overview.contains("catalog_generation"));
     }
@@ -37158,6 +37169,7 @@ mod tests {
         assert!(configured_catalog.contains(".list_agents(AgentListRequest"));
         assert!(configured_catalog.contains(".list_profiles().await?"));
         assert!(configured_catalog.contains("build_runtime_option_catalog_for_agents("));
+        assert!(configured_catalog.contains("this.runtime_catalog.is_none()"));
         assert!(configured_catalog.contains("this.load_agent_runtime_catalog(cx);"));
         assert!(!configured_catalog.contains("list_sessions("));
         assert!(!configured_catalog.contains("list_workspaces("));
