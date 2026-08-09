@@ -5725,24 +5725,40 @@ impl ManagementCenter {
                 v_flex()
                     .id(SharedString::from(format!("management-agent-row-{id}")))
                     .aria_label(agent.label.clone())
+                    .relative()
                     .w_full()
                     .gap_1()
-                    .rounded(px(16.0))
+                    .overflow_hidden()
+                    .rounded(px(10.0))
                     .border_1()
-                    .border_color(if selected {
-                        cx.theme().ring.opacity(0.60)
-                    } else {
-                        cx.theme().border.opacity(0.70)
-                    })
+                    .border_color(cx.theme().border.opacity(if selected { 0.0 } else { 0.65 }))
                     .bg(if selected {
-                        cx.theme().accent.opacity(0.35)
+                        cx.theme().primary.opacity(0.12)
                     } else {
                         cx.theme().background.opacity(0.70)
                     })
                     .px_2()
                     .py_2()
-                    .when(!selected, |row| {
-                        row.hover(|style| style.bg(cx.theme().accent.opacity(0.18)))
+                    .hover(|style| {
+                        style
+                            .bg(if selected {
+                                cx.theme().primary.opacity(0.18)
+                            } else {
+                                cx.theme().accent.opacity(0.32)
+                            })
+                            .shadow_xs()
+                    })
+                    .when(selected, |row| {
+                        row.child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .top_2()
+                                .bottom_2()
+                                .w(px(3.0))
+                                .rounded(px(2.0))
+                                .bg(cx.theme().primary),
+                        )
                     })
                     .when(added, |row| {
                         row.role(Role::Button)
@@ -5794,8 +5810,10 @@ impl ManagementCenter {
                                     Button::new(SharedString::from(format!(
                                         "management-agent-probe-{probe_id}"
                                     )))
-                                    .xsmall()
+                                    .small()
                                     .outline()
+                                    .h(px(34.0))
+                                    .px_3()
                                     .icon(IconName::ExternalLink)
                                     .label(management_install_label())
                                     .loading(matches!(
@@ -5832,7 +5850,7 @@ impl ManagementCenter {
                                     )))
                                     .small()
                                     .ghost()
-                                    .size(px(32.0))
+                                    .size(px(36.0))
                                     .icon(IconName::CircleX)
                                     .tooltip(copy.remove)
                                     .loading(managed_uninstalling)
@@ -5862,7 +5880,7 @@ impl ManagementCenter {
                                     )))
                                     .small()
                                     .outline()
-                                    .size(px(32.0))
+                                    .size(px(36.0))
                                     .icon(IconName::Plus)
                                     .tooltip(management_add_label())
                                     .loading(
@@ -6949,6 +6967,7 @@ impl ManagementCenter {
     fn render_agent_authentication(
         &mut self,
         window: &mut Window,
+        provider_configuration: Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.ensure_agent_auth_inputs(window, cx);
@@ -7025,6 +7044,8 @@ impl ManagementCenter {
                             Button::new("agent-auth-refresh")
                                 .small()
                                 .outline()
+                                .h(px(38.0))
+                                .px_3()
                                 .icon(Icon::default().path("icons/vibex/rotate-ccw.svg"))
                                 .label(management_locale_text(
                                     "Refresh methods",
@@ -7042,6 +7063,8 @@ impl ManagementCenter {
                                 Button::new("agent-auth-logout")
                                     .small()
                                     .danger()
+                                    .h(px(38.0))
+                                    .px_3()
                                     .label(management_locale_text("Sign out", "退出登录", "登出"))
                                     .loading(matches!(
                                         self.mutation,
@@ -7054,6 +7077,9 @@ impl ManagementCenter {
                         }),
                 ),
         );
+        content = content.when_some(provider_configuration, |content, configuration| {
+            content.child(configuration)
+        });
 
         if !auth_available {
             content = content.child(status_line(
@@ -7225,8 +7251,10 @@ impl ManagementCenter {
                                             Button::new(SharedString::from(format!(
                                                 "agent-auth-clear-{key}"
                                             )))
-                                            .xsmall()
+                                            .small()
                                             .outline()
+                                            .h(px(34.0))
+                                            .px_3()
                                             .label(if clearing {
                                                 management_locale_text(
                                                     "Keep saved value",
@@ -7259,8 +7287,10 @@ impl ManagementCenter {
                                 "agent-auth-credential-link-{}",
                                 method.id
                             )))
-                            .xsmall()
+                            .small()
                             .link()
+                            .h(px(34.0))
+                            .px_2()
                             .label(management_locale_text(
                                 "Get credentials",
                                 "获取凭据",
@@ -7282,6 +7312,8 @@ impl ManagementCenter {
                         )))
                         .small()
                         .primary()
+                        .h(px(38.0))
+                        .px_3()
                         .label(action_label)
                         .loading(method_loading)
                         .disabled(
@@ -7324,6 +7356,7 @@ impl ManagementCenter {
                                 Button::new("agent-auth-terminal-close")
                                     .xsmall()
                                     .ghost()
+                                    .size(px(36.0))
                                     .icon(IconName::Close)
                                     .tooltip(management_locale_text(
                                         "Close sign-in terminal",
@@ -7358,13 +7391,14 @@ impl ManagementCenter {
                     );
         }
 
-        management_card(
+        management_card_with_icon(
             management_locale_text("Authentication", "登录与认证", "登入與驗證"),
             management_locale_text(
-                "Selected Agent authentication methods",
-                "当前 Agent 认证方式",
-                "目前 Agent 驗證方式",
+                "Agent sign-in and model provider credentials",
+                "Agent 登录与模型供应商凭据",
+                "Agent 登入與模型供應商憑證",
             ),
+            "icons/vibex/shield-alert.svg",
             content.into_any_element(),
             cx,
         )
@@ -7394,13 +7428,14 @@ impl ManagementCenter {
                 "Agent 會先下載並驗證，完成後才會正式可用。",
             )
         };
-        management_card(
+        management_card_with_icon(
             title,
             management_locale_text(
                 "Verified ACP Registry runtime",
                 "ACP Registry 托管运行时",
                 "ACP Registry 託管執行環境",
             ),
+            "icons/vibex/download.svg",
             v_flex()
                 .w_full()
                 .items_center()
@@ -7466,13 +7501,14 @@ impl ManagementCenter {
                             "Vibex 使用此 Agent 在 PATH 中已有的 CLI。",
                         )),
                 );
-            return management_card(
+            return management_card_with_icon(
                 management_locale_text("Agent installation", "Agent 安装", "Agent 安裝"),
                 management_locale_text(
                     "This Agent is not distributed through the verified ACP Registry.",
                     "此 Agent 暂未提供可校验的 ACP Registry 分发包。",
                     "此 Agent 暫未提供可驗證的 ACP Registry 分發包。",
                 ),
+                "icons/vibex/download.svg",
                 content.into_any_element(),
                 cx,
             );
@@ -7550,6 +7586,8 @@ impl ManagementCenter {
                 Button::new(SharedString::from(format!("management-agent-install-{id}")))
                     .small()
                     .primary()
+                    .h(px(38.0))
+                    .px_3()
                     .icon(IconName::ArrowDown)
                     .label(management_locale_text("Install", "安装", "安裝"))
                     .loading(upgrading)
@@ -7564,6 +7602,8 @@ impl ManagementCenter {
                 Button::new(SharedString::from(format!("management-agent-check-{id}")))
                     .small()
                     .outline()
+                    .h(px(38.0))
+                    .px_3()
                     .icon(IconName::Search)
                     .label(management_locale_text(
                         "Check for updates",
@@ -7583,6 +7623,8 @@ impl ManagementCenter {
                 Button::new(SharedString::from(format!("management-agent-upgrade-{id}")))
                     .small()
                     .primary()
+                    .h(px(38.0))
+                    .px_3()
                     .icon(IconName::ArrowUp)
                     .label(management_locale_text("Upgrade", "升级", "升級"))
                     .loading(upgrading)
@@ -7601,6 +7643,8 @@ impl ManagementCenter {
                 )))
                 .small()
                 .danger()
+                .h(px(38.0))
+                .px_3()
                 .icon(IconName::Delete)
                 .label(management_locale_text("Uninstall", "卸载", "解除安裝"))
                 .loading(uninstalling)
@@ -7621,13 +7665,14 @@ impl ManagementCenter {
             );
         }
         content = content.child(actions);
-        management_card(
+        management_card_with_icon(
             management_locale_text("Agent installation", "Agent 安装", "Agent 安裝"),
             management_locale_text(
                 "Vibex-managed runtime",
                 "Vibex 托管运行时",
                 "Vibex 託管執行環境",
             ),
+            "icons/vibex/download.svg",
             content.into_any_element(),
             cx,
         )
@@ -7683,7 +7728,7 @@ impl ManagementCenter {
                 .gap_4()
                 .child(agent_header)
                 .child(self.render_agent_installation_card(&selected_agent, window, cx))
-                .child(self.render_agent_authentication(window, cx))
+                .child(self.render_agent_authentication(window, None, cx))
                 .into_any_element();
         }
         let profiles = self
@@ -7815,7 +7860,7 @@ impl ManagementCenter {
                         .xsmall()
                         .outline()
                         .compact()
-                        .size(px(30.0))
+                        .size(px(36.0))
                         .icon(IconName::Check)
                         .tooltip(management_set_default_label())
                         .disabled(pending)
@@ -7835,7 +7880,7 @@ impl ManagementCenter {
                         .xsmall()
                         .secondary()
                         .compact()
-                        .size(px(30.0))
+                        .size(px(36.0))
                         .icon(Icon::default().path("icons/vibex/pencil.svg"))
                         .disabled(pending)
                         .tooltip(management_locale_text(
@@ -7855,7 +7900,7 @@ impl ManagementCenter {
                     .xsmall()
                     .outline()
                     .compact()
-                    .size(px(30.0))
+                    .size(px(36.0))
                     .icon(IconName::Copy)
                     .disabled(pending)
                     .tooltip(management_locale_text(
@@ -7873,7 +7918,7 @@ impl ManagementCenter {
                         .xsmall()
                         .secondary()
                         .compact()
-                        .size(px(30.0))
+                        .size(px(36.0))
                         .icon(Icon::default().path("icons/vibex/activity.svg"))
                         .loading(testing)
                         .disabled(pending)
@@ -7892,7 +7937,7 @@ impl ManagementCenter {
                         .xsmall()
                         .danger()
                         .compact()
-                        .size(px(30.0))
+                        .size(px(36.0))
                         .icon(IconName::Delete)
                         .loading(deleting)
                         .disabled(pending)
@@ -7921,24 +7966,32 @@ impl ManagementCenter {
                     .overflow_hidden()
                     .rounded(px(14.0))
                     .border_1()
-                    .border_color(if is_default {
-                        cx.theme().primary.opacity(0.25)
-                    } else if active {
-                        cx.theme().ring.opacity(0.50)
-                    } else {
-                        cx.theme().border.opacity(0.70)
-                    })
-                    .bg(if is_default {
-                        cx.theme().background.opacity(0.95)
-                    } else if active {
-                        cx.theme().accent.opacity(0.20)
+                    .border_color(cx.theme().border.opacity(if active { 0.0 } else { 0.65 }))
+                    .bg(if active {
+                        cx.theme().primary.opacity(0.10)
                     } else {
                         cx.theme().background.opacity(0.90)
                     })
                     .hover(|style| {
                         style
-                            .border_color(cx.theme().ring.opacity(0.55))
-                            .bg(cx.theme().accent.opacity(if active { 0.28 } else { 0.12 }))
+                            .bg(if active {
+                                cx.theme().primary.opacity(0.16)
+                            } else {
+                                cx.theme().accent.opacity(0.28)
+                            })
+                            .shadow_xs()
+                    })
+                    .when(active, |row| {
+                        row.child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .top_2()
+                                .bottom_2()
+                                .w(px(3.0))
+                                .rounded(px(2.0))
+                                .bg(cx.theme().primary),
+                        )
                     })
                     .child(selectable)
                     .child(actions),
@@ -7946,7 +7999,87 @@ impl ManagementCenter {
         }
 
         let installation = self.render_agent_installation_card(&selected_agent, window, cx);
-        let authentication = self.render_agent_authentication(window, cx);
+        let provider_configuration = v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_3()
+            .border_t_1()
+            .border_color(cx.theme().border.opacity(0.75))
+            .pt_4()
+            .child(management_module_heading(
+                copy.provider_configuration,
+                management_locale_text(
+                    "Credentials used to connect this Agent to model services",
+                    "用于连接此 Agent 与模型服务的凭据配置",
+                    "用於連接此 Agent 與模型服務的憑證設定",
+                ),
+                "icons/vibex/database.svg",
+                cx,
+            ))
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_profile_count(profiles.len())),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .flex_wrap()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("provider-import-existing")
+                                    .small()
+                                    .secondary()
+                                    .h(px(38.0))
+                                    .px_3()
+                                    .icon(Icon::default().path("icons/vibex/import.svg"))
+                                    .label(copy.import_configuration)
+                                    .loading(native_importing)
+                                    .disabled(
+                                        pending
+                                            || cc_switch_import_candidate_count.is_none()
+                                            || cc_switch_import_candidate_count == Some(0),
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let agent_id = this.selected_agent_id.clone();
+                                        this.preview_native_import(true, agent_id, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("provider-add-configuration")
+                                    .small()
+                                    .primary()
+                                    .h(px(38.0))
+                                    .px_3()
+                                    .icon(Icon::default().path("icons/vibex/plug-zap.svg"))
+                                    .label(copy.add_configuration)
+                                    .disabled(pending)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_profile_creator(window, cx);
+                                    })),
+                            ),
+                    ),
+            )
+            .child(if profiles.is_empty() {
+                compact_empty_state(copy.no_profiles, copy.no_profiles_description, cx)
+            } else {
+                profile_rows.into_any_element()
+            });
+        let authentication = self.render_agent_authentication(
+            window,
+            Some(provider_configuration.into_any_element()),
+            cx,
+        );
 
         v_flex()
             .w_full()
@@ -7955,82 +8088,6 @@ impl ManagementCenter {
             .child(agent_header)
             .child(installation)
             .child(authentication)
-            .child(
-                v_flex()
-                    .w_full()
-                    .gap_3()
-                    .rounded(px(8.0))
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .p_4()
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .min_w_0()
-                            .flex_wrap()
-                            .items_center()
-                            .justify_between()
-                            .gap_3()
-                            .child(
-                                v_flex()
-                                    .min_w_0()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .truncate()
-                                            .text_sm()
-                                            .font_semibold()
-                                            .child(copy.provider_configuration),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(management_profile_count(profiles.len())),
-                                    ),
-                            )
-                            .child(
-                                h_flex()
-                                    .flex_none()
-                                    .flex_wrap()
-                                    .justify_end()
-                                    .gap_2()
-                                    .child(
-                                        Button::new("provider-import-existing")
-                                            .small()
-                                            .secondary()
-                                            .icon(Icon::default().path("icons/vibex/import.svg"))
-                                            .label(copy.import_configuration)
-                                            .loading(native_importing)
-                                            .disabled(
-                                                pending
-                                                    || cc_switch_import_candidate_count.is_none()
-                                                    || cc_switch_import_candidate_count == Some(0),
-                                            )
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                let agent_id = this.selected_agent_id.clone();
-                                                this.preview_native_import(true, agent_id, cx)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("provider-add-configuration")
-                                            .small()
-                                            .primary()
-                                            .icon(Icon::default().path("icons/vibex/plug-zap.svg"))
-                                            .label(copy.add_configuration)
-                                            .disabled(pending)
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.open_profile_creator(window, cx);
-                                            })),
-                                    ),
-                            ),
-                    )
-                    .child(if profiles.is_empty() {
-                        compact_empty_state(copy.no_profiles, copy.no_profiles_description, cx)
-                    } else {
-                        profile_rows.into_any_element()
-                    }),
-            )
             .into_any_element()
     }
 
@@ -13739,6 +13796,26 @@ fn management_card(
     content: AnyElement,
     cx: &mut Context<ManagementCenter>,
 ) -> AnyElement {
+    management_card_inner(title, description, None, content, cx)
+}
+
+fn management_card_with_icon(
+    title: &'static str,
+    description: &'static str,
+    icon_path: &'static str,
+    content: AnyElement,
+    cx: &mut Context<ManagementCenter>,
+) -> AnyElement {
+    management_card_inner(title, description, Some(icon_path), content, cx)
+}
+
+fn management_card_inner(
+    title: &'static str,
+    description: &'static str,
+    icon_path: Option<&'static str>,
+    content: AnyElement,
+    cx: &mut Context<ManagementCenter>,
+) -> AnyElement {
     v_flex()
         .w_full()
         .min_w_0()
@@ -13748,7 +13825,9 @@ fn management_card(
         .border_color(cx.theme().border)
         .bg(cx.theme().background.opacity(0.75))
         .p_4()
-        .child(
+        .child(if let Some(icon_path) = icon_path {
+            management_module_heading(title, description, icon_path, cx)
+        } else {
             v_flex()
                 .min_w_0()
                 .gap_1()
@@ -13758,9 +13837,53 @@ fn management_card(
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child(description),
+                )
+                .into_any_element()
+        })
+        .child(content)
+        .into_any_element()
+}
+
+fn management_module_heading(
+    title: &'static str,
+    description: &'static str,
+    icon_path: &'static str,
+    cx: &mut Context<ManagementCenter>,
+) -> AnyElement {
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .items_center()
+        .gap_3()
+        .child(
+            div()
+                .size(px(36.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(8.0))
+                .bg(cx.theme().accent.opacity(0.45))
+                .child(
+                    Icon::default()
+                        .path(icon_path)
+                        .size(px(18.0))
+                        .text_color(cx.theme().foreground.opacity(0.82)),
                 ),
         )
-        .child(content)
+        .child(
+            v_flex()
+                .min_w_0()
+                .flex_1()
+                .gap_1()
+                .child(div().text_sm().font_semibold().child(title))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(description),
+                ),
+        )
         .into_any_element()
 }
 
@@ -14446,7 +14569,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("Provider renderer should remain inspectable");
 
-        assert!(render.contains("render_agent_authentication(window, cx)"));
+        assert!(render.contains("render_agent_authentication(window, None, cx)"));
         assert!(!render.contains("render_runtime_verification_card"));
         assert!(!render.contains("runtime_options_card"));
         assert!(!render.contains("render_projection_contract"));
@@ -14469,7 +14592,7 @@ mod tests {
 
         assert!(capability_gate < profile_projection);
         assert!(render.contains("render_agent_installation_card(&selected_agent, window, cx)"));
-        assert!(render.contains("render_agent_authentication(window, cx)"));
+        assert!(render.contains("render_agent_authentication(window, None, cx)"));
 
         let sidebar = source
             .split_once("    fn render_agents(")
@@ -14492,6 +14615,10 @@ mod tests {
         assert!(render.contains("management_agent_detail_header"));
         assert!(render.contains("icons/vibex/grip-vertical.svg"));
         assert!(render.contains("management_model_count"));
+        assert!(render.contains("cx.theme().primary.opacity(0.10)"));
+        assert!(render.contains("cx.theme().accent.opacity(0.28)"));
+        assert!(render.contains(".shadow_xs()"));
+        assert!(!render.contains("cx.theme().ring.opacity(0.50)"));
         assert!(!render.contains(".invisible()"));
         assert!(!render.contains(".group_hover("));
         for action in [
@@ -14512,6 +14639,48 @@ mod tests {
             .map(|(body, _)| body)
             .expect("Provider glyph should remain inspectable");
         assert!(glyph.contains("agent_brand_icon("));
+    }
+
+    #[test]
+    fn agent_details_merge_provider_credentials_into_authentication() {
+        let source = include_str!("management.rs");
+        let render = source
+            .split_once("    fn render_providers(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_mcp("))
+            .map(|(body, _)| body)
+            .expect("Provider renderer should remain inspectable");
+        let authentication = source
+            .split_once("    fn render_agent_authentication(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_agent_install_loading("))
+            .map(|(body, _)| body)
+            .expect("Authentication renderer should remain inspectable");
+
+        assert!(render.contains("let provider_configuration = v_flex()"));
+        assert!(render.contains("icons/vibex/database.svg"));
+        assert!(render.contains("Some(provider_configuration.into_any_element())"));
+        assert!(authentication.contains("provider_configuration: Option<AnyElement>"));
+        assert!(authentication.contains("content.when_some(provider_configuration"));
+        assert!(authentication.contains("icons/vibex/shield-alert.svg"));
+    }
+
+    #[test]
+    fn agent_detail_modules_have_icons_and_larger_actions() {
+        let source = include_str!("management.rs");
+        let install = source
+            .split_once("    fn render_agent_installation_card(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_providers("))
+            .map(|(body, _)| body)
+            .expect("Installation renderer should remain inspectable");
+        let render = source
+            .split_once("    fn render_providers(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_mcp("))
+            .map(|(body, _)| body)
+            .expect("Provider renderer should remain inspectable");
+
+        assert!(install.contains("management_card_with_icon("));
+        assert!(install.contains("icons/vibex/download.svg"));
+        assert!(render.contains(".size(px(36.0))"));
+        assert!(render.contains(".h(px(38.0))"));
     }
 
     #[test]
@@ -14622,6 +14791,10 @@ mod tests {
         assert!(render_agents.contains("agents.sort_by_cached_key(management_agent_sort_key);"));
         assert!(render_agents.contains("management-agent-add-{add_id}"));
         assert!(!render_agents.contains("management-agent-catalog-"));
+        assert!(render_agents.contains("cx.theme().primary.opacity(0.12)"));
+        assert!(render_agents.contains("cx.theme().accent.opacity(0.32)"));
+        assert!(render_agents.contains(".shadow_xs()"));
+        assert!(!render_agents.contains("cx.theme().ring.opacity(0.60)"));
         assert!(render_agents.matches("cx.stop_propagation();").count() >= 4);
     }
 
