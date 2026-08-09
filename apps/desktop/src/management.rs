@@ -365,6 +365,20 @@ impl ManagementMutation {
             Self::BackupRestore => "backup:restore".into(),
         }
     }
+
+    fn concurrent_agent_id(&self) -> Option<&str> {
+        match self {
+            Self::AgentToggle(action) => Some(
+                action
+                    .rsplit_once(':')
+                    .map_or(action.as_str(), |(_, agent_id)| agent_id),
+            ),
+            Self::AgentInstall(agent_id)
+            | Self::AgentUpdateCheck(agent_id)
+            | Self::AgentUninstall(agent_id) => Some(agent_id),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -424,11 +438,13 @@ pub struct ManagementCenter {
     devices: Vec<vibex_core::RemoteDeviceDetail>,
     loading: bool,
     mutation: Option<ManagementMutation>,
+    agent_mutations: BTreeMap<String, ManagementMutation>,
     error: Option<String>,
     notice: Option<String>,
     generation: u64,
     refresh_task: Option<Task<()>>,
     mutation_task: Option<Task<()>>,
+    agent_mutation_tasks: BTreeMap<String, Task<()>>,
     agent_auth_task: Option<Task<()>>,
     agent_auth_terminal_monitor_task: Option<Task<()>>,
     discover_agents_after_refresh: bool,
@@ -804,11 +820,13 @@ impl ManagementCenter {
             devices: Vec::new(),
             loading: false,
             mutation: None,
+            agent_mutations: BTreeMap::new(),
             error: None,
             notice: None,
             generation: 0,
             refresh_task: None,
             mutation_task: None,
+            agent_mutation_tasks: BTreeMap::new(),
             agent_auth_task: None,
             agent_auth_terminal_monitor_task: None,
             discover_agents_after_refresh: false,
@@ -3614,26 +3632,48 @@ impl ManagementCenter {
     ) where
         F: std::future::Future<Output = VibexResult<String>> + Send + 'static,
     {
-        if self.mutation.is_some() {
-            self.notice = Some(
-                management_locale_text(
-                    "Another management action is still pending",
-                    "另一项配置操作仍在处理中",
-                    "另一項配置操作仍在處理中",
-                )
-                .into(),
-            );
-            cx.notify();
-            return;
+        let concurrent_agent_id = mutation.concurrent_agent_id().map(str::to_string);
+        if let Some(agent_id) = concurrent_agent_id.as_deref() {
+            if self.agent_mutations.contains_key(agent_id) {
+                self.notice = Some(
+                    management_locale_text(
+                        "Another action for this Agent is still pending",
+                        "此 Agent 的另一项操作仍在处理中",
+                        "此 Agent 的另一項操作仍在處理中",
+                    )
+                    .into(),
+                );
+                cx.notify();
+                return;
+            }
+            self.agent_mutations
+                .insert(agent_id.to_string(), mutation.clone());
+        } else {
+            if self.mutation.is_some() {
+                self.notice = Some(
+                    management_locale_text(
+                        "Another management action is still pending",
+                        "另一项配置操作仍在处理中",
+                        "另一項配置操作仍在處理中",
+                    )
+                    .into(),
+                );
+                cx.notify();
+                return;
+            }
+            self.mutation = Some(mutation.clone());
         }
-        self.mutation = Some(mutation.clone());
         let completed_mutation = mutation;
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, work);
-        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+        let task = cx.spawn(async move |_, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
-                this.mutation = None;
+                if let Some(agent_id) = completed_mutation.concurrent_agent_id() {
+                    this.agent_mutations.remove(agent_id);
+                } else {
+                    this.mutation = None;
+                }
                 let agent_registry_changed = matches!(
                     &completed_mutation,
                     ManagementMutation::AgentToggle(_)
@@ -3722,7 +3762,14 @@ impl ManagementCenter {
                     }
                 }
             });
-        }));
+        });
+        if let Some(agent_id) = concurrent_agent_id {
+            self.agent_mutation_tasks
+                .retain(|_, existing| !existing.is_ready());
+            self.agent_mutation_tasks.insert(agent_id, task);
+        } else {
+            self.mutation_task = Some(task);
+        }
     }
 
     fn present_feedback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5558,7 +5605,6 @@ impl ManagementCenter {
             .cloned()
             .collect::<Vec<_>>();
         agents.sort_by_cached_key(management_agent_sort_key);
-        let pending = self.mutation.is_some();
         let mut agent_rows = v_flex().w_full().gap(px(6.0));
         if agents.is_empty() {
             agent_rows = agent_rows.child(compact_empty_state(
@@ -5569,6 +5615,8 @@ impl ManagementCenter {
         }
         for agent in agents {
             let id = agent.id.as_str().to_string();
+            let mutation = self.agent_mutations.get(&id);
+            let pending = mutation.is_some();
             let row_select_id = id.clone();
             let keyboard_select_id = id.clone();
             let toggle_id = id.clone();
@@ -5579,11 +5627,11 @@ impl ManagementCenter {
             let add_id = id.clone();
             let added = agent.added;
             let managed_installing = matches!(
-                &self.mutation,
+                mutation,
                 Some(ManagementMutation::AgentInstall(active_id)) if active_id == &id
             );
             let managed_uninstalling = matches!(
-                &self.mutation,
+                mutation,
                 Some(ManagementMutation::AgentUninstall(active_id)) if active_id == &id
             );
             let selected = (added || agent.managed_install.managed || managed_installing)
@@ -5710,7 +5758,7 @@ impl ManagementCenter {
                                     .icon(IconName::ExternalLink)
                                     .label(management_install_label())
                                     .loading(matches!(
-                                        &self.mutation,
+                                        mutation,
                                         Some(ManagementMutation::AgentToggle(action))
                                             if action == &format!("probe:{probe_id}")
                                     ))
@@ -5779,7 +5827,7 @@ impl ManagementCenter {
                                     .loading(
                                         managed_installing
                                             || matches!(
-                                                &self.mutation,
+                                                mutation,
                                                 Some(ManagementMutation::AgentToggle(action))
                                                     if action == &format!("add:{add_id}")
                                             ),
@@ -6235,7 +6283,8 @@ impl ManagementCenter {
         selected_agent_id: String,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let pending = self.mutation.is_some();
+        let pending =
+            self.mutation.is_some() || self.agent_mutations.contains_key(&selected_agent_id);
         let wire_api_choices = self.projection_editor.wire_api_choices();
         let shows_wire_api = self
             .projection_editor
@@ -6671,7 +6720,8 @@ impl ManagementCenter {
             return div().size_full().into_any_element();
         }
         let selected_agent_id = self.selected_agent_id.clone().unwrap_or_default();
-        let pending = self.mutation.is_some();
+        let pending =
+            self.mutation.is_some() || self.agent_mutations.contains_key(&selected_agent_id);
         let updating = self.editing_profile_id.is_some();
         let saving = matches!(
             self.mutation,
@@ -6833,6 +6883,10 @@ impl ManagementCenter {
         self.ensure_agent_auth_inputs(window, cx);
         self.ensure_agent_auth_terminal_surface(window, cx);
         let pending = self.mutation.is_some()
+            || self
+                .selected_agent_id
+                .as_deref()
+                .is_some_and(|agent_id| self.agent_mutations.contains_key(agent_id))
             || self.agent_auth_terminal_state == Some(AgentAuthTerminalState::Running);
         let selected_profile_label = self
             .selected_management_provider_profile()
@@ -7362,6 +7416,7 @@ impl ManagementCenter {
         }
 
         let id = agent.id.as_str().to_string();
+        let mutation = self.agent_mutations.get(&id);
         let healthy_installation = state.has_usable_installation();
         let needs_install = !healthy_installation
             && matches!(
@@ -7371,15 +7426,15 @@ impl ManagementCenter {
             );
         let checking = healthy_installation
             && matches!(
-                &self.mutation,
+                mutation,
                 Some(ManagementMutation::AgentUpdateCheck(active_id)) if active_id == &id
             );
         let upgrading = matches!(
-            &self.mutation,
+            mutation,
             Some(ManagementMutation::AgentInstall(active_id)) if active_id == &id
         );
         let uninstalling = matches!(
-            &self.mutation,
+            mutation,
             Some(ManagementMutation::AgentUninstall(active_id)) if active_id == &id
         );
         let update_available =
@@ -7425,7 +7480,7 @@ impl ManagementCenter {
                     .child(error.to_string()),
             );
         }
-        let pending = self.mutation.is_some();
+        let pending = mutation.is_some();
         let mut actions = h_flex().w_full().justify_end().gap_2();
         if needs_install {
             actions = actions.child(
@@ -7527,7 +7582,7 @@ impl ManagementCenter {
         };
         let selected_id = selected_agent.id.as_str().to_string();
         if matches!(
-            &self.mutation,
+            self.agent_mutations.get(&selected_id),
             Some(ManagementMutation::AgentInstall(active_id)) if active_id == &selected_id
         ) {
             return self.render_agent_install_loading(
@@ -7570,7 +7625,8 @@ impl ManagementCenter {
         let selected_profile_id = self
             .selected_management_provider_profile()
             .map(|profile| profile.id.as_str().to_string());
-        let pending = self.mutation.is_some();
+        let pending =
+            self.mutation.is_some() || self.agent_mutations.contains_key(&selected_agent_id);
         let native_importing = matches!(
             &self.mutation,
             Some(ManagementMutation::ProviderPreview(action)) if action == "native-import"
@@ -13612,6 +13668,45 @@ fn empty_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_mutations_are_keyed_by_their_target_agent() {
+        for (mutation, expected) in [
+            (ManagementMutation::AgentToggle("codex".into()), "codex"),
+            (
+                ManagementMutation::AgentToggle("add:claude".into()),
+                "claude",
+            ),
+            (
+                ManagementMutation::AgentToggle("probe:opencode".into()),
+                "opencode",
+            ),
+            (ManagementMutation::AgentInstall("pi".into()), "pi"),
+            (
+                ManagementMutation::AgentUpdateCheck("gemini".into()),
+                "gemini",
+            ),
+            (ManagementMutation::AgentUninstall("kiro".into()), "kiro"),
+        ] {
+            assert_eq!(mutation.concurrent_agent_id(), Some(expected));
+        }
+        assert_eq!(
+            ManagementMutation::AgentDiscovery.concurrent_agent_id(),
+            None
+        );
+        assert_eq!(
+            ManagementMutation::ProfileCreate.concurrent_agent_id(),
+            None
+        );
+
+        let mut pending = BTreeMap::new();
+        pending.insert(
+            "codex".to_string(),
+            ManagementMutation::AgentInstall("codex".into()),
+        );
+        assert!(pending.contains_key("codex"));
+        assert!(!pending.contains_key("claude"));
+    }
 
     fn provider_options(entries: &[(&str, &str)]) -> vibex_core::ProviderOptions {
         vibex_core::ProviderOptions {

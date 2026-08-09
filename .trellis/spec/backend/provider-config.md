@@ -2520,6 +2520,12 @@ AgentInstallService::install(agent_id).await
 AgentInstallService::check_update(agent_id).await
 AgentInstallService::uninstall(agent_id).await
 AgentInstallService::bootstrap_agent_ids() -> Vec<AgentId>
+ConfigCenter.agent_mutations[agent_id] -> ManagementMutation
+AgentInstallService operation keys:
+  agent:<agent_id>
+  shared:registry
+  shared:runtime:<node|uv>
+  shared:download:<artifact_identity>
 AgentNodeRuntimeOptions { node_path, npm_path }
 AgentUvRuntimeOptions { uv_path }
 AgentManagedInstallationRecord {
@@ -2533,6 +2539,19 @@ AgentManagedInstallationRecord {
   disabled loading state until the verified command is published; only then
   does the UI set `added = true`/`enabled = true`, refresh runtime capability
   data, and discover authentication methods for the user to choose.
+- Agent operations are pending per Agent id in both Config Center and
+  `AgentInstallService`. Install, update check, uninstall, Add/remove, toggle,
+  and probe for one Agent disable only that Agent's controls; another Agent may
+  start and finish an operation concurrently. A second operation for the same
+  Agent remains serialized so its durable install/config/auth transitions
+  cannot overlap.
+- Registry refresh, managed Node/uv publication, and verified download-cache
+  publication use separate shared resource keys. Operations for unrelated
+  Agents must not share one global lock, while operations that resolve the same
+  shared resource must coalesce or serialize before replacing its cache entry.
+  Completed UI operations reload the authoritative snapshot; generation fencing
+  makes the newest reload win when several Agent operations finish close
+  together.
 - The upstream Registry response is cached for one hour. Binary archives must
   carry a SHA-256. npm distributions must use an exact version, metadata
   integrity, and the canonical `registry.npmjs.org` tarball URL; the lockfile
@@ -2656,6 +2675,10 @@ AgentManagedInstallationRecord {
   failed and does not re-enable a missing process.
 - Uninstall failure -> preserve the old usable command and configuration when
   possible; never leave an enabled Agent pointing at deleted files.
+- A second operation for the same Agent while one is pending -> keep the first
+  task and show/retain the same-Agent pending state; do not replace its task
+  handle. An operation for a different Agent -> admit it immediately unless it
+  waits on the exact same Registry/runtime/download resource key.
 
 ### 5. Good/Base/Bad Cases
 
@@ -2670,11 +2693,19 @@ AgentManagedInstallationRecord {
   applicable official latest CLI channel.
 - Good: removing an Agent deletes its command, installation row, and auth
   catalog; a later startup does not reinstall it unless the user adds it again.
+- Good: Codex can continue downloading while Claude is toggled or checked; each
+  row shows only its own loading/disabled state, and both completions reconcile
+  through fresh authoritative snapshots.
+- Base: two actions targeting Codex are serialized, and two installs that need
+  the same managed Node archive serialize only the shared runtime/cache step.
 - Bad: activate an Agent before checksum/lock verification, use npm's global
   state, assign one blank npm config file to both user and global levels,
   accept an unprobed or pre-22 Node/npm candidate, silently downgrade, accept
   an unprobed or pre-0.5 `uv`, install a ranged/URL `uvx` package, or restore
   an old exact compatibility workaround for a newer binary.
+- Bad: store one global Config Center Agent mutation or hold one global install
+  mutex across every Agent operation; either makes unrelated Agent controls and
+  work wait behind a long download.
 
 ### 6. Tests Required
 
@@ -2695,6 +2726,13 @@ AgentManagedInstallationRecord {
   descriptor compatibility.
 - Desktop management tests cover Add loading, upgrade loading, failed-install
   detail rendering, and Agent registry refresh events.
+- `cargo test -p vibex-desktop agent_mutations_are_keyed_by_their_target_agent
+  --locked` asserts every concurrent Agent mutation maps to its target id and
+  unrelated ids remain independently actionable.
+- `cargo test -p vibex-desktop-runtime
+  agent_operation_locks_only_serialize_the_same_agent --locked` holds one Agent
+  guard, asserts another Agent acquires immediately, then asserts the queued
+  same-Agent guard resumes only after release.
 
 ### 7. Wrong vs Correct
 
@@ -2719,6 +2757,25 @@ command
 
 Both files are private and empty, so the selected explicit, system, or managed
 Node/npm runtime stays isolated without triggering npm's duplicate-load guard.
+
+#### Wrong
+
+```rust
+self.mutation = Some(ManagementMutation::AgentInstall(agent_id));
+let _guard = self.global_install_lock.lock().await;
+```
+
+One long Agent download disables every Agent row and queues unrelated work.
+
+#### Correct
+
+```rust
+self.agent_mutations.insert(agent_id.clone(), mutation);
+let _guard = self.acquire_operation(format!("agent:{agent_id}")).await;
+```
+
+The target Agent stays internally serialized while other Agent ids retain their
+own UI state and operation lock. Shared artifacts use their own resource keys.
 
 ## Scenario: ACP Managed Adapter Compatibility Registry
 

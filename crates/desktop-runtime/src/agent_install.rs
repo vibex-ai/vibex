@@ -6,8 +6,8 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Output, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::time::timeout;
 use url::Url;
 use vibex_config_switch::ProviderConfigService;
@@ -102,7 +102,7 @@ pub struct AgentInstallService {
     node_runtime_options: AgentNodeRuntimeOptions,
     uv_runtime_options: AgentUvRuntimeOptions,
     client: Client,
-    operation_lock: Arc<Mutex<()>>,
+    operation_locks: Arc<Mutex<BTreeMap<String, Weak<Mutex<()>>>>>,
 }
 
 impl AgentInstallService {
@@ -183,7 +183,7 @@ impl AgentInstallService {
             node_runtime_options,
             uv_runtime_options,
             client,
-            operation_lock: Arc::new(Mutex::new(())),
+            operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
         };
         service.recover_interrupted_operations()?;
         Ok(service)
@@ -194,7 +194,7 @@ impl AgentInstallService {
     }
 
     pub async fn install(&self, agent_id: AgentId) -> VibexResult<AgentManagedInstallState> {
-        let _guard = self.operation_lock.lock().await;
+        let _guard = self.acquire_agent_operation(&agent_id).await;
         self.install_locked(agent_id).await
     }
 
@@ -204,7 +204,7 @@ impl AgentInstallService {
         &self,
         agent_id: AgentId,
     ) -> VibexResult<AgentManagedInstallState> {
-        let _guard = self.operation_lock.lock().await;
+        let _guard = self.acquire_agent_operation(&agent_id).await;
         if let Some(record) = self.read_record(&agent_id)?
             && record_has_usable_installation(&record)
             && managed_companion_installation_is_usable(&agent_id, &record)
@@ -222,7 +222,7 @@ impl AgentInstallService {
     }
 
     pub async fn check_update(&self, agent_id: AgentId) -> VibexResult<AgentManagedInstallState> {
-        let _guard = self.operation_lock.lock().await;
+        let _guard = self.acquire_agent_operation(&agent_id).await;
         let (registry_id, entry) = self.load_install_entry(&agent_id, true).await?;
         let distribution = resolve_distribution(&entry)?;
         let now = unix_timestamp_ms();
@@ -273,7 +273,7 @@ impl AgentInstallService {
     }
 
     pub async fn uninstall(&self, agent_id: AgentId) -> VibexResult<AgentManagedInstallState> {
-        let _guard = self.operation_lock.lock().await;
+        let _guard = self.acquire_agent_operation(&agent_id).await;
         require_registry_id(&agent_id)?;
         let previous = self.read_record(&agent_id)?;
         let previous_agent = self
@@ -373,6 +373,26 @@ impl AgentInstallService {
         state.updated_at_ms = Some(unix_timestamp_ms());
         state.available_version = None;
         Ok(state)
+    }
+
+    async fn acquire_agent_operation(&self, agent_id: &AgentId) -> OwnedMutexGuard<()> {
+        self.acquire_operation(format!("agent:{}", agent_id.as_str()))
+            .await
+    }
+
+    async fn acquire_operation(&self, key: String) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.operation_locks.lock().await;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(Mutex::new(()));
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        lock.lock_owned().await
     }
 
     pub fn bootstrap_agent_ids(&self) -> VibexResult<Vec<AgentId>> {
@@ -1317,12 +1337,18 @@ impl AgentInstallService {
     }
 
     async fn load_registry(&self, force: bool) -> VibexResult<RegistryIndex> {
+        let requested_at_ms = unix_timestamp_ms();
+        let _guard = self.acquire_operation("shared:registry".into()).await;
         let cache_path = self.root.join("registry/registry.json");
         let metadata_path = self.root.join("registry/metadata.json");
         let cached = fs::read(&cache_path).ok();
-        if !force
+        let refreshed_while_waiting = force
             && cached.is_some()
-            && registry_cache_is_fresh(&metadata_path, unix_timestamp_ms())
+            && registry_cache_fetched_at_ms(&metadata_path)
+                .is_some_and(|fetched_at_ms| fetched_at_ms >= requested_at_ms);
+        if cached.is_some()
+            && ((!force && registry_cache_is_fresh(&metadata_path, unix_timestamp_ms()))
+                || refreshed_while_waiting)
         {
             return parse_registry(cached.as_deref().unwrap_or_default());
         }
@@ -1561,6 +1587,9 @@ impl AgentInstallService {
         let cache_key = expected_sha256
             .map(ToString::to_string)
             .unwrap_or_else(|| format!("url-{}", distribution_fingerprint(&[url])));
+        let _guard = self
+            .acquire_operation(format!("shared:download:{cache_key}"))
+            .await;
         let cached = cache_dir.join(cache_key);
         if cached.is_file()
             && expected_sha256
@@ -1672,6 +1701,7 @@ impl AgentInstallService {
         if let Some(runtime) = self.select_external_node_runtime(minimum_version).await {
             return Ok(runtime);
         }
+        let _guard = self.acquire_operation("shared:runtime:node".into()).await;
         let runtime = self.ensure_managed_node_runtime().await?;
         validate_minimum_node_version(&runtime.version, minimum_version)?;
         Ok(runtime)
@@ -1819,6 +1849,7 @@ impl AgentInstallService {
         if let Some(runtime) = self.select_external_uv_runtime().await {
             return Ok(runtime);
         }
+        let _guard = self.acquire_operation("shared:runtime:uv".into()).await;
         self.ensure_managed_uv_runtime().await
     }
 
@@ -4637,11 +4668,16 @@ fn sha256_file(path: &Path) -> VibexResult<String> {
 }
 
 fn registry_cache_is_fresh(path: &Path, now: i64) -> bool {
+    registry_cache_fetched_at_ms(path)
+        .and_then(|fetched_at_ms| now.checked_sub(fetched_at_ms))
+        .is_some_and(|age| (0..=REGISTRY_CACHE_MAX_AGE_MS).contains(&age))
+}
+
+fn registry_cache_fetched_at_ms(path: &Path) -> Option<i64> {
     fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<RegistryCacheMetadata>(&bytes).ok())
-        .and_then(|metadata| now.checked_sub(metadata.fetched_at_ms))
-        .is_some_and(|age| (0..=REGISTRY_CACHE_MAX_AGE_MS).contains(&age))
+        .map(|metadata| metadata.fetched_at_ms)
 }
 
 fn strip_archive_suffix(filename: &str) -> &str {
@@ -4767,6 +4803,45 @@ fn process_error(code: &str, message: &str, error: impl ToString) -> VibexError 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn agent_operation_locks_only_serialize_the_same_agent() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("vibex.db");
+        let root = temp.path().join("managed-agents");
+        let service =
+            AgentInstallService::new(&db_path, &root, ProviderConfigService::new(&db_path))
+                .unwrap();
+        let codex = AgentId::parse("codex").unwrap();
+        let claude = AgentId::parse("claude").unwrap();
+
+        let codex_guard = service.acquire_agent_operation(&codex).await;
+        let waiting_service = service.clone();
+        let waiting_codex = codex.clone();
+        let same_agent = tokio::spawn(async move {
+            waiting_service
+                .acquire_agent_operation(&waiting_codex)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!same_agent.is_finished());
+
+        let claude_guard = tokio::time::timeout(
+            Duration::from_millis(250),
+            service.acquire_agent_operation(&claude),
+        )
+        .await
+        .expect("a different Agent operation must not wait for Codex");
+        assert!(!same_agent.is_finished());
+
+        drop(claude_guard);
+        drop(codex_guard);
+        let same_agent_guard = tokio::time::timeout(Duration::from_millis(250), same_agent)
+            .await
+            .expect("the queued Codex operation should resume")
+            .expect("the queued Codex operation task should complete");
+        drop(same_agent_guard);
+    }
 
     #[cfg(unix)]
     fn write_version_probe(path: &Path, version: &str) {
