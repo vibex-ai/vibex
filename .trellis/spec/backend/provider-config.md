@@ -3230,6 +3230,25 @@ ProviderConfigService::{
   configured model without a display name is emitted as an empty model object;
   OpenCode accepts `name: string | undefined` and rejects `name: null` before
   the ACP handshake.
+- Product state uses `provider_model_id` as the canonical model identity. The
+  projection engine is the only owner of configured product-model to
+  Agent-runtime-model translation. For OpenCode it qualifies the model with
+  the generated provider id selected by that model's Wire API; Responses,
+  Chat Completions, Anthropic Messages, Google Generative AI, and AWS Bedrock
+  Converse therefore use their exact `provider/model` runtime namespaces.
+- OpenCode model qualification is idempotent. A historical or imported
+  `agent_model_id` that already starts with the generated provider id is used
+  once, never expanded to `provider/provider/model` in either the overlay or
+  ACP requests.
+- Each ACP process snapshots the exact configured product/runtime model-id
+  pairs from the same projection used to launch it. Outbound ACP model fields
+  use the runtime id; inbound session creation, discovery, config updates, and
+  mutation responses are normalized back to the product id before comparison,
+  event publication, or SQLite persistence. Unknown ids pass through unchanged
+  instead of being heuristically stripped.
+- A runtime id that maps to multiple configured product ids is ambiguous and
+  fails process preparation with `acp_model_id_projection_ambiguous`; the
+  runtime must not guess which durable identity to store.
 - Managed overlays live only under the Vibex private runtime root, use atomic
   owner-only writes, and reject absolute/parent traversal, symlink escape, and
   arbitrary catalog templates.
@@ -3306,9 +3325,14 @@ ProviderConfigService::{
 - Config-switch tests assert deterministic env/JSON/TOML/YAML projection,
   private permissions, path/symlink rejection, late Secret resolution,
   redacted `Debug`/preview, selective stale propagation, and omission of an
-  absent OpenCode model display name without losing a configured name.
+  absent OpenCode model display name without losing a configured name. They
+  also assert exact OpenCode runtime ids for all five Wire APIs and idempotent
+  handling of already-qualified model ids.
 - ACP tests assert Claude/Codex/OpenCode parity, prepare-failure fencing, and
-  Profile-save stale marking without process termination.
+  Profile-save stale marking without process termination. The OpenCode
+  regression must exercise a qualified runtime catalog, send the qualified id
+  through `session/set_model`, normalize responses back to the product id, and
+  prove the durable runtime config remains converged.
 - Backend/Remote/UI tests assert version-matched capability pass-through,
   OpenCode API-key surface selection, redacted preview, private entity/Secret
   rejection, draft preservation, eight credential surfaces, and Codex Chat

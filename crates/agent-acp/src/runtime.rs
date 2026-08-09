@@ -56,9 +56,9 @@ use vibex_agent::{
     SwitchTargetExecutor, default_adapter_for_agent,
 };
 use vibex_config_switch::{
-    CODEX_MODEL_PROVIDER_ID_OPTION_KEY, LegacyAgentProviderProjectionRuntimePlan,
-    ProviderConfigService, ProviderProfileChangeListener, provider_option_value,
-    secrets::resolve_provider_secret,
+    CODEX_MODEL_PROVIDER_ID_OPTION_KEY, LegacyAgentProviderModelIdProjection,
+    LegacyAgentProviderProjectionRuntimePlan, ProviderConfigService, ProviderProfileChangeListener,
+    provider_option_value, secrets::resolve_provider_secret,
 };
 #[cfg(test)]
 use vibex_config_switch::{CodexProviderRuntimeConfig, codex_runtime_config_from_profile};
@@ -1345,6 +1345,48 @@ struct ProcessShared {
     operation_evidence: BTreeMap<AcpOperation, SessionConfigOperationEvidence>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct AcpModelIdProjection {
+    product_to_runtime: BTreeMap<String, String>,
+    runtime_to_product: BTreeMap<String, String>,
+}
+
+impl AcpModelIdProjection {
+    fn new(entries: Vec<LegacyAgentProviderModelIdProjection>) -> VibexResult<Self> {
+        let mut projection = Self::default();
+        for entry in entries {
+            if let Some(existing) = projection.runtime_to_product.insert(
+                entry.runtime_model_id.clone(),
+                entry.product_model_id.clone(),
+            ) && existing != entry.product_model_id
+            {
+                return Err(VibexError::validation(
+                    "acp_model_id_projection_ambiguous",
+                    "Agent runtime model id maps to multiple configured models",
+                ));
+            }
+            projection
+                .product_to_runtime
+                .insert(entry.product_model_id, entry.runtime_model_id);
+        }
+        Ok(projection)
+    }
+
+    fn runtime_id(&self, product_model_id: &str) -> String {
+        self.product_to_runtime
+            .get(product_model_id)
+            .cloned()
+            .unwrap_or_else(|| product_model_id.to_string())
+    }
+
+    fn product_id(&self, runtime_model_id: &str) -> String {
+        self.runtime_to_product
+            .get(runtime_model_id)
+            .cloned()
+            .unwrap_or_else(|| runtime_model_id.to_string())
+    }
+}
+
 pub(crate) struct AcpProcess {
     process_instance_id: AcpProcessInstanceId,
     exit_reporter: Option<ProcessExitReporter<AcpProcess>>,
@@ -1376,6 +1418,7 @@ pub(crate) struct AcpProcess {
     process_strategy_requested: AcpProcessStrategy,
     process_strategy_effective: AcpProcessStrategy,
     pool_fallback_reason: Option<String>,
+    model_id_projection: AcpModelIdProjection,
     opencode_error_bridge_enabled: bool,
     attachment_router: Weak<AcpAttachmentRouter>,
     observability: Arc<RuntimeObservability>,
@@ -1498,9 +1541,10 @@ impl AcpSessionAttachment {
     ) -> Self {
         let OpenedAcpSession {
             native_session_id,
-            state,
+            mut state,
             registration_barrier,
         } = opened;
+        lease.process().normalize_attachment_models(&mut state);
         let attachment = Self {
             lease,
             logical_session_id,
@@ -2404,9 +2448,13 @@ impl AcpSessionAttachment {
         let generation = self.activation_generation();
         let mut runtime_snapshot = None;
         if let Ok(mut state) = self.state.lock() {
-            let current_model = extract_current_model_id(update);
+            let current_model =
+                extract_current_model_id(update).map(|model| process.product_model_id(&model));
             let current_mode = extract_current_mode_id(update);
-            let models = extract_config_values(model_candidates(update));
+            let mut models = extract_config_values(model_candidates(update));
+            for model in &mut models {
+                model.value = process.product_model_id(&model.value);
+            }
             let modes = extract_config_values(mode_candidates(update));
             {
                 let discovery =
@@ -2943,6 +2991,46 @@ impl AcpSessionAttachment {
 }
 
 impl AcpProcess {
+    fn runtime_model_id(&self, product_model_id: &str) -> String {
+        self.model_id_projection.runtime_id(product_model_id)
+    }
+
+    fn product_model_id(&self, runtime_model_id: &str) -> String {
+        self.model_id_projection.product_id(runtime_model_id)
+    }
+
+    fn normalize_session_config_models(&self, config: &mut ProviderSessionConfigState) {
+        if let Some(current) = config.current_model.as_mut() {
+            current.value = self.product_model_id(&current.value);
+        }
+        for model in &mut config.models {
+            model.value = self.product_model_id(&model.value);
+        }
+    }
+
+    fn normalize_attachment_models(&self, state: &mut AcpAttachmentShared) {
+        state.current_model_id = state
+            .current_model_id
+            .take()
+            .map(|model| self.product_model_id(&model));
+        for model in &mut state.model_ids {
+            *model = self.product_model_id(model);
+        }
+        if let Some(config) = state.session_config_state.as_mut() {
+            self.normalize_session_config_models(config);
+        }
+        state.session_runtime_config_state.preferred_model = state
+            .session_runtime_config_state
+            .preferred_model
+            .take()
+            .map(|model| self.product_model_id(&model));
+        state.session_runtime_config_state.effective_model = state
+            .session_runtime_config_state
+            .effective_model
+            .take()
+            .map(|model| self.product_model_id(&model));
+    }
+
     fn publish_attachment_payload(&self, attachment: &Arc<AcpSessionAttachment>) {
         let Some(router) = self.attachment_router.upgrade() else {
             self.observability.increment(
@@ -8168,24 +8256,23 @@ impl AcpRuntimeClient {
         Ok(())
     }
 
-    fn selected_model_for_profile(
+    fn selected_model_for_process(
         &self,
-        profile_id: &ProviderProfileId,
+        process: &AcpProcess,
         model: Option<&str>,
     ) -> Option<String> {
         let model = model.map(str::trim).filter(|model| !model.is_empty())?;
-        let profile = self.config_service.get_profile(profile_id).ok().flatten();
+        let profile = self
+            .config_service
+            .get_profile(&process.provider_profile_id)
+            .ok()
+            .flatten();
         if profile.as_ref().is_some_and(|profile| {
             profile.agent_id.as_str() == OPENCODE_AGENT_ID && is_opencode_default_model(model)
         }) {
             return None;
         }
-        Some(
-            profile
-                .as_ref()
-                .and_then(|profile| opencode_qualified_model_id(profile, model))
-                .unwrap_or_else(|| model.to_string()),
-        )
+        Some(model.to_string())
     }
 
     #[cfg(test)]
@@ -8903,6 +8990,11 @@ impl AcpRuntimeClient {
                 }),
         };
         let adapter_identity = self.effective_adapter_identity(&agent_id, config)?;
+        let model_id_projection = AcpModelIdProjection::new(
+            self.config_service
+                .legacy_agent_provider_model_id_projections(profile_id)?
+                .unwrap_or_default(),
+        )?;
         let command_path = Path::new(&config.command);
         if command_path.is_absolute() && !command_path.is_file() {
             return Err(VibexError::process(
@@ -9034,6 +9126,7 @@ impl AcpRuntimeClient {
             process_strategy_requested: config.process_strategy,
             process_strategy_effective,
             pool_fallback_reason,
+            model_id_projection,
             opencode_error_bridge_enabled,
             attachment_router: Arc::downgrade(&self.attachment_router),
             observability: self.observability.clone(),
@@ -9643,8 +9736,7 @@ impl AcpRuntimeClient {
         attachment: &AcpAttachmentHandle,
         model: Option<&str>,
     ) -> VibexResult<()> {
-        let Some(model) = self
-            .selected_model_for_profile(&attachment.payload().process().provider_profile_id, model)
+        let Some(model) = self.selected_model_for_process(&attachment.payload().process(), model)
         else {
             return Ok(());
         };
@@ -9950,9 +10042,9 @@ impl AcpRuntimeClient {
                             .await;
                         match response {
                             Ok(response) => {
-                                if let Some(error_code) =
-                                    runtime_config_response_conflict(&response, &field, &plan)
-                                {
+                                if let Some(error_code) = runtime_config_response_conflict(
+                                    &process, &response, &field, &plan,
+                                ) {
                                     outcomes.push(runtime_config_outcome(
                                         &field,
                                         SessionRuntimeConfigApplyStatus::Failed,
@@ -10052,6 +10144,15 @@ impl AcpRuntimeClient {
         plan: &SessionConfigPlan,
         option_kind: Option<&ProviderSessionConfigOptionKind>,
     ) -> VibexResult<Value> {
+        let runtime_model_field = (field.kind == SessionConfigFieldKind::Model).then(|| {
+            let mut projected = field.clone();
+            projected.value = field
+                .value
+                .as_deref()
+                .map(|model| process.runtime_model_id(model));
+            projected
+        });
+        let field = runtime_model_field.as_ref().unwrap_or(field);
         let (method, params) = match plan {
             SessionConfigPlan::Live {
                 operation,
@@ -10230,15 +10331,23 @@ impl AcpRuntimeClient {
                 // Discovery is attachment-local as well.  Apply the response
                 // only after the revision/fence check, so a late response
                 // cannot overwrite a replacement generation's view.
-                let process_profile_id = current.process().provider_profile_id.clone();
-                let model_ids = extract_model_ids(response);
-                let current_model_id = extract_current_model_id(response);
+                let process = current.process();
+                let process_profile_id = process.provider_profile_id.clone();
+                let model_ids = extract_model_ids(response)
+                    .into_iter()
+                    .map(|model| process.product_model_id(&model))
+                    .collect::<Vec<_>>();
+                let current_model_id = extract_current_model_id(response)
+                    .map(|model| process.product_model_id(&model));
                 let current_mode_id = extract_current_mode_id(response);
-                let discovery = extract_provider_session_config_state(
+                let mut discovery = extract_provider_session_config_state(
                     response,
                     &process_profile_id,
                     Some(&current.native_session_id),
                 );
+                if let Some(discovery) = discovery.as_mut() {
+                    process.normalize_session_config_models(discovery);
+                }
                 if !model_ids.is_empty() {
                     state.model_ids = model_ids;
                 }
@@ -11368,6 +11477,7 @@ fn is_capability_negative(error: &VibexError) -> bool {
 }
 
 fn runtime_config_response_conflict(
+    process: &AcpProcess,
     response: &Value,
     field: &RuntimeConfigField,
     plan: &SessionConfigPlan,
@@ -11402,6 +11512,13 @@ fn runtime_config_response_conflict(
         }
     };
     explicit
+        .map(|value| {
+            if field.kind == SessionConfigFieldKind::Model {
+                process.product_model_id(&value)
+            } else {
+                value
+            }
+        })
         .filter(|value| value != target)
         .map(|_| "acp_session_config_response_mismatch")
 }
@@ -11734,6 +11851,7 @@ fn opencode_unqualified_model_id(
     model.to_string()
 }
 
+#[cfg(test)]
 fn opencode_model_wire_api(
     profile: &ProviderProfile,
     base_provider_id: &str,
@@ -11752,6 +11870,7 @@ fn opencode_model_wire_api(
         .unwrap_or(default_wire_api)
 }
 
+#[cfg(test)]
 fn opencode_qualified_model_id(profile: &ProviderProfile, model: &str) -> Option<String> {
     let base_provider_id = opencode_model_provider_id(profile)?;
     let default_wire_api = opencode_default_wire_api(profile);
@@ -15623,6 +15742,7 @@ mod tests {
             process_strategy_requested: AcpProcessStrategy::PerSession,
             process_strategy_effective: AcpProcessStrategy::PerSession,
             pool_fallback_reason: None,
+            model_id_projection: AcpModelIdProjection::default(),
             opencode_error_bridge_enabled: false,
             attachment_router: Weak::new(),
             observability: Arc::new(RuntimeObservability::new()),
@@ -17815,6 +17935,15 @@ advertise_resume = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_RESUME") == "true"
 advertise_auth = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_AUTH") == "true"
 session_new_delay = float(os.environ.get("VIBEX_MOCK_ACP_SESSION_NEW_DELAY", "0"))
 fail_first_session_new = os.environ.get("VIBEX_MOCK_ACP_FAIL_FIRST_SESSION_NEW") == "true"
+model_prefix = os.environ.get("VIBEX_MOCK_ACP_MODEL_PREFIX", "").strip("/")
+
+
+def runtime_model_id(model_id):
+    return (model_prefix + "/" + model_id) if model_prefix else model_id
+
+
+model_1 = runtime_model_id("mock/model-1")
+model_2 = runtime_model_id("mock/model-2")
 
 for line in sys.stdin:
     line = line.strip()
@@ -17881,7 +18010,7 @@ for line in sys.stdin:
             "result": {
                 "data": [
                     {
-                        "id": "mock/model-1",
+                        "id": model_1,
                         "defaultReasoningEffort": "medium",
                         "supportedReasoningEfforts": [
                             {"reasoningEffort": "low", "description": "Low"},
@@ -17890,7 +18019,7 @@ for line in sys.stdin:
                         ],
                     },
                     {
-                        "id": "mock/model-2",
+                        "id": model_2,
                         "defaultReasoningEffort": "high",
                         "supportedReasoningEfforts": [
                             {"reasoningEffort": "high", "description": "High"},
@@ -17931,8 +18060,8 @@ for line in sys.stdin:
             "result": {
                 "sessionId": session_id,
                 "models": {
-                    "availableModels": [{"modelId": "mock/model-1"}],
-                    "currentModelId": "mock/model-1",
+                    "availableModels": [{"modelId": model_1}],
+                    "currentModelId": model_1,
                 },
                 "modes": {
                     "availableModes": [
@@ -17947,10 +18076,10 @@ for line in sys.stdin:
                         "category": "model",
                         "label": "Model",
                         "type": "select",
-                        "currentValue": "mock/model-1",
+                        "currentValue": model_1,
                         "options": [
-                            {"value": "mock/model-1", "label": "Model 1"},
-                            {"value": "mock/model-2", "label": "Model 2"},
+                            {"value": model_1, "label": "Model 1"},
+                            {"value": model_2, "label": "Model 2"},
                         ],
                     },
                     {
@@ -17976,7 +18105,7 @@ for line in sys.stdin:
         })
     elif method == "session/set_model":
         session_id = msg.get("params", {}).get("sessionId", "mock-session-1")
-        model_id = msg.get("params", {}).get("modelId", "mock/model-1")
+        model_id = msg.get("params", {}).get("modelId", model_1)
         if set_model_mode == "unsupported":
             send({
                 "jsonrpc": "2.0",
@@ -17993,7 +18122,7 @@ for line in sys.stdin:
             if model_config_updates:
                 thought_levels = (
                     ["none", "on"]
-                    if model_id == "mock/model-2"
+                    if model_id == model_2
                     else ["none", "high", "max"]
                 )
                 send({
@@ -18024,8 +18153,8 @@ for line in sys.stdin:
                     "sessionId": session_id,
                     "models": {
                         "availableModels": [
-                            {"modelId": "mock/model-1"},
-                            {"modelId": "mock/model-2"},
+                            {"modelId": model_1},
+                            {"modelId": model_2},
                         ],
                         "currentModelId": model_id,
                     },
@@ -18051,7 +18180,7 @@ for line in sys.stdin:
     elif method == "session/set_config_option":
         session_id = msg.get("params", {}).get("sessionId", "mock-session-1")
         config_id = msg.get("params", {}).get("configId", "model")
-        value = msg.get("params", {}).get("value", "mock/model-1")
+        value = msg.get("params", {}).get("value", model_1)
         option = {
             "id": config_id,
             "label": config_id,
@@ -18064,8 +18193,8 @@ for line in sys.stdin:
                 "category": "model",
                 "label": "Model",
                 "options": [
-                    {"value": "mock/model-1", "label": "Model 1"},
-                    {"value": "mock/model-2", "label": "Model 2"},
+                    {"value": model_1, "label": "Model 1"},
+                    {"value": model_2, "label": "Model 2"},
                 ],
             })
         send({
@@ -18085,8 +18214,8 @@ for line in sys.stdin:
                         "workspaceRoot": msg.get("params", {}).get("cwd", ""),
                         "updatedAtMs": 123,
                         "models": {
-                            "availableModels": [{"modelId": "mock/model-1"}],
-                            "currentModelId": "mock/model-1",
+                            "availableModels": [{"modelId": model_1}],
+                            "currentModelId": model_1,
                         },
                     }
                 ]
@@ -18129,8 +18258,8 @@ for line in sys.stdin:
                 "id": mid,
                 "result": {
                     "models": {
-                        "availableModels": [{"modelId": "mock/model-2"}],
-                        "currentModelId": "mock/model-2",
+                        "availableModels": [{"modelId": model_2}],
+                        "currentModelId": model_2,
                     },
                 },
             })
@@ -18179,8 +18308,8 @@ for line in sys.stdin:
             "id": mid,
             "result": {
                 "models": {
-                    "availableModels": [{"modelId": "mock/model-2"}],
-                    "currentModelId": "mock/model-2",
+                    "availableModels": [{"modelId": model_2}],
+                    "currentModelId": model_2,
                 },
                 "modes": {
                     "availableModes": [{"id": "review", "label": "Review"}],
@@ -18635,6 +18764,48 @@ for line in sys.stdin:
                 .unwrap();
         }
 
+        fn set_model_prefix(&self, prefix: &str) {
+            let service = self.service();
+            let mut config = service
+                .get_acp_profile_config(self.profile_id.clone())
+                .unwrap();
+            config.env.push(vibex_core::AcpProviderEnvReference {
+                key: "VIBEX_MOCK_ACP_MODEL_PREFIX".to_string(),
+                source: AcpProviderEnvSource::Literal,
+                value: Some(prefix.to_string()),
+                secret_lookup_key: None,
+                redacted_hint: "mock qualified model ids".to_string(),
+            });
+            service
+                .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                    provider_profile_id: self.profile_id.clone(),
+                    config,
+                })
+                .unwrap();
+        }
+
+        fn use_verified_opencode_projection(&self) {
+            let service = self.service();
+            let config = service
+                .get_acp_profile_config(self.profile_id.clone())
+                .unwrap();
+            let conn = open_database(&self.db_path).unwrap();
+            persist_managed_runtime(
+                &conn,
+                OPENCODE_AGENT_ID,
+                OPENCODE_AGENT_ID,
+                vibex_core::OPENCODE_LAST_VERIFIED_VERSION,
+                &config,
+            );
+            drop(conn);
+            service
+                .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                    provider_profile_id: self.profile_id.clone(),
+                    config,
+                })
+                .unwrap();
+        }
+
         fn set_prompt_mode(&self, mode: &str) {
             let service = self.service();
             let mut config = service
@@ -19015,6 +19186,13 @@ for line in sys.stdin:
     }
 
     async fn runtime_switch_fixture(label: &str) -> Option<RuntimeSwitchFixture> {
+        runtime_switch_fixture_with_model_prefix(label, None).await
+    }
+
+    async fn runtime_switch_fixture_with_model_prefix(
+        label: &str,
+        model_prefix: Option<&str>,
+    ) -> Option<RuntimeSwitchFixture> {
         use vibex_agent::{
             MessageSubmissionCoordinator, MessageSubmissionCoordinatorConfig,
             RuntimeSelectionService, RuntimeSelectionServiceConfig, RuntimeSwitchCoordinator,
@@ -19048,6 +19226,9 @@ for line in sys.stdin:
                 config,
             })
             .unwrap();
+        if let Some(model_prefix) = model_prefix {
+            fixture.set_model_prefix(model_prefix);
+        }
 
         let observability = Arc::new(RuntimeObservability::new());
         let client = Arc::new(AcpRuntimeClient::new_with_observability(
@@ -19111,6 +19292,9 @@ for line in sys.stdin:
             mode_id: Some("build".to_string()),
             config_values: Default::default(),
         };
+        if model_prefix.is_some() {
+            fixture.use_verified_opencode_projection();
+        }
         let session = manager
             .create_session(CreateAgentSessionRequest {
                 runtime: selection.clone(),
@@ -20293,6 +20477,76 @@ for line in sys.stdin:
             &activated_fence
         );
 
+        drop(fixture.message_submission);
+        drop(fixture.runtime_selection);
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn opencode_runtime_switch_maps_qualified_model_ids_at_the_acp_boundary() {
+        let Some(fixture) = runtime_switch_fixture_with_model_prefix(
+            "switch-opencode-qualified-model",
+            Some("acp"),
+        )
+        .await
+        else {
+            return;
+        };
+        assert_eq!(
+            fixture
+                .source_binding
+                .session_runtime_config_state
+                .effective_model
+                .as_deref(),
+            Some("mock/model-1")
+        );
+        assert_eq!(
+            logged_request_count(&fixture.fixture.request_log(), "session/set_model"),
+            0
+        );
+
+        let intent = switch_intent(
+            &fixture,
+            fixture.source_binding.binding_id.clone(),
+            "mock/model-2",
+            "review",
+        );
+        let prepared = fixture
+            .bridge
+            .acquire_prepared(&intent, &fixture.source_binding)
+            .await
+            .unwrap();
+        fixture
+            .bridge
+            .apply_live_mutation(&intent, &prepared, &switch_operation("qualified-model"))
+            .await
+            .unwrap();
+
+        let set_model = fixture
+            .fixture
+            .request_log()
+            .into_iter()
+            .rev()
+            .find(|request| request["method"] == "session/set_model")
+            .expect("qualified OpenCode model switch must reach ACP");
+        assert_eq!(set_model["params"]["modelId"], "acp/mock/model-2");
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        let stored = RuntimeBindingRepository::get(&conn, &fixture.source_binding.binding_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .session_runtime_config_state
+                .effective_model
+                .as_deref(),
+            Some("mock/model-2")
+        );
+        assert!(stored.session_runtime_config_state.is_converged());
+
+        drop(conn);
         drop(fixture.message_submission);
         drop(fixture.runtime_selection);
         drop(fixture.manager);

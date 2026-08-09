@@ -105,6 +105,12 @@ pub struct LegacyAgentProviderProjectionRuntimePlan {
     pub process_args: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyAgentProviderModelIdProjection {
+    pub product_model_id: String,
+    pub runtime_model_id: String,
+}
+
 impl ResolvedAgentProviderProjection {
     pub fn child_environment(&self) -> Vec<(String, String)> {
         self.non_secret_env
@@ -228,7 +234,8 @@ impl AgentProviderProjectionEngine {
                 "selected credential kind is not supported by the selected projection descriptor",
             ));
         }
-        let effective_model = selected_model.map(|model| model.agent_model_id.clone());
+        let effective_model = selected_model
+            .map(|model| projected_runtime_model_id(model_provider, descriptor, model));
 
         let mut non_secret_env = binding.projection_overrides.non_secret_env.clone();
         let mut secret_env = Vec::new();
@@ -809,6 +816,33 @@ impl ProviderConfigService {
             non_secret_env,
             process_args,
         }))
+    }
+
+    /// Maps product-facing configured model ids to the exact ids understood by
+    /// the selected Agent projection. OpenCode namespaces models by the
+    /// generated provider id; other projections retain their declared Agent id.
+    pub fn legacy_agent_provider_model_id_projections(
+        &self,
+        provider_profile_id: &vibex_core::ProviderProfileId,
+    ) -> VibexResult<Option<Vec<LegacyAgentProviderModelIdProjection>>> {
+        let conn = self.open_connection()?;
+        let Some(binding) =
+            AgentModelProviderBindingRepository::get_by_legacy_profile(&conn, provider_profile_id)?
+        else {
+            return Ok(None);
+        };
+        let (provider, _, binding, descriptor) = load_projection_input(&conn, &binding.id)?;
+        Ok(Some(
+            binding
+                .configured_models
+                .iter()
+                .filter(|model| model.enabled)
+                .map(|model| LegacyAgentProviderModelIdProjection {
+                    product_model_id: model.provider_model_id.clone(),
+                    runtime_model_id: projected_runtime_model_id(&provider, &descriptor, model),
+                })
+                .collect(),
+        ))
     }
 
     pub fn plan_legacy_agent_provider_projection(
@@ -1689,7 +1723,7 @@ fn opencode_overlay(
     {
         let (provider_id, npm) = opencode_provider_identity(&base_provider_id, model);
         let model_endpoint = opencode_endpoint_for_model(provider, binding, endpoint, model);
-        let entry = providers.entry(provider_id).or_insert_with(|| {
+        let entry = providers.entry(provider_id.clone()).or_insert_with(|| {
             let mut options = serde_json::Map::new();
             if let Some(endpoint) = model_endpoint {
                 options.insert(
@@ -1718,7 +1752,7 @@ fn opencode_overlay(
                 model_config.insert("name".to_string(), serde_json::Value::String(display_name));
             }
             models.insert(
-                model.agent_model_id.clone(),
+                opencode_model_key(&provider_id, &model.agent_model_id),
                 serde_json::Value::Object(model_config),
             );
         }
@@ -1808,7 +1842,10 @@ fn opencode_overlay(
             .find(|model| model.enabled && model.provider_model_id == default_model)
             .map(|model| {
                 let (provider_id, _) = opencode_provider_identity(&base_provider_id, model);
-                format!("{provider_id}/{}", model.agent_model_id)
+                format!(
+                    "{provider_id}/{}",
+                    opencode_model_key(&provider_id, &model.agent_model_id)
+                )
             })
             .unwrap_or_else(|| format!("{base_provider_id}/{default_model}"));
         root.insert("model".to_string(), serde_json::Value::String(qualified));
@@ -1853,6 +1890,44 @@ fn opencode_provider_identity<'a>(
         format!("{base_provider_id}-{suffix}")
     };
     (provider_id, npm)
+}
+
+fn opencode_model_key(provider_id: &str, model_id: &str) -> String {
+    model_id
+        .strip_prefix(&format!("{provider_id}/"))
+        .unwrap_or(model_id)
+        .to_string()
+}
+
+fn projected_runtime_model_id(
+    provider: &ModelProviderProfile,
+    descriptor: &AgentProviderProjectionDescriptor,
+    model: &AgentConfiguredModelBinding,
+) -> String {
+    if matches!(
+        descriptor.provider_control,
+        AgentProviderControl::ManagedConfigOverlay {
+            strategy: ConfigOverlayStrategy::OpenCodeInlineProvider
+        }
+    ) || matches!(
+        descriptor.model_control,
+        AgentModelControl::ManagedConfigOverlay {
+            strategy: ConfigOverlayStrategy::OpenCodeInlineProvider
+        }
+    ) {
+        let base_provider_id = sanitize_provider_id(
+            provider
+                .vendor_hint
+                .as_deref()
+                .unwrap_or_else(|| provider.id.as_str()),
+        );
+        let (provider_id, _) = opencode_provider_identity(&base_provider_id, model);
+        return format!(
+            "{provider_id}/{}",
+            opencode_model_key(&provider_id, &model.agent_model_id)
+        );
+    }
+    model.agent_model_id.clone()
 }
 
 fn require_secret_env_key(key: Option<&str>) -> VibexResult<&str> {
@@ -3900,8 +3975,34 @@ mod tests {
     }
 
     #[test]
+    fn opencode_projection_keeps_prequalified_model_ids_idempotent() {
+        let (provider, _, mut binding, descriptor) =
+            fixture(ConfigOverlayStrategy::OpenCodeInlineProvider);
+        binding.configured_models[0].provider_model_id = "fake/model-a".to_string();
+        binding.configured_models[0].agent_model_id = "fake/model-a".to_string();
+        let endpoint = provider.endpoints.first().unwrap();
+
+        let content = opencode_overlay(&provider, &binding, Some(endpoint)).unwrap();
+        let overlay: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(
+            overlay["provider"]["fake"]["models"]
+                .get("model-a")
+                .is_some()
+        );
+        assert!(
+            overlay["provider"]["fake"]["models"]
+                .get("fake/model-a")
+                .is_none()
+        );
+        assert_eq!(
+            projected_runtime_model_id(&provider, &descriptor, &binding.configured_models[0]),
+            "fake/model-a"
+        );
+    }
+
+    #[test]
     fn opencode_overlay_maps_all_five_protocols_to_their_sdk_adapters() {
-        let (mut provider, _, mut binding, _) =
+        let (mut provider, _, mut binding, descriptor) =
             fixture(ConfigOverlayStrategy::OpenCodeInlineProvider);
         provider.endpoints.extend([
             ModelProviderEndpoint {
@@ -4007,6 +4108,23 @@ mod tests {
             "https://bedrock.example.invalid"
         );
         assert_eq!(providers["fake-chat"]["options"]["baseURL"], endpoint.url);
+        for (model_id, runtime_model_id) in [
+            ("responses", "fake/responses"),
+            ("chat", "fake-chat/chat"),
+            ("anthropic", "fake-anthropic/anthropic"),
+            ("google", "fake-google/google"),
+            ("bedrock", "fake-bedrock/bedrock"),
+        ] {
+            let model = binding
+                .configured_models
+                .iter()
+                .find(|model| model.provider_model_id == model_id)
+                .unwrap();
+            assert_eq!(
+                projected_runtime_model_id(&provider, &descriptor, model),
+                runtime_model_id
+            );
+        }
     }
 
     #[test]

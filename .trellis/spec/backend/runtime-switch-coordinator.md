@@ -387,6 +387,11 @@ agent://runtime-selection-event
   replays preferred values. If the rebuilt local state differs, CAS the
   durable old state to that rebuilt state before applying the requested patch;
   otherwise the next config CAS uses a baseline SQLite never stored.
+- Runtime selection, convergence checks, switch records, and SQLite bindings
+  use product model ids. An Agent adapter may translate that id only at its
+  external protocol boundary, and must normalize current-model values and
+  model catalogs back before config comparison. A runtime-qualified OpenCode
+  id must never be compared directly with the provider-neutral switch target.
 - Agent terminals count as active from successful terminal creation until a
   successful kill, release or wait-for-exit response. Attachment cleanup also
   removes terminal ownership. Failed terminal operations leave the terminal
@@ -463,6 +468,9 @@ agent://runtime-selection-event
 - DB and ACP lifecycle tests cover exact-fence recovery from
   `FailedUsingPrevious`, including both an existing attachment and a restored
   attachment; stale binding/generation or divergent selection stays failed.
+- ACP runtime-switch tests cover an Agent that reports qualified model ids:
+  initial configuration reaches Ready, outbound mutation uses the qualified
+  wire id, and the committed binding retains the provider-neutral product id.
 - Mock ACP tests assert the durable initial switch/journal exists before the
   first spawn or `session/new`, Prepared event quarantine, post-activation
   current routing, exactly-once recovery, live config persistence, and startup

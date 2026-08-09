@@ -114,6 +114,23 @@ conditional update, lease, or equivalent atomic claim. Evidence such as
 duplicate startup/status events for one visible action usually means the claim
 belongs lower in the stack.
 
+### Mistake 6: Multiple Layers Rewrite The Same Identity
+
+**Bad**: A projection layer qualifies a model id for an Agent, while session
+code independently adds or removes a provider prefix. Product state then
+compares `model-x` with `provider/model-x` and reports a false configuration
+conflict even though the Agent selected the requested model.
+
+**Good**: Choose one canonical product identity and one owner for the external
+translation. Snapshot an exact bidirectional mapping with the external runtime,
+translate outbound values at that boundary, and normalize inbound values before
+they enter service state, events, or storage.
+
+**Rule**: Never recover a canonical identity by guessing from delimiters or
+prefixes. Use exact mappings created by the same projection that produced the
+external configuration, keep already-translated values idempotent, fail closed
+on collisions, and test the full product -> wire -> product round trip.
+
 ---
 
 ## Checklist for Cross-Layer Features
@@ -136,6 +153,8 @@ After implementation:
       (`seq`, `id`, `version`) instead of inventing a second cursor
 - [ ] Checked that duplicate triggers are rejected or coalesced at the durable
       service/storage boundary, not only hidden by UI pending state
+- [ ] Checked that external identity translations have one owner, use exact
+      bidirectional mappings, and round-trip to the canonical stored identity
 - [ ] Checked that identity/version matches are not reused as capability or
       readiness proof; downstream status, fingerprints, controls, and evidence
       must all preserve the source capability's conservative state
