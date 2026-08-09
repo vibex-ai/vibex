@@ -2012,17 +2012,24 @@ impl AgentManager {
         let session = SessionRepository::get(&conn, session_id)?.ok_or_else(|| {
             VibexError::validation("session_not_found", "Agent session was not found")
         })?;
+        let runtime_state = AgentSessionRuntimeRepository::get_runtime_state(&conn, &session.id)?;
         let (selection, binding, _identity, route_key) = match self
             .durable_session_execution(&conn, &session)
         {
             Ok(execution) => execution,
             Err(error)
-                if session.state == AgentSessionState::Initializing
-                    && matches!(
-                        error.code.as_str(),
-                        "session_runtime_selection_missing" | "session_runtime_not_ready"
-                    ) =>
+                if (session.state == AgentSessionState::Initializing
+                    && error.code == "session_runtime_not_ready")
+                    || (error.code == "session_runtime_selection_missing"
+                        && runtime_state
+                            .as_ref()
+                            .is_some_and(|state| state.current_binding_id.is_none())) =>
             {
+                // A deferred first prompt can still be waiting for its initial
+                // runtime switch after a session snapshot has been projected as
+                // Running by the desktop. A missing committed binding proves
+                // that no provider turn can have started, so the durable
+                // submission status is the authoritative cancellation fence.
                 let cancelled = MessageSubmissionRepository::cancel_before_dispatch_for_session(
                     &conn,
                     &session.id,
@@ -4596,6 +4603,93 @@ mod tests {
                 .unwrap()
                 .status,
             RuntimeSwitchStatus::Requested
+        );
+
+        drop(conn);
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn interrupt_cancels_queued_prompt_when_session_snapshot_is_running() {
+        let db_path = temp_db_path("interrupt-queued-prompt-running-snapshot");
+        let workspace_root = temp_workspace_path("interrupt-queued-prompt-running-snapshot");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let manager = AgentManager::new(&db_path).unwrap();
+        let mut conn = manager.open_migrated().unwrap();
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let agent_id = AgentId::parse("claude").unwrap();
+        let session = insert_session(
+            &conn,
+            "interrupt queued prompt running snapshot",
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            agent_id.clone(),
+            AgentSessionState::Running,
+        );
+        let selection = SessionRuntimeSelection {
+            agent_id,
+            provider_profile_id: ProviderProfileId::parse("provider_acp_claude").unwrap(),
+            model_id: "claude-test-model".to_string(),
+            reasoning_effort: None,
+            mode_id: None,
+            config_values: Default::default(),
+        };
+        let runtime_switch = AgentSessionRuntimeRepository::enqueue_initial_runtime_switch(
+            &mut conn,
+            RuntimeSwitchId::new(),
+            &DesiredRuntimeSwitchEnqueueRequest {
+                session_id: session.id.clone(),
+                idempotency_key: format!("session-init:{}", session.id.as_str()),
+                expected_revision: 0,
+                expected_selection_revision: 0,
+                target_binding_id: RuntimeBindingId::new(),
+                target_adapter_id: AcpAdapterId::parse("claude-agent-acp").unwrap(),
+                desired: selection.clone(),
+                requested_policy: RuntimeSwitchPolicy::Automatic,
+                active_work_policy: RuntimeSwitchActiveWorkPolicy::default(),
+                requested_session_config: RuntimeSwitchCoordinator::encode_requested_config(
+                    &selection, None,
+                )
+                .unwrap(),
+            },
+        )
+        .unwrap();
+        let submission = MessageSubmissionRepository::enqueue(
+            &mut conn,
+            MessageSubmissionId::new(),
+            &SendAgentMessageRequest {
+                session_id: session.id.clone(),
+                message_idempotency_key: "initial-prompt".to_string(),
+                desired_runtime: selection,
+                text: "hello".to_string(),
+                attachments: Vec::new(),
+                reasoning_effort: None,
+                correlation_id: None,
+            },
+        )
+        .unwrap();
+        MessageSubmissionRepository::associate_required_switch(
+            &conn,
+            &submission.submission_id,
+            &runtime_switch.switch_id,
+        )
+        .unwrap();
+        drop(conn);
+
+        manager.interrupt(&session.id).await.unwrap();
+
+        let conn = manager.open_migrated().unwrap();
+        let cancelled = MessageSubmissionRepository::get(&conn, &submission.submission_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.status, MessageSubmissionStatus::Cancelled);
+        assert_eq!(
+            cancelled.error_code.as_deref(),
+            Some("message_submission_interrupted_before_dispatch")
         );
 
         drop(conn);
