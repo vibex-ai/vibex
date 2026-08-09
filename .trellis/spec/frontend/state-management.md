@@ -633,6 +633,11 @@ Remote attach role  -> viewer
   The projection never mutates the authoritative Timeline: a matching persisted
   user row replaces it, while a terminal send failure removes it and clears the
   local running state.
+- If the user interrupts that turn before initial runtime preparation reaches
+  provider dispatch, Desktop removes the optimistic row and pending Agent state
+  when the durable cancellation completes, without presenting the intentional
+  `message_submission_interrupted_before_dispatch` outcome as an initial-message
+  failure. Runtime preparation may continue independently for later prompts.
 - Local/session storage may persist only the bounded locator and runtime client
   handle. Prompt text, attachments, tokens, secrets, raw errors, native ids,
   and live binding data must not be persisted there.
@@ -656,6 +661,8 @@ Remote attach role  -> viewer
 - Final transient failure -> retain effective runtime and offer an explicit
   retry when a target is remembered.
 - Ambiguous message dispatch -> show uncertain delivery and never auto-resend.
+- User interrupt before initial prompt dispatch -> clear the optimistic turn and
+  show no failure notification; do not claim that the provider was interrupted.
 - Missing `beforeinput.inputType` -> treat as an unclassified insertion event;
   do not throw or suppress input.
 

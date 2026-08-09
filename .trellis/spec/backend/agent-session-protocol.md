@@ -3454,6 +3454,12 @@ agent_message_submission_payloads(
   `effective == desiredRuntime`. A linked cancelled switch cancels only
   Awaiting/Ready rows. Failed, superseded, or ambiguous preparation never
   falls back to the previous runtime.
+- Interrupting an `Initializing` session before a ready effective binding exists
+  cancels its `AwaitingRuntime` and `ReadyToDispatch` submissions with
+  `message_submission_interrupted_before_dispatch`. It does not cancel the
+  linked runtime switch and never rewrites `AboutToPrompt` or a later state;
+  those states require the normal provider-aware interrupt and reconciliation
+  path.
 - A previous switch failure may be cleared before enqueue only by successful
   lifecycle materialization of the exact DB-current binding and activation
   generation. The recovery CAS also requires `desired == effective`, no
@@ -3506,6 +3512,7 @@ agent_message_submission_payloads(
 | Same key with another payload/runtime | `message_submission_idempotency_payload_conflict`; no second sequence or prompt. |
 | Request effort differs from desired runtime | `message_submission_runtime_config_mismatch`; zero enqueue. |
 | Runtime gate changes before manager admission | `message_submission_runtime_gate_changed`; no provider call. |
+| Interrupt during initial runtime preparation | Cancel only `AwaitingRuntime` / `ReadyToDispatch`; return success when at least one submission was cancelled, otherwise preserve the runtime readiness error. |
 | Old `FailedUsingPrevious` state retries the already effective selection and exact current runtime materializes successfully | CAS the selection to `Ready`, clear only the session projection error, and retain the failed switch journal. |
 | Linked switch commits between selection and switch reads | Reread selection; dispatch once if it converged, otherwise `message_submission_runtime_changed_after_commit`. |
 | Current binding missing, stale, non-current, or config/generation mismatch | `message_submission_runtime_binding_*`; no provider call. |
@@ -3533,14 +3540,16 @@ agent_message_submission_payloads(
 
 - Core tests cover serde fields and Debug redaction for send/query/state.
 - DB tests cover atomic enqueue, exact conflict, sequence ordering, switch
-  cancellation, CAS transitions, dispatch-result transaction, and range load.
+  cancellation, session interrupt before the prompt boundary, CAS transitions,
+  dispatch-result transaction, and range load.
 - Coordinator tests cover concurrent same-key submit, caller drop, per-session
   order, cross-session parallelism, desired gate, terminal switch outcomes,
   committed-switch selection-read races, AboutToPrompt ambiguity, and result-fenced
   recovery.
 - Manager/ACP tests cover dropped-coordinator fail-closed, no durable
   failover/history bridge/binding update, prepare/send identity mismatch, and
-  ForceFresh dispatch exclusively to the current target native session.
+  ForceFresh dispatch exclusively to the current target native session. Manager
+  tests also cover initialization-time interrupt without an effective binding.
 - Selection-service/ACP-lifecycle/DB tests cover healing stale
   `FailedUsingPrevious` through same-selection retry only after the exact
   current attachment activates; Ready same-selection remains a no-op, while

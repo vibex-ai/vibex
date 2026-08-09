@@ -364,6 +364,11 @@ agent://runtime-selection-event
 - Startup reconciliation discovers the durable initial `Requested` switch and
   may resume it after any post-enqueue crash. It must never infer initial state
   from an unjournaled external attachment.
+- A deferred-selection watcher supervises its switch driver until SQLite records
+  a terminal status. If a drive attempt exits while the switch remains
+  nonterminal, including when another worker's lease temporarily prevents a
+  claim, the watcher retries on its bounded polling cadence; observing events
+  alone must not leave an `Initializing` session permanently stranded.
 - `SetDesiredAgentSessionRuntime` atomically advances `selection_revision` and
   inserts a `Requested` switch. Only the current selection revision may claim
   pending ownership and Commit. Query always rebuilds the product state from
@@ -468,8 +473,9 @@ agent://runtime-selection-event
   switch journal.
 - Selection service tests cover Requested/Waiting/Preparing/terminal mapping,
   initial crash recovery, broadcast recovery, latest-revision convergence,
-  cancellation separation, timeout fallback, and failed same-selection retry
-  without changing the side-effect-free Ready no-op.
+  cancellation separation, timeout fallback, a deferred driver retry after a
+  temporary lease conflict, and failed same-selection retry without changing
+  the side-effect-free Ready no-op.
 - DB and ACP lifecycle tests cover exact-fence recovery from
   `FailedUsingPrevious`, including both an existing attachment and a restored
   attachment; stale binding/generation or divergent selection stays failed.

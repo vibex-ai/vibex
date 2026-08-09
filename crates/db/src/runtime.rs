@@ -4029,6 +4029,35 @@ impl MessageSubmissionRepository {
         ))
     }
 
+    /// Cancels queued submissions that have not crossed the provider prompt
+    /// boundary. `AboutToPrompt` and later states require provider-aware
+    /// reconciliation and must not be rewritten by this path.
+    pub fn cancel_before_dispatch_for_session(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<usize> {
+        conn.execute(
+            "UPDATE agent_message_submissions
+             SET status = ?2,
+                 error_code = ?3,
+                 error_detail_redacted = NULL,
+                 updated_at_ms = ?4
+             WHERE session_id = ?1 AND status IN (?5, ?6)",
+            params![
+                session_id.as_str(),
+                enum_to_db(&MessageSubmissionStatus::Cancelled)?,
+                "message_submission_interrupted_before_dispatch",
+                unix_timestamp_ms(),
+                enum_to_db(&MessageSubmissionStatus::AwaitingRuntime)?,
+                enum_to_db(&MessageSubmissionStatus::ReadyToDispatch)?,
+            ],
+        )
+        .map_err(storage_err(
+            "message_submission_cancel_failed",
+            "failed to cancel message submissions before dispatch",
+        ))
+    }
+
     /// Advances the submission status with a CAS on the expected current
     /// status. Illegal transitions per §20.4 are rejected before touching the
     /// database.
@@ -7355,6 +7384,71 @@ mod tests {
                 .unwrap()
                 .submission_id,
             third.submission_id
+        );
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn message_submission_session_interrupt_only_cancels_before_dispatch() {
+        let temp = temp_db_path("submission-session-interrupt");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let session_id = seeded_session(&conn, "submission-session-interrupt");
+        let awaiting = MessageSubmissionRepository::enqueue(
+            &mut conn,
+            MessageSubmissionId::new(),
+            &message_request(&session_id, "interrupt-awaiting", "awaiting"),
+        )
+        .unwrap();
+        let ready = MessageSubmissionRepository::enqueue(
+            &mut conn,
+            MessageSubmissionId::new(),
+            &message_request(&session_id, "interrupt-ready", "ready"),
+        )
+        .unwrap();
+        MessageSubmissionRepository::advance_status(
+            &conn,
+            &ready.submission_id,
+            MessageSubmissionStatus::AwaitingRuntime,
+            MessageSubmissionStatus::ReadyToDispatch,
+        )
+        .unwrap();
+        let prompting = MessageSubmissionRepository::enqueue(
+            &mut conn,
+            MessageSubmissionId::new(),
+            &message_request(&session_id, "interrupt-prompting", "prompting"),
+        )
+        .unwrap();
+        MessageSubmissionRepository::advance_status(
+            &conn,
+            &prompting.submission_id,
+            MessageSubmissionStatus::AwaitingRuntime,
+            MessageSubmissionStatus::ReadyToDispatch,
+        )
+        .unwrap();
+        MessageSubmissionRepository::mark_about_to_prompt(&conn, &prompting.submission_id).unwrap();
+
+        assert_eq!(
+            MessageSubmissionRepository::cancel_before_dispatch_for_session(&conn, &session_id)
+                .unwrap(),
+            2
+        );
+        for submission_id in [&awaiting.submission_id, &ready.submission_id] {
+            let cancelled = MessageSubmissionRepository::get(&conn, submission_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(cancelled.status, MessageSubmissionStatus::Cancelled);
+            assert_eq!(
+                cancelled.error_code.as_deref(),
+                Some("message_submission_interrupted_before_dispatch")
+            );
+        }
+        assert_eq!(
+            MessageSubmissionRepository::get(&conn, &prompting.submission_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            MessageSubmissionStatus::AboutToPrompt
         );
         cleanup_db(temp);
     }

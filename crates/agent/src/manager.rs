@@ -35,9 +35,9 @@ use vibex_core::{
 use vibex_db::{
     AgentConfigRepository, AgentDefaultModelProviderProfileRepository,
     AgentSessionRuntimeRepository, DbConnection, ElicitationRepository, McpServerRepository,
-    PermissionRepository, PromptRepository, ProviderProfileRepository, RuntimeBindingRepository,
-    RuntimeSwitchRepository, SessionRepository, SkillRepository, TimelineAppend,
-    TimelineRepository, WorkspaceRepository, apply_migrations, open_database,
+    MessageSubmissionRepository, PermissionRepository, PromptRepository, ProviderProfileRepository,
+    RuntimeBindingRepository, RuntimeSwitchRepository, SessionRepository, SkillRepository,
+    TimelineAppend, TimelineRepository, WorkspaceRepository, apply_migrations, open_database,
 };
 
 use crate::adapter::{
@@ -2012,8 +2012,28 @@ impl AgentManager {
         let session = SessionRepository::get(&conn, session_id)?.ok_or_else(|| {
             VibexError::validation("session_not_found", "Agent session was not found")
         })?;
-        let (selection, binding, _identity, route_key) =
-            self.durable_session_execution(&conn, &session)?;
+        let (selection, binding, _identity, route_key) = match self
+            .durable_session_execution(&conn, &session)
+        {
+            Ok(execution) => execution,
+            Err(error)
+                if session.state == AgentSessionState::Initializing
+                    && matches!(
+                        error.code.as_str(),
+                        "session_runtime_selection_missing" | "session_runtime_not_ready"
+                    ) =>
+            {
+                let cancelled = MessageSubmissionRepository::cancel_before_dispatch_for_session(
+                    &conn,
+                    &session.id,
+                )?;
+                if cancelled > 0 {
+                    return Ok(());
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         let provider = self.runtime(&route_key)?;
         let capabilities = provider.capabilities_for_profile(Some(&selection.provider_profile_id));
         if !capabilities.interrupt {
@@ -3459,9 +3479,10 @@ mod tests {
 
     use async_trait::async_trait;
     use vibex_core::{
-        AcpAdapterId, AgentRuntimeRouteKey, AgentSessionSafety, NativeStateHomeId, RuntimeBinding,
-        RuntimeBindingId, RuntimeSwitchActiveWorkPolicy, RuntimeSwitchId, RuntimeSwitchPolicy,
-        SessionRuntimeConfigState, WorkspaceMode,
+        AcpAdapterId, AgentRuntimeRouteKey, AgentSessionSafety, MessageSubmissionStatus,
+        NativeStateHomeId, RuntimeBinding, RuntimeBindingId, RuntimeSwitchActiveWorkPolicy,
+        RuntimeSwitchId, RuntimeSwitchPolicy, RuntimeSwitchStatus, SessionRuntimeConfigState,
+        WorkspaceMode,
     };
     use vibex_db::{DesiredRuntimeSwitchEnqueueRequest, WorkspaceRepository};
 
@@ -4482,6 +4503,100 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(recovered_running.state, AgentSessionState::Error);
+
+        drop(conn);
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn interrupt_during_initial_runtime_preparation_cancels_queued_prompt() {
+        let db_path = temp_db_path("interrupt-initial-runtime-preparation");
+        let workspace_root = temp_workspace_path("interrupt-initial-runtime-preparation");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let manager = AgentManager::new(&db_path).unwrap();
+        let mut conn = manager.open_migrated().unwrap();
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let agent_id = AgentId::parse("claude").unwrap();
+        let session = insert_session(
+            &conn,
+            "interrupt initial runtime preparation",
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            agent_id.clone(),
+            AgentSessionState::Initializing,
+        );
+        let selection = SessionRuntimeSelection {
+            agent_id,
+            provider_profile_id: ProviderProfileId::parse("provider_acp_claude").unwrap(),
+            model_id: "claude-test-model".to_string(),
+            reasoning_effort: None,
+            mode_id: None,
+            config_values: Default::default(),
+        };
+        let runtime_switch = AgentSessionRuntimeRepository::enqueue_initial_runtime_switch(
+            &mut conn,
+            RuntimeSwitchId::new(),
+            &DesiredRuntimeSwitchEnqueueRequest {
+                session_id: session.id.clone(),
+                idempotency_key: format!("session-init:{}", session.id.as_str()),
+                expected_revision: 0,
+                expected_selection_revision: 0,
+                target_binding_id: RuntimeBindingId::new(),
+                target_adapter_id: AcpAdapterId::parse("claude-agent-acp").unwrap(),
+                desired: selection.clone(),
+                requested_policy: RuntimeSwitchPolicy::Automatic,
+                active_work_policy: RuntimeSwitchActiveWorkPolicy::default(),
+                requested_session_config: RuntimeSwitchCoordinator::encode_requested_config(
+                    &selection, None,
+                )
+                .unwrap(),
+            },
+        )
+        .unwrap();
+        let submission = MessageSubmissionRepository::enqueue(
+            &mut conn,
+            MessageSubmissionId::new(),
+            &SendAgentMessageRequest {
+                session_id: session.id.clone(),
+                message_idempotency_key: "initial-prompt".to_string(),
+                desired_runtime: selection,
+                text: "hello".to_string(),
+                attachments: Vec::new(),
+                reasoning_effort: None,
+                correlation_id: None,
+            },
+        )
+        .unwrap();
+        MessageSubmissionRepository::associate_required_switch(
+            &conn,
+            &submission.submission_id,
+            &runtime_switch.switch_id,
+        )
+        .unwrap();
+        drop(conn);
+
+        manager.interrupt(&session.id).await.unwrap();
+
+        let conn = manager.open_migrated().unwrap();
+        let cancelled = MessageSubmissionRepository::get(&conn, &submission.submission_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.status, MessageSubmissionStatus::Cancelled);
+        assert_eq!(
+            cancelled.error_code.as_deref(),
+            Some("message_submission_interrupted_before_dispatch")
+        );
+        assert_eq!(
+            RuntimeSwitchRepository::get(&conn, &runtime_switch.switch_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            RuntimeSwitchStatus::Requested
+        );
 
         drop(conn);
         cleanup_db(&db_path);

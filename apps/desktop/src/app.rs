@@ -660,6 +660,16 @@ fn runtime_attachment_warning<T>(outcome: vibex_core::VibexResult<T>) -> Option<
         .map(|error| format!("{}: {}", error.code, error.message))
 }
 
+fn initial_message_failure_note(error: &vibex_core::VibexError) -> Option<String> {
+    if error.code == "message_submission_interrupted_before_dispatch" {
+        return None;
+    }
+    Some(format!(
+        "Session created; initial message failed: {}: {}",
+        error.code, error.message
+    ))
+}
+
 fn runtime_token_usage_snapshot(
     runtime: &DesktopRuntime,
     session_id: &VibexSessionId,
@@ -12122,8 +12132,7 @@ impl VibexWorkbench {
                 ),
                 initial_message,
             )
-            .await
-            .map(|error| format!("{}: {}", error.code, error.message));
+            .await;
             let refreshed_session = runtime
                 .agent()
                 .manager()
@@ -12249,9 +12258,10 @@ impl VibexWorkbench {
                         {
                             this.refresh_selected_agent_timeline(cx);
                         }
-                        if let Some(error) = initial_message_error {
-                            this.runtime_note =
-                                Some(format!("Session created; initial message failed: {error}"));
+                        if let Some(error) = initial_message_error
+                            && let Some(note) = initial_message_failure_note(&error)
+                        {
+                            this.runtime_note = Some(note);
                         }
                         this.reconcile_sidebar_state();
                         this.refresh_workspace_contexts(cx);
@@ -34250,6 +34260,21 @@ mod tests {
 
         release_tx.send(()).expect("release initial message");
         assert!(submission.await.expect("submission task").is_none());
+    }
+
+    #[test]
+    fn initial_message_interrupt_is_not_reported_as_a_failure() {
+        let interrupted = vibex_core::VibexError::conflict(
+            "message_submission_interrupted_before_dispatch",
+            "message submission was cancelled before dispatch",
+        );
+        assert_eq!(initial_message_failure_note(&interrupted), None);
+
+        let failed = vibex_core::VibexError::provider("provider_failed", "provider failed");
+        assert_eq!(
+            initial_message_failure_note(&failed).as_deref(),
+            Some("Session created; initial message failed: provider_failed: provider failed")
+        );
     }
 
     #[test]

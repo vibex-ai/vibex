@@ -615,11 +615,10 @@ impl RuntimeSelectionService {
         let switch_id = record.switch_id.clone();
         let session_id = record.session_id.clone();
         tokio::spawn(async move {
-            let coordinator = service.inner.coordinator.clone();
-            let driver_switch_id = switch_id.clone();
-            tokio::spawn(async move {
-                let _ = coordinator.drive_switch(&driver_switch_id).await;
-            });
+            let mut driver = Some(spawn_switch_driver(
+                service.inner.coordinator.clone(),
+                switch_id.clone(),
+            ));
 
             let mut previous = service.authoritative_event(&session_id).ok();
             loop {
@@ -671,6 +670,25 @@ impl RuntimeSelectionService {
                     }
                     _ => break,
                 }
+                if driver
+                    .as_ref()
+                    .is_some_and(tokio::task::JoinHandle::is_finished)
+                {
+                    let _ = driver
+                        .take()
+                        .expect("finished switch driver is present")
+                        .await;
+                }
+                if driver.is_none() {
+                    // A driver can lose a lease race, be cancelled with its
+                    // caller, or fail before claiming the durable Requested
+                    // row. Keep supervising until SQLite records a terminal
+                    // outcome instead of leaving the session initializing.
+                    driver = Some(spawn_switch_driver(
+                        service.inner.coordinator.clone(),
+                        switch_id.clone(),
+                    ));
+                }
             }
             if let Ok(mut watched) = service.inner.watched_switches.lock() {
                 watched.remove(&switch_id);
@@ -708,6 +726,13 @@ impl RuntimeSelectionService {
         let conn = open_database(self.inner.coordinator.database_path())?;
         RuntimeSwitchRepository::get_by_idempotency_key(&conn, session_id, idempotency_key)
     }
+}
+
+fn spawn_switch_driver(
+    coordinator: RuntimeSwitchCoordinator,
+    switch_id: RuntimeSwitchId,
+) -> tokio::task::JoinHandle<VibexResult<crate::runtime_switch::SwitchOutcome>> {
+    tokio::spawn(async move { coordinator.drive_switch(&switch_id).await })
 }
 
 fn selection_metric_result(status: RuntimeSwitchStatus) -> RuntimeMetricResult {
@@ -1607,6 +1632,59 @@ mod tests {
                 .unwrap()
                 .state,
             AgentSessionState::Idle
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_initial_switch_retries_when_the_first_driver_cannot_claim() {
+        let env = TestEnvironment::new("deferred-driver-retry", 500);
+        let conn = open_database(&env.db_path).unwrap();
+        let template = SessionRepository::get(&conn, &env.session_id)
+            .unwrap()
+            .unwrap();
+        let session_id = VibexSessionId::new();
+        let mut session = template;
+        session.id = session_id.clone();
+        session.title = "deferred driver retry".to_string();
+        session.state = AgentSessionState::Initializing;
+        SessionRepository::insert(&conn, &session).unwrap();
+        drop(conn);
+
+        let record = env
+            .service
+            .enqueue_initial_runtime_switch(&session_id, env.effective.clone())
+            .await
+            .unwrap();
+        let now = unix_timestamp_ms();
+        let conn = open_database(&env.db_path).unwrap();
+        assert!(
+            RuntimeSwitchRepository::try_acquire_worker_lease(
+                &conn,
+                &record.switch_id,
+                "departed-worker",
+                25,
+                now,
+            )
+            .unwrap()
+        );
+        drop(conn);
+
+        env.service.emit_authoritative(&session_id).unwrap();
+        env.service.start_watcher(&record).unwrap();
+        let ready = wait_for_status(
+            &env.service,
+            &session_id,
+            SessionRuntimeSelectionStatus::Ready,
+        )
+        .await;
+        assert_eq!(ready.desired, env.effective);
+        assert_eq!(ready.effective, env.effective);
+        assert_eq!(
+            RuntimeSwitchRepository::get(&open_database(&env.db_path).unwrap(), &record.switch_id,)
+                .unwrap()
+                .unwrap()
+                .status,
+            RuntimeSwitchStatus::Committed
         );
     }
 
