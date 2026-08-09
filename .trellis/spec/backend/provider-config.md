@@ -3161,7 +3161,7 @@ spawn_acp_child(resolved.child_environment())?;
 Only the authoritative runtime resolves the Secret, and every file target is a
 validated code-owned overlay under the private runtime root.
 
-## Scenario: Exact-Version Catalog Agent Runtime Projection
+## Scenario: Minimum-Version Catalog Agent Runtime Projection
 
 ### 1. Scope / Trigger
 
@@ -3217,12 +3217,14 @@ ResolvedAgentProviderProjection {
 
 ### 3. Contracts
 
-- The 17 descriptors match only their exact catalog versions: Copilot `1.0.78`,
-  CodeWhale `0.8.55`, crow-cli `0.1.23`, Dirac `0.4.1`, Factory Droid
-  `0.153.1`, fast-agent `0.7.21`, Goose `1.33.1`, Grok `0.2.11`, Hermes
-  `0.19.0`, Kilo `7.2.40`, Kimi `0.11.0`, Mistral Vibe `2.9.3`, Poolside
-  `1.0.0`, Pi `0.0.33`, Qwen Code `0.18.4`, Stakpak `0.3.80`, and VT Code
-  `0.96.14`. A future or unknown version never inherits these schemas.
+- The 17 descriptors accept their researched catalog versions and later
+  semantic versions: Copilot `>=1.0.78`, CodeWhale `>=0.8.55`, crow-cli
+  `>=0.1.23`, Dirac `>=0.4.1`, Factory Droid `>=0.153.1`, fast-agent
+  `>=0.7.21`, Goose `>=1.33.1`, Grok `>=0.2.11`, Hermes `>=0.19.0`, Kilo
+  `>=7.2.40`, Kimi `>=0.11.0`, Mistral Vibe `>=2.9.3`, Poolside `>=1.0.0`,
+  Pi `>=0.0.33`, Qwen Code `>=0.18.4`, Stakpak `>=0.3.80`, and VT Code
+  `>=0.96.14`. Older, missing, manual, or non-semantic versions never inherit
+  these schemas.
 - Explicit refresh may run `<binary> --version` only for these trusted binary
   names: `copilot`, `codewhale`, `crow-cli`, `goose`, `grok`, `hermes`, `kilo`,
   `kimi`, `vibe-acp`, `pool`, `stakpak`, and `vtcode`. Dirac, Factory Droid,
@@ -3282,7 +3284,7 @@ ResolvedAgentProviderProjection {
 
 | Condition | Required result |
 | --- | --- |
-| Agent version is absent, manual, future, or differs from the exact catalog version | Conservative capability with `agent_projection_version_untrusted` or `agent_projection_version_mismatch`; inject nothing. |
+| Agent version is absent, manual, non-semantic, or below the catalog minimum | Conservative capability with `agent_projection_version_untrusted` or `agent_projection_version_mismatch`; inject nothing. |
 | PATH binary basename is not the Agent's trusted name | Record `agent_version_probe_command_untrusted`; do not execute it or enable the projector. |
 | Pinned `npx`/`uvx` command or any argument differs | Do not infer the catalog version; automatic projection remains closed. |
 | Model Wire API is not in the descriptor's interface list | `agent_model_interface_unsupported`; preserve the current binding/process. |
@@ -3304,8 +3306,9 @@ ResolvedAgentProviderProjection {
 - Base: Copilot, fast-agent, or Poolside needs no config file. The process
   receives only its typed endpoint/key/model environment plus safe runtime
   metadata.
-- Bad: apply a `1.33.1` Goose overlay to an unrecognized future Goose version,
-  or treat successful ACP `initialize` as proof that the endpoint was selected.
+- Bad: apply a `1.33.1` Goose overlay to Goose `1.32.9`, a missing version, or
+  a non-semantic version, or treat successful ACP `initialize` as proof that
+  the endpoint was selected.
 - Bad: register a Goose custom provider without selecting it, register a Grok
   custom model without `[models].default`, write an API key into an overlay, or
   materialize one set of args for the fingerprint and spawn another set.
@@ -3313,9 +3316,9 @@ ResolvedAgentProviderProjection {
 ### 6. Tests Required
 
 - Core `catalog_projection_contracts_are_explicit_and_conservative` asserts all
-  17 ids, exact-version compatibility, typed provider/model boundaries,
-  `VibexPrivate`, and `RestartAndResume`; the six blocked Agents remain
-  conservative.
+  17 ids, catalog-derived `>=` semantic-version compatibility, typed
+  provider/model boundaries, `VibexPrivate`, and `RestartAndResume`; the six
+  blocked Agents remain conservative.
 - DB `pinned_catalog_commands_supply_exact_versions_only_for_full_command_matches`
   asserts the five fixed-command identities and fail-closed mismatches.
 - Config-switch
@@ -3462,9 +3465,9 @@ check:agent-provider-runtime[:self-test]
 
 ### 5. Good/Base/Bad Cases
 
-- Good: CodeBuddy exact `2.109.0` receives only its three documented env keys,
+- Good: a Goose `>=1.33.1` runtime receives only its documented projection,
   the isolated probe confirms the planned safe origin plus exact model, and
-  evidence remains scoped to that exact descriptor/version.
+  evidence remains scoped to the matching descriptor and runtime version.
 - Good: an exact Autohand descriptor without a typed projector remains
   `Unverified`, has no runtime home/fingerprint, and returns its stable
   capability diagnostic.
@@ -3478,9 +3481,9 @@ check:agent-provider-runtime[:self-test]
 
 ### 6. Tests Required
 
-- Core tests cover exact and semantic-range 39-entry catalog/descriptor/manifest
-  identity, per-entry conservative diagnostics, and the two explicit
-  environment descriptors.
+- Core tests cover exact builtin and semantic-range catalog 39-entry
+  catalog/descriptor/manifest identity, per-entry conservative diagnostics,
+  and the two explicit environment descriptors.
 - ACP probe tests cover duplicate isolation keys, bounded cleanup, independent
   fact aggregation, restore response identity, matching safe origins, wrong
   origins with identical model names, and missing expected identities.

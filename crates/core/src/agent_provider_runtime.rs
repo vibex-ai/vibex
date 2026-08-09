@@ -289,16 +289,14 @@ impl CatalogProjectionShape {
 }
 
 fn catalog_version_compatibility(
-    agent_id: &str,
     version: &str,
+    mode: AgentProviderCapabilityMode,
     shape: &CatalogProjectionShape,
 ) -> (AgentVersionPolicy, AgentVersionCompatibility) {
-    // The two legacy environment projectors predate this catalog rollout and
-    // have documented compatibility ranges. The newly typed catalog
-    // projectors are pinned to the exact source version until a newer schema
-    // has its own evidence; applying a future schema silently would inject
-    // credentials into an incompatible process.
-    if matches!(agent_id, "codebuddy-code" | "glm-acp-agent")
+    // Every explicit ReplaceableProvider projector uses its researched
+    // catalog version as a minimum supported version. Managed/cloud/local
+    // Agents and conservative entries retain their stricter policies.
+    if mode == AgentProviderCapabilityMode::ReplaceableProvider
         && shape.supports_vibex_model_provider_projection()
     {
         at_least_or_manual(version)
@@ -681,7 +679,7 @@ fn catalog_manifest_entry(
     let agent_id = AgentId::parse(id)?;
     let mode = mode_for(id);
     let shape = catalog_projection_shape(id, mode)?;
-    let (version_policy, _) = catalog_version_compatibility(id, version, &shape);
+    let (version_policy, _) = catalog_version_compatibility(version, mode, &shape);
     let entry = AgentProviderRolloutManifestEntry {
         agent_id: agent_id.clone(),
         catalog_version: version.to_string(),
@@ -807,7 +805,7 @@ pub fn catalog_projection_descriptors() -> VibexResult<Vec<AgentProviderProjecti
         let agent_id = AgentId::parse(entry.id)?;
         let mode = mode_for(entry.id);
         let shape = catalog_projection_shape(entry.id, mode)?;
-        let (_, compatibility) = catalog_version_compatibility(entry.id, entry.version, &shape);
+        let (_, compatibility) = catalog_version_compatibility(entry.version, mode, &shape);
         result.push(AgentProviderProjectionDescriptor {
             id: descriptor_id(&agent_id),
             descriptor_version: "1".to_string(),
@@ -1621,12 +1619,22 @@ mod tests {
             .iter()
             .filter(|descriptor| typed_projectors.contains(&descriptor.route.agent_id.as_str()))
         {
+            let catalog_version = acp_agent_catalog_entries()
+                .iter()
+                .find(|entry| entry.id == descriptor.route.agent_id.as_str())
+                .expect("typed projector is present in the ACP catalog")
+                .version;
+            let expected_requirement = format!(">={catalog_version}");
             assert!(
                 matches!(
                     descriptor.compatibility,
-                    AgentVersionCompatibility::Exact { .. }
+                    AgentVersionCompatibility::SemverRange {
+                        adapter_range: None,
+                        agent_range: Some(ref range),
+                        runtime_dependency_ranges: ref ranges,
+                    } if range == &expected_requirement && ranges.is_empty()
                 ),
-                "{} must fail closed outside its verified catalog version",
+                "{} must accept its catalog version and newer versions",
                 descriptor.route.agent_id
             );
         }

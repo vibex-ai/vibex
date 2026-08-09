@@ -3,9 +3,9 @@
   "status": "passed",
   "claimScope": "manifest_and_contract",
   "realRuntimeVerification": "blocked",
-  "capturedAt": "2026-08-07T09:56:59.065Z",
+  "capturedAt": "2026-08-09T03:15:46.434Z",
   "source": {
-    "captureParentCommit": "d3e428d2c2cdd7df3dcbd89df4e419016b0187d1",
+    "captureParentCommit": "e4e01270d38453b933b0172b7ca1357baac17664",
     "rustToolchain": "rustc-1.97.0",
     "sourceInputRoots": [
       "crates/core/src/acp_catalog.rs",
@@ -53,21 +53,21 @@
       "crates/vibex-ui/Cargo.toml",
       "apps/desktop/Cargo.toml"
     ],
-    "sourceInputTreeSha256": "c48b7cebe7f6168b715f33acffc929fd28b349770f5c9e13cc0f0b4d61b936f4",
+    "sourceInputTreeSha256": "71ef3fc19b676e3f393e2227605c13dbd5a915e9c0521822dce9090e649771e5",
     "bindings": {
-      "catalog": "164f53c193e4c687d56e7df12a7f6c395a32cadb744cf46471954a25cae42bd5",
-      "manifest": "827339f122692ed3f67d5bf3d7c8822b07780b3bb3a6d05083fcab8aa58a3d71",
-      "probe": "5136cd7c379d1dbb873aee0615bdadf9d58301eab14bfbbfaa5e6aff713ce4b4",
-      "database": "b73956a31d95742232b357fd923dcf5f489a86687e4c996236f9f53f23419658",
+      "catalog": "43caa8cfba59ee6c92f92e8e16fb5c789665791ddbb3d45acabb4b7a61c6c5d0",
+      "manifest": "a7dcd5154b5681cd10fe0b71ac4b2c815e106c6ba4dc7782c1fe6dcf857e9efe",
+      "probe": "f29f32434b98aa1b131fab25c0d71e5f3716e16d18d8ed1f889897af650c1581",
+      "database": "c0ddc4cb8f43510c3bc7737af615b022ed3d4083556a0389cb813f7a01412555",
       "remote": "cca712dc885a20fa5dbf4ec8d0db5d603015c7b87d1f879f458d88d29cb70905",
-      "ui": "93c3d25efa7c7713f1cf7731542521fd43808abf866336e017cafd8bcb34cded",
-      "switch": "aa9ef1a461fb4adad5756ba2c7931aaae3b0de499b85d1603df5c9cdf7fe9996",
+      "ui": "977aaaf340811d56a7413d48c1488ae4dd7dc34d200e51970091c03dc5c8c04b",
+      "switch": "599e83811eea20587b22de0556d1ef672b80d1fcdd335e8b8dd59eeb04406308",
       "scripts": "4b85e8061180d809d2df0d8b3de8a3e93a1724cef464c02dd9ef6870b5f4dc86",
       "packageMetadata": "ce644f6fff1360cbac4c638cb82bec12b939e1bee1a56c6cfdb3481d4345341a"
     },
     "cargoLockSha256": "1f1bee10326503e236af53f9e5242462f871def4ccf3f665a803d4555368eced",
     "packageJsonSha256": "4e1c85256422478413b0e9c5f0e046295bbe260944dd7d93a59b1c190ed7d739",
-    "rolloutManifestSha256": "b7df3c0dd5e2a3c0eaf29e721c147975c519db0b3cea2dfadedf2921193005a6"
+    "rolloutManifestSha256": "fd583933fc1c72fcc52dad8874128df8cdd04008f28671aacc5728f4ef10279a"
   },
   "manifest": {
     "schemaVersion": "agent-provider-runtime-manifest.v1",
@@ -244,22 +244,33 @@
       },
       {
         "agentId": "copilot",
-        "catalogVersion": "manual",
+        "catalogVersion": "1.0.78",
         "adapterId": "copilot-acp",
         "descriptorId": "projection_copilot_runtime_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
-          "kind": "detected_manual"
+          "kind": "detected_semver",
+          "requirement": ">=1.0.78"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "none",
-        "switchBehavior": "unverified",
-        "credentialKinds": [],
-        "modelInterfaces": [],
-        "evidenceState": "unverified",
-        "sourceEvidenceReference": "research/acp-agent/copilot@manual",
+        "runtimeHomeStrategy": "vibex_private",
+        "switchBehavior": "restart_and_resume",
+        "credentialKinds": [
+          "api_key"
+        ],
+        "modelInterfaces": [
+          {
+            "wireProtocolId": "openai_chat_completions",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": false,
+            "processScoped": true
+          }
+        ],
+        "evidenceState": "documented",
+        "sourceEvidenceReference": "research/acp-agent/copilot@1.0.78",
         "smokeId": "agent-provider-copilot",
-        "capabilityDiagnosticCode": "agent_projection_version_detection_required"
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
         "agentId": "codebuddy-code",
@@ -298,17 +309,28 @@
         "descriptorId": "projection_codewhale_runtime_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
-          "kind": "exact"
+          "kind": "detected_semver",
+          "requirement": ">=0.8.55"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "none",
-        "switchBehavior": "unverified",
-        "credentialKinds": [],
-        "modelInterfaces": [],
-        "evidenceState": "unverified",
+        "runtimeHomeStrategy": "vibex_private",
+        "switchBehavior": "restart_and_resume",
+        "credentialKinds": [
+          "api_key"
+        ],
+        "modelInterfaces": [
+          {
+            "wireProtocolId": "openai_chat_completions",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": false,
+            "processScoped": true
+          }
+        ],
+        "evidenceState": "documented",
         "sourceEvidenceReference": "research/acp-agent/codewhale@0.8.55",
         "smokeId": "agent-provider-codewhale",
-        "capabilityDiagnosticCode": "agent_projection_typed_projector_not_implemented"
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
         "agentId": "cortex-code",
@@ -317,8 +339,7 @@
         "descriptorId": "projection_cortex_code_runtime_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
-          "kind": "detected_semver",
-          "requirement": ">=1.0.73"
+          "kind": "exact"
         },
         "capabilityMode": "cloud_credential",
         "runtimeHomeStrategy": "agent_managed",
@@ -340,17 +361,28 @@
         "descriptorId": "projection_crow_cli_runtime_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
-          "kind": "exact"
+          "kind": "detected_semver",
+          "requirement": ">=0.1.23"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "none",
-        "switchBehavior": "unverified",
-        "credentialKinds": [],
-        "modelInterfaces": [],
-        "evidenceState": "unverified",
+        "runtimeHomeStrategy": "vibex_private",
+        "switchBehavior": "restart_and_resume",
+        "credentialKinds": [
+          "api_key"
+        ],
+        "modelInterfaces": [
+          {
+            "wireProtocolId": "openai_chat_completions",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": false,
+            "processScoped": true
+          }
+        ],
+        "evidenceState": "documented",
         "sourceEvidenceReference": "research/acp-agent/crow-cli@0.1.23",
         "smokeId": "agent-provider-crow-cli",
-        "capabilityDiagnosticCode": "agent_projection_typed_projector_not_implemented"
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
         "agentId": "cursor",
@@ -432,7 +464,7 @@
         "evidenceState": "unverified",
         "sourceEvidenceReference": "research/acp-agent/dimcode@0.2.7",
         "smokeId": "agent-provider-dimcode",
-        "capabilityDiagnosticCode": "agent_projection_typed_projector_not_implemented"
+        "capabilityDiagnosticCode": "agent_projection_auth_boundary_not_runtime_verified"
       },
       {
         "agentId": "dirac",
@@ -441,17 +473,28 @@
         "descriptorId": "projection_dirac_runtime_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
-          "kind": "exact"
+          "kind": "detected_semver",
+          "requirement": ">=0.4.1"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "none",
-        "switchBehavior": "unverified",
-        "credentialKinds": [],
-        "modelInterfaces": [],
-        "evidenceState": "unverified",
+        "runtimeHomeStrategy": "vibex_private",
+        "switchBehavior": "restart_and_resume",
+        "credentialKinds": [
+          "api_key"
+        ],
+        "modelInterfaces": [
+          {
+            "wireProtocolId": "openai_chat_completions",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": false,
+            "processScoped": true
+          }
+        ],
+        "evidenceState": "documented",
         "sourceEvidenceReference": "research/acp-agent/dirac@0.4.1",
         "smokeId": "agent-provider-dirac",
-        "capabilityDiagnosticCode": "agent_projection_auth_boundary_not_runtime_verified"
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
         "agentId": "factory-droid",
@@ -460,17 +503,42 @@
         "descriptorId": "projection_factory_droid_runtime_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
-          "kind": "exact"
+          "kind": "detected_semver",
+          "requirement": ">=0.153.1"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "none",
-        "switchBehavior": "unverified",
-        "credentialKinds": [],
-        "modelInterfaces": [],
-        "evidenceState": "unverified",
+        "runtimeHomeStrategy": "vibex_private",
+        "switchBehavior": "restart_and_resume",
+        "credentialKinds": [
+          "api_key"
+        ],
+        "modelInterfaces": [
+          {
+            "wireProtocolId": "openai_responses",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": true,
+            "processScoped": true
+          },
+          {
+            "wireProtocolId": "openai_chat_completions",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": true,
+            "processScoped": true
+          },
+          {
+            "wireProtocolId": "anthropic_messages",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": true,
+            "processScoped": true
+          }
+        ],
+        "evidenceState": "documented",
         "sourceEvidenceReference": "research/acp-agent/factory-droid@0.153.1",
         "smokeId": "agent-provider-factory-droid",
-        "capabilityDiagnosticCode": "agent_projection_typed_projector_not_implemented"
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
         "agentId": "fast-agent",
@@ -479,17 +547,28 @@
         "descriptorId": "projection_fast_agent_runtime_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
-          "kind": "exact"
+          "kind": "detected_semver",
+          "requirement": ">=0.7.21"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "none",
-        "switchBehavior": "unverified",
-        "credentialKinds": [],
-        "modelInterfaces": [],
-        "evidenceState": "unverified",
+        "runtimeHomeStrategy": "vibex_private",
+        "switchBehavior": "restart_and_resume",
+        "credentialKinds": [
+          "api_key"
+        ],
+        "modelInterfaces": [
+          {
+            "wireProtocolId": "openai_chat_completions",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": false,
+            "processScoped": true
+          }
+        ],
+        "evidenceState": "documented",
         "sourceEvidenceReference": "research/acp-agent/fast-agent@0.7.21",
         "smokeId": "agent-provider-fast-agent",
-        "capabilityDiagnosticCode": "agent_projection_typed_projector_not_implemented"
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
         "agentId": "gemini",
@@ -498,8 +577,7 @@
         "descriptorId": "projection_gemini_runtime_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
-          "kind": "detected_semver",
-          "requirement": ">=0.47.0"
+          "kind": "exact"
         },
         "capabilityMode": "cloud_credential",
         "runtimeHomeStrategy": "agent_managed",
@@ -552,17 +630,28 @@
         "descriptorId": "projection_goose_runtime_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
-          "kind": "exact"
+          "kind": "detected_semver",
+          "requirement": ">=1.33.1"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "none",
-        "switchBehavior": "unverified",
-        "credentialKinds": [],
-        "modelInterfaces": [],
-        "evidenceState": "unverified",
+        "runtimeHomeStrategy": "vibex_private",
+        "switchBehavior": "restart_and_resume",
+        "credentialKinds": [
+          "api_key"
+        ],
+        "modelInterfaces": [
+          {
+            "wireProtocolId": "openai_chat_completions",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": false,
+            "processScoped": true
+          }
+        ],
+        "evidenceState": "documented",
         "sourceEvidenceReference": "research/acp-agent/goose@1.33.1",
         "smokeId": "agent-provider-goose",
-        "capabilityDiagnosticCode": "agent_projection_acp_option_not_runtime_verified"
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
         "agentId": "grok",
@@ -571,36 +660,72 @@
         "descriptorId": "projection_grok_runtime_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
-          "kind": "exact"
+          "kind": "detected_semver",
+          "requirement": ">=0.2.11"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "none",
-        "switchBehavior": "unverified",
-        "credentialKinds": [],
-        "modelInterfaces": [],
-        "evidenceState": "unverified",
+        "runtimeHomeStrategy": "vibex_private",
+        "switchBehavior": "restart_and_resume",
+        "credentialKinds": [
+          "api_key"
+        ],
+        "modelInterfaces": [
+          {
+            "wireProtocolId": "openai_responses",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": true,
+            "processScoped": true
+          },
+          {
+            "wireProtocolId": "openai_chat_completions",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": true,
+            "processScoped": true
+          },
+          {
+            "wireProtocolId": "anthropic_messages",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": true,
+            "processScoped": true
+          }
+        ],
+        "evidenceState": "documented",
         "sourceEvidenceReference": "research/acp-agent/grok@0.2.11",
         "smokeId": "agent-provider-grok",
-        "capabilityDiagnosticCode": "agent_projection_mixed_auth_boundary_not_runtime_verified"
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
         "agentId": "hermes",
-        "catalogVersion": "manual",
+        "catalogVersion": "0.19.0",
         "adapterId": "hermes-acp",
         "descriptorId": "projection_hermes_runtime_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
-          "kind": "detected_manual"
+          "kind": "detected_semver",
+          "requirement": ">=0.19.0"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "none",
-        "switchBehavior": "unverified",
-        "credentialKinds": [],
-        "modelInterfaces": [],
-        "evidenceState": "unverified",
-        "sourceEvidenceReference": "research/acp-agent/hermes@manual",
+        "runtimeHomeStrategy": "vibex_private",
+        "switchBehavior": "restart_and_resume",
+        "credentialKinds": [
+          "api_key"
+        ],
+        "modelInterfaces": [
+          {
+            "wireProtocolId": "openai_chat_completions",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": false,
+            "processScoped": true
+          }
+        ],
+        "evidenceState": "documented",
+        "sourceEvidenceReference": "research/acp-agent/hermes@0.19.0",
         "smokeId": "agent-provider-hermes",
-        "capabilityDiagnosticCode": "agent_projection_version_detection_required"
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
         "agentId": "junie",
@@ -631,17 +756,28 @@
         "descriptorId": "projection_kilo_runtime_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
-          "kind": "exact"
+          "kind": "detected_semver",
+          "requirement": ">=7.2.40"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "none",
-        "switchBehavior": "unverified",
-        "credentialKinds": [],
-        "modelInterfaces": [],
-        "evidenceState": "unverified",
+        "runtimeHomeStrategy": "vibex_private",
+        "switchBehavior": "restart_and_resume",
+        "credentialKinds": [
+          "api_key"
+        ],
+        "modelInterfaces": [
+          {
+            "wireProtocolId": "openai_chat_completions",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": false,
+            "processScoped": true
+          }
+        ],
+        "evidenceState": "documented",
         "sourceEvidenceReference": "research/acp-agent/kilo@7.2.40",
         "smokeId": "agent-provider-kilo",
-        "capabilityDiagnosticCode": "agent_projection_auth_boundary_not_runtime_verified"
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
         "agentId": "kiro",
@@ -672,17 +808,35 @@
         "descriptorId": "projection_kimi_runtime_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
-          "kind": "exact"
+          "kind": "detected_semver",
+          "requirement": ">=0.11.0"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "none",
-        "switchBehavior": "unverified",
-        "credentialKinds": [],
-        "modelInterfaces": [],
-        "evidenceState": "unverified",
+        "runtimeHomeStrategy": "vibex_private",
+        "switchBehavior": "restart_and_resume",
+        "credentialKinds": [
+          "api_key"
+        ],
+        "modelInterfaces": [
+          {
+            "wireProtocolId": "openai_chat_completions",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": true,
+            "processScoped": true
+          },
+          {
+            "wireProtocolId": "anthropic_messages",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": true,
+            "processScoped": true
+          }
+        ],
+        "evidenceState": "documented",
         "sourceEvidenceReference": "research/acp-agent/kimi@0.11.0",
         "smokeId": "agent-provider-kimi",
-        "capabilityDiagnosticCode": "agent_projection_typed_projector_not_implemented"
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
         "agentId": "minion-code",
@@ -710,17 +864,42 @@
         "descriptorId": "projection_mistral_vibe_runtime_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
-          "kind": "exact"
+          "kind": "detected_semver",
+          "requirement": ">=2.9.3"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "none",
-        "switchBehavior": "unverified",
-        "credentialKinds": [],
-        "modelInterfaces": [],
-        "evidenceState": "unverified",
+        "runtimeHomeStrategy": "vibex_private",
+        "switchBehavior": "restart_and_resume",
+        "credentialKinds": [
+          "api_key"
+        ],
+        "modelInterfaces": [
+          {
+            "wireProtocolId": "openai_chat_completions",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": true,
+            "processScoped": true
+          },
+          {
+            "wireProtocolId": "openai_responses",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": true,
+            "processScoped": true
+          },
+          {
+            "wireProtocolId": "anthropic_messages",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": true,
+            "processScoped": true
+          }
+        ],
+        "evidenceState": "documented",
         "sourceEvidenceReference": "research/acp-agent/mistral-vibe@2.9.3",
         "smokeId": "agent-provider-mistral-vibe",
-        "capabilityDiagnosticCode": "agent_projection_typed_projector_not_implemented"
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
         "agentId": "nova",
@@ -748,17 +927,28 @@
         "descriptorId": "projection_poolside_runtime_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
-          "kind": "exact"
+          "kind": "detected_semver",
+          "requirement": ">=1.0.0"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "none",
-        "switchBehavior": "unverified",
-        "credentialKinds": [],
-        "modelInterfaces": [],
-        "evidenceState": "unverified",
+        "runtimeHomeStrategy": "vibex_private",
+        "switchBehavior": "restart_and_resume",
+        "credentialKinds": [
+          "api_key"
+        ],
+        "modelInterfaces": [
+          {
+            "wireProtocolId": "openai_chat_completions",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": false,
+            "processScoped": true
+          }
+        ],
+        "evidenceState": "documented",
         "sourceEvidenceReference": "research/acp-agent/poolside@1.0.0",
         "smokeId": "agent-provider-poolside",
-        "capabilityDiagnosticCode": "agent_projection_mixed_auth_boundary_not_runtime_verified"
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
         "agentId": "pi",
@@ -767,17 +957,42 @@
         "descriptorId": "projection_pi_runtime_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
-          "kind": "exact"
+          "kind": "detected_semver",
+          "requirement": ">=0.0.33"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "none",
-        "switchBehavior": "unverified",
-        "credentialKinds": [],
-        "modelInterfaces": [],
-        "evidenceState": "unverified",
+        "runtimeHomeStrategy": "vibex_private",
+        "switchBehavior": "restart_and_resume",
+        "credentialKinds": [
+          "api_key"
+        ],
+        "modelInterfaces": [
+          {
+            "wireProtocolId": "openai_chat_completions",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": true,
+            "processScoped": true
+          },
+          {
+            "wireProtocolId": "openai_responses",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": true,
+            "processScoped": true
+          },
+          {
+            "wireProtocolId": "anthropic_messages",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": true,
+            "processScoped": true
+          }
+        ],
+        "evidenceState": "documented",
         "sourceEvidenceReference": "research/acp-agent/pi@0.0.33",
         "smokeId": "agent-provider-pi",
-        "capabilityDiagnosticCode": "agent_projection_mixed_auth_boundary_not_runtime_verified"
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
         "agentId": "qoder",
@@ -808,17 +1023,28 @@
         "descriptorId": "projection_qwen_code_runtime_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
-          "kind": "exact"
+          "kind": "detected_semver",
+          "requirement": ">=0.18.4"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "none",
-        "switchBehavior": "unverified",
-        "credentialKinds": [],
-        "modelInterfaces": [],
-        "evidenceState": "unverified",
+        "runtimeHomeStrategy": "vibex_private",
+        "switchBehavior": "restart_and_resume",
+        "credentialKinds": [
+          "api_key"
+        ],
+        "modelInterfaces": [
+          {
+            "wireProtocolId": "openai_chat_completions",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": false,
+            "processScoped": true
+          }
+        ],
+        "evidenceState": "documented",
         "sourceEvidenceReference": "research/acp-agent/qwen-code@0.18.4",
         "smokeId": "agent-provider-qwen-code",
-        "capabilityDiagnosticCode": "agent_projection_typed_projector_not_implemented"
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
         "agentId": "sigit",
@@ -848,17 +1074,28 @@
         "descriptorId": "projection_stakpak_runtime_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
-          "kind": "exact"
+          "kind": "detected_semver",
+          "requirement": ">=0.3.80"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "none",
-        "switchBehavior": "unverified",
-        "credentialKinds": [],
-        "modelInterfaces": [],
-        "evidenceState": "unverified",
+        "runtimeHomeStrategy": "vibex_private",
+        "switchBehavior": "restart_and_resume",
+        "credentialKinds": [
+          "api_key"
+        ],
+        "modelInterfaces": [
+          {
+            "wireProtocolId": "openai_chat_completions",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": false,
+            "processScoped": true
+          }
+        ],
+        "evidenceState": "documented",
         "sourceEvidenceReference": "research/acp-agent/stakpak@0.3.80",
         "smokeId": "agent-provider-stakpak",
-        "capabilityDiagnosticCode": "agent_projection_typed_projector_not_implemented"
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
         "agentId": "vtcode",
@@ -867,17 +1104,28 @@
         "descriptorId": "projection_vtcode_runtime_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
-          "kind": "exact"
+          "kind": "detected_semver",
+          "requirement": ">=0.96.14"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "none",
-        "switchBehavior": "unverified",
-        "credentialKinds": [],
-        "modelInterfaces": [],
-        "evidenceState": "unverified",
+        "runtimeHomeStrategy": "vibex_private",
+        "switchBehavior": "restart_and_resume",
+        "credentialKinds": [
+          "api_key"
+        ],
+        "modelInterfaces": [
+          {
+            "wireProtocolId": "openai_chat_completions",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "userSelectable": false,
+            "processScoped": true
+          }
+        ],
+        "evidenceState": "documented",
         "sourceEvidenceReference": "research/acp-agent/vtcode@0.96.14",
         "smokeId": "agent-provider-vtcode",
-        "capabilityDiagnosticCode": "agent_projection_typed_projector_not_implemented"
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       }
     ]
   },
@@ -1187,15 +1435,15 @@
     {
       "agentId": "copilot",
       "smokeId": "agent-provider-copilot",
-      "catalogVersion": "manual",
+      "catalogVersion": "1.0.78",
       "descriptorId": "projection_copilot_runtime_v1",
       "descriptorVersion": "1",
-      "versionPolicy": "detected_manual",
+      "versionPolicy": "detected_semver",
       "capabilityMode": "replaceable_provider",
-      "switchBehavior": "unverified",
+      "switchBehavior": "restart_and_resume",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "agent_projection_version_detection_required",
+      "diagnosticCode": "operator_prerequisites_unavailable",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1216,7 +1464,7 @@
       "providerVerified": false,
       "liveSwitchVerified": false,
       "binaryOnlyVerified": false,
-      "sourceEvidenceReference": "research/acp-agent/copilot@manual",
+      "sourceEvidenceReference": "research/acp-agent/copilot@1.0.78",
       "recordedAt": null
     },
     {
@@ -1260,12 +1508,12 @@
       "catalogVersion": "0.8.55",
       "descriptorId": "projection_codewhale_runtime_v1",
       "descriptorVersion": "1",
-      "versionPolicy": "exact",
+      "versionPolicy": "detected_semver",
       "capabilityMode": "replaceable_provider",
-      "switchBehavior": "unverified",
+      "switchBehavior": "restart_and_resume",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "agent_projection_typed_projector_not_implemented",
+      "diagnosticCode": "operator_prerequisites_unavailable",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1295,7 +1543,7 @@
       "catalogVersion": "1.0.73",
       "descriptorId": "projection_cortex_code_runtime_v1",
       "descriptorVersion": "1",
-      "versionPolicy": "detected_semver",
+      "versionPolicy": "exact",
       "capabilityMode": "cloud_credential",
       "switchBehavior": "restart_and_resume",
       "status": "blocked",
@@ -1330,12 +1578,12 @@
       "catalogVersion": "0.1.23",
       "descriptorId": "projection_crow_cli_runtime_v1",
       "descriptorVersion": "1",
-      "versionPolicy": "exact",
+      "versionPolicy": "detected_semver",
       "capabilityMode": "replaceable_provider",
-      "switchBehavior": "unverified",
+      "switchBehavior": "restart_and_resume",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "agent_projection_typed_projector_not_implemented",
+      "diagnosticCode": "operator_prerequisites_unavailable",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1475,7 +1723,7 @@
       "switchBehavior": "unverified",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "agent_projection_typed_projector_not_implemented",
+      "diagnosticCode": "agent_projection_auth_boundary_not_runtime_verified",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1505,12 +1753,12 @@
       "catalogVersion": "0.4.1",
       "descriptorId": "projection_dirac_runtime_v1",
       "descriptorVersion": "1",
-      "versionPolicy": "exact",
+      "versionPolicy": "detected_semver",
       "capabilityMode": "replaceable_provider",
-      "switchBehavior": "unverified",
+      "switchBehavior": "restart_and_resume",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "agent_projection_auth_boundary_not_runtime_verified",
+      "diagnosticCode": "operator_prerequisites_unavailable",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1540,12 +1788,12 @@
       "catalogVersion": "0.153.1",
       "descriptorId": "projection_factory_droid_runtime_v1",
       "descriptorVersion": "1",
-      "versionPolicy": "exact",
+      "versionPolicy": "detected_semver",
       "capabilityMode": "replaceable_provider",
-      "switchBehavior": "unverified",
+      "switchBehavior": "restart_and_resume",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "agent_projection_typed_projector_not_implemented",
+      "diagnosticCode": "operator_prerequisites_unavailable",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1575,12 +1823,12 @@
       "catalogVersion": "0.7.21",
       "descriptorId": "projection_fast_agent_runtime_v1",
       "descriptorVersion": "1",
-      "versionPolicy": "exact",
+      "versionPolicy": "detected_semver",
       "capabilityMode": "replaceable_provider",
-      "switchBehavior": "unverified",
+      "switchBehavior": "restart_and_resume",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "agent_projection_typed_projector_not_implemented",
+      "diagnosticCode": "operator_prerequisites_unavailable",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1610,7 +1858,7 @@
       "catalogVersion": "0.47.0",
       "descriptorId": "projection_gemini_runtime_v1",
       "descriptorVersion": "1",
-      "versionPolicy": "detected_semver",
+      "versionPolicy": "exact",
       "capabilityMode": "cloud_credential",
       "switchBehavior": "restart_and_resume",
       "status": "blocked",
@@ -1680,12 +1928,12 @@
       "catalogVersion": "1.33.1",
       "descriptorId": "projection_goose_runtime_v1",
       "descriptorVersion": "1",
-      "versionPolicy": "exact",
+      "versionPolicy": "detected_semver",
       "capabilityMode": "replaceable_provider",
-      "switchBehavior": "unverified",
+      "switchBehavior": "restart_and_resume",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "agent_projection_acp_option_not_runtime_verified",
+      "diagnosticCode": "operator_prerequisites_unavailable",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1715,12 +1963,12 @@
       "catalogVersion": "0.2.11",
       "descriptorId": "projection_grok_runtime_v1",
       "descriptorVersion": "1",
-      "versionPolicy": "exact",
+      "versionPolicy": "detected_semver",
       "capabilityMode": "replaceable_provider",
-      "switchBehavior": "unverified",
+      "switchBehavior": "restart_and_resume",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "agent_projection_mixed_auth_boundary_not_runtime_verified",
+      "diagnosticCode": "operator_prerequisites_unavailable",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1747,15 +1995,15 @@
     {
       "agentId": "hermes",
       "smokeId": "agent-provider-hermes",
-      "catalogVersion": "manual",
+      "catalogVersion": "0.19.0",
       "descriptorId": "projection_hermes_runtime_v1",
       "descriptorVersion": "1",
-      "versionPolicy": "detected_manual",
+      "versionPolicy": "detected_semver",
       "capabilityMode": "replaceable_provider",
-      "switchBehavior": "unverified",
+      "switchBehavior": "restart_and_resume",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "agent_projection_version_detection_required",
+      "diagnosticCode": "operator_prerequisites_unavailable",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1776,7 +2024,7 @@
       "providerVerified": false,
       "liveSwitchVerified": false,
       "binaryOnlyVerified": false,
-      "sourceEvidenceReference": "research/acp-agent/hermes@manual",
+      "sourceEvidenceReference": "research/acp-agent/hermes@0.19.0",
       "recordedAt": null
     },
     {
@@ -1820,12 +2068,12 @@
       "catalogVersion": "7.2.40",
       "descriptorId": "projection_kilo_runtime_v1",
       "descriptorVersion": "1",
-      "versionPolicy": "exact",
+      "versionPolicy": "detected_semver",
       "capabilityMode": "replaceable_provider",
-      "switchBehavior": "unverified",
+      "switchBehavior": "restart_and_resume",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "agent_projection_auth_boundary_not_runtime_verified",
+      "diagnosticCode": "operator_prerequisites_unavailable",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1890,12 +2138,12 @@
       "catalogVersion": "0.11.0",
       "descriptorId": "projection_kimi_runtime_v1",
       "descriptorVersion": "1",
-      "versionPolicy": "exact",
+      "versionPolicy": "detected_semver",
       "capabilityMode": "replaceable_provider",
-      "switchBehavior": "unverified",
+      "switchBehavior": "restart_and_resume",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "agent_projection_typed_projector_not_implemented",
+      "diagnosticCode": "operator_prerequisites_unavailable",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -1960,12 +2208,12 @@
       "catalogVersion": "2.9.3",
       "descriptorId": "projection_mistral_vibe_runtime_v1",
       "descriptorVersion": "1",
-      "versionPolicy": "exact",
+      "versionPolicy": "detected_semver",
       "capabilityMode": "replaceable_provider",
-      "switchBehavior": "unverified",
+      "switchBehavior": "restart_and_resume",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "agent_projection_typed_projector_not_implemented",
+      "diagnosticCode": "operator_prerequisites_unavailable",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -2030,12 +2278,12 @@
       "catalogVersion": "1.0.0",
       "descriptorId": "projection_poolside_runtime_v1",
       "descriptorVersion": "1",
-      "versionPolicy": "exact",
+      "versionPolicy": "detected_semver",
       "capabilityMode": "replaceable_provider",
-      "switchBehavior": "unverified",
+      "switchBehavior": "restart_and_resume",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "agent_projection_mixed_auth_boundary_not_runtime_verified",
+      "diagnosticCode": "operator_prerequisites_unavailable",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -2065,12 +2313,12 @@
       "catalogVersion": "0.0.33",
       "descriptorId": "projection_pi_runtime_v1",
       "descriptorVersion": "1",
-      "versionPolicy": "exact",
+      "versionPolicy": "detected_semver",
       "capabilityMode": "replaceable_provider",
-      "switchBehavior": "unverified",
+      "switchBehavior": "restart_and_resume",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "agent_projection_mixed_auth_boundary_not_runtime_verified",
+      "diagnosticCode": "operator_prerequisites_unavailable",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -2135,12 +2383,12 @@
       "catalogVersion": "0.18.4",
       "descriptorId": "projection_qwen_code_runtime_v1",
       "descriptorVersion": "1",
-      "versionPolicy": "exact",
+      "versionPolicy": "detected_semver",
       "capabilityMode": "replaceable_provider",
-      "switchBehavior": "unverified",
+      "switchBehavior": "restart_and_resume",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "agent_projection_typed_projector_not_implemented",
+      "diagnosticCode": "operator_prerequisites_unavailable",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -2205,12 +2453,12 @@
       "catalogVersion": "0.3.80",
       "descriptorId": "projection_stakpak_runtime_v1",
       "descriptorVersion": "1",
-      "versionPolicy": "exact",
+      "versionPolicy": "detected_semver",
       "capabilityMode": "replaceable_provider",
-      "switchBehavior": "unverified",
+      "switchBehavior": "restart_and_resume",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "agent_projection_typed_projector_not_implemented",
+      "diagnosticCode": "operator_prerequisites_unavailable",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -2240,12 +2488,12 @@
       "catalogVersion": "0.96.14",
       "descriptorId": "projection_vtcode_runtime_v1",
       "descriptorVersion": "1",
-      "versionPolicy": "exact",
+      "versionPolicy": "detected_semver",
       "capabilityMode": "replaceable_provider",
-      "switchBehavior": "unverified",
+      "switchBehavior": "restart_and_resume",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "agent_projection_typed_projector_not_implemented",
+      "diagnosticCode": "operator_prerequisites_unavailable",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
