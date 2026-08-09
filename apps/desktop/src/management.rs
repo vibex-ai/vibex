@@ -10,14 +10,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    AccessibleAction, Animation, AnimationExt as _, AnyElement, App, Context, DragMoveEvent, Empty,
-    Entity, EventEmitter, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Orientation,
-    Render, Role, SharedString, StatefulInteractiveElement as _, Subscription, Task, Window, div,
-    prelude::*, px,
+    AccessibleAction, Anchor, Animation, AnimationExt as _, AnyElement, App, Context,
+    DragMoveEvent, Empty, Entity, EventEmitter, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, Orientation, Render, Role, SharedString, StatefulInteractiveElement as _,
+    Subscription, Task, Window, div, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
-    StyledExt as _, WindowExt as _,
+    StyledExt as _, Theme, WindowExt as _,
     animation::ease_out_cubic,
     button::{Button, ButtonVariants as _},
     h_flex,
@@ -3821,6 +3821,7 @@ impl ManagementCenter {
         };
 
         window.defer(cx, move |window, cx| {
+            Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
             window.push_notification(
                 notification
                     .id::<ManagementCenterFeedbackNotification>()
@@ -13838,7 +13839,7 @@ mod tests {
     }
 
     #[test]
-    fn management_feedback_uses_the_shared_click_dismissable_autohide_notification() {
+    fn management_feedback_uses_a_top_centered_click_dismissable_autohide_notification() {
         let source = include_str!("management.rs");
         let presentation = source
             .split_once("    fn present_feedback(")
@@ -13846,6 +13847,10 @@ mod tests {
             .map(|(body, _)| body)
             .expect("management feedback presenter should remain inspectable");
 
+        assert!(
+            presentation
+                .contains("Theme::global_mut(cx).notification.placement = Anchor::TopCenter;")
+        );
         assert!(presentation.contains("Notification::info("));
         assert!(presentation.contains("Notification::error("));
         assert!(presentation.contains(".id::<ManagementCenterFeedbackNotification>()"));
