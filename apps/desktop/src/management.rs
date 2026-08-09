@@ -5742,13 +5742,11 @@ impl ManagementCenter {
                     .px_2()
                     .py_2()
                     .hover(|style| {
-                        style
-                            .bg(if selected {
-                                cx.theme().primary.opacity(0.11)
-                            } else {
-                                cx.theme().accent
-                            })
-                            .shadow_sm()
+                        style.bg(if selected {
+                            cx.theme().primary.opacity(0.08)
+                        } else {
+                            cx.theme().accent
+                        })
                     })
                     .when(added, |row| {
                         row.role(Role::Button)
@@ -7975,13 +7973,11 @@ impl ManagementCenter {
                         cx.theme().background.opacity(0.90)
                     })
                     .hover(|style| {
-                        style
-                            .bg(if active {
-                                cx.theme().primary.opacity(0.11)
-                            } else {
-                                cx.theme().accent
-                            })
-                            .shadow_sm()
+                        style.bg(if active {
+                            cx.theme().primary.opacity(0.08)
+                        } else {
+                            cx.theme().accent
+                        })
                     })
                     .child(selectable)
                     .child(actions),
@@ -14607,7 +14603,8 @@ mod tests {
         assert!(render.contains("management_model_count"));
         assert!(render.contains("cx.theme().primary.opacity(0.08)"));
         assert!(render.contains("cx.theme().accent"));
-        assert!(render.contains(".shadow_sm()"));
+        assert!(!render.contains("cx.theme().primary.opacity(0.11)"));
+        assert!(!render.contains(".shadow_sm()"));
         assert!(!render.contains("cx.theme().ring.opacity(0.50)"));
         assert!(render.contains(".group(hover_group)"));
         assert!(render.contains(".invisible()"));
@@ -14801,7 +14798,8 @@ mod tests {
         assert!(!render_agents.contains("management-agent-catalog-"));
         assert!(render_agents.contains("cx.theme().primary.opacity(0.08)"));
         assert!(render_agents.contains("cx.theme().accent"));
-        assert!(render_agents.contains(".shadow_sm()"));
+        assert!(!render_agents.contains("cx.theme().primary.opacity(0.11)"));
+        assert!(!render_agents.contains(".shadow_sm()"));
         assert!(!render_agents.contains(".w(px(3.0))"));
         assert!(!render_agents.contains("cx.theme().ring.opacity(0.60)"));
         assert!(render_agents.matches("cx.stop_propagation();").count() >= 4);
