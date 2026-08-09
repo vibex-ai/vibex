@@ -6017,6 +6017,10 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
 
 #[async_trait]
 impl SwitchTargetExecutor for AcpRuntimeSwitchBridge {
+    fn restore_failure_allows_fresh(&self, error: &VibexError) -> bool {
+        error.code == "acp_restore_fresh_allowed"
+    }
+
     async fn assess_target(&self, intent: &SwitchIntent) -> VibexResult<SwitchTargetAssessment> {
         let context = self.target_context(&intent.session_id, &intent.target_selection)?;
         let source = self.source_binding(intent)?;

@@ -358,6 +358,12 @@ pub trait SwitchTargetExecutor: Send + Sync {
         operation: &JournaledOperation,
     ) -> VibexResult<PreparedAttachment>;
 
+    /// Returns whether a failed resume is an explicit request to create a
+    /// fresh session and bridge the logical session context into it.
+    fn restore_failure_allows_fresh(&self, _error: &VibexError) -> bool {
+        false
+    }
+
     async fn recover_attachment(
         &self,
         intent: &SwitchIntent,
@@ -1619,6 +1625,35 @@ impl RuntimeSwitchCoordinator {
         assessment: &SwitchTargetAssessment,
         owner: &str,
     ) -> VibexResult<PreparedAttachment> {
+        let prepared = self
+            .prepare_session_operation(intent, process, strategy, assessment, owner)
+            .await;
+        match prepared {
+            Err(error)
+                if strategy == RuntimeSwitchStrategy::RestartAndResume
+                    && self.inner.executor.restore_failure_allows_fresh(&error) =>
+            {
+                self.prepare_session_operation(
+                    intent,
+                    process,
+                    RuntimeSwitchStrategy::RestartFreshAndBridge,
+                    assessment,
+                    owner,
+                )
+                .await
+            }
+            result => result,
+        }
+    }
+
+    async fn prepare_session_operation(
+        &self,
+        intent: &SwitchIntent,
+        process: &PreparedProcess,
+        strategy: RuntimeSwitchStrategy,
+        assessment: &SwitchTargetAssessment,
+        owner: &str,
+    ) -> VibexResult<PreparedAttachment> {
         let operation_kind = match strategy {
             RuntimeSwitchStrategy::RestartAndResume => OP_RESTORE_SESSION,
             RuntimeSwitchStrategy::RestartFreshAndBridge => OP_CREATE_SESSION,
@@ -2311,6 +2346,7 @@ mod tests {
         assessment: SwitchTargetAssessment,
         calls: Vec<String>,
         fail_on: Option<String>,
+        restore_fresh_allowed: bool,
         delay_ms: u64,
         delay_on: Option<String>,
         reconcile_outcome: OperationReconcileOutcome,
@@ -2322,6 +2358,7 @@ mod tests {
                 assessment: restart_assessment(),
                 calls: Vec::new(),
                 fail_on: None,
+                restore_fresh_allowed: false,
                 delay_ms: 0,
                 delay_on: None,
                 reconcile_outcome: OperationReconcileOutcome::NotFound,
@@ -2354,6 +2391,10 @@ mod tests {
 
         fn fail_on(&self, operation: &str) {
             self.state.lock().unwrap().fail_on = Some(operation.to_string());
+        }
+
+        fn set_restore_fresh_allowed(&self, allowed: bool) {
+            self.state.lock().unwrap().restore_fresh_allowed = allowed;
         }
 
         fn set_delay_ms(&self, delay_ms: u64) {
@@ -2484,7 +2525,19 @@ mod tests {
                 RuntimeSwitchStrategy::LiveMutation => unreachable!(),
             };
             self.before_operation(operation).await?;
+            if strategy == RuntimeSwitchStrategy::RestartAndResume
+                && self.state.lock().unwrap().restore_fresh_allowed
+            {
+                return Err(VibexError::capability(
+                    "mock_restore_fresh_allowed",
+                    "mock restore did not find a usable native session",
+                ));
+            }
             Ok(Self::attachment(intent))
+        }
+
+        fn restore_failure_allows_fresh(&self, error: &VibexError) -> bool {
+            error.code == "mock_restore_fresh_allowed"
         }
 
         async fn recover_attachment(
@@ -3220,6 +3273,76 @@ mod tests {
                 .filter(|call| call.starts_with("activate:"))
                 .count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_failure_with_fresh_fallback_is_journaled_and_commits() {
+        let env = TestEnvironment::new("restore-fresh-fallback");
+        env.executor.set_restore_fresh_allowed(true);
+        let mut request = env.request("restore-fresh-fallback");
+        request.requested_policy = RuntimeSwitchPolicy::Automatic;
+
+        let outcome = env.coordinator.request_switch(request).await.unwrap();
+
+        assert_eq!(outcome.status, RuntimeSwitchStatus::Committed);
+        assert_eq!(
+            env.executor.calls(),
+            vec![
+                "assess_target".to_string(),
+                "assess_target".to_string(),
+                OP_SPAWN_PROCESS.to_string(),
+                OP_RESTORE_SESSION.to_string(),
+                OP_CREATE_SESSION.to_string(),
+                OP_APPLY_SESSION_CONFIG.to_string(),
+                "build_context_delta".to_string(),
+                "acquire_prepared".to_string(),
+                "revalidate_prepared".to_string(),
+                "activate:1".to_string(),
+                "cleanup_source".to_string(),
+            ]
+        );
+
+        let operations =
+            SwitchOperationJournalRepository::list_by_switch(&env.connection(), &outcome.switch_id)
+                .unwrap();
+        assert_eq!(operations.len(), 4);
+        assert_eq!(operations[1].operation_kind, OP_RESTORE_SESSION);
+        assert_eq!(operations[1].status, SwitchOperationStatus::Failed);
+        let restore_error: String = env
+            .connection()
+            .query_row(
+                "SELECT error_detail_redacted FROM runtime_switch_operations WHERE operation_id = ?1",
+                (operations[1].operation_id.as_str(),),
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(restore_error, "mock_restore_fresh_allowed");
+        assert_eq!(operations[2].operation_kind, OP_CREATE_SESSION);
+        assert_eq!(operations[2].status, SwitchOperationStatus::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn ordinary_restore_failure_does_not_create_a_fresh_session() {
+        let env = TestEnvironment::new("restore-failure");
+        env.executor.fail_on(OP_RESTORE_SESSION);
+        let mut request = env.request("restore-failure");
+        request.requested_policy = RuntimeSwitchPolicy::Automatic;
+
+        let error = env.coordinator.request_switch(request).await.unwrap_err();
+
+        assert_eq!(error.code, "mock_prepare_failed");
+        assert_eq!(
+            env.executor
+                .calls()
+                .iter()
+                .filter(|call| *call == OP_CREATE_SESSION)
+                .count(),
+            0
+        );
+        assert_eq!(
+            env.switch_by_key("restore-failure").status,
+            RuntimeSwitchStatus::Failed
         );
     }
 

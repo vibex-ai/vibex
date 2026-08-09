@@ -110,6 +110,12 @@ SwitchOperationJournalRepository::{
   session-scoped-only changes, negotiated live operations, and no active turn.
 - Compatible/probeable restore or a resumable historical binding selects
   `RestartAndResume`; the remaining cases select fresh-and-bridge.
+- When a `RestartAndResume` executor explicitly reports that the native session
+  is unavailable but a fresh session is allowed, mark the restore operation
+  failed, append a separately journaled `create_session` operation, and
+  continue with `RestartFreshAndBridge`. Authentication, transient, fatal, or
+  ambiguous restore failures must remain terminal and must not create a fresh
+  session implicitly.
 - Reserve first allocates a fresh target id. While status is still `Reserved`,
   a CAS may replace it with the source binding for LiveMutation. After leaving
   `Reserved`, target identity is immutable.
@@ -247,6 +253,9 @@ closed. Reconciliation must never apply the live mutation twice or advance to
 - Hot switch: prepare failure, Superseded, same-binding LiveMutation generation,
   caller drop shield, target cleanup, source pointer preservation, and an
   activation failure that stays closed until startup replay succeeds.
+- Restore fallback: an explicit fresh-allowed resume failure records the failed
+  restore operation, appends one create operation, and commits through the
+  normal fresh bridge path; other restore failures do not fall back.
 - Crash matrix: Reserved, AboutToSend create/config, binding-before-marker,
   Prepared, Committing before transaction, Committed before activation.
 - Committed LiveMutation recovery tests assert exact `N - 1 -> N` re-fence,
