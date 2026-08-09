@@ -2506,10 +2506,12 @@ APIs but does not participate in the online route above.
 ### 1. Scope / Trigger
 
 - Trigger: the user clicks Add, Upgrade, or Uninstall for an ACP Agent whose
-  `AgentDefinition` maps to the verified ACP Registry. The right-hand Config
-  Center panel is the user-visible operation surface.
-- Agents without a verified Registry distribution remain external-CLI
-  Agents; Vibex does not download or replace their user-installed command.
+  `AgentDefinition` maps to either the verified ACP Registry or a documented
+  Vibex-managed latest CLI channel. The right-hand Config Center panel is the
+  user-visible operation surface.
+- Agents without a verified Registry distribution or an explicit managed
+  latest channel remain external-CLI Agents; Vibex does not download or
+  replace their user-installed command.
 
 ### 2. Signatures
 
@@ -2537,15 +2539,38 @@ AgentManagedInstallationRecord {
   `resolved` URL must match that same canonical artifact.
 - Registry `uvx` distributions must use an exact package version in either
   `package==version` or `package@version` form. The package name is a plain
-  PyPI identity, the version must be exact SemVer, and it must equal the
-  Registry entry version; ranges, URLs, VCS references, and local paths are
-  rejected before `uv` runs.
+  PyPI identity with optional validated extras, the version must be exact
+  SemVer, and it must equal the resolved entry version; ranges, URLs, VCS
+  references, and local paths are rejected before `uv` runs.
 - Pi is a managed npm bundle: Vibex installs the Registry-pinned `pi-acp`
   Adapter and the Vibex-pinned `@earendil-works/pi-coding-agent` runtime in the
   same isolated tree. Both direct packages independently pass metadata,
   integrity, canonical tarball, executable, and lockfile identity checks. The
   generated launcher sets `PI_ACP_PI_COMMAND` to that tree's `.bin/pi` command;
   it never depends on or replaces a user-global Pi installation.
+- Five additional Agent CLIs use their official latest published release when
+  Add, Upgrade, or Check for updates resolves an installation: CodeWhale uses
+  npm `codewhale/latest`; Hermes uses PyPI `hermes-agent` with the `[acp]`
+  extra; Kiro uses the stable latest CLI manifest; Amp uses npm
+  `@ampcode/cli/latest`; and Autohand uses npm `autohand-cli/latest`. The
+  resolved release is converted to an exact version before installation and
+  recorded in `runtimeVersion`; no floating package range reaches npm or uv.
+- CodeWhale and Hermes expose ACP from the CLI itself (`codewhale serve --acp`
+  and `hermes acp`). Kiro launches `kiro-cli acp`. Kiro archives and their
+  SHA-256 values come from the official manifest; Linux installs into a staged
+  private home, macOS retains the private app bundle from the DMG, and Windows
+  retains the MSI administrative-extract tree. Unsupported manifest platforms
+  fail closed.
+- Amp and Autohand keep their ACP Adapter and latest CLI in the same isolated
+  npm tree. Their generated launchers set `AMP_CLI_PATH` or `AUTOHAND_CMD` to
+  that tree's `.bin/amp` or `.bin/autohand` command before importing the
+  Adapter. These five managed CLIs never probe, prefer, replace, or depend on a
+  user-global Agent CLI from `PATH`; only Node/npm and uv toolchain discovery
+  may reuse verified user/system executables.
+- "Latest" is resolved only during Add, explicit Upgrade/install, or Check for
+  updates. Desktop startup restores a healthy recorded installation without a
+  network lookup or silent upgrade. Check for updates compares both the
+  Adapter version and a separately recorded Amp/Autohand CLI runtime version.
 - npm Agents select Node/npm in this order: explicit
   `VIBEX_AGENT_NODE_PATH`/`VIBEX_AGENT_NPM_PATH` configuration, system
   `node`/`npm` from `PATH`, then a downloaded Vibex-managed Node.js 22 runtime.
@@ -2579,7 +2604,8 @@ AgentManagedInstallationRecord {
   staging, keeps healthy versions side by side, and only prunes old versions
   after the new command is durable. Archive paths, extraction budgets, and
   executable paths are bounded and traversal-safe.
-- A usable installed SemVer may not be replaced by a lower Registry SemVer.
+- A usable installed SemVer may not be replaced by a lower Registry or latest
+  channel SemVer.
   Exact-version cache hits are idempotent; an invalid cache entry is removed
   and rebuilt. Pending install/upgrade/uninstall rows are reconciled on the
   next startup using actual install-root and command-file checks, not only a
@@ -2602,11 +2628,15 @@ AgentManagedInstallationRecord {
 
 ### 4. Validation & Error Matrix
 
-- Missing Registry mapping -> `capability/agent_managed_install_unavailable`;
-  Vibex falls back to the external CLI path.
+- Missing Registry/latest-channel mapping ->
+  `capability/agent_managed_install_unavailable`; Vibex falls back to the
+  external CLI path.
 - Registry parse, unsupported platform, missing checksum, invalid archive,
   canonical npm source, integrity, lockfile, or executable mismatch -> a
   structured validation/capability error; no partial install is activated.
+- Invalid npm/PyPI latest metadata, a Kiro manifest/download version mismatch,
+  a missing trusted package setup script, or a missing private companion CLI
+  fails closed without probing a user-global Agent command.
 - Download or extraction timeout -> bounded process error and a persisted
   `Failed`/`UpdateAvailable` state suitable for retry.
 - Registry downgrade candidate -> `conflict/agent_install_downgrade_rejected`.
@@ -2634,7 +2664,8 @@ AgentManagedInstallationRecord {
   version in runtime identity, and keeps the old version available until the
   new command is active.
 - Base: opening Config Center reads the cached installation state without
-  downloading; an explicit Check for updates refreshes the Registry.
+  downloading; an explicit Check for updates refreshes the Registry and any
+  applicable official latest CLI channel.
 - Good: removing an Agent deletes its command, installation row, and auth
   catalog; a later startup does not reinstall it unless the user adds it again.
 - Bad: activate an Agent before checksum/lock verification, use npm's global
@@ -2649,9 +2680,11 @@ AgentManagedInstallationRecord {
   canonical npm sources, lockfile identity, checksum/archive limits, SemVer
   downgrade rejection, explicit/system/managed Node selection and fallback,
   malformed/old Node rejection, distinct empty user/global npm configs,
-  Pi's dual-package lock and local launcher, explicit/system/managed `uv`
-  selection and fallback, exact `uvx` parsing, metadata entry-point validation,
-  relocatable Python cache recovery, interrupted recovery, and uninstall cleanup.
+  Pi's dual-package lock and local launcher, Amp/Autohand latest companion
+  binding, Autohand bin selection, Kiro manifest platform selection,
+  explicit/system/managed `uv` selection and fallback, exact `uvx` and Hermes
+  `[acp]` extra parsing, metadata entry-point validation, relocatable Python
+  cache recovery, interrupted recovery, and uninstall cleanup.
 - `cargo test -p vibex-config-switch agent` covers removal of runtime and auth
   snapshots plus managed command/version matching.
 - `cargo test -p vibex-agent-acp runtime` covers dynamic managed identities,

@@ -433,8 +433,11 @@ impl AgentSnapshotEntry {
     }
 }
 
-/// Maps Vibex's stable Agent ids onto the upstream ACP Registry identities.
-/// Agents absent from the Registry remain user-managed and retain PATH probing.
+/// Maps Vibex's stable Agent ids onto managed ACP identities.
+///
+/// Most ids are upstream ACP Registry identities. CodeWhale, Hermes, and Kiro
+/// use Vibex-owned latest-channel distributions because their ACP-capable CLIs
+/// are not currently published as installable Registry entries.
 pub fn acp_registry_agent_id(agent_id: &AgentId) -> Option<&'static str> {
     match agent_id.as_str() {
         "claude" => return Some("claude-acp"),
@@ -443,11 +446,9 @@ pub fn acp_registry_agent_id(agent_id: &AgentId) -> Option<&'static str> {
         "grok" => return Some("grok-build"),
         "opencode" => return Some("opencode"),
         "pi" => return Some("pi-acp"),
-        // These entries are absent from the Registry or do not currently
-        // publish a supported distribution that Vibex can install.
-        "codewhale" | "hermes" | "kiro" => {
-            return None;
-        }
+        "codewhale" => return Some("codewhale"),
+        "hermes" => return Some("hermes"),
+        "kiro" => return Some("kiro"),
         _ => {}
     }
     acp_agent_catalog_entries()
@@ -806,11 +807,11 @@ mod tests {
                 "{managed} must use its Registry binary distribution"
             );
         }
-        for external in ["codewhale", "hermes", "kiro"] {
+        for latest_managed in ["codewhale", "hermes", "kiro"] {
             assert_eq!(
-                acp_registry_agent_id(&AgentId::parse(external).unwrap()),
-                None,
-                "{external} must remain external until the Registry publishes an installable distribution"
+                acp_registry_agent_id(&AgentId::parse(latest_managed).unwrap()),
+                Some(latest_managed),
+                "{latest_managed} must use its Vibex-managed latest CLI distribution"
             );
         }
     }
@@ -848,5 +849,18 @@ mod tests {
             pi.managed_install.status,
             AgentManagedInstallStatus::NotInstalled
         );
+        for agent_id in ["codewhale", "hermes", "kiro"] {
+            let definition = definitions
+                .iter()
+                .find(|definition| definition.id.as_str() == agent_id)
+                .unwrap();
+            let snapshot = AgentSnapshotEntry::from_definition(definition, None, None);
+            assert!(snapshot.managed_install.managed, "{agent_id}");
+            assert_eq!(
+                snapshot.managed_install.status,
+                AgentManagedInstallStatus::NotInstalled,
+                "{agent_id}"
+            );
+        }
     }
 }

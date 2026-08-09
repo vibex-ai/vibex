@@ -35,6 +35,10 @@ use vibex_db::{
 
 const ACP_REGISTRY_URL: &str =
     "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json";
+const NPM_REGISTRY_BASE_URL: &str = "https://registry.npmjs.org";
+const PYPI_JSON_BASE_URL: &str = "https://pypi.org/pypi";
+const KIRO_MANIFEST_URL: &str = "https://prod.download.cli.kiro.dev/stable/latest/manifest.json";
+const KIRO_DOWNLOAD_BASE_URL: &str = "https://prod.download.cli.kiro.dev/stable/latest";
 const REGISTRY_CACHE_MAX_AGE_MS: i64 = 60 * 60 * 1_000;
 const REGISTRY_MAX_BYTES: usize = 5 * 1024 * 1024;
 const DOWNLOAD_MAX_BYTES: u64 = 768 * 1024 * 1024;
@@ -50,7 +54,11 @@ const PI_MINIMUM_NODE_VERSION: semver::Version = semver::Version::new(22, 19, 0)
 const PI_CODING_AGENT_PACKAGE: &str = "@earendil-works/pi-coding-agent";
 const PI_CODING_AGENT_VERSION: &str = "0.84.1";
 const PI_COMMAND_NAME: &str = "pi";
-const PI_ACP_LAUNCHER_NAME: &str = "vibex-pi-acp-launcher.cjs";
+const NPM_COMPANION_LAUNCHER_NAME: &str = "vibex-acp-companion-launcher.cjs";
+const AMP_CLI_PACKAGE: &str = "@ampcode/cli";
+const AUTOHAND_CLI_PACKAGE: &str = "autohand-cli";
+const CODEWHALE_CLI_PACKAGE: &str = "codewhale";
+const HERMES_CLI_PACKAGE: &str = "hermes-agent";
 const NODE_RELEASE_INDEX_URL: &str = "https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt";
 const UV_RELEASE_DOWNLOAD_BASE: &str = "https://github.com/astral-sh/uv/releases/latest/download";
 const AGENT_NODE_PATH_ENV: &str = "VIBEX_AGENT_NODE_PATH";
@@ -200,8 +208,8 @@ impl AgentInstallService {
         let _guard = self.operation_lock.lock().await;
         if let Some(record) = self.read_record(&agent_id)?
             && record_has_usable_installation(&record)
+            && managed_companion_installation_is_usable(&agent_id, &record)
         {
-            verify_required_external_commands(&agent_id)?;
             self.config_service.reconcile_agent_acp_runtime(
                 agent_id,
                 record
@@ -216,9 +224,7 @@ impl AgentInstallService {
 
     pub async fn check_update(&self, agent_id: AgentId) -> VibexResult<AgentManagedInstallState> {
         let _guard = self.operation_lock.lock().await;
-        let registry_id = require_registry_id(&agent_id)?;
-        let registry = self.load_registry(true).await?;
-        let entry = registry.require_agent(registry_id)?.clone();
+        let (registry_id, entry) = self.load_install_entry(&agent_id, true).await?;
         let distribution = resolve_distribution(&entry)?;
         let now = unix_timestamp_ms();
         let existing = self.read_record(&agent_id)?;
@@ -234,10 +240,15 @@ impl AgentInstallService {
                     .and_then(|record| record.state.installed_version.clone())
             })
             .flatten();
+        let runtime_update = existing_is_usable
+            && self
+                .managed_runtime_version_is_newer(&agent_id, existing.as_ref())
+                .await?;
         let status = match installed_version.as_deref() {
             Some(version) if version_is_newer(version, &entry.version) => {
                 AgentManagedInstallStatus::UpdateAvailable
             }
+            Some(_) if runtime_update => AgentManagedInstallStatus::UpdateAvailable,
             Some(_) => AgentManagedInstallStatus::Installed,
             None => AgentManagedInstallStatus::NotInstalled,
         };
@@ -379,9 +390,7 @@ impl AgentInstallService {
     }
 
     async fn install_locked(&self, agent_id: AgentId) -> VibexResult<AgentManagedInstallState> {
-        let registry_id = require_registry_id(&agent_id)?;
-        let registry = self.load_registry(false).await?;
-        let entry = registry.require_agent(registry_id)?.clone();
+        let (registry_id, entry) = self.load_install_entry(&agent_id, false).await?;
         let distribution = resolve_distribution(&entry)?;
         let distribution_kind = distribution.kind();
         let (node_runtime, uv_runtime) = match &distribution {
@@ -394,6 +403,7 @@ impl AgentInstallService {
             ),
             ResolvedDistribution::Uvx(_) => (None, Some(self.select_uv_runtime().await?)),
             ResolvedDistribution::Binary(_) => (None, None),
+            ResolvedDistribution::Kiro(_) => (None, None),
         };
         let previous = self.read_record(&agent_id)?;
         let previous_is_usable = previous
@@ -415,6 +425,7 @@ impl AgentInstallService {
                         && installed_distribution_kind(Path::new(root)) == Some(distribution_kind)
                 })
                 && record.command.as_ref().is_some_and(command_is_available)
+                && latest_npm_companion(&agent_id).is_none()
                 && node_runtime.as_ref().is_none_or(|runtime| {
                     record.command.as_ref().is_some_and(|command| {
                         Path::new(&command.command) == runtime.node.as_path()
@@ -422,7 +433,6 @@ impl AgentInstallService {
                 })
         }) {
             let mut record = previous.expect("matching managed record exists");
-            verify_required_external_commands(&agent_id)?;
             self.config_service.reconcile_agent_acp_runtime(
                 agent_id,
                 record
@@ -470,11 +480,7 @@ impl AgentInstallService {
 
         let installed = self
             .install_distribution(&agent_id, &entry, distribution, node_runtime, uv_runtime)
-            .await
-            .and_then(|installed| {
-                verify_required_external_commands(&agent_id)?;
-                Ok(installed)
-            });
+            .await;
 
         match installed {
             Ok(installed) => {
@@ -653,7 +659,121 @@ impl AgentInstallService {
                 })?;
                 self.install_uvx(agent_id, entry, uvx, uv_runtime).await
             }
+            ResolvedDistribution::Kiro(kiro) => self.install_kiro(agent_id, entry, kiro).await,
         }
+    }
+
+    async fn load_install_entry(
+        &self,
+        agent_id: &AgentId,
+        force_registry: bool,
+    ) -> VibexResult<(String, RegistryEntry)> {
+        if let Some(custom) = ManagedCliAgent::for_agent(agent_id) {
+            return self.load_latest_cli_entry(custom).await;
+        }
+        let registry_id = require_registry_id(agent_id)?;
+        let registry = self.load_registry(force_registry).await?;
+        match registry.require_agent(registry_id) {
+            Ok(entry) => Ok((registry_id.to_string(), entry.clone())),
+            Err(_error) if agent_id.as_str() == "amp-acp" => {
+                let entry = self
+                    .load_latest_npm_entry("amp-acp", "amp-acp", Vec::new())
+                    .await?;
+                Ok((registry_id.to_string(), entry))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn load_latest_cli_entry(
+        &self,
+        agent: ManagedCliAgent,
+    ) -> VibexResult<(String, RegistryEntry)> {
+        let entry = match agent {
+            ManagedCliAgent::Codewhale => {
+                self.load_latest_npm_entry(
+                    agent.registry_id(),
+                    CODEWHALE_CLI_PACKAGE,
+                    vec!["serve".to_string(), "--acp".to_string()],
+                )
+                .await?
+            }
+            ManagedCliAgent::Hermes => {
+                let version = self.fetch_latest_pypi_version(HERMES_CLI_PACKAGE).await?;
+                RegistryEntry {
+                    id: agent.registry_id().to_string(),
+                    version: version.clone(),
+                    distribution: RegistryDistribution {
+                        binary: None,
+                        npx: None,
+                        uvx: Some(RegistryUvxDistribution {
+                            package: format!("{HERMES_CLI_PACKAGE}[acp]=={version}"),
+                            args: vec!["acp".to_string()],
+                        }),
+                        kiro: None,
+                    },
+                }
+            }
+            ManagedCliAgent::Kiro => {
+                let distribution = self.fetch_latest_kiro_distribution().await?;
+                RegistryEntry {
+                    id: agent.registry_id().to_string(),
+                    version: distribution.version.clone(),
+                    distribution: RegistryDistribution {
+                        binary: None,
+                        npx: None,
+                        uvx: None,
+                        kiro: Some(distribution),
+                    },
+                }
+            }
+        };
+        Ok((agent.registry_id().to_string(), entry))
+    }
+
+    async fn load_latest_npm_entry(
+        &self,
+        id: &str,
+        package: &str,
+        args: Vec<String>,
+    ) -> VibexResult<RegistryEntry> {
+        let metadata = self.fetch_latest_npm_metadata(package).await?;
+        let version = metadata.version;
+        Ok(RegistryEntry {
+            id: id.to_string(),
+            version: version.clone(),
+            distribution: RegistryDistribution {
+                binary: None,
+                npx: Some(RegistryNpxDistribution {
+                    package: format!("{package}@{version}"),
+                    args,
+                }),
+                uvx: None,
+                kiro: None,
+            },
+        })
+    }
+
+    async fn managed_runtime_version_is_newer(
+        &self,
+        agent_id: &AgentId,
+        existing: Option<&AgentManagedInstallationRecord>,
+    ) -> VibexResult<bool> {
+        let Some(record) = existing else {
+            return Ok(false);
+        };
+        let Some(root) = record.install_root.as_deref() else {
+            return Ok(false);
+        };
+        let Some(runtime_package) = latest_npm_companion(agent_id) else {
+            return Ok(false);
+        };
+        let latest = self
+            .fetch_latest_npm_metadata(runtime_package)
+            .await?
+            .version;
+        let installed = read_manifest_runtime_version(Path::new(root));
+        Ok(installed.is_none_or(|installed| version_is_newer(&installed, &latest)))
     }
 
     async fn install_binary(
@@ -712,10 +832,139 @@ impl AgentInstallService {
             registry_agent_id: entry.id.clone(),
             version: entry.version.clone(),
             fingerprint: fingerprint.clone(),
+            runtime_version: None,
             distribution_kind: AgentManagedDistributionKind::Binary,
             launch: ManifestLaunch::Binary {
                 command: command_rel.to_string_lossy().into_owned(),
                 args: target.args,
+            },
+        };
+        write_json_private(&staging.join("vibex-install.json"), &manifest)?;
+        publish_staging(&staging, &target_root)?;
+        staging_guard.disarm();
+        load_installed_agent(&target_root, &fingerprint)
+    }
+
+    async fn install_kiro(
+        &self,
+        agent_id: &AgentId,
+        entry: &RegistryEntry,
+        kiro: RegistryKiroDistribution,
+    ) -> VibexResult<InstalledAgent> {
+        validate_https_url(&kiro.archive, "Kiro CLI archive")?;
+        let fingerprint = distribution_fingerprint(&[
+            entry.id.as_str(),
+            entry.version.as_str(),
+            kiro.archive.as_str(),
+            kiro.sha256.as_str(),
+            kiro.file_type.as_str(),
+            kiro.cli_path.as_deref().unwrap_or_default(),
+        ]);
+        let target_root = self.version_root(agent_id, &entry.version, &fingerprint)?;
+        if let Some(installed) = load_or_remove_cached_installation(&target_root, &fingerprint)? {
+            return Ok(installed);
+        }
+
+        let archive = self
+            .download_verified(&kiro.archive, Some(kiro.sha256.as_str()))
+            .await?;
+        let staging = self.create_staging(agent_id)?;
+        let mut staging_guard = StagingGuard::new(staging.clone());
+
+        #[cfg(target_os = "linux")]
+        let command_path = {
+            if kiro.file_type != "tarGz" {
+                return Err(VibexError::capability(
+                    "agent_kiro_archive_unsupported",
+                    "Kiro CLI Linux distribution is not a supported tar.gz archive",
+                ));
+            }
+            let archive_url = kiro.archive.clone();
+            let archive_for_extract = archive.clone();
+            let staging_for_extract = staging.clone();
+            tokio::task::spawn_blocking(move || {
+                extract_archive(&archive_for_extract, &archive_url, &staging_for_extract)
+            })
+            .await
+            .map_err(|error| {
+                VibexError::process(
+                    "agent_archive_extract_join_failed",
+                    "Kiro CLI archive extraction task failed",
+                )
+                .with_diagnostic("error", error.to_string())
+            })??;
+
+            let package_root = staging.join("kirocli");
+            let install_script = package_root.join("install.sh");
+            ensure_regular_file(
+                &staging,
+                &install_script,
+                "agent_kiro_install_script_missing",
+            )?;
+            make_executable(&install_script)?;
+            let private_home = staging.join("home");
+            fs::create_dir_all(&private_home).map_err(|error| {
+                storage_error(
+                    "agent_kiro_home_create_failed",
+                    "Kiro CLI private home could not be created",
+                    error,
+                )
+            })?;
+            let mut command = Command::new(&install_script);
+            command
+                .current_dir(&package_root)
+                .env("HOME", &private_home)
+                .env("XDG_CONFIG_HOME", private_home.join(".config"))
+                .env("XDG_DATA_HOME", private_home.join(".local/share"))
+                .env("XDG_CACHE_HOME", private_home.join(".cache"))
+                .env("KIRO_CLI_SKIP_SETUP", "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+            run_install_command(
+                command,
+                "agent_kiro_setup_timeout",
+                "agent_kiro_setup_spawn_failed",
+                "agent_kiro_setup_failed",
+                "Kiro CLI private installation failed",
+            )
+            .await?;
+            private_home.join(".local/bin/kiro-cli")
+        };
+
+        #[cfg(target_os = "macos")]
+        let command_path = install_kiro_macos(&archive, &staging, kiro.cli_path.as_deref()).await?;
+
+        #[cfg(target_os = "windows")]
+        let command_path = install_kiro_windows(&archive, &staging).await?;
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        let command_path = {
+            let _ = (&archive, &staging, &kiro);
+            return Err(VibexError::capability(
+                "agent_kiro_platform_unsupported",
+                "Kiro CLI is not supported on this platform",
+            ));
+        };
+
+        ensure_regular_file(&staging, &command_path, "agent_kiro_binary_missing")?;
+        make_executable(&command_path)?;
+        let command_rel = command_path.strip_prefix(&staging).map_err(|_| {
+            VibexError::validation(
+                "agent_kiro_binary_outside_install",
+                "Kiro CLI executable escaped the managed installation",
+            )
+        })?;
+        let manifest = InstallManifest {
+            registry_agent_id: entry.id.clone(),
+            version: entry.version.clone(),
+            fingerprint: fingerprint.clone(),
+            runtime_version: Some(kiro.version),
+            distribution_kind: AgentManagedDistributionKind::Binary,
+            launch: ManifestLaunch::Binary {
+                command: command_rel.to_string_lossy().into_owned(),
+                args: vec!["acp".to_string()],
             },
         };
         write_json_private(&staging.join("vibex-install.json"), &manifest)?;
@@ -740,13 +989,19 @@ impl AgentInstallService {
                 self.resolve_verified_npm_package(dependency.package, dependency.version)
                     .await?,
             )
+        } else if let Some(package) = latest_npm_companion(agent_id) {
+            let metadata = self.fetch_latest_npm_metadata(package).await?;
+            Some(
+                self.resolve_verified_npm_package(package, &metadata.version)
+                    .await?,
+            )
         } else {
             None
         };
         let adapter_script_rel = npm_package_bin_relative_path(&package)?;
-        let pi_launcher = runtime_package
+        let companion_launcher = runtime_package
             .as_ref()
-            .map(|_| pi_acp_launcher_source(&adapter_script_rel))
+            .map(|_| npm_companion_launcher_source(agent_id, &adapter_script_rel))
             .transpose()?;
         let args_identity = serde_json::to_string(&npx.args).map_err(|error| {
             VibexError::validation(
@@ -773,11 +1028,11 @@ impl AgentInstallService {
                 runtime_package.integrity.as_str(),
                 runtime_package.tarball.as_str(),
                 runtime_package.bin_path.as_str(),
-                PI_COMMAND_NAME,
+                npm_companion_command(agent_id).unwrap_or_default(),
             ]);
         }
-        if let Some(pi_launcher) = pi_launcher.as_deref() {
-            fingerprint_parts.push(pi_launcher);
+        if let Some(companion_launcher) = companion_launcher.as_deref() {
+            fingerprint_parts.push(companion_launcher);
         }
         let fingerprint = distribution_fingerprint(&fingerprint_parts);
         let target_root = self.version_root(agent_id, &entry.version, &fingerprint)?;
@@ -859,6 +1114,8 @@ impl AgentInstallService {
             .with_diagnostic("status", status.to_string()));
         }
 
+        run_trusted_npm_setup(agent_id, &staging, &node, &npm_config).await?;
+
         verify_npm_lock(
             &staging,
             &package.name,
@@ -868,8 +1125,8 @@ impl AgentInstallService {
         )?;
         let adapter_script = staging.join(&adapter_script_rel);
         ensure_regular_file(&staging, &adapter_script, "agent_npm_bin_missing")?;
-        let script = if let (Some(runtime_package), Some(pi_launcher)) =
-            (runtime_package.as_ref(), pi_launcher.as_deref())
+        let script = if let (Some(runtime_package), Some(companion_launcher)) =
+            (runtime_package.as_ref(), companion_launcher.as_deref())
         {
             verify_npm_lock(
                 &staging,
@@ -880,10 +1137,22 @@ impl AgentInstallService {
             )?;
             let runtime_script = staging.join(npm_package_bin_relative_path(runtime_package)?);
             ensure_regular_file(&staging, &runtime_script, "agent_npm_runtime_bin_missing")?;
-            let pi_command = npm_command_path(&staging, PI_COMMAND_NAME);
-            ensure_regular_file(&staging, &pi_command, "agent_npm_runtime_command_missing")?;
-            let launcher = staging.join(PI_ACP_LAUNCHER_NAME);
-            write_private_file(&launcher, pi_launcher.as_bytes())?;
+            let runtime_command = npm_command_path(
+                &staging,
+                npm_companion_command(agent_id).ok_or_else(|| {
+                    VibexError::validation(
+                        "agent_npm_runtime_command_missing",
+                        "managed npm companion command was not configured",
+                    )
+                })?,
+            );
+            ensure_regular_file(
+                &staging,
+                &runtime_command,
+                "agent_npm_runtime_command_missing",
+            )?;
+            let launcher = staging.join(NPM_COMPANION_LAUNCHER_NAME);
+            write_private_file(&launcher, companion_launcher.as_bytes())?;
             launcher
         } else {
             adapter_script
@@ -898,6 +1167,10 @@ impl AgentInstallService {
             registry_agent_id: entry.id.clone(),
             version: entry.version.clone(),
             fingerprint: fingerprint.clone(),
+            runtime_version: runtime_package
+                .as_ref()
+                .map(|package| package.version.clone())
+                .or_else(|| (agent_id.as_str() == "codewhale").then(|| package.version.clone())),
             distribution_kind: AgentManagedDistributionKind::Npm,
             launch: ManifestLaunch::Node {
                 node: node.node.to_string_lossy().into_owned(),
@@ -919,6 +1192,7 @@ impl AgentInstallService {
         uv: UvRuntime,
     ) -> VibexResult<InstalledAgent> {
         let package = parse_exact_uvx_spec(&uvx.package, &entry.version)?;
+        let entry_point_identity = managed_uvx_entry_point(agent_id).unwrap_or(&package.name);
         let args_identity = serde_json::to_string(&uvx.args).map_err(|error| {
             VibexError::validation(
                 "agent_uvx_args_invalid",
@@ -933,6 +1207,7 @@ impl AgentInstallService {
             uvx.package.as_str(),
             package.name.as_str(),
             package.version.as_str(),
+            entry_point_identity,
             args_identity.as_str(),
             uv_identity.as_str(),
         ]);
@@ -1011,7 +1286,7 @@ impl AgentInstallService {
             .with_diagnostic("expectedVersion", package.version)
             .with_diagnostic("actualVersion", installed_package.version));
         }
-        let executable = select_uvx_entry_point(&package.name, &installed_package.scripts)?;
+        let executable = select_uvx_entry_point(entry_point_identity, &installed_package.scripts)?;
         let launcher = staging.join("vibex-uvx-launcher.py");
         let launcher_source = uvx_launcher_source(&package.name, &executable)?;
         write_private_file(&launcher, launcher_source.as_bytes())?;
@@ -1033,6 +1308,7 @@ impl AgentInstallService {
             registry_agent_id: entry.id.clone(),
             version: entry.version.clone(),
             fingerprint: fingerprint.clone(),
+            runtime_version: Some(package.version.clone()),
             distribution_kind: AgentManagedDistributionKind::Uvx,
             launch: ManifestLaunch::Python {
                 python: python_rel.to_string_lossy().into_owned(),
@@ -1113,6 +1389,81 @@ impl AgentInstallService {
             version,
         )?;
         Ok(metadata)
+    }
+
+    async fn fetch_latest_npm_metadata(&self, package: &str) -> VibexResult<NpmPackageMetadata> {
+        let encoded = url::form_urlencoded::byte_serialize(package.as_bytes()).collect::<String>();
+        let url = format!("{NPM_REGISTRY_BASE_URL}/{encoded}/latest");
+        let bytes = self.fetch_limited(&url, REGISTRY_MAX_BYTES).await?;
+        let metadata: NpmPackageMetadata = serde_json::from_slice(&bytes).map_err(|error| {
+            VibexError::validation(
+                "agent_npm_metadata_invalid",
+                "latest npm package metadata was invalid",
+            )
+            .with_diagnostic("error", error.to_string())
+        })?;
+        if metadata.name != package {
+            return Err(VibexError::validation(
+                "agent_npm_metadata_identity_mismatch",
+                "latest npm package metadata did not match the requested package",
+            ));
+        }
+        validate_npm_version(&metadata.version, "latest npm package version")?;
+        validate_canonical_npm_tarball_source(
+            metadata.dist.tarball.as_deref().ok_or_else(|| {
+                VibexError::validation(
+                    "agent_npm_tarball_missing",
+                    "latest npm package metadata has no tarball source",
+                )
+            })?,
+            package,
+            &metadata.version,
+        )?;
+        Ok(metadata)
+    }
+
+    async fn fetch_latest_pypi_version(&self, package: &str) -> VibexResult<String> {
+        let url = format!("{PYPI_JSON_BASE_URL}/{package}/json");
+        let bytes = self.fetch_limited(&url, REGISTRY_MAX_BYTES).await?;
+        let metadata: PypiPackageMetadata = serde_json::from_slice(&bytes).map_err(|error| {
+            VibexError::validation(
+                "agent_pypi_metadata_invalid",
+                "latest PyPI package metadata was invalid",
+            )
+            .with_diagnostic("error", error.to_string())
+        })?;
+        if metadata.info.name != package {
+            return Err(VibexError::validation(
+                "agent_pypi_metadata_identity_mismatch",
+                "latest PyPI package metadata did not match the requested package",
+            ));
+        }
+        validate_npm_version(&metadata.info.version, "latest PyPI package version")?;
+        Ok(metadata.info.version)
+    }
+
+    async fn fetch_latest_kiro_distribution(&self) -> VibexResult<RegistryKiroDistribution> {
+        let bytes = self
+            .fetch_limited(KIRO_MANIFEST_URL, REGISTRY_MAX_BYTES)
+            .await?;
+        let manifest: KiroReleaseManifest = serde_json::from_slice(&bytes).map_err(|error| {
+            VibexError::validation(
+                "agent_kiro_manifest_invalid",
+                "latest Kiro CLI manifest was invalid",
+            )
+            .with_diagnostic("error", error.to_string())
+        })?;
+        validate_npm_version(&manifest.version, "latest Kiro CLI version")?;
+        let package = select_kiro_package(&manifest.packages)?;
+        let archive = kiro_archive_url(&package.download, &manifest.version)?;
+        validate_https_url(&archive, "Kiro CLI archive")?;
+        Ok(RegistryKiroDistribution {
+            archive,
+            sha256: validate_sha256(&package.sha256)?,
+            cli_path: package.cli_path,
+            file_type: package.file_type,
+            version: manifest.version,
+        })
     }
 
     async fn resolve_verified_npm_package(
@@ -1854,11 +2205,39 @@ struct RegistryEntry {
     distribution: RegistryDistribution,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedCliAgent {
+    Codewhale,
+    Hermes,
+    Kiro,
+}
+
+impl ManagedCliAgent {
+    fn for_agent(agent_id: &AgentId) -> Option<Self> {
+        match agent_id.as_str() {
+            "codewhale" => Some(Self::Codewhale),
+            "hermes" => Some(Self::Hermes),
+            "kiro" => Some(Self::Kiro),
+            _ => None,
+        }
+    }
+
+    fn registry_id(self) -> &'static str {
+        match self {
+            Self::Codewhale => "codewhale",
+            Self::Hermes => "hermes",
+            Self::Kiro => "kiro",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 struct RegistryDistribution {
     binary: Option<BTreeMap<String, RegistryBinaryTarget>>,
     npx: Option<RegistryNpxDistribution>,
     uvx: Option<RegistryUvxDistribution>,
+    #[serde(skip)]
+    kiro: Option<RegistryKiroDistribution>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1885,10 +2264,20 @@ struct RegistryUvxDistribution {
 }
 
 #[derive(Debug, Clone)]
+struct RegistryKiroDistribution {
+    archive: String,
+    sha256: String,
+    cli_path: Option<String>,
+    file_type: String,
+    version: String,
+}
+
+#[derive(Debug, Clone)]
 enum ResolvedDistribution {
     Binary(RegistryBinaryTarget),
     Npm(RegistryNpxDistribution),
     Uvx(RegistryUvxDistribution),
+    Kiro(RegistryKiroDistribution),
 }
 
 impl ResolvedDistribution {
@@ -1897,6 +2286,7 @@ impl ResolvedDistribution {
             Self::Binary(_) => AgentManagedDistributionKind::Binary,
             Self::Npm(_) => AgentManagedDistributionKind::Npm,
             Self::Uvx(_) => AgentManagedDistributionKind::Uvx,
+            Self::Kiro(_) => AgentManagedDistributionKind::Binary,
         }
     }
 }
@@ -1907,6 +2297,37 @@ struct NpmPackageMetadata {
     version: String,
     dist: NpmDist,
     bin: Option<NpmBin>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PypiPackageMetadata {
+    info: PypiPackageInfo,
+}
+
+#[derive(Debug, Deserialize)]
+struct PypiPackageInfo {
+    name: String,
+    version: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KiroReleaseManifest {
+    version: String,
+    packages: Vec<KiroReleasePackage>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KiroReleasePackage {
+    os: String,
+    architecture: String,
+    variant: String,
+    file_type: String,
+    download: String,
+    sha256: String,
+    #[serde(default)]
+    cli_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1934,12 +2355,19 @@ struct VerifiedNpmPackage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VerifiedUvxPackage {
     name: String,
+    extras: Vec<String>,
     version: String,
 }
 
 impl VerifiedUvxPackage {
     fn exact_spec(&self) -> String {
-        format!("{}=={}", self.name, self.version)
+        let extras = (!self.extras.is_empty()).then(|| format!("[{}]", self.extras.join(",")));
+        format!(
+            "{}{}=={}",
+            self.name,
+            extras.as_deref().unwrap_or_default(),
+            self.version
+        )
     }
 }
 
@@ -1967,6 +2395,8 @@ struct InstallManifest {
     registry_agent_id: String,
     version: String,
     fingerprint: String,
+    #[serde(default)]
+    runtime_version: Option<String>,
     distribution_kind: AgentManagedDistributionKind,
     launch: ManifestLaunch,
 }
@@ -2189,7 +2619,52 @@ fn npm_runtime_dependency(agent_id: &AgentId) -> Option<NpmRuntimeDependency> {
     })
 }
 
+fn latest_npm_companion(agent_id: &AgentId) -> Option<&'static str> {
+    match agent_id.as_str() {
+        "amp-acp" => Some(AMP_CLI_PACKAGE),
+        "autohand" => Some(AUTOHAND_CLI_PACKAGE),
+        _ => None,
+    }
+}
+
+fn managed_uvx_entry_point(agent_id: &AgentId) -> Option<&'static str> {
+    match agent_id.as_str() {
+        "hermes" => Some("hermes"),
+        _ => None,
+    }
+}
+
+fn npm_companion_command(agent_id: &AgentId) -> Option<&'static str> {
+    match agent_id.as_str() {
+        "amp-acp" => Some("amp"),
+        "autohand" => Some("autohand"),
+        "pi" => Some(PI_COMMAND_NAME),
+        _ => None,
+    }
+}
+
+fn npm_companion_environment(agent_id: &AgentId) -> Option<&'static str> {
+    match agent_id.as_str() {
+        "amp-acp" => Some("AMP_CLI_PATH"),
+        "autohand" => Some("AUTOHAND_CMD"),
+        "pi" => Some("PI_ACP_PI_COMMAND"),
+        _ => None,
+    }
+}
+
+fn npm_companion_command_for_registry_id(registry_agent_id: &str) -> Option<&'static str> {
+    match registry_agent_id {
+        "amp-acp" => Some("amp"),
+        "autohand" => Some("autohand"),
+        "pi-acp" => Some(PI_COMMAND_NAME),
+        _ => None,
+    }
+}
+
 fn resolve_distribution(entry: &RegistryEntry) -> VibexResult<ResolvedDistribution> {
+    if let Some(kiro) = entry.distribution.kiro.clone() {
+        return Ok(ResolvedDistribution::Kiro(kiro));
+    }
     if let Some(targets) = entry.distribution.binary.as_ref()
         && let Some(target) = targets.get(current_platform_key()?)
     {
@@ -2793,6 +3268,64 @@ fn prepend_node_to_path(command: &mut Command, node: &Path) {
     }
 }
 
+async fn run_trusted_npm_setup(
+    agent_id: &AgentId,
+    staging: &Path,
+    node: &NodeRuntime,
+    npm_config: &IsolatedNpmConfigs,
+) -> VibexResult<()> {
+    let setup = match agent_id.as_str() {
+        "amp-acp" => Some((AMP_CLI_PACKAGE, "install.cjs")),
+        "autohand" => Some((
+            AUTOHAND_CLI_PACKAGE,
+            "scripts/ensure-node-pty-helper-permissions.mjs",
+        )),
+        "codewhale" => Some((CODEWHALE_CLI_PACKAGE, "scripts/install.js")),
+        _ => None,
+    };
+    let Some((package, script)) = setup else {
+        return Ok(());
+    };
+    let package_root = package_directory(staging, package)?;
+    let script = package_root.join(safe_relative_path(script, "npm setup script")?);
+    ensure_regular_file(staging, &script, "agent_npm_setup_script_missing")?;
+    let mut command = Command::new(&node.node);
+    command
+        .arg(&script)
+        .current_dir(package_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .env("npm_config_cache", staging.join("npm-setup-cache"))
+        .env("npm_config_userconfig", &npm_config.user)
+        .env("npm_config_globalconfig", &npm_config.global)
+        .env("npm_config_update_notifier", "false")
+        .env_remove("NPM_TOKEN")
+        .env_remove("NODE_AUTH_TOKEN");
+    prepend_node_to_path(&mut command, &node.node);
+    run_install_command(
+        command,
+        "agent_npm_setup_timeout",
+        "agent_npm_setup_spawn_failed",
+        "agent_npm_setup_failed",
+        "managed npm Agent setup failed",
+    )
+    .await
+}
+
+fn validate_npm_version(version: &str, label: &str) -> VibexResult<()> {
+    validate_safe_segment(version, label)?;
+    semver::Version::parse(version).map_err(|error| {
+        VibexError::validation(
+            "agent_managed_version_invalid",
+            format!("{label} was not exact SemVer"),
+        )
+        .with_diagnostic("error", error.to_string())
+    })?;
+    Ok(())
+}
+
 fn parse_exact_npm_spec<'a>(spec: &'a str, expected: &str) -> VibexResult<(&'a str, &'a str)> {
     let (package, version) = spec.rsplit_once('@').ok_or_else(|| {
         VibexError::validation(
@@ -2834,10 +3367,36 @@ fn parse_exact_uvx_spec(spec: &str, expected: &str) -> VibexResult<VerifiedUvxPa
             "ACP Registry uvx package must include an exact version",
         ));
     };
+    let (package, extras) = if let Some((package, extras)) = package.split_once('[') {
+        let extras = extras.strip_suffix(']').ok_or_else(|| {
+            VibexError::validation(
+                "agent_uvx_spec_invalid",
+                "ACP Registry uvx package extras were invalid",
+            )
+        })?;
+        let extras = extras.split(',').map(str::to_string).collect::<Vec<_>>();
+        if extras.is_empty()
+            || extras.iter().any(|extra| {
+                extra.is_empty()
+                    || !extra.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    })
+            })
+        {
+            return Err(VibexError::validation(
+                "agent_uvx_spec_invalid",
+                "ACP Registry uvx package extras were invalid",
+            ));
+        }
+        (package, extras)
+    } else {
+        (package, Vec::new())
+    };
     if package.is_empty()
         || version.is_empty()
         || version != expected
         || package.contains("..")
+        || package.contains(['[', ']'])
         || !package
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
@@ -2856,6 +3415,7 @@ fn parse_exact_uvx_spec(spec: &str, expected: &str) -> VibexResult<VerifiedUvxPa
     })?;
     Ok(VerifiedUvxPackage {
         name: package.to_string(),
+        extras,
         version: version.to_string(),
     })
 }
@@ -2871,18 +3431,22 @@ fn select_npm_bin(metadata: &NpmPackageMetadata, package: &str) -> VibexResult<S
         NpmBin::Single(path) => path,
         NpmBin::Multiple(bins) => {
             let preferred = package.rsplit('/').next().unwrap_or(package);
-            bins.get(preferred)
-                .or_else(|| {
-                    let mut paths = bins.values();
-                    let path = paths.next()?;
-                    paths.all(|candidate| candidate == path).then_some(path)
-                })
-                .ok_or_else(|| {
-                    VibexError::validation(
-                        "agent_npm_bin_missing",
-                        "npm package did not declare an unambiguous executable",
-                    )
-                })?
+            bins.get(if package == AUTOHAND_CLI_PACKAGE {
+                "autohand"
+            } else {
+                preferred
+            })
+            .or_else(|| {
+                let mut paths = bins.values();
+                let path = paths.next()?;
+                paths.all(|candidate| candidate == path).then_some(path)
+            })
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "agent_npm_bin_missing",
+                    "npm package did not declare an unambiguous executable",
+                )
+            })?
         }
     };
     let _ = safe_relative_path(selected, "npm bin")?;
@@ -2900,17 +3464,126 @@ fn npm_command_path(root: &Path, command: &str) -> PathBuf {
     root.join("node_modules").join(".bin").join(command)
 }
 
-fn pi_acp_launcher_source(adapter_script: &Path) -> VibexResult<String> {
+fn select_kiro_package(packages: &[KiroReleasePackage]) -> VibexResult<KiroReleasePackage> {
+    let os = env::consts::OS;
+    let architecture = env::consts::ARCH;
+    let selected = packages
+        .iter()
+        .filter(|package| package.os == os)
+        .find(|package| match os {
+            "linux" => {
+                package.architecture == architecture
+                    && package.variant == "headless"
+                    && package.file_type == "tarGz"
+                    && package.download.ends_with(".tar.gz")
+                    && (cfg!(target_env = "musl") == package.download.contains("-musl"))
+            }
+            "macos" => {
+                package.architecture == "universal"
+                    && package.variant == "full"
+                    && package.file_type == "dmg"
+            }
+            "windows" => {
+                package.architecture == architecture
+                    && package.variant == "full"
+                    && package.file_type == "msi"
+            }
+            _ => false,
+        })
+        .cloned()
+        .ok_or_else(|| {
+            VibexError::capability(
+                "agent_kiro_platform_unsupported",
+                "Kiro CLI did not publish a supported package for this platform",
+            )
+            .with_diagnostic("os", os.to_string())
+            .with_diagnostic("architecture", architecture.to_string())
+        })?;
+    validate_safe_segment(&selected.file_type, "Kiro CLI archive format")?;
+    validate_sha256(&selected.sha256)?;
+    Ok(selected)
+}
+
+fn kiro_archive_url(download: &str, version: &str) -> VibexResult<String> {
+    let download_path = safe_relative_path(download, "Kiro CLI download")?;
+    if download_path.parent() != Some(Path::new(version)) {
+        return Err(VibexError::validation(
+            "agent_kiro_download_version_mismatch",
+            "Kiro CLI download path did not match the latest manifest version",
+        ));
+    }
+    let filename = download_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            VibexError::validation(
+                "agent_kiro_download_invalid",
+                "Kiro CLI download did not have a valid filename",
+            )
+        })?;
+    Url::parse(&format!("{KIRO_DOWNLOAD_BASE_URL}/"))
+        .and_then(|base| base.join(filename))
+        .map(|url| url.to_string())
+        .map_err(|error| {
+            VibexError::validation(
+                "agent_kiro_download_invalid",
+                "Kiro CLI download URL could not be constructed",
+            )
+            .with_diagnostic("error", error.to_string())
+        })
+}
+
+fn npm_companion_launcher_source(agent_id: &AgentId, adapter_script: &Path) -> VibexResult<String> {
+    let command = npm_companion_command(agent_id).ok_or_else(|| {
+        VibexError::validation(
+            "agent_npm_launcher_agent_invalid",
+            "managed npm companion launcher did not have a command",
+        )
+    })?;
+    let environment = npm_companion_environment(agent_id).ok_or_else(|| {
+        VibexError::validation(
+            "agent_npm_launcher_agent_invalid",
+            "managed npm companion launcher did not have an environment key",
+        )
+    })?;
     let adapter_script = adapter_script.to_str().ok_or_else(|| {
         VibexError::validation(
             "agent_npm_launcher_path_invalid",
-            "Pi ACP adapter path was not valid UTF-8",
+            "ACP adapter path was not valid UTF-8",
         )
     })?;
     let adapter_script = serde_json::to_string(adapter_script).map_err(|error| {
         VibexError::validation(
             "agent_npm_launcher_path_invalid",
-            "Pi ACP adapter path could not be encoded",
+            "ACP adapter path could not be encoded",
+        )
+        .with_diagnostic("error", error.to_string())
+    })?;
+    let windows_command = serde_json::to_string(&format!("{command}.cmd")).map_err(|error| {
+        VibexError::validation(
+            "agent_npm_launcher_command_invalid",
+            "managed npm companion command could not be encoded",
+        )
+        .with_diagnostic("error", error.to_string())
+    })?;
+    let command = serde_json::to_string(command).map_err(|error| {
+        VibexError::validation(
+            "agent_npm_launcher_command_invalid",
+            "managed npm companion command could not be encoded",
+        )
+        .with_diagnostic("error", error.to_string())
+    })?;
+    let environment = serde_json::to_string(environment).map_err(|error| {
+        VibexError::validation(
+            "agent_npm_launcher_environment_invalid",
+            "managed npm companion environment key could not be encoded",
+        )
+        .with_diagnostic("error", error.to_string())
+    })?;
+    let label = serde_json::to_string(agent_id.as_str()).map_err(|error| {
+        VibexError::validation(
+            "agent_npm_launcher_agent_invalid",
+            "managed npm Agent id could not be encoded",
         )
         .with_diagnostic("error", error.to_string())
     })?;
@@ -2919,15 +3592,23 @@ fn pi_acp_launcher_source(adapter_script: &Path) -> VibexResult<String> {
 const path = require("node:path");
 const {{ pathToFileURL }} = require("node:url");
 
-const piCommand = process.platform === "win32" ? "pi.cmd" : "pi";
-process.env.PI_ACP_PI_COMMAND = path.join(__dirname, "node_modules", ".bin", piCommand);
+const companionCommand = process.platform === "win32" ? {windows_command} : {command};
+process.env[{environment}] = path.join(__dirname, "node_modules", ".bin", companionCommand);
 const adapter = path.join(__dirname, {adapter_script});
 import(pathToFileURL(adapter).href).catch((error) => {{
-  console.error("Failed to start pi-acp:", error);
+  console.error("Failed to start {label} ACP adapter:", error);
   process.exitCode = 1;
 }});
 "#
     ))
+}
+
+#[cfg(test)]
+fn pi_acp_launcher_source(adapter_script: &Path) -> VibexResult<String> {
+    npm_companion_launcher_source(
+        &AgentId::parse("pi").expect("static Agent id"),
+        adapter_script,
+    )
 }
 
 fn canonical_npm_tarball_url(package: &str, version: &str) -> VibexResult<String> {
@@ -3097,6 +3778,21 @@ fn load_installed_agent(root: &Path, expected_fingerprint: &str) -> VibexResult<
             "managed Agent cache did not match the requested distribution",
         ));
     }
+    if matches!(manifest.registry_agent_id.as_str(), "amp-acp" | "autohand")
+        && manifest.runtime_version.is_none()
+    {
+        return Err(VibexError::validation(
+            "agent_npm_runtime_version_missing",
+            "managed npm companion version was missing from the installation",
+        ));
+    }
+    if let Some(companion) = npm_companion_command_for_registry_id(&manifest.registry_agent_id) {
+        ensure_regular_file(
+            root,
+            &npm_command_path(root, companion),
+            "agent_npm_runtime_command_missing",
+        )?;
+    }
     let command = match manifest.launch {
         ManifestLaunch::Binary { command, args } => {
             let path = root.join(safe_relative_path(&command, "binary command")?);
@@ -3202,6 +3898,29 @@ fn record_has_usable_installation(record: &AgentManagedInstallationRecord) -> bo
     record.state.has_usable_installation() && installation_files_are_usable(record)
 }
 
+fn managed_companion_installation_is_usable(
+    agent_id: &AgentId,
+    record: &AgentManagedInstallationRecord,
+) -> bool {
+    if latest_npm_companion(agent_id).is_none() {
+        return true;
+    }
+    let Some(root) = record.install_root.as_deref().map(Path::new) else {
+        return false;
+    };
+    let runtime_version_is_valid = read_manifest_runtime_version(root)
+        .is_some_and(|version| semver::Version::parse(&version).is_ok());
+    let runtime_command_is_valid = npm_companion_command(agent_id).is_some_and(|command| {
+        ensure_regular_file(
+            root,
+            &npm_command_path(root, command),
+            "agent_npm_runtime_command_missing",
+        )
+        .is_ok()
+    });
+    runtime_version_is_valid && runtime_command_is_valid
+}
+
 fn installation_files_are_usable(record: &AgentManagedInstallationRecord) -> bool {
     record
         .install_root
@@ -3256,6 +3975,12 @@ fn version_is_newer(installed: &str, available: &str) -> bool {
     }
 }
 
+fn read_manifest_runtime_version(root: &Path) -> Option<String> {
+    let bytes = fs::read(root.join("vibex-install.json")).ok()?;
+    let manifest = serde_json::from_slice::<InstallManifest>(&bytes).ok()?;
+    manifest.runtime_version
+}
+
 fn command_is_available(command: &AgentCommandConfig) -> bool {
     let program = Path::new(&command.command);
     let script_runtime = program.file_stem().is_some_and(|name| {
@@ -3270,24 +3995,6 @@ fn command_is_available(command: &AgentCommandConfig) -> bool {
                 .args
                 .first()
                 .is_some_and(|script| Path::new(script).is_file()))
-}
-
-fn verify_required_external_commands(agent_id: &AgentId) -> VibexResult<()> {
-    let required: &[&str] = match agent_id.as_str() {
-        "amp-acp" => &["amp"],
-        "autohand" => &["autohand"],
-        _ => &[],
-    };
-    for command in required {
-        if vibex_config_switch::resolve_binary_path(command).is_none() {
-            return Err(VibexError::capability(
-                "agent_required_cli_missing",
-                "The ACP adapter was installed, but its required Agent CLI is missing",
-            )
-            .with_diagnostic("requiredCommand", (*command).to_string()));
-        }
-    }
-    Ok(())
 }
 
 fn distribution_fingerprint(parts: &[&str]) -> String {
@@ -3748,6 +4455,177 @@ fn make_executable(path: &Path) -> VibexResult<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+async fn install_kiro_macos(
+    archive: &Path,
+    staging: &Path,
+    cli_path: Option<&str>,
+) -> VibexResult<PathBuf> {
+    let relative_cli = safe_relative_path(
+        cli_path.ok_or_else(|| {
+            VibexError::validation(
+                "agent_kiro_cli_path_missing",
+                "Kiro CLI macOS manifest did not provide a CLI path",
+            )
+        })?,
+        "Kiro CLI path",
+    )?;
+    let mount = staging.join("kiro-mount");
+    fs::create_dir_all(&mount).map_err(|error| {
+        storage_error(
+            "agent_kiro_mount_create_failed",
+            "Kiro CLI DMG mount directory could not be created",
+            error,
+        )
+    })?;
+    let mut attach = Command::new("hdiutil");
+    attach
+        .arg("attach")
+        .arg("-nobrowse")
+        .arg("-readonly")
+        .arg("-mountpoint")
+        .arg(&mount)
+        .arg(archive)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    run_install_command(
+        attach,
+        "agent_kiro_mount_timeout",
+        "agent_kiro_mount_spawn_failed",
+        "agent_kiro_mount_failed",
+        "Kiro CLI DMG could not be mounted",
+    )
+    .await?;
+
+    let mut source_app = None;
+    if let Ok(entries) = fs::read_dir(&mount) {
+        for entry in entries.flatten() {
+            let candidate = entry.path();
+            if candidate
+                .extension()
+                .is_some_and(|extension| extension == "app")
+            {
+                let path = candidate.join(&relative_cli);
+                if path.is_file() {
+                    source_app = Some(candidate);
+                    break;
+                }
+            }
+        }
+    }
+    let destination_app = staging.join("Kiro CLI.app");
+    let destination = destination_app.join(&relative_cli);
+    let copy_result = if let Some(source_app) = source_app {
+        let mut copy = Command::new("ditto");
+        copy.arg(source_app)
+            .arg(&destination_app)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        run_install_command(
+            copy,
+            "agent_kiro_bundle_copy_timeout",
+            "agent_kiro_bundle_copy_spawn_failed",
+            "agent_kiro_bundle_copy_failed",
+            "Kiro CLI app bundle could not be copied from the DMG",
+        )
+        .await
+        .map(|()| destination.clone())
+    } else {
+        Err(VibexError::validation(
+            "agent_kiro_binary_missing",
+            "Kiro CLI DMG did not contain the manifest CLI path",
+        ))
+    };
+    let mut detach = Command::new("hdiutil");
+    detach
+        .arg("detach")
+        .arg(&mount)
+        .arg("-force")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let detach_result = run_install_command(
+        detach,
+        "agent_kiro_unmount_timeout",
+        "agent_kiro_unmount_spawn_failed",
+        "agent_kiro_unmount_failed",
+        "Kiro CLI DMG could not be unmounted",
+    )
+    .await;
+    copy_result.and(detach_result.map(|()| destination))
+}
+
+#[cfg(target_os = "windows")]
+async fn install_kiro_windows(archive: &Path, staging: &Path) -> VibexResult<PathBuf> {
+    let extraction = staging.join("kiro-msi");
+    fs::create_dir_all(&extraction).map_err(|error| {
+        storage_error(
+            "agent_kiro_msi_directory_failed",
+            "Kiro CLI MSI extraction directory could not be created",
+            error,
+        )
+    })?;
+    let target = format!("TARGETDIR={}", extraction.to_string_lossy());
+    let mut command = Command::new("msiexec");
+    command
+        .arg("/a")
+        .arg(archive)
+        .arg("/qn")
+        .arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    run_install_command(
+        command,
+        "agent_kiro_msi_timeout",
+        "agent_kiro_msi_spawn_failed",
+        "agent_kiro_msi_failed",
+        "Kiro CLI MSI extraction failed",
+    )
+    .await?;
+    find_file_named(&extraction, "kiro-cli.exe").ok_or_else(|| {
+        VibexError::validation(
+            "agent_kiro_binary_missing",
+            "Kiro CLI MSI did not contain kiro-cli.exe",
+        )
+    })
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn find_file_named(root: &Path, name: &str) -> Option<PathBuf> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut inspected = 0_usize;
+    while let Some(path) = pending.pop() {
+        inspected = inspected.saturating_add(1);
+        if inspected > ARCHIVE_MAX_ENTRIES {
+            return None;
+        }
+        let metadata = fs::symlink_metadata(&path).ok()?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_file() {
+            if path
+                .file_name()
+                .is_some_and(|value| value.to_string_lossy().eq_ignore_ascii_case(name))
+            {
+                return Some(path);
+            }
+            continue;
+        }
+        for entry in fs::read_dir(path).ok()?.flatten() {
+            pending.push(entry.path());
+        }
+    }
+    None
+}
+
 fn sha256_file(path: &Path) -> VibexResult<String> {
     let mut file = File::open(path).map_err(|error| {
         storage_error(
@@ -4120,7 +4998,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_aliases_and_external_agents_are_explicit() {
+    fn registry_aliases_and_latest_managed_agents_are_explicit() {
         assert_eq!(
             require_registry_id(&AgentId::parse("claude").unwrap()).unwrap(),
             "claude-acp"
@@ -4145,6 +5023,12 @@ mod tests {
             require_registry_id(&AgentId::parse("minion-code").unwrap()).unwrap(),
             "minion-code"
         );
+        for agent_id in ["codewhale", "hermes", "kiro"] {
+            assert_eq!(
+                require_registry_id(&AgentId::parse(agent_id).unwrap()).unwrap(),
+                agent_id
+            );
+        }
     }
 
     #[test]
@@ -4170,6 +5054,27 @@ mod tests {
     }
 
     #[test]
+    fn latest_npm_companions_are_bound_to_private_adapter_launchers() {
+        for (agent, package, command, environment) in [
+            ("amp-acp", AMP_CLI_PACKAGE, "amp", "AMP_CLI_PATH"),
+            ("autohand", AUTOHAND_CLI_PACKAGE, "autohand", "AUTOHAND_CMD"),
+        ] {
+            let agent_id = AgentId::parse(agent).unwrap();
+            assert_eq!(latest_npm_companion(&agent_id), Some(package));
+            assert_eq!(npm_companion_command(&agent_id), Some(command));
+            assert_eq!(npm_companion_environment(&agent_id), Some(environment));
+            let launcher = npm_companion_launcher_source(
+                &agent_id,
+                Path::new("node_modules/adapter/dist/index.js"),
+            )
+            .unwrap();
+            assert!(launcher.contains(environment));
+            assert!(launcher.contains(&format!("? \"{command}.cmd\" : \"{command}\"")));
+            assert!(launcher.contains("node_modules/adapter/dist/index.js"));
+        }
+    }
+
+    #[test]
     fn exact_npm_specs_reject_ranges_and_identity_drift() {
         assert_eq!(
             parse_exact_npm_spec("@scope/agent@1.2.3", "1.2.3").unwrap(),
@@ -4185,6 +5090,7 @@ mod tests {
             parse_exact_uvx_spec("fast-agent-acp==0.9.30", "0.9.30").unwrap(),
             VerifiedUvxPackage {
                 name: "fast-agent-acp".to_string(),
+                extras: Vec::new(),
                 version: "0.9.30".to_string(),
             }
         );
@@ -4194,6 +5100,13 @@ mod tests {
                 .exact_spec(),
             "minion-code==0.1.44"
         );
+        assert_eq!(
+            parse_exact_uvx_spec("hermes-agent[acp]==0.19.0", "0.19.0")
+                .unwrap()
+                .exact_spec(),
+            "hermes-agent[acp]==0.19.0"
+        );
+        assert!(parse_exact_uvx_spec("hermes-agent[acp,../bad]==0.19.0", "0.19.0").is_err());
         assert!(parse_exact_uvx_spec("agent>=1.2.3", "1.2.3").is_err());
         assert!(parse_exact_uvx_spec("agent@1.2.4", "1.2.3").is_err());
         assert!(parse_exact_uvx_spec("agent@https://example.com/agent.whl", "1.2.3").is_err());
@@ -4217,6 +5130,7 @@ mod tests {
                 )])),
                 npx: None,
                 uvx: None,
+                kiro: None,
             },
         };
         assert!(matches!(
@@ -4239,6 +5153,7 @@ mod tests {
                     args: Vec::new(),
                 }),
                 uvx: None,
+                kiro: None,
             },
             ..entry
         };
@@ -4255,6 +5170,7 @@ mod tests {
                     package: "test-agent==1.2.3".to_string(),
                     args: vec!["acp".to_string()],
                 }),
+                kiro: None,
             },
             ..fallback
         };
@@ -4286,6 +5202,36 @@ mod tests {
         );
         assert!(validate_npm_integrity(&npm_integrity).is_ok());
         assert!(validate_npm_integrity("sha512-not-base64").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kiro_package_selection_uses_the_current_linux_runtime() {
+        let architecture = env::consts::ARCH.to_string();
+        let package = |download: &str| KiroReleasePackage {
+            os: "linux".to_string(),
+            architecture: architecture.clone(),
+            variant: "headless".to_string(),
+            file_type: "tarGz".to_string(),
+            download: download.to_string(),
+            sha256: "a".repeat(64),
+            cli_path: None,
+        };
+        let packages = vec![
+            package(&format!("1.2.3/kirocli-{architecture}-linux.tar.gz")),
+            package(&format!("1.2.3/kirocli-{architecture}-linux-musl.tar.gz")),
+        ];
+
+        let selected = select_kiro_package(&packages).unwrap();
+        assert_eq!(
+            selected.download.contains("-musl"),
+            cfg!(target_env = "musl")
+        );
+        assert_eq!(
+            kiro_archive_url("2.16.2/Kiro CLI.dmg", "2.16.2").unwrap(),
+            "https://prod.download.cli.kiro.dev/stable/latest/Kiro%20CLI.dmg"
+        );
+        assert!(kiro_archive_url("2.16.1/kirocli.zip", "2.16.2").is_err());
     }
 
     #[test]
@@ -4330,6 +5276,20 @@ mod tests {
         assert!(
             select_uvx_entry_point("package", &["first".to_string(), "second".to_string()])
                 .is_err()
+        );
+        let hermes_id = AgentId::parse("hermes").unwrap();
+        let hermes_entry_point = managed_uvx_entry_point(&hermes_id).unwrap();
+        assert_eq!(
+            select_uvx_entry_point(
+                hermes_entry_point,
+                &[
+                    "hermes".to_string(),
+                    "hermes-agent".to_string(),
+                    "hermes-acp".to_string(),
+                ],
+            )
+            .unwrap(),
+            "hermes"
         );
         assert!(select_uvx_entry_point("package", &["../escape".to_string()]).is_err());
     }
@@ -4515,6 +5475,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn autohand_cli_selects_the_canonical_command_from_multiple_bins() {
+        let metadata = NpmPackageMetadata {
+            name: AUTOHAND_CLI_PACKAGE.to_string(),
+            version: "0.9.4".to_string(),
+            dist: NpmDist {
+                integrity: None,
+                tarball: None,
+            },
+            bin: Some(NpmBin::Multiple(BTreeMap::from([
+                ("agent".to_string(), "dist/agent.js".to_string()),
+                ("autohand".to_string(), "dist/index.js".to_string()),
+                (
+                    "autohand-code".to_string(),
+                    "dist/autohand-code.js".to_string(),
+                ),
+            ]))),
+        };
+
+        assert_eq!(
+            select_npm_bin(&metadata, AUTOHAND_CLI_PACKAGE).unwrap(),
+            "dist/index.js"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn uvx_cached_installation_recovers_a_relocatable_python_launcher() {
@@ -4536,6 +5521,7 @@ mod tests {
             registry_agent_id: "fast-agent".to_string(),
             version: "0.9.30".to_string(),
             fingerprint: "fixture".to_string(),
+            runtime_version: None,
             distribution_kind: AgentManagedDistributionKind::Uvx,
             launch: ManifestLaunch::Python {
                 python: "venv/bin/python".to_string(),
@@ -4623,6 +5609,62 @@ printf '%s\n' '{"version":"1.2.3","scripts":["test-package"]}'
         assert!(!record_has_usable_installation(&record));
         fs::remove_file(command).unwrap();
         assert!(!installation_files_are_usable(&record));
+    }
+
+    #[test]
+    fn legacy_companion_installations_require_private_runtime_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("autohand");
+        fs::create_dir_all(&root).unwrap();
+        let adapter = root.join("adapter.cjs");
+        fs::write(&adapter, b"fixture").unwrap();
+        let agent_id = AgentId::parse("autohand").unwrap();
+        let record = AgentManagedInstallationRecord {
+            agent_id: agent_id.clone(),
+            registry_agent_id: "autohand".to_string(),
+            state: AgentManagedInstallState {
+                managed: true,
+                status: AgentManagedInstallStatus::Installed,
+                distribution_kind: Some(AgentManagedDistributionKind::Npm),
+                installed_version: Some("0.2.1".to_string()),
+                available_version: Some("0.2.1".to_string()),
+                last_error_code: None,
+                last_error_message: None,
+                updated_at_ms: Some(1),
+            },
+            command: Some(AgentCommandConfig {
+                command: adapter.to_string_lossy().into_owned(),
+                args: Vec::new(),
+            }),
+            install_root: Some(root.to_string_lossy().into_owned()),
+            updated_at_ms: 1,
+        };
+        assert!(!managed_companion_installation_is_usable(
+            &agent_id, &record
+        ));
+
+        let companion = npm_command_path(&root, "autohand");
+        write_private_file(&companion, b"fixture").unwrap();
+        write_json_private(
+            &root.join("vibex-install.json"),
+            &InstallManifest {
+                registry_agent_id: "autohand".to_string(),
+                version: "0.2.1".to_string(),
+                fingerprint: "fixture".to_string(),
+                runtime_version: Some("0.9.4".to_string()),
+                distribution_kind: AgentManagedDistributionKind::Npm,
+                launch: ManifestLaunch::Node {
+                    node: adapter.to_string_lossy().into_owned(),
+                    script: "adapter.cjs".to_string(),
+                    args: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+        assert!(managed_companion_installation_is_usable(&agent_id, &record));
+        assert!(load_installed_agent(&root, "fixture").is_ok());
+        fs::remove_file(companion).unwrap();
+        assert!(load_installed_agent(&root, "fixture").is_err());
     }
 
     #[tokio::test]
