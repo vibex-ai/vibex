@@ -73,6 +73,8 @@ const MANAGEMENT_COMPACT_RESIZE_HANDLE_ANIMATION_MS: u64 = 140;
 const AGENT_AUTH_TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MANAGEMENT_HOST_TITLE_BAR_HEIGHT: f32 = 44.0;
 const MANAGEMENT_COMPACT_RESIZE_STEP: f32 = 16.0;
+const MANAGEMENT_DETAIL_ACTION_HEIGHT: f32 = 42.0;
+const MANAGEMENT_PROVIDER_ROW_ACTION_SIZE: f32 = 40.0;
 const PROVIDER_OPTION_WEBSITE_URL: &str = "ccSwitchWebsiteUrl";
 const PROVIDER_OPTION_CC_SWITCH_DB_PATH: &str = "ccSwitchDbPath";
 const PROVIDER_OPTION_CC_SWITCH_PROVIDER_ID: &str = "ccSwitchProviderId";
@@ -5733,7 +5735,7 @@ impl ManagementCenter {
                     .border_1()
                     .border_color(cx.theme().border.opacity(if selected { 0.0 } else { 0.65 }))
                     .bg(if selected {
-                        cx.theme().primary.opacity(0.12)
+                        cx.theme().primary.opacity(0.08)
                     } else {
                         cx.theme().background.opacity(0.70)
                     })
@@ -5742,23 +5744,11 @@ impl ManagementCenter {
                     .hover(|style| {
                         style
                             .bg(if selected {
-                                cx.theme().primary.opacity(0.18)
+                                cx.theme().primary.opacity(0.11)
                             } else {
-                                cx.theme().accent.opacity(0.32)
+                                cx.theme().accent
                             })
-                            .shadow_xs()
-                    })
-                    .when(selected, |row| {
-                        row.child(
-                            div()
-                                .absolute()
-                                .left_0()
-                                .top_2()
-                                .bottom_2()
-                                .w(px(3.0))
-                                .rounded(px(2.0))
-                                .bg(cx.theme().primary),
-                        )
+                            .shadow_sm()
                     })
                     .when(added, |row| {
                         row.role(Role::Button)
@@ -5850,7 +5840,7 @@ impl ManagementCenter {
                                     )))
                                     .small()
                                     .ghost()
-                                    .size(px(36.0))
+                                    .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
                                     .icon(IconName::CircleX)
                                     .tooltip(copy.remove)
                                     .loading(managed_uninstalling)
@@ -5880,7 +5870,7 @@ impl ManagementCenter {
                                     )))
                                     .small()
                                     .outline()
-                                    .size(px(36.0))
+                                    .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
                                     .icon(IconName::Plus)
                                     .tooltip(management_add_label())
                                     .loading(
@@ -7044,8 +7034,8 @@ impl ManagementCenter {
                             Button::new("agent-auth-refresh")
                                 .small()
                                 .outline()
-                                .h(px(38.0))
-                                .px_3()
+                                .h(px(MANAGEMENT_DETAIL_ACTION_HEIGHT))
+                                .px_4()
                                 .icon(Icon::default().path("icons/vibex/rotate-ccw.svg"))
                                 .label(management_locale_text(
                                     "Refresh methods",
@@ -7063,8 +7053,8 @@ impl ManagementCenter {
                                 Button::new("agent-auth-logout")
                                     .small()
                                     .danger()
-                                    .h(px(38.0))
-                                    .px_3()
+                                    .h(px(MANAGEMENT_DETAIL_ACTION_HEIGHT))
+                                    .px_4()
                                     .label(management_locale_text("Sign out", "退出登录", "登出"))
                                     .loading(matches!(
                                         self.mutation,
@@ -7312,8 +7302,8 @@ impl ManagementCenter {
                         )))
                         .small()
                         .primary()
-                        .h(px(38.0))
-                        .px_3()
+                        .h(px(MANAGEMENT_DETAIL_ACTION_HEIGHT))
+                        .px_4()
                         .label(action_label)
                         .loading(method_loading)
                         .disabled(
@@ -7586,8 +7576,8 @@ impl ManagementCenter {
                 Button::new(SharedString::from(format!("management-agent-install-{id}")))
                     .small()
                     .primary()
-                    .h(px(38.0))
-                    .px_3()
+                    .h(px(MANAGEMENT_DETAIL_ACTION_HEIGHT))
+                    .px_4()
                     .icon(IconName::ArrowDown)
                     .label(management_locale_text("Install", "安装", "安裝"))
                     .loading(upgrading)
@@ -7602,8 +7592,8 @@ impl ManagementCenter {
                 Button::new(SharedString::from(format!("management-agent-check-{id}")))
                     .small()
                     .outline()
-                    .h(px(38.0))
-                    .px_3()
+                    .h(px(MANAGEMENT_DETAIL_ACTION_HEIGHT))
+                    .px_4()
                     .icon(IconName::Search)
                     .label(management_locale_text(
                         "Check for updates",
@@ -7623,8 +7613,8 @@ impl ManagementCenter {
                 Button::new(SharedString::from(format!("management-agent-upgrade-{id}")))
                     .small()
                     .primary()
-                    .h(px(38.0))
-                    .px_3()
+                    .h(px(MANAGEMENT_DETAIL_ACTION_HEIGHT))
+                    .px_4()
                     .icon(IconName::ArrowUp)
                     .label(management_locale_text("Upgrade", "升级", "升級"))
                     .loading(upgrading)
@@ -7643,8 +7633,8 @@ impl ManagementCenter {
                 )))
                 .small()
                 .danger()
-                .h(px(38.0))
-                .px_3()
+                .h(px(MANAGEMENT_DETAIL_ACTION_HEIGHT))
+                .px_4()
                 .icon(IconName::Delete)
                 .label(management_locale_text("Uninstall", "卸载", "解除安裝"))
                 .loading(uninstalling)
@@ -7754,6 +7744,7 @@ impl ManagementCenter {
         let mut profile_rows = v_flex().w_full().gap_2();
         for profile in profiles.clone() {
             let id = profile.id.clone();
+            let hover_group: SharedString = format!("provider-row-hover-{id}").into();
             let select_id = id.clone();
             let agent_id = profile.agent_id.clone();
             let edit_profile = profile.clone();
@@ -7853,14 +7844,16 @@ impl ManagementCenter {
                 .items_center()
                 .justify_end()
                 .gap_1()
-                .pr_3();
+                .pr_3()
+                .invisible()
+                .group_hover(&hover_group, |style| style.visible());
             if !is_default {
                 actions = actions.child(button_with_aria_label(
                     Button::new(SharedString::from(format!("provider-default-{default_id}")))
                         .xsmall()
-                        .outline()
+                        .secondary()
                         .compact()
-                        .size(px(36.0))
+                        .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
                         .icon(IconName::Check)
                         .tooltip(management_set_default_label())
                         .disabled(pending)
@@ -7880,8 +7873,12 @@ impl ManagementCenter {
                         .xsmall()
                         .secondary()
                         .compact()
-                        .size(px(36.0))
-                        .icon(Icon::default().path("icons/vibex/pencil.svg"))
+                        .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
+                        .icon(
+                            Icon::default()
+                                .path("icons/vibex/pencil.svg")
+                                .size(px(18.0)),
+                        )
                         .disabled(pending)
                         .tooltip(management_locale_text(
                             "Edit configuration",
@@ -7898,9 +7895,9 @@ impl ManagementCenter {
                         "provider-duplicate-{duplicate_id}"
                     )))
                     .xsmall()
-                    .outline()
+                    .secondary()
                     .compact()
-                    .size(px(36.0))
+                    .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
                     .icon(IconName::Copy)
                     .disabled(pending)
                     .tooltip(management_locale_text(
@@ -7918,8 +7915,12 @@ impl ManagementCenter {
                         .xsmall()
                         .secondary()
                         .compact()
-                        .size(px(36.0))
-                        .icon(Icon::default().path("icons/vibex/activity.svg"))
+                        .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
+                        .icon(
+                            Icon::default()
+                                .path("icons/vibex/activity.svg")
+                                .size(px(18.0)),
+                        )
                         .loading(testing)
                         .disabled(pending)
                         .tooltip(if testing {
@@ -7937,7 +7938,7 @@ impl ManagementCenter {
                         .xsmall()
                         .danger()
                         .compact()
-                        .size(px(36.0))
+                        .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
                         .icon(IconName::Delete)
                         .loading(deleting)
                         .disabled(pending)
@@ -7957,6 +7958,7 @@ impl ManagementCenter {
             profile_rows = profile_rows.child(
                 div()
                     .id(SharedString::from(format!("provider-row-{id}")))
+                    .group(hover_group)
                     .relative()
                     .flex()
                     .items_center()
@@ -7968,30 +7970,18 @@ impl ManagementCenter {
                     .border_1()
                     .border_color(cx.theme().border.opacity(if active { 0.0 } else { 0.65 }))
                     .bg(if active {
-                        cx.theme().primary.opacity(0.10)
+                        cx.theme().primary.opacity(0.08)
                     } else {
                         cx.theme().background.opacity(0.90)
                     })
                     .hover(|style| {
                         style
                             .bg(if active {
-                                cx.theme().primary.opacity(0.16)
+                                cx.theme().primary.opacity(0.11)
                             } else {
-                                cx.theme().accent.opacity(0.28)
+                                cx.theme().accent
                             })
-                            .shadow_xs()
-                    })
-                    .when(active, |row| {
-                        row.child(
-                            div()
-                                .absolute()
-                                .left_0()
-                                .top_2()
-                                .bottom_2()
-                                .w(px(3.0))
-                                .rounded(px(2.0))
-                                .bg(cx.theme().primary),
-                        )
+                            .shadow_sm()
                     })
                     .child(selectable)
                     .child(actions),
@@ -8040,8 +8030,8 @@ impl ManagementCenter {
                                 Button::new("provider-import-existing")
                                     .small()
                                     .secondary()
-                                    .h(px(38.0))
-                                    .px_3()
+                                    .h(px(MANAGEMENT_DETAIL_ACTION_HEIGHT))
+                                    .px_4()
                                     .icon(Icon::default().path("icons/vibex/import.svg"))
                                     .label(copy.import_configuration)
                                     .loading(native_importing)
@@ -8059,8 +8049,8 @@ impl ManagementCenter {
                                 Button::new("provider-add-configuration")
                                     .small()
                                     .primary()
-                                    .h(px(38.0))
-                                    .px_3()
+                                    .h(px(MANAGEMENT_DETAIL_ACTION_HEIGHT))
+                                    .px_4()
                                     .icon(Icon::default().path("icons/vibex/plug-zap.svg"))
                                     .label(copy.add_configuration)
                                     .disabled(pending)
@@ -12761,7 +12751,7 @@ fn management_profile_glyph(
 ) -> AnyElement {
     let identity = format!("{kind} {label}");
     div()
-        .size(px(38.0))
+        .size(px(42.0))
         .flex_none()
         .flex()
         .items_center()
@@ -12780,7 +12770,7 @@ fn management_profile_glyph(
         })
         .child(agent_brand_icon(
             &identity,
-            px(22.0),
+            px(26.0),
             Some(if is_default {
                 cx.theme().primary
             } else {
@@ -13857,7 +13847,7 @@ fn management_module_heading(
         .gap_3()
         .child(
             div()
-                .size(px(36.0))
+                .size(px(42.0))
                 .flex_none()
                 .flex()
                 .items_center()
@@ -13867,7 +13857,7 @@ fn management_module_heading(
                 .child(
                     Icon::default()
                         .path(icon_path)
-                        .size(px(18.0))
+                        .size(px(22.0))
                         .text_color(cx.theme().foreground.opacity(0.82)),
                 ),
         )
@@ -14604,7 +14594,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_details_keep_identity_and_provider_actions_visible() {
+    fn agent_details_reveal_consistent_provider_actions_on_hover() {
         let source = include_str!("management.rs");
         let render = source
             .split_once("    fn render_providers(")
@@ -14615,12 +14605,13 @@ mod tests {
         assert!(render.contains("management_agent_detail_header"));
         assert!(render.contains("icons/vibex/grip-vertical.svg"));
         assert!(render.contains("management_model_count"));
-        assert!(render.contains("cx.theme().primary.opacity(0.10)"));
-        assert!(render.contains("cx.theme().accent.opacity(0.28)"));
-        assert!(render.contains(".shadow_xs()"));
+        assert!(render.contains("cx.theme().primary.opacity(0.08)"));
+        assert!(render.contains("cx.theme().accent"));
+        assert!(render.contains(".shadow_sm()"));
         assert!(!render.contains("cx.theme().ring.opacity(0.50)"));
-        assert!(!render.contains(".invisible()"));
-        assert!(!render.contains(".group_hover("));
+        assert!(render.contains(".group(hover_group)"));
+        assert!(render.contains(".invisible()"));
+        assert!(render.contains(".group_hover(&hover_group, |style| style.visible())"));
         for action in [
             "provider-edit-",
             "provider-duplicate-",
@@ -14630,6 +14621,23 @@ mod tests {
             assert!(
                 render.contains(action),
                 "missing visible provider action: {action}"
+            );
+        }
+        for action in [
+            "provider-default-",
+            "provider-edit-",
+            "provider-duplicate-",
+            "provider-test-",
+        ] {
+            let action_body = render
+                .split_once(action)
+                .map(|(_, tail)| tail)
+                .expect("Provider action should remain inspectable");
+            assert!(
+                action_body
+                    .find(".secondary()")
+                    .is_some_and(|index| index < 360),
+                "non-destructive Provider action must use the shared secondary background: {action}"
             );
         }
 
@@ -14679,8 +14687,8 @@ mod tests {
 
         assert!(install.contains("management_card_with_icon("));
         assert!(install.contains("icons/vibex/download.svg"));
-        assert!(render.contains(".size(px(36.0))"));
-        assert!(render.contains(".h(px(38.0))"));
+        assert!(render.contains("MANAGEMENT_PROVIDER_ROW_ACTION_SIZE"));
+        assert!(render.contains("MANAGEMENT_DETAIL_ACTION_HEIGHT"));
     }
 
     #[test]
@@ -14791,9 +14799,10 @@ mod tests {
         assert!(render_agents.contains("agents.sort_by_cached_key(management_agent_sort_key);"));
         assert!(render_agents.contains("management-agent-add-{add_id}"));
         assert!(!render_agents.contains("management-agent-catalog-"));
-        assert!(render_agents.contains("cx.theme().primary.opacity(0.12)"));
-        assert!(render_agents.contains("cx.theme().accent.opacity(0.32)"));
-        assert!(render_agents.contains(".shadow_xs()"));
+        assert!(render_agents.contains("cx.theme().primary.opacity(0.08)"));
+        assert!(render_agents.contains("cx.theme().accent"));
+        assert!(render_agents.contains(".shadow_sm()"));
+        assert!(!render_agents.contains(".w(px(3.0))"));
         assert!(!render_agents.contains("cx.theme().ring.opacity(0.60)"));
         assert!(render_agents.matches("cx.stop_propagation();").count() >= 4);
     }
