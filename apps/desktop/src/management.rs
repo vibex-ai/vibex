@@ -242,6 +242,7 @@ struct ManagementSnapshot {
     acp_configs: Vec<(String, vibex_core::AcpProviderConfig)>,
     native_import_preview: Option<vibex_core::ProviderNativeImportPreview>,
     agent_profile_states: Vec<AgentProviderProfileState>,
+    provider_display_order: BTreeMap<String, i64>,
     projection_states: Vec<AgentProviderProjectionState>,
     health_summaries: Vec<vibex_core::ProviderHealthSummary>,
     capability_summaries: Vec<vibex_core::ProviderCapabilitySummary>,
@@ -266,6 +267,39 @@ struct AgentProviderProfileState {
 }
 
 #[derive(Clone)]
+struct ProviderDisplayOrderDrag {
+    agent_id: String,
+    profile_id: String,
+    label: SharedString,
+}
+
+impl Render for ProviderDisplayOrderDrag {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .rounded_sm()
+            .border_1()
+            .border_color(cx.theme().drag_border)
+            .bg(cx.theme().popover)
+            .text_color(cx.theme().popover_foreground)
+            .child(
+                Icon::default()
+                    .path("icons/vibex/grip-vertical.svg")
+                    .size(px(14.0)),
+            )
+            .child(self.label.clone())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderDisplayOrderDropTarget {
+    profile_id: String,
+    after: bool,
+}
+
+#[derive(Clone)]
 struct AgentProviderProjectionState {
     agent_id: String,
     legacy_profile_id: Option<String>,
@@ -282,6 +316,7 @@ enum ManagementMutation {
     ProviderProbe(String),
     AgentAuth(String),
     ProviderPreview(String),
+    ProviderDisplayOrder(String),
     AgentToggle(String),
     AgentInstall(String),
     AgentUpdateCheck(String),
@@ -337,6 +372,7 @@ impl ManagementMutation {
             Self::ProviderProbe(id) => format!("provider:probe:{id}"),
             Self::AgentAuth(id) => format!("agent:auth:{id}"),
             Self::ProviderPreview(id) => format!("provider:preview:{id}"),
+            Self::ProviderDisplayOrder(id) => format!("provider:display-order:{id}"),
             Self::AgentToggle(id) => format!("agent:toggle:{id}"),
             Self::AgentInstall(id) => format!("agent:install:{id}"),
             Self::AgentUpdateCheck(id) => format!("agent:update-check:{id}"),
@@ -377,7 +413,8 @@ impl ManagementMutation {
             ),
             Self::AgentInstall(agent_id)
             | Self::AgentUpdateCheck(agent_id)
-            | Self::AgentUninstall(agent_id) => Some(agent_id),
+            | Self::AgentUninstall(agent_id)
+            | Self::ProviderDisplayOrder(agent_id) => Some(agent_id),
             _ => None,
         }
     }
@@ -415,6 +452,7 @@ pub struct ManagementCenter {
     acp_configs: Vec<(String, vibex_core::AcpProviderConfig)>,
     native_import_preview: Option<vibex_core::ProviderNativeImportPreview>,
     agent_profile_states: Vec<AgentProviderProfileState>,
+    provider_display_order: BTreeMap<String, i64>,
     projection_states: Vec<AgentProviderProjectionState>,
     projection_editor: AgentProviderBindingEditorState,
     health_summaries: Vec<vibex_core::ProviderHealthSummary>,
@@ -468,6 +506,7 @@ pub struct ManagementCenter {
     agent_auth_terminal: Option<TerminalAuthActionDescriptor>,
     agent_auth_terminal_surface: Option<(String, Entity<TerminalSurface>)>,
     agent_auth_terminal_state: Option<AgentAuthTerminalState>,
+    provider_display_order_drop_target: Option<ProviderDisplayOrderDropTarget>,
     selected_mcp_id: Option<String>,
     selected_skill_id: Option<String>,
     selected_scheduled_task_id: Option<String>,
@@ -798,6 +837,7 @@ impl ManagementCenter {
             acp_configs: Vec::new(),
             native_import_preview: None,
             agent_profile_states: Vec::new(),
+            provider_display_order: BTreeMap::new(),
             projection_states: Vec::new(),
             projection_editor: AgentProviderBindingEditorState::default(),
             health_summaries: Vec::new(),
@@ -839,6 +879,7 @@ impl ManagementCenter {
             skill_discovery: None,
             mcp_validation: None,
             skill_validation: None,
+            provider_display_order_drop_target: None,
             selected_agent_id: None,
             selected_provider_profile_id: None,
             agent_auth_scope: None,
@@ -1955,6 +1996,7 @@ impl ManagementCenter {
     fn apply_snapshot(&mut self, snapshot: ManagementSnapshot, cx: &mut Context<Self>) {
         self.snapshot = snapshot.center;
         self.provider_profiles = snapshot.provider_profiles;
+        self.provider_display_order = snapshot.provider_display_order;
         self.model_provider_agent_ids = snapshot.model_provider_agent_ids;
         self.acp_configs = snapshot.acp_configs;
         self.native_import_preview = snapshot.native_import_preview;
@@ -3657,6 +3699,79 @@ impl ManagementCenter {
                         },
                     )
                     .map(|_| management_default_updated_message(active_locale, scope_kind).into())
+            },
+        );
+    }
+
+    fn reorder_provider_profiles(
+        &mut self,
+        moving_id: &str,
+        target_id: &str,
+        after: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(agent_id) = self.selected_agent_id.clone() else {
+            return;
+        };
+        let mut current_ids = self
+            .snapshot
+            .profiles
+            .iter()
+            .filter(|profile| profile.agent_id == agent_id)
+            .map(|profile| profile.id.as_str().to_string())
+            .collect::<Vec<_>>();
+        current_ids.sort_by_key(|profile_id| {
+            (
+                self.provider_display_order
+                    .get(profile_id.as_str())
+                    .is_none(),
+                self.provider_display_order
+                    .get(profile_id.as_str())
+                    .copied()
+                    .unwrap_or(i64::MAX),
+            )
+        });
+        let ordered_ids = reordered_provider_profile_ids(&current_ids, moving_id, target_id, after);
+        if ordered_ids == current_ids {
+            return;
+        }
+        let Ok(parsed_agent_id) = AgentId::parse(agent_id.clone()) else {
+            return;
+        };
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        let active_locale = locale::current_locale();
+        let entries = ordered_ids
+            .into_iter()
+            .map(
+                |provider_profile_id| vibex_core::AgentModelProviderDisplayOrderSetEntry {
+                    provider_profile_id: vibex_core::ProviderProfileId::parse(provider_profile_id)
+                        .expect("provider profile ids originate from the loaded snapshot"),
+                },
+            )
+            .collect::<Vec<_>>();
+        self.begin_simple_task(
+            ManagementMutation::ProviderDisplayOrder(agent_id),
+            cx,
+            async move {
+                runtime
+                    .management()
+                    .providers()
+                    .management()
+                    .set_agent_model_provider_display_order(
+                        vibex_core::AgentModelProviderDisplayOrderSetRequest {
+                            agent_id: parsed_agent_id,
+                            entries,
+                        },
+                    )?;
+                Ok(management_locale_text_for(
+                    active_locale,
+                    "Provider order updated",
+                    "模型供应商顺序已更新",
+                    "模型供應商順序已更新",
+                )
+                .to_string())
             },
         );
     }
@@ -7106,7 +7221,6 @@ impl ManagementCenter {
                 ));
             }
             for method in catalog.methods {
-                let method_id = method.id.clone();
                 let method_loading = matches!(
                     self.mutation,
                     Some(ManagementMutation::AgentAuth(ref action)) if action == &method.id
@@ -7129,48 +7243,56 @@ impl ManagementCenter {
                         Icon::default().path("icons/vibex/file-terminal.svg")
                     }
                 };
-                let kind_label = match method.kind {
-                    AgentAuthMethodKind::Agent => {
-                        management_locale_text("Agent account", "Agent 账号", "Agent 帳號")
-                    }
-                    AgentAuthMethodKind::Environment => {
-                        management_locale_text("Provider credentials", "供应商凭据", "供應商憑證")
-                    }
-                    AgentAuthMethodKind::Terminal => {
-                        management_locale_text("Interactive terminal", "交互式终端", "互動式終端")
-                    }
-                };
-                let mut method_content = v_flex()
-                    .w_full()
-                    .min_w_0()
-                    .gap_3()
-                    .border_t_1()
-                    .border_color(cx.theme().border.opacity(0.75))
-                    .pt_3()
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .min_w_0()
-                            .items_start()
-                            .justify_between()
-                            .gap_3()
-                            .child(
-                                v_flex()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .gap_1()
-                                    .child(div().text_sm().font_semibold().child(method.name))
-                                    .when_some(method.description, |title, description| {
-                                        title.child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(description),
-                                        )
-                                    }),
-                            )
-                            .child(management_status_badge(kind_label.to_string(), cx)),
-                    );
+                let submit_disabled = pending
+                    || (method.kind == AgentAuthMethodKind::Environment
+                        && self.selected_provider_profile_id.is_none());
+                let submit_method_id = method.id.clone();
+                let mut method_content =
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_3()
+                        .border_t_1()
+                        .border_color(cx.theme().border.opacity(0.75))
+                        .pt_3()
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .min_w_0()
+                                .items_start()
+                                .justify_between()
+                                .gap_3()
+                                .child(
+                                    v_flex()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .gap_1()
+                                        .child(div().text_sm().font_semibold().child(method.name))
+                                        .when_some(method.description, |title, description| {
+                                            title.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(description),
+                                            )
+                                        }),
+                                )
+                                .child(management_detail_icon_action(
+                                    Button::new(SharedString::from(format!(
+                                        "agent-auth-submit-{}",
+                                        method.id
+                                    )))
+                                    .small()
+                                    .primary()
+                                    .icon(action_icon)
+                                    .loading(method_loading)
+                                    .disabled(submit_disabled)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.authenticate_agent(submit_method_id.clone(), cx)
+                                    })),
+                                    action_label,
+                                )),
+                        );
 
                 for variable in method.environment {
                     let key = agent_auth_input_key(&method.id, &variable.name);
@@ -7290,32 +7412,6 @@ impl ManagementCenter {
                             )),
                     );
                 }
-                method_content = method_content.child(
-                    h_flex()
-                        .w_full()
-                        .justify_end()
-                        .child(management_detail_icon_action(
-                            Button::new(SharedString::from(format!(
-                                "agent-auth-submit-{}",
-                                method.id
-                            )))
-                            .small()
-                            .primary()
-                            .icon(action_icon)
-                            .loading(method_loading)
-                            .disabled(
-                                pending
-                                    || (method.kind == AgentAuthMethodKind::Environment
-                                        && self.selected_provider_profile_id.is_none()),
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.authenticate_agent(method_id.clone(), cx)
-                                },
-                            )),
-                            action_label,
-                        )),
-                );
                 content = content.child(method_content);
             }
         }
@@ -7708,13 +7804,24 @@ impl ManagementCenter {
                 .child(self.render_agent_authentication(window, None, cx))
                 .into_any_element();
         }
-        let profiles = self
+        let mut profiles = self
             .snapshot
             .profiles
             .iter()
             .filter(|profile| profile.agent_id == selected_agent_id)
             .cloned()
             .collect::<Vec<_>>();
+        profiles.sort_by_key(|profile| {
+            (
+                self.provider_display_order
+                    .get(profile.id.as_str())
+                    .is_none(),
+                self.provider_display_order
+                    .get(profile.id.as_str())
+                    .copied()
+                    .unwrap_or(i64::MAX),
+            )
+        });
         let selected_profile_id = self
             .selected_management_provider_profile()
             .map(|profile| profile.id.as_str().to_string());
@@ -7776,12 +7883,6 @@ impl ManagementCenter {
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.select_provider_profile(select_id.clone(), cx);
                 }))
-                .child(
-                    Icon::default()
-                        .path("icons/vibex/grip-vertical.svg")
-                        .size(px(16.0))
-                        .text_color(cx.theme().muted_foreground.opacity(0.55)),
-                )
                 .child(management_profile_glyph(
                     profile.kind,
                     &profile.display_name,
@@ -7942,6 +8043,51 @@ impl ManagementCenter {
                         })),
                     management_delete_profile_label(),
                 ));
+            let drag_payload = ProviderDisplayOrderDrag {
+                agent_id: selected_agent_id.clone(),
+                profile_id: id.clone(),
+                label: profile.display_name.clone().into(),
+            };
+            let drag_entity = cx.weak_entity();
+            let drag_tooltip = management_locale_text(
+                "Drag to reorder providers",
+                "拖动调整供应商顺序",
+                "拖動調整供應商順序",
+            );
+            let drag_handle = div()
+                .id(SharedString::from(format!("provider-drag-handle-{id}")))
+                .flex_none()
+                .w(px(36.0))
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_grab()
+                .tooltip(move |window, cx| Tooltip::new(drag_tooltip).build(window, cx))
+                .child(
+                    Icon::default()
+                        .path("icons/vibex/grip-vertical.svg")
+                        .size(px(18.0))
+                        .text_color(cx.theme().muted_foreground.opacity(0.65)),
+                )
+                .on_drag(drag_payload, move |drag, _, _, cx| {
+                    cx.stop_propagation();
+                    let _ = drag_entity.update(cx, |this, cx| {
+                        this.provider_display_order_drop_target = None;
+                        cx.notify();
+                    });
+                    cx.new(|_| drag.clone())
+                });
+            let active_drop_after =
+                self.provider_display_order_drop_target
+                    .as_ref()
+                    .and_then(|target| {
+                        (cx.has_active_drag() && target.profile_id == id).then_some(target.after)
+                    });
+            let move_agent_id = selected_agent_id.clone();
+            let move_profile_id = id.clone();
+            let drop_agent_id = selected_agent_id.clone();
+            let drop_profile_id = id.clone();
             profile_rows = profile_rows.child(
                 div()
                     .id(SharedString::from(format!("provider-row-{id}")))
@@ -7968,6 +8114,52 @@ impl ManagementCenter {
                             cx.theme().accent
                         })
                     })
+                    .when_some(active_drop_after, |this, after| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .h(px(2.0))
+                                .bg(cx.theme().drag_border)
+                                .map(|line| if after { line.bottom_0() } else { line.top_0() }),
+                        )
+                    })
+                    .on_drag_move(cx.listener(
+                        move |this, event: &DragMoveEvent<ProviderDisplayOrderDrag>, _, cx| {
+                            let drag = event.drag(cx);
+                            let next = (event.bounds.contains(&event.event.position)
+                                && drag.agent_id == move_agent_id
+                                && drag.profile_id != move_profile_id)
+                                .then_some(ProviderDisplayOrderDropTarget {
+                                    profile_id: move_profile_id.clone(),
+                                    after: event.event.position.y >= event.bounds.center().y,
+                                });
+                            if this.provider_display_order_drop_target != next {
+                                this.provider_display_order_drop_target = next;
+                                cx.notify();
+                            }
+                        },
+                    ))
+                    .on_drop(
+                        cx.listener(move |this, drag: &ProviderDisplayOrderDrag, _, cx| {
+                            let target = this.provider_display_order_drop_target.take();
+                            if let Some(target) = target.filter(|target| {
+                                target.profile_id == drop_profile_id
+                                    && drag.agent_id == drop_agent_id
+                            }) {
+                                this.reorder_provider_profiles(
+                                    &drag.profile_id,
+                                    &target.profile_id,
+                                    target.after,
+                                    cx,
+                                );
+                            } else {
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .child(drag_handle)
                     .child(selectable)
                     .child(actions),
             );
@@ -7981,16 +8173,27 @@ impl ManagementCenter {
             .border_t_1()
             .border_color(cx.theme().border.opacity(0.75))
             .pt_4()
-            .child(management_module_heading(
-                copy.provider_configuration,
-                management_locale_text(
-                    "Credentials used to connect this Agent to model services",
-                    "用于连接此 Agent 与模型服务的凭据配置",
-                    "用於連接此 Agent 與模型服務的憑證設定",
-                ),
-                "icons/vibex/database.svg",
-                cx,
-            ))
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child(copy.provider_configuration),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text(
+                                "Credentials used to connect this Agent to model services",
+                                "用于连接此 Agent 与模型服务的凭据配置",
+                                "用於連接此 Agent 與模型服務的憑證設定",
+                            )),
+                    ),
+            )
             .child(
                 h_flex()
                     .w_full()
@@ -12182,6 +12385,28 @@ fn management_primary_section(section: ManagementSection) -> ManagementSection {
     }
 }
 
+fn reordered_provider_profile_ids(
+    profile_ids: &[String],
+    moving_id: &str,
+    target_id: &str,
+    after: bool,
+) -> Vec<String> {
+    let mut ids = profile_ids.to_vec();
+    if moving_id == target_id {
+        return ids;
+    }
+    let Some(moving_index) = ids.iter().position(|id| id == moving_id) else {
+        return ids;
+    };
+    let moving = ids.remove(moving_index);
+    let Some(target_index) = ids.iter().position(|id| id == target_id) else {
+        ids.insert(moving_index.min(ids.len()), moving);
+        return ids;
+    };
+    ids.insert(target_index + usize::from(after), moving);
+    ids
+}
+
 fn management_provider_default_scope(
     workspace_id: Option<vibex_core::WorkspaceId>,
 ) -> vibex_core::ProviderProfileDefaultScope {
@@ -13544,6 +13769,7 @@ async fn load_snapshot(
         })
         .collect::<Vec<_>>();
     let mut agent_profile_states = Vec::new();
+    let mut provider_display_order = BTreeMap::new();
     let mut projection_states = Vec::new();
     let projection_workspace_key = default_scope
         .workspace_id
@@ -13569,6 +13795,10 @@ async fn load_snapshot(
                 agent_id: agent.id.clone(),
             },
         )?;
+        provider_display_order.extend(response.profiles.iter().filter_map(|item| {
+            item.display_order_index
+                .map(|order_index| (item.profile.id.as_str().to_string(), order_index))
+        }));
         agent_profile_states.extend(agent_provider_profile_states(
             agent.id.as_str(),
             response.profiles.into_iter().map(|item| item.profile),
@@ -13726,6 +13956,7 @@ async fn load_snapshot(
         acp_configs,
         native_import_preview,
         agent_profile_states,
+        provider_display_order,
         projection_states,
         health_summaries,
         capability_summaries,
@@ -14568,7 +14799,7 @@ mod tests {
             .find(".model_provider_agent_ids")
             .expect("Provider rendering must consult the shared capability set");
         let profile_projection = render
-            .find("let profiles = self")
+            .find("let mut profiles = self")
             .expect("supported Agents should still render Provider profiles");
 
         assert!(capability_gate < profile_projection);
@@ -14656,11 +14887,76 @@ mod tests {
             .expect("Authentication renderer should remain inspectable");
 
         assert!(render.contains("let provider_configuration = v_flex()"));
-        assert!(render.contains("icons/vibex/database.svg"));
+        assert!(!render.contains("icons/vibex/database.svg"));
         assert!(render.contains("Some(provider_configuration.into_any_element())"));
         assert!(authentication.contains("provider_configuration: Option<AnyElement>"));
         assert!(authentication.contains("content.when_some(provider_configuration"));
         assert!(authentication.contains("icons/vibex/shield-alert.svg"));
+    }
+
+    #[test]
+    fn agent_authentication_actions_share_method_header_row_without_kind_badges() {
+        let source = include_str!("management.rs");
+        let render = source
+            .split_once("    fn render_agent_authentication(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_agent_install_loading("))
+            .map(|(body, _)| body)
+            .expect("Authentication renderer should remain inspectable");
+        assert!(!render.contains("let kind_label = match method.kind"));
+        assert!(!render.contains("management_status_badge(kind_label"));
+        let header = render
+            .split_once("let mut method_content =")
+            .and_then(|(_, tail)| tail.split_once("for variable in method.environment"))
+            .map(|(body, _)| body)
+            .expect("Authentication method header should remain inspectable");
+        assert!(header.contains("agent-auth-submit-"));
+        assert!(header.contains("management_detail_icon_action("));
+        assert!(!render.contains("justify_end().child(management_detail_icon_action(\n                            Button::new(SharedString::from(format!(\n                                \"agent-auth-submit-"));
+    }
+
+    #[test]
+    fn provider_rows_expose_a_drag_handle_and_persist_reordered_ids() {
+        let source = include_str!("management.rs");
+        let render = source
+            .split_once("    fn render_providers(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_mcp("))
+            .map(|(body, _)| body)
+            .expect("Provider renderer should remain inspectable");
+        assert!(render.contains("ProviderDisplayOrderDrag"));
+        assert!(render.contains("provider-drag-handle-"));
+        assert!(render.contains(".cursor_grab()"));
+        assert!(render.contains(".on_drag_move(cx.listener("));
+        assert!(render.contains(".on_drop("));
+        assert!(render.contains("reorder_provider_profiles("));
+        assert!(render.contains("provider_display_order_drop_target"));
+
+        let helper = source
+            .split_once("fn reordered_provider_profile_ids(")
+            .and_then(|(_, tail)| tail.split_once("\nfn management_provider_default_scope("))
+            .map(|(body, _)| body)
+            .expect("Provider reorder helper should remain inspectable");
+        assert!(helper.contains("ids.remove(moving_index)"));
+        assert!(helper.contains("ids.insert(target_index + usize::from(after), moving)"));
+    }
+
+    #[test]
+    fn provider_reorder_helper_moves_before_and_after_target() {
+        let ids = ["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(
+            reordered_provider_profile_ids(&ids, "c", "a", false),
+            ["c", "a", "b"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            reordered_provider_profile_ids(&ids, "a", "b", true),
+            ["b", "a", "c"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(reordered_provider_profile_ids(&ids, "b", "b", false), ids);
     }
 
     #[test]

@@ -1339,6 +1339,47 @@ pub struct AgentModelProviderProfile {
     pub is_default: bool,
     pub failover_order_index: Option<i64>,
     pub in_failover_queue: bool,
+    pub display_order_index: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelProviderDisplayOrderEntry {
+    pub agent_id: AgentId,
+    pub provider_profile_id: ProviderProfileId,
+    pub order_index: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelProviderDisplayOrderSetEntry {
+    pub provider_profile_id: ProviderProfileId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelProviderDisplayOrderListRequest {
+    pub agent_id: AgentId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelProviderDisplayOrderListResponse {
+    pub entries: Vec<AgentModelProviderDisplayOrderEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelProviderDisplayOrderSetRequest {
+    pub agent_id: AgentId,
+    pub entries: Vec<AgentModelProviderDisplayOrderSetEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelProviderDisplayOrderSetResponse {
+    pub entries: Vec<AgentModelProviderDisplayOrderEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

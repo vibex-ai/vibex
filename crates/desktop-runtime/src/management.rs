@@ -350,6 +350,24 @@ impl ProviderManagementFacade {
         self.service.get_agent_model_provider_failover(request)
     }
 
+    pub fn get_agent_model_provider_display_order(
+        &self,
+        request: vibex_core::AgentModelProviderDisplayOrderListRequest,
+    ) -> VibexResult<vibex_core::AgentModelProviderDisplayOrderListResponse> {
+        self.service.get_agent_model_provider_display_order(request)
+    }
+
+    pub fn set_agent_model_provider_display_order(
+        &self,
+        request: vibex_core::AgentModelProviderDisplayOrderSetRequest,
+    ) -> VibexResult<vibex_core::AgentModelProviderDisplayOrderSetResponse> {
+        let _claim = self.mutation_guard.claim(format!(
+            "provider:agent-profile:display-order:{}",
+            request.agent_id
+        ))?;
+        self.service.set_agent_model_provider_display_order(request)
+    }
+
     pub fn set_agent_model_provider_failover(
         &self,
         request: vibex_core::AgentModelProviderFailoverSetRequest,

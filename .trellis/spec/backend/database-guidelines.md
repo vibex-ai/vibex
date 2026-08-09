@@ -99,6 +99,11 @@ the ability to reconstruct user-visible history needed by remote clients.
 - Destructive migrations need backup/rollback notes because Vibex is local-first
   and user data may not exist anywhere else.
 
+Migration 43 adds `agent_model_provider_display_order`, an Agent-scoped table
+for Config Center presentation order. It is independent from failover storage;
+replacement of one Agent's complete profile-id list runs in a transaction and
+profile deletion removes its display-order rows.
+
 ## Transactions
 
 Use transactions for multi-record state transitions:

@@ -15,13 +15,15 @@ use vibex_core::{
     AgentAuthEnvironmentUpdateRequest, AgentCatalogListResponse, AgentCommandConfig, AgentConfig,
     AgentConfigStatus, AgentDefinition, AgentDiscoveryRecord, AgentId, AgentInstallStatus,
     AgentListRequest, AgentListResponse, AgentModelProviderDefaultRequest,
-    AgentModelProviderDefaultSelection, AgentModelProviderFailoverEntry,
-    AgentModelProviderFailoverListRequest, AgentModelProviderFailoverListResponse,
-    AgentModelProviderFailoverSetRequest, AgentModelProviderProfile,
-    AgentModelProviderProfileCreateRequest, AgentModelProviderProfileDeleteRequest,
-    AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
-    AgentModelProviderProfileListRequest, AgentModelProviderProfileListResponse,
-    AgentModelProviderProfileSecretValueRequest, AgentModelProviderProfileSecretValueResponse,
+    AgentModelProviderDefaultSelection, AgentModelProviderDisplayOrderEntry,
+    AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
+    AgentModelProviderFailoverEntry, AgentModelProviderFailoverListRequest,
+    AgentModelProviderFailoverListResponse, AgentModelProviderFailoverSetRequest,
+    AgentModelProviderProfile, AgentModelProviderProfileCreateRequest,
+    AgentModelProviderProfileDeleteRequest, AgentModelProviderProfileFetchModelsRequest,
+    AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileListRequest,
+    AgentModelProviderProfileListResponse, AgentModelProviderProfileSecretValueRequest,
+    AgentModelProviderProfileSecretValueResponse,
     AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileTestRequest,
     AgentModelProviderProfileTestResult, AgentModelProviderProfileUpdateRequest,
     AgentModelProviderSetDefaultRequest, AgentModelProviderTestStatus, AgentRefreshSnapshotRequest,
@@ -62,12 +64,12 @@ use vibex_core::{
 use vibex_db::{
     AgentAuthCatalogSnapshotRepository, AgentConfigRepository,
     AgentDefaultModelProviderProfileRepository, AgentDiscoveryRepository,
-    AgentManagedInstallationRepository, AgentModelProviderFailoverRepository,
-    AgentRuntimeOptionSnapshotRepository, HookRepository, McpServerRepository, PromptRepository,
-    ProviderCapabilityRepository, ProviderDefaultProfileRepository, ProviderHealthRepository,
-    ProviderInjectionPreviewRepository, ProviderProfileRepository,
-    ProviderSecretReferenceRepository, ProviderUsageRepository, SkillRepository, apply_migrations,
-    open_database,
+    AgentManagedInstallationRepository, AgentModelProviderDisplayOrderRepository,
+    AgentModelProviderFailoverRepository, AgentRuntimeOptionSnapshotRepository, HookRepository,
+    McpServerRepository, PromptRepository, ProviderCapabilityRepository,
+    ProviderDefaultProfileRepository, ProviderHealthRepository, ProviderInjectionPreviewRepository,
+    ProviderProfileRepository, ProviderSecretReferenceRepository, ProviderUsageRepository,
+    SkillRepository, apply_migrations, open_database,
 };
 
 mod native_export;
@@ -557,13 +559,78 @@ impl ProviderConfigService {
             request.agent_id.clone(),
         )?;
         let failover = AgentModelProviderFailoverRepository::list(&conn, &request.agent_id)?;
+        let display_order =
+            AgentModelProviderDisplayOrderRepository::list(&conn, &request.agent_id)?;
         Ok(AgentModelProviderProfileListResponse {
             profiles: build_agent_model_provider_profiles(
                 definition.id,
                 profiles,
                 default.provider_profile_id.as_ref(),
                 &failover,
+                &display_order,
             ),
+        })
+    }
+
+    pub fn set_agent_model_provider_display_order(
+        &self,
+        request: AgentModelProviderDisplayOrderSetRequest,
+    ) -> VibexResult<AgentModelProviderDisplayOrderSetResponse> {
+        require_agent_definition(&request.agent_id)?;
+        let mut seen = HashSet::new();
+        let mut conn = self.open_connection()?;
+        let profiles = ProviderProfileRepository::list_by_agent(&conn, &request.agent_id, true)?;
+        let profile_ids = profiles
+            .iter()
+            .map(|profile| profile.id.clone())
+            .collect::<HashSet<_>>();
+        let mut entries = Vec::with_capacity(request.entries.len());
+        for (order_index, entry) in request.entries.into_iter().enumerate() {
+            if !seen.insert(entry.provider_profile_id.clone()) {
+                return Err(VibexError::validation(
+                    "provider_display_order_duplicate",
+                    "provider display order contains a duplicate profile",
+                ));
+            }
+            if !profile_ids.contains(&entry.provider_profile_id) {
+                return Err(VibexError::validation(
+                    "provider_display_order_profile_not_found",
+                    "provider display order contains a profile outside the Agent",
+                )
+                .with_diagnostic("agentId", request.agent_id.as_str())
+                .with_diagnostic("providerProfileId", entry.provider_profile_id.as_str()));
+            }
+            entries.push(AgentModelProviderDisplayOrderEntry {
+                agent_id: request.agent_id.clone(),
+                provider_profile_id: entry.provider_profile_id,
+                order_index: order_index as i64,
+                updated_at_ms: unix_timestamp_ms(),
+            });
+        }
+        if seen != profile_ids {
+            return Err(VibexError::validation(
+                "provider_display_order_incomplete",
+                "provider display order must include every profile belonging to the Agent",
+            )
+            .with_diagnostic("agentId", request.agent_id.as_str()));
+        }
+        Ok(AgentModelProviderDisplayOrderSetResponse {
+            entries: AgentModelProviderDisplayOrderRepository::replace(
+                &mut conn,
+                &request.agent_id,
+                &entries,
+            )?,
+        })
+    }
+
+    pub fn get_agent_model_provider_display_order(
+        &self,
+        request: vibex_core::AgentModelProviderDisplayOrderListRequest,
+    ) -> VibexResult<vibex_core::AgentModelProviderDisplayOrderListResponse> {
+        require_agent_definition(&request.agent_id)?;
+        let conn = self.open_connection()?;
+        Ok(vibex_core::AgentModelProviderDisplayOrderListResponse {
+            entries: AgentModelProviderDisplayOrderRepository::list(&conn, &request.agent_id)?,
         })
     }
 
@@ -7554,24 +7621,40 @@ fn build_agent_model_provider_profiles(
     profiles: Vec<ProviderProfile>,
     default_profile_id: Option<&ProviderProfileId>,
     failover: &[AgentModelProviderFailoverEntry],
+    display_order: &[AgentModelProviderDisplayOrderEntry],
 ) -> Vec<AgentModelProviderProfile> {
     let failover_by_profile = failover
         .iter()
         .map(|entry| (entry.provider_profile_id.clone(), entry))
         .collect::<HashMap<_, _>>();
-    profiles
+    let display_order_by_profile = display_order
+        .iter()
+        .map(|entry| (entry.provider_profile_id.clone(), entry.order_index))
+        .collect::<HashMap<_, _>>();
+    let mut profiles = profiles
         .into_iter()
         .filter(|profile| profile.agent_id == agent_id)
         .map(|profile| {
             let failover_entry = failover_by_profile.get(&profile.id);
+            let display_order_index = display_order_by_profile.get(&profile.id).copied();
             AgentModelProviderProfile {
                 is_default: default_profile_id.is_some_and(|id| id == &profile.id),
                 failover_order_index: failover_entry.map(|entry| entry.order_index),
                 in_failover_queue: failover_entry.is_some_and(|entry| entry.enabled),
+                display_order_index,
                 profile,
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+    profiles.sort_by_key(|entry| {
+        (
+            entry.display_order_index.is_none(),
+            entry.display_order_index.unwrap_or(i64::MAX),
+            std::cmp::Reverse(entry.profile.updated_at_ms),
+            entry.profile.id.as_str().to_string(),
+        )
+    });
+    profiles
 }
 
 fn global_default_scope() -> ProviderProfileDefaultScope {
@@ -8540,6 +8623,110 @@ mod tests {
             .unwrap();
         assert_eq!(failover.entries.len(), 1);
         assert_eq!(failover.entries[0].provider_profile_id, claude_profile.id);
+    }
+
+    #[test]
+    fn agent_model_provider_display_order_round_trips_without_mutating_failover() {
+        let dir = tempdir().unwrap();
+        let service = ProviderConfigService::new(dir.path().join("vibex.db"));
+        let agent_id = AgentId::parse("claude").unwrap();
+        for display_name in ["Provider Alpha", "Provider Beta"] {
+            service
+                .create_agent_model_provider_profile(AgentModelProviderProfileCreateRequest {
+                    agent_id: agent_id.clone(),
+                    display_name: display_name.to_string(),
+                    account_alias: None,
+                    base_url: None,
+                    default_model: None,
+                    small_model: None,
+                    large_model: None,
+                    configured_models: Vec::new(),
+                    reasoning_effort: None,
+                    sandbox_defaults: None,
+                    network_defaults: None,
+                    permission_defaults: None,
+                    provider_options: None,
+                    secret_references: Vec::new(),
+                })
+                .unwrap();
+        }
+        let mut expected_ids = service
+            .list_agent_model_provider_profiles(AgentModelProviderProfileListRequest {
+                agent_id: agent_id.clone(),
+                include_disabled: true,
+            })
+            .unwrap()
+            .profiles
+            .into_iter()
+            .map(|entry| entry.profile.id)
+            .collect::<Vec<_>>();
+        expected_ids.reverse();
+
+        let response = service
+            .set_agent_model_provider_display_order(
+                vibex_core::AgentModelProviderDisplayOrderSetRequest {
+                    agent_id: agent_id.clone(),
+                    entries: expected_ids
+                        .iter()
+                        .cloned()
+                        .map(|provider_profile_id| {
+                            vibex_core::AgentModelProviderDisplayOrderSetEntry {
+                                provider_profile_id,
+                            }
+                        })
+                        .collect(),
+                },
+            )
+            .unwrap();
+        assert_eq!(response.entries.len(), expected_ids.len());
+        assert_eq!(
+            response
+                .entries
+                .iter()
+                .map(|entry| entry.provider_profile_id.clone())
+                .collect::<Vec<_>>(),
+            expected_ids
+        );
+        assert_eq!(
+            service
+                .list_agent_model_provider_profiles(AgentModelProviderProfileListRequest {
+                    agent_id: agent_id.clone(),
+                    include_disabled: true,
+                })
+                .unwrap()
+                .profiles
+                .into_iter()
+                .map(|entry| entry.profile.id)
+                .collect::<Vec<_>>(),
+            expected_ids
+        );
+        assert!(
+            service
+                .get_agent_model_provider_failover(AgentModelProviderFailoverListRequest {
+                    agent_id: agent_id.clone(),
+                })
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+
+        let error = service
+            .set_agent_model_provider_display_order(
+                vibex_core::AgentModelProviderDisplayOrderSetRequest {
+                    agent_id,
+                    entries: expected_ids
+                        .into_iter()
+                        .skip(1)
+                        .map(|provider_profile_id| {
+                            vibex_core::AgentModelProviderDisplayOrderSetEntry {
+                                provider_profile_id,
+                            }
+                        })
+                        .collect(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "provider_display_order_incomplete");
     }
 
     #[test]

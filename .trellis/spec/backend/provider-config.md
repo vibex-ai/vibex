@@ -35,6 +35,12 @@ the Runtime Option Catalog, runtime binding, or online dispatch. An online
 Claude/Codex profile uses the same concrete `agent_id` with `kind = acp` and a
 typed managed-Adapter configuration.
 
+The Config Center's model-provider display order is an independent Agent-scoped
+preference. It is persisted separately from the failover queue, which remains a
+runtime selection policy and must not be reused for visual ordering. Reordering
+replaces the complete current profile id list atomically; the service rejects
+duplicates, profiles belonging to another Agent, and incomplete lists.
+
 ## Assistant and Workflow Presets
 
 Assistant/Workflow Presets are not Provider Profiles. A Provider Profile answers

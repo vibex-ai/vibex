@@ -2102,6 +2102,7 @@ mod tests {
                 "40:agent_auth_catalog_snapshots",
                 "41:agent_managed_installations",
                 "42:provider_model_runtime_option_snapshots",
+                "43:agent_model_provider_display_order",
             ]
         );
         assert_eq!(

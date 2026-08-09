@@ -8,22 +8,22 @@ use serde::{Serialize, de::DeserializeOwned};
 use vibex_core::{
     AdapterDiagnostic, AgentAuthCatalog, AgentCommandConfig, AgentConfig, AgentDiscoveryRecord,
     AgentId, AgentManagedInstallState, AgentModelListResponse, AgentModelProviderDefaultSelection,
-    AgentModelProviderFailoverEntry, AgentSession, AgentSessionConfigProbe, AgentSessionSafety,
-    AgentSessionState, AutomationEdge, AutomationEdgeCreateRequest, AutomationEdgeId,
-    AutomationGraph, AutomationGraphCreateRequest, AutomationGraphId, AutomationGraphListRequest,
-    AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationNode,
-    AutomationNodeCreateRequest, AutomationNodeId, AutomationRun, AutomationRunCreateRequest,
-    AutomationRunId, AutomationRunListRequest, AutomationRunStep, AutomationRunStepCreateRequest,
-    AutomationRunStepId, AutomationRunStepListRequest, AutomationRunStepUpdateRequest,
-    AutomationRunUpdateRequest, CorrelationId, DeviceId, ElicitationRequest,
-    ElicitationRequestStatus, ElicitationResolution, ElicitationResolutionAction,
-    GitManagedWorktreeRecord, GitManagedWorktreeStatus, GitWorktreeDiagnostic,
-    GitWorktreeOperationCheckpoint, GitWorktreeOperationDetail, GitWorktreeOperationRecord,
-    GitWorktreeOperationStatus, GitWorktreeReadinessRecord, GitWorktreeReconciliationState, Hook,
-    HookCreateRequest, HookId, HookInstallPreview, HookInstallState, McpServer,
-    McpServerAgentMatrix, McpServerCreateRequest, McpServerId, McpServerProviderMatrix,
-    McpServerSecretReference, McpServerStatus, PermissionActionDetail, PermissionRequest,
-    PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
+    AgentModelProviderDisplayOrderEntry, AgentModelProviderFailoverEntry, AgentSession,
+    AgentSessionConfigProbe, AgentSessionSafety, AgentSessionState, AutomationEdge,
+    AutomationEdgeCreateRequest, AutomationEdgeId, AutomationGraph, AutomationGraphCreateRequest,
+    AutomationGraphId, AutomationGraphListRequest, AutomationGraphStatus,
+    AutomationGraphUpdateRequest, AutomationNode, AutomationNodeCreateRequest, AutomationNodeId,
+    AutomationRun, AutomationRunCreateRequest, AutomationRunId, AutomationRunListRequest,
+    AutomationRunStep, AutomationRunStepCreateRequest, AutomationRunStepId,
+    AutomationRunStepListRequest, AutomationRunStepUpdateRequest, AutomationRunUpdateRequest,
+    CorrelationId, DeviceId, ElicitationRequest, ElicitationRequestStatus, ElicitationResolution,
+    ElicitationResolutionAction, GitManagedWorktreeRecord, GitManagedWorktreeStatus,
+    GitWorktreeDiagnostic, GitWorktreeOperationCheckpoint, GitWorktreeOperationDetail,
+    GitWorktreeOperationRecord, GitWorktreeOperationStatus, GitWorktreeReadinessRecord,
+    GitWorktreeReconciliationState, Hook, HookCreateRequest, HookId, HookInstallPreview,
+    HookInstallState, McpServer, McpServerAgentMatrix, McpServerCreateRequest, McpServerId,
+    McpServerProviderMatrix, McpServerSecretReference, McpServerStatus, PermissionActionDetail,
+    PermissionRequest, PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
     PermissionResponseOption, ProjectId, ProjectRecord, Prompt, PromptCreateRequest, PromptId,
     PromptStatus, ProviderCapabilityProbeResult, ProviderHealthProbeResult,
     ProviderInjectionPreview, ProviderInjectionPreviewRequest, ProviderKind,
@@ -73,7 +73,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 42;
+pub const CURRENT_SCHEMA_VERSION: i64 = 43;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -1708,6 +1708,23 @@ const MIGRATIONS: &[Migration] = &[
                 ON provider_model_runtime_option_snapshots(agent_id, last_attempt_at_ms);
         ",
     },
+    Migration {
+        version: 43,
+        name: "agent_model_provider_display_order",
+        sql: "
+            CREATE TABLE IF NOT EXISTS agent_model_provider_display_order (
+                agent_id TEXT NOT NULL,
+                provider_profile_id TEXT NOT NULL
+                    REFERENCES provider_profiles(provider_profile_id) ON DELETE CASCADE,
+                order_index INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY(agent_id, provider_profile_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_model_provider_display_order
+                ON agent_model_provider_display_order(agent_id, order_index, provider_profile_id);
+        ",
+    },
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -1728,6 +1745,7 @@ pub struct ProviderSecretReferenceRepository;
 pub struct ProviderDefaultProfileRepository;
 pub struct AgentDefaultModelProviderProfileRepository;
 pub struct AgentModelProviderFailoverRepository;
+pub struct AgentModelProviderDisplayOrderRepository;
 pub struct ProviderInjectionPreviewRepository;
 pub struct ProviderNativeExportRepository;
 pub struct ProviderCapabilityRepository;
@@ -3174,6 +3192,11 @@ impl ProviderProfileRepository {
                 "failed to clear failover entries for deleted profile",
             ),
             (
+                "agent_model_provider_display_order",
+                "provider_profile_display_order_cleanup_failed",
+                "failed to clear display order entries for deleted profile",
+            ),
+            (
                 "provider_runtime_option_snapshots",
                 "provider_profile_runtime_option_snapshot_cleanup_failed",
                 "failed to clear runtime option snapshot for deleted profile",
@@ -3597,6 +3620,90 @@ impl AgentModelProviderFailoverRepository {
         tx.commit().map_err(storage_err(
             "agent_model_provider_failover_commit_failed",
             "failed to commit agent model provider failover transaction",
+        ))?;
+        Self::list(conn, agent_id)
+    }
+}
+
+impl AgentModelProviderDisplayOrderRepository {
+    pub fn list(
+        conn: &Connection,
+        agent_id: &AgentId,
+    ) -> VibexResult<Vec<AgentModelProviderDisplayOrderEntry>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT agent_id, provider_profile_id, order_index, updated_at_ms
+                FROM agent_model_provider_display_order
+                WHERE agent_id = ?1
+                ORDER BY order_index ASC, provider_profile_id ASC
+                ",
+            )
+            .map_err(storage_err(
+                "agent_model_provider_display_order_list_failed",
+                "failed to list agent model provider display order",
+            ))?;
+        let rows = stmt
+            .query_map(params![agent_id.as_str()], |row| {
+                Ok(AgentModelProviderDisplayOrderEntry {
+                    agent_id: parse_id_sql(row.get(0)?, AgentId::parse)?,
+                    provider_profile_id: parse_id_sql(row.get(1)?, ProviderProfileId::parse)?,
+                    order_index: row.get(2)?,
+                    updated_at_ms: row.get(3)?,
+                })
+            })
+            .map_err(storage_err(
+                "agent_model_provider_display_order_list_failed",
+                "failed to list agent model provider display order",
+            ))?;
+        collect_rows(
+            rows,
+            "agent_model_provider_display_order_decode_failed",
+            "failed to decode agent model provider display order",
+        )
+    }
+
+    pub fn replace(
+        conn: &mut Connection,
+        agent_id: &AgentId,
+        entries: &[AgentModelProviderDisplayOrderEntry],
+    ) -> VibexResult<Vec<AgentModelProviderDisplayOrderEntry>> {
+        let tx = conn.transaction().map_err(storage_err(
+            "agent_model_provider_display_order_transaction_failed",
+            "failed to start agent model provider display order transaction",
+        ))?;
+        tx.execute(
+            "DELETE FROM agent_model_provider_display_order WHERE agent_id = ?1",
+            params![agent_id.as_str()],
+        )
+        .map_err(storage_err(
+            "agent_model_provider_display_order_clear_failed",
+            "failed to clear agent model provider display order",
+        ))?;
+        let now = unix_timestamp_ms();
+        for entry in entries {
+            tx.execute(
+                "
+                INSERT INTO agent_model_provider_display_order (
+                    agent_id, provider_profile_id, order_index, created_at_ms, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?4)
+                ",
+                params![
+                    agent_id.as_str(),
+                    entry.provider_profile_id.as_str(),
+                    entry.order_index,
+                    now
+                ],
+            )
+            .map_err(storage_err(
+                "agent_model_provider_display_order_insert_failed",
+                "failed to insert agent model provider display order",
+            ))?;
+        }
+        tx.commit().map_err(storage_err(
+            "agent_model_provider_display_order_commit_failed",
+            "failed to commit agent model provider display order",
         ))?;
         Self::list(conn, agent_id)
     }
@@ -12000,7 +12107,8 @@ mod tests {
                 "39:agent_runtime_option_snapshots",
                 "40:agent_auth_catalog_snapshots",
                 "41:agent_managed_installations",
-                "42:provider_model_runtime_option_snapshots"
+                "42:provider_model_runtime_option_snapshots",
+                "43:agent_model_provider_display_order"
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -12145,7 +12253,8 @@ mod tests {
                 "39:agent_runtime_option_snapshots",
                 "40:agent_auth_catalog_snapshots",
                 "41:agent_managed_installations",
-                "42:provider_model_runtime_option_snapshots"
+                "42:provider_model_runtime_option_snapshots",
+                "43:agent_model_provider_display_order"
             ]
         );
         assert_eq!(
@@ -12180,6 +12289,22 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "v31 must create usage index {index}");
         }
+        let display_order_table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'agent_model_provider_display_order'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(display_order_table, 1);
+        let display_order_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_agent_model_provider_display_order'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(display_order_index, 1);
         for table in [
             "agent_sessions",
             "session_runtime_bindings",
@@ -13696,7 +13821,8 @@ mod tests {
                 "39:agent_runtime_option_snapshots",
                 "40:agent_auth_catalog_snapshots",
                 "41:agent_managed_installations",
-                "42:provider_model_runtime_option_snapshots"
+                "42:provider_model_runtime_option_snapshots",
+                "43:agent_model_provider_display_order"
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
@@ -14162,6 +14288,20 @@ mod tests {
         assert_eq!(queue[0].provider_profile_id, profile.id);
         assert!(queue[0].enabled);
 
+        let display_order = AgentModelProviderDisplayOrderRepository::replace(
+            &mut conn,
+            &agent_id,
+            &[AgentModelProviderDisplayOrderEntry {
+                agent_id: agent_id.clone(),
+                provider_profile_id: profile.id.clone(),
+                order_index: 0,
+                updated_at_ms: unix_timestamp_ms(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(display_order.len(), 1);
+        assert_eq!(display_order[0].provider_profile_id, profile.id);
+
         ProviderDefaultProfileRepository::set(
             &conn,
             ProviderProfileSetDefaultRequest {
@@ -14190,10 +14330,16 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        assert!(
+            AgentModelProviderDisplayOrderRepository::list(&conn, &agent_id)
+                .unwrap()
+                .is_empty()
+        );
         for table in [
             "provider_default_profiles",
             "agent_default_model_provider_profiles",
             "agent_model_provider_failover",
+            "agent_model_provider_display_order",
         ] {
             let count: i64 = conn
                 .query_row(
