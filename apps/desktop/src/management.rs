@@ -489,6 +489,7 @@ pub struct ManagementCenter {
     profile_note: Entity<InputState>,
     profile_website_url: Entity<InputState>,
     profile_base_url: Entity<InputState>,
+    profile_protocol_base_urls: Vec<(vibex_core::ProviderModelWireApi, Entity<InputState>)>,
     profile_model_draft: Entity<InputState>,
     profile_model_edit_id: Entity<InputState>,
     profile_model_edit_name: Entity<InputState>,
@@ -871,6 +872,7 @@ impl ManagementCenter {
             profile_note,
             profile_website_url,
             profile_base_url,
+            profile_protocol_base_urls: Vec::new(),
             profile_model_draft,
             profile_model_edit_id,
             profile_model_edit_name,
@@ -2173,6 +2175,7 @@ impl ManagementCenter {
         self.profile_model_edit_index = None;
         self.profile_model_edit_wire_api = None;
         self.profile_provider_options = vibex_core::ProviderOptions::empty();
+        self.rebuild_profile_protocol_base_urls(window, cx);
         self.profile_editor_open = true;
         self.error = None;
         self.navigation.mark_dirty(ManagementSection::Agents, false);
@@ -2237,6 +2240,7 @@ impl ManagementCenter {
         self.profile_provider_options = full_profile
             .map(|profile| profile.provider_options)
             .unwrap_or_else(vibex_core::ProviderOptions::empty);
+        self.rebuild_profile_protocol_base_urls(window, cx);
         self.editing_profile_id = Some(profile.id.clone());
         self.projection_editor.draft_revision = 0;
         self.profile_secret_touched = false;
@@ -2269,8 +2273,31 @@ impl ManagementCenter {
         self.profile_model_edit_index = None;
         self.profile_model_edit_wire_api = None;
         self.profile_provider_options = vibex_core::ProviderOptions::empty();
+        self.profile_protocol_base_urls.clear();
         self.navigation.mark_dirty(ManagementSection::Agents, false);
         cx.notify();
+    }
+
+    fn rebuild_profile_protocol_base_urls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.profile_protocol_base_urls.clear();
+        for wire_api in self.projection_editor.supported_wire_apis() {
+            let option_key = wire_api.protocol_base_url_option_key();
+            let value = provider_option_value(&self.profile_provider_options, &option_key)
+                .unwrap_or_default()
+                .to_string();
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value(value)
+                    .placeholder("https://provider.example")
+            });
+            self._subscriptions
+                .push(cx.subscribe(&input, |this, _, _: &InputEvent, cx| {
+                    this.projection_editor.mark_draft_changed();
+                    this.navigation.mark_dirty(ManagementSection::Agents, true);
+                    cx.notify();
+                }));
+            self.profile_protocol_base_urls.push((wire_api, input));
+        }
     }
 
     fn present_profile_editor_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2530,11 +2557,19 @@ impl ManagementCenter {
             .iter()
             .find(|model| model.enabled)
             .map(|model| model.id.clone());
-        let provider_options = with_provider_option(
+        let mut provider_options = with_provider_option(
             self.profile_provider_options.clone(),
             PROVIDER_OPTION_WEBSITE_URL,
             (!website_url.is_empty()).then_some(website_url),
         );
+        for (wire_api, input) in &self.profile_protocol_base_urls {
+            let value = input.read(cx).value().trim().to_string();
+            provider_options = with_provider_option(
+                provider_options,
+                &wire_api.protocol_base_url_option_key(),
+                (!value.is_empty()).then_some(value),
+            );
+        }
         let editing_profile_id = match self
             .editing_profile_id
             .as_deref()
@@ -6334,7 +6369,11 @@ impl ManagementCenter {
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
                                     .child(match model.wire_api {
-                                        Some(wire_api) => format!("{} · {wire_api:?}", model.id),
+                                        Some(wire_api) => format!(
+                                            "{} · {}",
+                                            model.id,
+                                            provider_wire_api_label(wire_api)
+                                        ),
                                         None => format!(
                                             "{} · {}",
                                             model.id,
@@ -6403,8 +6442,17 @@ impl ManagementCenter {
                     .collect::<Vec<_>>();
                 for candidate in candidates {
                     let label = candidate.map_or_else(
-                        || management_locale_text("Inherit", "继承", "繼承"),
-                        provider_wire_api_label,
+                        || management_locale_text("Inherit", "继承", "繼承").to_string(),
+                        |wire_api| {
+                            let support = self
+                                .projection_editor
+                                .wire_api_integration_kind(wire_api)
+                                .map(provider_interface_integration_label)
+                                .unwrap_or_else(|| {
+                                    management_locale_text("Unsupported", "不支持", "不支援")
+                                });
+                            format!("{} · {support}", provider_wire_api_label(wire_api))
+                        },
                     );
                     wire_controls = wire_controls.child(
                         Button::new(SharedString::from(format!(
@@ -6738,6 +6786,18 @@ impl ManagementCenter {
         let credential_control = self.render_projection_credential_control(cx);
         let model_section =
             shows_model.then(|| self.render_profile_model_section(selected_agent_id, cx));
+        let protocol_endpoints = shows_endpoint.then(|| {
+            let mut section = v_flex().w_full().gap_2();
+            for (wire_api, input) in &self.profile_protocol_base_urls {
+                section = section.child(management_input_field(
+                    provider_protocol_url_override_label(*wire_api),
+                    input,
+                    false,
+                    cx,
+                ));
+            }
+            section.into_any_element()
+        });
         let mut form = v_flex()
             .w_full()
             .gap_3()
@@ -6772,12 +6832,17 @@ impl ManagementCenter {
             .child(credential_control)
             .when(shows_endpoint, |form| {
                 form.child(management_input_field(
-                    management_locale_text("API request URL", "API 请求地址", "API 請求位址"),
+                    management_locale_text(
+                        "Default API request URL",
+                        "默认 API 请求地址",
+                        "預設 API 請求位址",
+                    ),
                     &self.profile_base_url,
                     false,
                     cx,
                 ))
             })
+            .when_some(protocol_endpoints, |form, endpoints| form.child(endpoints))
             .when_some(model_section, |form, section| form.child(section));
         if shows_api_key && self.profile_secret_loading {
             form = form.child(status_line(
@@ -12606,6 +12671,30 @@ fn provider_wire_api_label(wire_api: vibex_core::ProviderModelWireApi) -> &'stat
         vibex_core::ProviderModelWireApi::OpenaiResponses => "OpenAI Responses",
         vibex_core::ProviderModelWireApi::OpenaiChatCompletions => "Chat Completions",
         vibex_core::ProviderModelWireApi::AnthropicMessages => "Anthropic Messages",
+        vibex_core::ProviderModelWireApi::GoogleGenerativeAi => "Google Generative AI",
+        vibex_core::ProviderModelWireApi::AwsBedrockConverse => "AWS Bedrock Converse",
+    }
+}
+
+fn provider_interface_integration_label(
+    kind: vibex_core::AgentModelInterfaceIntegrationKind,
+) -> &'static str {
+    match kind {
+        vibex_core::AgentModelInterfaceIntegrationKind::Direct => {
+            management_locale_text("Direct", "直接支持", "直接支援")
+        }
+        vibex_core::AgentModelInterfaceIntegrationKind::Bridged => {
+            management_locale_text("Bridged", "协议桥接", "協定橋接")
+        }
+    }
+}
+
+fn provider_protocol_url_override_label(wire_api: vibex_core::ProviderModelWireApi) -> String {
+    let protocol = provider_wire_api_label(wire_api);
+    match locale::current_locale() {
+        ResolvedLocale::En => format!("{protocol} URL override"),
+        ResolvedLocale::ZhCn => format!("{protocol} URL 覆盖"),
+        ResolvedLocale::ZhTw => format!("{protocol} URL 覆寫"),
     }
 }
 
@@ -12693,7 +12782,7 @@ fn management_search_input(
 }
 
 fn management_input_field(
-    label: &'static str,
+    label: impl Into<SharedString>,
     state: &Entity<InputState>,
     masked: bool,
     cx: &mut Context<ManagementCenter>,
@@ -12707,7 +12796,7 @@ fn management_input_field(
                 .text_xs()
                 .font_medium()
                 .text_color(cx.theme().muted_foreground)
-                .child(label),
+                .child(label.into()),
         )
         .child(if masked { input.mask_toggle() } else { input })
         .into_any_element()

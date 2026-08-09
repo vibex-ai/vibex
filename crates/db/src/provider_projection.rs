@@ -1034,18 +1034,7 @@ fn map_legacy_projection_records(
         vendor_hint: provider_option(legacy, "codexModelProviderId")
             .or_else(|| legacy.account_alias.clone())
             .or_else(|| Some(legacy.kind.to_string())),
-        endpoints: legacy
-            .base_url
-            .as_deref()
-            .filter(|url| !url.trim().is_empty())
-            .map(|url| {
-                vec![ModelProviderEndpoint {
-                    id: "api".to_string(),
-                    kind: ModelProviderEndpointKind::Api,
-                    url: url.trim().to_string(),
-                }]
-            })
-            .unwrap_or_default(),
+        endpoints: legacy_model_provider_endpoints(legacy),
         proxy_policy: ModelProviderProxyPolicy::InheritSystem,
         headers: legacy_headers(legacy, &credentials),
         credentials,
@@ -1146,10 +1135,15 @@ fn map_legacy_projection_records(
         projection_overrides: AgentProviderProjectionOverrides::default(),
         configured_models,
         projection_fingerprint: None,
-        status: if resolution.match_kind == ProjectionDescriptorMatch::Conservative {
-            AgentModelProviderBindingStatus::Unverified
-        } else {
-            AgentModelProviderBindingStatus::Ready
+        status: match (resolution.match_kind, resolution.descriptor.evidence.state) {
+            (ProjectionDescriptorMatch::Conservative, _) => {
+                AgentModelProviderBindingStatus::Unverified
+            }
+            (_, ProjectionEvidenceState::Verified) => AgentModelProviderBindingStatus::Ready,
+            (_, ProjectionEvidenceState::Unsupported) => {
+                AgentModelProviderBindingStatus::Unsupported
+            }
+            _ => AgentModelProviderBindingStatus::Unverified,
         },
         verification,
         revision: 1,
@@ -1543,6 +1537,36 @@ fn legacy_model_catalog(profile: &ProviderProfile) -> Vec<ModelProviderCatalogEn
         .collect()
 }
 
+fn legacy_model_provider_endpoints(profile: &ProviderProfile) -> Vec<ModelProviderEndpoint> {
+    let mut endpoints = Vec::new();
+    if let Some(url) = profile
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    {
+        endpoints.push(ModelProviderEndpoint {
+            id: "api".to_string(),
+            kind: ModelProviderEndpointKind::Api,
+            url: url.to_string(),
+            wire_protocol_id: None,
+        });
+    }
+    for wire_api in ProviderModelWireApi::ALL {
+        let option_key = wire_api.protocol_base_url_option_key();
+        let Some(url) = provider_option(profile, &option_key) else {
+            continue;
+        };
+        endpoints.push(ModelProviderEndpoint {
+            id: format!("api-{}", wire_api.wire_protocol_id().replace('_', "-")),
+            kind: ModelProviderEndpointKind::Api,
+            url,
+            wire_protocol_id: Some(wire_api.wire_protocol_id().to_string()),
+        });
+    }
+    endpoints
+}
+
 fn legacy_configured_model_bindings(
     profile: &ProviderProfile,
     binding_id: &AgentModelProviderBindingId,
@@ -1679,6 +1703,12 @@ fn legacy_wire_protocol(
         Some(ProviderModelWireApi::OpenaiResponses) => WIRE_PROTOCOL_OPENAI_RESPONSES,
         Some(ProviderModelWireApi::OpenaiChatCompletions) => WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
         Some(ProviderModelWireApi::AnthropicMessages) => WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
+        Some(ProviderModelWireApi::GoogleGenerativeAi) => {
+            vibex_core::WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI
+        }
+        Some(ProviderModelWireApi::AwsBedrockConverse) => {
+            vibex_core::WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE
+        }
         None if profile.agent_id.as_str() == "claude" => WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
         None if profile.agent_id.as_str() == "opencode" => {
             let value = provider_option(profile, "wireApi")
@@ -1857,8 +1887,8 @@ mod tests {
         current_schema_version,
     };
     use vibex_core::{
-        ModelProviderEndpoint, ProviderConfiguredModel, ProviderKind, ProviderModelWireApi,
-        ProviderSecretBackend, ProviderSecretReference, RequestId,
+        ModelProviderEndpoint, ProviderBindingMetadata, ProviderConfiguredModel, ProviderKind,
+        ProviderModelWireApi, ProviderSecretBackend, ProviderSecretReference, RequestId,
     };
 
     fn schema_through(conn: &mut Connection, version: i64) {
@@ -2134,6 +2164,63 @@ mod tests {
     }
 
     #[test]
+    fn legacy_profile_projects_default_and_protocol_specific_endpoints() {
+        let mut profile = ProviderProfile::local_default(ProviderKind::Acp);
+        profile.base_url = Some("https://default.example.invalid/v1".to_string());
+        profile.provider_options.entries.extend([
+            ProviderBindingMetadata {
+                key: ProviderModelWireApi::GoogleGenerativeAi.protocol_base_url_option_key(),
+                value: "https://google.example.invalid/v1beta".to_string(),
+            },
+            ProviderBindingMetadata {
+                key: ProviderModelWireApi::AwsBedrockConverse.protocol_base_url_option_key(),
+                value: "https://bedrock.example.invalid".to_string(),
+            },
+        ]);
+
+        let endpoints = legacy_model_provider_endpoints(&profile);
+        assert_eq!(endpoints.len(), 3);
+        assert_eq!(endpoints[0].id, "api");
+        assert_eq!(endpoints[0].wire_protocol_id, None);
+        assert_eq!(
+            endpoints[1].wire_protocol_id.as_deref(),
+            Some(vibex_core::WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI)
+        );
+        assert_eq!(endpoints[1].url, "https://google.example.invalid/v1beta");
+        assert_eq!(
+            endpoints[2].wire_protocol_id.as_deref(),
+            Some(vibex_core::WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE)
+        );
+        assert_eq!(endpoints[2].url, "https://bedrock.example.invalid");
+    }
+
+    #[test]
+    fn documented_legacy_projection_never_initializes_as_ready() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let mut profile = ProviderProfile::local_default(ProviderKind::Acp);
+        profile.id = ProviderProfileId::new();
+        profile.agent_id = AgentId::parse("gemini").unwrap();
+        profile.default_model = Some("gemini-test".to_string());
+        profile.configured_models = vec![ProviderConfiguredModel {
+            id: "gemini-test".to_string(),
+            display_name: None,
+            enabled: true,
+            wire_api: Some(ProviderModelWireApi::GoogleGenerativeAi),
+        }];
+
+        let records = map_legacy_projection_records(&conn, &profile).unwrap();
+        assert_eq!(
+            records.binding.verification.state,
+            ProjectionEvidenceState::Documented
+        );
+        assert_eq!(
+            records.binding.status,
+            AgentModelProviderBindingStatus::Unverified
+        );
+    }
+
+    #[test]
     fn legacy_repository_reads_are_safe_inside_a_transaction() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
@@ -2165,6 +2252,7 @@ mod tests {
                 id: "api".to_string(),
                 kind: ModelProviderEndpointKind::Api,
                 url: "https://gateway.example.invalid/v1".to_string(),
+                wire_protocol_id: None,
             }],
             proxy_policy: ModelProviderProxyPolicy::InheritSystem,
             credentials: Vec::new(),

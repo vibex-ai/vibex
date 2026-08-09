@@ -330,38 +330,44 @@ impl AgentProviderBindingEditorState {
             .model_interfaces
             .iter()
             .filter(|interface| interface.user_selectable)
-            .filter_map(|interface| match interface.wire_protocol_id.as_str() {
-                vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES => {
-                    Some(vibex_core::ProviderModelWireApi::OpenaiResponses)
-                }
-                vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS => {
-                    Some(vibex_core::ProviderModelWireApi::OpenaiChatCompletions)
-                }
-                vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => {
-                    Some(vibex_core::ProviderModelWireApi::AnthropicMessages)
-                }
-                _ => None,
+            .filter_map(|interface| {
+                vibex_core::ProviderModelWireApi::from_wire_protocol_id(&interface.wire_protocol_id)
+            })
+            .collect()
+    }
+
+    pub fn supported_wire_apis(&self) -> Vec<vibex_core::ProviderModelWireApi> {
+        let Some(capability) = self.capability.as_ref() else {
+            return Vec::new();
+        };
+        capability
+            .model_interfaces
+            .iter()
+            .filter_map(|interface| {
+                vibex_core::ProviderModelWireApi::from_wire_protocol_id(&interface.wire_protocol_id)
             })
             .collect()
     }
 
     pub fn accepts_wire_api(&self, wire_api: vibex_core::ProviderModelWireApi) -> bool {
         self.capability.as_ref().is_some_and(|capability| {
-            let protocol = match wire_api {
-                vibex_core::ProviderModelWireApi::OpenaiResponses => {
-                    vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES
-                }
-                vibex_core::ProviderModelWireApi::OpenaiChatCompletions => {
-                    vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS
-                }
-                vibex_core::ProviderModelWireApi::AnthropicMessages => {
-                    vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES
-                }
-            };
             capability
                 .model_interfaces
                 .iter()
-                .any(|interface| interface.wire_protocol_id == protocol)
+                .any(|interface| interface.wire_protocol_id == wire_api.wire_protocol_id())
+        })
+    }
+
+    pub fn wire_api_integration_kind(
+        &self,
+        wire_api: vibex_core::ProviderModelWireApi,
+    ) -> Option<vibex_core::AgentModelInterfaceIntegrationKind> {
+        self.capability.as_ref().and_then(|capability| {
+            capability
+                .model_interfaces
+                .iter()
+                .find(|interface| interface.wire_protocol_id == wire_api.wire_protocol_id())
+                .map(|interface| interface.integration_kind)
         })
     }
 }
@@ -1655,6 +1661,7 @@ mod tests {
                 wire_protocol_id: vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES.to_string(),
                 sdk_adapter_id: None,
                 transport: "https".to_string(),
+                integration_kind: vibex_core::AgentModelInterfaceIntegrationKind::Direct,
                 user_selectable: false,
                 process_scoped: false,
             }],
@@ -1665,6 +1672,46 @@ mod tests {
         assert!(editor.accepts_wire_api(vibex_core::ProviderModelWireApi::OpenaiResponses));
         assert!(!editor.accepts_wire_api(vibex_core::ProviderModelWireApi::OpenaiChatCompletions));
         assert!(editor.wire_api_choices().is_empty());
+    }
+
+    #[test]
+    fn binding_editor_exposes_google_and_bedrock_direct_interfaces() {
+        let capability = projection_capability(
+            vec![vibex_core::AgentProjectionFormControl::WireProtocol],
+            vec![
+                vibex_core::AgentModelInterfaceDescriptor {
+                    wire_protocol_id: vibex_core::WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI.to_string(),
+                    sdk_adapter_id: Some("@ai-sdk/google".to_string()),
+                    transport: "https".to_string(),
+                    integration_kind: vibex_core::AgentModelInterfaceIntegrationKind::Direct,
+                    user_selectable: true,
+                    process_scoped: true,
+                },
+                vibex_core::AgentModelInterfaceDescriptor {
+                    wire_protocol_id: vibex_core::WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE.to_string(),
+                    sdk_adapter_id: Some("@ai-sdk/amazon-bedrock".to_string()),
+                    transport: "https".to_string(),
+                    integration_kind: vibex_core::AgentModelInterfaceIntegrationKind::Direct,
+                    user_selectable: true,
+                    process_scoped: true,
+                },
+            ],
+        );
+        let mut editor = AgentProviderBindingEditorState::default();
+        editor.replace_capability(capability);
+
+        assert_eq!(
+            editor.wire_api_choices(),
+            vec![
+                vibex_core::ProviderModelWireApi::GoogleGenerativeAi,
+                vibex_core::ProviderModelWireApi::AwsBedrockConverse,
+            ]
+        );
+        assert_eq!(editor.supported_wire_apis(), editor.wire_api_choices());
+        assert_eq!(
+            editor.wire_api_integration_kind(vibex_core::ProviderModelWireApi::GoogleGenerativeAi),
+            Some(vibex_core::AgentModelInterfaceIntegrationKind::Direct)
+        );
     }
 
     #[test]

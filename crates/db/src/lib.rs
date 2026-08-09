@@ -14044,8 +14044,8 @@ mod tests {
 
         let mut unsupported = ProviderProfile::local_default(ProviderKind::Acp);
         unsupported.id = ProviderProfileId::new();
-        unsupported.agent_id = AgentId::parse("gemini").unwrap();
-        unsupported.display_name = "Gemini internal profile".to_string();
+        unsupported.agent_id = AgentId::parse("cline").unwrap();
+        unsupported.display_name = "Cline internal profile".to_string();
         unsupported.status = ProviderProfileStatus::Enabled;
         ProviderProfileRepository::insert(&conn, &unsupported).unwrap();
 

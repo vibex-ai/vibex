@@ -24,6 +24,8 @@ pub const PROVIDER_PROJECTION_SCHEMA_VERSION: u32 = 1;
 pub const WIRE_PROTOCOL_OPENAI_RESPONSES: &str = "openai_responses";
 pub const WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS: &str = "openai_chat_completions";
 pub const WIRE_PROTOCOL_ANTHROPIC_MESSAGES: &str = "anthropic_messages";
+pub const WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI: &str = "google_generative_ai";
+pub const WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE: &str = "aws_bedrock_converse";
 
 pub const CLAUDE_PROJECTION_DESCRIPTOR_ID: &str = "projection_claude_environment_v1";
 pub const CODEX_PROJECTION_DESCRIPTOR_ID: &str = "projection_codex_stable_home_v1";
@@ -74,6 +76,10 @@ pub struct ModelProviderEndpoint {
     pub id: String,
     pub kind: ModelProviderEndpointKind,
     pub url: String,
+    /// `None` is a provider-wide fallback. A protocol-specific endpoint wins
+    /// when the selected Agent model binding uses the same wire protocol.
+    #[serde(default)]
+    pub wire_protocol_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,6 +280,23 @@ impl ModelProviderProfile {
             "model_provider_endpoint_invalid",
             "model provider endpoint ids must be non-empty and unique",
         )?;
+        for endpoint in &self.endpoints {
+            if endpoint
+                .wire_protocol_id
+                .as_deref()
+                .is_some_and(|protocol| !is_model_provider_wire_protocol(protocol))
+            {
+                return Err(VibexError::validation(
+                    "model_provider_endpoint_protocol_invalid",
+                    "model provider endpoint references an unsupported wire protocol",
+                )
+                .with_diagnostic("endpointId", endpoint.id.as_str())
+                .with_diagnostic(
+                    "wireProtocolId",
+                    endpoint.wire_protocol_id.as_deref().unwrap_or_default(),
+                ));
+            }
+        }
         unique_non_empty(
             self.configured_models.iter().map(|model| model.id.as_str()),
             "model_provider_model_invalid",
@@ -305,6 +328,35 @@ impl ModelProviderProfile {
             .iter()
             .find(|endpoint| endpoint.kind == ModelProviderEndpointKind::Api)
     }
+
+    pub fn primary_api_endpoint_for_protocol(
+        &self,
+        wire_protocol_id: &str,
+    ) -> Option<&ModelProviderEndpoint> {
+        self.endpoints
+            .iter()
+            .find(|endpoint| {
+                endpoint.kind == ModelProviderEndpointKind::Api
+                    && endpoint.wire_protocol_id.as_deref() == Some(wire_protocol_id)
+            })
+            .or_else(|| {
+                self.endpoints.iter().find(|endpoint| {
+                    endpoint.kind == ModelProviderEndpointKind::Api
+                        && endpoint.wire_protocol_id.is_none()
+                })
+            })
+    }
+}
+
+pub fn is_model_provider_wire_protocol(value: &str) -> bool {
+    matches!(
+        value.trim(),
+        WIRE_PROTOCOL_OPENAI_RESPONSES
+            | WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS
+            | WIRE_PROTOCOL_ANTHROPIC_MESSAGES
+            | WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI
+            | WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -700,9 +752,19 @@ pub struct AgentModelInterfaceDescriptor {
     pub wire_protocol_id: String,
     pub sdk_adapter_id: Option<String>,
     pub transport: String,
+    #[serde(default)]
+    pub integration_kind: AgentModelInterfaceIntegrationKind,
     pub user_selectable: bool,
     #[serde(default)]
     pub process_scoped: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentModelInterfaceIntegrationKind {
+    #[default]
+    Direct,
+    Bridged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1435,6 +1497,7 @@ fn claude_projection_descriptor() -> VibexResult<AgentProviderProjectionDescript
             wire_protocol_id: WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string(),
             sdk_adapter_id: None,
             transport: "https".to_string(),
+            integration_kind: AgentModelInterfaceIntegrationKind::Direct,
             user_selectable: false,
             process_scoped: false,
         }],
@@ -1478,6 +1541,7 @@ fn codex_projection_descriptor() -> VibexResult<AgentProviderProjectionDescripto
             wire_protocol_id: WIRE_PROTOCOL_OPENAI_RESPONSES.to_string(),
             sdk_adapter_id: None,
             transport: "https".to_string(),
+            integration_kind: AgentModelInterfaceIntegrationKind::Direct,
             user_selectable: false,
             process_scoped: false,
         }],
@@ -1518,6 +1582,8 @@ fn opencode_projection_descriptor() -> VibexResult<AgentProviderProjectionDescri
                 "@ai-sdk/openai-compatible",
             ),
             interface(WIRE_PROTOCOL_ANTHROPIC_MESSAGES, "@ai-sdk/anthropic"),
+            interface(WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI, "@ai-sdk/google"),
+            interface(WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE, "@ai-sdk/amazon-bedrock"),
         ],
         runtime_home_strategy: AgentRuntimeHomeStrategy::VibexPrivate,
         switch_behavior: ProviderSwitchBehavior::RestartAndResume,
@@ -1533,6 +1599,7 @@ fn interface(wire_protocol_id: &str, sdk_adapter_id: &str) -> AgentModelInterfac
         wire_protocol_id: wire_protocol_id.to_string(),
         sdk_adapter_id: Some(sdk_adapter_id.to_string()),
         transport: "https".to_string(),
+        integration_kind: AgentModelInterfaceIntegrationKind::Direct,
         user_selectable: true,
         process_scoped: true,
     }
@@ -1746,6 +1813,110 @@ mod tests {
         let encoded = serde_json::to_string(&model).unwrap();
         assert!(!encoded.contains("wire"));
         assert!(!encoded.contains("sdk"));
+    }
+
+    #[test]
+    fn model_provider_endpoints_select_protocol_specific_urls_and_validate_ids() {
+        let mut profile = ModelProviderProfile {
+            id: ModelProviderProfileId::new(),
+            legacy_provider_profile_id: None,
+            display_name: "Shared gateway".to_string(),
+            vendor_hint: None,
+            endpoints: vec![
+                ModelProviderEndpoint {
+                    id: "fallback".to_string(),
+                    kind: ModelProviderEndpointKind::Api,
+                    url: "https://fallback.example.invalid/v1".to_string(),
+                    wire_protocol_id: None,
+                },
+                ModelProviderEndpoint {
+                    id: "google".to_string(),
+                    kind: ModelProviderEndpointKind::Api,
+                    url: "https://google.example.invalid/v1beta".to_string(),
+                    wire_protocol_id: Some(WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI.to_string()),
+                },
+            ],
+            proxy_policy: ModelProviderProxyPolicy::InheritSystem,
+            credentials: Vec::new(),
+            configured_models: Vec::new(),
+            default_model_id: None,
+            headers: Vec::new(),
+            status: ModelProviderProfileStatus::Enabled,
+            revision: 1,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            deleted_at_ms: None,
+        };
+
+        profile.validate().unwrap();
+        assert_eq!(
+            profile
+                .primary_api_endpoint_for_protocol(WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI)
+                .map(|endpoint| endpoint.id.as_str()),
+            Some("google")
+        );
+        assert_eq!(
+            profile
+                .primary_api_endpoint_for_protocol(WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE)
+                .map(|endpoint| endpoint.id.as_str()),
+            Some("fallback")
+        );
+
+        profile.endpoints[1].wire_protocol_id = Some("unsupported_protocol".to_string());
+        assert_eq!(
+            profile.validate().unwrap_err().code,
+            "model_provider_endpoint_protocol_invalid"
+        );
+    }
+
+    #[test]
+    fn builtin_opencode_descriptor_exposes_all_five_direct_protocols() {
+        let descriptor = AgentProviderProjectionRegistry::builtin()
+            .unwrap()
+            .resolve(&builtin_identity("opencode"))
+            .unwrap()
+            .descriptor;
+        let interfaces = descriptor
+            .model_interfaces
+            .iter()
+            .map(|interface| {
+                (
+                    interface.wire_protocol_id.as_str(),
+                    interface.sdk_adapter_id.as_deref(),
+                    interface.integration_kind,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            interfaces,
+            vec![
+                (
+                    WIRE_PROTOCOL_OPENAI_RESPONSES,
+                    Some("@ai-sdk/openai"),
+                    AgentModelInterfaceIntegrationKind::Direct,
+                ),
+                (
+                    WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+                    Some("@ai-sdk/openai-compatible"),
+                    AgentModelInterfaceIntegrationKind::Direct,
+                ),
+                (
+                    WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
+                    Some("@ai-sdk/anthropic"),
+                    AgentModelInterfaceIntegrationKind::Direct,
+                ),
+                (
+                    WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI,
+                    Some("@ai-sdk/google"),
+                    AgentModelInterfaceIntegrationKind::Direct,
+                ),
+                (
+                    WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE,
+                    Some("@ai-sdk/amazon-bedrock"),
+                    AgentModelInterfaceIntegrationKind::Direct,
+                ),
+            ]
+        );
     }
 
     #[test]

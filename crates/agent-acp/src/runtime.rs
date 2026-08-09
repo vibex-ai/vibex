@@ -211,12 +211,16 @@ enum OpenCodeWireApi {
     OpenaiResponses,
     OpenaiChatCompletions,
     AnthropicMessages,
+    GoogleGenerativeAi,
+    AwsBedrockConverse,
 }
 
-const OPENCODE_WIRE_APIS: [OpenCodeWireApi; 3] = [
+const OPENCODE_WIRE_APIS: [OpenCodeWireApi; 5] = [
     OpenCodeWireApi::OpenaiResponses,
     OpenCodeWireApi::OpenaiChatCompletions,
     OpenCodeWireApi::AnthropicMessages,
+    OpenCodeWireApi::GoogleGenerativeAi,
+    OpenCodeWireApi::AwsBedrockConverse,
 ];
 
 /// Environment variables that must never leak from a parent agent session into
@@ -11639,6 +11643,8 @@ impl OpenCodeWireApi {
             Self::OpenaiResponses => "@ai-sdk/openai",
             Self::OpenaiChatCompletions => "@ai-sdk/openai-compatible",
             Self::AnthropicMessages => "@ai-sdk/anthropic",
+            Self::GoogleGenerativeAi => "@ai-sdk/google",
+            Self::AwsBedrockConverse => "@ai-sdk/amazon-bedrock",
         }
     }
 
@@ -11647,6 +11653,8 @@ impl OpenCodeWireApi {
             Self::OpenaiResponses => "responses",
             Self::OpenaiChatCompletions => "chat",
             Self::AnthropicMessages => "anthropic",
+            Self::GoogleGenerativeAi => "google",
+            Self::AwsBedrockConverse => "bedrock",
         }
     }
 
@@ -11656,6 +11664,8 @@ impl OpenCodeWireApi {
             Self::OpenaiResponses => "OpenAI Responses",
             Self::OpenaiChatCompletions => "OpenAI Chat Completions",
             Self::AnthropicMessages => "Anthropic Messages",
+            Self::GoogleGenerativeAi => "Google Generative AI",
+            Self::AwsBedrockConverse => "AWS Bedrock Converse",
         }
     }
 }
@@ -11666,6 +11676,8 @@ impl From<ProviderModelWireApi> for OpenCodeWireApi {
             ProviderModelWireApi::OpenaiResponses => Self::OpenaiResponses,
             ProviderModelWireApi::OpenaiChatCompletions => Self::OpenaiChatCompletions,
             ProviderModelWireApi::AnthropicMessages => Self::AnthropicMessages,
+            ProviderModelWireApi::GoogleGenerativeAi => Self::GoogleGenerativeAi,
+            ProviderModelWireApi::AwsBedrockConverse => Self::AwsBedrockConverse,
         }
     }
 }
@@ -11680,7 +11692,11 @@ fn opencode_default_wire_api(profile: &ProviderProfile) -> OpenCodeWireApi {
         .trim()
         .to_ascii_lowercase()
         .replace(['-', ' '], "_");
-    if wire_api.contains("anthropic") || wire_api == "messages" {
+    if wire_api.contains("bedrock") {
+        OpenCodeWireApi::AwsBedrockConverse
+    } else if wire_api.contains("google") || wire_api.contains("gemini") {
+        OpenCodeWireApi::GoogleGenerativeAi
+    } else if wire_api.contains("anthropic") || wire_api == "messages" {
         OpenCodeWireApi::AnthropicMessages
     } else if wire_api.contains("response") {
         OpenCodeWireApi::OpenaiResponses
@@ -12029,6 +12045,8 @@ fn provider_model_wire_api_name(wire_api: OpenCodeWireApi) -> &'static str {
         OpenCodeWireApi::OpenaiResponses => "openai_responses",
         OpenCodeWireApi::OpenaiChatCompletions => "openai_chat_completions",
         OpenCodeWireApi::AnthropicMessages => "anthropic_messages",
+        OpenCodeWireApi::GoogleGenerativeAi => "google_generative_ai",
+        OpenCodeWireApi::AwsBedrockConverse => "aws_bedrock_converse",
     }
 }
 

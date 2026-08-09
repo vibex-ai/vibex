@@ -46,6 +46,8 @@ const OPENCODE_SECRET_ENV: &str = "VIBEX_OPENCODE_PROVIDER_API_KEY";
 const CODEX_MODEL_PROVIDER_ENV: &str = "MODEL_PROVIDER";
 const CODEX_DEFAULT_AUTH_REQUEST_ENV: &str = "DEFAULT_AUTH_REQUEST";
 const CODEX_DEFAULT_API_KEY_AUTH_REQUEST: &str = r#"{"methodId":"api-key"}"#;
+const OVERLAY_SECRET_PLACEHOLDER_PREFIX: &str = "__VIBEX_SECRET_ENV_";
+const OVERLAY_SECRET_PLACEHOLDER_SUFFIX: &str = "__";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ResolvedProjectionSecret(String);
@@ -212,7 +214,8 @@ impl AgentProviderProjectionEngine {
             binding.validate_against_descriptor(descriptor)?;
         }
 
-        let endpoint = selected_endpoint(model_provider, binding)?;
+        let selected_model = selected_model(model_provider, binding)?;
+        let endpoint = selected_endpoint(model_provider, binding, selected_model)?;
         let credential = selected_credential(model_provider, binding)?;
         if let Some(credential) = credential
             && !descriptor
@@ -225,7 +228,6 @@ impl AgentProviderProjectionEngine {
                 "selected credential kind is not supported by the selected projection descriptor",
             ));
         }
-        let selected_model = selected_model(model_provider, binding)?;
         let effective_model = selected_model.map(|model| model.agent_model_id.clone());
 
         let mut non_secret_env = binding.projection_overrides.non_secret_env.clone();
@@ -392,7 +394,8 @@ impl AgentProviderProjectionEngine {
         let mut overlay_files = Vec::with_capacity(plan.overlay_files.len());
         for overlay in &plan.overlay_files {
             let path = safe_overlay_path(&overlay_root, &overlay.relative_path)?;
-            write_private_file_atomic(&path, overlay.content.as_bytes())?;
+            let content = materialize_overlay_secrets(overlay, &secret_env)?;
+            write_private_file_atomic(&path, content.as_bytes())?;
             overlay_files.push(path);
         }
         let non_secret_env =
@@ -410,6 +413,82 @@ impl AgentProviderProjectionEngine {
             switch_behavior: plan.switch_behavior,
             fingerprint: plan.fingerprint.clone(),
         })
+    }
+}
+
+fn overlay_secret_placeholder(secret_env_key: &str) -> String {
+    format!(
+        "{OVERLAY_SECRET_PLACEHOLDER_PREFIX}{secret_env_key}{OVERLAY_SECRET_PLACEHOLDER_SUFFIX}"
+    )
+}
+
+fn materialize_overlay_secrets(
+    overlay: &ManagedProjectionOverlay,
+    secrets: &[ResolvedProjectionSecretEnv],
+) -> VibexResult<String> {
+    if !overlay.contains_secret_reference
+        || !overlay.content.contains(OVERLAY_SECRET_PLACEHOLDER_PREFIX)
+    {
+        return Ok(overlay.content.clone());
+    }
+    if overlay.format != "yaml" {
+        return Err(VibexError::capability(
+            "agent_projection_overlay_secret_format_unsupported",
+            "managed overlay Secret materialization is not supported for this format",
+        ));
+    }
+    let mut value =
+        serde_yaml::from_str::<serde_yaml::Value>(&overlay.content).map_err(|error| {
+            VibexError::validation(
+                "agent_projection_overlay_secret_decode_failed",
+                "managed overlay could not be decoded before Secret materialization",
+            )
+            .with_diagnostic("format", overlay.format.as_str())
+            .with_diagnostic("error", error.to_string())
+        })?;
+    for secret in secrets {
+        replace_yaml_scalar(
+            &mut value,
+            &overlay_secret_placeholder(&secret.key),
+            secret.value.expose(),
+        );
+    }
+    let content = serde_yaml::to_string(&value).map_err(|error| {
+        VibexError::validation(
+            "agent_projection_overlay_secret_encode_failed",
+            "managed overlay could not be encoded after Secret materialization",
+        )
+        .with_diagnostic("format", overlay.format.as_str())
+        .with_diagnostic("error", error.to_string())
+    })?;
+    if content.contains(OVERLAY_SECRET_PLACEHOLDER_PREFIX) {
+        return Err(VibexError::validation(
+            "agent_projection_overlay_secret_missing",
+            "managed overlay references a Secret that was not resolved",
+        ));
+    }
+    Ok(content)
+}
+
+fn replace_yaml_scalar(value: &mut serde_yaml::Value, marker: &str, replacement: &str) {
+    match value {
+        serde_yaml::Value::String(candidate) if candidate == marker => {
+            *candidate = replacement.to_string();
+        }
+        serde_yaml::Value::Sequence(values) => {
+            for value in values {
+                replace_yaml_scalar(value, marker, replacement);
+            }
+        }
+        serde_yaml::Value::Mapping(values) => {
+            for value in values.values_mut() {
+                replace_yaml_scalar(value, marker, replacement);
+            }
+        }
+        serde_yaml::Value::Tagged(tagged) => {
+            replace_yaml_scalar(&mut tagged.value, marker, replacement);
+        }
+        _ => {}
     }
 }
 
@@ -932,21 +1011,36 @@ impl ProviderConfigService {
 fn selected_endpoint<'a>(
     provider: &'a ModelProviderProfile,
     binding: &AgentModelProviderBinding,
+    model: Option<&AgentConfiguredModelBinding>,
 ) -> VibexResult<Option<&'a ModelProviderEndpoint>> {
     if let Some(endpoint_id) = binding.projection_overrides.endpoint_id.as_deref() {
-        return provider
+        let endpoint = provider
             .endpoints
             .iter()
             .find(|endpoint| endpoint.id == endpoint_id)
-            .map(Some)
             .ok_or_else(|| {
                 VibexError::validation(
                     "agent_projection_endpoint_not_found",
                     "binding endpoint override was not found in the model provider profile",
                 )
-            });
+            })?;
+        if let (Some(endpoint_protocol), Some(model)) =
+            (endpoint.wire_protocol_id.as_deref(), model)
+            && endpoint_protocol != model.wire_protocol_id
+        {
+            return Err(VibexError::validation(
+                "agent_projection_endpoint_protocol_mismatch",
+                "binding endpoint does not support the selected model wire protocol",
+            )
+            .with_diagnostic("endpointId", endpoint.id.as_str())
+            .with_diagnostic("wireProtocolId", model.wire_protocol_id.as_str()));
+        }
+        return Ok(Some(endpoint));
     }
-    Ok(provider.primary_api_endpoint())
+    Ok(model.map_or_else(
+        || provider.primary_api_endpoint(),
+        |model| provider.primary_api_endpoint_for_protocol(&model.wire_protocol_id),
+    ))
 }
 
 fn selected_credential<'a>(
@@ -1250,6 +1344,7 @@ fn private_home_env_key(agent_id: &str) -> Option<&'static str> {
         "crow-cli" => None,
         "dirac" => Some("DIRAC_DIR"),
         "factory-droid" => Some("FACTORY_HOME_OVERRIDE"),
+        "gemini" => Some("GEMINI_HOME"),
         "goose" => Some("GOOSE_PATH_ROOT"),
         "grok" => Some("GROK_HOME"),
         "hermes" => Some("HERMES_HOME"),
@@ -1593,11 +1688,19 @@ fn opencode_overlay(
         .filter(|model| model.enabled)
     {
         let (provider_id, npm) = opencode_provider_identity(&base_provider_id, model);
+        let model_endpoint = opencode_endpoint_for_model(provider, binding, endpoint, model);
         let entry = providers.entry(provider_id).or_insert_with(|| {
+            let mut options = serde_json::Map::new();
+            if let Some(endpoint) = model_endpoint {
+                options.insert(
+                    "baseURL".to_string(),
+                    serde_json::Value::String(endpoint.url.clone()),
+                );
+            }
             serde_json::json!({
                 "name": provider.display_name,
                 "npm": npm,
-                "options": {},
+                "options": options,
                 "models": {}
             })
         });
@@ -1626,31 +1729,48 @@ fn opencode_overlay(
             serde_json::json!({
                 "name": provider.display_name,
                 "npm": "@ai-sdk/openai",
-                "options": {},
+                "options": endpoint.map_or_else(serde_json::Map::new, |endpoint| {
+                    serde_json::Map::from_iter([(
+                        "baseURL".to_string(),
+                        serde_json::Value::String(endpoint.url.clone()),
+                    )])
+                }),
                 "models": {}
             }),
         );
     }
     for value in providers.values_mut() {
+        let npm = value
+            .get("npm")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         if let Some(options) = value
             .get_mut("options")
             .and_then(serde_json::Value::as_object_mut)
         {
-            if let Some(endpoint) = endpoint {
-                options.insert(
-                    "baseURL".to_string(),
-                    serde_json::Value::String(endpoint.url.clone()),
-                );
-            }
             if provider
                 .credentials
                 .iter()
                 .any(|credential| credential.credential.secret_reference().is_some())
             {
-                options.insert(
-                    "apiKey".to_string(),
-                    serde_json::Value::String(format!("{{env:{OPENCODE_SECRET_ENV}}}")),
-                );
+                let secret_reference = format!("{{env:{OPENCODE_SECRET_ENV}}}");
+                if npm == "@ai-sdk/amazon-bedrock" {
+                    let headers = options
+                        .entry("headers".to_string())
+                        .or_insert_with(|| serde_json::json!({}));
+                    if let Some(headers) = headers.as_object_mut() {
+                        headers.insert(
+                            "Authorization".to_string(),
+                            serde_json::Value::String(format!("Bearer {secret_reference}")),
+                        );
+                    }
+                } else {
+                    options.insert(
+                        "apiKey".to_string(),
+                        serde_json::Value::String(secret_reference),
+                    );
+                }
             }
             for header in &provider.headers {
                 if let ModelProviderHeaderValue::NonSecretLiteral(value) = &header.value {
@@ -1696,6 +1816,24 @@ fn opencode_overlay(
     serde_json::to_string(&root).map_err(encode_error)
 }
 
+fn opencode_endpoint_for_model<'a>(
+    provider: &'a ModelProviderProfile,
+    binding: &AgentModelProviderBinding,
+    selected_endpoint: Option<&'a ModelProviderEndpoint>,
+    model: &AgentConfiguredModelBinding,
+) -> Option<&'a ModelProviderEndpoint> {
+    if binding.projection_overrides.endpoint_id.is_some()
+        && let Some(endpoint) = selected_endpoint
+        && endpoint
+            .wire_protocol_id
+            .as_deref()
+            .is_none_or(|protocol| protocol == model.wire_protocol_id)
+    {
+        return Some(endpoint);
+    }
+    provider.primary_api_endpoint_for_protocol(&model.wire_protocol_id)
+}
+
 fn opencode_provider_identity<'a>(
     base_provider_id: &str,
     model: &'a AgentConfiguredModelBinding,
@@ -1705,6 +1843,8 @@ fn opencode_provider_identity<'a>(
         vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES => "responses",
         vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS => "chat",
         vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => "anthropic",
+        vibex_core::WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI => "google",
+        vibex_core::WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE => "bedrock",
         _ => "custom",
     };
     let provider_id = if suffix == "responses" {
@@ -1738,18 +1878,11 @@ fn projection_wire_protocol(model: Option<&AgentConfiguredModelBinding>) -> &str
         .unwrap_or(vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS)
 }
 
-fn wire_style(model: Option<&AgentConfiguredModelBinding>) -> &'static str {
+fn hermes_api_mode(model: Option<&AgentConfiguredModelBinding>) -> &'static str {
     match projection_wire_protocol(model) {
-        vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES => "responses",
-        vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => "messages",
-        _ => "chat_completions",
-    }
-}
-
-fn grok_api_backend(model: Option<&AgentConfiguredModelBinding>) -> &'static str {
-    match projection_wire_protocol(model) {
-        vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES => "responses",
-        vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => "messages",
+        vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES => "codex_responses",
+        vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => "anthropic_messages",
+        vibex_core::WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE => "bedrock_converse",
         _ => "chat_completions",
     }
 }
@@ -1958,20 +2091,8 @@ fn grok_overlay(
     );
     config.insert("name".to_string(), serde_json::json!(provider.display_name));
     config.insert("env_key".to_string(), serde_json::json!(secret_env_key));
-    config.insert(
-        "api_backend".to_string(),
-        serde_json::json!(grok_api_backend(model)),
-    );
-    config.insert(
-        "auth_scheme".to_string(),
-        serde_json::json!(if projection_wire_protocol(model)
-            == vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES
-        {
-            "x_api_key"
-        } else {
-            "bearer"
-        }),
-    );
+    config.insert("api_backend".to_string(), serde_json::json!("responses"));
+    config.insert("auth_scheme".to_string(), serde_json::json!("bearer"));
     serialized_toml(serde_json::json!({
         "model": {model_id: config},
         "models": {"default": model_id},
@@ -1994,28 +2115,32 @@ fn hermes_overlay(
     secret_env_key: &str,
 ) -> VibexResult<String> {
     let model_id = projection_model_id(model).unwrap_or("vibex-model");
-    let provider_id = "vibex";
+    let provider_id = sanitize_provider_id(
+        provider
+            .vendor_hint
+            .as_deref()
+            .unwrap_or_else(|| provider.id.as_str()),
+    );
     let mut provider_config = serde_json::Map::new();
     json_string_if_present(
         &mut provider_config,
         "base_url",
         endpoint.map(|endpoint| endpoint.url.as_str()),
     );
+    json_string_if_present(&mut provider_config, "name", Some(provider_id.as_str()));
+    let secret_placeholder = overlay_secret_placeholder(secret_env_key);
+    json_string_if_present(&mut provider_config, "api_key", Some(&secret_placeholder));
     json_string_if_present(
         &mut provider_config,
-        "name",
-        Some(provider.display_name.as_str()),
+        "api_mode",
+        Some(hermes_api_mode(model)),
     );
-    json_string_if_present(&mut provider_config, "key_env", Some(secret_env_key));
-    json_string_if_present(&mut provider_config, "model", Some(model_id));
-    json_string_if_present(&mut provider_config, "default_model", Some(model_id));
-    json_string_if_present(&mut provider_config, "transport", Some(wire_style(model)));
     provider_config.insert(
         "models".to_string(),
         serde_json::json!({model_id: {"context_length": 128000}}),
     );
     serialized_yaml(serde_json::json!({
-        "providers": {provider_id: provider_config},
+        "custom_providers": [provider_config],
         "model": {"provider": provider_id, "default": model_id},
     }))
 }
@@ -2371,7 +2496,7 @@ fn projection_fingerprint(
         "processArgs": process_args,
         "providerId": provider.id,
         "providerStatus": provider.status,
-        "endpoint": selected_endpoint(provider, binding)?.map(|value| &value.url),
+        "endpoint": selected_endpoint(provider, binding, model)?.map(|value| &value.url),
         "proxyPolicy": provider.proxy_policy,
         "nonSecretEnv": env,
         "secretReferenceRevisions": secret_revisions,
@@ -2464,9 +2589,14 @@ fn status_for_resolution(
         AgentModelProviderBindingStatus::Unverified
     } else {
         match descriptor.evidence.state {
-            ProjectionEvidenceState::Unverified => AgentModelProviderBindingStatus::Unverified,
+            ProjectionEvidenceState::Verified => AgentModelProviderBindingStatus::Ready,
             ProjectionEvidenceState::Unsupported => AgentModelProviderBindingStatus::Unsupported,
-            _ => AgentModelProviderBindingStatus::Ready,
+            ProjectionEvidenceState::Documented
+            | ProjectionEvidenceState::AgentManaged
+            | ProjectionEvidenceState::Local
+            | ProjectionEvidenceState::ServiceMarketplace
+            | ProjectionEvidenceState::Unverified
+            | ProjectionEvidenceState::Stale => AgentModelProviderBindingStatus::Unverified,
         }
     }
 }
@@ -2476,17 +2606,19 @@ fn apply_stale_state(
     next_fingerprint: &str,
     match_kind: ProjectionDescriptorMatch,
 ) {
-    if match_kind == ProjectionDescriptorMatch::Conservative
-        || binding.verification.state == ProjectionEvidenceState::Unverified
-    {
-        binding.status = AgentModelProviderBindingStatus::Unverified;
-        binding.projection_fingerprint = None;
-        binding.verification.state = ProjectionEvidenceState::Unverified;
-        return;
-    }
     if binding.verification.state == ProjectionEvidenceState::Unsupported {
         binding.status = AgentModelProviderBindingStatus::Unsupported;
         binding.projection_fingerprint = None;
+        return;
+    }
+    if match_kind == ProjectionDescriptorMatch::Conservative
+        || binding.verification.state != ProjectionEvidenceState::Verified
+    {
+        binding.status = AgentModelProviderBindingStatus::Unverified;
+        binding.projection_fingerprint = None;
+        if match_kind == ProjectionDescriptorMatch::Conservative {
+            binding.verification.state = ProjectionEvidenceState::Unverified;
+        }
         return;
     }
     match binding.projection_fingerprint.as_deref() {
@@ -2878,6 +3010,7 @@ mod tests {
                 id: "api".to_string(),
                 kind: ModelProviderEndpointKind::Api,
                 url: "https://user:pass@example.invalid/v1?token=never-preview".to_string(),
+                wire_protocol_id: None,
             }],
             proxy_policy: ModelProviderProxyPolicy::InheritSystem,
             credentials: Vec::new(),
@@ -2941,6 +3074,7 @@ mod tests {
                 wire_protocol_id: WIRE_PROTOCOL_OPENAI_RESPONSES.to_string(),
                 sdk_adapter_id: None,
                 transport: "https".to_string(),
+                integration_kind: vibex_core::AgentModelInterfaceIntegrationKind::Direct,
                 user_selectable: false,
                 process_scoped: true,
             }],
@@ -2996,7 +3130,7 @@ mod tests {
         runtime_home_env_key: Option<&'static str>,
     }
 
-    fn typed_projection_expectations() -> [TypedProjectionExpectation; 17] {
+    fn typed_projection_expectations() -> [TypedProjectionExpectation; 18] {
         [
             TypedProjectionExpectation {
                 agent_id: "copilot",
@@ -3051,6 +3185,15 @@ mod tests {
                 overlay_path: None,
                 overlay_format: None,
                 runtime_home_env_key: None,
+            },
+            TypedProjectionExpectation {
+                agent_id: "gemini",
+                base_url_key: Some("GOOGLE_GEMINI_BASE_URL"),
+                secret_env_key: "GEMINI_API_KEY",
+                model_env_key: Some("GEMINI_MODEL"),
+                overlay_path: None,
+                overlay_format: None,
+                runtime_home_env_key: Some("GEMINI_HOME"),
             },
             TypedProjectionExpectation {
                 agent_id: "goose",
@@ -3178,6 +3321,7 @@ mod tests {
                 id: "api".to_string(),
                 kind: ModelProviderEndpointKind::Api,
                 url: "https://provider.example.invalid/v1/".to_string(),
+                wire_protocol_id: None,
             }],
             proxy_policy: ModelProviderProxyPolicy::InheritSystem,
             credentials: vec![ModelProviderCredentialReference {
@@ -3357,13 +3501,18 @@ mod tests {
             }
             "hermes" => {
                 let value: serde_yaml::Value = serde_yaml::from_str(&overlay.content).unwrap();
-                let provider = &value["providers"]["vibex"];
+                let provider = &value["custom_providers"][0];
                 assert_eq!(provider["base_url"], ENDPOINT);
-                assert_eq!(provider["key_env"], "VIBEX_HERMES_API_KEY");
-                assert_eq!(provider["default_model"], "agent-model");
-                assert_eq!(provider["transport"], "chat_completions");
-                assert_eq!(value["model"]["provider"], "vibex");
+                assert_eq!(provider["name"], "matrix-provider");
+                assert_eq!(
+                    provider["api_key"],
+                    overlay_secret_placeholder("VIBEX_HERMES_API_KEY")
+                );
+                assert_eq!(provider["api_mode"], "chat_completions");
+                assert_eq!(provider["models"]["agent-model"]["context_length"], 128000);
+                assert_eq!(value["model"]["provider"], "matrix-provider");
                 assert_eq!(value["model"]["default"], "agent-model");
+                assert!(value.get("providers").is_none());
             }
             "kilo" => {
                 let value: serde_json::Value = serde_json::from_str(&overlay.content).unwrap();
@@ -3481,7 +3630,7 @@ mod tests {
     fn all_typed_catalog_projectors_map_provider_env_secret_model_and_private_state() {
         let descriptors = vibex_core::catalog_projection_descriptors().unwrap();
         let expectations = typed_projection_expectations();
-        assert_eq!(expectations.len(), 17);
+        assert_eq!(expectations.len(), 18);
 
         for expected in expectations {
             let descriptor = descriptors
@@ -3751,9 +3900,271 @@ mod tests {
     }
 
     #[test]
+    fn opencode_overlay_maps_all_five_protocols_to_their_sdk_adapters() {
+        let (mut provider, _, mut binding, _) =
+            fixture(ConfigOverlayStrategy::OpenCodeInlineProvider);
+        provider.endpoints.extend([
+            ModelProviderEndpoint {
+                id: "google".to_string(),
+                kind: ModelProviderEndpointKind::Api,
+                url: "https://google.example.invalid/v1beta".to_string(),
+                wire_protocol_id: Some(vibex_core::WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI.to_string()),
+            },
+            ModelProviderEndpoint {
+                id: "bedrock".to_string(),
+                kind: ModelProviderEndpointKind::Api,
+                url: "https://bedrock.example.invalid".to_string(),
+                wire_protocol_id: Some(vibex_core::WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE.to_string()),
+            },
+        ]);
+        let credential_id = RequestId::new();
+        provider.credentials = vec![ModelProviderCredentialReference {
+            id: credential_id.clone(),
+            display_name: "OpenCode API key".to_string(),
+            status: AgentCredentialStatus::Referenced,
+            credential: AgentCredential::ApiKey {
+                secret: ProjectionSecretReference {
+                    id: credential_id,
+                    backend: ProviderSecretBackend::Placeholder,
+                    setup_state: ProviderSecretSetupState::Missing,
+                    lookup_key: "opencode-test-secret".to_string(),
+                    redacted_hint: "configured".to_string(),
+                    revision: 1,
+                    legacy_secret_reference_id: None,
+                },
+                target_hint: None,
+            },
+            revision: 1,
+        }];
+        binding.configured_models = [
+            (
+                "responses",
+                vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES,
+                "@ai-sdk/openai",
+            ),
+            (
+                "chat",
+                vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+                "@ai-sdk/openai-compatible",
+            ),
+            (
+                "anthropic",
+                vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
+                "@ai-sdk/anthropic",
+            ),
+            (
+                "google",
+                vibex_core::WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI,
+                "@ai-sdk/google",
+            ),
+            (
+                "bedrock",
+                vibex_core::WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE,
+                "@ai-sdk/amazon-bedrock",
+            ),
+        ]
+        .into_iter()
+        .map(|(model, protocol, sdk)| AgentConfiguredModelBinding {
+            id: AgentConfiguredModelBindingId::new(),
+            provider_model_id: model.to_string(),
+            agent_model_id: model.to_string(),
+            wire_protocol_id: protocol.to_string(),
+            sdk_adapter_id: Some(sdk.to_string()),
+            deployment: None,
+            enabled: true,
+            process_scoped: true,
+        })
+        .collect();
+
+        let endpoint = provider.endpoints.first().unwrap();
+        let content = opencode_overlay(&provider, &binding, Some(endpoint)).unwrap();
+        let overlay: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let providers = overlay["provider"].as_object().unwrap();
+        for (provider_id, npm) in [
+            ("fake", "@ai-sdk/openai"),
+            ("fake-chat", "@ai-sdk/openai-compatible"),
+            ("fake-anthropic", "@ai-sdk/anthropic"),
+            ("fake-google", "@ai-sdk/google"),
+            ("fake-bedrock", "@ai-sdk/amazon-bedrock"),
+        ] {
+            assert_eq!(providers[provider_id]["npm"], npm);
+        }
+        assert_eq!(
+            providers["fake-bedrock"]["options"]["headers"]["Authorization"],
+            "Bearer {env:VIBEX_OPENCODE_PROVIDER_API_KEY}"
+        );
+        assert!(providers["fake-bedrock"]["options"].get("apiKey").is_none());
+        assert_eq!(
+            providers["fake-google"]["options"]["apiKey"],
+            "{env:VIBEX_OPENCODE_PROVIDER_API_KEY}"
+        );
+        assert_eq!(
+            providers["fake-google"]["options"]["baseURL"],
+            "https://google.example.invalid/v1beta"
+        );
+        assert_eq!(
+            providers["fake-bedrock"]["options"]["baseURL"],
+            "https://bedrock.example.invalid"
+        );
+        assert_eq!(providers["fake-chat"]["options"]["baseURL"], endpoint.url);
+    }
+
+    #[test]
+    fn hermes_protocol_modes_are_exact_and_secret_is_materialized_only_privately() {
+        for (protocol, expected_mode) in [
+            (
+                vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+                "chat_completions",
+            ),
+            (
+                vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
+                "anthropic_messages",
+            ),
+            (
+                vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES,
+                "codex_responses",
+            ),
+            (
+                vibex_core::WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE,
+                "bedrock_converse",
+            ),
+        ] {
+            let model = AgentConfiguredModelBinding {
+                id: AgentConfiguredModelBindingId::new(),
+                provider_model_id: "provider-model".to_string(),
+                agent_model_id: "agent-model".to_string(),
+                wire_protocol_id: protocol.to_string(),
+                sdk_adapter_id: None,
+                deployment: None,
+                enabled: true,
+                process_scoped: true,
+            };
+            assert_eq!(hermes_api_mode(Some(&model)), expected_mode);
+        }
+
+        let descriptor = vibex_core::catalog_projection_descriptors()
+            .unwrap()
+            .into_iter()
+            .find(|descriptor| descriptor.route.agent_id.as_str() == "hermes")
+            .unwrap();
+        let (mut provider, runtime, binding) = typed_projection_fixture(&descriptor);
+        let lookup_key = format!("hermes-materialize-{}", RequestId::new());
+        let secret_value = "hermes-private-secret";
+        let AgentCredential::ApiKey { secret, .. } = &mut provider.credentials[0].credential else {
+            panic!("Hermes fixture must use an API key")
+        };
+        secret.backend = ProviderSecretBackend::OsKeychain;
+        secret.setup_state = ProviderSecretSetupState::Available;
+        secret.lookup_key = lookup_key.clone();
+
+        let plan = AgentProviderProjectionEngine::plan(
+            &provider,
+            &runtime,
+            &binding,
+            &descriptor,
+            "hermes-secret",
+        )
+        .unwrap();
+        assert!(plan.overlay_files[0].contains_secret_reference);
+        assert!(!plan.overlay_files[0].content.contains(secret_value));
+        assert!(!format!("{plan:?}").contains(secret_value));
+
+        secrets::store_provider_secret(&lookup_key, secret_value).unwrap();
+        let runtime_root = tempdir().unwrap();
+        let resolved = AgentProviderProjectionEngine::resolve_and_materialize(
+            &plan,
+            runtime_root.path(),
+            "hermes-secret",
+        )
+        .unwrap();
+        let materialized = fs::read_to_string(&resolved.overlay_files[0]).unwrap();
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&materialized).unwrap();
+        assert_eq!(yaml["custom_providers"][0]["api_key"], secret_value);
+        assert!(!materialized.contains(OVERLAY_SECRET_PLACEHOLDER_PREFIX));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&resolved.overlay_files[0])
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        secrets::delete_provider_secret(&lookup_key).unwrap();
+    }
+
+    #[test]
+    fn selected_endpoint_prefers_protocol_match_and_rejects_override_mismatch() {
+        let (mut provider, _, mut binding, _) =
+            fixture(ConfigOverlayStrategy::StructuredJsonOverlay);
+        provider.endpoints = vec![
+            ModelProviderEndpoint {
+                id: "fallback".to_string(),
+                kind: ModelProviderEndpointKind::Api,
+                url: "https://fallback.example.invalid/v1".to_string(),
+                wire_protocol_id: None,
+            },
+            ModelProviderEndpoint {
+                id: "google".to_string(),
+                kind: ModelProviderEndpointKind::Api,
+                url: "https://google.example.invalid/v1beta".to_string(),
+                wire_protocol_id: Some(vibex_core::WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI.to_string()),
+            },
+        ];
+        binding.configured_models[0].wire_protocol_id =
+            vibex_core::WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI.to_string();
+        let model = binding.configured_models.first().unwrap();
+        assert_eq!(
+            selected_endpoint(&provider, &binding, Some(model))
+                .unwrap()
+                .map(|endpoint| endpoint.id.as_str()),
+            Some("google")
+        );
+
+        binding.projection_overrides.endpoint_id = Some("fallback".to_string());
+        assert_eq!(
+            selected_endpoint(&provider, &binding, Some(model))
+                .unwrap()
+                .map(|endpoint| endpoint.id.as_str()),
+            Some("fallback")
+        );
+        binding.projection_overrides.endpoint_id = Some("google".to_string());
+        binding.configured_models[0].wire_protocol_id =
+            vibex_core::WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE.to_string();
+        assert_eq!(
+            selected_endpoint(&provider, &binding, binding.configured_models.first())
+                .unwrap_err()
+                .code,
+            "agent_projection_endpoint_protocol_mismatch"
+        );
+    }
+
+    #[test]
     fn exact_conservative_evidence_never_promotes_a_binding_to_ready() {
         let (_, _, mut binding, mut descriptor) =
             fixture(ConfigOverlayStrategy::StructuredJsonOverlay);
+
+        descriptor.evidence.state = ProjectionEvidenceState::Documented;
+        assert_eq!(
+            status_for_resolution(ProjectionDescriptorMatch::Exact, &descriptor),
+            AgentModelProviderBindingStatus::Unverified
+        );
+        binding.verification = verification_from_descriptor(&descriptor);
+        binding.projection_fingerprint = Some("sha256:active".to_string());
+        apply_stale_state(
+            &mut binding,
+            "sha256:next",
+            ProjectionDescriptorMatch::Exact,
+        );
+        assert_eq!(binding.status, AgentModelProviderBindingStatus::Unverified);
+        assert_eq!(
+            binding.verification.state,
+            ProjectionEvidenceState::Documented
+        );
+        assert!(binding.projection_fingerprint.is_none());
 
         descriptor.evidence.state = ProjectionEvidenceState::Unverified;
         assert_eq!(
@@ -3915,11 +4326,17 @@ mod tests {
                         id: "claude-api".to_string(),
                         kind: ModelProviderEndpointKind::Api,
                         url: "https://claude.example.invalid/v1".to_string(),
+                        wire_protocol_id: Some(
+                            vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string(),
+                        ),
                     },
                     ModelProviderEndpoint {
                         id: "codex-api".to_string(),
                         kind: ModelProviderEndpointKind::Api,
                         url: "https://codex.example.invalid/v1".to_string(),
+                        wire_protocol_id: Some(
+                            vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES.to_string(),
+                        ),
                     },
                 ],
                 proxy_policy: ModelProviderProxyPolicy::InheritSystem,

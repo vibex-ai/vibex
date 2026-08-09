@@ -17,12 +17,14 @@ use crate::provider_projection::{
 };
 use crate::{
     AcpAdapterId, AgentCredentialControl, AgentCredentialKind, AgentId, AgentModelControl,
-    AgentModelInterfaceDescriptor, AgentProviderControl, AgentProviderProjectionDescriptor,
-    AgentProviderProjectionDescriptorId, AgentRuntimeHomeStrategy, AgentVersionCompatibility,
-    ProjectionDescriptorMatch, ProjectionEvidenceReference, ProjectionEvidenceState,
-    ProviderSecretKind, ProviderSwitchBehavior, VibexError, VibexResult,
-    WIRE_PROTOCOL_ANTHROPIC_MESSAGES, WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
-    WIRE_PROTOCOL_OPENAI_RESPONSES, acp_agent_catalog_entries,
+    AgentModelInterfaceDescriptor, AgentModelInterfaceIntegrationKind, AgentProviderControl,
+    AgentProviderProjectionDescriptor, AgentProviderProjectionDescriptorId,
+    AgentRuntimeHomeStrategy, AgentVersionCompatibility, ProjectionDescriptorMatch,
+    ProjectionEvidenceReference, ProjectionEvidenceState, ProviderSecretKind,
+    ProviderSwitchBehavior, VibexError, VibexResult, WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
+    WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE, WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI,
+    WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, WIRE_PROTOCOL_OPENAI_RESPONSES,
+    acp_agent_catalog_entries,
 };
 use crate::{AgentModelProviderBindingId, AgentRuntimeProbeId, AgentRuntimeProfileId};
 
@@ -262,7 +264,7 @@ fn mode_for(agent_id: &str) -> AgentProviderCapabilityMode {
         "amp-acp" | "auggie" | "cursor" | "devin" | "junie" | "qoder" => {
             AgentProviderCapabilityMode::AgentManaged
         }
-        "cortex-code" | "gemini" | "kiro" => AgentProviderCapabilityMode::CloudCredential,
+        "cortex-code" | "kiro" => AgentProviderCapabilityMode::CloudCredential,
         _ => AgentProviderCapabilityMode::ReplaceableProvider,
     }
 }
@@ -326,6 +328,16 @@ fn catalog_projection_shape(
                 "ACP_GLM_BASE_URL",
                 "Z_AI_API_KEY",
                 "ACP_GLM_MODEL",
+            )),
+            "gemini" => Ok(environment_projection_shape_with_interfaces(
+                "GOOGLE_GEMINI_BASE_URL",
+                "GEMINI_API_KEY",
+                "GEMINI_MODEL",
+                vec![catalog_interface(
+                    WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI,
+                    false,
+                    true,
+                )],
             )),
             "copilot" => Ok(environment_projection_shape(
                 "COPILOT_PROVIDER_BASE_URL",
@@ -395,20 +407,21 @@ fn catalog_projection_shape(
             "grok" => Ok(overlay_projection_shape(
                 ConfigOverlayStrategy::GrokToml,
                 "VIBEX_GROK_API_KEY",
-                vec![
-                    catalog_interface(WIRE_PROTOCOL_OPENAI_RESPONSES, true, true),
-                    catalog_interface(WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, true, true),
-                    catalog_interface(WIRE_PROTOCOL_ANTHROPIC_MESSAGES, true, true),
-                ],
+                vec![catalog_interface(
+                    WIRE_PROTOCOL_OPENAI_RESPONSES,
+                    false,
+                    true,
+                )],
             )),
             "hermes" => Ok(overlay_projection_shape(
                 ConfigOverlayStrategy::HermesYaml,
                 "VIBEX_HERMES_API_KEY",
-                vec![catalog_interface(
-                    WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
-                    false,
-                    true,
-                )],
+                vec![
+                    catalog_interface(WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, true, true),
+                    catalog_interface(WIRE_PROTOCOL_ANTHROPIC_MESSAGES, true, true),
+                    catalog_interface(WIRE_PROTOCOL_OPENAI_RESPONSES, true, true),
+                    catalog_interface(WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE, true, true),
+                ],
             )),
             "kilo" => Ok(overlay_projection_shape(
                 ConfigOverlayStrategy::KiloInlineJson,
@@ -512,20 +525,6 @@ fn catalog_projection_shape(
                         method_ids: vec!["snowflake_connection".to_string(), "oauth".to_string()],
                     },
                     vec![AgentCredentialKind::Snowflake, AgentCredentialKind::OAuth],
-                ),
-                "gemini" => (
-                    AgentCredentialControl::AdvertisedAuthMethod {
-                        method_ids: vec![
-                            "google_oauth".to_string(),
-                            "api_key".to_string(),
-                            "vertex_adc".to_string(),
-                        ],
-                    },
-                    vec![
-                        AgentCredentialKind::OAuth,
-                        AgentCredentialKind::ApiKey,
-                        AgentCredentialKind::Gcp,
-                    ],
                 ),
                 "kiro" => (
                     AgentCredentialControl::AdvertisedAuthMethod {
@@ -646,6 +645,7 @@ fn catalog_interface(
         wire_protocol_id: wire_protocol_id.to_string(),
         sdk_adapter_id: None,
         transport: "https".to_string(),
+        integration_kind: AgentModelInterfaceIntegrationKind::Direct,
         user_selectable,
         process_scoped,
     }
@@ -1606,6 +1606,7 @@ mod tests {
             "dirac",
             "factory-droid",
             "fast-agent",
+            "gemini",
             "goose",
             "grok",
             "hermes",
@@ -1626,7 +1627,7 @@ mod tests {
             "minion-code",
             "nova",
         ];
-        assert_eq!(typed_projectors.len(), 17);
+        assert_eq!(typed_projectors.len(), 18);
         assert_eq!(blocked_projectors.len(), 6);
 
         for descriptor in descriptors
@@ -1729,6 +1730,7 @@ mod tests {
             "claude",
             "codex",
             "opencode",
+            "gemini",
             "glm-acp-agent",
             "copilot",
             "qwen-code",
@@ -1738,12 +1740,66 @@ mod tests {
                 "{agent_id} has a typed model-provider projector"
             );
         }
-        for agent_id in ["gemini", "sigit", "agoragentic-acp", "cline"] {
+        for agent_id in ["sigit", "agoragentic-acp", "cline"] {
             assert!(
                 !supported.contains(&AgentId::parse(agent_id).unwrap()),
                 "{agent_id} must not expose model-provider configuration"
             );
         }
+    }
+
+    #[test]
+    fn catalog_agent_protocol_contracts_are_agent_specific() {
+        let descriptors = catalog_projection_descriptors().unwrap();
+        let protocols = |agent_id: &str| {
+            descriptors
+                .iter()
+                .find(|descriptor| descriptor.route.agent_id.as_str() == agent_id)
+                .unwrap()
+                .model_interfaces
+                .iter()
+                .map(|interface| interface.wire_protocol_id.as_str())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            protocols("gemini"),
+            vec![WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI]
+        );
+        assert_eq!(protocols("grok"), vec![WIRE_PROTOCOL_OPENAI_RESPONSES]);
+        assert_eq!(
+            protocols("hermes"),
+            vec![
+                WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+                WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
+                WIRE_PROTOCOL_OPENAI_RESPONSES,
+                WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE,
+            ]
+        );
+
+        let gemini = descriptors
+            .iter()
+            .find(|descriptor| descriptor.route.agent_id.as_str() == "gemini")
+            .unwrap();
+        assert_eq!(
+            gemini.provider_control,
+            AgentProviderControl::Environment {
+                base_url_key: Some("GOOGLE_GEMINI_BASE_URL".to_string())
+            }
+        );
+        assert_eq!(
+            gemini.credential_control,
+            AgentCredentialControl::Environment {
+                secret_env_key: "GEMINI_API_KEY".to_string(),
+                accepted_secret_kinds: vec![ProviderSecretKind::ApiKey],
+            }
+        );
+        assert_eq!(
+            gemini.model_control,
+            AgentModelControl::ProcessEnvironment {
+                key: "GEMINI_MODEL".to_string()
+            }
+        );
     }
 
     #[test]

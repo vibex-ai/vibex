@@ -4748,44 +4748,37 @@ fn validate_agent_model_interfaces(
     models: &[ProviderConfiguredModel],
     options: Option<&ProviderOptions>,
 ) -> VibexResult<()> {
-    match agent_id.as_str() {
-        "codex" => {
-            for model in models {
-                if let Some(wire_api) = model.wire_api
-                    && wire_api != vibex_core::ProviderModelWireApi::OpenaiResponses
-                {
-                    return Err(unsupported_model_interface(
-                        agent_id,
-                        &format!("{wire_api:?}"),
-                    ));
-                }
-            }
-            if let Some(options) = options {
-                if let Some(wire_api) = provider_runtime_option_value(options, "wireApi")? {
-                    validate_codex_wire_api(&wire_api)?;
-                }
-                if let Some(fragment) = provider_runtime_option_value(
-                    options,
-                    CODEX_MODEL_PROVIDER_CONFIG_TOML_OPTION_KEY,
-                )? && let Some(wire_api) = codex_provider_toml_wire_api(&fragment)
-                {
-                    validate_codex_wire_api(&wire_api)?;
-                }
+    let registry = vibex_core::AgentProviderProjectionRegistry::builtin()?;
+    let supported_protocols = registry
+        .descriptors_for_agent(agent_id)
+        .flat_map(|descriptor| descriptor.model_interfaces.iter())
+        .map(|interface| interface.wire_protocol_id.as_str())
+        .collect::<HashSet<_>>();
+    if !supported_protocols.is_empty() {
+        for model in models {
+            if let Some(wire_api) = model.wire_api
+                && !supported_protocols.contains(wire_api.wire_protocol_id())
+            {
+                return Err(unsupported_model_interface(
+                    agent_id,
+                    wire_api.wire_protocol_id(),
+                ));
             }
         }
-        "claude" => {
-            for model in models {
-                if let Some(wire_api) = model.wire_api
-                    && wire_api != vibex_core::ProviderModelWireApi::AnthropicMessages
-                {
-                    return Err(unsupported_model_interface(
-                        agent_id,
-                        &format!("{wire_api:?}"),
-                    ));
-                }
-            }
+    }
+
+    if agent_id.as_str() == "codex"
+        && let Some(options) = options
+    {
+        if let Some(wire_api) = provider_runtime_option_value(options, "wireApi")? {
+            validate_codex_wire_api(&wire_api)?;
         }
-        _ => {}
+        if let Some(fragment) =
+            provider_runtime_option_value(options, CODEX_MODEL_PROVIDER_CONFIG_TOML_OPTION_KEY)?
+            && let Some(wire_api) = codex_provider_toml_wire_api(&fragment)
+        {
+            validate_codex_wire_api(&wire_api)?;
+        }
     }
     Ok(())
 }
@@ -5288,38 +5281,43 @@ fn run_provider_api_probe(
     profile: &ProviderProfile,
     probe_kind: ProviderApiProbeKind,
 ) -> VibexResult<ProviderApiProbeOutcome> {
-    match agent_model_provider_kind(&profile.agent_id) {
-        ProviderKind::Codex => run_openai_compatible_api_probe(profile, probe_kind),
-        ProviderKind::Claude => run_anthropic_api_probe(profile, probe_kind),
-        ProviderKind::Acp => Ok(provider_api_probe_fail(
-            "agent_model_provider_acp_live_probe_unavailable",
-            "ACP profiles do not expose a generic model provider HTTP API; live probing must run through the agent runtime",
-            vec![diagnostic("providerKind", "acp")],
-        )),
+    let Some(wire_api) = effective_profile_wire_api(profile)? else {
+        return Ok(provider_api_probe_fail(
+            "agent_model_provider_protocol_missing",
+            "Provider profile does not select a supported model API protocol",
+            vec![diagnostic("wireProtocolId", "missing")],
+        ));
+    };
+    match wire_api {
+        vibex_core::ProviderModelWireApi::OpenaiResponses
+        | vibex_core::ProviderModelWireApi::OpenaiChatCompletions => {
+            run_openai_compatible_api_probe(profile, probe_kind, wire_api)
+        }
+        vibex_core::ProviderModelWireApi::AnthropicMessages => {
+            run_anthropic_api_probe(profile, probe_kind)
+        }
+        vibex_core::ProviderModelWireApi::GoogleGenerativeAi => {
+            run_google_generative_ai_probe(profile, probe_kind)
+        }
+        vibex_core::ProviderModelWireApi::AwsBedrockConverse => {
+            run_bedrock_converse_probe(profile, probe_kind)
+        }
     }
 }
 
 fn run_openai_compatible_api_probe(
     profile: &ProviderProfile,
     probe_kind: ProviderApiProbeKind,
+    wire_api: vibex_core::ProviderModelWireApi,
 ) -> VibexResult<ProviderApiProbeOutcome> {
-    let config = codex_runtime_config_from_profile(profile, None)?;
-    let Some(api_key) = config
-        .api_key
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    else {
+    let Some(api_key) = resolved_profile_secret_value(profile)? else {
         return Ok(provider_api_probe_fail(
             "agent_model_provider_secret_missing",
             "Provider profile is missing an available API key",
             vec![diagnostic("secret", "missing")],
         ));
     };
-    let Some(base_url) = config
-        .base_url
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    else {
+    let Some(base_url) = profile_protocol_base_url(profile, wire_api) else {
         return Ok(provider_api_probe_fail(
             "agent_model_provider_endpoint_missing",
             "Provider profile is missing an API request URL",
@@ -5339,14 +5337,14 @@ fn run_openai_compatible_api_probe(
             probe_get_json(
                 &client,
                 &endpoints,
-                |request| request.bearer_auth(api_key),
+                |request| request.bearer_auth(&api_key),
                 "agent_model_provider_model_list_probe_passed",
                 "Model list API request succeeded",
             )
         }
         ProviderApiProbeKind::SimplePrompt => {
-            let Some(model) = config
-                .model
+            let Some(model) = profile
+                .default_model
                 .as_deref()
                 .filter(|value| !value.trim().is_empty())
             else {
@@ -5356,28 +5354,28 @@ fn run_openai_compatible_api_probe(
                     vec![diagnostic("model", "missing")],
                 ));
             };
-            let wire_api = config.wire_api.as_deref().unwrap_or("responses");
-            let (path, body) = if wire_api.contains("chat") {
-                (
-                    "chat/completions",
-                    serde_json::json!({
-                        "model": model,
-                        "messages": [{ "role": "user", "content": "ping" }],
-                        "max_tokens": 1,
-                        "stream": false
-                    }),
-                )
-            } else {
-                (
-                    "responses",
-                    serde_json::json!({
-                        "model": model,
-                        "input": "ping",
-                        "max_output_tokens": 1,
-                        "stream": false
-                    }),
-                )
-            };
+            let (path, body) =
+                if wire_api == vibex_core::ProviderModelWireApi::OpenaiChatCompletions {
+                    (
+                        "chat/completions",
+                        serde_json::json!({
+                            "model": model,
+                            "messages": [{ "role": "user", "content": "ping" }],
+                            "max_tokens": 1,
+                            "stream": false
+                        }),
+                    )
+                } else {
+                    (
+                        "responses",
+                        serde_json::json!({
+                            "model": model,
+                            "input": "ping",
+                            "max_output_tokens": 1,
+                            "stream": false
+                        }),
+                    )
+                };
             let endpoints = provider_api_endpoint_candidates(
                 base_url,
                 path,
@@ -5388,7 +5386,7 @@ fn run_openai_compatible_api_probe(
                 &client,
                 &endpoints,
                 body,
-                |request| request.bearer_auth(api_key),
+                |request| request.bearer_auth(&api_key),
                 "agent_model_provider_simple_prompt_probe_passed",
                 "Simple prompt API request succeeded",
             )
@@ -5407,10 +5405,8 @@ fn run_anthropic_api_probe(
             vec![diagnostic("secret", "missing")],
         ));
     };
-    let Some(base_url) = profile
-        .base_url
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
+    let Some(base_url) =
+        profile_protocol_base_url(profile, vibex_core::ProviderModelWireApi::AnthropicMessages)
     else {
         return Ok(provider_api_probe_fail(
             "agent_model_provider_endpoint_missing",
@@ -5479,39 +5475,258 @@ fn run_anthropic_api_probe(
     }
 }
 
+fn run_google_generative_ai_probe(
+    profile: &ProviderProfile,
+    probe_kind: ProviderApiProbeKind,
+) -> VibexResult<ProviderApiProbeOutcome> {
+    let Some(api_key) = resolved_profile_secret_value(profile)? else {
+        return Ok(provider_api_probe_fail(
+            "agent_model_provider_secret_missing",
+            "Provider profile is missing an available API key",
+            vec![diagnostic("secret", "missing")],
+        ));
+    };
+    let Some(base_url) = profile_protocol_base_url(
+        profile,
+        vibex_core::ProviderModelWireApi::GoogleGenerativeAi,
+    ) else {
+        return Ok(provider_api_probe_fail(
+            "agent_model_provider_endpoint_missing",
+            "Provider profile is missing an API request URL",
+            vec![diagnostic("endpoint", "missing")],
+        ));
+    };
+    let client = provider_probe_http_client()?;
+    match probe_kind {
+        ProviderApiProbeKind::ModelList => probe_get_json(
+            &client,
+            &google_api_endpoint_candidates(base_url, "models", profile_uses_full_api_url(profile)),
+            |request| request.header("x-goog-api-key", &api_key),
+            "agent_model_provider_model_list_probe_passed",
+            "Google model list API request succeeded",
+        ),
+        ProviderApiProbeKind::SimplePrompt => {
+            let Some(model) = profile
+                .default_model
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            else {
+                return Ok(provider_api_probe_fail(
+                    "agent_model_provider_model_missing",
+                    "Provider profile is missing a default model",
+                    vec![diagnostic("model", "missing")],
+                ));
+            };
+            let model = model.strip_prefix("models/").unwrap_or(model);
+            let model = encoded_url_path_segment(model)?;
+            probe_post_json(
+                &client,
+                &google_api_endpoint_candidates(
+                    base_url,
+                    &format!("models/{model}:generateContent"),
+                    profile_uses_full_api_url(profile),
+                ),
+                serde_json::json!({
+                    "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
+                    "generationConfig": {"maxOutputTokens": 1}
+                }),
+                |request| request.header("x-goog-api-key", &api_key),
+                "agent_model_provider_simple_prompt_probe_passed",
+                "Google Generative AI prompt request succeeded",
+            )
+        }
+    }
+}
+
+fn run_bedrock_converse_probe(
+    profile: &ProviderProfile,
+    probe_kind: ProviderApiProbeKind,
+) -> VibexResult<ProviderApiProbeOutcome> {
+    let Some(api_key) = resolved_profile_secret_value(profile)? else {
+        return Ok(provider_api_probe_fail(
+            "agent_model_provider_secret_missing",
+            "Provider profile is missing an available API key",
+            vec![diagnostic("secret", "missing")],
+        ));
+    };
+    let Some(base_url) = profile_protocol_base_url(
+        profile,
+        vibex_core::ProviderModelWireApi::AwsBedrockConverse,
+    ) else {
+        return Ok(provider_api_probe_fail(
+            "agent_model_provider_endpoint_missing",
+            "Provider profile is missing an API request URL",
+            vec![diagnostic("endpoint", "missing")],
+        ));
+    };
+    let client = provider_probe_http_client()?;
+    match probe_kind {
+        ProviderApiProbeKind::ModelList => probe_get_json(
+            &client,
+            &provider_api_endpoint_candidates(
+                base_url,
+                "models",
+                profile_uses_full_api_url(profile),
+                false,
+            ),
+            |request| request.bearer_auth(&api_key),
+            "agent_model_provider_model_list_probe_passed",
+            "Bedrock-compatible model list API request succeeded",
+        ),
+        ProviderApiProbeKind::SimplePrompt => {
+            let Some(model) = profile
+                .default_model
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            else {
+                return Ok(provider_api_probe_fail(
+                    "agent_model_provider_model_missing",
+                    "Provider profile is missing a default model",
+                    vec![diagnostic("model", "missing")],
+                ));
+            };
+            let model = encoded_url_path_segment(model)?;
+            probe_post_json(
+                &client,
+                &provider_api_endpoint_candidates(
+                    base_url,
+                    &format!("model/{model}/converse"),
+                    profile_uses_full_api_url(profile),
+                    false,
+                ),
+                serde_json::json!({
+                    "messages": [{
+                        "role": "user",
+                        "content": [{"text": "ping"}]
+                    }],
+                    "inferenceConfig": {"maxTokens": 1}
+                }),
+                |request| request.bearer_auth(&api_key),
+                "agent_model_provider_simple_prompt_probe_passed",
+                "Bedrock Converse prompt request succeeded",
+            )
+        }
+    }
+}
+
+fn effective_profile_wire_api(
+    profile: &ProviderProfile,
+) -> VibexResult<Option<vibex_core::ProviderModelWireApi>> {
+    let configured = profile
+        .default_model
+        .as_deref()
+        .and_then(|default_model| {
+            profile
+                .configured_models
+                .iter()
+                .find(|model| model.id == default_model && model.enabled)
+        })
+        .and_then(|model| model.wire_api)
+        .or_else(|| {
+            profile
+                .configured_models
+                .iter()
+                .find(|model| model.enabled && model.wire_api.is_some())
+                .and_then(|model| model.wire_api)
+        });
+    if configured.is_some() {
+        return Ok(configured);
+    }
+    if let Some(value) = provider_option_value(&profile.provider_options, "wireApi")
+        && let Some(wire_api) = provider_model_wire_api_from_alias(&value)
+    {
+        return Ok(Some(wire_api));
+    }
+    let registry = vibex_core::AgentProviderProjectionRegistry::builtin()?;
+    Ok(registry
+        .descriptors_for_agent(&profile.agent_id)
+        .flat_map(|descriptor| descriptor.model_interfaces.iter())
+        .find_map(|interface| {
+            vibex_core::ProviderModelWireApi::from_wire_protocol_id(&interface.wire_protocol_id)
+        }))
+}
+
+fn profile_protocol_base_url(
+    profile: &ProviderProfile,
+    wire_api: vibex_core::ProviderModelWireApi,
+) -> Option<&str> {
+    let option_key = wire_api.protocol_base_url_option_key();
+    profile
+        .provider_options
+        .entries
+        .iter()
+        .find(|entry| entry.key.trim() == option_key)
+        .map(|entry| entry.value.trim())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            profile
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn provider_model_wire_api_from_alias(value: &str) -> Option<vibex_core::ProviderModelWireApi> {
+    let normalized = value.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    if normalized.contains("bedrock") || normalized == "converse" {
+        Some(vibex_core::ProviderModelWireApi::AwsBedrockConverse)
+    } else if normalized.contains("google") || normalized.contains("gemini") {
+        Some(vibex_core::ProviderModelWireApi::GoogleGenerativeAi)
+    } else if normalized.contains("anthropic") || normalized == "messages" {
+        Some(vibex_core::ProviderModelWireApi::AnthropicMessages)
+    } else if normalized.contains("chat") || normalized == "completions" {
+        Some(vibex_core::ProviderModelWireApi::OpenaiChatCompletions)
+    } else if normalized.contains("response") {
+        Some(vibex_core::ProviderModelWireApi::OpenaiResponses)
+    } else {
+        None
+    }
+}
+
 fn fetch_provider_profile_models(
     profile: &ProviderProfile,
 ) -> VibexResult<(Vec<String>, Vec<ProviderBindingMetadata>)> {
-    match agent_model_provider_kind(&profile.agent_id) {
-        ProviderKind::Codex => fetch_openai_compatible_profile_models(profile),
-        ProviderKind::Claude => fetch_anthropic_profile_models(profile),
-        ProviderKind::Acp => Err(VibexError::capability(
-            "agent_model_provider_model_fetch_acp_unavailable",
-            "ACP profiles do not expose a generic HTTP model list endpoint",
-        )
-        .with_diagnostic("providerKind", "acp")),
+    match effective_profile_wire_api(profile)? {
+        Some(vibex_core::ProviderModelWireApi::OpenaiResponses) => {
+            fetch_openai_compatible_profile_models(
+                profile,
+                vibex_core::ProviderModelWireApi::OpenaiResponses,
+            )
+        }
+        Some(vibex_core::ProviderModelWireApi::OpenaiChatCompletions) => {
+            fetch_openai_compatible_profile_models(
+                profile,
+                vibex_core::ProviderModelWireApi::OpenaiChatCompletions,
+            )
+        }
+        Some(vibex_core::ProviderModelWireApi::AnthropicMessages) => {
+            fetch_anthropic_profile_models(profile)
+        }
+        Some(vibex_core::ProviderModelWireApi::GoogleGenerativeAi) => {
+            fetch_google_profile_models(profile)
+        }
+        Some(vibex_core::ProviderModelWireApi::AwsBedrockConverse) => {
+            fetch_bedrock_profile_models(profile)
+        }
+        None => Err(VibexError::validation(
+            "agent_model_provider_protocol_missing",
+            "Provider profile does not select a supported model API protocol",
+        )),
     }
 }
 
 fn fetch_openai_compatible_profile_models(
     profile: &ProviderProfile,
+    wire_api: vibex_core::ProviderModelWireApi,
 ) -> VibexResult<(Vec<String>, Vec<ProviderBindingMetadata>)> {
-    let config = codex_runtime_config_from_profile(profile, None)?;
-    let Some(api_key) = config
-        .api_key
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    else {
+    let Some(api_key) = resolved_profile_secret_value(profile)? else {
         return Err(VibexError::validation(
             "agent_model_provider_secret_missing",
             "Provider profile is missing an available API key",
         ));
     };
-    let Some(base_url) = config
-        .base_url
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    else {
+    let Some(base_url) = profile_protocol_base_url(profile, wire_api) else {
         return Err(VibexError::validation(
             "agent_model_provider_endpoint_missing",
             "Provider profile is missing an API request URL",
@@ -5522,7 +5737,59 @@ fn fetch_openai_compatible_profile_models(
     fetch_models_from_endpoints(
         &client,
         &model_list_endpoint_candidates(base_url, profile_uses_full_api_url(profile), false),
-        |request| request.bearer_auth(api_key),
+        |request| request.bearer_auth(&api_key),
+    )
+}
+
+fn fetch_google_profile_models(
+    profile: &ProviderProfile,
+) -> VibexResult<(Vec<String>, Vec<ProviderBindingMetadata>)> {
+    let Some(api_key) = resolved_profile_secret_value(profile)? else {
+        return Err(VibexError::validation(
+            "agent_model_provider_secret_missing",
+            "Provider profile is missing an available API key",
+        ));
+    };
+    let Some(base_url) = profile_protocol_base_url(
+        profile,
+        vibex_core::ProviderModelWireApi::GoogleGenerativeAi,
+    ) else {
+        return Err(VibexError::validation(
+            "agent_model_provider_endpoint_missing",
+            "Provider profile is missing an API request URL",
+        ));
+    };
+    let client = provider_probe_http_client()?;
+    fetch_models_from_endpoints(
+        &client,
+        &google_api_endpoint_candidates(base_url, "models", profile_uses_full_api_url(profile)),
+        |request| request.header("x-goog-api-key", &api_key),
+    )
+}
+
+fn fetch_bedrock_profile_models(
+    profile: &ProviderProfile,
+) -> VibexResult<(Vec<String>, Vec<ProviderBindingMetadata>)> {
+    let Some(api_key) = resolved_profile_secret_value(profile)? else {
+        return Err(VibexError::validation(
+            "agent_model_provider_secret_missing",
+            "Provider profile is missing an available API key",
+        ));
+    };
+    let Some(base_url) = profile_protocol_base_url(
+        profile,
+        vibex_core::ProviderModelWireApi::AwsBedrockConverse,
+    ) else {
+        return Err(VibexError::validation(
+            "agent_model_provider_endpoint_missing",
+            "Provider profile is missing an API request URL",
+        ));
+    };
+    let client = provider_probe_http_client()?;
+    fetch_models_from_endpoints(
+        &client,
+        &model_list_endpoint_candidates(base_url, profile_uses_full_api_url(profile), false),
+        |request| request.bearer_auth(&api_key),
     )
 }
 
@@ -5535,10 +5802,8 @@ fn fetch_anthropic_profile_models(
             "Provider profile is missing an available auth token",
         ));
     };
-    let Some(base_url) = profile
-        .base_url
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
+    let Some(base_url) =
+        profile_protocol_base_url(profile, vibex_core::ProviderModelWireApi::AnthropicMessages)
     else {
         return Err(VibexError::validation(
             "agent_model_provider_endpoint_missing",
@@ -5732,6 +5997,41 @@ fn provider_api_endpoint_candidates(
     } else {
         vec![direct, v1]
     }
+}
+
+fn google_api_endpoint_candidates(base_url: &str, path: &str, full_url: bool) -> Vec<String> {
+    let base = base_url.trim().trim_end_matches('/');
+    if full_url {
+        return vec![base.to_string()];
+    }
+    let path = path.trim_start_matches('/');
+    if base.ends_with("/v1beta") || base.ends_with("/v1") {
+        return vec![format!("{base}/{path}")];
+    }
+    vec![
+        format!("{base}/v1beta/{path}"),
+        format!("{base}/v1/{path}"),
+        format!("{base}/{path}"),
+    ]
+}
+
+fn encoded_url_path_segment(value: &str) -> VibexResult<String> {
+    let mut url = reqwest::Url::parse("https://vibex.invalid/").map_err(|error| {
+        VibexError::validation(
+            "agent_model_provider_model_url_invalid",
+            "failed to prepare the provider model request path",
+        )
+        .with_diagnostic("error", error.to_string())
+    })?;
+    url.path_segments_mut()
+        .map_err(|_| {
+            VibexError::validation(
+                "agent_model_provider_model_url_invalid",
+                "failed to prepare the provider model request path",
+            )
+        })?
+        .push(value);
+    Ok(url.path().trim_start_matches('/').to_string())
 }
 
 fn model_list_endpoint_candidates(base_url: &str, full_url: bool, prefer_v1: bool) -> Vec<String> {
@@ -8554,6 +8854,146 @@ mod tests {
     }
 
     #[test]
+    fn google_and_bedrock_acp_profiles_send_protocol_correct_prompt_requests() {
+        let dir = tempdir().unwrap();
+        let service = ProviderConfigService::new(dir.path().join("vibex.db"));
+
+        let (google_base_url, google_request) = spawn_recording_http_probe_server();
+        let google_agent = AgentId::parse("gemini").unwrap();
+        let google_profile = service
+            .create_agent_model_provider_profile(AgentModelProviderProfileCreateRequest {
+                agent_id: google_agent.clone(),
+                display_name: "Google compatible".to_string(),
+                account_alias: None,
+                base_url: Some("http://127.0.0.1:1".to_string()),
+                default_model: Some("gemini-test".to_string()),
+                small_model: None,
+                large_model: None,
+                configured_models: vec![ProviderConfiguredModel {
+                    id: "gemini-test".to_string(),
+                    display_name: None,
+                    enabled: true,
+                    wire_api: Some(vibex_core::ProviderModelWireApi::GoogleGenerativeAi),
+                }],
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: Some(ProviderOptions {
+                    schema_version: 1,
+                    entries: vec![option_entry(
+                        vibex_core::ProviderModelWireApi::GoogleGenerativeAi
+                            .protocol_base_url_option_key(),
+                        google_base_url,
+                    )],
+                }),
+                secret_references: Vec::new(),
+            })
+            .unwrap();
+        service
+            .update_agent_model_provider_profile_secret_value(
+                AgentModelProviderProfileSecretValueUpdateRequest {
+                    agent_id: google_agent.clone(),
+                    provider_profile_id: google_profile.id.clone(),
+                    value: Some("google-secret".to_string()),
+                    clear: false,
+                },
+            )
+            .unwrap();
+        let result = service
+            .test_agent_model_provider_profile(AgentModelProviderProfileTestRequest {
+                agent_id: google_agent.clone(),
+                provider_profile_id: google_profile.id.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            result.status,
+            AgentModelProviderTestStatus::Pass,
+            "{result:#?}"
+        );
+        let request = google_request
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+        assert!(headers.starts_with("POST /v1beta/models/gemini-test:generateContent HTTP/1.1"));
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("x-goog-api-key: google-secret")
+        );
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["contents"][0]["parts"][0]["text"], "ping");
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 1);
+
+        let (bedrock_base_url, bedrock_request) = spawn_recording_http_probe_server();
+        let bedrock_agent = AgentId::parse("opencode").unwrap();
+        let bedrock_profile = service
+            .create_agent_model_provider_profile(AgentModelProviderProfileCreateRequest {
+                agent_id: bedrock_agent.clone(),
+                display_name: "Bedrock compatible".to_string(),
+                account_alias: None,
+                base_url: Some("http://127.0.0.1:1".to_string()),
+                default_model: Some("anthropic.claude-v1".to_string()),
+                small_model: None,
+                large_model: None,
+                configured_models: vec![ProviderConfiguredModel {
+                    id: "anthropic.claude-v1".to_string(),
+                    display_name: None,
+                    enabled: true,
+                    wire_api: Some(vibex_core::ProviderModelWireApi::AwsBedrockConverse),
+                }],
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: Some(ProviderOptions {
+                    schema_version: 1,
+                    entries: vec![option_entry(
+                        vibex_core::ProviderModelWireApi::AwsBedrockConverse
+                            .protocol_base_url_option_key(),
+                        bedrock_base_url,
+                    )],
+                }),
+                secret_references: Vec::new(),
+            })
+            .unwrap();
+        service
+            .update_agent_model_provider_profile_secret_value(
+                AgentModelProviderProfileSecretValueUpdateRequest {
+                    agent_id: bedrock_agent.clone(),
+                    provider_profile_id: bedrock_profile.id.clone(),
+                    value: Some("bedrock-secret".to_string()),
+                    clear: false,
+                },
+            )
+            .unwrap();
+        let result = service
+            .test_agent_model_provider_profile(AgentModelProviderProfileTestRequest {
+                agent_id: bedrock_agent,
+                provider_profile_id: bedrock_profile.id,
+            })
+            .unwrap();
+        assert_eq!(
+            result.status,
+            AgentModelProviderTestStatus::Pass,
+            "{result:#?}"
+        );
+        let request = bedrock_request
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+        assert!(headers.starts_with("POST /model/anthropic.claude-v1/converse HTTP/1.1"));
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("authorization: bearer bedrock-secret")
+        );
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["messages"][0]["content"][0]["text"], "ping");
+        assert_eq!(body["inferenceConfig"]["maxTokens"], 1);
+    }
+
+    #[test]
     fn agent_auth_environment_preserves_blank_values_and_requires_explicit_clear() {
         let dir = tempdir().unwrap();
         let service = ProviderConfigService::new(dir.path().join("vibex.db"));
@@ -8850,6 +9290,52 @@ mod tests {
             std::io::Write::write_all(&mut stream, response.as_bytes()).unwrap();
         });
         format!("http://{address}")
+    }
+
+    fn spawn_recording_http_probe_server() -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let bytes_read = stream.read(&mut buffer).unwrap_or(0);
+                if bytes_read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..bytes_read]);
+                let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            sender.send(String::from_utf8(request).unwrap()).unwrap();
+            let body = r#"{"ok":true}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            std::io::Write::write_all(&mut stream, response.as_bytes()).unwrap();
+        });
+        (format!("http://{address}"), receiver)
     }
 
     #[test]

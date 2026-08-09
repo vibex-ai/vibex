@@ -1059,6 +1059,43 @@ pub enum ProviderModelWireApi {
     OpenaiResponses,
     OpenaiChatCompletions,
     AnthropicMessages,
+    GoogleGenerativeAi,
+    AwsBedrockConverse,
+}
+
+impl ProviderModelWireApi {
+    pub const ALL: [Self; 5] = [
+        Self::OpenaiResponses,
+        Self::OpenaiChatCompletions,
+        Self::AnthropicMessages,
+        Self::GoogleGenerativeAi,
+        Self::AwsBedrockConverse,
+    ];
+
+    pub const fn wire_protocol_id(self) -> &'static str {
+        match self {
+            Self::OpenaiResponses => crate::WIRE_PROTOCOL_OPENAI_RESPONSES,
+            Self::OpenaiChatCompletions => crate::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+            Self::AnthropicMessages => crate::WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
+            Self::GoogleGenerativeAi => crate::WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI,
+            Self::AwsBedrockConverse => crate::WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE,
+        }
+    }
+
+    pub fn from_wire_protocol_id(value: &str) -> Option<Self> {
+        match value.trim() {
+            crate::WIRE_PROTOCOL_OPENAI_RESPONSES => Some(Self::OpenaiResponses),
+            crate::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS => Some(Self::OpenaiChatCompletions),
+            crate::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => Some(Self::AnthropicMessages),
+            crate::WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI => Some(Self::GoogleGenerativeAi),
+            crate::WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE => Some(Self::AwsBedrockConverse),
+            _ => None,
+        }
+    }
+
+    pub fn protocol_base_url_option_key(self) -> String {
+        format!("protocolBaseUrl.{}", self.wire_protocol_id())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2234,6 +2271,26 @@ pub struct AdapterDiagnostic {
 #[cfg(test)]
 mod tests {
     use super::{ProviderConfiguredModel, ProviderModelWireApi};
+
+    #[test]
+    fn model_wire_protocol_ids_round_trip_the_canonical_five_protocols() {
+        assert_eq!(ProviderModelWireApi::ALL.len(), 5);
+        for wire_api in ProviderModelWireApi::ALL {
+            let protocol_id = wire_api.wire_protocol_id();
+            assert_eq!(
+                ProviderModelWireApi::from_wire_protocol_id(protocol_id),
+                Some(wire_api)
+            );
+            assert_eq!(
+                wire_api.protocol_base_url_option_key(),
+                format!("protocolBaseUrl.{protocol_id}")
+            );
+        }
+        assert_eq!(
+            ProviderModelWireApi::from_wire_protocol_id("openai_completions"),
+            None
+        );
+    }
 
     #[test]
     fn configured_model_without_wire_api_remains_backward_compatible() {
