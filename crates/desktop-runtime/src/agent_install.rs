@@ -421,6 +421,13 @@ impl AgentInstallService {
                 None,
             ),
             ResolvedDistribution::Uvx(_) => (None, Some(self.select_uv_runtime().await?)),
+            ResolvedDistribution::Binary(_) if latest_npm_companion(&agent_id).is_some() => (
+                Some(
+                    self.select_node_runtime(&minimum_node_version(&agent_id))
+                        .await?,
+                ),
+                None,
+            ),
             ResolvedDistribution::Binary(_) => (None, None),
             ResolvedDistribution::Kiro(_) => (None, None),
         };
@@ -658,7 +665,8 @@ impl AgentInstallService {
     ) -> VibexResult<InstalledAgent> {
         match distribution {
             ResolvedDistribution::Binary(target) => {
-                self.install_binary(agent_id, entry, target).await
+                self.install_binary(agent_id, entry, target, node_runtime)
+                    .await
             }
             ResolvedDistribution::Npm(npx) => {
                 let node_runtime = node_runtime.ok_or_else(|| {
@@ -800,9 +808,31 @@ impl AgentInstallService {
         agent_id: &AgentId,
         entry: &RegistryEntry,
         target: RegistryBinaryTarget,
+        node: Option<NodeRuntime>,
     ) -> VibexResult<InstalledAgent> {
         validate_https_url(&target.archive, "Agent binary")?;
         let sha256 = optional_sha256(target.sha256.as_deref())?;
+        let command_rel = safe_relative_path(&target.cmd, "binary command")?;
+        let runtime_package = if let Some(package) = latest_npm_companion(agent_id) {
+            let metadata = self.fetch_latest_npm_metadata(package).await?;
+            Some(
+                self.resolve_verified_npm_package(package, &metadata.version)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let node = runtime_package.is_some().then_some(node).flatten();
+        if runtime_package.is_some() && node.is_none() {
+            return Err(VibexError::capability(
+                "agent_node_runtime_unselected",
+                "npm Agent installation has no selected Node.js runtime",
+            ));
+        }
+        let companion_launcher = runtime_package
+            .as_ref()
+            .map(|_| npm_companion_binary_launcher_source(agent_id, &command_rel))
+            .transpose()?;
         let args_identity = serde_json::to_string(&target.args).map_err(|error| {
             VibexError::validation(
                 "agent_binary_args_invalid",
@@ -810,14 +840,32 @@ impl AgentInstallService {
             )
             .with_diagnostic("error", error.to_string())
         })?;
-        let fingerprint = distribution_fingerprint(&[
+        let node_identity = node.as_ref().map(NodeRuntime::fingerprint_identity);
+        let mut fingerprint_parts = vec![
             entry.id.as_str(),
             entry.version.as_str(),
             target.archive.as_str(),
             sha256.as_deref().unwrap_or_default(),
             target.cmd.as_str(),
             args_identity.as_str(),
-        ]);
+        ];
+        if let (Some(runtime_package), Some(node_identity)) =
+            (runtime_package.as_ref(), node_identity.as_deref())
+        {
+            fingerprint_parts.extend([
+                runtime_package.name.as_str(),
+                runtime_package.version.as_str(),
+                runtime_package.integrity.as_str(),
+                runtime_package.tarball.as_str(),
+                runtime_package.bin_path.as_str(),
+                npm_companion_command(agent_id).unwrap_or_default(),
+                node_identity,
+            ]);
+        }
+        if let Some(companion_launcher) = companion_launcher.as_deref() {
+            fingerprint_parts.push(companion_launcher);
+        }
+        let fingerprint = distribution_fingerprint(&fingerprint_parts);
         let target_root = self.version_root(agent_id, &entry.version, &fingerprint)?;
         if let Some(installed) = load_or_remove_cached_installation(&target_root, &fingerprint)? {
             return Ok(installed);
@@ -843,20 +891,52 @@ impl AgentInstallService {
             .with_diagnostic("error", error.to_string())
         })??;
 
-        let command_rel = safe_relative_path(&target.cmd, "binary command")?;
         let command_path = staging.join(&command_rel);
         ensure_regular_file(&staging, &command_path, "agent_binary_missing")?;
         make_executable(&command_path)?;
+        let launch = if let (Some(runtime_package), Some(companion_launcher), Some(node)) = (
+            runtime_package.as_ref(),
+            companion_launcher.as_deref(),
+            node.as_ref(),
+        ) {
+            self.install_verified_npm_packages(agent_id, &staging, node, &[runtime_package])
+                .await?;
+            let runtime_script = staging.join(npm_package_bin_relative_path(runtime_package)?);
+            ensure_regular_file(&staging, &runtime_script, "agent_npm_runtime_bin_missing")?;
+            let runtime_command = npm_command_path(
+                &staging,
+                npm_companion_command(agent_id).ok_or_else(|| {
+                    VibexError::validation(
+                        "agent_npm_runtime_command_missing",
+                        "managed npm companion command was not configured",
+                    )
+                })?,
+            );
+            ensure_regular_file(
+                &staging,
+                &runtime_command,
+                "agent_npm_runtime_command_missing",
+            )?;
+            let launcher = staging.join(NPM_COMPANION_LAUNCHER_NAME);
+            write_private_file(&launcher, companion_launcher.as_bytes())?;
+            ManifestLaunch::Node {
+                node: node.node.to_string_lossy().into_owned(),
+                script: NPM_COMPANION_LAUNCHER_NAME.to_string(),
+                args: target.args,
+            }
+        } else {
+            ManifestLaunch::Binary {
+                command: command_rel.to_string_lossy().into_owned(),
+                args: target.args,
+            }
+        };
         let manifest = InstallManifest {
             registry_agent_id: entry.id.clone(),
             version: entry.version.clone(),
             fingerprint: fingerprint.clone(),
-            runtime_version: None,
+            runtime_version: runtime_package.map(|package| package.version),
             distribution_kind: AgentManagedDistributionKind::Binary,
-            launch: ManifestLaunch::Binary {
-                command: command_rel.to_string_lossy().into_owned(),
-                args: target.args,
-            },
+            launch,
         };
         write_json_private(&staging.join("vibex-install.json"), &manifest)?;
         publish_staging(&staging, &target_root)?;
@@ -1056,99 +1136,17 @@ impl AgentInstallService {
 
         let staging = self.create_staging(agent_id)?;
         let mut staging_guard = StagingGuard::new(staging.clone());
-        let mut dependencies = serde_json::Map::new();
-        dependencies.insert(
-            package.name.clone(),
-            serde_json::Value::String(format!("={}", package.version)),
-        );
+        let mut packages = vec![&package];
         if let Some(runtime_package) = runtime_package.as_ref() {
-            dependencies.insert(
-                runtime_package.name.clone(),
-                serde_json::Value::String(format!("={}", runtime_package.version)),
-            );
+            packages.push(runtime_package);
         }
-        let package_json = serde_json::json!({
-            "name": "vibex-managed-acp-agent",
-            "private": true,
-            "version": "0.0.0",
-            "dependencies": dependencies,
-        });
-        write_json_private(&staging.join("package.json"), &package_json)?;
-        let npm_config = write_isolated_npm_configs(&staging)?;
-        fs::create_dir_all(self.root.join("cache/npm")).map_err(|error| {
-            storage_error(
-                "agent_npm_cache_create_failed",
-                "managed npm cache could not be created",
-                error,
-            )
-        })?;
-
-        let mut command = node.npm_command();
-        command
-            .arg("install")
-            .arg("--ignore-scripts")
-            .arg("--no-audit")
-            .arg("--no-fund")
-            .arg("--save-exact")
-            .arg("--registry=https://registry.npmjs.org/")
-            .arg("--")
-            .arg(&npx.package)
-            .args(runtime_package.as_ref().map(VerifiedNpmPackage::exact_spec))
-            .current_dir(&staging)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .env("npm_config_cache", self.root.join("cache/npm"))
-            .env("npm_config_userconfig", &npm_config.user)
-            .env("npm_config_globalconfig", &npm_config.global)
-            .env("npm_config_update_notifier", "false")
-            .env_remove("NPM_TOKEN")
-            .env_remove("NODE_AUTH_TOKEN");
-        let status = timeout(INSTALL_TIMEOUT, command.status())
-            .await
-            .map_err(|_| {
-                VibexError::process(
-                    "agent_npm_install_timeout",
-                    "managed npm installation timed out",
-                )
-            })?
-            .map_err(|error| {
-                process_error(
-                    "agent_npm_install_spawn_failed",
-                    "managed npm installation could not start",
-                    error,
-                )
-            })?;
-        if !status.success() {
-            return Err(VibexError::process(
-                "agent_npm_install_failed",
-                "managed npm installation failed",
-            )
-            .with_diagnostic("status", status.to_string()));
-        }
-
-        run_trusted_npm_setup(agent_id, &staging, &node, &npm_config).await?;
-
-        verify_npm_lock(
-            &staging,
-            &package.name,
-            &package.version,
-            &package.integrity,
-            &package.tarball,
-        )?;
+        self.install_verified_npm_packages(agent_id, &staging, &node, &packages)
+            .await?;
         let adapter_script = staging.join(&adapter_script_rel);
         ensure_regular_file(&staging, &adapter_script, "agent_npm_bin_missing")?;
         let script = if let (Some(runtime_package), Some(companion_launcher)) =
             (runtime_package.as_ref(), companion_launcher.as_deref())
         {
-            verify_npm_lock(
-                &staging,
-                &runtime_package.name,
-                &runtime_package.version,
-                &runtime_package.integrity,
-                &runtime_package.tarball,
-            )?;
             let runtime_script = staging.join(npm_package_bin_relative_path(runtime_package)?);
             ensure_regular_file(&staging, &runtime_script, "agent_npm_runtime_bin_missing")?;
             let runtime_command = npm_command_path(
@@ -1196,6 +1194,105 @@ impl AgentInstallService {
         publish_staging(&staging, &target_root)?;
         staging_guard.disarm();
         load_installed_agent(&target_root, &fingerprint)
+    }
+
+    async fn install_verified_npm_packages(
+        &self,
+        agent_id: &AgentId,
+        staging: &Path,
+        node: &NodeRuntime,
+        packages: &[&VerifiedNpmPackage],
+    ) -> VibexResult<()> {
+        if packages.is_empty() {
+            return Err(VibexError::validation(
+                "agent_npm_packages_missing",
+                "managed npm installation did not specify any packages",
+            ));
+        }
+        let dependencies =
+            packages
+                .iter()
+                .fold(serde_json::Map::new(), |mut dependencies, package| {
+                    dependencies.insert(
+                        package.name.clone(),
+                        serde_json::Value::String(format!("={}", package.version)),
+                    );
+                    dependencies
+                });
+        let package_json = serde_json::json!({
+            "name": "vibex-managed-acp-agent",
+            "private": true,
+            "version": "0.0.0",
+            "dependencies": dependencies,
+        });
+        write_json_private(&staging.join("package.json"), &package_json)?;
+        let npm_config = write_isolated_npm_configs(staging)?;
+        fs::create_dir_all(self.root.join("cache/npm")).map_err(|error| {
+            storage_error(
+                "agent_npm_cache_create_failed",
+                "managed npm cache could not be created",
+                error,
+            )
+        })?;
+
+        let mut command = node.npm_command();
+        command
+            .arg("install")
+            .arg("--ignore-scripts")
+            .arg("--no-audit")
+            .arg("--no-fund")
+            .arg("--save-exact")
+            .arg("--registry=https://registry.npmjs.org/")
+            .arg("--");
+        for package in packages {
+            command.arg(package.exact_spec());
+        }
+        command
+            .current_dir(staging)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .env("npm_config_cache", self.root.join("cache/npm"))
+            .env("npm_config_userconfig", &npm_config.user)
+            .env("npm_config_globalconfig", &npm_config.global)
+            .env("npm_config_update_notifier", "false")
+            .env_remove("NPM_TOKEN")
+            .env_remove("NODE_AUTH_TOKEN");
+        let status = timeout(INSTALL_TIMEOUT, command.status())
+            .await
+            .map_err(|_| {
+                VibexError::process(
+                    "agent_npm_install_timeout",
+                    "managed npm installation timed out",
+                )
+            })?
+            .map_err(|error| {
+                process_error(
+                    "agent_npm_install_spawn_failed",
+                    "managed npm installation could not start",
+                    error,
+                )
+            })?;
+        if !status.success() {
+            return Err(VibexError::process(
+                "agent_npm_install_failed",
+                "managed npm installation failed",
+            )
+            .with_diagnostic("status", status.to_string()));
+        }
+
+        run_trusted_npm_setup(agent_id, staging, node, &npm_config).await?;
+        for package in packages {
+            verify_npm_lock(
+                staging,
+                &package.name,
+                &package.version,
+                &package.integrity,
+                &package.tarball,
+            )?;
+        }
+        Ok(())
     }
 
     async fn install_uvx(
@@ -3616,6 +3713,87 @@ import(pathToFileURL(adapter).href).catch((error) => {{
     ))
 }
 
+fn npm_companion_binary_launcher_source(
+    agent_id: &AgentId,
+    adapter_binary: &Path,
+) -> VibexResult<String> {
+    let command = npm_companion_command(agent_id).ok_or_else(|| {
+        VibexError::validation(
+            "agent_npm_launcher_agent_invalid",
+            "managed npm companion launcher did not have a command",
+        )
+    })?;
+    let environment = npm_companion_environment(agent_id).ok_or_else(|| {
+        VibexError::validation(
+            "agent_npm_launcher_agent_invalid",
+            "managed npm companion launcher did not have an environment key",
+        )
+    })?;
+    let adapter_binary = adapter_binary.to_str().ok_or_else(|| {
+        VibexError::validation(
+            "agent_npm_launcher_path_invalid",
+            "ACP adapter path was not valid UTF-8",
+        )
+    })?;
+    let adapter_binary = serde_json::to_string(adapter_binary).map_err(|error| {
+        VibexError::validation(
+            "agent_npm_launcher_path_invalid",
+            "ACP adapter path could not be encoded",
+        )
+        .with_diagnostic("error", error.to_string())
+    })?;
+    let windows_command = serde_json::to_string(&format!("{command}.cmd")).map_err(|error| {
+        VibexError::validation(
+            "agent_npm_launcher_command_invalid",
+            "managed npm companion command could not be encoded",
+        )
+        .with_diagnostic("error", error.to_string())
+    })?;
+    let command = serde_json::to_string(command).map_err(|error| {
+        VibexError::validation(
+            "agent_npm_launcher_command_invalid",
+            "managed npm companion command could not be encoded",
+        )
+        .with_diagnostic("error", error.to_string())
+    })?;
+    let environment = serde_json::to_string(environment).map_err(|error| {
+        VibexError::validation(
+            "agent_npm_launcher_environment_invalid",
+            "managed npm companion environment key could not be encoded",
+        )
+        .with_diagnostic("error", error.to_string())
+    })?;
+    let label = serde_json::to_string(agent_id.as_str()).map_err(|error| {
+        VibexError::validation(
+            "agent_npm_launcher_agent_invalid",
+            "managed npm Agent id could not be encoded",
+        )
+        .with_diagnostic("error", error.to_string())
+    })?;
+    Ok(format!(
+        r#""use strict";
+const path = require("node:path");
+const {{ spawn }} = require("node:child_process");
+
+const companionCommand = process.platform === "win32" ? {windows_command} : {command};
+process.env[{environment}] = path.join(__dirname, "node_modules", ".bin", companionCommand);
+const adapter = path.join(__dirname, {adapter_binary});
+const child = spawn(adapter, process.argv.slice(2), {{ stdio: "inherit", env: process.env }});
+child.on("error", (error) => {{
+  console.error("Failed to start {label} ACP adapter:", error);
+  process.exitCode = 1;
+}});
+child.on("close", (code, signal) => {{
+  if (signal) {{
+    process.kill(process.pid, signal);
+  }} else {{
+    process.exitCode = code ?? 1;
+  }}
+}});
+"#
+    ))
+}
+
 #[cfg(test)]
 fn pi_acp_launcher_source(adapter_script: &Path) -> VibexResult<String> {
     npm_companion_launcher_source(
@@ -5131,6 +5309,20 @@ mod tests {
     }
 
     #[test]
+    fn amp_binary_launcher_uses_the_private_cli_and_forwards_acp_arguments() {
+        let launcher = npm_companion_binary_launcher_source(
+            &AgentId::parse("amp-acp").unwrap(),
+            Path::new("amp-acp"),
+        )
+        .unwrap();
+
+        assert!(launcher.contains("AMP_CLI_PATH"));
+        assert!(launcher.contains("node_modules\", \".bin"));
+        assert!(launcher.contains("const adapter = path.join(__dirname, \"amp-acp\")"));
+        assert!(launcher.contains("spawn(adapter, process.argv.slice(2)"));
+    }
+
+    #[test]
     fn exact_npm_specs_reject_ranges_and_identity_drift() {
         assert_eq!(
             parse_exact_npm_spec("@scope/agent@1.2.3", "1.2.3").unwrap(),
@@ -5752,6 +5944,39 @@ printf '%s\n' '{"version":"1.2.3","scripts":["test-package"]}'
 
         let error = load_installed_agent(&root, "fixture").unwrap_err();
         assert_eq!(error.code, "agent_npm_runtime_version_missing");
+    }
+
+    #[test]
+    fn amp_binary_install_manifest_requires_and_accepts_private_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("amp");
+        fs::create_dir_all(&root).unwrap();
+        let node = root.join("node");
+        let launcher = root.join(NPM_COMPANION_LAUNCHER_NAME);
+        fs::write(&node, b"fixture").unwrap();
+        fs::write(&launcher, b"fixture").unwrap();
+        write_private_file(&npm_command_path(&root, "amp"), b"fixture").unwrap();
+
+        let mut manifest = InstallManifest {
+            registry_agent_id: "amp-acp".to_string(),
+            version: "0.9.0".to_string(),
+            fingerprint: "fixture".to_string(),
+            runtime_version: None,
+            distribution_kind: AgentManagedDistributionKind::Binary,
+            launch: ManifestLaunch::Node {
+                node: node.to_string_lossy().into_owned(),
+                script: NPM_COMPANION_LAUNCHER_NAME.to_string(),
+                args: Vec::new(),
+            },
+        };
+        write_json_private(&root.join("vibex-install.json"), &manifest).unwrap();
+
+        let error = load_installed_agent(&root, "fixture").unwrap_err();
+        assert_eq!(error.code, "agent_npm_runtime_version_missing");
+
+        manifest.runtime_version = Some("0.0.1".to_string());
+        write_json_private(&root.join("vibex-install.json"), &manifest).unwrap();
+        assert!(load_installed_agent(&root, "fixture").is_ok());
     }
 
     #[tokio::test]
