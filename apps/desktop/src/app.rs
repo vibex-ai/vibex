@@ -8419,10 +8419,6 @@ impl VibexWorkbench {
             ..
         } = message;
         let is_command = command_invocation.is_some();
-        self.set_session_turn_pending(&session_id, true);
-        if self.selected_session_id.as_ref() == Some(&session_id) {
-            self.agent_error = None;
-        }
         let generation = self.session_generation;
         let submitted_session_id = session_id.clone();
         let idempotency_key = format!(
@@ -8432,6 +8428,29 @@ impl VibexWorkbench {
             message_id,
             unix_timestamp_ms()
         );
+        let optimistic_message = (!is_command).then(|| OptimisticUserMessage {
+            session_id: session_id.clone(),
+            item_id: TimelineItemId::new(),
+            after_sequence: if self.timeline.session_id.as_ref() == Some(&session_id) {
+                self.timeline.authoritative_end_sequence.unwrap_or(0)
+            } else {
+                self.agent_session_view_cache
+                    .get(session_id.as_str())
+                    .and_then(|entry| entry.timeline.authoritative_end_sequence)
+                    .unwrap_or(0)
+            },
+            submitted_at_ms: unix_timestamp_ms(),
+            text: text.clone(),
+            attachments: attachments.clone(),
+        });
+        self.set_session_turn_pending(&session_id, true);
+        if let Some(optimistic_message) = optimistic_message {
+            self.install_optimistic_user_message(optimistic_message);
+        }
+        if self.selected_session_id.as_ref() == Some(&session_id) {
+            self.agent_error = None;
+        }
+        cx.notify();
         if !is_command {
             // Keep a durable-submission locator so background delivery and terminal
             // failure states remain reconciled even though transient states are hidden.
@@ -8501,6 +8520,8 @@ impl VibexWorkbench {
                         .retain(|locator| locator.message_idempotency_key != submit_key);
                     this.composer_submission_states
                         .retain(|state| state.message_idempotency_key != submit_key);
+                } else if !is_command {
+                    this.discard_optimistic_user_message(&submitted_session_id);
                 }
                 this.set_session_turn_pending(&submitted_session_id, false);
                 this.sync_auto_continue_for_session(&submitted_session_id, cx);
@@ -36198,6 +36219,37 @@ mod tests {
     }
 
     #[test]
+    fn composer_submission_projects_user_turn_before_background_runtime_wait() {
+        let source = include_str!("app.rs");
+        let dispatch = source
+            .split_once("    fn dispatch_composer_message(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn maybe_dispatch_next_composer_queue_message(")
+            })
+            .map(|(body, _)| body)
+            .expect("Composer dispatch should remain inspectable");
+
+        let pending = dispatch
+            .find("self.set_session_turn_pending(&session_id, true);")
+            .expect("submission should immediately project the Agent as running");
+        let optimistic = dispatch
+            .find("self.install_optimistic_user_message(optimistic_message);")
+            .expect("submission should immediately project the user message");
+        let repaint = dispatch[pending..]
+            .find("cx.notify();")
+            .map(|offset| pending + offset)
+            .expect("the optimistic projection should request an immediate repaint");
+        let background = dispatch
+            .find("let runner = gpui_tokio::Tokio::spawn(cx, async move")
+            .expect("runtime preparation and prompt dispatch should stay in the background");
+
+        assert!(pending < optimistic);
+        assert!(optimistic < repaint);
+        assert!(repaint < background);
+        assert!(dispatch.contains("this.discard_optimistic_user_message(&submitted_session_id);"));
+    }
+
+    #[test]
     fn agent_turn_completion_is_fenced_by_generation_and_session() {
         let session = VibexSessionId::parse("session_active").unwrap();
         let other = VibexSessionId::parse("session_other").unwrap();
@@ -38131,6 +38183,18 @@ mod tests {
         assert_eq!(projected.len(), 1);
         assert_eq!(timeline.items.len(), 0);
         assert_eq!(projected[0].sequence, 1);
+        let pending_turns =
+            timeline_conversation_turns(&projected, Some(AgentSessionState::Running), true);
+        assert_eq!(pending_turns.len(), 1);
+        assert_eq!(
+            pending_turns[0]
+                .user_row
+                .as_ref()
+                .map(|row| row.body.trim()),
+            Some("first prompt")
+        );
+        assert!(!pending_turns[0].complete);
+        assert!(pending_turns[0].conclusion_row.is_none());
 
         let mut timeline = TimelineModel::default();
         timeline.replace_authoritative(
@@ -38146,6 +38210,15 @@ mod tests {
             )],
         );
         assert!(optimistic.projected_items(&timeline).is_none());
+        let authoritative_turns = timeline.conversation_turns(Some(AgentSessionState::Idle), false);
+        assert_eq!(authoritative_turns.len(), 1);
+        assert_eq!(
+            authoritative_turns[0]
+                .user_row
+                .as_ref()
+                .map(|row| row.body.as_str()),
+            Some("first prompt")
+        );
     }
 
     #[test]

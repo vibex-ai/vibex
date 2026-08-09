@@ -626,6 +626,13 @@ Remote attach role  -> viewer
 - Ordinary send calls the durable send API directly with the displayed desired
   runtime and a stable message idempotency key. It does not await the switch and
   is not disabled by another pending submission.
+- When an ordinary Composer action enters durable send, Desktop immediately
+  projects the captured user message and a presentation-only running Agent turn
+  before spawning the durable send future. Runtime switching, Context Bridge
+  preparation, Ready convergence, and prompt dispatch remain background work.
+  The projection never mutates the authoritative Timeline: a matching persisted
+  user row replaces it, while a terminal send failure removes it and clears the
+  local running state.
 - Local/session storage may persist only the bounded locator and runtime client
   handle. Prompt text, attachments, tokens, secrets, raw errors, native ids,
   and live binding data must not be persisted there.
@@ -659,15 +666,19 @@ Remote attach role  -> viewer
   from backend revisions without duplicate prompts.
 - Base: a switch completes inside 400 ms and the UI moves directly from the old
   effective label to the new one without flashing a pending row.
-- Bad: optimistic UI changes effective state, inserts a fake user Timeline row,
-  stores message text in localStorage, or applies an old attachment snapshot to
-  the new generation.
+- Bad: optimistic UI changes effective state, writes a fake authoritative user
+  Timeline row, waits for runtime readiness before projecting the captured user
+  turn, stores message text in localStorage, or applies an old attachment
+  snapshot to the new generation.
 
 ### 6. Tests Required
 
 - Shared unit tests cover revision ordering, overlay reconciliation, Catalog
   grouping, exact fence rejection, status presentation, locator sanitization,
   bounds, TTL, and deduplication.
+- Desktop tests cover synchronous optimistic user-turn plus pending-Agent
+  projection before the background durable send, authoritative replacement
+  without duplication, and failure cleanup.
 - Desktop/Web typechecks and builds cover generated contracts and controller
   wiring; lint must report no unsafe casts or suppressed errors.
 - Browser checks exercise preparing, queued, settled, read-only, and recovery
@@ -693,6 +704,7 @@ await sendMessage(text);
 setOverlay({ idempotencyKey, desired: selection });
 setDesiredRuntime({ expectedRevision, expectedSelectionRevision, desired: selection });
 registerSubmissionLocator({ sessionId, messageIdempotencyKey, desiredRuntime: selection });
+projectOptimisticUserTurn({ sessionId, text, attachments });
 sendMessage({ sessionId, messageIdempotencyKey, desiredRuntime: selection, text });
 ```
 
