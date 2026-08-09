@@ -7643,26 +7643,33 @@ impl ManagementCenter {
         let Some(selected_agent) = selected_agent.cloned() else {
             return detail_empty_state(copy.no_agents, copy.no_agents_description, cx);
         };
+        let agent_header = management_agent_detail_header(&selected_agent, cx);
         let selected_id = selected_agent.id.as_str().to_string();
         if matches!(
             self.agent_mutations.get(&selected_id),
             Some(ManagementMutation::AgentInstall(active_id)) if active_id == &selected_id
         ) {
-            return self.render_agent_install_loading(
-                &selected_agent,
-                matches!(
-                    selected_agent.managed_install.status,
-                    vibex_core::AgentManagedInstallStatus::UpdateAvailable
-                        | vibex_core::AgentManagedInstallStatus::Upgrading
-                ),
-                cx,
-            );
+            return v_flex()
+                .w_full()
+                .gap_4()
+                .child(agent_header)
+                .child(self.render_agent_install_loading(
+                    &selected_agent,
+                    matches!(
+                        selected_agent.managed_install.status,
+                        vibex_core::AgentManagedInstallStatus::UpdateAvailable
+                            | vibex_core::AgentManagedInstallStatus::Upgrading
+                    ),
+                    cx,
+                ))
+                .into_any_element();
         }
         if !selected_agent.added {
             if selected_agent.managed_install.managed {
                 return v_flex()
                     .w_full()
-                    .gap_3()
+                    .gap_4()
+                    .child(agent_header)
                     .child(self.render_agent_installation_card(&selected_agent, window, cx))
                     .into_any_element();
             }
@@ -7673,7 +7680,8 @@ impl ManagementCenter {
             return v_flex()
                 .w_full()
                 .min_w_0()
-                .gap_3()
+                .gap_4()
+                .child(agent_header)
                 .child(self.render_agent_installation_card(&selected_agent, window, cx))
                 .child(self.render_agent_authentication(window, cx))
                 .into_any_element();
@@ -7724,7 +7732,6 @@ impl ManagementCenter {
                 .filter(|value| !value.is_empty())
                 .map(str::to_string)
                 .unwrap_or_else(management_unconfigured_label);
-            let hover_group = SharedString::from(format!("provider-row-hover-{id}"));
             let testing = matches!(
                 &self.mutation,
                 Some(ManagementMutation::ProviderProbe(active_id)) if active_id == &id
@@ -7735,18 +7742,25 @@ impl ManagementCenter {
             );
             let selectable = h_flex()
                 .id(SharedString::from(format!("provider-select-{id}")))
-                .w_full()
+                .flex_1()
                 .min_w_0()
-                .min_h(px(76.0))
+                .min_h(px(72.0))
                 .items_center()
                 .gap_3()
                 .cursor_pointer()
                 .px_3()
-                .py(px(10.0))
+                .py(px(12.0))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.select_provider_profile(select_id.clone(), cx);
                 }))
+                .child(
+                    Icon::default()
+                        .path("icons/vibex/grip-vertical.svg")
+                        .size(px(16.0))
+                        .text_color(cx.theme().muted_foreground.opacity(0.55)),
+                )
                 .child(management_profile_glyph(
+                    profile.kind,
                     &profile.display_name,
                     is_default,
                     cx,
@@ -7778,29 +7792,30 @@ impl ManagementCenter {
                         )
                         .child(
                             div()
+                                .min_w_0()
                                 .truncate()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
-                                .child(address),
+                                .child(format!(
+                                    "{} · {}",
+                                    address,
+                                    management_model_count(profile.configured_model_count)
+                                )),
                         ),
                 );
             let mut actions = h_flex()
-                .absolute()
-                .right_3()
-                .top_2()
-                .bottom_2()
+                .flex_none()
                 .items_center()
                 .justify_end()
                 .gap_1()
-                .invisible()
-                .bg(cx.theme().background.opacity(0.96))
-                .group_hover(&hover_group, |style| style.visible());
+                .pr_3();
             if !is_default {
-                actions = actions.child(
+                actions = actions.child(button_with_aria_label(
                     Button::new(SharedString::from(format!("provider-default-{default_id}")))
                         .xsmall()
                         .outline()
                         .compact()
+                        .size(px(30.0))
                         .icon(IconName::Check)
                         .tooltip(management_set_default_label())
                         .disabled(pending)
@@ -7811,14 +7826,16 @@ impl ManagementCenter {
                                 cx,
                             )
                         })),
-                );
+                    management_set_default_label(),
+                ));
             }
             actions = actions
-                .child(
+                .child(button_with_aria_label(
                     Button::new(SharedString::from(format!("provider-edit-{id}")))
                         .xsmall()
                         .secondary()
                         .compact()
+                        .size(px(30.0))
                         .icon(Icon::default().path("icons/vibex/pencil.svg"))
                         .disabled(pending)
                         .tooltip(management_locale_text(
@@ -7829,14 +7846,16 @@ impl ManagementCenter {
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.open_profile_editor(edit_profile.clone(), window, cx)
                         })),
-                )
-                .child(
+                    management_locale_text("Edit configuration", "编辑配置", "編輯配置"),
+                ))
+                .child(button_with_aria_label(
                     Button::new(SharedString::from(format!(
                         "provider-duplicate-{duplicate_id}"
                     )))
                     .xsmall()
                     .outline()
                     .compact()
+                    .size(px(30.0))
                     .icon(IconName::Copy)
                     .disabled(pending)
                     .tooltip(management_locale_text(
@@ -7847,12 +7866,14 @@ impl ManagementCenter {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.duplicate_provider_profile(duplicate_id.clone(), cx)
                     })),
-                )
-                .child(
+                    management_locale_text("Duplicate configuration", "复制配置", "複製配置"),
+                ))
+                .child(button_with_aria_label(
                     Button::new(SharedString::from(format!("provider-test-{test_id}")))
                         .xsmall()
                         .secondary()
                         .compact()
+                        .size(px(30.0))
                         .icon(Icon::default().path("icons/vibex/activity.svg"))
                         .loading(testing)
                         .disabled(pending)
@@ -7864,12 +7885,14 @@ impl ManagementCenter {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.test_provider_profile(test_id.clone(), test_agent.clone(), cx)
                         })),
-                )
-                .child(
+                    management_test_label(),
+                ))
+                .child(button_with_aria_label(
                     Button::new(SharedString::from(format!("provider-delete-{delete_id}")))
                         .xsmall()
                         .danger()
                         .compact()
+                        .size(px(30.0))
                         .icon(IconName::Delete)
                         .loading(deleting)
                         .disabled(pending)
@@ -7884,17 +7907,19 @@ impl ManagementCenter {
                                 cx,
                             )
                         })),
-                );
+                    management_delete_profile_label(),
+                ));
             profile_rows = profile_rows.child(
                 div()
                     .id(SharedString::from(format!("provider-row-{id}")))
-                    .group(hover_group)
                     .relative()
+                    .flex()
+                    .items_center()
                     .w_full()
                     .min_w_0()
-                    .min_h(px(76.0))
+                    .min_h(px(72.0))
                     .overflow_hidden()
-                    .rounded(px(16.0))
+                    .rounded(px(14.0))
                     .border_1()
                     .border_color(if is_default {
                         cx.theme().primary.opacity(0.25)
@@ -7910,18 +7935,10 @@ impl ManagementCenter {
                     } else {
                         cx.theme().background.opacity(0.90)
                     })
-                    .hover(|style| style.border_color(cx.theme().ring.opacity(0.45)))
-                    .when(is_default, |row| {
-                        row.child(
-                            div()
-                                .absolute()
-                                .left_0()
-                                .top_3()
-                                .bottom_3()
-                                .w(px(4.0))
-                                .rounded(px(2.0))
-                                .bg(cx.theme().primary.opacity(0.55)),
-                        )
+                    .hover(|style| {
+                        style
+                            .border_color(cx.theme().ring.opacity(0.55))
+                            .bg(cx.theme().accent.opacity(if active { 0.28 } else { 0.12 }))
                     })
                     .child(selectable)
                     .child(actions),
@@ -7934,7 +7951,8 @@ impl ManagementCenter {
         v_flex()
             .w_full()
             .min_w_0()
-            .gap_3()
+            .gap_4()
+            .child(agent_header)
             .child(installation)
             .child(authentication)
             .child(
@@ -7954,13 +7972,22 @@ impl ManagementCenter {
                             .justify_between()
                             .gap_3()
                             .child(
-                                v_flex().min_w_0().gap_1().child(
-                                    div()
-                                        .truncate()
-                                        .text_sm()
-                                        .font_semibold()
-                                        .child(copy.provider_configuration),
-                                ),
+                                v_flex()
+                                    .min_w_0()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_sm()
+                                            .font_semibold()
+                                            .child(copy.provider_configuration),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(management_profile_count(profiles.len())),
+                                    ),
                             )
                             .child(
                                 h_flex()
@@ -12609,24 +12636,80 @@ fn management_agent_glyph(identity: &str, label: &str, active: bool, cx: &App) -
         .into_any_element()
 }
 
-fn management_profile_glyph(label: &str, is_default: bool, cx: &App) -> AnyElement {
-    let initials = label
-        .split_whitespace()
-        .filter_map(|part| part.chars().next())
-        .take(2)
-        .collect::<String>();
-    let initials = if initials.is_empty() {
-        label.chars().take(2).collect::<String>()
-    } else {
-        initials
-    };
+fn management_agent_detail_header(agent: &AgentSnapshotEntry, cx: &App) -> AnyElement {
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .items_center()
+        .gap_3()
+        .px_1()
+        .py_1()
+        .child(
+            div()
+                .size(px(42.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(cx.theme().border.opacity(0.75))
+                .bg(cx.theme().muted.opacity(0.25))
+                .child(management_agent_icon(
+                    agent.id.as_str(),
+                    &agent.label,
+                    true,
+                    cx,
+                )),
+        )
+        .child(
+            v_flex()
+                .min_w_0()
+                .flex_1()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .truncate()
+                        .text_base()
+                        .font_semibold()
+                        .child(agent.label.clone()),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(agent.description.clone().unwrap_or_else(|| {
+                            management_locale_text(
+                                "Agent settings and runtime configuration",
+                                "Agent 设置与运行配置",
+                                "Agent 設定與執行配置",
+                            )
+                            .to_string()
+                        })),
+                ),
+        )
+        .child(management_status_badge(
+            management_agent_status_label(agent).to_string(),
+            cx,
+        ))
+        .into_any_element()
+}
+
+fn management_profile_glyph(
+    kind: ProviderKind,
+    label: &str,
+    is_default: bool,
+    cx: &App,
+) -> AnyElement {
+    let identity = format!("{kind} {label}");
     div()
-        .size(px(40.0))
+        .size(px(38.0))
         .flex_none()
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(12.0))
+        .rounded(px(8.0))
         .border_1()
         .border_color(if is_default {
             cx.theme().primary.opacity(0.25)
@@ -12638,14 +12721,15 @@ fn management_profile_glyph(label: &str, is_default: bool, cx: &App) -> AnyEleme
         } else {
             cx.theme().muted.opacity(0.35)
         })
-        .text_xs()
-        .font_medium()
-        .text_color(if is_default {
-            cx.theme().primary
-        } else {
-            cx.theme().muted_foreground
-        })
-        .child(initials.to_uppercase())
+        .child(agent_brand_icon(
+            &identity,
+            px(22.0),
+            Some(if is_default {
+                cx.theme().primary
+            } else {
+                cx.theme().foreground.opacity(0.78)
+            }),
+        ))
         .into_any_element()
 }
 
@@ -14394,6 +14478,40 @@ mod tests {
             .expect("Agent sidebar renderer should remain inspectable");
         assert!(sidebar.contains("model_provider_configuration_supported"));
         assert!(sidebar.contains("added && model_provider_configuration_supported"));
+    }
+
+    #[test]
+    fn agent_details_keep_identity_and_provider_actions_visible() {
+        let source = include_str!("management.rs");
+        let render = source
+            .split_once("    fn render_providers(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_mcp("))
+            .map(|(body, _)| body)
+            .expect("Provider renderer should remain inspectable");
+
+        assert!(render.contains("management_agent_detail_header"));
+        assert!(render.contains("icons/vibex/grip-vertical.svg"));
+        assert!(render.contains("management_model_count"));
+        assert!(!render.contains(".invisible()"));
+        assert!(!render.contains(".group_hover("));
+        for action in [
+            "provider-edit-",
+            "provider-duplicate-",
+            "provider-test-",
+            "provider-delete-",
+        ] {
+            assert!(
+                render.contains(action),
+                "missing visible provider action: {action}"
+            );
+        }
+
+        let glyph = source
+            .split_once("fn management_profile_glyph(")
+            .and_then(|(_, tail)| tail.split_once("\nfn management_status_badge("))
+            .map(|(body, _)| body)
+            .expect("Provider glyph should remain inspectable");
+        assert!(glyph.contains("agent_brand_icon("));
     }
 
     #[test]
