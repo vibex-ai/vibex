@@ -52,7 +52,6 @@ const MINIMUM_NODE_VERSION: semver::Version = semver::Version::new(22, 0, 0);
 const MINIMUM_UV_VERSION: semver::Version = semver::Version::new(0, 5, 0);
 const PI_MINIMUM_NODE_VERSION: semver::Version = semver::Version::new(22, 19, 0);
 const PI_CODING_AGENT_PACKAGE: &str = "@earendil-works/pi-coding-agent";
-const PI_CODING_AGENT_VERSION: &str = "0.84.1";
 const PI_COMMAND_NAME: &str = "pi";
 const NPM_COMPANION_LAUNCHER_NAME: &str = "vibex-acp-companion-launcher.cjs";
 const AMP_CLI_PACKAGE: &str = "@ampcode/cli";
@@ -984,12 +983,7 @@ impl AgentInstallService {
         let package = self
             .resolve_verified_npm_package(package, package_version)
             .await?;
-        let runtime_package = if let Some(dependency) = npm_runtime_dependency(agent_id) {
-            Some(
-                self.resolve_verified_npm_package(dependency.package, dependency.version)
-                    .await?,
-            )
-        } else if let Some(package) = latest_npm_companion(agent_id) {
+        let runtime_package = if let Some(package) = latest_npm_companion(agent_id) {
             let metadata = self.fetch_latest_npm_metadata(package).await?;
             Some(
                 self.resolve_verified_npm_package(package, &metadata.version)
@@ -2383,12 +2377,6 @@ impl VerifiedNpmPackage {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct NpmRuntimeDependency {
-    package: &'static str,
-    version: &'static str,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct InstallManifest {
@@ -2612,17 +2600,11 @@ fn minimum_node_version(agent_id: &AgentId) -> semver::Version {
     }
 }
 
-fn npm_runtime_dependency(agent_id: &AgentId) -> Option<NpmRuntimeDependency> {
-    (agent_id.as_str() == "pi").then_some(NpmRuntimeDependency {
-        package: PI_CODING_AGENT_PACKAGE,
-        version: PI_CODING_AGENT_VERSION,
-    })
-}
-
 fn latest_npm_companion(agent_id: &AgentId) -> Option<&'static str> {
     match agent_id.as_str() {
         "amp-acp" => Some(AMP_CLI_PACKAGE),
         "autohand" => Some(AUTOHAND_CLI_PACKAGE),
+        "pi" => Some(PI_CODING_AGENT_PACKAGE),
         _ => None,
     }
 }
@@ -3778,8 +3760,10 @@ fn load_installed_agent(root: &Path, expected_fingerprint: &str) -> VibexResult<
             "managed Agent cache did not match the requested distribution",
         ));
     }
-    if matches!(manifest.registry_agent_id.as_str(), "amp-acp" | "autohand")
-        && manifest.runtime_version.is_none()
+    if matches!(
+        manifest.registry_agent_id.as_str(),
+        "amp-acp" | "autohand" | "pi-acp"
+    ) && manifest.runtime_version.is_none()
     {
         return Err(VibexError::validation(
             "agent_npm_runtime_version_missing",
@@ -5032,19 +5016,15 @@ mod tests {
     }
 
     #[test]
-    fn pi_runtime_dependency_and_launcher_are_managed_locally() {
-        let dependency = npm_runtime_dependency(&AgentId::parse("pi").unwrap()).unwrap();
-        assert_eq!(dependency.package, PI_CODING_AGENT_PACKAGE);
-        assert_eq!(dependency.version, PI_CODING_AGENT_VERSION);
+    fn pi_latest_runtime_and_launcher_are_managed_locally() {
+        let agent_id = AgentId::parse("pi").unwrap();
+        let package = latest_npm_companion(&agent_id).unwrap();
+        assert_eq!(package, PI_CODING_AGENT_PACKAGE);
         assert_eq!(
-            parse_exact_npm_spec(
-                &format!("{}@{}", dependency.package, dependency.version),
-                dependency.version
-            )
-            .unwrap(),
-            (dependency.package, dependency.version)
+            parse_exact_npm_spec(&format!("{package}@1.2.3"), "1.2.3").unwrap(),
+            (package, "1.2.3")
         );
-        assert!(npm_runtime_dependency(&AgentId::parse("gemini").unwrap()).is_none());
+        assert!(latest_npm_companion(&AgentId::parse("gemini").unwrap()).is_none());
 
         let launcher =
             pi_acp_launcher_source(Path::new("node_modules/pi-acp/dist/index.js")).unwrap();
@@ -5058,6 +5038,7 @@ mod tests {
         for (agent, package, command, environment) in [
             ("amp-acp", AMP_CLI_PACKAGE, "amp", "AMP_CLI_PATH"),
             ("autohand", AUTOHAND_CLI_PACKAGE, "autohand", "AUTOHAND_CMD"),
+            ("pi", PI_CODING_AGENT_PACKAGE, "pi", "PI_ACP_PI_COMMAND"),
         ] {
             let agent_id = AgentId::parse(agent).unwrap();
             assert_eq!(latest_npm_companion(&agent_id), Some(package));
@@ -5391,7 +5372,7 @@ mod tests {
         );
         let runtime = (
             PI_CODING_AGENT_PACKAGE,
-            PI_CODING_AGENT_VERSION,
+            "1.2.3",
             "sha512-ncAqFrG+iybuPGOhMiZoEHkEzTpJgz3guYD32pD+M7ucc0WeHmauP6wa7qwP8V/KWvsZDVNa5XGsdZ7fkC7w7A==",
         );
         let adapter_resolved = canonical_npm_tarball_url(adapter.0, adapter.1).unwrap();
@@ -5665,6 +5646,37 @@ printf '%s\n' '{"version":"1.2.3","scripts":["test-package"]}'
         assert!(load_installed_agent(&root, "fixture").is_ok());
         fs::remove_file(companion).unwrap();
         assert!(load_installed_agent(&root, "fixture").is_err());
+    }
+
+    #[test]
+    fn pi_install_manifest_requires_runtime_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("pi");
+        fs::create_dir_all(&root).unwrap();
+        let node = root.join("node");
+        let adapter = root.join("adapter.cjs");
+        fs::write(&node, b"fixture").unwrap();
+        fs::write(&adapter, b"fixture").unwrap();
+        write_private_file(&npm_command_path(&root, PI_COMMAND_NAME), b"fixture").unwrap();
+        write_json_private(
+            &root.join("vibex-install.json"),
+            &InstallManifest {
+                registry_agent_id: "pi-acp".to_string(),
+                version: "0.0.33".to_string(),
+                fingerprint: "fixture".to_string(),
+                runtime_version: None,
+                distribution_kind: AgentManagedDistributionKind::Npm,
+                launch: ManifestLaunch::Node {
+                    node: node.to_string_lossy().into_owned(),
+                    script: "adapter.cjs".to_string(),
+                    args: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+
+        let error = load_installed_agent(&root, "fixture").unwrap_err();
+        assert_eq!(error.code, "agent_npm_runtime_version_missing");
     }
 
     #[tokio::test]

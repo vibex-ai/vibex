@@ -2543,11 +2543,12 @@ AgentManagedInstallationRecord {
   SemVer, and it must equal the resolved entry version; ranges, URLs, VCS
   references, and local paths are rejected before `uv` runs.
 - Pi is a managed npm bundle: Vibex installs the Registry-pinned `pi-acp`
-  Adapter and the Vibex-pinned `@earendil-works/pi-coding-agent` runtime in the
-  same isolated tree. Both direct packages independently pass metadata,
-  integrity, canonical tarball, executable, and lockfile identity checks. The
-  generated launcher sets `PI_ACP_PI_COMMAND` to that tree's `.bin/pi` command;
-  it never depends on or replaces a user-global Pi installation.
+  Adapter and resolves the latest published `@earendil-works/pi-coding-agent`
+  runtime before installing both exact versions in the same isolated tree.
+  Both direct packages independently pass metadata, integrity, canonical
+  tarball, executable, and lockfile identity checks. The generated launcher
+  sets `PI_ACP_PI_COMMAND` to that tree's `.bin/pi` command; it never depends
+  on or replaces a user-global Pi installation.
 - Five additional Agent CLIs use their official latest published release when
   Add, Upgrade, or Check for updates resolves an installation: CodeWhale uses
   npm `codewhale/latest`; Hermes uses PyPI `hermes-agent` with the `[acp]`
@@ -2570,7 +2571,8 @@ AgentManagedInstallationRecord {
 - "Latest" is resolved only during Add, explicit Upgrade/install, or Check for
   updates. Desktop startup restores a healthy recorded installation without a
   network lookup or silent upgrade. Check for updates compares both the
-  Adapter version and a separately recorded Amp/Autohand CLI runtime version.
+  Adapter version and any separately recorded Pi, Amp, or Autohand CLI runtime
+  version.
 - npm Agents select Node/npm in this order: explicit
   `VIBEX_AGENT_NODE_PATH`/`VIBEX_AGENT_NPM_PATH` configuration, system
   `node`/`npm` from `PATH`, then a downloaded Vibex-managed Node.js 22 runtime.
@@ -2680,8 +2682,9 @@ AgentManagedInstallationRecord {
   canonical npm sources, lockfile identity, checksum/archive limits, SemVer
   downgrade rejection, explicit/system/managed Node selection and fallback,
   malformed/old Node rejection, distinct empty user/global npm configs,
-  Pi's dual-package lock and local launcher, Amp/Autohand latest companion
-  binding, Autohand bin selection, Kiro manifest platform selection,
+  Pi's dual-package lock, latest runtime companion, and local launcher,
+  Amp/Autohand latest companion binding, Autohand bin selection, Kiro manifest
+  platform selection,
   explicit/system/managed `uv` selection and fallback, exact `uvx` and Hermes
   `[acp]` extra parsing, metadata entry-point validation, relocatable Python
   cache recovery, interrupted recovery, and uninstall cleanup.
