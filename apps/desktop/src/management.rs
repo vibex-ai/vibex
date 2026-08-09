@@ -7028,32 +7028,28 @@ impl ManagementCenter {
                     h_flex()
                         .flex_none()
                         .gap_2()
-                        .child(
+                        .child(management_detail_icon_action(
                             Button::new("agent-auth-refresh")
                                 .small()
                                 .outline()
-                                .h(px(MANAGEMENT_DETAIL_ACTION_HEIGHT))
-                                .px_4()
                                 .icon(Icon::default().path("icons/vibex/rotate-ccw.svg"))
-                                .label(management_locale_text(
-                                    "Refresh methods",
-                                    "刷新认证方式",
-                                    "重新整理驗證方式",
-                                ))
                                 .loading(self.agent_auth_loading)
                                 .disabled(pending || self.agent_auth_loading || !auth_available)
                                 .on_click(
                                     cx.listener(|this, _, _, cx| this.load_agent_auth(true, cx)),
                                 ),
-                        )
+                            management_locale_text(
+                                "Refresh methods",
+                                "刷新认证方式",
+                                "重新整理驗證方式",
+                            ),
+                        ))
                         .when(supports_logout, |actions| {
-                            actions.child(
+                            actions.child(management_detail_icon_action(
                                 Button::new("agent-auth-logout")
                                     .small()
                                     .danger()
-                                    .h(px(MANAGEMENT_DETAIL_ACTION_HEIGHT))
-                                    .px_4()
-                                    .label(management_locale_text("Sign out", "退出登录", "登出"))
+                                    .icon(IconName::ExternalLink)
                                     .loading(matches!(
                                         self.mutation,
                                         Some(ManagementMutation::AgentAuth(ref action))
@@ -7061,7 +7057,8 @@ impl ManagementCenter {
                                     ))
                                     .disabled(pending)
                                     .on_click(cx.listener(|this, _, _, cx| this.logout_agent(cx))),
-                            )
+                                management_locale_text("Sign out", "退出登录", "登出"),
+                            ))
                         }),
                 ),
         );
@@ -7124,6 +7121,13 @@ impl ManagementCenter {
                         "打开登录终端",
                         "開啟登入終端",
                     ),
+                };
+                let action_icon = match method.kind {
+                    AgentAuthMethodKind::Agent => Icon::new(IconName::ArrowRight),
+                    AgentAuthMethodKind::Environment => Icon::new(IconName::Check),
+                    AgentAuthMethodKind::Terminal => {
+                        Icon::default().path("icons/vibex/file-terminal.svg")
+                    }
                 };
                 let kind_label = match method.kind {
                     AgentAuthMethodKind::Agent => {
@@ -7189,6 +7193,11 @@ impl ManagementCenter {
                     };
                     let clear_key = key.clone();
                     let clearing = self.agent_auth_clear_values.contains(&key);
+                    let clear_label = if clearing {
+                        management_locale_text("Keep saved value", "保留已保存值", "保留已儲存值")
+                    } else {
+                        management_locale_text("Clear saved value", "清除已保存值", "清除已儲存值")
+                    };
                     method_content = method_content.child(
                         v_flex()
                             .w_full()
@@ -7235,32 +7244,23 @@ impl ManagementCenter {
                                             }),
                                     )
                                     .when(variable.configured, |row| {
-                                        row.child(
+                                        row.child(management_detail_icon_action(
                                             Button::new(SharedString::from(format!(
                                                 "agent-auth-clear-{key}"
                                             )))
                                             .small()
                                             .outline()
-                                            .h(px(34.0))
-                                            .px_3()
-                                            .label(if clearing {
-                                                management_locale_text(
-                                                    "Keep saved value",
-                                                    "保留已保存值",
-                                                    "保留已儲存值",
-                                                )
+                                            .icon(if clearing {
+                                                IconName::Undo2
                                             } else {
-                                                management_locale_text(
-                                                    "Clear saved value",
-                                                    "清除已保存值",
-                                                    "清除已儲存值",
-                                                )
+                                                IconName::Delete
                                             })
                                             .disabled(pending)
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.toggle_agent_auth_clear(clear_key.clone(), cx)
                                             })),
-                                        )
+                                            clear_label,
+                                        ))
                                     }),
                             )
                             .child(input_element),
@@ -7270,49 +7270,51 @@ impl ManagementCenter {
                 if let Some(link) = method.credential_link {
                     let open_link = link.clone();
                     method_content = method_content.child(
-                        h_flex().w_full().justify_end().child(
-                            Button::new(SharedString::from(format!(
-                                "agent-auth-credential-link-{}",
-                                method.id
-                            )))
-                            .small()
-                            .link()
-                            .h(px(34.0))
-                            .px_2()
-                            .label(management_locale_text(
-                                "Get credentials",
-                                "获取凭据",
-                                "取得憑證",
-                            ))
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.open_agent_auth_link(open_link.clone(), cx)
-                                },
+                        h_flex()
+                            .w_full()
+                            .justify_end()
+                            .child(management_detail_icon_action(
+                                Button::new(SharedString::from(format!(
+                                    "agent-auth-credential-link-{}",
+                                    method.id
+                                )))
+                                .small()
+                                .link()
+                                .icon(IconName::ExternalLink)
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.open_agent_auth_link(open_link.clone(), cx)
+                                    },
+                                )),
+                                management_locale_text("Get credentials", "获取凭据", "取得憑證"),
                             )),
-                        ),
                     );
                 }
                 method_content = method_content.child(
-                    h_flex().w_full().justify_end().child(
-                        Button::new(SharedString::from(format!(
-                            "agent-auth-submit-{}",
-                            method.id
-                        )))
-                        .small()
-                        .primary()
-                        .h(px(MANAGEMENT_DETAIL_ACTION_HEIGHT))
-                        .px_4()
-                        .label(action_label)
-                        .loading(method_loading)
-                        .disabled(
-                            pending
-                                || (method.kind == AgentAuthMethodKind::Environment
-                                    && self.selected_provider_profile_id.is_none()),
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.authenticate_agent(method_id.clone(), cx)
-                        })),
-                    ),
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .child(management_detail_icon_action(
+                            Button::new(SharedString::from(format!(
+                                "agent-auth-submit-{}",
+                                method.id
+                            )))
+                            .small()
+                            .primary()
+                            .icon(action_icon)
+                            .loading(method_loading)
+                            .disabled(
+                                pending
+                                    || (method.kind == AgentAuthMethodKind::Environment
+                                        && self.selected_provider_profile_id.is_none()),
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.authenticate_agent(method_id.clone(), cx)
+                                },
+                            )),
+                            action_label,
+                        )),
                 );
                 content = content.child(method_content);
             }
@@ -7340,21 +7342,20 @@ impl ManagementCenter {
                             .justify_between()
                             .gap_2()
                             .child(management_status_badge(terminal_status.to_string(), cx))
-                            .child(
+                            .child(management_detail_icon_action(
                                 Button::new("agent-auth-terminal-close")
                                     .xsmall()
                                     .ghost()
-                                    .size(px(36.0))
                                     .icon(IconName::Close)
-                                    .tooltip(management_locale_text(
-                                        "Close sign-in terminal",
-                                        "关闭登录终端",
-                                        "關閉登入終端",
-                                    ))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.close_agent_auth_terminal(cx)
                                     })),
-                            ),
+                                management_locale_text(
+                                    "Close sign-in terminal",
+                                    "关闭登录终端",
+                                    "關閉登入終端",
+                                ),
+                            )),
                     )
                     .child(
                         div()
@@ -7570,71 +7571,58 @@ impl ManagementCenter {
         let pending = mutation.is_some();
         let mut actions = h_flex().w_full().justify_end().gap_2();
         if needs_install {
-            actions = actions.child(
+            actions = actions.child(management_detail_icon_action(
                 Button::new(SharedString::from(format!("management-agent-install-{id}")))
                     .small()
                     .primary()
-                    .h(px(MANAGEMENT_DETAIL_ACTION_HEIGHT))
-                    .px_4()
                     .icon(IconName::ArrowDown)
-                    .label(management_locale_text("Install", "安装", "安裝"))
                     .loading(upgrading)
                     .disabled(pending)
                     .on_click(cx.listener({
                         let id = id.clone();
                         move |this, _, _, cx| this.install_managed_agent(id.clone(), false, cx)
                     })),
-            );
+                management_locale_text("Install", "安装", "安裝"),
+            ));
         } else if healthy_installation {
-            actions = actions.child(
+            actions = actions.child(management_detail_icon_action(
                 Button::new(SharedString::from(format!("management-agent-check-{id}")))
                     .small()
                     .outline()
-                    .h(px(MANAGEMENT_DETAIL_ACTION_HEIGHT))
-                    .px_4()
                     .icon(IconName::Search)
-                    .label(management_locale_text(
-                        "Check for updates",
-                        "检查更新",
-                        "檢查更新",
-                    ))
                     .loading(checking)
                     .disabled(pending)
                     .on_click(cx.listener({
                         let id = id.clone();
                         move |this, _, _, cx| this.check_managed_agent_update(id.clone(), cx)
                     })),
-            );
+                management_locale_text("Check for updates", "检查更新", "檢查更新"),
+            ));
         }
         if update_available && healthy_installation {
-            actions = actions.child(
+            actions = actions.child(management_detail_icon_action(
                 Button::new(SharedString::from(format!("management-agent-upgrade-{id}")))
                     .small()
                     .primary()
-                    .h(px(MANAGEMENT_DETAIL_ACTION_HEIGHT))
-                    .px_4()
                     .icon(IconName::ArrowUp)
-                    .label(management_locale_text("Upgrade", "升级", "升級"))
                     .loading(upgrading)
                     .disabled(pending)
                     .on_click(cx.listener({
                         let id = id.clone();
                         move |this, _, _, cx| this.install_managed_agent(id.clone(), true, cx)
                     })),
-            );
+                management_locale_text("Upgrade", "升级", "升級"),
+            ));
         }
         if agent.added || state.installed_version.is_some() {
             let uninstall_label = agent.label.clone();
-            actions = actions.child(
+            actions = actions.child(management_detail_icon_action(
                 Button::new(SharedString::from(format!(
                     "management-agent-uninstall-{id}"
                 )))
                 .small()
                 .danger()
-                .h(px(MANAGEMENT_DETAIL_ACTION_HEIGHT))
-                .px_4()
                 .icon(IconName::Delete)
-                .label(management_locale_text("Uninstall", "卸载", "解除安裝"))
                 .loading(uninstalling)
                 .disabled(pending)
                 .on_click(cx.listener({
@@ -7650,7 +7638,8 @@ impl ManagementCenter {
                         )
                     }
                 })),
-            );
+                management_locale_text("Uninstall", "卸载", "解除安裝"),
+            ));
         }
         content = content.child(actions);
         management_card_with_icon(
@@ -8022,14 +8011,11 @@ impl ManagementCenter {
                             .flex_wrap()
                             .justify_end()
                             .gap_2()
-                            .child(
+                            .child(management_detail_icon_action(
                                 Button::new("provider-import-existing")
                                     .small()
                                     .secondary()
-                                    .h(px(MANAGEMENT_DETAIL_ACTION_HEIGHT))
-                                    .px_4()
                                     .icon(Icon::default().path("icons/vibex/import.svg"))
-                                    .label(copy.import_configuration)
                                     .loading(native_importing)
                                     .disabled(
                                         pending
@@ -8040,20 +8026,19 @@ impl ManagementCenter {
                                         let agent_id = this.selected_agent_id.clone();
                                         this.preview_native_import(true, agent_id, cx)
                                     })),
-                            )
-                            .child(
+                                copy.import_configuration,
+                            ))
+                            .child(management_detail_icon_action(
                                 Button::new("provider-add-configuration")
                                     .small()
                                     .primary()
-                                    .h(px(MANAGEMENT_DETAIL_ACTION_HEIGHT))
-                                    .px_4()
                                     .icon(Icon::default().path("icons/vibex/plug-zap.svg"))
-                                    .label(copy.add_configuration)
                                     .disabled(pending)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.open_profile_creator(window, cx);
                                     })),
-                            ),
+                                copy.add_configuration,
+                            )),
                     ),
             )
             .child(if profiles.is_empty() {
@@ -13795,6 +13780,16 @@ fn management_card_with_icon(
     management_card_inner(title, description, Some(icon_path), content, cx)
 }
 
+fn management_detail_icon_action(button: Button, label: &'static str) -> impl IntoElement {
+    let label = SharedString::from(label);
+    button_with_aria_label(
+        button
+            .size(px(MANAGEMENT_DETAIL_ACTION_HEIGHT))
+            .tooltip(label.clone()),
+        label,
+    )
+}
+
 fn management_card_inner(
     title: &'static str,
     description: &'static str,
@@ -14669,8 +14664,13 @@ mod tests {
     }
 
     #[test]
-    fn agent_detail_modules_have_icons_and_larger_actions() {
+    fn agent_detail_modules_use_accessible_icon_actions() {
         let source = include_str!("management.rs");
+        let authentication = source
+            .split_once("    fn render_agent_authentication(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_agent_install_loading("))
+            .map(|(body, _)| body)
+            .expect("Authentication renderer should remain inspectable");
         let install = source
             .split_once("    fn render_agent_installation_card(")
             .and_then(|(_, tail)| tail.split_once("\n    fn render_providers("))
@@ -14681,11 +14681,32 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_mcp("))
             .map(|(body, _)| body)
             .expect("Provider renderer should remain inspectable");
+        let action_helper = source
+            .split_once("fn management_detail_icon_action(")
+            .and_then(|(_, tail)| tail.split_once("\nfn management_card_inner("))
+            .map(|(body, _)| body)
+            .expect("Detail icon action helper should remain inspectable");
 
         assert!(install.contains("management_card_with_icon("));
         assert!(install.contains("icons/vibex/download.svg"));
         assert!(render.contains("MANAGEMENT_PROVIDER_ROW_ACTION_SIZE"));
-        assert!(render.contains("MANAGEMENT_DETAIL_ACTION_HEIGHT"));
+        assert!(action_helper.contains(".size(px(MANAGEMENT_DETAIL_ACTION_HEIGHT))"));
+        assert!(action_helper.contains(".tooltip(label.clone())"));
+        assert!(action_helper.contains("button_with_aria_label("));
+        for (name, body, minimum_actions) in [
+            ("authentication", authentication, 6),
+            ("installation", install, 4),
+            ("Provider configuration", render, 2),
+        ] {
+            assert!(
+                !body.contains(".label("),
+                "{name} actions must remain icon-only"
+            );
+            assert!(
+                body.matches("management_detail_icon_action(").count() >= minimum_actions,
+                "{name} actions must use the accessible icon helper"
+            );
+        }
     }
 
     #[test]
