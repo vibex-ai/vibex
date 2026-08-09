@@ -593,6 +593,12 @@ pub struct SessionModelCatalogEntry {
     pub model_id: String,
     pub reasoning_efforts: Vec<AgentReasoningEffort>,
     pub default_reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub modes: Vec<ProviderSessionConfigValue>,
+    #[serde(default)]
+    pub options: Vec<ProviderSessionConfigOption>,
+    #[serde(default)]
+    pub runtime_options_complete: bool,
     pub source: SessionModelCatalogSource,
 }
 
@@ -820,20 +826,38 @@ pub fn build_runtime_option_catalog(
         }
 
         let availability = catalog_availability(agent, evidence);
-        let modes = catalog_modes(evidence);
-        let features = catalog_features(evidence);
-        let feature_config_values = features
-            .iter()
-            .filter_map(|feature| {
-                feature
-                    .current_value
-                    .as_ref()
-                    .or(feature.default_value.as_ref())
-                    .map(|value| (feature.id.clone(), value.value.clone()))
-            })
-            .collect::<BTreeMap<_, _>>();
+        let fallback_modes = catalog_modes(evidence);
+        let fallback_features = catalog_features(evidence);
         for (model_id, model_label) in configured_models {
             let model_evidence = evidence_models.get(&model_id).copied();
+            let modes = model_evidence
+                .filter(|model| model.runtime_options_complete || !model.modes.is_empty())
+                .map(|model| {
+                    catalog_modes(Some(&RuntimeOptionCatalogProfileEvidence {
+                        modes: model.modes.clone(),
+                        ..Default::default()
+                    }))
+                })
+                .unwrap_or_else(|| fallback_modes.clone());
+            let features = model_evidence
+                .filter(|model| model.runtime_options_complete || !model.options.is_empty())
+                .map(|model| {
+                    catalog_features(Some(&RuntimeOptionCatalogProfileEvidence {
+                        options: model.options.clone(),
+                        ..Default::default()
+                    }))
+                })
+                .unwrap_or_else(|| fallback_features.clone());
+            let feature_config_values = features
+                .iter()
+                .filter_map(|feature| {
+                    feature
+                        .current_value
+                        .as_ref()
+                        .or(feature.default_value.as_ref())
+                        .map(|value| (feature.id.clone(), value.value.clone()))
+                })
+                .collect::<BTreeMap<_, _>>();
             options.push(SessionRuntimeOption {
                 selection: SessionRuntimeSelection {
                     agent_id: agent.id.clone(),
@@ -841,14 +865,16 @@ pub fn build_runtime_option_catalog(
                     model_id,
                     reasoning_effort: None,
                     mode_id: None,
-                    config_values: feature_config_values.clone(),
+                    config_values: feature_config_values,
                 },
                 agent_label: bounded_catalog_label(&agent.label),
                 provider_profile_label: bounded_catalog_label(&profile.display_name),
                 model_label,
                 reasoning_efforts: model_evidence
+                    .filter(|model| {
+                        model.runtime_options_complete || !model.reasoning_efforts.is_empty()
+                    })
                     .map(catalog_reasoning_efforts)
-                    .filter(|efforts| !efforts.is_empty())
                     .unwrap_or_else(|| {
                         catalog_reasoning_effort_values(
                             evidence
@@ -856,8 +882,8 @@ pub fn build_runtime_option_catalog(
                                 .unwrap_or_default(),
                         )
                     }),
-                modes: modes.clone(),
-                features: features.clone(),
+                modes,
+                features,
                 availability,
             });
         }
@@ -1159,7 +1185,7 @@ fn write_catalog_component(hasher: &mut Sha256, value: &[u8]) {
     hasher.update(value);
 }
 
-/// Merges model evidence by source priority.  Effort values are attached only
+/// Merges model evidence by source priority. Runtime values are attached only
 /// when the caller supplies evidence explicitly associated with that model.
 pub fn merge_model_catalog(
     session: impl IntoIterator<Item = SessionModelCatalogEntry>,
@@ -1185,6 +1211,9 @@ pub fn merge_model_catalog(
                     model_id,
                     reasoning_efforts: Vec::new(),
                     default_reasoning_effort: None,
+                    modes: Vec::new(),
+                    options: Vec::new(),
+                    runtime_options_complete: false,
                     source: SessionModelCatalogSource::Profile,
                 })
                 .collect(),
@@ -1210,17 +1239,26 @@ pub fn merge_model_catalog(
                 None => {
                     merged.insert(entry.model_id.clone(), entry);
                 }
-                Some(existing)
-                    if existing.reasoning_efforts.is_empty()
-                        && !entry.reasoning_efforts.is_empty() =>
-                {
+                Some(_) => {
                     let existing = merged
                         .get_mut(&entry.model_id)
                         .expect("catalog entry existence checked above");
-                    existing.reasoning_efforts = entry.reasoning_efforts;
-                    existing.default_reasoning_effort = entry.default_reasoning_effort;
+                    if !existing.runtime_options_complete {
+                        if existing.reasoning_efforts.is_empty()
+                            && !entry.reasoning_efforts.is_empty()
+                        {
+                            existing.reasoning_efforts = entry.reasoning_efforts;
+                            existing.default_reasoning_effort = entry.default_reasoning_effort;
+                        }
+                        if existing.modes.is_empty() && !entry.modes.is_empty() {
+                            existing.modes = entry.modes;
+                        }
+                        if existing.options.is_empty() && !entry.options.is_empty() {
+                            existing.options = entry.options;
+                        }
+                        existing.runtime_options_complete = entry.runtime_options_complete;
+                    }
                 }
-                _ => {}
             }
         }
     }
@@ -1591,6 +1629,9 @@ mod tests {
                 model_id: "model-a".to_string(),
                 reasoning_efforts: Vec::new(),
                 default_reasoning_effort: None,
+                modes: Vec::new(),
+                options: Vec::new(),
+                runtime_options_complete: false,
                 source: SessionModelCatalogSource::Session,
             }],
             Vec::new(),
@@ -1602,11 +1643,46 @@ mod tests {
                     description: None,
                 }],
                 default_reasoning_effort: Some("high".to_string()),
+                modes: Vec::new(),
+                options: Vec::new(),
+                runtime_options_complete: false,
                 source: SessionModelCatalogSource::Extension,
             }],
         );
         assert_eq!(catalog[0].source, SessionModelCatalogSource::Session);
         assert_eq!(catalog[0].reasoning_efforts[0].value, "high");
+    }
+
+    #[test]
+    fn complete_model_evidence_keeps_empty_runtime_options() {
+        let catalog = merge_model_catalog(
+            vec![SessionModelCatalogEntry {
+                model_id: "model-a".to_string(),
+                reasoning_efforts: Vec::new(),
+                default_reasoning_effort: None,
+                modes: Vec::new(),
+                options: Vec::new(),
+                runtime_options_complete: true,
+                source: SessionModelCatalogSource::Session,
+            }],
+            Vec::new(),
+            Vec::new(),
+            vec![SessionModelCatalogEntry {
+                model_id: "model-a".to_string(),
+                reasoning_efforts: vec![AgentReasoningEffort {
+                    value: "high".to_string(),
+                    description: None,
+                }],
+                default_reasoning_effort: Some("high".to_string()),
+                modes: Vec::new(),
+                options: Vec::new(),
+                runtime_options_complete: false,
+                source: SessionModelCatalogSource::Extension,
+            }],
+        );
+
+        assert!(catalog[0].reasoning_efforts.is_empty());
+        assert!(catalog[0].runtime_options_complete);
     }
 
     #[test]
@@ -1688,6 +1764,9 @@ mod tests {
                         description: Some("High".to_string()),
                     }],
                     default_reasoning_effort: Some("high".to_string()),
+                    modes: Vec::new(),
+                    options: Vec::new(),
+                    runtime_options_complete: false,
                     source: SessionModelCatalogSource::Session,
                 }],
                 modes: vec![ProviderSessionConfigValue {
@@ -1884,6 +1963,9 @@ mod tests {
                         description: Some("High".to_string()),
                     }],
                     default_reasoning_effort: Some("high".to_string()),
+                    modes: Vec::new(),
+                    options: Vec::new(),
+                    runtime_options_complete: false,
                     source: SessionModelCatalogSource::Probe,
                 }],
                 modes: vec![ProviderSessionConfigValue {

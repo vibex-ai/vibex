@@ -60,6 +60,7 @@ use acp_terminal::DesktopAcpTerminalHost;
 pub use agent_install::{AgentInstallService, AgentNodeRuntimeOptions, AgentUvRuntimeOptions};
 pub use auth_catalog::AgentAuthCatalogService;
 pub use catalog::{
+    ProviderModelRuntimeOptionKey, ProviderModelRuntimeOptionProbeResult,
     RuntimeOptionCatalogService, RuntimeOptionProbeResult, RuntimeOptionSnapshotSummary,
 };
 pub use events::{
@@ -1186,22 +1187,11 @@ impl DesktopRuntime {
                     }
                 }
             }
+            let mut runtime_options_changed = false;
             match runtime_catalog.probe_missing_enabled_agents().await {
                 Ok(result) => {
                     if !result.probed_agent_ids.is_empty() {
-                        let _ = runtime_option_events.send(DesktopEvent::ProviderConfigChanged(
-                            ProviderConfigChangedEvent {
-                                provider_profile_ids: Vec::new(),
-                                phase: ProviderConfigChangePhase::RuntimeOptionsChanged,
-                            },
-                        ));
-                        if let Err(error) = runtime_option_gateway.publish_provider_invalidation() {
-                            tracing::warn!(
-                                target: "vibex_desktop",
-                                error_code = %error.code,
-                                "Remote runtime option catalog invalidation failed"
-                            );
-                        }
+                        runtime_options_changed = true;
                     }
                     if !result.failed_agent_ids.is_empty() {
                         tracing::warn!(
@@ -1216,6 +1206,42 @@ impl DesktopRuntime {
                         target: "vibex_desktop",
                         error_code = %error.code,
                         "Agent runtime option bootstrap failed"
+                    );
+                }
+            }
+            match runtime_catalog.probe_missing_enabled_profile_models().await {
+                Ok(result) => {
+                    if !result.probed_models.is_empty() {
+                        runtime_options_changed = true;
+                    }
+                    if !result.failed_models.is_empty() {
+                        tracing::warn!(
+                            target: "vibex_desktop",
+                            failed_model_count = result.failed_models.len(),
+                            "Provider model runtime option background probing failed"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "vibex_desktop",
+                        error_code = %error.code,
+                        "Provider model runtime option bootstrap failed"
+                    );
+                }
+            }
+            if runtime_options_changed {
+                let _ = runtime_option_events.send(DesktopEvent::ProviderConfigChanged(
+                    ProviderConfigChangedEvent {
+                        provider_profile_ids: Vec::new(),
+                        phase: ProviderConfigChangePhase::RuntimeOptionsChanged,
+                    },
+                ));
+                if let Err(error) = runtime_option_gateway.publish_provider_invalidation() {
+                    tracing::warn!(
+                        target: "vibex_desktop",
+                        error_code = %error.code,
+                        "Remote runtime option catalog invalidation failed"
                     );
                 }
             }
@@ -1336,24 +1362,30 @@ impl DesktopRuntime {
         })?;
         let profile_events = self.events.clone();
         let profile_gateway = self.remote.gateway.clone();
+        let runtime_option_events = self.events.clone();
+        let runtime_option_gateway = self.remote.gateway.clone();
+        let runtime_catalog = self.agent.runtime_catalog();
+        let (model_probe_sender, mut model_probe_receiver) =
+            mpsc::unbounded_channel::<BTreeMap<ProviderProfileId, bool>>();
         tasks.push(tokio::spawn(async move {
             while let Some(first) = receiver.recv().await {
                 let mut changes = vec![first];
                 while let Ok(change) = receiver.try_recv() {
                     changes.push(change);
                 }
-                let mut changed_profile_ids = BTreeSet::new();
+                let mut latest_changes = BTreeMap::new();
                 for change in changes {
-                    let provider_profile_id = match change {
-                        ProviderProfileMutationEvent::Saved(provider_profile_id)
-                        | ProviderProfileMutationEvent::Deleted(provider_profile_id) => {
-                            provider_profile_id
+                    match change {
+                        ProviderProfileMutationEvent::Saved(provider_profile_id) => {
+                            latest_changes.insert(provider_profile_id, true);
                         }
-                    };
-                    changed_profile_ids.insert(provider_profile_id);
+                        ProviderProfileMutationEvent::Deleted(provider_profile_id) => {
+                            latest_changes.insert(provider_profile_id, false);
+                        }
+                    }
                 }
-                if !changed_profile_ids.is_empty() {
-                    let provider_profile_ids = changed_profile_ids.into_iter().collect();
+                if !latest_changes.is_empty() {
+                    let provider_profile_ids = latest_changes.keys().cloned().collect();
                     let _ = profile_events.send(DesktopEvent::ProviderConfigChanged(
                         ProviderConfigChangedEvent {
                             provider_profile_ids,
@@ -1365,6 +1397,68 @@ impl DesktopRuntime {
                             target: "vibex_desktop",
                             error_code = %error.code,
                             "Remote Provider projection invalidation failed"
+                        );
+                    }
+                }
+                let _ = model_probe_sender.send(latest_changes);
+            }
+        }));
+        tasks.push(tokio::spawn(async move {
+            while let Some(latest_changes) = model_probe_receiver.recv().await {
+                let mut probed_profile_ids = BTreeSet::new();
+                for (provider_profile_id, saved) in latest_changes {
+                    if !saved {
+                        if let Err(error) =
+                            runtime_catalog.delete_profile_model_snapshots(&provider_profile_id)
+                        {
+                            tracing::warn!(
+                                target: "vibex_desktop",
+                                provider_profile_id = %provider_profile_id,
+                                error_code = %error.code,
+                                "Provider model runtime option cleanup failed"
+                            );
+                        }
+                        continue;
+                    }
+                    match runtime_catalog
+                        .probe_profile_models(&provider_profile_id)
+                        .await
+                    {
+                        Ok(result) => {
+                            if !result.failed_models.is_empty() {
+                                tracing::warn!(
+                                    target: "vibex_desktop",
+                                    provider_profile_id = %provider_profile_id,
+                                    failed_model_count = result.failed_models.len(),
+                                    "Provider model runtime option background probing failed"
+                                );
+                            }
+                            if !result.probed_models.is_empty() {
+                                probed_profile_ids.insert(provider_profile_id);
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                target: "vibex_desktop",
+                                provider_profile_id = %provider_profile_id,
+                                error_code = %error.code,
+                                "Provider model runtime option background probe failed"
+                            );
+                        }
+                    }
+                }
+                if !probed_profile_ids.is_empty() {
+                    let _ = runtime_option_events.send(DesktopEvent::ProviderConfigChanged(
+                        ProviderConfigChangedEvent {
+                            provider_profile_ids: probed_profile_ids.into_iter().collect(),
+                            phase: ProviderConfigChangePhase::RuntimeOptionsChanged,
+                        },
+                    ));
+                    if let Err(error) = runtime_option_gateway.publish_provider_invalidation() {
+                        tracing::warn!(
+                            target: "vibex_desktop",
+                            error_code = %error.code,
+                            "Remote runtime option catalog invalidation failed"
                         );
                     }
                 }
@@ -1787,10 +1881,12 @@ mod tests {
         assert!(bootstrap.contains("install_service.ensure_installed(agent_id)"));
         assert!(!bootstrap.contains("refresh_missing"));
         assert!(bootstrap.contains("runtime_catalog.probe_missing_enabled_agents().await"));
+        assert!(bootstrap.contains("probe_missing_enabled_profile_models().await"));
         assert!(bootstrap.contains("ProviderConfigChangePhase::RuntimeOptionsChanged"));
         assert!(!provider_consumer.contains("refresh_profile"));
         assert!(!provider_consumer.contains("invalidate_profile_snapshot"));
-        assert!(!provider_consumer.contains("RuntimeOptionsChanged"));
+        assert!(provider_consumer.contains("probe_profile_models"));
+        assert!(provider_consumer.contains("RuntimeOptionsChanged"));
     }
 
     #[test]

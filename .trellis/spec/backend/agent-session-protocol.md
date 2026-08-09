@@ -42,15 +42,18 @@ one attachment.
 Session creation and in-session selectors need one provider-neutral list of
 enabled Agent/Profile/Model combinations. Runtime controls belong to the Agent
 CLI, while model choices belong to Provider Profiles. The catalog joins those
-two independently owned inputs without turning a model Provider configuration
-into a capability probe target.
+inputs with an Agent-level fallback and a model-specific capability cache.
 
 ### 2. Signatures
 
 ```text
 agent_list_runtime_options() -> SessionRuntimeOptionCatalog
 RuntimeOptionCatalogService::probe_agent(agent_id) -> RuntimeOptionProbeResult
+RuntimeOptionCatalogService::probe_profile_models(provider_profile_id)
+  -> ProviderModelRuntimeOptionProbeResult
 AgentProvider::probe_agent_session_config(agent_id) -> AgentSessionConfigProbe
+AgentProvider::probe_session_config_for_model(profile_id, model_id)
+  -> AgentSessionConfigProbe
 ProviderConfigService::get_agent_acp_runtime_config(agent_id) -> AcpProviderConfig
 AcpRuntimeClient::profile_session_config_evidence()
   -> Map<ProviderProfileId, AgentSessionConfigProbe>
@@ -64,6 +67,17 @@ agent_runtime_option_snapshots(
   last_attempt_at_ms,
   last_error_code
 )
+
+provider_model_runtime_option_snapshots(
+  provider_profile_id,
+  model_id,
+  agent_id,
+  session_config_json,
+  last_success_at_ms,
+  last_attempt_at_ms,
+  last_error_code,
+  PRIMARY KEY(provider_profile_id, model_id)
+)
 ```
 
 ### 3. Contracts
@@ -76,28 +90,41 @@ agent_runtime_option_snapshots(
   args and Agent env. It must not list or load a Provider Profile, resolve a
   Provider secret, materialize a Provider projection, or use a Provider model.
   A synthetic `ProviderProfileId` may exist only as in-process bookkeeping.
-- Trigger the probe when an installed Agent is added, discovered in bulk,
+- Trigger the Agent fallback probe when an installed Agent is added, discovered in bulk,
   detected after installation, or enabled and installed at desktop startup without a
   successful persisted snapshot. A failed first attempt may be retried by the
   next startup bootstrap or an explicit Agent action. Ordinary enable/disable
-  and Provider Profile create/update/delete never trigger an Agent option probe.
+  and Provider Profile create/update/delete never trigger an Agent fallback probe.
 - A successful snapshot is immutable while the Agent remains added. Later
   calls return `cached_agent_ids` without launching the CLI. Removing the
   Agent deletes its snapshot so a later re-add can probe once again.
-- Ordinary catalog reads load the SQLite Agent fallback plus current in-memory
-  Profile evidence and never start an ACP process. Provider mutations rebuild
-  the Profile/model projection and reuse the Agent fallback; they do not invoke
-  `session/new` as a hidden configuration side effect.
+- Saving a configured ACP Provider Profile schedules a background probe for
+  each enabled model without a successful `(provider_profile_id, model_id)`
+  snapshot. A successful model snapshot is reused while that model id remains
+  configured, even when unrelated Profile fields change. Removing or replacing
+  a model deletes its stale row; deleting a Profile deletes all model rows.
+- Model probes project exactly one target model into the short-lived ACP
+  process. The probe must capture the model switch response and any bounded
+  `config_option_update` that the Agent emits for that switch; GLM publishes
+  model-specific thought levels through the update while returning an empty
+  `session/set_model` result. A failed model probe records its attempt and error
+  without blocking the Provider save or removing an existing successful model
+  snapshot.
+- Ordinary catalog reads load the SQLite Agent fallback, persisted model
+  snapshots, and current in-memory Profile evidence; they never start an ACP
+  process. Provider mutations trigger only the asynchronous missing-model
+  bootstrap.
 - A real `session/new`, `session/load`, or `session/resume` response publishes
   its safe session configuration under the exact `provider_profile_id`.
   `ConfigOptionUpdate` replaces that session's complete option set, including
   removal of withdrawn options, then refreshes the Profile evidence.
 - Live Profile evidence overrides the Agent fallback only for that Profile.
-  Other Profiles continue to render immediately from the Agent snapshot until
-  one of their real sessions supplies newer evidence.
-- Profile evidence is process-memory calibration, not a second durable source
-  of Provider configuration. Remove it when the Profile changes or is deleted;
-  after restart, the catalog starts from the persisted Agent fallback again.
+  Persisted model entries remain attached to their exact models. Other
+  Profiles continue to render immediately from cached evidence until one of
+  their real sessions supplies newer evidence.
+- Profile-wide live evidence is process-memory calibration. Model snapshots are
+  durable and keyed by both Profile and model; after restart, unchanged models
+  reuse them before falling back to Agent evidence.
 - Enabled ACP Provider Profiles contribute only enabled configured model ids,
   or their configured default model when the explicit list is empty. Agent
   discovery, Agent probe, and live session models never populate the selector.
@@ -116,6 +143,11 @@ agent_runtime_option_snapshots(
   not launch a process.
 - Successful snapshot exists -> return the Agent in `cached_agent_ids`; do not
   probe again.
+- Successful model snapshot exists for the same Profile/model pair -> reuse it;
+  do not probe again. A different model id never shares that row.
+- Successful model evidence is authoritative even when one of its option sets
+  is empty; an empty model-specific reasoning/mode/Feature set must not revive
+  the Agent fallback for that field.
 - Agent command/config changes while a probe is in flight -> discard the stale
   result by comparing the Agent config revision before commit.
 - Probe fails before any success -> persist `last_attempt_at_ms` and the stable
@@ -123,15 +155,17 @@ agent_runtime_option_snapshots(
   explicit retry.
 - Adapter returns models -> clear them before the Agent snapshot write.
 - A live response or update includes models -> clear them before publishing
-  Profile evidence; Provider Profile models stay authoritative.
+  Profile-wide evidence; Provider Profile models stay authoritative. Explicit
+  model probe evidence is stored under that model entry only.
 - `ConfigOptionUpdate` omits the `configOptions` array -> ignore it rather than
   erasing the current evidence.
 - `ConfigOptionUpdate` contains an empty `configOptions` array -> replace the
   previous option set with empty; withdrawn controls must not remain selectable.
 - Live Profile evidence is absent or was invalidated -> layer the Agent fallback
   for that Profile.
-- No Provider Profile or no configured Provider model -> probing may still
-  succeed, but the joined catalog has no model option for that Profile.
+- No Provider Profile or no configured Provider model -> Agent probing may
+  still succeed, but no model probe is launched and the joined catalog has no
+  model option for that Profile.
 - Disabled Agent/Profile/model -> omit it; cached Agent evidence cannot revive
   an explicitly disabled model.
 - Enabled non-ACP Profile -> omit it; never reinterpret it as an ACP runtime
@@ -149,8 +183,8 @@ agent_runtime_option_snapshots(
   while the session selector remains empty until a Profile supplies a model.
 - Base: a Profile has models but the Agent exposes no reasoning control; its
   models remain selectable and the reasoning selector is empty.
-- Bad: saving a Provider API key starts `session/new`, clears the Agent
-  snapshot, or creates another snapshot keyed by `provider_profile_id`.
+- Bad: saving a Provider API key clears the Agent snapshot, blocks on a probe,
+  or copies one model's options into another model's snapshot.
 - Bad: a model returned by the Agent probe appears in a Profile that did not
   configure that model.
 - Bad: a stale Profile-wide snapshot masks the full option set announced by a
@@ -158,17 +192,17 @@ agent_runtime_option_snapshots(
 
 ### 6. Tests Required
 
-- `cargo test -p vibex-db agent_runtime_option_snapshot --locked` asserts the
-  Agent-keyed SQLite round trip and deletion.
+- `cargo test -p vibex-db runtime_option_snapshot --locked` asserts Agent-keyed
+  fallback and Provider/model-keyed SQLite round trips and deletion.
 - `cargo test -p vibex-config-switch agent_acp_runtime_config --locked` asserts
   command/args/Agent-env resolution without a Provider Profile.
 - `cargo test -p vibex-agent-acp session_config::tests --locked` asserts Agent
   evidence is shared and models come only from Provider Profiles.
 - `cargo test -p vibex-agent-acp config_option_update --locked` asserts a full
   replacement, runtime-state calibration, and model stripping.
-- `cargo test -p vibex-desktop-runtime catalog --locked` asserts one process
-  call, cached reuse, Profile mutation independence, live-over-fallback layering,
-  model stripping, and failure recording by Agent.
+- `cargo test -p vibex-desktop-runtime catalog --locked` asserts cached reuse,
+  live-over-fallback layering, model stripping, model-specific efforts/modes,
+  and failure recording by Agent/model.
 - Desktop management tests assert Agent add/discovery/install detection invokes
   `probe_agent`, ordinary toggles and Profile saves do not, and a successful
   snapshot disables the probe button.
@@ -178,20 +212,23 @@ agent_runtime_option_snapshots(
 #### Wrong
 
 ```rust
-for profile in enabled_profiles {
-    catalog.refresh_profile(&profile.id).await?;
+for model in profile.configured_models {
+    manager
+        .probe_session_config_for_model(profile.agent_id, profile.id, &model.id)
+        .await?;
 }
 ```
 
-This couples Agent capabilities to Provider credentials and repeats the same
-CLI discovery for every model configuration.
+This starts Agent processes from an ordinary read path and discards the durable
+per-model cache.
 
 #### Correct
 
 ```rust
-let result = catalog.probe_agent(&agent_id).await?;
+let fallback = catalog.probe_agent(&agent_id).await?;
+let model_options = catalog.probe_profile_models(&profile_id).await?;
 let options = catalog.list().await?;
-// SQLite Agent fallback + current in-memory Profile evidence + Profile models.
+// Model snapshot -> live/Profile fallback -> Agent fallback.
 ```
 
 The successful Agent snapshot provides fast fallback; real sessions calibrate

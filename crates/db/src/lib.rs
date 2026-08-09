@@ -73,7 +73,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 41;
+pub const CURRENT_SCHEMA_VERSION: i64 = 42;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -1689,6 +1689,25 @@ const MIGRATIONS: &[Migration] = &[
                 ON agent_managed_installations(updated_at_ms);
         ",
     },
+    Migration {
+        version: 42,
+        name: "provider_model_runtime_option_snapshots",
+        sql: "
+            CREATE TABLE IF NOT EXISTS provider_model_runtime_option_snapshots (
+                provider_profile_id TEXT NOT NULL
+                    REFERENCES provider_profiles(provider_profile_id) ON DELETE CASCADE,
+                model_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                session_config_json TEXT NULL,
+                last_success_at_ms INTEGER NULL,
+                last_attempt_at_ms INTEGER NOT NULL,
+                last_error_code TEXT NULL,
+                PRIMARY KEY(provider_profile_id, model_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_provider_model_runtime_option_snapshots_agent
+                ON provider_model_runtime_option_snapshots(agent_id, last_attempt_at_ms);
+        ",
+    },
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -1713,6 +1732,7 @@ pub struct ProviderInjectionPreviewRepository;
 pub struct ProviderNativeExportRepository;
 pub struct ProviderCapabilityRepository;
 pub struct ProviderRuntimeOptionSnapshotRepository;
+pub struct ProviderModelRuntimeOptionSnapshotRepository;
 pub struct AgentRuntimeOptionSnapshotRepository;
 pub struct AgentAuthCatalogSnapshotRepository;
 pub struct AgentManagedInstallationRepository;
@@ -1744,6 +1764,17 @@ pub struct ProviderRuntimeOptionSnapshotRecord {
     pub provider_profile_id: ProviderProfileId,
     pub agent_id: AgentId,
     pub model_response: Option<AgentModelListResponse>,
+    pub session_config: Option<AgentSessionConfigProbe>,
+    pub last_success_at_ms: Option<i64>,
+    pub last_attempt_at_ms: i64,
+    pub last_error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderModelRuntimeOptionSnapshotRecord {
+    pub provider_profile_id: ProviderProfileId,
+    pub model_id: String,
+    pub agent_id: AgentId,
     pub session_config: Option<AgentSessionConfigProbe>,
     pub last_success_at_ms: Option<i64>,
     pub last_attempt_at_ms: i64,
@@ -2814,6 +2845,21 @@ impl ProviderProfileRepository {
             ProviderKind::Codex,
         ] {
             let profile = ProviderProfile::local_default(kind);
+            let exists = conn
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM provider_profiles WHERE provider_profile_id = ?1
+                    )",
+                    params![profile.id.as_str()],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(storage_err(
+                    "provider_profile_seed_check_failed",
+                    "failed to inspect the local default provider profile",
+                ))?;
+            if exists {
+                continue;
+            }
             conn.execute(
                 "
                 INSERT OR IGNORE INTO provider_profiles (
@@ -3131,6 +3177,11 @@ impl ProviderProfileRepository {
                 "provider_runtime_option_snapshots",
                 "provider_profile_runtime_option_snapshot_cleanup_failed",
                 "failed to clear runtime option snapshot for deleted profile",
+            ),
+            (
+                "provider_model_runtime_option_snapshots",
+                "provider_profile_model_runtime_option_snapshot_cleanup_failed",
+                "failed to clear model runtime option snapshots for deleted profile",
             ),
         ] {
             tx.execute(
@@ -4001,6 +4052,152 @@ impl ProviderRuntimeOptionSnapshotRepository {
             records.push(row.map_err(storage_err(
                 "runtime_option_snapshot_decode_failed",
                 "failed to decode runtime option snapshot",
+            ))?);
+        }
+        Ok(records)
+    }
+}
+
+impl ProviderModelRuntimeOptionSnapshotRepository {
+    pub fn upsert_success(
+        conn: &Connection,
+        record: &ProviderModelRuntimeOptionSnapshotRecord,
+    ) -> VibexResult<()> {
+        let session_config = record.session_config.as_ref().ok_or_else(|| {
+            VibexError::validation(
+                "provider_model_runtime_option_snapshot_session_config_missing",
+                "successful model runtime option snapshot requires session configuration evidence",
+            )
+        })?;
+        let last_success_at_ms = record.last_success_at_ms.ok_or_else(|| {
+            VibexError::validation(
+                "provider_model_runtime_option_snapshot_success_time_missing",
+                "successful model runtime option snapshot requires a success timestamp",
+            )
+        })?;
+        conn.execute(
+            "
+            INSERT INTO provider_model_runtime_option_snapshots (
+                provider_profile_id, model_id, agent_id, session_config_json,
+                last_success_at_ms, last_attempt_at_ms, last_error_code
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
+            ON CONFLICT(provider_profile_id, model_id) DO UPDATE SET
+                agent_id = excluded.agent_id,
+                session_config_json = excluded.session_config_json,
+                last_success_at_ms = excluded.last_success_at_ms,
+                last_attempt_at_ms = excluded.last_attempt_at_ms,
+                last_error_code = NULL
+            ",
+            params![
+                record.provider_profile_id.as_str(),
+                record.model_id,
+                record.agent_id.as_str(),
+                json_to_db(session_config)?,
+                last_success_at_ms,
+                record.last_attempt_at_ms,
+            ],
+        )
+        .map_err(storage_err(
+            "provider_model_runtime_option_snapshot_upsert_failed",
+            "failed to persist model runtime option snapshot",
+        ))?;
+        Ok(())
+    }
+
+    pub fn record_failure(
+        conn: &Connection,
+        provider_profile_id: &ProviderProfileId,
+        model_id: &str,
+        agent_id: &AgentId,
+        attempted_at_ms: i64,
+        error_code: &str,
+    ) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO provider_model_runtime_option_snapshots (
+                provider_profile_id, model_id, agent_id, session_config_json,
+                last_success_at_ms, last_attempt_at_ms, last_error_code
+            )
+            VALUES (?1, ?2, ?3, NULL, NULL, ?4, ?5)
+            ON CONFLICT(provider_profile_id, model_id) DO UPDATE SET
+                agent_id = excluded.agent_id,
+                last_attempt_at_ms = excluded.last_attempt_at_ms,
+                last_error_code = excluded.last_error_code
+            ",
+            params![
+                provider_profile_id.as_str(),
+                model_id,
+                agent_id.as_str(),
+                attempted_at_ms,
+                error_code,
+            ],
+        )
+        .map_err(storage_err(
+            "provider_model_runtime_option_snapshot_failure_record_failed",
+            "failed to record model runtime option snapshot failure",
+        ))?;
+        Ok(())
+    }
+
+    pub fn delete_model(
+        conn: &Connection,
+        provider_profile_id: &ProviderProfileId,
+        model_id: &str,
+    ) -> VibexResult<()> {
+        conn.execute(
+            "DELETE FROM provider_model_runtime_option_snapshots
+             WHERE provider_profile_id = ?1 AND model_id = ?2",
+            params![provider_profile_id.as_str(), model_id],
+        )
+        .map_err(storage_err(
+            "provider_model_runtime_option_snapshot_delete_failed",
+            "failed to delete model runtime option snapshot",
+        ))?;
+        Ok(())
+    }
+
+    pub fn delete_profile(
+        conn: &Connection,
+        provider_profile_id: &ProviderProfileId,
+    ) -> VibexResult<()> {
+        conn.execute(
+            "DELETE FROM provider_model_runtime_option_snapshots
+             WHERE provider_profile_id = ?1",
+            params![provider_profile_id.as_str()],
+        )
+        .map_err(storage_err(
+            "provider_model_runtime_option_snapshot_delete_failed",
+            "failed to delete model runtime option snapshots",
+        ))?;
+        Ok(())
+    }
+
+    pub fn list(conn: &Connection) -> VibexResult<Vec<ProviderModelRuntimeOptionSnapshotRecord>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT provider_profile_id, model_id, agent_id, session_config_json,
+                    last_success_at_ms, last_attempt_at_ms, last_error_code
+                FROM provider_model_runtime_option_snapshots
+                ORDER BY provider_profile_id ASC, model_id ASC
+                ",
+            )
+            .map_err(storage_err(
+                "provider_model_runtime_option_snapshot_list_failed",
+                "failed to list model runtime option snapshots",
+            ))?;
+        let rows = stmt
+            .query_map([], map_provider_model_runtime_option_snapshot)
+            .map_err(storage_err(
+                "provider_model_runtime_option_snapshot_list_failed",
+                "failed to list model runtime option snapshots",
+            ))?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(storage_err(
+                "provider_model_runtime_option_snapshot_decode_failed",
+                "failed to decode model runtime option snapshot",
             ))?);
         }
         Ok(records)
@@ -11438,6 +11635,24 @@ fn map_provider_runtime_option_snapshot(
     })
 }
 
+fn map_provider_model_runtime_option_snapshot(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ProviderModelRuntimeOptionSnapshotRecord> {
+    let session_config = row
+        .get::<_, Option<String>>(3)?
+        .map(json_from_db_sql::<AgentSessionConfigProbe>)
+        .transpose()?;
+    Ok(ProviderModelRuntimeOptionSnapshotRecord {
+        provider_profile_id: parse_id_sql(row.get(0)?, ProviderProfileId::parse)?,
+        model_id: row.get(1)?,
+        agent_id: parse_id_sql(row.get(2)?, AgentId::parse)?,
+        session_config,
+        last_success_at_ms: row.get(4)?,
+        last_attempt_at_ms: row.get(5)?,
+        last_error_code: row.get(6)?,
+    })
+}
+
 fn map_agent_runtime_option_snapshot(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<AgentRuntimeOptionSnapshotRecord> {
@@ -11784,7 +11999,8 @@ mod tests {
                 "38:agent_runtime_provider_probe_evidence",
                 "39:agent_runtime_option_snapshots",
                 "40:agent_auth_catalog_snapshots",
-                "41:agent_managed_installations"
+                "41:agent_managed_installations",
+                "42:provider_model_runtime_option_snapshots"
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -11928,7 +12144,8 @@ mod tests {
                 "38:agent_runtime_provider_probe_evidence",
                 "39:agent_runtime_option_snapshots",
                 "40:agent_auth_catalog_snapshots",
-                "41:agent_managed_installations"
+                "41:agent_managed_installations",
+                "42:provider_model_runtime_option_snapshots"
             ]
         );
         assert_eq!(
@@ -13478,7 +13695,8 @@ mod tests {
                 "38:agent_runtime_provider_probe_evidence",
                 "39:agent_runtime_option_snapshots",
                 "40:agent_auth_catalog_snapshots",
-                "41:agent_managed_installations"
+                "41:agent_managed_installations",
+                "42:provider_model_runtime_option_snapshots"
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
@@ -14603,6 +14821,114 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|snapshot| snapshot.provider_profile_id != successful_profile.id)
+        );
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn provider_model_runtime_option_snapshot_round_trips_by_model() {
+        let temp = temp_db_path("provider-model-runtime-option-snapshot");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let agent_id = AgentId::parse("opencode").unwrap();
+        let profile =
+            ProviderProfileRepository::from_create_request(ProviderProfileCreateRequest {
+                agent_id: Some(agent_id.clone()),
+                kind: ProviderKind::Acp,
+                display_name: "Model-scoped ACP profile".to_string(),
+                account_alias: None,
+                base_url: None,
+                default_model: None,
+                small_model: None,
+                large_model: None,
+                configured_models: Vec::new(),
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: None,
+                secret_references: Vec::new(),
+            });
+        ProviderProfileRepository::insert(&conn, &profile).unwrap();
+        let session_config = AgentSessionConfigProbe {
+            models: vec!["gpt-5.6-sol".to_string()],
+            modes: Vec::new(),
+            reasoning_efforts: vec![AgentReasoningEffort {
+                value: "on".to_string(),
+                description: None,
+            }],
+            options: Vec::new(),
+        };
+        ProviderModelRuntimeOptionSnapshotRepository::upsert_success(
+            &conn,
+            &ProviderModelRuntimeOptionSnapshotRecord {
+                provider_profile_id: profile.id.clone(),
+                model_id: "gpt-5.6-sol".to_string(),
+                agent_id: agent_id.clone(),
+                session_config: Some(session_config.clone()),
+                last_success_at_ms: Some(100),
+                last_attempt_at_ms: 100,
+                last_error_code: None,
+            },
+        )
+        .unwrap();
+        ProviderModelRuntimeOptionSnapshotRepository::record_failure(
+            &conn,
+            &profile.id,
+            "gpt-5.6-sol",
+            &agent_id,
+            200,
+            "model_probe_failed",
+        )
+        .unwrap();
+        ProviderModelRuntimeOptionSnapshotRepository::record_failure(
+            &conn,
+            &profile.id,
+            "glm-5.2",
+            &agent_id,
+            300,
+            "model_unavailable",
+        )
+        .unwrap();
+
+        let snapshots = ProviderModelRuntimeOptionSnapshotRepository::list(&conn).unwrap();
+        let success = snapshots
+            .iter()
+            .find(|snapshot| snapshot.model_id == "gpt-5.6-sol")
+            .unwrap();
+        assert_eq!(success.session_config, Some(session_config));
+        assert_eq!(success.last_success_at_ms, Some(100));
+        assert_eq!(success.last_attempt_at_ms, 200);
+        assert_eq!(
+            success.last_error_code.as_deref(),
+            Some("model_probe_failed")
+        );
+        let failure = snapshots
+            .iter()
+            .find(|snapshot| snapshot.model_id == "glm-5.2")
+            .unwrap();
+        assert!(failure.session_config.is_none());
+        assert_eq!(failure.last_success_at_ms, None);
+        assert_eq!(
+            failure.last_error_code.as_deref(),
+            Some("model_unavailable")
+        );
+
+        ProviderModelRuntimeOptionSnapshotRepository::delete_model(&conn, &profile.id, "glm-5.2")
+            .unwrap();
+        assert_eq!(
+            ProviderModelRuntimeOptionSnapshotRepository::list(&conn)
+                .unwrap()
+                .len(),
+            1
+        );
+        ProviderProfileRepository::soft_delete(&mut conn, &profile.id).unwrap();
+        assert!(
+            ProviderModelRuntimeOptionSnapshotRepository::list(&conn)
+                .unwrap()
+                .is_empty()
         );
 
         cleanup_db(temp);

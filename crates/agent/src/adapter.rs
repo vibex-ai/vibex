@@ -483,6 +483,16 @@ pub trait AgentProvider: Send + Sync {
         Ok(AgentSessionConfigProbe::default())
     }
 
+    /// Stateless session-config probe for one concrete model. Providers that
+    /// do not expose model-sensitive options may reuse their Profile probe.
+    async fn probe_session_config_for_model(
+        &self,
+        provider_profile_id: &ProviderProfileId,
+        _model_id: &str,
+    ) -> VibexResult<AgentSessionConfigProbe> {
+        self.probe_session_config(provider_profile_id).await
+    }
+
     /// Stateless Agent-level probe used during Agent setup. Unlike
     /// `probe_session_config`, this path deliberately has no Provider Profile
     /// and therefore must not resolve credentials, models, or provider

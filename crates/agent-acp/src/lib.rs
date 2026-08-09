@@ -514,6 +514,16 @@ pub trait AcpClient: Send + Sync {
         })
     }
 
+    /// Stateless session-config probe for one concrete model. Clients without
+    /// model-sensitive discovery support may reuse the Profile-level probe.
+    async fn probe_runtime_session_config_for_model(
+        &self,
+        provider_profile_id: &ProviderProfileId,
+        _model_id: &str,
+    ) -> VibexResult<AcpRuntimeSessionProbe> {
+        self.probe_runtime_session_config(provider_profile_id).await
+    }
+
     /// Stateless Agent-level session option probe. Implementations may
     /// override this when the CLI can be launched from its Agent-owned
     /// command configuration without a Provider Profile.
@@ -2133,6 +2143,23 @@ impl AgentProvider for AcpAgentProvider {
         let probed = self
             .client
             .probe_runtime_session_config(provider_profile_id)
+            .await?;
+        Ok(AgentSessionConfigProbe {
+            models: probed.models,
+            modes: probed.modes,
+            reasoning_efforts: probed.reasoning_efforts,
+            options: probed.options,
+        })
+    }
+
+    async fn probe_session_config_for_model(
+        &self,
+        provider_profile_id: &ProviderProfileId,
+        model_id: &str,
+    ) -> VibexResult<AgentSessionConfigProbe> {
+        let probed = self
+            .client
+            .probe_runtime_session_config_for_model(provider_profile_id, model_id)
             .await?;
         Ok(AgentSessionConfigProbe {
             models: probed.models,

@@ -150,6 +150,7 @@ const ACP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const ACP_SESSION_LOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const ACP_PROMPT_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 pub(crate) const ACP_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+const ACP_PROBE_CONFIG_UPDATE_TIMEOUT: Duration = Duration::from_millis(500);
 #[cfg(not(test))]
 const ACP_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 // Keep tests faster than production while allowing OS process-group cleanup to run
@@ -1354,6 +1355,7 @@ pub(crate) struct AcpProcess {
     next_request_id: AtomicU64,
     pending_requests: Mutex<HashMap<u64, PendingTransportResponse>>,
     pending_prompt_requests: Mutex<HashMap<String, u64>>,
+    probe_config_update_waiters: Mutex<HashMap<String, oneshot::Sender<Value>>>,
     pending_available_commands: Mutex<PendingAvailableCommandCatalogs>,
     active_terminal_owners: Mutex<HashMap<TerminalId, Weak<AcpSessionAttachment>>>,
     request_admission: Mutex<()>,
@@ -4372,6 +4374,9 @@ impl AcpProcess {
     }
 
     fn handle_session_update(&self, params: &Value) {
+        if self.capture_probe_config_update(params) {
+            return;
+        }
         let is_available_commands_update = params
             .get("update")
             .and_then(|update| update.get("sessionUpdate"))
@@ -4396,6 +4401,49 @@ impl AcpProcess {
             self.with_routed_params(params, AcpOperation::SessionUpdate.method(), |attachment| {
                 attachment.handle_session_update(params)
             });
+    }
+
+    fn register_probe_config_update(&self, native_session_id: &str) -> oneshot::Receiver<Value> {
+        let (sender, receiver) = oneshot::channel();
+        if let Ok(mut waiters) = self.probe_config_update_waiters.lock() {
+            waiters.insert(native_session_id.to_string(), sender);
+        }
+        receiver
+    }
+
+    fn cancel_probe_config_update(&self, native_session_id: &str) {
+        if let Ok(mut waiters) = self.probe_config_update_waiters.lock() {
+            waiters.remove(native_session_id);
+        }
+    }
+
+    fn capture_probe_config_update(&self, params: &Value) -> bool {
+        let update = params.get("update");
+        if update
+            .and_then(|update| update.get("sessionUpdate"))
+            .and_then(Value::as_str)
+            .is_none_or(|kind| !matches!(kind, "config_option_update" | "config_options_update"))
+        {
+            return false;
+        }
+        let Some(native_session_id) = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return false;
+        };
+        let sender = self
+            .probe_config_update_waiters
+            .lock()
+            .ok()
+            .and_then(|mut waiters| waiters.remove(native_session_id));
+        let Some(sender) = sender else {
+            return false;
+        };
+        let _ = sender.send(update.cloned().unwrap_or(Value::Null));
+        true
     }
 
     fn fail_pending_requests(&self, failure: AcpRpcFailure) {
@@ -7422,6 +7470,9 @@ impl AcpRuntimeClient {
                     model_id,
                     reasoning_efforts: Vec::new(),
                     default_reasoning_effort: None,
+                    modes: Vec::new(),
+                    options: Vec::new(),
+                    runtime_options_complete: false,
                     source: crate::session_config::SessionModelCatalogSource::Session,
                 });
         let profile_models = payload.process().provider_profile_id.clone();
@@ -8959,6 +9010,7 @@ impl AcpRuntimeClient {
             next_request_id: AtomicU64::new(1),
             pending_requests: Mutex::new(HashMap::new()),
             pending_prompt_requests: Mutex::new(HashMap::new()),
+            probe_config_update_waiters: Mutex::new(HashMap::new()),
             pending_available_commands: Mutex::new(PendingAvailableCommandCatalogs::default()),
             active_terminal_owners: Mutex::new(HashMap::new()),
             request_admission: Mutex::new(()),
@@ -12477,6 +12529,7 @@ async fn probe_runtime_session_config_with_config(
     agent_id: Option<&AgentId>,
     config: &AcpProviderConfig,
     materialized_env: Option<Vec<(String, String)>>,
+    target_model: Option<&str>,
 ) -> VibexResult<AcpRuntimeSessionProbe> {
     let probe_cwd = std::env::var("HOME")
         .map(PathBuf::from)
@@ -12519,11 +12572,69 @@ async fn probe_runtime_session_config_with_config(
                 ACP_PROBE_TIMEOUT,
             )
             .await?;
+        let (model_response, model_config_update) = if let Some(model_id) = target_model {
+            let native_session_id = session
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    VibexError::provider(
+                        "agent_runtime_probe_session_id_missing",
+                        "ACP session/new did not return a session identity",
+                    )
+                })?;
+            let config_update = process.register_probe_config_update(native_session_id);
+            let response = process
+                .request(
+                    AcpOperation::SessionSetModel.method(),
+                    protocol::build_session_set_model_params(native_session_id, model_id),
+                    ACP_PROBE_TIMEOUT,
+                )
+                .await?;
+            let config_update = if response_has_config_options(&response) {
+                process.cancel_probe_config_update(native_session_id);
+                None
+            } else {
+                match timeout(ACP_PROBE_CONFIG_UPDATE_TIMEOUT, config_update).await {
+                    Ok(Ok(update)) => Some(update),
+                    Ok(Err(_)) | Err(_) => {
+                        process.cancel_probe_config_update(native_session_id);
+                        None
+                    }
+                }
+            };
+            (Some(response), config_update)
+        } else {
+            (None, None)
+        };
+        let model_response_ref = model_response.as_ref();
+        let modes = model_response_ref
+            .filter(|response| response_has_mode_evidence(response))
+            .or_else(|| {
+                model_config_update
+                    .as_ref()
+                    .filter(|update| response_has_mode_evidence(update))
+            })
+            .map(|response| extract_config_values(mode_candidates(response)))
+            .unwrap_or_else(|| extract_config_values(mode_candidates(&session)));
+        let reasoning_efforts = model_response_ref
+            .filter(|response| response_has_config_options(response))
+            .or(model_config_update.as_ref())
+            .map(extract_probe_reasoning_efforts)
+            .unwrap_or_else(|| extract_probe_reasoning_efforts(&session));
+        let options = model_response_ref
+            .filter(|response| response_has_config_options(response))
+            .or(model_config_update.as_ref())
+            .map(extract_config_options)
+            .unwrap_or_else(|| extract_config_options(&session));
         Ok::<AcpRuntimeSessionProbe, VibexError>(AcpRuntimeSessionProbe {
-            models: extract_model_ids(&session),
-            modes: extract_config_values(mode_candidates(&session)),
-            reasoning_efforts: extract_probe_reasoning_efforts(&session),
-            options: extract_config_options(&session),
+            models: target_model
+                .map(|model| vec![model.to_string()])
+                .unwrap_or_else(|| extract_model_ids(&session)),
+            modes,
+            reasoning_efforts,
+            options,
         })
     };
 
@@ -13233,8 +13344,33 @@ impl AcpClient for AcpRuntimeClient {
         provider_profile_id: &ProviderProfileId,
     ) -> VibexResult<AcpRuntimeSessionProbe> {
         let config = self.profile_config(provider_profile_id)?;
-        probe_runtime_session_config_with_config(self, provider_profile_id, None, &config, None)
-            .await
+        probe_runtime_session_config_with_config(
+            self,
+            provider_profile_id,
+            None,
+            &config,
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn probe_runtime_session_config_for_model(
+        &self,
+        provider_profile_id: &ProviderProfileId,
+        model_id: &str,
+    ) -> VibexResult<AcpRuntimeSessionProbe> {
+        let mut config = self.profile_config(provider_profile_id)?;
+        config.models = vec![model_id.to_string()];
+        probe_runtime_session_config_with_config(
+            self,
+            provider_profile_id,
+            None,
+            &config,
+            None,
+            Some(model_id),
+        )
+        .await
     }
 
     async fn probe_runtime_session_config_for_agent(
@@ -13254,6 +13390,7 @@ impl AcpClient for AcpRuntimeClient {
             Some(agent_id),
             &config,
             Some(env_overlays),
+            None,
         )
         .await?;
         // Model choices are owned by model Provider Profiles, not by this
@@ -14542,6 +14679,23 @@ fn config_options_array(response: &Value) -> Option<&Vec<Value>> {
         .and_then(Value::as_array)
 }
 
+fn response_has_config_options(response: &Value) -> bool {
+    response
+        .get("configOptions")
+        .or_else(|| response.get("config_options"))
+        .is_some()
+}
+
+fn response_has_mode_evidence(response: &Value) -> bool {
+    response.get("availableModes").is_some()
+        || response.get("modes").is_some()
+        || config_options_array(response).is_some_and(|options| {
+            options
+                .iter()
+                .any(|option| option.get("category").and_then(Value::as_str) == Some("mode"))
+        })
+}
+
 fn extract_config_values(candidates: Vec<&Value>) -> Vec<ProviderSessionConfigValue> {
     let mut values: Vec<ProviderSessionConfigValue> = Vec::new();
     for candidate in candidates {
@@ -15434,6 +15588,7 @@ mod tests {
             next_request_id: AtomicU64::new(1),
             pending_requests: Mutex::new(HashMap::new()),
             pending_prompt_requests: Mutex::new(HashMap::new()),
+            probe_config_update_waiters: Mutex::new(HashMap::new()),
             pending_available_commands: Mutex::new(PendingAvailableCommandCatalogs::default()),
             active_terminal_owners: Mutex::new(HashMap::new()),
             request_admission: Mutex::new(()),
@@ -17635,6 +17790,7 @@ session_counter = 0
 pending_prompt_id = None
 request_log_path = os.environ.get("VIBEX_MOCK_ACP_REQUEST_LOG")
 set_model_mode = os.environ.get("VIBEX_MOCK_ACP_SET_MODEL_MODE", "supported")
+model_config_updates = os.environ.get("VIBEX_MOCK_ACP_MODEL_CONFIG_UPDATES") == "true"
 prompt_mode = os.environ.get("VIBEX_MOCK_ACP_PROMPT_MODE", "success")
 restore_mode = os.environ.get("VIBEX_MOCK_ACP_RESTORE_MODE", "success")
 advertise_resume = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_RESUME") == "true"
@@ -17816,6 +17972,33 @@ for line in sys.stdin:
                 "error": {"code": -32003, "message": "permission denied"},
             })
         else:
+            if model_config_updates:
+                thought_levels = (
+                    ["none", "on"]
+                    if model_id == "mock/model-2"
+                    else ["none", "high", "max"]
+                )
+                send({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "config_option_update",
+                            "configOptions": [{
+                                "id": "thought_level",
+                                "category": "thought_level",
+                                "label": "Thinking",
+                                "type": "select",
+                                "currentValue": thought_levels[-1],
+                                "options": [
+                                    {"value": value, "label": value.title()}
+                                    for value in thought_levels
+                                ],
+                            }],
+                        },
+                    },
+                })
             send({
                 "jsonrpc": "2.0",
                 "id": mid,
@@ -18405,6 +18588,26 @@ for line in sys.stdin:
                 value: Some(mode.to_string()),
                 secret_lookup_key: None,
                 redacted_hint: "mock set-model failure mode".to_string(),
+            });
+            service
+                .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                    provider_profile_id: self.profile_id.clone(),
+                    config,
+                })
+                .unwrap();
+        }
+
+        fn enable_model_config_updates(&self) {
+            let service = self.service();
+            let mut config = service
+                .get_acp_profile_config(self.profile_id.clone())
+                .unwrap();
+            config.env.push(vibex_core::AcpProviderEnvReference {
+                key: "VIBEX_MOCK_ACP_MODEL_CONFIG_UPDATES".to_string(),
+                source: AcpProviderEnvSource::Literal,
+                value: Some("true".to_string()),
+                secret_lookup_key: None,
+                redacted_hint: "mock model config updates".to_string(),
             });
             service
                 .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
@@ -24838,6 +25041,7 @@ for line in sys.stdin:
         let Some(fixture) = MockAcpFixture::create("probe") else {
             return;
         };
+        fixture.enable_model_config_updates();
         let client = AcpRuntimeClient::new(ProviderConfigService::new(fixture.db_path.clone()));
 
         let probed = client
@@ -24871,6 +25075,34 @@ for line in sys.stdin:
             .await
             .unwrap();
         assert_eq!(models, probed.models);
+
+        let model_probe = client
+            .probe_runtime_session_config_for_model(&fixture.profile_id, "mock/model-2")
+            .await
+            .unwrap();
+        assert_eq!(model_probe.models, vec!["mock/model-2".to_string()]);
+        assert_eq!(
+            model_probe
+                .reasoning_efforts
+                .iter()
+                .map(|effort| effort.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["none", "on"]
+        );
+        assert_eq!(
+            model_probe
+                .modes
+                .iter()
+                .map(|mode| mode.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["build", "review"]
+        );
+        let model_request = fixture
+            .request_log()
+            .into_iter()
+            .find(|entry| entry["method"] == "session/set_model")
+            .expect("model-scoped probe must select its target model");
+        assert_eq!(model_request["params"]["modelId"], "mock/model-2");
         fixture.cleanup();
     }
 

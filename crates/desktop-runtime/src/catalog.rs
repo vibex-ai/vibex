@@ -4,13 +4,18 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use vibex_agent::AgentManager;
 use vibex_agent_acp::{
-    AcpRuntimeClient, RuntimeOptionCatalogProfileEvidence, build_runtime_option_catalog,
+    AcpRuntimeClient, RuntimeOptionCatalogProfileEvidence, SessionModelCatalogEntry,
+    SessionModelCatalogSource, build_runtime_option_catalog,
 };
 use vibex_config_switch::ProviderConfigService;
-use vibex_core::{AgentId, AgentListRequest, SessionRuntimeOptionCatalog, VibexError};
+use vibex_core::{
+    AgentId, AgentListRequest, ProviderKind, ProviderProfile, ProviderProfileId,
+    ProviderProfileStatus, SessionRuntimeOptionCatalog, VibexError,
+};
 use vibex_db::{
     AgentConfigRepository, AgentRuntimeOptionSnapshotRecord, AgentRuntimeOptionSnapshotRepository,
-    apply_migrations, open_database,
+    ProviderModelRuntimeOptionSnapshotRecord, ProviderModelRuntimeOptionSnapshotRepository,
+    ProviderProfileRepository, apply_migrations, open_database,
 };
 use vibex_remote::RemoteRuntimeOptionCatalogSource;
 
@@ -27,6 +32,19 @@ pub struct RuntimeOptionProbeResult {
     pub probed_agent_ids: Vec<AgentId>,
     pub failed_agent_ids: Vec<AgentId>,
     pub cached_agent_ids: Vec<AgentId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ProviderModelRuntimeOptionKey {
+    pub provider_profile_id: ProviderProfileId,
+    pub model_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProviderModelRuntimeOptionProbeResult {
+    pub probed_models: Vec<ProviderModelRuntimeOptionKey>,
+    pub failed_models: Vec<ProviderModelRuntimeOptionKey>,
+    pub cached_models: Vec<ProviderModelRuntimeOptionKey>,
 }
 
 #[derive(Clone)]
@@ -66,6 +84,7 @@ impl RuntimeOptionCatalogService {
         })?;
         let profiles = self.provider_config.list_runtime_profiles()?;
         let snapshots = self.snapshot_map()?;
+        let model_snapshots = self.model_snapshot_records()?;
         let mut fallback_by_agent = BTreeMap::new();
 
         for agent in &agents.agents {
@@ -103,8 +122,13 @@ impl RuntimeOptionCatalogService {
             .map(|runtime| runtime.profile_session_config_evidence())
             .transpose()?
             .unwrap_or_default();
-        let evidence_by_profile =
-            layer_profile_session_evidence(&profiles, &fallback_by_agent, live_by_profile);
+        let model_evidence_by_profile = model_snapshot_evidence(model_snapshots);
+        let evidence_by_profile = layer_profile_session_evidence(
+            &profiles,
+            &fallback_by_agent,
+            model_evidence_by_profile,
+            live_by_profile,
+        );
 
         Ok(build_runtime_option_catalog(
             &agents.agents,
@@ -144,6 +168,133 @@ impl RuntimeOptionCatalogService {
             result.probed_agent_ids.extend(probe.probed_agent_ids);
             result.failed_agent_ids.extend(probe.failed_agent_ids);
             result.cached_agent_ids.extend(probe.cached_agent_ids);
+        }
+        Ok(result)
+    }
+
+    /// Fills missing model-owned option snapshots after startup. Catalog reads
+    /// remain process-free; a successful `(Profile, model)` cache is reused.
+    pub(crate) async fn probe_missing_enabled_profile_models(
+        &self,
+    ) -> Result<ProviderModelRuntimeOptionProbeResult, VibexError> {
+        let agents = self.provider_config.list_agents(AgentListRequest {
+            include_disabled: true,
+        })?;
+        let snapshots = self.model_snapshot_map()?;
+        let profile_ids = self
+            .provider_config
+            .list_runtime_profiles()?
+            .into_iter()
+            .filter(|profile| {
+                profile.kind == ProviderKind::Acp
+                    && profile.status == ProviderProfileStatus::Enabled
+                    && agents.agents.iter().any(|agent| {
+                        agent.id == profile.agent_id
+                            && agent.added
+                            && agent.enabled
+                            && agent.installed
+                    })
+            })
+            .filter(|profile| {
+                let model_ids = configured_model_ids(profile);
+                !model_ids.is_empty()
+                    && (model_ids.iter().any(|model_id| {
+                        snapshots
+                            .get(&(profile.id.clone(), model_id.clone()))
+                            .is_none_or(|snapshot| snapshot.last_success_at_ms.is_none())
+                    }) || snapshots.keys().any(|(profile_id, model_id)| {
+                        profile_id == &profile.id && !model_ids.contains(model_id)
+                    }))
+            })
+            .map(|profile| profile.id)
+            .collect::<Vec<_>>();
+        let mut result = ProviderModelRuntimeOptionProbeResult::default();
+        for profile_id in profile_ids {
+            let probe = self.probe_profile_models(&profile_id).await?;
+            result.probed_models.extend(probe.probed_models);
+            result.failed_models.extend(probe.failed_models);
+            result.cached_models.extend(probe.cached_models);
+        }
+        Ok(result)
+    }
+
+    /// Probes only models without a successful persistent cache. Removed
+    /// models are cleaned up, while unchanged model ids keep their evidence.
+    pub async fn probe_profile_models(
+        &self,
+        provider_profile_id: &ProviderProfileId,
+    ) -> Result<ProviderModelRuntimeOptionProbeResult, VibexError> {
+        let _probe_guard = self.probe_lock.lock().await;
+        let Some(profile) = self.provider_config.get_profile(provider_profile_id)? else {
+            self.delete_profile_model_snapshots(provider_profile_id)?;
+            return Ok(ProviderModelRuntimeOptionProbeResult::default());
+        };
+        let model_ids = configured_model_ids(&profile);
+        self.delete_stale_profile_model_snapshots(&profile.id, &model_ids)?;
+        if profile.kind != ProviderKind::Acp || profile.status != ProviderProfileStatus::Enabled {
+            return Ok(ProviderModelRuntimeOptionProbeResult::default());
+        }
+        let agents = self.provider_config.list_agents(AgentListRequest {
+            include_disabled: true,
+        })?;
+        if !agents.agents.iter().any(|agent| {
+            agent.id == profile.agent_id && agent.added && agent.enabled && agent.installed
+        }) {
+            return Ok(ProviderModelRuntimeOptionProbeResult::default());
+        }
+
+        let mut snapshots = self.model_snapshot_map()?;
+        let mut result = ProviderModelRuntimeOptionProbeResult::default();
+        for model_id in model_ids {
+            let key = ProviderModelRuntimeOptionKey {
+                provider_profile_id: profile.id.clone(),
+                model_id: model_id.clone(),
+            };
+            if snapshots
+                .get(&(profile.id.clone(), model_id.clone()))
+                .is_some_and(|snapshot| snapshot.last_success_at_ms.is_some())
+            {
+                result.cached_models.push(key);
+                continue;
+            }
+
+            let attempted_at_ms = vibex_core::unix_timestamp_ms();
+            let mut session_config = match self
+                .manager
+                .probe_session_config_for_model(
+                    profile.agent_id.clone(),
+                    profile.id.clone(),
+                    &model_id,
+                )
+                .await
+            {
+                Ok(probe) => probe,
+                Err(error) => {
+                    if self.record_model_snapshot_failure_if_current(
+                        &profile,
+                        &model_id,
+                        attempted_at_ms,
+                        &error.code,
+                    )? {
+                        result.failed_models.push(key);
+                    }
+                    continue;
+                }
+            };
+            session_config.models = vec![model_id.clone()];
+            let record = ProviderModelRuntimeOptionSnapshotRecord {
+                provider_profile_id: profile.id.clone(),
+                model_id: model_id.clone(),
+                agent_id: profile.agent_id.clone(),
+                session_config: Some(session_config),
+                last_success_at_ms: Some(attempted_at_ms),
+                last_attempt_at_ms: attempted_at_ms,
+                last_error_code: None,
+            };
+            if self.persist_model_snapshot_success_if_current(&profile, &record)? {
+                snapshots.insert((profile.id.clone(), model_id), record);
+                result.probed_models.push(key);
+            }
         }
         Ok(result)
     }
@@ -235,6 +386,18 @@ impl RuntimeOptionCatalogService {
         AgentRuntimeOptionSnapshotRepository::delete(&connection, agent_id)
     }
 
+    pub fn delete_profile_model_snapshots(
+        &self,
+        provider_profile_id: &ProviderProfileId,
+    ) -> Result<(), VibexError> {
+        let mut connection = open_database(self.provider_config.database_path())?;
+        apply_migrations(&mut connection)?;
+        ProviderModelRuntimeOptionSnapshotRepository::delete_profile(
+            &connection,
+            provider_profile_id,
+        )
+    }
+
     pub fn snapshot_summaries(&self) -> Result<Vec<RuntimeOptionSnapshotSummary>, VibexError> {
         Ok(self
             .snapshot_records()?
@@ -262,6 +425,140 @@ impl RuntimeOptionCatalogService {
             .into_iter()
             .map(|record| (record.agent_id.clone(), record))
             .collect())
+    }
+
+    fn model_snapshot_records(
+        &self,
+    ) -> Result<Vec<ProviderModelRuntimeOptionSnapshotRecord>, VibexError> {
+        let mut connection = open_database(self.provider_config.database_path())?;
+        apply_migrations(&mut connection)?;
+        ProviderModelRuntimeOptionSnapshotRepository::list(&connection)
+    }
+
+    fn model_snapshot_map(
+        &self,
+    ) -> Result<
+        BTreeMap<(ProviderProfileId, String), ProviderModelRuntimeOptionSnapshotRecord>,
+        VibexError,
+    > {
+        Ok(self
+            .model_snapshot_records()?
+            .into_iter()
+            .map(|record| {
+                (
+                    (record.provider_profile_id.clone(), record.model_id.clone()),
+                    record,
+                )
+            })
+            .collect())
+    }
+
+    fn delete_stale_profile_model_snapshots(
+        &self,
+        provider_profile_id: &ProviderProfileId,
+        model_ids: &[String],
+    ) -> Result<(), VibexError> {
+        let stale_models = self
+            .model_snapshot_records()?
+            .into_iter()
+            .filter(|snapshot| {
+                snapshot.provider_profile_id == *provider_profile_id
+                    && !model_ids.contains(&snapshot.model_id)
+            })
+            .map(|snapshot| snapshot.model_id)
+            .collect::<Vec<_>>();
+        if stale_models.is_empty() {
+            return Ok(());
+        }
+        let mut connection = open_database(self.provider_config.database_path())?;
+        apply_migrations(&mut connection)?;
+        let transaction = connection.transaction().map_err(|error| {
+            VibexError::storage(
+                "provider_model_runtime_option_snapshot_transaction_failed",
+                "failed to begin model runtime option snapshot transaction",
+            )
+            .with_diagnostic("error", error.to_string())
+        })?;
+        for model_id in stale_models {
+            ProviderModelRuntimeOptionSnapshotRepository::delete_model(
+                &transaction,
+                provider_profile_id,
+                &model_id,
+            )?;
+        }
+        transaction.commit().map_err(|error| {
+            VibexError::storage(
+                "provider_model_runtime_option_snapshot_commit_failed",
+                "failed to commit model runtime option snapshot cleanup",
+            )
+            .with_diagnostic("error", error.to_string())
+        })?;
+        Ok(())
+    }
+
+    fn persist_model_snapshot_success_if_current(
+        &self,
+        expected: &ProviderProfile,
+        record: &ProviderModelRuntimeOptionSnapshotRecord,
+    ) -> Result<bool, VibexError> {
+        let mut connection = open_database(self.provider_config.database_path())?;
+        apply_migrations(&mut connection)?;
+        let transaction = connection.transaction().map_err(|error| {
+            VibexError::storage(
+                "provider_model_runtime_option_snapshot_transaction_failed",
+                "failed to begin model runtime option snapshot transaction",
+            )
+            .with_diagnostic("error", error.to_string())
+        })?;
+        if ProviderProfileRepository::get(&transaction, &expected.id)?.as_ref() != Some(expected) {
+            return Ok(false);
+        }
+        ProviderModelRuntimeOptionSnapshotRepository::upsert_success(&transaction, record)?;
+        transaction.commit().map_err(|error| {
+            VibexError::storage(
+                "provider_model_runtime_option_snapshot_commit_failed",
+                "failed to commit model runtime option snapshot",
+            )
+            .with_diagnostic("error", error.to_string())
+        })?;
+        Ok(true)
+    }
+
+    fn record_model_snapshot_failure_if_current(
+        &self,
+        expected: &ProviderProfile,
+        model_id: &str,
+        attempted_at_ms: i64,
+        error_code: &str,
+    ) -> Result<bool, VibexError> {
+        let mut connection = open_database(self.provider_config.database_path())?;
+        apply_migrations(&mut connection)?;
+        let transaction = connection.transaction().map_err(|error| {
+            VibexError::storage(
+                "provider_model_runtime_option_snapshot_transaction_failed",
+                "failed to begin model runtime option snapshot transaction",
+            )
+            .with_diagnostic("error", error.to_string())
+        })?;
+        if ProviderProfileRepository::get(&transaction, &expected.id)?.as_ref() != Some(expected) {
+            return Ok(false);
+        }
+        ProviderModelRuntimeOptionSnapshotRepository::record_failure(
+            &transaction,
+            &expected.id,
+            model_id,
+            &expected.agent_id,
+            attempted_at_ms,
+            error_code,
+        )?;
+        transaction.commit().map_err(|error| {
+            VibexError::storage(
+                "provider_model_runtime_option_snapshot_commit_failed",
+                "failed to commit model runtime option snapshot failure",
+            )
+            .with_diagnostic("error", error.to_string())
+        })?;
+        Ok(true)
     }
 
     fn persist_agent_snapshot_success_if_current(
@@ -342,34 +639,86 @@ impl RuntimeOptionCatalogService {
 }
 
 fn layer_profile_session_evidence(
-    profiles: &[vibex_core::ProviderProfile],
+    profiles: &[ProviderProfile],
     fallback_by_agent: &BTreeMap<AgentId, RuntimeOptionCatalogProfileEvidence>,
-    live_by_profile: BTreeMap<vibex_core::ProviderProfileId, vibex_core::AgentSessionConfigProbe>,
-) -> BTreeMap<vibex_core::ProviderProfileId, RuntimeOptionCatalogProfileEvidence> {
+    mut model_evidence_by_profile: BTreeMap<ProviderProfileId, Vec<SessionModelCatalogEntry>>,
+    live_by_profile: BTreeMap<ProviderProfileId, vibex_core::AgentSessionConfigProbe>,
+) -> BTreeMap<ProviderProfileId, RuntimeOptionCatalogProfileEvidence> {
     let mut evidence_by_profile = profiles
         .iter()
-        .filter_map(|profile| {
-            fallback_by_agent
+        .map(|profile| {
+            let mut evidence = fallback_by_agent
                 .get(&profile.agent_id)
                 .cloned()
-                .map(|evidence| (profile.id.clone(), evidence))
+                .unwrap_or_default();
+            evidence.models = model_evidence_by_profile
+                .remove(&profile.id)
+                .unwrap_or_default();
+            if !evidence.models.is_empty() {
+                evidence.temporarily_unavailable = false;
+            }
+            (profile.id.clone(), evidence)
         })
         .collect::<BTreeMap<_, _>>();
     for (profile_id, probe) in live_by_profile {
-        evidence_by_profile.insert(
-            profile_id,
-            RuntimeOptionCatalogProfileEvidence {
-                // Models are always owned by the Provider Profile. A live
-                // Agent session calibrates only Agent-owned controls.
-                models: Vec::new(),
-                modes: probe.modes,
-                reasoning_efforts: probe.reasoning_efforts,
-                options: probe.options,
-                temporarily_unavailable: false,
-            },
-        );
+        let evidence = evidence_by_profile.entry(profile_id).or_default();
+        // A live session refreshes Profile-wide fallback controls. Persisted
+        // model evidence remains authoritative for its concrete model.
+        evidence.modes = probe.modes;
+        evidence.reasoning_efforts = probe.reasoning_efforts;
+        evidence.options = probe.options;
+        evidence.temporarily_unavailable = false;
     }
     evidence_by_profile
+}
+
+fn model_snapshot_evidence(
+    snapshots: Vec<ProviderModelRuntimeOptionSnapshotRecord>,
+) -> BTreeMap<ProviderProfileId, Vec<SessionModelCatalogEntry>> {
+    let mut evidence = BTreeMap::<ProviderProfileId, Vec<SessionModelCatalogEntry>>::new();
+    for snapshot in snapshots {
+        if snapshot.last_success_at_ms.is_none() {
+            continue;
+        }
+        let Some(session_config) = snapshot.session_config else {
+            continue;
+        };
+        evidence
+            .entry(snapshot.provider_profile_id)
+            .or_default()
+            .push(SessionModelCatalogEntry {
+                model_id: snapshot.model_id,
+                reasoning_efforts: session_config.reasoning_efforts,
+                default_reasoning_effort: None,
+                modes: session_config.modes,
+                options: session_config.options,
+                runtime_options_complete: true,
+                source: SessionModelCatalogSource::Probe,
+            });
+    }
+    evidence
+}
+
+fn configured_model_ids(profile: &ProviderProfile) -> Vec<String> {
+    let mut models = profile
+        .configured_models
+        .iter()
+        .filter(|model| model.enabled)
+        .map(|model| model.id.trim().to_string())
+        .filter(|model| !model.is_empty())
+        .collect::<Vec<_>>();
+    if models.is_empty()
+        && let Some(model) = profile
+            .default_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+    {
+        models.push(model.to_string());
+    }
+    models.sort();
+    models.dedup();
+    models
 }
 
 #[async_trait]
@@ -391,14 +740,16 @@ mod tests {
     };
     use vibex_core::{
         AcpProcessStrategy, AcpProviderConfig, AcpProviderProfileCreateRequest, AgentCommandConfig,
-        AgentModelProviderProfileCreateRequest, AgentReasoningEffort, AgentRuntimeRouteKey,
-        AgentSessionConfigProbe, AgentUpdateConfigRequest, ProviderBinding, ProviderCapabilities,
-        ProviderConfiguredModel, ProviderProfile, ProviderSessionConfigOption,
-        ProviderSessionConfigOptionKind, ProviderSessionConfigValue, TransportKind, VibexResult,
+        AgentModelProviderProfileCreateRequest, AgentModelProviderProfileUpdateRequest,
+        AgentReasoningEffort, AgentRuntimeRouteKey, AgentSessionConfigProbe,
+        AgentUpdateConfigRequest, ProviderBinding, ProviderCapabilities, ProviderConfiguredModel,
+        ProviderProfile, ProviderSessionConfigOption, ProviderSessionConfigOptionKind,
+        ProviderSessionConfigValue, TransportKind, VibexResult,
     };
 
     struct CountingProvider {
         calls: AtomicUsize,
+        model_calls: AtomicUsize,
         fail_probe: bool,
     }
 
@@ -427,6 +778,15 @@ mod tests {
                 ));
             }
             Ok(agent_session_config())
+        }
+
+        async fn probe_session_config_for_model(
+            &self,
+            _provider_profile_id: &vibex_core::ProviderProfileId,
+            model_id: &str,
+        ) -> VibexResult<AgentSessionConfigProbe> {
+            self.model_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(model_session_config(model_id))
         }
 
         async fn create_session(
@@ -517,6 +877,7 @@ mod tests {
         }
         let provider = Arc::new(CountingProvider {
             calls: AtomicUsize::new(0),
+            model_calls: AtomicUsize::new(0),
             fail_probe,
         });
         let mut manager = AgentManager::new(&database_path).unwrap();
@@ -592,7 +953,7 @@ mod tests {
         AgentSessionConfigProbe {
             models: vec!["model-from-agent-must-not-be-used".to_string()],
             modes: vec![mode("plan", Some("Plan mode"))],
-            reasoning_efforts: vec![effort("high")],
+            reasoning_efforts: vec![effort("none"), effort("high"), effort("max")],
             options: vec![ProviderSessionConfigOption {
                 id: "auto_approve".to_string(),
                 label: "Auto approve".to_string(),
@@ -603,6 +964,33 @@ mod tests {
                 default_value: Some(enabled),
                 values: Vec::new(),
             }],
+        }
+    }
+
+    fn model_session_config(model_id: &str) -> AgentSessionConfigProbe {
+        if model_id == "model-without-runtime-options" {
+            return AgentSessionConfigProbe {
+                models: vec![model_id.to_string()],
+                ..Default::default()
+            };
+        }
+        let reasoning_efforts = match model_id {
+            "gpt-5.6-sol" => vec![effort("none"), effort("on")],
+            "glm-5.2" => vec![effort("none"), effort("high"), effort("max")],
+            _ => vec![effort("high")],
+        };
+        AgentSessionConfigProbe {
+            models: vec![model_id.to_string()],
+            modes: vec![mode(
+                if model_id == "gpt-5.6-sol" {
+                    "accept_edits"
+                } else {
+                    "plan"
+                },
+                None,
+            )],
+            reasoning_efforts,
+            options: Vec::new(),
         }
     }
 
@@ -727,6 +1115,165 @@ mod tests {
         assert_eq!(catalog.snapshot_summaries().unwrap().len(), 1);
     }
 
+    #[tokio::test]
+    async fn model_snapshots_override_agent_fallback_and_are_reused_by_model() {
+        let (_directory, catalog, provider_config, agent_id, provider) = catalog_fixture(false);
+        let profile = create_profile(
+            &provider_config,
+            &agent_id,
+            "GLM model provider",
+            vec![configured_model("glm-5.2"), configured_model("gpt-5.6-sol")],
+        );
+
+        catalog.probe_agent(&agent_id).await.unwrap();
+        let fallback = catalog.list().await.unwrap();
+        let fallback_gpt = fallback
+            .options
+            .iter()
+            .find(|option| {
+                option.selection.provider_profile_id == profile.id
+                    && option.selection.model_id == "gpt-5.6-sol"
+            })
+            .unwrap();
+        assert!(
+            fallback_gpt
+                .reasoning_efforts
+                .iter()
+                .any(|effort| effort.value == "max")
+        );
+
+        let result = catalog.probe_profile_models(&profile.id).await.unwrap();
+        assert_eq!(result.probed_models.len(), 2);
+        assert_eq!(provider.model_calls.load(Ordering::SeqCst), 2);
+        let options = catalog.list().await.unwrap().options;
+        let gpt = options
+            .iter()
+            .find(|option| {
+                option.selection.provider_profile_id == profile.id
+                    && option.selection.model_id == "gpt-5.6-sol"
+            })
+            .unwrap();
+        assert_eq!(
+            gpt.reasoning_efforts
+                .iter()
+                .map(|effort| effort.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["none", "on"]
+        );
+        assert!(
+            !gpt.reasoning_efforts
+                .iter()
+                .any(|effort| effort.value == "max")
+        );
+        assert_eq!(gpt.modes[0].value, "accept_edits");
+
+        let glm = options
+            .iter()
+            .find(|option| {
+                option.selection.provider_profile_id == profile.id
+                    && option.selection.model_id == "glm-5.2"
+            })
+            .unwrap();
+        assert!(
+            glm.reasoning_efforts
+                .iter()
+                .any(|effort| effort.value == "max")
+        );
+        assert_eq!(glm.modes[0].value, "plan");
+
+        let cached = catalog.probe_profile_models(&profile.id).await.unwrap();
+        assert_eq!(cached.probed_models.len(), 0);
+        assert_eq!(cached.cached_models.len(), 2);
+        assert_eq!(provider.model_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn successful_empty_model_snapshot_suppresses_agent_fallback_controls() {
+        let (_directory, catalog, provider_config, agent_id, _provider) = catalog_fixture(false);
+        let profile = create_profile(
+            &provider_config,
+            &agent_id,
+            "Model without runtime options",
+            vec![configured_model("model-without-runtime-options")],
+        );
+
+        catalog.probe_agent(&agent_id).await.unwrap();
+        catalog.probe_profile_models(&profile.id).await.unwrap();
+
+        let options = catalog.list().await.unwrap().options;
+        let model = options
+            .iter()
+            .find(|option| option.selection.provider_profile_id == profile.id)
+            .unwrap();
+        assert!(model.reasoning_efforts.is_empty());
+        assert!(model.modes.is_empty());
+        assert!(model.features.is_empty());
+        assert!(model.selection.config_values.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unchanged_model_keeps_cache_while_replaced_model_is_probed() {
+        let (_directory, catalog, provider_config, agent_id, provider) = catalog_fixture(false);
+        let profile = create_profile(
+            &provider_config,
+            &agent_id,
+            "Editable provider",
+            vec![configured_model("gpt-5.6-sol")],
+        );
+        catalog.probe_profile_models(&profile.id).await.unwrap();
+        assert_eq!(provider.model_calls.load(Ordering::SeqCst), 1);
+
+        provider_config
+            .update_agent_model_provider_profile(AgentModelProviderProfileUpdateRequest {
+                agent_id: agent_id.clone(),
+                provider_profile_id: profile.id.clone(),
+                display_name: Some("Renamed provider".to_string()),
+                status: None,
+                account_alias: None,
+                base_url: None,
+                default_model: None,
+                small_model: None,
+                large_model: None,
+                configured_models: None,
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: None,
+            })
+            .unwrap();
+        let cached = catalog.probe_profile_models(&profile.id).await.unwrap();
+        assert_eq!(cached.cached_models.len(), 1);
+        assert_eq!(provider.model_calls.load(Ordering::SeqCst), 1);
+
+        provider_config
+            .update_agent_model_provider_profile(AgentModelProviderProfileUpdateRequest {
+                agent_id,
+                provider_profile_id: profile.id.clone(),
+                display_name: None,
+                status: None,
+                account_alias: None,
+                base_url: None,
+                default_model: None,
+                small_model: None,
+                large_model: None,
+                configured_models: Some(vec![configured_model("glm-5.2")]),
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: None,
+            })
+            .unwrap();
+        let replaced = catalog.probe_profile_models(&profile.id).await.unwrap();
+        assert_eq!(replaced.probed_models.len(), 1);
+        assert_eq!(replaced.probed_models[0].model_id, "glm-5.2");
+        assert_eq!(provider.model_calls.load(Ordering::SeqCst), 2);
+        let snapshots = catalog.model_snapshot_records().unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].model_id, "glm-5.2");
+    }
+
     #[test]
     fn live_profile_evidence_overrides_agent_fallback_without_overriding_models() {
         let (_directory, _catalog, provider_config, agent_id, _provider) = catalog_fixture(false);
@@ -762,7 +1309,7 @@ mod tests {
             },
         )]);
         let profiles = provider_config.list_profiles().unwrap();
-        let layered = layer_profile_session_evidence(&profiles, &fallback, live);
+        let layered = layer_profile_session_evidence(&profiles, &fallback, BTreeMap::new(), live);
         let first_evidence = layered.get(&first_profile.id).unwrap();
         assert!(first_evidence.models.is_empty());
         assert_eq!(first_evidence.modes[0].value, "review");

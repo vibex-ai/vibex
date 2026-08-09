@@ -39,7 +39,8 @@ Plan migrations around these domain records:
 - `agent_timeline_items`.
 - `provider_configs`, `provider_bindings`, `provider_health`,
   `provider_usage`, `provider_injection_plans`, and the legacy
-  `provider_runtime_option_snapshots` table.
+  `provider_runtime_option_snapshots` table, plus the active
+  `provider_model_runtime_option_snapshots` model cache.
 - `agent_configs`, `agent_discovery_records`, and the active Agent-owned
   `agent_runtime_option_snapshots` table.
 - `agent_managed_installations`, the durable lifecycle record for verified ACP
@@ -119,7 +120,7 @@ state before the side effect to support recovery on restart.
   `project_id`, or `provider_profile_id`.
 - JSON columns must have documented payload versions.
 
-`agent_runtime_option_snapshots` is the active Runtime Option Catalog cache. It
+`agent_runtime_option_snapshots` is the active Runtime Option Catalog fallback. It
 stores one row per `agent_id` (not per Provider Profile) with a nullable
 `session_config_json`, `last_success_at_ms`, `last_attempt_at_ms`, and
 `last_error_code`. Successful Agent probes persist only modes, reasoning
@@ -129,6 +130,18 @@ launch until the Agent is removed. Removing an Agent deletes the row so a later
 re-add can probe again. A failed first attempt records its timestamp and stable
 error code; ordinary reads never retry it, while the desktop startup bootstrap
 may retry enabled, installed Agents without a successful row.
+
+`provider_model_runtime_option_snapshots` is schema migration 42 and stores
+product-safe ACP session configuration for one `(provider_profile_id, model_id)`
+pair. Successful rows contain the model's modes, reasoning efforts, and generic
+options in `session_config_json`; the target model is projected into the probe
+process before discovery. A successful row is reused while the model id remains
+configured, including unrelated Profile edits. Missing or failed model rows may
+be retried by the background bootstrap; failures preserve a previous success
+and otherwise record only the attempt timestamp and stable error code. Removing
+a model or deleting its Profile removes the corresponding rows. Empty modes,
+reasoning efforts, or generic options in a successful payload are meaningful
+negative capability evidence and must not be replaced by Agent fallback values.
 
 `provider_runtime_option_snapshots` is retained only as a migration-compatible
 legacy table. Current catalog code must not read, write, invalidate, or key new

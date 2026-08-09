@@ -2269,6 +2269,22 @@ impl AgentManager {
         provider.probe_session_config(&provider_profile_id).await
     }
 
+    /// Stateless session-config discovery for one model in an Agent Provider
+    /// Profile. The model id is projected into the short-lived probe process.
+    pub async fn probe_session_config_for_model(
+        &self,
+        agent_id: AgentId,
+        provider_profile_id: ProviderProfileId,
+        model_id: &str,
+    ) -> VibexResult<AgentSessionConfigProbe> {
+        let resolved_agent =
+            self.resolve_enabled_agent(Some(agent_id), ProviderKind::Acp, false)?;
+        let provider = self.runtime(&self.route_for_agent(&resolved_agent.agent_id)?)?;
+        provider
+            .probe_session_config_for_model(&provider_profile_id, model_id)
+            .await
+    }
+
     /// Discovers session-level options from the Agent CLI itself. This is
     /// intentionally independent of any Provider Profile so setup can cache
     /// one Agent-owned capability snapshot.

@@ -2057,7 +2057,8 @@ provider_capability_probe_records(
   remains owned by Config Center.
 - Runtime-option probing runs in the post-activation background bootstrap for
   already-enabled, installed Agents that have no successful persisted snapshot.
-  It remains independent from Provider Profile reconciliation.
+  The same bootstrap scans enabled configured models for missing model-scoped
+  snapshots without delaying runtime readiness.
 
 ### 2. Signatures
 
@@ -2066,6 +2067,8 @@ DesktopRuntime::start(config) -> Arc<DesktopRuntime>
 DesktopRuntime::spawn_agent_bootstrap() -> VibexResult<()>
 AgentInstallService::ensure_installed(agent_id).await
 RuntimeOptionCatalogService::probe_agent(agent_id).await
+RuntimeOptionCatalogService::probe_missing_enabled_profile_models().await
+RuntimeOptionCatalogService::probe_profile_models(provider_profile_id).await
 ProviderProfileMutationEvent::{Saved, Deleted}(provider_profile_id)
 ```
 
@@ -2087,17 +2090,24 @@ ProviderProfileMutationEvent::{Saved, Deleted}(provider_profile_id)
   previously failed snapshot is probed in the background; existing successful
   snapshots remain ordinary SQLite cache reads. A successful probe publishes
   `RuntimeOptionsChanged` so open clients refresh their runtime catalog.
-- Provider Profile save/delete consumers publish `ProfilesChanged` only. They
-  must not clear Agent snapshots, call `probe_agent`, enqueue a Profile-scoped
-  refresh, or publish `RuntimeOptionsChanged` as a consequence of the Provider
-  mutation.
+- Provider Profile save/delete consumers publish `ProfilesChanged` immediately.
+  A saved ACP Profile then asynchronously probes only enabled models without a
+  successful model-scoped snapshot; it never clears the Agent fallback or waits
+  for the probe before the save completes. Successful probes publish a
+  coalesced `RuntimeOptionsChanged`; failures do not block the mutation.
 - Explicit detected-version refresh may reconcile legacy projection rows, but
   it publishes a profile event only when the effective compatibility rows or
   projection state changed. An idempotent refresh is silent; otherwise the
   `ProfilesChanged` consumer would start the same version probe again.
-- After a Provider mutation, clients rebuild the Profile/model projection and
-  read the unchanged Agent snapshot. A newly configured model therefore gains
-  the Agent's cached controls without another probe.
+- After a Provider mutation, clients rebuild the Profile/model projection. A
+  newly configured model uses the Agent's cached controls while its background
+  probe runs; an unchanged model keeps its durable snapshot without another
+  process launch.
+- A model switch may publish its runtime options through
+  `config_option_update` rather than the `session/set_model` response. The
+  background probe waits for that bounded update before persisting the model
+  snapshot; an explicitly empty model field remains authoritative over the
+  Agent fallback.
 - While a client fetches the updated Profile/model projection, it retains the
   last complete runtime catalog. A provisional catalog with empty Agent
   evidence is allowed only when no catalog exists yet; it must never replace
@@ -2113,14 +2123,17 @@ ProviderProfileMutationEvent::{Saved, Deleted}(provider_profile_id)
   warning and keep the runtime available; do not fall through to an option
   probe.
 - Provider save/delete succeeds -> publish one coalesced `ProfilesChanged`
-  event and remote Provider invalidation only.
+  event and remote Provider invalidation immediately. A successful model probe
+  may publish a later `RuntimeOptionsChanged`; a failed probe only records its
+  error and leaves fallback controls available.
 - Repeating an explicit detected-version refresh without a projection change
   -> publish no additional `ProfilesChanged` event.
 - Agent has no successful runtime-option snapshot at startup -> probe it in the
   background and persist either the option snapshot or the failed-attempt
   record. A probe failure must not make the runtime unavailable.
-- Agent has a successful snapshot while a Provider changes -> preserve the
-  snapshot and reuse it in the rebuilt catalog.
+- Agent has a successful snapshot while a Provider changes -> preserve and use
+  it as fallback. A successful model snapshot takes precedence only for its
+  exact `(provider_profile_id, model_id)` key.
 
 ### 5. Good/Base/Bad Cases
 
@@ -2130,13 +2143,15 @@ ProviderProfileMutationEvent::{Saved, Deleted}(provider_profile_id)
 - Base: exact adapters are installed and an Agent has no snapshot; the
   workbench remains ready while the background probe persists options and
   refreshes the runtime catalog.
-- Good: adding a Provider Profile updates models and immediately reuses the
-  Agent's previously cached modes and Features.
+- Good: adding a Provider Profile updates models immediately, reuses the
+  Agent's cached controls while the background model probe runs, then publishes
+  model-specific options when the probe succeeds.
 - Good: a repeated Config Center snapshot with the same detected CLI version
   leaves the Profile listener quiet and does not start another refresh cycle.
 - Bad: `build_agent_manager` or `activate` awaits a managed download, an ACP
   probe, or complete catalog enrichment before reporting the runtime ready.
-- Bad: a Profile save calls `refresh_profile`/`probe_agent`.
+- Bad: a Profile save calls `probe_agent`, blocks on `session/new`, or reuses a
+  successful snapshot for a different model id.
 - Bad: a Profile event installs a catalog built from an empty evidence map over
   an existing enriched catalog, causing non-model controls to disappear.
 
@@ -2144,11 +2159,11 @@ ProviderProfileMutationEvent::{Saved, Deleted}(provider_profile_id)
 
 - `vibex-desktop-runtime` asserts activation precedes background bootstrap and
   manager construction contains no adapter installation.
-- Runtime source assertions require missing-snapshot probing and
-  `RuntimeOptionsChanged` in the background bootstrap, while rejecting profile
-  refreshes and runtime-option events in Provider mutation consumers.
-- Provider mutation tests assert `ProfilesChanged` is published and no later
-  `RuntimeOptionsChanged` arrives.
+- Runtime source assertions require Agent and model missing-snapshot probing
+  plus `RuntimeOptionsChanged` in the background bootstrap, while rejecting
+  Agent refreshes in Provider mutation consumers.
+- Provider mutation tests assert `ProfilesChanged` is published immediately;
+  ACP model probes may produce a later `RuntimeOptionsChanged`.
 - Config-switch tests assert the first detected-version projection change emits
   an event while the next identical refresh emits none.
 - Runtime catalog tests assert startup/list paths perform no provider or Agent

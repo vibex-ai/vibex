@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use vibex_core::default_acp_adapter_id;
 use vibex_core::{
     AcpAdapterId, AcpProcessStrategy, AcpProviderConfig, AcpProviderEnvReference,
@@ -346,10 +346,11 @@ impl AgentRuntimeProfileRepository {
 impl AgentModelProviderBindingRepository {
     pub fn insert(conn: &Connection, binding: &AgentModelProviderBinding) -> VibexResult<()> {
         binding.validate()?;
-        let transaction = conn.unchecked_transaction().map_err(storage_err(
-            "agent_model_provider_binding_transaction_failed",
-            "failed to start Agent provider binding transaction",
-        ))?;
+        let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "agent_model_provider_binding_transaction_failed",
+                "failed to start Agent provider binding transaction",
+            ))?;
         insert_agent_model_provider_binding(&transaction, binding)?;
         transaction.commit().map_err(storage_err(
             "agent_model_provider_binding_commit_failed",
@@ -458,10 +459,11 @@ impl AgentModelProviderBindingRepository {
                 "Agent provider binding revision must advance exactly once",
             ));
         }
-        let transaction = conn.unchecked_transaction().map_err(storage_err(
-            "agent_model_provider_binding_transaction_failed",
-            "failed to start Agent provider binding transaction",
-        ))?;
+        let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "agent_model_provider_binding_transaction_failed",
+                "failed to start Agent provider binding transaction",
+            ))?;
         let changed = transaction
             .execute(
                 "
@@ -589,10 +591,11 @@ impl ProviderProjectionCompatibilityRepository {
         conn: &Connection,
         legacy: &ProviderProfile,
     ) -> VibexResult<LegacyProviderProjectionRecords> {
-        let transaction = conn.unchecked_transaction().map_err(storage_err(
-            "provider_projection_backfill_transaction_failed",
-            "failed to start provider projection compatibility transaction",
-        ))?;
+        let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "provider_projection_backfill_transaction_failed",
+                "failed to start provider projection compatibility transaction",
+            ))?;
         let records = map_legacy_projection_records(&transaction, legacy)?;
         let model_provider = upsert_legacy_model_provider(&transaction, records.model_provider)?;
         let agent_runtime = upsert_legacy_agent_runtime(&transaction, records.agent_runtime)?;
@@ -616,10 +619,11 @@ impl ProviderProjectionCompatibilityRepository {
         legacy_id: &ProviderProfileId,
         deleted_at_ms: i64,
     ) -> VibexResult<()> {
-        let transaction = conn.unchecked_transaction().map_err(storage_err(
-            "provider_projection_delete_transaction_failed",
-            "failed to start provider projection delete transaction",
-        ))?;
+        let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "provider_projection_delete_transaction_failed",
+                "failed to start provider projection delete transaction",
+            ))?;
         for (table, id_column) in [
             (
                 "agent_model_provider_bindings_v2",
@@ -2067,6 +2071,7 @@ mod tests {
                 "39:agent_runtime_option_snapshots",
                 "40:agent_auth_catalog_snapshots",
                 "41:agent_managed_installations",
+                "42:provider_model_runtime_option_snapshots",
             ]
         );
         assert_eq!(
