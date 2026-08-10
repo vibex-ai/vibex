@@ -8196,7 +8196,7 @@ impl ManagementCenter {
                         .danger()
                         .compact()
                         .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
-                        .icon(IconName::Delete)
+                        .icon(Icon::default().path("icons/vibex/trash-2.svg"))
                         .loading(deleting)
                         .disabled(pending)
                         .tooltip(management_delete_profile_label())
@@ -15354,6 +15354,7 @@ mod tests {
         assert!(install.contains("icons/vibex/trash-2.svg"));
         assert!(render.contains("MANAGEMENT_PROVIDER_ROW_ACTION_SIZE"));
         assert!(render.contains(".icon(IconName::Plus)"));
+        assert!(render.contains("icons/vibex/trash-2.svg"));
         assert!(
             authentication
                 .contains("AgentAuthMethodKind::Terminal => Icon::new(IconName::ArrowRight)")
