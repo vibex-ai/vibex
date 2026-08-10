@@ -11187,7 +11187,6 @@ fn git_selection_indicator(
     cx: &Context<CodeRightRail>,
 ) -> AnyElement {
     let selected = state != GitPathSelectionState::Unchecked;
-    let selected_background = cx.theme().muted_foreground.opacity(0.68);
     div()
         .size(px(14.0))
         .flex_none()
@@ -11196,21 +11195,21 @@ fn git_selection_indicator(
         .rounded(px(3.0))
         .border_1()
         .border_color(if selected {
-            selected_background
+            cx.theme().accent_foreground.opacity(0.18)
         } else {
-            cx.theme().sidebar_foreground.opacity(0.42)
+            cx.theme().input
         })
         .bg(if selected {
-            selected_background
+            cx.theme().accent
         } else {
-            cx.theme().sidebar_accent.opacity(0.36)
+            cx.theme().transparent
         })
-        .text_color(gpui::white())
+        .text_color(cx.theme().accent_foreground.opacity(0.72))
         .when(state == GitPathSelectionState::Checked, |this| {
             this.child(Icon::new(IconName::Check).size(px(10.0)))
         })
         .when(state == GitPathSelectionState::Indeterminate, |this| {
-            this.child(div().w(px(8.0)).h(px(1.5)).bg(gpui::white()))
+            this.child(Icon::new(IconName::Minus).size(px(10.0)))
         })
         .into_any_element()
 }
@@ -12653,6 +12652,28 @@ mod tests {
             [RightRailMode::Files, RightRailMode::Git].map(RightRailMode::title),
             ["Files", "Git"]
         );
+    }
+
+    #[test]
+    fn git_selection_indicator_uses_neutral_theme_states_and_a_centered_mixed_glyph() {
+        let source = include_str!("code_workbench.rs");
+        let indicator = source
+            .split_once("fn git_selection_indicator(")
+            .and_then(|(_, tail)| tail.split_once("\nfn git_change_text_color("))
+            .map(|(body, _)| body)
+            .unwrap();
+
+        for theme_style in [
+            "cx.theme().input",
+            "cx.theme().accent",
+            "cx.theme().accent_foreground",
+            "cx.theme().transparent",
+        ] {
+            assert!(indicator.contains(theme_style));
+        }
+        assert!(indicator.contains("IconName::Minus"));
+        assert!(!indicator.contains("h(px(1.5))"));
+        assert!(!indicator.contains("gpui::white()"));
     }
 
     #[gpui::test]
