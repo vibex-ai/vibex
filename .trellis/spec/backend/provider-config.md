@@ -3248,6 +3248,12 @@ ProviderConfigService::{
   product identity. Other Claude model ids pass through unchanged. The
   idempotent startup backfill repairs older mirrored rows that incorrectly used
   the full Provider model id as the Claude Agent model id.
+- An OpenCode model with no explicit Wire API inherits the legacy `wireApi`
+  option when present. Otherwise, exactly one non-empty protocol-specific URL
+  override defines the inherited protocol; zero or multiple overrides retain
+  the backwards-compatible Responses default. Startup backfill repairs the
+  mirrored Wire protocol and SDK adapter, so an Anthropic-only profile cannot
+  launch as `@ai-sdk/openai` or select the wrong OpenCode provider namespace.
 - OpenCode model qualification is idempotent. A historical or imported
   `agent_model_id` that already starts with the generated provider id is used
   once, never expanded to `provider/provider/model` in either the overlay or
@@ -3333,8 +3339,8 @@ ProviderConfigService::{
   conservative unknown/manual behavior, all eight credential variants, and
   Codex Responses-only model binding.
 - Database tests assert v37 idempotent migration/backfill, three-entity CRUD and
-  revision CAS, legacy id preservation, Claude legacy model alias repair, and
-  one Provider bound to two runtimes.
+  revision CAS, legacy id preservation, Claude legacy model alias repair,
+  OpenCode inherited-protocol repair, and one Provider bound to two runtimes.
 - Config-switch tests assert deterministic env/JSON/TOML/YAML projection,
   private permissions, path/symlink rejection, late Secret resolution,
   redacted `Debug`/preview, selective stale propagation, and omission of an

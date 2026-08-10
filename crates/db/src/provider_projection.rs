@@ -1725,17 +1725,7 @@ fn legacy_wire_protocol(
         }
         None if profile.agent_id.as_str() == "claude" => WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
         None if profile.agent_id.as_str() == "opencode" => {
-            let value = provider_option(profile, "wireApi")
-                .unwrap_or_else(|| "responses".to_string())
-                .to_ascii_lowercase()
-                .replace(['-', ' '], "_");
-            if value.contains("anthropic") || value == "messages" {
-                WIRE_PROTOCOL_ANTHROPIC_MESSAGES
-            } else if value.contains("response") {
-                WIRE_PROTOCOL_OPENAI_RESPONSES
-            } else {
-                WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS
-            }
+            legacy_opencode_default_wire_protocol(profile)
         }
         None => interfaces
             .iter()
@@ -1745,6 +1735,31 @@ fn legacy_wire_protocol(
             .unwrap_or(WIRE_PROTOCOL_OPENAI_RESPONSES),
     }
     .to_string()
+}
+
+fn legacy_opencode_default_wire_protocol(profile: &ProviderProfile) -> &'static str {
+    if let Some(value) = provider_option(profile, "wireApi") {
+        let value = value.to_ascii_lowercase().replace(['-', ' '], "_");
+        return if value.contains("anthropic") || value == "messages" {
+            WIRE_PROTOCOL_ANTHROPIC_MESSAGES
+        } else if value.contains("response") {
+            WIRE_PROTOCOL_OPENAI_RESPONSES
+        } else {
+            WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS
+        };
+    }
+
+    let mut configured_protocols = ProviderModelWireApi::ALL.into_iter().filter(|wire_api| {
+        provider_option(profile, &wire_api.protocol_base_url_option_key()).is_some()
+    });
+    let Some(configured_protocol) = configured_protocols.next() else {
+        return WIRE_PROTOCOL_OPENAI_RESPONSES;
+    };
+    if configured_protocols.next().is_none() {
+        configured_protocol.wire_protocol_id()
+    } else {
+        WIRE_PROTOCOL_OPENAI_RESPONSES
+    }
 }
 
 fn legacy_sdk_adapter(agent_id: &AgentId, wire_protocol_id: &str) -> Option<String> {
@@ -2275,6 +2290,100 @@ mod tests {
             Some(vibex_core::WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE)
         );
         assert_eq!(endpoints[2].url, "https://bedrock.example.invalid");
+    }
+
+    #[test]
+    fn legacy_opencode_inherits_a_single_protocol_url_and_repairs_existing_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let mut profile = ProviderProfile::local_default(ProviderKind::Acp);
+        profile.id = ProviderProfileId::new();
+        profile.status = ProviderProfileStatus::Enabled;
+        profile.base_url = Some("https://gateway.example.invalid".to_string());
+        profile.default_model = Some("claude-opus-5".to_string());
+        profile.configured_models = vec![ProviderConfiguredModel {
+            id: "claude-opus-5".to_string(),
+            display_name: None,
+            enabled: true,
+            wire_api: None,
+        }];
+        profile
+            .provider_options
+            .entries
+            .push(ProviderBindingMetadata {
+                key: ProviderModelWireApi::AnthropicMessages.protocol_base_url_option_key(),
+                value: "https://gateway.example.invalid".to_string(),
+            });
+        ProviderProfileRepository::insert(&conn, &profile).unwrap();
+
+        let records =
+            ProviderProjectionCompatibilityRepository::sync_legacy_profile(&conn, &profile)
+                .unwrap();
+        let model = &records.binding.configured_models[0];
+        assert_eq!(model.wire_protocol_id, WIRE_PROTOCOL_ANTHROPIC_MESSAGES);
+        assert_eq!(model.sdk_adapter_id.as_deref(), Some("@ai-sdk/anthropic"));
+
+        conn.execute(
+            "UPDATE agent_configured_model_bindings
+             SET wire_protocol_id = ?2, sdk_adapter_id = ?3
+             WHERE agent_model_provider_binding_id = ?1",
+            params![
+                records.binding.id.as_str(),
+                WIRE_PROTOCOL_OPENAI_RESPONSES,
+                "@ai-sdk/openai",
+            ],
+        )
+        .unwrap();
+
+        ProviderProjectionCompatibilityRepository::backfill_legacy_profiles(&conn).unwrap();
+        let repaired = AgentModelProviderBindingRepository::get(&conn, &records.binding.id)
+            .unwrap()
+            .unwrap();
+        let repaired_model = &repaired.configured_models[0];
+        assert_eq!(
+            repaired_model.wire_protocol_id,
+            WIRE_PROTOCOL_ANTHROPIC_MESSAGES
+        );
+        assert_eq!(
+            repaired_model.sdk_adapter_id.as_deref(),
+            Some("@ai-sdk/anthropic")
+        );
+    }
+
+    #[test]
+    fn legacy_opencode_explicit_or_ambiguous_protocol_defaults_remain_stable() {
+        let mut profile = ProviderProfile::local_default(ProviderKind::Acp);
+        profile.provider_options.entries.extend([
+            ProviderBindingMetadata {
+                key: ProviderModelWireApi::AnthropicMessages.protocol_base_url_option_key(),
+                value: "https://anthropic.example.invalid".to_string(),
+            },
+            ProviderBindingMetadata {
+                key: "wireApi".to_string(),
+                value: "chat".to_string(),
+            },
+        ]);
+        assert_eq!(
+            legacy_opencode_default_wire_protocol(&profile),
+            WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS
+        );
+
+        profile
+            .provider_options
+            .entries
+            .retain(|entry| entry.key != "wireApi");
+        profile
+            .provider_options
+            .entries
+            .push(ProviderBindingMetadata {
+                key: ProviderModelWireApi::GoogleGenerativeAi.protocol_base_url_option_key(),
+                value: "https://google.example.invalid".to_string(),
+            });
+        assert_eq!(
+            legacy_opencode_default_wire_protocol(&profile),
+            WIRE_PROTOCOL_OPENAI_RESPONSES
+        );
     }
 
     #[test]
