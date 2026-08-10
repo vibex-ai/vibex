@@ -2800,6 +2800,9 @@ host seam keeps terminal execution provider-neutral.
 
 - Trigger: OpenCode keeps `session/prompt` pending while retrying a failed model
   API request and does not emit an ACP error response or notification on stdout.
+- Trigger: OpenCode returns `end_turn` without any non-empty Agent message,
+  thought, or new tool-call update after the model transport failed before the
+  first token.
 - This fallback is OpenCode-specific. Generic ACP agents must continue to use
   standard JSON-RPC responses and process lifecycle errors.
 
@@ -2866,6 +2869,13 @@ retryable main stream error -> provider/opencode_model_api_retrying
   deadline but must not permanently disarm it.
 - User-visible errors use stable code `opencode_model_api_error`; raw stderr is
   bounded and redacted before becoming diagnostic context.
+- A normal OpenCode `end_turn` requires evidence of model-stream progress. If
+  the turn has no non-empty Agent message, thought, or new tool-call update and
+  no permission/elicitation remains pending, Vibex returns
+  `opencode_model_api_error` and emits no synthetic empty final Agent message.
+  This covers OpenCode versions that reduce a malformed HTTP 200 response or
+  other pre-token transport failure to a zero-token `finish=unknown` turn
+  without writing a parseable `stream error` line.
 
 ### 4. Validation & Error Matrix
 
@@ -2883,6 +2893,8 @@ retryable main stream error -> provider/opencode_model_api_retrying
   `provider/opencode_model_api_error` plus `session/cancel`.
 - One correlated retryable error followed by two minutes of silence ->
   `provider/opencode_model_api_error` plus `session/cancel`.
+- OpenCode `end_turn` with no model-stream progress and no pending host input ->
+  `provider/opencode_model_api_error`; no empty final Agent message.
 - Stream error for an unknown/inactive session -> diagnostic tail only.
 - Prompt timeout wins before stderr failure -> `process/acp_request_timeout`; a
   late stderr line must not cancel a newer or already completed request.
@@ -2933,6 +2945,9 @@ retryable main stream error -> provider/opencode_model_api_retrying
   cancellation may be sent.
 - Mock-process tests emit a title error followed by a successful prompt and
   assert the main turn completes without cancellation.
+- Mock-process tests return `end_turn` without message, thought, tool, or pending
+  permission activity and assert `opencode_model_api_error` with no final Agent
+  message.
 
 ### 7. Wrong vs Correct
 

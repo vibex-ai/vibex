@@ -891,6 +891,7 @@ struct ActiveTurn {
     opencode_stream_error_epoch: u64,
     latest_opencode_stream_error: Option<String>,
     opencode_stream_error_watchdog: Option<OpenCodeStreamErrorWatchdog>,
+    opencode_stream_progress_seen: bool,
     assistant_text: String,
     assistant_text_truncated: bool,
     assistant_segment: String,
@@ -1662,6 +1663,7 @@ impl AcpSessionAttachment {
             opencode_stream_error_epoch: 0,
             latest_opencode_stream_error: None,
             opencode_stream_error_watchdog: None,
+            opencode_stream_progress_seen: false,
             assistant_text: String::new(),
             assistant_text_truncated: false,
             assistant_segment: String::new(),
@@ -2057,11 +2059,25 @@ impl AcpSessionAttachment {
         let Some(turn) = state.active_turn.as_mut() else {
             return;
         };
+        turn.opencode_stream_progress_seen = true;
         turn.opencode_stream_error_count = 0;
         turn.latest_opencode_stream_error = None;
         if let Some(watchdog) = turn.opencode_stream_error_watchdog.as_mut() {
             watchdog.deadline = Instant::now() + OPENCODE_STREAM_ERROR_RECOVERY_TIMEOUT;
         }
+    }
+
+    fn has_opencode_stream_progress(&self) -> bool {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| {
+                state
+                    .active_turn
+                    .as_ref()
+                    .map(|turn| turn.opencode_stream_progress_seen)
+            })
+            .unwrap_or(false)
     }
 
     fn claim_opencode_stream_error_watchdog(&self, epoch: u64) -> OpenCodeStreamErrorWatchdogState {
@@ -13326,6 +13342,21 @@ impl AcpClient for AcpRuntimeClient {
             turn_guard.abort(false, AgentUsageExecutionStatus::Failed);
             return Err(error);
         }
+        if stop_reason == "end_turn"
+            && !has_pending_permissions
+            && process.opencode_error_bridge_enabled
+            && !payload.has_opencode_stream_progress()
+        {
+            turn_guard.abort(false, AgentUsageExecutionStatus::Failed);
+            return Err(VibexError::provider(
+                OPENCODE_MODEL_API_ERROR_CODE,
+                "OpenCode ended the model turn without returning any model output",
+            )
+            .with_recovery_hint(
+                "Verify the provider API root, model id, and authentication, then retry. Anthropic-compatible API roots normally end in /v1.",
+            )
+            .with_diagnostic("stopReason", stop_reason));
+        }
         let buffered_events = turn_guard.complete(!has_pending_permissions, usage_status)?;
         let mut events = buffered_events;
         if stop_reason != "end_turn" {
@@ -18362,17 +18393,21 @@ for line in sys.stdin:
             "method": "_mock/heartbeat",
             "params": {"sessionId": session_id, "apiKey": "mock-secret"},
         })
-        send({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "sessionId": session_id,
-                "update": {
-                    "sessionUpdate": "agent_thought_chunk",
-                    "content": {"type": "text", "text": "thinking"},
+        if prompt_mode != "empty_end_turn":
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_thought_chunk",
+                        "content": {"type": "text", "text": "thinking"},
+                    },
                 },
-            },
-        })
+            })
+        if prompt_mode == "empty_end_turn":
+            send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
+            continue
         if prompt_mode in ("codex_reconnect_exhausted", "codex_reconnect_recovered"):
             for attempt in range(1, 6):
                 send({
@@ -23218,6 +23253,62 @@ for line in sys.stdin:
         assert_eq!(
             logged_request_count(&fixture.request_log(), "session/cancel"),
             0
+        );
+
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn opencode_empty_end_turn_is_reported_as_a_provider_error() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "opencode-empty-end-turn",
+            Some(vibex_core::AgentId::parse(OPENCODE_AGENT_ID).unwrap()),
+        ) else {
+            return;
+        };
+        fixture.set_prompt_mode("empty_end_turn");
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let error = prepare_and_send_turn(
+            &client,
+            AcpSendTurnRequest {
+                session_id: session_id.clone(),
+                message_submission_id: None,
+                required_runtime: None,
+                text: "trigger empty provider turn".to_string(),
+                attachments: Vec::new(),
+                workspace_root: fixture.workspace.display().to_string(),
+                binding: binding.clone(),
+                runtime_resources: ProviderRuntimeResources::default(),
+                execution_identity: None,
+                event_sender: Some(event_tx),
+                usage_execution_context: None,
+                usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                usage_event_sender: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code, OPENCODE_MODEL_API_ERROR_CODE);
+        assert!(error.message.contains("without returning any model output"));
+        assert!(
+            std::iter::from_fn(|| event_rx.try_recv().ok())
+                .all(|event| !matches!(event, AcpEvent::AssistantMessage { .. }))
         );
 
         client.close_session(&binding).await.unwrap();

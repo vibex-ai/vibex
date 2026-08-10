@@ -3254,6 +3254,13 @@ ProviderConfigService::{
   the backwards-compatible Responses default. Startup backfill repairs the
   mirrored Wire protocol and SDK adapter, so an Anthropic-only profile cannot
   launch as `@ai-sdk/openai` or select the wrong OpenCode provider namespace.
+- OpenCode protocol projection must translate Vibex endpoint semantics into the
+  selected AI SDK adapter's base-URL semantics. `@ai-sdk/anthropic` expects the
+  versioned API root and appends `/messages`; a provider root therefore projects
+  with `/v1`, an existing `/v1` remains unchanged, and a full `/v1/messages`
+  endpoint is reduced to `/v1`. Other Wire APIs retain their own endpoint form.
+  Passing a bare Anthropic provider root through unchanged can return an HTML
+  website from `/messages`, which OpenCode may report as a zero-token empty turn.
 - OpenCode model qualification is idempotent. A historical or imported
   `agent_model_id` that already starts with the generated provider id is used
   once, never expanded to `provider/provider/model` in either the overlay or
@@ -3319,6 +3326,9 @@ ProviderConfigService::{
   controls without pinning the user's CLI patch/minor version.
 - Good: an OpenCode model with no display name projects as `"model-id": {}` and
   the resulting inline configuration reaches the ACP initialize handshake.
+- Good: an Anthropic-compatible Provider root such as `https://gateway.example`
+  projects to OpenCode as `baseURL = https://gateway.example/v1`, so the AI SDK
+  sends the model request to `/v1/messages`.
 - Base: an unknown catalog Agent receives an explicit unverified capability and
   no fake API-key form or managed overlay.
 - Base: a future OpenCode `2.x` remains conservative until that breaking major
@@ -3346,7 +3356,9 @@ ProviderConfigService::{
   redacted `Debug`/preview, selective stale propagation, and omission of an
   absent OpenCode model display name without losing a configured name. They
   also assert exact OpenCode runtime ids for all five Wire APIs and idempotent
-  handling of already-qualified model ids.
+  handling of already-qualified model ids. Anthropic cases assert root, existing
+  `/v1`, nested root, and full `/v1/messages` inputs all produce the exact AI SDK
+  API root.
 - ACP tests assert Claude/Codex/OpenCode parity, prepare-failure fencing, and
   Profile-save stale marking without process termination. The OpenCode
   regression must exercise a qualified runtime catalog, send the qualified id

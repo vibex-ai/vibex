@@ -1723,12 +1723,14 @@ fn opencode_overlay(
     {
         let (provider_id, npm) = opencode_provider_identity(&base_provider_id, model);
         let model_endpoint = opencode_endpoint_for_model(provider, binding, endpoint, model);
+        let model_endpoint_url = model_endpoint
+            .map(|endpoint| opencode_base_url_for_model(&endpoint.url, &model.wire_protocol_id));
         let entry = providers.entry(provider_id.clone()).or_insert_with(|| {
             let mut options = serde_json::Map::new();
-            if let Some(endpoint) = model_endpoint {
+            if let Some(endpoint) = model_endpoint_url.as_deref() {
                 options.insert(
                     "baseURL".to_string(),
-                    serde_json::Value::String(endpoint.url.clone()),
+                    serde_json::Value::String(endpoint.to_string()),
                 );
             }
             serde_json::json!({
@@ -1869,6 +1871,37 @@ fn opencode_endpoint_for_model<'a>(
         return Some(endpoint);
     }
     provider.primary_api_endpoint_for_protocol(&model.wire_protocol_id)
+}
+
+/// OpenCode delegates Anthropic requests to the AI SDK, whose `baseURL` is the
+/// API root and whose transport appends `/messages`. Vibex provider endpoints
+/// are stored as provider roots, so add the Anthropic `/v1` prefix at this
+/// boundary while preserving already-versioned or full `/messages` URLs.
+fn opencode_base_url_for_model(endpoint: &str, wire_protocol_id: &str) -> String {
+    if wire_protocol_id != vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES {
+        return endpoint.to_string();
+    }
+    let trimmed = endpoint.trim().trim_end_matches('/');
+
+    let Ok(mut url) = reqwest::Url::parse(trimmed) else {
+        return if trimmed.ends_with("/v1") || trimmed.ends_with("/messages") {
+            trimmed.to_string()
+        } else {
+            format!("{trimmed}/v1")
+        };
+    };
+    let path = url.path().trim_end_matches('/').to_string();
+    if path.ends_with("/messages") {
+        url.set_path(path.trim_end_matches("/messages"));
+    } else if !path.ends_with("/v1") {
+        let versioned_path = if path.is_empty() {
+            "/v1".to_string()
+        } else {
+            format!("{path}/v1")
+        };
+        url.set_path(&versioned_path);
+    }
+    url.to_string().trim_end_matches('/').to_string()
 }
 
 fn opencode_provider_identity<'a>(
@@ -3975,6 +4008,40 @@ mod tests {
     }
 
     #[test]
+    fn opencode_anthropic_base_url_targets_the_versioned_api_root() {
+        for (endpoint, expected) in [
+            (
+                "https://agentrouter.example",
+                "https://agentrouter.example/v1",
+            ),
+            (
+                "https://agentrouter.example/anthropic/",
+                "https://agentrouter.example/anthropic/v1",
+            ),
+            (
+                "https://agentrouter.example/v1/",
+                "https://agentrouter.example/v1",
+            ),
+            (
+                "https://agentrouter.example/v1/messages",
+                "https://agentrouter.example/v1",
+            ),
+        ] {
+            assert_eq!(
+                opencode_base_url_for_model(endpoint, vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES),
+                expected
+            );
+        }
+        assert_eq!(
+            opencode_base_url_for_model(
+                "https://agentrouter.example",
+                vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES
+            ),
+            "https://agentrouter.example"
+        );
+    }
+
+    #[test]
     fn opencode_projection_keeps_prequalified_model_ids_idempotent() {
         let (provider, _, mut binding, descriptor) =
             fixture(ConfigOverlayStrategy::OpenCodeInlineProvider);
@@ -4005,6 +4072,12 @@ mod tests {
         let (mut provider, _, mut binding, descriptor) =
             fixture(ConfigOverlayStrategy::OpenCodeInlineProvider);
         provider.endpoints.extend([
+            ModelProviderEndpoint {
+                id: "anthropic".to_string(),
+                kind: ModelProviderEndpointKind::Api,
+                url: "https://anthropic.example.invalid".to_string(),
+                wire_protocol_id: Some(vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string()),
+            },
             ModelProviderEndpoint {
                 id: "google".to_string(),
                 kind: ModelProviderEndpointKind::Api,
@@ -4102,6 +4175,10 @@ mod tests {
         assert_eq!(
             providers["fake-google"]["options"]["baseURL"],
             "https://google.example.invalid/v1beta"
+        );
+        assert_eq!(
+            providers["fake-anthropic"]["options"]["baseURL"],
+            "https://anthropic.example.invalid/v1"
         );
         assert_eq!(
             providers["fake-bedrock"]["options"]["baseURL"],
