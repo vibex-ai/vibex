@@ -3375,6 +3375,7 @@ pub struct VibexWorkbench {
     new_session_worktree_name_input: Entity<InputState>,
     new_session_worktree_path_input: Entity<InputState>,
     new_session_project_search: Entity<InputState>,
+    new_session_base_ref_search: Entity<InputState>,
     new_session_project_menu_focus: FocusHandle,
     workspaces: Vec<(ProjectRecord, WorkspaceRecord)>,
     sessions: Vec<AgentSession>,
@@ -3409,7 +3410,8 @@ pub struct VibexWorkbench {
     new_session_runtime_menu_profile_id: Option<ProviderProfileId>,
     new_session_composer_geometry: ComposerGeometry,
     new_session_workspace: NewSessionWorkspaceState,
-    new_session_worktree_settings_open: bool,
+    new_session_workspace_mode_menu_open: bool,
+    new_session_base_ref_menu_open: bool,
     new_session_worktree_input_syncing: bool,
     new_session_eligibility_error: Option<String>,
     workspace_contexts: BTreeMap<String, WorkspaceContextProjection>,
@@ -3641,6 +3643,13 @@ impl VibexWorkbench {
         let new_session_project_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(initial_strings.new_session_search_project)
         });
+        let new_session_base_ref_search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(locale::text(
+                "Search branches",
+                "搜索分支",
+                "搜尋分支",
+            ))
+        });
         let mut agent_subscriptions = vec![
             cx.subscribe_in(
                 &session_search,
@@ -3686,6 +3695,9 @@ impl VibexWorkbench {
                 },
             ),
             cx.subscribe(&new_session_project_search, |_, _, _: &InputEvent, cx| {
+                cx.notify()
+            }),
+            cx.subscribe(&new_session_base_ref_search, |_, _, _: &InputEvent, cx| {
                 cx.notify()
             }),
             cx.subscribe_in(
@@ -3916,6 +3928,7 @@ impl VibexWorkbench {
             new_session_worktree_name_input,
             new_session_worktree_path_input,
             new_session_project_search,
+            new_session_base_ref_search,
             new_session_project_menu_focus,
             workspaces: Vec::new(),
             sessions: Vec::new(),
@@ -3950,7 +3963,8 @@ impl VibexWorkbench {
             new_session_runtime_menu_profile_id: None,
             new_session_composer_geometry: ComposerGeometry::default(),
             new_session_workspace,
-            new_session_worktree_settings_open: false,
+            new_session_workspace_mode_menu_open: false,
+            new_session_base_ref_menu_open: false,
             new_session_worktree_input_syncing: false,
             new_session_eligibility_error: None,
             workspace_contexts: BTreeMap::new(),
@@ -11750,7 +11764,10 @@ impl VibexWorkbench {
         self.new_session_runtime_menu_open = false;
         self.runtime_choice_menu_open = None;
         self.new_session_runtime_menu_profile_id = None;
-        self.new_session_worktree_settings_open = false;
+        self.new_session_workspace_mode_menu_open = false;
+        self.new_session_base_ref_menu_open = false;
+        self.new_session_base_ref_search
+            .update(cx, |input, cx| input.set_value("", window, cx));
         self.new_session_eligibility_error = None;
         self.new_session_eligibility_task = None;
         self.new_session_error = None;
@@ -18313,7 +18330,12 @@ impl VibexWorkbench {
                             .small()
                             .h_full()
                             .appearance(false)
-                            .text_xs(),
+                            .text_xs()
+                            .prefix(
+                                Icon::new(IconName::Search)
+                                    .small()
+                                    .text_color(muted_foreground),
+                            ),
                     ),
             )
             .child(project_results)
@@ -18424,74 +18446,12 @@ impl VibexWorkbench {
             self.new_session_eligibility_error.as_deref(),
             can_create_worktree,
         );
-        let current_location_label = if fixed_workspace {
+        let local_location_label = if fixed_workspace {
             locale::text("This Workspace", "此工作区", "此工作區")
         } else {
-            locale::text("Current Checkout", "当前项目目录", "目前專案目錄")
+            locale::text("Local", "本地", "本機")
         };
-        let location_control = h_flex()
-            .min_w_0()
-            .max_w(px(392.0))
-            .flex_1()
-            .items_center()
-            .gap_1()
-            .rounded(px(10.0))
-            .bg(muted_color.opacity(0.34))
-            .p(px(2.0))
-            .child(
-                Button::new("new-session-location-current")
-                    .xsmall()
-                    .ghost()
-                    .h(px(28.0))
-                    .min_w(px(120.0))
-                    .flex_1()
-                    .justify_center()
-                    .selected(!worktree_selected)
-                    .icon(Icon::default().path("icons/vibex/monitor.svg"))
-                    .label(current_location_label)
-                    .disabled(self.agent_action_pending)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.set_new_session_location(
-                            NewSessionLocation::CurrentCheckout,
-                            window,
-                            cx,
-                        )
-                    })),
-            )
-            .when(can_create_worktree && !fixed_workspace, |this| {
-                this.child(
-                    Button::new("new-session-location-worktree")
-                        .xsmall()
-                        .ghost()
-                        .h(px(28.0))
-                        .min_w(px(152.0))
-                        .flex_1()
-                        .justify_center()
-                        .selected(worktree_selected)
-                        .icon(Icon::default().path("icons/vibex/git-branch.svg"))
-                        .label(locale::text(
-                            "New Worktree",
-                            "新建隔离工作区",
-                            "新增隔離工作區",
-                        ))
-                        .tooltip(worktree_reason.clone().unwrap_or_else(|| {
-                            locale::text(
-                                "Create an isolated Git Worktree",
-                                "创建隔离的 Git Worktree",
-                                "建立隔離的 Git Worktree",
-                            )
-                            .to_string()
-                        }))
-                        .disabled(self.agent_action_pending || !worktree_ready)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.set_new_session_location(
-                                NewSessionLocation::NewWorktree,
-                                window,
-                                cx,
-                            )
-                        })),
-                )
-            });
+        let new_worktree_label = locale::text("New Worktree", "新建 Worktree", "新增 Worktree");
 
         let selected_base_ref = self.new_session_workspace.base_ref.clone();
         let base_ref_options = self
@@ -18500,14 +18460,123 @@ impl VibexWorkbench {
             .as_ref()
             .map(|eligibility| eligibility.selectable_base_refs.clone())
             .unwrap_or_default();
-        let base_ref_entity = cx.weak_entity();
-        let selected_base_ref_for_menu = selected_base_ref.clone();
-        let base_ref_button = Button::new("new-session-base-ref")
+        let base_ref_query = self
+            .new_session_base_ref_search
+            .read(cx)
+            .value()
+            .trim()
+            .to_lowercase();
+        let base_ref_rows = base_ref_options
+            .iter()
+            .filter(|base_ref| base_ref.to_lowercase().contains(&base_ref_query))
+            .map(|base_ref| {
+                let entity = cx.weak_entity();
+                let value = base_ref.clone();
+                let selected = selected_base_ref.as_ref() == Some(base_ref);
+                Button::new(format!("new-session-base-ref-option:{base_ref}"))
+                    .small()
+                    .ghost()
+                    .w_full()
+                    .h(px(32.0))
+                    .px_2()
+                    .selected(selected)
+                    .rounded(gpui_component::button::ButtonRounded::Size(px(7.0)))
+                    .text_color(popover_foreground)
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .gap_2()
+                                    .child(
+                                        sidebar_icon("icons/vibex/git-branch.svg").size(px(14.0)),
+                                    )
+                                    .child(div().min_w_0().truncate().child(base_ref.clone())),
+                            )
+                            .when(selected, |this| {
+                                this.child(Icon::new(IconName::Check).size(px(14.0)))
+                            }),
+                    )
+                    .on_click(move |_, window, cx| {
+                        let _ = entity.update(cx, |this, cx| {
+                            this.set_new_session_base_ref(value.clone(), cx);
+                            this.new_session_base_ref_menu_open = false;
+                            this.new_session_base_ref_search
+                                .update(cx, |input, cx| input.set_value("", window, cx));
+                            this.new_session_input
+                                .update(cx, |input, cx| input.focus(window, cx));
+                        });
+                    })
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let base_ref_results = if base_ref_rows.is_empty() {
+            div()
+                .px_2()
+                .py_3()
+                .text_xs()
+                .text_color(muted_foreground)
+                .child(locale::text("No branches", "没有匹配分支", "沒有符合分支"))
+                .into_any_element()
+        } else {
+            v_flex()
+                .max_h(px(240.0))
+                .overflow_y_scrollbar()
+                .children(base_ref_rows)
+                .into_any_element()
+        };
+        let base_ref_search_focused = self
+            .new_session_base_ref_search
+            .focus_handle(cx)
+            .is_focused(window);
+        let base_ref_panel = v_flex()
+            .w(px(282.0))
+            .min_w_0()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(border_color)
+            .bg(popover_color)
+            .p_2()
+            .text_color(popover_foreground)
+            .shadow_lg()
+            .child(
+                div()
+                    .mb_1()
+                    .h(px(34.0))
+                    .rounded(px(7.0))
+                    .border_1()
+                    .border_color(input_color)
+                    .when(base_ref_search_focused, |this| {
+                        this.border_color(ring_color).shadow(vec![
+                            gpui::BoxShadow::new(px(0.0), px(0.0), ring_color.opacity(0.30))
+                                .spread_radius(px(2.0)),
+                        ])
+                    })
+                    .child(
+                        Input::new(&self.new_session_base_ref_search)
+                            .small()
+                            .h_full()
+                            .appearance(false)
+                            .text_xs()
+                            .prefix(
+                                Icon::new(IconName::Search)
+                                    .small()
+                                    .text_color(muted_foreground),
+                            ),
+                    ),
+            )
+            .child(base_ref_results);
+        let base_ref_trigger = Button::new("new-session-base-ref")
             .xsmall()
             .ghost()
             .h(px(32.0))
             .max_w(px(208.0))
             .px_2()
+            .selected(self.new_session_base_ref_menu_open)
             .tooltip(locale::text("Base branch", "基于分支", "基於分支"))
             .disabled(self.agent_action_pending || base_ref_options.is_empty())
             .child(
@@ -18525,24 +18594,24 @@ impl VibexWorkbench {
                         }),
                     ))
                     .child(Icon::new(IconName::ChevronDown).size(px(13.0))),
-            )
-            .dropdown_menu(move |menu, _, _| {
-                let mut menu = menu;
-                for base_ref in &base_ref_options {
-                    let entity = base_ref_entity.clone();
-                    let value = base_ref.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(base_ref.clone())
-                            .checked(selected_base_ref_for_menu.as_ref() == Some(base_ref))
-                            .on_click(move |_, _, cx| {
-                                let _ = entity.update(cx, |this, cx| {
-                                    this.set_new_session_base_ref(value.clone(), cx)
-                                });
-                            }),
-                    );
+            );
+        let base_ref_button = Popover::new("new-session-base-ref-popover")
+            .appearance(false)
+            .open(self.new_session_base_ref_menu_open)
+            .on_open_change(cx.listener(|this, open, window, cx| {
+                this.new_session_base_ref_menu_open = *open;
+                if *open {
+                    this.new_session_base_ref_search
+                        .update(cx, |input, cx| input.focus(window, cx));
+                } else {
+                    this.new_session_base_ref_search
+                        .update(cx, |input, cx| input.set_value("", window, cx));
                 }
-                menu
-            });
+                cx.notify();
+            }))
+            .trigger(base_ref_trigger)
+            .child(base_ref_panel)
+            .into_any_element();
 
         let custom_path = self.new_session_workspace.worktree_path.trim();
         let custom_path_invalid = self.new_session_workspace.path_touched
@@ -18572,16 +18641,13 @@ impl VibexWorkbench {
         let settings_panel_width =
             (f32::from(window.viewport_size().width) - 24.0).clamp(280.0, 360.0);
         let settings_panel = v_flex()
-            .w(px(settings_panel_width))
+            .w_full()
             .min_w_0()
             .gap_3()
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(border_color)
-            .bg(popover_color)
-            .p_3()
+            .px_2()
+            .pt_3()
+            .pb_2()
             .text_color(popover_foreground)
-            .shadow_lg()
             .child(
                 h_flex()
                     .items_center()
@@ -18722,33 +18788,149 @@ impl VibexWorkbench {
                             })),
                     ),
             );
-        let settings_trigger = Button::new("new-session-worktree-settings")
+        let local_location_entity = cx.weak_entity();
+        let local_location_button = Button::new("new-session-location-current")
+            .small()
+            .ghost()
+            .w_full()
+            .h(px(32.0))
+            .px_2()
+            .selected(!worktree_selected)
+            .rounded(gpui_component::button::ButtonRounded::Size(px(7.0)))
+            .text_color(popover_foreground)
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(Icon::new(IconName::Folder).size(px(14.0)))
+                            .child(local_location_label),
+                    )
+                    .when(!worktree_selected, |this| {
+                        this.child(Icon::new(IconName::Check).size(px(14.0)))
+                    }),
+            )
+            .disabled(self.agent_action_pending || fixed_workspace)
+            .on_click(move |_, window, cx| {
+                let _ = local_location_entity.update(cx, |this, cx| {
+                    this.set_new_session_location(NewSessionLocation::CurrentCheckout, window, cx);
+                    this.new_session_workspace_mode_menu_open = false;
+                    this.new_session_input
+                        .update(cx, |input, cx| input.focus(window, cx));
+                });
+            });
+        let worktree_location_entity = cx.weak_entity();
+        let worktree_location_button = Button::new("new-session-location-worktree")
+            .small()
+            .ghost()
+            .w_full()
+            .h(px(32.0))
+            .px_2()
+            .selected(worktree_selected)
+            .rounded(gpui_component::button::ButtonRounded::Size(px(7.0)))
+            .text_color(popover_foreground)
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(sidebar_icon("icons/vibex/git-branch.svg").size(px(14.0)))
+                            .child(new_worktree_label),
+                    )
+                    .when(worktree_selected, |this| {
+                        this.child(Icon::new(IconName::Check).size(px(14.0)))
+                    }),
+            )
+            .tooltip(worktree_reason.clone().unwrap_or_else(|| {
+                locale::text(
+                    "Create an isolated Git Worktree",
+                    "创建隔离的 Git Worktree",
+                    "建立隔離的 Git Worktree",
+                )
+                .to_string()
+            }))
+            .disabled(self.agent_action_pending || !worktree_ready)
+            .on_click(move |_, window, cx| {
+                let _ = worktree_location_entity.update(cx, |this, cx| {
+                    this.set_new_session_location(NewSessionLocation::NewWorktree, window, cx)
+                });
+            });
+        let mode_panel = v_flex()
+            .w(px(settings_panel_width))
+            .min_w_0()
+            .max_h(window.viewport_size().height - px(16.0))
+            .overflow_y_scrollbar()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(border_color)
+            .bg(popover_color)
+            .p_2()
+            .text_color(popover_foreground)
+            .shadow_lg()
+            .child(local_location_button)
+            .when(!fixed_workspace, |this| {
+                this.child(worktree_location_button)
+            })
+            .when(worktree_selected, |this| {
+                this.child(
+                    div()
+                        .mx(px(-2.0))
+                        .mt_2()
+                        .h(px(1.0))
+                        .bg(border_color.opacity(0.60)),
+                )
+                .child(settings_panel)
+            });
+        let mode_trigger_icon = if worktree_selected {
+            sidebar_icon("icons/vibex/git-branch.svg")
+                .size(px(14.0))
+                .text_color(muted_foreground)
+                .into_any_element()
+        } else {
+            Icon::new(IconName::Folder)
+                .size(px(14.0))
+                .text_color(muted_foreground)
+                .into_any_element()
+        };
+        let mode_trigger = Button::new("new-session-workspace-mode")
             .xsmall()
             .ghost()
-            .compact()
-            .w(px(32.0))
             .h(px(32.0))
-            .icon(IconName::Settings)
-            .selected(self.new_session_worktree_settings_open)
-            .tooltip(locale::text(
-                "Worktree settings",
-                "Worktree 设置",
-                "Worktree 設定",
-            ))
-            .disabled(settings_disabled);
-        let settings_button = Popover::new("new-session-worktree-settings-popover")
+            .px_2()
+            .selected(self.new_session_workspace_mode_menu_open)
+            .text_color(muted_foreground)
+            .child(
+                h_flex()
+                    .gap(px(6.0))
+                    .child(mode_trigger_icon)
+                    .child(if worktree_selected {
+                        new_worktree_label
+                    } else {
+                        local_location_label
+                    })
+                    .child(Icon::new(IconName::ChevronDown).size(px(13.0))),
+            )
+            .disabled(self.agent_action_pending || fixed_workspace);
+        let location_control = Popover::new("new-session-workspace-mode-menu")
             .appearance(false)
-            .open(self.new_session_worktree_settings_open)
+            .open(self.new_session_workspace_mode_menu_open)
             .on_open_change(cx.listener(|this, open, _, cx| {
-                this.new_session_worktree_settings_open = *open;
+                this.new_session_workspace_mode_menu_open = *open;
                 cx.notify();
             }))
-            .trigger(settings_trigger)
-            .child(settings_panel)
+            .trigger(mode_trigger)
+            .child(mode_panel)
             .into_any_element();
         let workspace_controls = v_flex()
             .w_full()
             .min_w_0()
+            .mt_2()
             .gap(px(6.0))
             .child(
                 h_flex()
@@ -18756,13 +18938,21 @@ impl VibexWorkbench {
                     .min_w_0()
                     .flex_wrap()
                     .items_center()
-                    .gap_1()
-                    .px_1()
-                    .child(workspace_button)
-                    .child(location_control)
-                    .when(worktree_selected, |this| {
-                        this.child(base_ref_button).child(settings_button)
-                    }),
+                    .justify_between()
+                    .gap_2()
+                    .px_2()
+                    .child(div().flex_none().child(workspace_button))
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .flex_wrap()
+                            .items_center()
+                            .justify_end()
+                            .gap_1()
+                            .child(location_control)
+                            .when(worktree_selected, |this| this.child(base_ref_button)),
+                    ),
             )
             .when_some(
                 (can_create_worktree && !fixed_workspace && !worktree_ready)
@@ -18773,6 +18963,7 @@ impl VibexWorkbench {
                         h_flex()
                             .min_w_0()
                             .gap_1()
+                            .px_2()
                             .text_xs()
                             .text_color(muted_foreground)
                             .child(div().min_w_0().flex_1().child(reason))
@@ -19105,15 +19296,6 @@ impl VibexWorkbench {
                                     .gap_2()
                                     .p_4()
                                     .pt_1()
-                                    .child(
-                                        v_flex()
-                                            .w_full()
-                                            .min_w_0()
-                                            .border_b_1()
-                                            .border_color(cx.theme().border.opacity(0.42))
-                                            .pb_2()
-                                            .child(workspace_controls),
-                                    )
                                     .when(has_agent_choices, |this| {
                                         this.child(
                                             h_flex()
@@ -19182,7 +19364,8 @@ impl VibexWorkbench {
                                         )
                                     }),
                             ),
-                    ),
+                    )
+                    .child(workspace_controls),
             )
             .into_any_element()
     }
@@ -39216,16 +39399,42 @@ mod tests {
         assert!(panel.contains("new-session-location-current"));
         assert!(panel.contains("new-session-location-worktree"));
         assert!(panel.contains("new-session-base-ref"));
-        assert!(panel.contains("new-session-worktree-settings-popover"));
+        assert!(panel.contains("new-session-base-ref-popover"));
+        assert!(panel.contains("new_session_base_ref_search"));
+        assert!(panel.contains("new-session-workspace-mode-menu"));
+        assert!(!panel.contains("new-session-worktree-settings-popover"));
         assert!(panel.contains("new-session-default-worktree"));
-        assert!(panel.contains("can_create_worktree && !fixed_workspace"));
+        let mode_panel = panel
+            .split_once("        let mode_panel =")
+            .and_then(|(_, tail)| tail.split_once("        let mode_trigger_icon ="))
+            .map(|(body, _)| body)
+            .expect("workspace mode menu should remain inspectable");
+        assert!(mode_panel.contains(".child(settings_panel)"));
+
+        let workspace_toolbar = panel
+            .split_once("        let workspace_controls =")
+            .and_then(|(_, tail)| tail.split_once("        let worktree_form_valid ="))
+            .map(|(body, _)| body)
+            .expect("workspace toolbar should remain inspectable");
+        let project_control = workspace_toolbar
+            .find("workspace_button")
+            .expect("project control should remain in the workspace toolbar");
+        let location_control = workspace_toolbar
+            .find("location_control")
+            .expect("workspace mode should remain in the workspace toolbar");
+        let branch_control = workspace_toolbar
+            .find("base_ref_button")
+            .expect("base branch should remain in the workspace toolbar");
+        assert!(project_control < location_control);
+        assert!(location_control < branch_control);
+
         let context_row = panel
             .rfind(".child(workspace_controls)")
             .expect("workspace context row should be mounted");
         let runtime_row = panel
             .find(".when(has_agent_choices")
             .expect("runtime controls should be mounted");
-        assert!(context_row < runtime_row);
+        assert!(runtime_row < context_row);
 
         let sidebar = source
             .split_once("    fn render_agent_sidebar(")
