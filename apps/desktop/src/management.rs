@@ -18,7 +18,7 @@ use gpui::{
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
     StyledExt as _, Theme, WindowExt as _,
-    animation::ease_out_cubic,
+    animation::{Transition, ease_out_cubic},
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -74,6 +74,10 @@ const AGENT_AUTH_TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MANAGEMENT_HOST_TITLE_BAR_HEIGHT: f32 = 44.0;
 const MANAGEMENT_COMPACT_RESIZE_STEP: f32 = 16.0;
 const MANAGEMENT_DETAIL_ACTION_HEIGHT: f32 = 42.0;
+const MANAGEMENT_PROVIDER_ROW_HEIGHT: f32 = 72.0;
+const MANAGEMENT_PROVIDER_ROW_GAP: f32 = 8.0;
+const MANAGEMENT_PROVIDER_DRAG_PREVIEW_WIDTH: f32 = 520.0;
+const MANAGEMENT_PROVIDER_REORDER_ANIMATION_MS: u64 = 160;
 const MANAGEMENT_PROVIDER_ROW_ACTION_SIZE: f32 = 40.0;
 const PROVIDER_OPTION_WEBSITE_URL: &str = "ccSwitchWebsiteUrl";
 const PROVIDER_OPTION_CC_SWITCH_DB_PATH: &str = "ccSwitchDbPath";
@@ -266,26 +270,90 @@ struct AgentProviderProfileState {
 struct ProviderDisplayOrderDrag {
     agent_id: String,
     profile_id: String,
-    label: SharedString,
+    kind: ProviderKind,
+    label: String,
+    is_default: bool,
+    address: String,
+    model_count: String,
 }
 
 impl Render for ProviderDisplayOrderDrag {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
-            .gap_2()
-            .px_3()
-            .py_1()
-            .rounded_sm()
+            .w(px(MANAGEMENT_PROVIDER_DRAG_PREVIEW_WIDTH))
+            .min_w(px(360.0))
+            .min_h(px(MANAGEMENT_PROVIDER_ROW_HEIGHT))
+            .overflow_hidden()
+            .rounded(px(14.0))
             .border_1()
             .border_color(cx.theme().drag_border)
             .bg(cx.theme().popover)
             .text_color(cx.theme().popover_foreground)
+            .shadow_lg()
+            .opacity(0.92)
             .child(
-                Icon::default()
-                    .path("icons/vibex/grip-vertical.svg")
-                    .size(px(14.0)),
+                div()
+                    .w(px(36.0))
+                    .h(px(MANAGEMENT_PROVIDER_ROW_HEIGHT))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::default()
+                            .path("icons/vibex/grip-vertical.svg")
+                            .size(px(18.0))
+                            .text_color(cx.theme().muted_foreground.opacity(0.72)),
+                    ),
             )
-            .child(self.label.clone())
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .items_center()
+                    .gap_3()
+                    .pr_3()
+                    .child(management_profile_glyph(
+                        self.kind,
+                        &self.label,
+                        self.is_default,
+                        cx,
+                    ))
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .gap_1()
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_sm()
+                                            .font_semibold()
+                                            .child(self.label.clone()),
+                                    )
+                                    .when(self.is_default, |header| {
+                                        header.child(management_status_badge(
+                                            management_locale_text("Default", "默认", "預設")
+                                                .to_string(),
+                                            cx,
+                                        ))
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("{} · {}", self.address, self.model_count)),
+                            ),
+                    ),
+            )
     }
 }
 
@@ -293,6 +361,14 @@ impl Render for ProviderDisplayOrderDrag {
 struct ProviderDisplayOrderDropTarget {
     profile_id: String,
     after: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderDisplayOrderDragState {
+    agent_id: String,
+    profile_id: String,
+    original_ids: Vec<String>,
+    preview_ids: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -502,6 +578,7 @@ pub struct ManagementCenter {
     agent_auth_terminal: Option<TerminalAuthActionDescriptor>,
     agent_auth_terminal_surface: Option<(String, Entity<TerminalSurface>)>,
     agent_auth_terminal_state: Option<AgentAuthTerminalState>,
+    provider_display_order_drag_state: Option<ProviderDisplayOrderDragState>,
     provider_display_order_drop_target: Option<ProviderDisplayOrderDropTarget>,
     selected_mcp_id: Option<String>,
     selected_skill_id: Option<String>,
@@ -888,6 +965,7 @@ impl ManagementCenter {
             agent_auth_terminal: None,
             agent_auth_terminal_surface: None,
             agent_auth_terminal_state: None,
+            provider_display_order_drag_state: None,
             selected_mcp_id: None,
             selected_skill_id: None,
             selected_scheduled_task_id: None,
@@ -1993,6 +2071,8 @@ impl ManagementCenter {
         self.snapshot = snapshot.center;
         self.provider_profiles = snapshot.provider_profiles;
         self.provider_display_order = snapshot.provider_display_order;
+        self.provider_display_order_drag_state = None;
+        self.provider_display_order_drop_target = None;
         self.model_provider_agent_ids = snapshot.model_provider_agent_ids;
         self.acp_configs = snapshot.acp_configs;
         self.native_import_preview = snapshot.native_import_preview;
@@ -3699,24 +3779,15 @@ impl ManagementCenter {
         );
     }
 
-    fn reorder_provider_profiles(
-        &mut self,
-        moving_id: &str,
-        target_id: &str,
-        after: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(agent_id) = self.selected_agent_id.clone() else {
-            return;
-        };
-        let mut current_ids = self
+    fn ordered_provider_profile_ids(&self, agent_id: &str) -> Vec<String> {
+        let mut ids = self
             .snapshot
             .profiles
             .iter()
             .filter(|profile| profile.agent_id == agent_id)
             .map(|profile| profile.id.as_str().to_string())
             .collect::<Vec<_>>();
-        current_ids.sort_by_key(|profile_id| {
+        ids.sort_by_key(|profile_id| {
             (
                 self.provider_display_order
                     .get(profile_id.as_str())
@@ -3727,6 +3798,87 @@ impl ManagementCenter {
                     .unwrap_or(i64::MAX),
             )
         });
+        ids
+    }
+
+    fn start_provider_profile_drag(
+        &mut self,
+        agent_id: &str,
+        profile_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let original_ids = self.ordered_provider_profile_ids(agent_id);
+        if !original_ids.iter().any(|id| id == profile_id) {
+            return;
+        }
+        self.provider_display_order_drag_state = Some(ProviderDisplayOrderDragState {
+            agent_id: agent_id.to_string(),
+            profile_id: profile_id.to_string(),
+            preview_ids: original_ids.clone(),
+            original_ids,
+        });
+        self.provider_display_order_drop_target = None;
+        cx.notify();
+    }
+
+    fn preview_provider_profile_reorder(
+        &mut self,
+        drag: &ProviderDisplayOrderDrag,
+        target_id: &str,
+        after: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self
+            .provider_display_order_drag_state
+            .as_mut()
+            .filter(|state| state.agent_id == drag.agent_id && state.profile_id == drag.profile_id)
+        else {
+            return;
+        };
+        let next_target = ProviderDisplayOrderDropTarget {
+            profile_id: target_id.to_string(),
+            after,
+        };
+        let next_ids =
+            reordered_provider_profile_ids(&state.original_ids, &drag.profile_id, target_id, after);
+        if self.provider_display_order_drop_target.as_ref() == Some(&next_target)
+            && state.preview_ids == next_ids
+        {
+            return;
+        }
+        state.preview_ids = next_ids;
+        self.provider_display_order_drop_target = Some(next_target);
+        cx.notify();
+    }
+
+    fn finish_provider_profile_drag(
+        &mut self,
+        drag: &ProviderDisplayOrderDrag,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.provider_display_order_drop_target.take();
+        let state = self.provider_display_order_drag_state.take();
+        let valid_drag = state.as_ref().is_some_and(|state| {
+            state.agent_id == drag.agent_id && state.profile_id == drag.profile_id
+        });
+        if valid_drag && let Some(target) = target {
+            self.reorder_provider_profiles(&drag.profile_id, &target.profile_id, target.after, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn reorder_provider_profiles(
+        &mut self,
+        moving_id: &str,
+        target_id: &str,
+        after: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(agent_id) = self.selected_agent_id.clone() else {
+            return;
+        };
+        let current_ids = self.ordered_provider_profile_ids(&agent_id);
         let ordered_ids = reordered_provider_profile_ids(&current_ids, moving_id, target_id, after);
         if ordered_ids == current_ids {
             return;
@@ -3739,14 +3891,24 @@ impl ManagementCenter {
         };
         let active_locale = locale::current_locale();
         let entries = ordered_ids
-            .into_iter()
+            .iter()
             .map(
                 |provider_profile_id| vibex_core::AgentModelProviderDisplayOrderSetEntry {
-                    provider_profile_id: vibex_core::ProviderProfileId::parse(provider_profile_id)
-                        .expect("provider profile ids originate from the loaded snapshot"),
+                    provider_profile_id: vibex_core::ProviderProfileId::parse(
+                        provider_profile_id.clone(),
+                    )
+                    .expect("provider profile ids originate from the loaded snapshot"),
                 },
             )
             .collect::<Vec<_>>();
+        self.provider_display_order
+            .extend(ordered_ids.iter().enumerate().map(|(index, profile_id)| {
+                (
+                    profile_id.clone(),
+                    i64::try_from(index).expect("provider order index fits in i64"),
+                )
+            }));
+        cx.notify();
         self.begin_simple_task(
             ManagementMutation::ProviderDisplayOrder(agent_id),
             cx,
@@ -3830,6 +3992,11 @@ impl ManagementCenter {
                         | ManagementMutation::AgentUninstall(_)
                         | ManagementMutation::AgentDiscovery
                 );
+                let refresh_after_failure = agent_registry_changed
+                    || matches!(
+                        &completed_mutation,
+                        ManagementMutation::ProviderDisplayOrder(_)
+                    );
                 match outcome {
                     Ok(Ok(message)) => {
                         match &completed_mutation {
@@ -3886,8 +4053,10 @@ impl ManagementCenter {
                             this.recovery.error_code = Some(error.code.clone());
                         }
                         let message = format!("{}: {}", error.code, error.message);
-                        if agent_registry_changed {
+                        if refresh_after_failure {
                             this.refresh(cx);
+                        }
+                        if agent_registry_changed {
                             cx.emit(ManagementEvent::AgentRegistryChanged);
                         }
                         this.error = Some(message);
@@ -3902,8 +4071,10 @@ impl ManagementCenter {
                                 "配置中心操作失敗",
                             )
                         ));
-                        if agent_registry_changed {
+                        if refresh_after_failure {
                             this.refresh(cx);
+                        }
+                        if agent_registry_changed {
                             cx.emit(ManagementEvent::AgentRegistryChanged);
                         }
                         cx.notify();
@@ -7580,6 +7751,11 @@ impl ManagementCenter {
         let update_available =
             state.status == vibex_core::AgentManagedInstallStatus::UpdateAvailable;
         let mut content = v_flex().w_full().gap_2();
+        let available_version = state
+            .available_version
+            .as_deref()
+            .filter(|version| state.installed_version.as_deref() != Some(*version))
+            .map(str::to_string);
         content = content.child(
             h_flex()
                 .w_full()
@@ -7590,28 +7766,29 @@ impl ManagementCenter {
                     management_managed_install_status_label(state).to_string(),
                     cx,
                 ))
-                .when_some(state.installed_version.clone(), |row, version| {
-                    row.child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!("v{version}")),
-                    )
-                }),
+                .child(
+                    h_flex()
+                        .flex_none()
+                        .items_center()
+                        .gap_2()
+                        .when_some(state.installed_version.clone(), |row, version| {
+                            row.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("v{version}")),
+                            )
+                        })
+                        .when_some(available_version.clone(), |row, version| {
+                            row.child(div().text_xs().text_color(cx.theme().success).child(
+                                format!(
+                                    "{}: v{version}",
+                                    management_locale_text("Available", "可用版本", "可用版本")
+                                ),
+                            ))
+                        }),
+                ),
         );
-        if let Some(version) = state.available_version.as_deref()
-            && state.installed_version.as_deref() != Some(version)
-        {
-            content = content.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(format!(
-                        "{}: v{version}",
-                        management_locale_text("Available", "可用版本", "可用版本")
-                    )),
-            );
-        }
         if let Some(error) = state.last_error_message.as_deref() {
             content = content.child(
                 div()
@@ -7778,6 +7955,23 @@ impl ManagementCenter {
                     .unwrap_or(i64::MAX),
             )
         });
+        let active_drag = self
+            .provider_display_order_drag_state
+            .clone()
+            .filter(|state| cx.has_active_drag() && state.agent_id == selected_agent_id);
+        if let Some(active_drag) = active_drag.as_ref() {
+            profiles.sort_by_key(|profile| {
+                active_drag
+                    .preview_ids
+                    .iter()
+                    .position(|profile_id| profile_id == profile.id.as_str())
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        let active_drop_target = self
+            .provider_display_order_drop_target
+            .clone()
+            .filter(|_| cx.has_active_drag());
         let selected_profile_id = self
             .selected_management_provider_profile()
             .map(|profile| profile.id.as_str().to_string());
@@ -7791,7 +7985,7 @@ impl ManagementCenter {
             pending_cc_switch_import_item_ids(preview, &self.provider_profiles, &selected_agent.id)
                 .len()
         });
-        let mut profile_rows = v_flex().w_full().gap_2();
+        let mut profile_rows = v_flex().id("provider-profile-rows").w_full().gap_2();
         for profile in profiles.clone() {
             let id = profile.id.clone();
             let hover_group: SharedString = format!("provider-row-hover-{id}").into();
@@ -7818,6 +8012,7 @@ impl ManagementCenter {
                 .filter(|value| !value.is_empty())
                 .map(str::to_string)
                 .unwrap_or_else(management_unconfigured_label);
+            let model_count = management_model_count(profile.configured_model_count);
             let testing = matches!(
                 &self.mutation,
                 Some(ManagementMutation::ProviderProbe(active_id)) if active_id == &id
@@ -8002,24 +8197,32 @@ impl ManagementCenter {
             let drag_payload = ProviderDisplayOrderDrag {
                 agent_id: selected_agent_id.clone(),
                 profile_id: id.clone(),
-                label: profile.display_name.clone().into(),
+                kind: profile.kind,
+                label: profile.display_name.clone(),
+                is_default,
+                address: address.clone(),
+                model_count: model_count.clone(),
             };
             let drag_entity = cx.weak_entity();
-            let drag_tooltip = management_locale_text(
-                "Drag to reorder providers",
-                "拖动调整供应商顺序",
-                "拖動調整供應商順序",
-            );
+            let drag_agent_id = selected_agent_id.clone();
+            let drag_profile_id = id.clone();
             let drag_handle = div()
                 .id(SharedString::from(format!("provider-drag-handle-{id}")))
                 .flex_none()
                 .w(px(36.0))
-                .h_full()
+                .h(px(MANAGEMENT_PROVIDER_ROW_HEIGHT))
                 .flex()
                 .items_center()
                 .justify_center()
                 .cursor_grab()
-                .tooltip(move |window, cx| Tooltip::new(drag_tooltip).build(window, cx))
+                .tooltip(move |window, cx| {
+                    Tooltip::new(management_locale_text(
+                        "Drag to reorder providers",
+                        "拖动调整供应商顺序",
+                        "拖動調整供應商順序",
+                    ))
+                    .build(window, cx)
+                })
                 .child(
                     Icon::default()
                         .path("icons/vibex/grip-vertical.svg")
@@ -8029,97 +8232,141 @@ impl ManagementCenter {
                 .on_drag(drag_payload, move |drag, _, _, cx| {
                     cx.stop_propagation();
                     let _ = drag_entity.update(cx, |this, cx| {
-                        this.provider_display_order_drop_target = None;
-                        cx.notify();
+                        this.start_provider_profile_drag(&drag_agent_id, &drag_profile_id, cx);
                     });
                     cx.new(|_| drag.clone())
                 });
-            let active_drop_after =
-                self.provider_display_order_drop_target
+            let active_drop_after = active_drop_target
+                .as_ref()
+                .and_then(|target| (target.profile_id == id).then_some(target.after));
+            let reorder_offset = active_drag
+                .as_ref()
+                .and_then(|drag| {
+                    provider_reorder_row_offset(&drag.original_ids, &drag.preview_ids, id.as_str())
+                })
+                .map(|rows| {
+                    px(
+                        rows as f32
+                            * (MANAGEMENT_PROVIDER_ROW_HEIGHT + MANAGEMENT_PROVIDER_ROW_GAP),
+                    )
+                });
+            let reorder_animation_id =
+                active_drag
                     .as_ref()
-                    .and_then(|target| {
-                        (cx.has_active_drag() && target.profile_id == id).then_some(target.after)
+                    .zip(active_drop_target.as_ref())
+                    .map(|(drag, target)| {
+                        format!(
+                            "provider-reorder-{}-{}-{}-{}",
+                            drag.profile_id, target.profile_id, target.after, id
+                        )
                     });
             let move_agent_id = selected_agent_id.clone();
             let move_profile_id = id.clone();
-            let drop_agent_id = selected_agent_id.clone();
-            let drop_profile_id = id.clone();
-            profile_rows = profile_rows.child(
-                div()
-                    .id(SharedString::from(format!("provider-row-{id}")))
-                    .group(hover_group)
-                    .relative()
-                    .flex()
-                    .items_center()
-                    .w_full()
-                    .min_w_0()
-                    .min_h(px(72.0))
-                    .overflow_hidden()
-                    .rounded(px(14.0))
-                    .border_1()
-                    .border_color(cx.theme().border.opacity(if active { 0.0 } else { 0.65 }))
-                    .bg(if active {
+            let row = div()
+                .id(SharedString::from(format!("provider-row-{id}")))
+                .group(hover_group)
+                .relative()
+                .flex()
+                .items_center()
+                .w_full()
+                .min_w_0()
+                .min_h(px(MANAGEMENT_PROVIDER_ROW_HEIGHT))
+                .overflow_hidden()
+                .rounded(px(14.0))
+                .border_1()
+                .border_color(if active_drop_after.is_some() {
+                    cx.theme().drag_border
+                } else if active {
+                    cx.theme().primary.opacity(0.0)
+                } else {
+                    cx.theme().border.opacity(0.65)
+                })
+                .bg(if active_drop_after.is_some() {
+                    cx.theme().tokens.drop_target.into()
+                } else if active {
+                    cx.theme().primary.opacity(0.08)
+                } else {
+                    cx.theme().background.opacity(0.90)
+                })
+                .hover(|style| {
+                    style.bg(if active_drop_after.is_some() {
+                        cx.theme().tokens.drop_target.into()
+                    } else if active {
                         cx.theme().primary.opacity(0.08)
                     } else {
-                        cx.theme().background.opacity(0.90)
+                        cx.theme().accent
                     })
-                    .hover(|style| {
-                        style.bg(if active {
-                            cx.theme().primary.opacity(0.08)
-                        } else {
-                            cx.theme().accent
-                        })
-                    })
-                    .when_some(active_drop_after, |this, after| {
-                        this.child(
-                            div()
-                                .absolute()
-                                .left_0()
-                                .right_0()
-                                .h(px(2.0))
-                                .bg(cx.theme().drag_border)
-                                .map(|line| if after { line.bottom_0() } else { line.top_0() }),
-                        )
-                    })
-                    .on_drag_move(cx.listener(
-                        move |this, event: &DragMoveEvent<ProviderDisplayOrderDrag>, _, cx| {
-                            let drag = event.drag(cx);
-                            let next = (event.bounds.contains(&event.event.position)
-                                && drag.agent_id == move_agent_id
-                                && drag.profile_id != move_profile_id)
-                                .then_some(ProviderDisplayOrderDropTarget {
-                                    profile_id: move_profile_id.clone(),
-                                    after: event.event.position.y >= event.bounds.center().y,
-                                });
-                            if this.provider_display_order_drop_target != next {
-                                this.provider_display_order_drop_target = next;
-                                cx.notify();
-                            }
-                        },
-                    ))
-                    .on_drop(
-                        cx.listener(move |this, drag: &ProviderDisplayOrderDrag, _, cx| {
-                            let target = this.provider_display_order_drop_target.take();
-                            if let Some(target) = target.filter(|target| {
-                                target.profile_id == drop_profile_id
-                                    && drag.agent_id == drop_agent_id
-                            }) {
-                                this.reorder_provider_profiles(
-                                    &drag.profile_id,
-                                    &target.profile_id,
-                                    target.after,
-                                    cx,
-                                );
-                            } else {
-                                cx.notify();
-                            }
-                        }),
+                })
+                .when(
+                    active_drag
+                        .as_ref()
+                        .is_some_and(|drag| drag.profile_id == id),
+                    |this| this.opacity(0.45),
+                )
+                .when_some(active_drop_after, |this, after| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .h(px(2.0))
+                            .bg(cx.theme().drag_border)
+                            .map(|line| if after { line.bottom_0() } else { line.top_0() }),
                     )
-                    .child(drag_handle)
-                    .child(selectable)
-                    .child(actions),
-            );
+                })
+                .on_drag_move(cx.listener(
+                    move |this, event: &DragMoveEvent<ProviderDisplayOrderDrag>, _, cx| {
+                        let drag = event.drag(cx).clone();
+                        let next = (event.bounds.contains(&event.event.position)
+                            && drag.agent_id == move_agent_id
+                            && drag.profile_id != move_profile_id)
+                            .then_some(ProviderDisplayOrderDropTarget {
+                                profile_id: move_profile_id.clone(),
+                                after: event.event.position.y >= event.bounds.center().y,
+                            });
+                        if let Some(next) = next {
+                            this.preview_provider_profile_reorder(
+                                &drag,
+                                &next.profile_id,
+                                next.after,
+                                cx,
+                            );
+                        } else if this.provider_display_order_drop_target.take().is_some() {
+                            cx.notify();
+                        }
+                    },
+                ))
+                .child(drag_handle)
+                .child(selectable)
+                .child(actions);
+            let row = if let (Some(offset), Some(animation_id)) =
+                (reorder_offset, reorder_animation_id)
+            {
+                Transition::new(Duration::from_millis(
+                    MANAGEMENT_PROVIDER_REORDER_ANIMATION_MS,
+                ))
+                .ease(ease_out_cubic)
+                .slide_y(offset, px(0.0))
+                .apply(row, animation_id)
+                .into_any_element()
+            } else {
+                row.into_any_element()
+            };
+            profile_rows = profile_rows.child(row);
         }
+
+        let drop_agent_id = selected_agent_id.clone();
+        profile_rows = profile_rows.on_drop(cx.listener(
+            move |this, drag: &ProviderDisplayOrderDrag, _, cx| {
+                if drag.agent_id == drop_agent_id {
+                    this.finish_provider_profile_drag(drag, cx);
+                } else {
+                    this.provider_display_order_drag_state = None;
+                    this.provider_display_order_drop_target = None;
+                    cx.notify();
+                }
+            },
+        ));
 
         let installation = self.render_agent_installation_card(&selected_agent, window, cx);
         let provider_configuration = v_flex()
@@ -12363,6 +12610,17 @@ fn reordered_provider_profile_ids(
     ids
 }
 
+fn provider_reorder_row_offset(
+    original_ids: &[String],
+    preview_ids: &[String],
+    profile_id: &str,
+) -> Option<isize> {
+    let original_index = original_ids.iter().position(|id| id == profile_id)?;
+    let preview_index = preview_ids.iter().position(|id| id == profile_id)?;
+    let offset = isize::try_from(original_index).ok()? - isize::try_from(preview_index).ok()?;
+    (offset != 0).then_some(offset)
+}
+
 fn management_provider_default_scope(
     workspace_id: Option<vibex_core::WorkspaceId>,
 ) -> vibex_core::ProviderProfileDefaultScope {
@@ -14871,6 +15129,26 @@ mod tests {
     }
 
     #[test]
+    fn agent_update_version_stays_with_local_version_and_uses_success_color() {
+        let source = include_str!("management.rs");
+        let install = source
+            .split_once("    fn render_agent_installation_card(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_providers("))
+            .map(|(body, _)| body)
+            .expect("Installation renderer should remain inspectable");
+        let version_row = install
+            .split_once("let available_version =")
+            .and_then(|(_, tail)| tail.split_once("if let Some(error)"))
+            .map(|(body, _)| body)
+            .expect("Installation version row should remain inspectable");
+
+        assert!(version_row.contains("state.installed_version.clone()"));
+        assert!(version_row.contains("when_some(available_version.clone()"));
+        assert!(version_row.contains("cx.theme().success"));
+        assert!(!version_row.contains("content = content.child(\n                div()"));
+    }
+
+    #[test]
     fn provider_rows_expose_a_drag_handle_and_persist_reordered_ids() {
         let source = include_str!("management.rs");
         let render = source
@@ -14883,8 +15161,13 @@ mod tests {
         assert!(render.contains(".cursor_grab()"));
         assert!(render.contains(".on_drag_move(cx.listener("));
         assert!(render.contains(".on_drop("));
-        assert!(render.contains("reorder_provider_profiles("));
+        assert!(render.contains("finish_provider_profile_drag("));
         assert!(render.contains("provider_display_order_drop_target"));
+        assert!(source.contains("ProviderDisplayOrderDragState"));
+        assert!(render.contains("MANAGEMENT_PROVIDER_ROW_HEIGHT"));
+        assert!(render.contains("Transition::new(Duration::from_millis("));
+        assert!(source.contains(".shadow_lg()"));
+        assert!(render.contains("preview_provider_profile_reorder("));
 
         let helper = source
             .split_once("fn reordered_provider_profile_ids(")
@@ -14913,6 +15196,35 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(reordered_provider_profile_ids(&ids, "b", "b", false), ids);
+    }
+
+    #[test]
+    fn provider_reorder_row_offsets_show_source_and_target_motion() {
+        let original = ["a", "b", "c"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let preview = ["b", "c", "a"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            provider_reorder_row_offset(&original, &preview, "a"),
+            Some(-2)
+        );
+        assert_eq!(
+            provider_reorder_row_offset(&original, &preview, "b"),
+            Some(1)
+        );
+        assert_eq!(
+            provider_reorder_row_offset(&original, &preview, "c"),
+            Some(1)
+        );
+        assert_eq!(
+            provider_reorder_row_offset(&original, &preview, "missing"),
+            None
+        );
     }
 
     #[test]
