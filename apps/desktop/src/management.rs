@@ -79,11 +79,21 @@ const MANAGEMENT_PROVIDER_ROW_GAP: f32 = 8.0;
 const MANAGEMENT_PROVIDER_DRAG_PREVIEW_WIDTH: f32 = 520.0;
 const MANAGEMENT_PROVIDER_REORDER_ANIMATION_MS: u64 = 160;
 const MANAGEMENT_PROVIDER_ROW_ACTION_SIZE: f32 = 40.0;
+const PROVIDER_API_KEY_PLACEHOLDER: &str = "API Key";
+const PROVIDER_API_KEY_CONFIGURED_PLACEHOLDER: &str = "***";
 const PROVIDER_OPTION_WEBSITE_URL: &str = "ccSwitchWebsiteUrl";
 const PROVIDER_OPTION_CC_SWITCH_DB_PATH: &str = "ccSwitchDbPath";
 const PROVIDER_OPTION_CC_SWITCH_PROVIDER_ID: &str = "ccSwitchProviderId";
 const PROVIDER_OPTION_CC_SWITCH_APP_TYPE: &str = "ccSwitchAppType";
 const PROVIDER_OPTION_NATIVE_SOURCE: &str = "nativeSource";
+
+fn provider_api_key_placeholder(secret_configured: bool) -> &'static str {
+    if secret_configured {
+        PROVIDER_API_KEY_CONFIGURED_PLACEHOLDER
+    } else {
+        PROVIDER_API_KEY_PLACEHOLDER
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ManagementEvent {
@@ -669,7 +679,7 @@ impl ManagementCenter {
         });
         let profile_api_key = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("API Key")
+                .placeholder(PROVIDER_API_KEY_PLACEHOLDER)
                 .masked(true)
         });
         let acp_command = cx.new(|cx| {
@@ -2284,6 +2294,7 @@ impl ManagementCenter {
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.profile_api_key.update(cx, |state, cx| {
             state.set_masked(true, window, cx);
+            state.set_placeholder(PROVIDER_API_KEY_PLACEHOLDER, window, cx);
             state.set_value("", window, cx);
         });
         self.editing_profile_id = None;
@@ -2349,6 +2360,11 @@ impl ManagementCenter {
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.profile_api_key.update(cx, |state, cx| {
             state.set_masked(true, window, cx);
+            state.set_placeholder(
+                provider_api_key_placeholder(profile.secret_configured),
+                window,
+                cx,
+            );
             state.set_value("", window, cx);
         });
         self.profile_configured_models = full_profile
@@ -2381,8 +2397,10 @@ impl ManagementCenter {
     }
 
     fn reset_profile_editor_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.profile_api_key
-            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.profile_api_key.update(cx, |state, cx| {
+            state.set_placeholder(PROVIDER_API_KEY_PLACEHOLDER, window, cx);
+            state.set_value("", window, cx);
+        });
         self.profile_editor_open = false;
         self.editing_profile_id = None;
         self.projection_editor.draft_revision = 0;
@@ -14454,6 +14472,21 @@ fn empty_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_api_key_placeholder_reflects_saved_secret_state() {
+        assert_eq!(provider_api_key_placeholder(true), "***");
+        assert_eq!(provider_api_key_placeholder(false), "API Key");
+
+        let source = include_str!("management.rs");
+        let editor = source
+            .split_once("    fn open_profile_editor(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn close_profile_editor("))
+            .map(|(body, _)| body)
+            .expect("Provider editor should remain inspectable");
+        assert!(editor.contains("provider_api_key_placeholder(profile.secret_configured)"));
+        assert!(editor.contains("state.set_value(\"\", window, cx);"));
+    }
 
     #[test]
     fn agent_mutations_are_keyed_by_their_target_agent() {
