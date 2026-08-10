@@ -16,7 +16,7 @@ use gpui::{
     Subscription, Task, Window, div, prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Size,
     StyledExt as _, Theme, WindowExt as _,
     animation::{Transition, ease_out_cubic},
     button::{Button, ButtonVariants as _},
@@ -8183,11 +8183,11 @@ impl ManagementCenter {
                 .pr_3()
                 .invisible()
                 .group_hover(&hover_group, |style| style.visible());
-            // The semantic size controls the icon; the explicit size keeps the button at 40px.
+            // Medium keeps icons at 16px; the explicit size keeps the button at 40px.
             if !is_default {
                 actions = actions.child(button_with_aria_label(
                     Button::new(SharedString::from(format!("provider-default-{default_id}")))
-                        .large()
+                        .with_size(Size::Medium)
                         .secondary()
                         .compact()
                         .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
@@ -8207,7 +8207,7 @@ impl ManagementCenter {
             actions = actions
                 .child(button_with_aria_label(
                     Button::new(SharedString::from(format!("provider-edit-{id}")))
-                        .large()
+                        .with_size(Size::Medium)
                         .secondary()
                         .compact()
                         .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
@@ -8227,7 +8227,7 @@ impl ManagementCenter {
                     Button::new(SharedString::from(format!(
                         "provider-duplicate-{duplicate_id}"
                     )))
-                    .large()
+                    .with_size(Size::Medium)
                     .secondary()
                     .compact()
                     .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
@@ -8245,7 +8245,7 @@ impl ManagementCenter {
                 ))
                 .child(button_with_aria_label(
                     Button::new(SharedString::from(format!("provider-test-{test_id}")))
-                        .large()
+                        .with_size(Size::Medium)
                         .secondary()
                         .compact()
                         .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
@@ -8264,7 +8264,7 @@ impl ManagementCenter {
                 ))
                 .child(button_with_aria_label(
                     Button::new(SharedString::from(format!("provider-delete-{delete_id}")))
-                        .large()
+                        .with_size(Size::Medium)
                         .danger()
                         .compact()
                         .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
@@ -15291,9 +15291,9 @@ mod tests {
                 .expect("Provider action should remain inspectable");
             assert!(
                 action_body
-                    .find(".large()")
-                    .is_some_and(|index| index < 260),
-                "Provider action icon must use the large icon size: {action}"
+                    .find(".with_size(Size::Medium)")
+                    .is_some_and(|index| index < 300),
+                "Provider action icon must use the 16px medium icon size: {action}"
             );
         }
         for action in [
