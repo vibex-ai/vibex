@@ -20888,7 +20888,7 @@ impl VibexWorkbench {
                                         .xsmall()
                                         .ghost()
                                         .compact()
-                                        .icon(IconName::Delete)
+                                        .icon(Icon::default().path("icons/vibex/trash-2.svg"))
                                         .tooltip(locale::text(
                                             "Close terminal",
                                             "关闭终端",
@@ -37741,6 +37741,22 @@ mod tests {
         assert!(interrupt.contains("turn_was_locally_pending"));
         assert!(interrupt.contains("composer_queue_steering_session_ids"));
         assert!(interrupt.contains("ComposerQueueDispatchBehavior::AfterInterrupt"));
+    }
+
+    #[test]
+    fn desktop_delete_actions_use_the_shared_trash_icon() {
+        let legacy_delete_icon = ["IconName", "::Delete"].concat();
+
+        for (name, source) in [
+            ("desktop app", include_str!("app.rs")),
+            ("management center", include_str!("management.rs")),
+        ] {
+            assert!(
+                !source.contains(&legacy_delete_icon),
+                "{name} must use the shared trash icon for delete actions"
+            );
+            assert!(source.contains("icons/vibex/trash-2.svg"));
+        }
     }
 
     #[test]

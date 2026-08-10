@@ -647,6 +647,29 @@ information.
 - Use semantic tokens from `crates/vibex-ui/theme/tokens.json` across native and WASM GPUI.
 - Preserve dark mode as a first-class path.
 - Use shared GPUI/gpui-component primitives; legacy React may keep shadcn/Radix until cutover.
+- GPUI delete, remove, clear, and destructive close actions must use the shared
+  `icons/vibex/trash-2.svg` glyph. Do not use `IconName::Delete`: the locked
+  component library renders it as a backspace-style symbol rather than a trash
+  can, which makes destructive actions ambiguous. Conditional actions must
+  return `Icon` values from every branch:
+
+  ```rust
+  // Wrong: renders the backspace-style delete glyph.
+  Button::new("delete-item").icon(IconName::Delete);
+
+  // Correct: uses the shared destructive-action glyph.
+  Button::new("delete-item").icon(Icon::default().path("icons/vibex/trash-2.svg"));
+
+  // Correct: both conditional branches resolve to Icon.
+  button.icon(if clearing {
+      Icon::new(IconName::Undo2)
+  } else {
+      Icon::default().path("icons/vibex/trash-2.svg")
+  });
+  ```
+
+  Desktop source-contract coverage must reject `IconName::Delete` in
+  `apps/desktop/src/app.rs` and `apps/desktop/src/management.rs`.
 - Text-bearing overlays such as dialogs, sheets, dropdown menus, selects,
   context menus, command palettes, and tooltips should avoid scale/zoom
   animations and backdrop blur. In Tauri/WebKit these effects can keep text on

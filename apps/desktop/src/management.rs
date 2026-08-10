@@ -6691,7 +6691,7 @@ impl ManagementCenter {
                             .xsmall()
                             .ghost()
                             .compact()
-                            .icon(IconName::Delete)
+                            .icon(Icon::default().path("icons/vibex/trash-2.svg"))
                             .tooltip(management_locale_text(
                                 "Delete model",
                                 "删除模型",
@@ -7518,9 +7518,9 @@ impl ManagementCenter {
                                             .small()
                                             .outline()
                                             .icon(if clearing {
-                                                IconName::Undo2
+                                                Icon::new(IconName::Undo2)
                                             } else {
-                                                IconName::Delete
+                                                Icon::default().path("icons/vibex/trash-2.svg")
                                             })
                                             .disabled(pending)
                                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -8690,7 +8690,7 @@ impl ManagementCenter {
                                 Button::new(SharedString::from(format!("mcp-delete-{delete_id}")))
                                     .small()
                                     .danger()
-                                    .icon(IconName::Delete)
+                                    .icon(Icon::default().path("icons/vibex/trash-2.svg"))
                                     .loading(deleting)
                                     .tooltip(management_delete_mcp_label())
                                     .disabled(pending)
@@ -8930,7 +8930,7 @@ impl ManagementCenter {
                                     )))
                                     .small()
                                     .danger()
-                                    .icon(IconName::Delete)
+                                    .icon(Icon::default().path("icons/vibex/trash-2.svg"))
                                     .loading(deleting)
                                     .tooltip(management_delete_skill_label())
                                     .disabled(pending)
@@ -9049,7 +9049,7 @@ impl ManagementCenter {
                             Button::new(SharedString::from(format!("prompt-delete-{delete_id}")))
                                 .small()
                                 .danger()
-                                .icon(IconName::Delete)
+                                .icon(Icon::default().path("icons/vibex/trash-2.svg"))
                                 .label(management_locale_text("Delete", "删除", "刪除"))
                                 .loading(deleting)
                                 .disabled(pending)
@@ -9123,7 +9123,7 @@ impl ManagementCenter {
                             Button::new(SharedString::from(format!("hook-delete-{delete_id}")))
                                 .small()
                                 .danger()
-                                .icon(IconName::Delete)
+                                .icon(Icon::default().path("icons/vibex/trash-2.svg"))
                                 .label(management_locale_text("Delete", "删除", "刪除"))
                                 .loading(deleting)
                                 .disabled(pending)
@@ -10902,7 +10902,7 @@ impl ManagementCenter {
                         Button::new(SharedString::from(format!("scheduled-delete-{delete_id}")))
                             .small()
                             .danger()
-                            .icon(IconName::Delete)
+                            .icon(Icon::default().path("icons/vibex/trash-2.svg"))
                             .tooltip(management_locale_text(
                                 "Delete scheduled task (confirmation required)",
                                 "删除定时任务（需要确认）",
@@ -11420,7 +11420,7 @@ impl ManagementCenter {
                             Button::new("automation-delete-selection")
                                 .small()
                                 .danger()
-                                .icon(IconName::Delete)
+                                .icon(Icon::default().path("icons/vibex/trash-2.svg"))
                                 .tooltip(management_locale_text(
                                     "Delete selected nodes",
                                     "删除所选节点",
