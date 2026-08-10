@@ -239,6 +239,12 @@ AgentProviderBindingEditorState::{
 - The shared editor state contains no Secret value. A blank Secret control means
   no mutation until explicit user input sets `secret_touched`; clearing requires
   both `secret_touched=true` and `secret_clear=true`.
+- Native Desktop may keep the resolved Provider Profile API Key transiently in
+  its local masked `InputState` so the standard eye toggle can reveal it. This
+  does not add the Secret to `AgentProviderBindingEditorState`, snapshots, Debug,
+  notices, Web, or mobile. The async read is fenced by the exact Agent/Profile
+  scope, programmatic `set_value` leaves `secret_touched=false`, and dialog close
+  cancels the read and clears the input.
 - Capability/preview refresh replaces authoritative read state but preserves
   `draft_revision` and Secret intent. A background query must not reset an open
   draft or turn an untouched blank field into deletion.
@@ -259,6 +265,8 @@ AgentProviderBindingEditorState::{
   backend remains authoritative with `agent_model_interface_unsupported`.
 - Background capability refresh while draft is dirty -> preserve draft and
   Secret intent.
+- Saved Secret read completes for a closed or different Agent/Profile editor ->
+  ignore it and do not populate the current input.
 - Remote raw entity/Secret action -> show the structured
   `remote_*_private` / `remote_provider_secret_mutation_unavailable` recovery
   state; never fall back to a local mutation.
@@ -267,12 +275,17 @@ AgentProviderBindingEditorState::{
 
 - Good: an API-key descriptor shows a Secret-specific control and sends a
   separate Secret mutation only after the user edits or explicitly clears it.
+- Good: native Desktop loads a configured API Key into a masked input; the eye
+  toggle reveals the original value, while saving another field leaves the
+  Secret mutation untouched.
 - Good: AWS and local descriptors show cloud/local controls rather than an API
   key field with a different label.
 - Base: an unknown Agent shows an unverified state with no selectable model
   interface.
 - Bad: branch on `agent_id == "codex"` in each client to build controls.
 - Bad: preserve a redacted placeholder in a field and submit it as a new Secret.
+- Bad: render a fixed `***` placeholder for a configured Provider Profile key;
+  the eye toggle cannot reveal the original value.
 - Bad: deserialize `provider_options` in GPUI to construct env or overlay files.
 
 ### 6. Tests Required
@@ -281,6 +294,9 @@ AgentProviderBindingEditorState::{
   unsupported states expose no credential input.
 - Shared UI and Desktop tests assert capability refresh preserves draft and
   `secret_touched`/`secret_clear` intent.
+- Desktop Management tests assert that the editor calls the local Secret-value
+  read, writes the response into the masked `InputState`, keeps the eye toggle,
+  and rejects stale Agent/Profile callbacks.
 - Codex tests assert Responses is accepted and Chat is absent/rejected in the
   editor and at the backend validation boundary.
 - Backend parity tests cover Native, Disconnected, and WebRemote capability
@@ -306,6 +322,19 @@ if agent_id.as_str() == "codex" {
 let surface = editor.credential_surface();
 let wire_choices = editor.wire_api_choices();
 let preview = editor.preview.as_ref(); // already bounded and redacted
+```
+
+For the native Desktop Provider Profile editor only:
+
+```rust
+// Wrong: there is no original value for the eye toggle to reveal.
+state.set_placeholder("***", window, cx);
+state.set_value("", window, cx);
+
+// Correct: keep the resolved value local and masked by default.
+state.set_masked(true, window, cx);
+state.set_value(secret.value.unwrap_or_default(), window, cx);
+profile_secret_touched = false;
 ```
 
 The exact descriptor determines the controls once, and every client consumes

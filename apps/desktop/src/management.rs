@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    AccessibleAction, Anchor, Animation, AnimationExt as _, AnyElement, App, Context,
-    DragMoveEvent, Empty, Entity, EventEmitter, IntoElement, KeyDownEvent, MouseButton,
+    AccessibleAction, Anchor, Animation, AnimationExt as _, AnyElement, AnyWindowHandle, App,
+    Context, DragMoveEvent, Empty, Entity, EventEmitter, IntoElement, KeyDownEvent, MouseButton,
     MouseDownEvent, Orientation, Render, Role, SharedString, StatefulInteractiveElement as _,
     Subscription, Task, Window, div, prelude::*, px,
 };
@@ -80,20 +80,11 @@ const MANAGEMENT_PROVIDER_DRAG_PREVIEW_WIDTH: f32 = 520.0;
 const MANAGEMENT_PROVIDER_REORDER_ANIMATION_MS: u64 = 160;
 const MANAGEMENT_PROVIDER_ROW_ACTION_SIZE: f32 = 40.0;
 const PROVIDER_API_KEY_PLACEHOLDER: &str = "API Key";
-const PROVIDER_API_KEY_CONFIGURED_PLACEHOLDER: &str = "***";
 const PROVIDER_OPTION_WEBSITE_URL: &str = "ccSwitchWebsiteUrl";
 const PROVIDER_OPTION_CC_SWITCH_DB_PATH: &str = "ccSwitchDbPath";
 const PROVIDER_OPTION_CC_SWITCH_PROVIDER_ID: &str = "ccSwitchProviderId";
 const PROVIDER_OPTION_CC_SWITCH_APP_TYPE: &str = "ccSwitchAppType";
 const PROVIDER_OPTION_NATIVE_SOURCE: &str = "nativeSource";
-
-fn provider_api_key_placeholder(secret_configured: bool) -> &'static str {
-    if secret_configured {
-        PROVIDER_API_KEY_CONFIGURED_PLACEHOLDER
-    } else {
-        PROVIDER_API_KEY_PLACEHOLDER
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ManagementEvent {
@@ -566,6 +557,7 @@ pub struct ManagementCenter {
     generation: u64,
     refresh_task: Option<Task<()>>,
     mutation_task: Option<Task<()>>,
+    profile_secret_task: Option<Task<()>>,
     agent_mutation_tasks: BTreeMap<String, Task<()>>,
     agent_auth_task: Option<Task<()>>,
     agent_auth_terminal_monitor_task: Option<Task<()>>,
@@ -952,6 +944,7 @@ impl ManagementCenter {
             generation: 0,
             refresh_task: None,
             mutation_task: None,
+            profile_secret_task: None,
             agent_mutation_tasks: BTreeMap::new(),
             agent_auth_task: None,
             agent_auth_terminal_monitor_task: None,
@@ -2302,6 +2295,7 @@ impl ManagementCenter {
         self.profile_secret_touched = false;
         self.projection_editor.set_secret_intent(false, false);
         self.profile_secret_loading = false;
+        self.profile_secret_task = None;
         self.profile_configured_models.clear();
         self.profile_model_edit_index = None;
         self.profile_model_edit_wire_api = None;
@@ -2360,11 +2354,7 @@ impl ManagementCenter {
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.profile_api_key.update(cx, |state, cx| {
             state.set_masked(true, window, cx);
-            state.set_placeholder(
-                provider_api_key_placeholder(profile.secret_configured),
-                window,
-                cx,
-            );
+            state.set_placeholder(PROVIDER_API_KEY_PLACEHOLDER, window, cx);
             state.set_value("", window, cx);
         });
         self.profile_configured_models = full_profile
@@ -2381,12 +2371,92 @@ impl ManagementCenter {
         self.projection_editor.draft_revision = 0;
         self.profile_secret_touched = false;
         self.projection_editor.set_secret_intent(false, false);
-        self.profile_secret_loading = false;
+        self.profile_secret_loading = profile.secret_configured;
+        self.profile_secret_task = None;
         self.profile_editor_open = true;
         self.error = None;
         self.navigation.mark_dirty(ManagementSection::Agents, false);
         self.present_profile_editor_dialog(window, cx);
+        if profile.secret_configured {
+            if let (Ok(agent_id), Ok(provider_profile_id)) = (
+                AgentId::parse(profile.agent_id),
+                vibex_core::ProviderProfileId::parse(profile.id),
+            ) {
+                self.load_profile_secret(agent_id, provider_profile_id, window.window_handle(), cx);
+            } else {
+                self.profile_secret_loading = false;
+            }
+        }
         cx.notify();
+    }
+
+    fn load_profile_secret(
+        &mut self,
+        agent_id: AgentId,
+        provider_profile_id: vibex_core::ProviderProfileId,
+        window_handle: AnyWindowHandle,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(runtime) = self.runtime.clone() else {
+            self.profile_secret_loading = false;
+            return;
+        };
+        let expected_agent_id = agent_id.as_str().to_string();
+        let expected_profile_id = provider_profile_id.as_str().to_string();
+        let entity = cx.weak_entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            runtime
+                .management()
+                .providers()
+                .management()
+                .get_agent_model_provider_profile_secret_value(
+                    vibex_core::AgentModelProviderProfileSecretValueRequest {
+                        agent_id,
+                        provider_profile_id,
+                    },
+                )
+        });
+        self.profile_secret_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = cx.update_window(window_handle, |_, window, cx| {
+                let _ = entity.update(cx, |this, cx| {
+                    if !profile_secret_scope_matches(
+                        this.profile_editor_open,
+                        this.selected_agent_id.as_deref(),
+                        this.editing_profile_id.as_deref(),
+                        &expected_agent_id,
+                        &expected_profile_id,
+                    ) {
+                        return;
+                    }
+                    this.profile_secret_loading = false;
+                    match outcome {
+                        Ok(Ok(secret)) => {
+                            this.profile_api_key.update(cx, |state, cx| {
+                                state.set_value(secret.value.unwrap_or_default(), window, cx)
+                            });
+                            this.profile_secret_touched = false;
+                            this.projection_editor.set_secret_intent(false, false);
+                            this.navigation.mark_dirty(ManagementSection::Agents, false);
+                        }
+                        Ok(Err(error)) => {
+                            this.error = Some(format!("{}: {}", error.code, error.message));
+                        }
+                        Err(error) => {
+                            this.error = Some(format!(
+                                "{}: {error}",
+                                management_error_text(
+                                    "API Key loading failed",
+                                    "API Key 加载失败",
+                                    "API Key 載入失敗",
+                                )
+                            ));
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        }));
     }
 
     fn close_profile_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2407,6 +2477,7 @@ impl ManagementCenter {
         self.profile_secret_touched = false;
         self.projection_editor.set_secret_intent(false, false);
         self.profile_secret_loading = false;
+        self.profile_secret_task = None;
         self.profile_configured_models.clear();
         self.profile_model_edit_index = None;
         self.profile_model_edit_wire_api = None;
@@ -12768,6 +12839,18 @@ fn agent_auth_input_key(method_id: &str, variable_name: &str) -> String {
     format!("{}:{method_id}{variable_name}", method_id.len())
 }
 
+fn profile_secret_scope_matches(
+    editor_open: bool,
+    selected_agent_id: Option<&str>,
+    editing_profile_id: Option<&str>,
+    expected_agent_id: &str,
+    expected_profile_id: &str,
+) -> bool {
+    editor_open
+        && selected_agent_id == Some(expected_agent_id)
+        && editing_profile_id == Some(expected_profile_id)
+}
+
 fn agent_auth_scope_matches(
     current_generation: u64,
     current_scope: Option<&(String, Option<String>)>,
@@ -14467,18 +14550,68 @@ mod tests {
     use super::*;
 
     #[test]
-    fn provider_api_key_placeholder_reflects_saved_secret_state() {
-        assert_eq!(provider_api_key_placeholder(true), "***");
-        assert_eq!(provider_api_key_placeholder(false), "API Key");
-
+    fn provider_api_key_editor_loads_saved_value_into_masked_input() {
         let source = include_str!("management.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .map(|(body, _)| body)
+            .expect("Management production source should remain inspectable");
         let editor = source
             .split_once("    fn open_profile_editor(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn close_profile_editor("))
+            .and_then(|(_, tail)| tail.split_once("\n    fn load_profile_secret("))
             .map(|(body, _)| body)
             .expect("Provider editor should remain inspectable");
-        assert!(editor.contains("provider_api_key_placeholder(profile.secret_configured)"));
+        let loader = source
+            .split_once("    fn load_profile_secret(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn close_profile_editor("))
+            .map(|(body, _)| body)
+            .expect("Provider Secret loader should remain inspectable");
+        let credential_control = source
+            .split_once("    fn render_projection_credential_control(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_profile_editor_dialog("))
+            .map(|(body, _)| body)
+            .expect("Provider credential control should remain inspectable");
+
+        assert!(editor.contains("self.profile_secret_loading = profile.secret_configured;"));
+        assert!(editor.contains("self.load_profile_secret("));
         assert!(editor.contains("state.set_value(\"\", window, cx);"));
+        assert!(loader.contains("get_agent_model_provider_profile_secret_value"));
+        assert!(loader.contains("state.set_value(secret.value.unwrap_or_default(), window, cx)"));
+        assert!(loader.contains("profile_secret_scope_matches("));
+        assert!(credential_control.contains(".mask_toggle()"));
+        assert!(!production.contains("PROVIDER_API_KEY_CONFIGURED_PLACEHOLDER"));
+    }
+
+    #[test]
+    fn provider_api_key_async_results_are_fenced_by_editor_scope() {
+        assert!(profile_secret_scope_matches(
+            true,
+            Some("codex"),
+            Some("profile-a"),
+            "codex",
+            "profile-a",
+        ));
+        assert!(!profile_secret_scope_matches(
+            false,
+            Some("codex"),
+            Some("profile-a"),
+            "codex",
+            "profile-a",
+        ));
+        assert!(!profile_secret_scope_matches(
+            true,
+            Some("claude"),
+            Some("profile-a"),
+            "codex",
+            "profile-a",
+        ));
+        assert!(!profile_secret_scope_matches(
+            true,
+            Some("codex"),
+            Some("profile-b"),
+            "codex",
+            "profile-a",
+        ));
     }
 
     #[test]

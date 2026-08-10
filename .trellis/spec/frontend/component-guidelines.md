@@ -632,12 +632,19 @@ surface, not a diagnostics console:
 - Secret environment fields use masked inputs and expose only a configured
   marker plus an explicit clear action. Optional fields are labeled; exact
   Agent-provided environment names remain visible.
+- The native Desktop Provider Profile API Key editor is the deliberate local
+  exception: it may resolve the saved value through `DesktopRuntime`, place it
+  in a masked `InputState`, and expose the standard eye toggle. Do not represent
+  a configured key with a fixed `***` placeholder because the toggle would have
+  no original value to reveal. The plaintext remains confined to that local
+  editor state and the Secret mutation request.
 - Render logout only when advertised. A terminal method opens the shared
   Terminal surface with a close action and explicit running/success/failure
   state.
 - Do not render runtime verification, runtime-option snapshots, Provider
-  projection internals, raw ACP payloads, or resolved credential values in the
-  Agent detail surface.
+  projection internals, raw ACP payloads, or resolved authentication-method
+  credential values in the Agent detail surface. The local Provider Profile
+  editor exception above applies only to its explicit masked API Key control.
 
 Native export UI must always include diff, backup, atomic write, and rollback
 information.
