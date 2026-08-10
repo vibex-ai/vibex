@@ -28,6 +28,17 @@ const DEFAULT_HISTORY_LIMIT: u32 = 50;
 const MAX_BLAME_LINES: u32 = 500;
 const VIBEX_GIT_MUTATION_LOCK_FILE: &str = "vibex-mutation.lock";
 
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+
+        command.creation_flags(0x0800_0000);
+    }
+    command
+}
+
 struct GitMutationGuard {
     file: File,
 }
@@ -1445,7 +1456,7 @@ fn ensure_git_repo(repo_path: &Path) -> VibexResult<()> {
         );
     }
 
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(repo_path)
         .args(["rev-parse", "--is-inside-work-tree"])
@@ -1804,7 +1815,7 @@ fn rebase_state_value(root: &Path, name: &str) -> VibexResult<Option<String>> {
 fn is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> VibexResult<bool> {
     validate_commitish(ancestor)?;
     validate_commitish(descendant)?;
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(root)
         .args(["merge-base", "--is-ancestor", ancestor, descendant])
@@ -1830,7 +1841,7 @@ fn is_untracked(root: &Path, path: &str) -> VibexResult<bool> {
 }
 
 fn has_staged_changes(root: &Path) -> VibexResult<bool> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(root)
         .args(["diff", "--staged", "--quiet"])
@@ -2393,7 +2404,7 @@ fn validate_commitish(value: &str) -> VibexResult<()> {
 fn validate_existing_commitish(root: &Path, value: &str) -> VibexResult<()> {
     validate_commitish(value)?;
     let verify_ref = format!("{value}^{{commit}}");
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(root)
         .args(["rev-parse", "--verify", &verify_ref])
@@ -2421,7 +2432,7 @@ fn validate_existing_commitish(root: &Path, value: &str) -> VibexResult<()> {
 
 fn validate_branch_name(root: &Path, value: &str) -> VibexResult<()> {
     validate_ref_arg(value)?;
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(root)
         .args(["check-ref-format", "--branch", value])
@@ -2463,7 +2474,7 @@ fn validate_ref_arg(value: &str) -> VibexResult<()> {
 }
 
 fn run_git_owned(root: &Path, args: &[String]) -> VibexResult<String> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(root)
         .args(args)
@@ -2487,7 +2498,7 @@ fn run_git_owned(root: &Path, args: &[String]) -> VibexResult<String> {
 }
 
 fn run_git(root: &Path, args: &[&str]) -> VibexResult<String> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(root)
         .args(args)
@@ -2532,7 +2543,7 @@ fn run_git_optional(root: &Path, args: &[&str]) -> VibexResult<Option<String>> {
 }
 
 fn run_git_paths(root: &Path, args: &[&str], paths: &[String]) -> VibexResult<String> {
-    let mut command = Command::new("git");
+    let mut command = git_command();
     command.arg("-C").arg(root).args(args).arg("--");
     for path in paths {
         command.arg(path);
@@ -2555,7 +2566,7 @@ fn run_git_paths(root: &Path, args: &[&str], paths: &[String]) -> VibexResult<St
 
 fn run_git_no_index_for_untracked(root: &Path, path: &str) -> VibexResult<String> {
     let null_path = if cfg!(windows) { "NUL" } else { "/dev/null" };
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(root)
         .args(["diff", "--no-index", "--", null_path, path])

@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Output};
+#[cfg(test)]
+use std::process::Command;
+use std::process::Output;
 
 use vibex_core::{
     GitPathIdentity, GitProjectEligibility, GitProjectEligibilityState, GitProjectIneligibleReason,
@@ -357,7 +359,7 @@ fn git_stdout_optional(path: &Path, args: &[&str]) -> VibexResult<Option<String>
 }
 
 fn git_output(path: &Path, args: &[&str]) -> VibexResult<Output> {
-    Command::new("git")
+    crate::git_command()
         .arg("-C")
         .arg(path)
         .args(args)

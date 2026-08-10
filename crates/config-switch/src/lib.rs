@@ -3793,7 +3793,14 @@ fn trusted_version_probe_binary_names(agent_id: &str) -> Option<&'static [&'stat
 const CLI_VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn probe_cli_version(binary_path: &Path) -> Result<String, &'static str> {
-    let mut child = Command::new(binary_path)
+    let mut command = Command::new(binary_path);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+
+        command.creation_flags(0x0800_0000);
+    }
+    let mut child = command
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

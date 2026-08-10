@@ -55,6 +55,61 @@ const PI_MINIMUM_NODE_VERSION: semver::Version = semver::Version::new(22, 19, 0)
 const PI_CODING_AGENT_PACKAGE: &str = "@earendil-works/pi-coding-agent";
 const PI_COMMAND_NAME: &str = "pi";
 const NPM_COMPANION_LAUNCHER_NAME: &str = "vibex-acp-companion-launcher.cjs";
+const NPM_WINDOWS_CHILD_PROCESS_HOOK_NAME: &str = "vibex-windows-child-process.cjs";
+const NPM_WINDOWS_CHILD_PROCESS_HOOK_SOURCE: &str = r#""use strict";
+if (process.platform === "win32") {
+  const childProcess = require("node:child_process");
+  const { syncBuiltinESMExports } = require("node:module");
+  const hiddenOptions = (options) => ({ ...(options ?? {}), windowsHide: true });
+  const wrapSpawn = (original) => function(command, args, options) {
+    if (Array.isArray(args)) {
+      return original.call(this, command, args, hiddenOptions(options));
+    }
+    return original.call(this, command, hiddenOptions(args));
+  };
+  const wrapExecFileSync = (original) => function(file, args, options) {
+    if (Array.isArray(args)) {
+      return original.call(this, file, args, hiddenOptions(options));
+    }
+    return original.call(this, file, hiddenOptions(args));
+  };
+
+  childProcess.spawn = wrapSpawn(childProcess.spawn);
+  childProcess.spawnSync = wrapSpawn(childProcess.spawnSync);
+  childProcess.fork = wrapSpawn(childProcess.fork);
+  childProcess.execFileSync = wrapExecFileSync(childProcess.execFileSync);
+
+  const originalExec = childProcess.exec;
+  childProcess.exec = function(command, options, callback) {
+    if (typeof options === "function") {
+      return originalExec.call(this, command, hiddenOptions(), options);
+    }
+    return originalExec.call(this, command, hiddenOptions(options), callback);
+  };
+
+  const originalExecFile = childProcess.execFile;
+  childProcess.execFile = function(file, args, options, callback) {
+    if (Array.isArray(args)) {
+      if (typeof options === "function") {
+        return originalExecFile.call(this, file, args, hiddenOptions(), options);
+      }
+      return originalExecFile.call(this, file, args, hiddenOptions(options), callback);
+    }
+    if (typeof args === "function") {
+      return originalExecFile.call(this, file, [], hiddenOptions(), args);
+    }
+    return originalExecFile.call(this, file, [], hiddenOptions(args), options);
+  };
+
+  const preloadPath = __filename.replaceAll("\\", "/");
+  const inheritedOptions = process.env.NODE_OPTIONS ?? "";
+  if (!inheritedOptions.includes(preloadPath)) {
+    const preloadOption = `--require="${preloadPath}"`;
+    process.env.NODE_OPTIONS = [inheritedOptions, preloadOption].filter(Boolean).join(" ");
+  }
+  syncBuiltinESMExports();
+}
+"#;
 const AMP_CLI_PACKAGE: &str = "@ampcode/cli";
 const AUTOHAND_CLI_PACKAGE: &str = "autohand-cli";
 const CODEWHALE_CLI_PACKAGE: &str = "codewhale";
@@ -209,6 +264,7 @@ impl AgentInstallService {
         if let Some(record) = self.read_record(&agent_id)?
             && record_has_usable_installation(&record)
             && managed_companion_installation_is_usable(&agent_id, &record)
+            && windows_npm_installation_is_current(&record)
         {
             self.config_service.reconcile_agent_acp_runtime(
                 agent_id,
@@ -452,6 +508,7 @@ impl AgentInstallService {
                         && installed_distribution_kind(Path::new(root)) == Some(distribution_kind)
                 })
                 && record.command.as_ref().is_some_and(command_is_available)
+                && windows_npm_installation_is_current(record)
                 && latest_npm_companion(&agent_id).is_none()
                 && node_runtime.as_ref().is_none_or(|runtime| {
                     record.command.as_ref().is_some_and(|command| {
@@ -1094,10 +1151,19 @@ impl AgentInstallService {
             None
         };
         let adapter_script_rel = npm_package_bin_relative_path(&package)?;
-        let companion_launcher = runtime_package
-            .as_ref()
-            .map(|_| npm_companion_launcher_source(agent_id, &adapter_script_rel))
-            .transpose()?;
+        let companion_launcher = if runtime_package.is_some() {
+            Some(npm_companion_launcher_source(
+                agent_id,
+                &adapter_script_rel,
+            )?)
+        } else if cfg!(windows) {
+            Some(npm_windows_adapter_launcher_source(
+                agent_id,
+                &adapter_script_rel,
+            )?)
+        } else {
+            None
+        };
         let args_identity = serde_json::to_string(&npx.args).map_err(|error| {
             VibexError::validation(
                 "agent_npm_args_invalid",
@@ -1129,6 +1195,9 @@ impl AgentInstallService {
         if let Some(companion_launcher) = companion_launcher.as_deref() {
             fingerprint_parts.push(companion_launcher);
         }
+        if cfg!(windows) {
+            fingerprint_parts.push(NPM_WINDOWS_CHILD_PROCESS_HOOK_SOURCE);
+        }
         let fingerprint = distribution_fingerprint(&fingerprint_parts);
         let target_root = self.version_root(agent_id, &entry.version, &fingerprint)?;
         if let Some(installed) = load_or_remove_cached_installation(&target_root, &fingerprint)? {
@@ -1145,25 +1214,31 @@ impl AgentInstallService {
             .await?;
         let adapter_script = staging.join(&adapter_script_rel);
         ensure_regular_file(&staging, &adapter_script, "agent_npm_bin_missing")?;
-        let script = if let (Some(runtime_package), Some(companion_launcher)) =
-            (runtime_package.as_ref(), companion_launcher.as_deref())
-        {
-            let runtime_script = staging.join(npm_package_bin_relative_path(runtime_package)?);
-            ensure_regular_file(&staging, &runtime_script, "agent_npm_runtime_bin_missing")?;
-            let runtime_command = npm_command_path(
-                &staging,
-                npm_companion_command(agent_id).ok_or_else(|| {
-                    VibexError::validation(
-                        "agent_npm_runtime_command_missing",
-                        "managed npm companion command was not configured",
-                    )
-                })?,
-            );
-            ensure_regular_file(
-                &staging,
-                &runtime_command,
-                "agent_npm_runtime_command_missing",
-            )?;
+        let script = if let Some(companion_launcher) = companion_launcher.as_deref() {
+            if let Some(runtime_package) = runtime_package.as_ref() {
+                let runtime_script = staging.join(npm_package_bin_relative_path(runtime_package)?);
+                ensure_regular_file(&staging, &runtime_script, "agent_npm_runtime_bin_missing")?;
+                let runtime_command = npm_command_path(
+                    &staging,
+                    npm_companion_command(agent_id).ok_or_else(|| {
+                        VibexError::validation(
+                            "agent_npm_runtime_command_missing",
+                            "managed npm companion command was not configured",
+                        )
+                    })?,
+                );
+                ensure_regular_file(
+                    &staging,
+                    &runtime_command,
+                    "agent_npm_runtime_command_missing",
+                )?;
+            }
+            if cfg!(windows) {
+                write_private_file(
+                    &staging.join(NPM_WINDOWS_CHILD_PROCESS_HOOK_NAME),
+                    NPM_WINDOWS_CHILD_PROCESS_HOOK_SOURCE.as_bytes(),
+                )?;
+            }
             let launcher = staging.join(NPM_COMPANION_LAUNCHER_NAME);
             write_private_file(&launcher, companion_launcher.as_bytes())?;
             launcher
@@ -3646,6 +3721,47 @@ fn kiro_archive_url(download: &str, version: &str) -> VibexResult<String> {
         })
 }
 
+fn npm_windows_adapter_launcher_source(
+    agent_id: &AgentId,
+    adapter_script: &Path,
+) -> VibexResult<String> {
+    let adapter_script = adapter_script.to_str().ok_or_else(|| {
+        VibexError::validation(
+            "agent_npm_launcher_path_invalid",
+            "ACP adapter path was not valid UTF-8",
+        )
+    })?;
+    let adapter_script = serde_json::to_string(adapter_script).map_err(|error| {
+        VibexError::validation(
+            "agent_npm_launcher_path_invalid",
+            "ACP adapter path could not be encoded",
+        )
+        .with_diagnostic("error", error.to_string())
+    })?;
+    let windows_hook = serde_json::to_string(NPM_WINDOWS_CHILD_PROCESS_HOOK_NAME)
+        .expect("static Windows child process hook name is valid JSON");
+    let label = serde_json::to_string(agent_id.as_str()).map_err(|error| {
+        VibexError::validation(
+            "agent_npm_launcher_agent_invalid",
+            "managed npm Agent id could not be encoded",
+        )
+        .with_diagnostic("error", error.to_string())
+    })?;
+    Ok(format!(
+        r#""use strict";
+const path = require("node:path");
+const {{ pathToFileURL }} = require("node:url");
+
+require(path.join(__dirname, {windows_hook}));
+const adapter = path.join(__dirname, {adapter_script});
+import(pathToFileURL(adapter).href).catch((error) => {{
+  console.error("Failed to start {label} ACP adapter:", error);
+  process.exitCode = 1;
+}});
+"#
+    ))
+}
+
 fn npm_companion_launcher_source(agent_id: &AgentId, adapter_script: &Path) -> VibexResult<String> {
     let command = npm_companion_command(agent_id).ok_or_else(|| {
         VibexError::validation(
@@ -3700,11 +3816,14 @@ fn npm_companion_launcher_source(agent_id: &AgentId, adapter_script: &Path) -> V
         )
         .with_diagnostic("error", error.to_string())
     })?;
+    let windows_hook = serde_json::to_string(NPM_WINDOWS_CHILD_PROCESS_HOOK_NAME)
+        .expect("static Windows child process hook name is valid JSON");
     Ok(format!(
         r#""use strict";
 const path = require("node:path");
 const {{ pathToFileURL }} = require("node:url");
 
+if (process.platform === "win32") require(path.join(__dirname, {windows_hook}));
 const companionCommand = process.platform === "win32" ? {windows_command} : {command};
 process.env[{environment}] = path.join(__dirname, "node_modules", ".bin", companionCommand);
 const adapter = path.join(__dirname, {adapter_script});
@@ -3773,9 +3892,12 @@ fn npm_companion_binary_launcher_source(
         )
         .with_diagnostic("error", error.to_string())
     })?;
+    let windows_hook = serde_json::to_string(NPM_WINDOWS_CHILD_PROCESS_HOOK_NAME)
+        .expect("static Windows child process hook name is valid JSON");
     Ok(format!(
         r#""use strict";
 const path = require("node:path");
+if (process.platform === "win32") require(path.join(__dirname, {windows_hook}));
 const {{ spawn }} = require("node:child_process");
 
 const companionCommand = process.platform === "win32" ? {windows_command} : {command};
@@ -4115,6 +4237,30 @@ fn managed_companion_installation_is_usable(
         .is_ok()
     });
     runtime_version_is_valid && runtime_command_is_valid
+}
+
+fn windows_npm_installation_is_current(record: &AgentManagedInstallationRecord) -> bool {
+    if !cfg!(windows) || record.state.distribution_kind != Some(AgentManagedDistributionKind::Npm) {
+        return true;
+    }
+    let (Some(root), Some(command)) = (
+        record.install_root.as_deref().map(Path::new),
+        record.command.as_ref(),
+    ) else {
+        return false;
+    };
+    let launcher = root.join(NPM_COMPANION_LAUNCHER_NAME);
+    let launcher_is_active = command
+        .args
+        .first()
+        .is_some_and(|script| Path::new(script) == launcher.as_path());
+    let launcher_is_current = fs::read_to_string(&launcher)
+        .ok()
+        .is_some_and(|source| source.contains(NPM_WINDOWS_CHILD_PROCESS_HOOK_NAME));
+    let hook_is_current = fs::read(root.join(NPM_WINDOWS_CHILD_PROCESS_HOOK_NAME))
+        .ok()
+        .is_some_and(|source| source == NPM_WINDOWS_CHILD_PROCESS_HOOK_SOURCE.as_bytes());
+    launcher_is_active && launcher_is_current && hook_is_current
 }
 
 fn installation_files_are_usable(record: &AgentManagedInstallationRecord) -> bool {
@@ -5312,6 +5458,27 @@ mod tests {
     }
 
     #[test]
+    fn windows_node_launchers_hide_descendant_processes() {
+        let launcher = npm_windows_adapter_launcher_source(
+            &AgentId::parse("codex").unwrap(),
+            Path::new("node_modules/@agentclientprotocol/codex-acp/dist/index.js"),
+        )
+        .unwrap();
+
+        assert!(launcher.contains(NPM_WINDOWS_CHILD_PROCESS_HOOK_NAME));
+        assert!(launcher.contains("@agentclientprotocol/codex-acp/dist/index.js"));
+        for required in [
+            "windowsHide: true",
+            "childProcess.spawn =",
+            "childProcess.execFile =",
+            "process.env.NODE_OPTIONS",
+            "syncBuiltinESMExports()",
+        ] {
+            assert!(NPM_WINDOWS_CHILD_PROCESS_HOOK_SOURCE.contains(required));
+        }
+    }
+
+    #[test]
     fn amp_binary_launcher_uses_the_private_cli_and_forwards_acp_arguments() {
         let launcher = npm_companion_binary_launcher_source(
             &AgentId::parse("amp-acp").unwrap(),
@@ -5323,6 +5490,9 @@ mod tests {
         assert!(launcher.contains("node_modules\", \".bin"));
         assert!(launcher.contains("const adapter = path.join(__dirname, \"amp-acp\")"));
         assert!(launcher.contains("spawn(adapter, process.argv.slice(2)"));
+        let hook_index = launcher.find(NPM_WINDOWS_CHILD_PROCESS_HOOK_NAME).unwrap();
+        let spawn_import_index = launcher.find("const { spawn }").unwrap();
+        assert!(hook_index < spawn_import_index);
     }
 
     #[test]
@@ -5916,6 +6086,54 @@ printf '%s\n' '{"version":"1.2.3","scripts":["test-package"]}'
         assert!(load_installed_agent(&root, "fixture").is_ok());
         fs::remove_file(companion).unwrap();
         assert!(load_installed_agent(&root, "fixture").is_err());
+    }
+
+    #[test]
+    fn windows_npm_installations_require_the_hidden_process_launcher() {
+        if !cfg!(windows) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let node = root.join("node.exe");
+        let adapter = root.join("adapter.cjs");
+        fs::write(&node, b"fixture").unwrap();
+        fs::write(&adapter, b"fixture").unwrap();
+        let mut record = AgentManagedInstallationRecord {
+            agent_id: AgentId::parse("codex").unwrap(),
+            registry_agent_id: "codex".to_string(),
+            state: AgentManagedInstallState {
+                managed: true,
+                status: AgentManagedInstallStatus::Installed,
+                distribution_kind: Some(AgentManagedDistributionKind::Npm),
+                installed_version: Some("1.0.0".to_string()),
+                available_version: Some("1.0.0".to_string()),
+                last_error_code: None,
+                last_error_message: None,
+                updated_at_ms: Some(1),
+            },
+            command: Some(AgentCommandConfig {
+                command: node.to_string_lossy().into_owned(),
+                args: vec![adapter.to_string_lossy().into_owned()],
+            }),
+            install_root: Some(root.to_string_lossy().into_owned()),
+            updated_at_ms: 1,
+        };
+        assert!(!windows_npm_installation_is_current(&record));
+
+        let launcher = root.join(NPM_COMPANION_LAUNCHER_NAME);
+        fs::write(
+            &launcher,
+            format!("require({NPM_WINDOWS_CHILD_PROCESS_HOOK_NAME:?});\n"),
+        )
+        .unwrap();
+        fs::write(
+            root.join(NPM_WINDOWS_CHILD_PROCESS_HOOK_NAME),
+            NPM_WINDOWS_CHILD_PROCESS_HOOK_SOURCE,
+        )
+        .unwrap();
+        record.command.as_mut().unwrap().args[0] = launcher.to_string_lossy().into_owned();
+        assert!(windows_npm_installation_is_current(&record));
     }
 
     #[test]

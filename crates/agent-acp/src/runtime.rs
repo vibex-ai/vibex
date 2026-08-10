@@ -9067,7 +9067,10 @@ impl AcpRuntimeClient {
             }
         }
 
-        let mut child = command.group().kill_on_drop(true).spawn().map_err(|err| {
+        let mut process_group = command.group();
+        #[cfg(windows)]
+        process_group.creation_flags(crate::process_environment::WINDOWS_CREATE_NO_WINDOW);
+        let mut child = process_group.kill_on_drop(true).spawn().map_err(|err| {
             VibexError::process("acp_spawn_failed", "ACP agent process could not be started")
                 .with_diagnostic("command", config.command.clone())
                 .with_diagnostic("args", redacted_args_summary(&process_args))

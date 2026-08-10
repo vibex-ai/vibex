@@ -1067,6 +1067,8 @@ impl ProcessRunner for TokioProcessRunner {
             ));
         }
         let mut command = Command::new(program);
+        #[cfg(windows)]
+        command.creation_flags(0x0800_0000);
         command
             .args(args)
             .stdin(Stdio::null())

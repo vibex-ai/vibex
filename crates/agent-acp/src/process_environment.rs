@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub(crate) const WINDOWS_CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[cfg(target_os = "linux")]
 const APPIMAGE_PATH_LIST_KEYS: &[&str] = &[
@@ -35,7 +35,7 @@ pub fn sanitize_inherited_appimage_environment(command: &mut Command) {
     {
         use std::os::windows::process::CommandExt as _;
 
-        command.creation_flags(CREATE_NO_WINDOW);
+        command.creation_flags(WINDOWS_CREATE_NO_WINDOW);
     }
 
     #[cfg(target_os = "linux")]
