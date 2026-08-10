@@ -2418,8 +2418,14 @@ impl SessionRepository {
                 SELECT session_id, title, project_id, workspace_id, workspace_root,
                     workspace_mode, state,
                     permission_mode, ask_on_risk, bypass_all_permissions,
-                    created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms,
-                    current_agent_id
+                    created_at_ms, updated_at_ms,
+                    COALESCE(
+                        (SELECT MAX(timestamp_ms)
+                         FROM agent_timeline_items
+                         WHERE agent_timeline_items.session_id = agent_sessions.session_id),
+                        created_at_ms
+                    ) AS last_message_at_ms,
+                    archived_at_ms, deleted_at_ms, current_agent_id
                 FROM agent_sessions
                 WHERE session_id = ?1 AND deleted_at_ms IS NULL
                 ",
@@ -2439,22 +2445,34 @@ impl SessionRepository {
             SELECT session_id, title, project_id, workspace_id, workspace_root,
                 workspace_mode, state,
                 permission_mode, ask_on_risk, bypass_all_permissions,
-                created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms,
-                current_agent_id
+                created_at_ms, updated_at_ms,
+                COALESCE(
+                    (SELECT MAX(timestamp_ms)
+                     FROM agent_timeline_items
+                     WHERE agent_timeline_items.session_id = agent_sessions.session_id),
+                    created_at_ms
+                ) AS last_message_at_ms,
+                archived_at_ms, deleted_at_ms, current_agent_id
             FROM agent_sessions
             WHERE deleted_at_ms IS NULL
-            ORDER BY updated_at_ms DESC
+            ORDER BY last_message_at_ms DESC, session_id DESC
             "
         } else {
             "
             SELECT session_id, title, project_id, workspace_id, workspace_root,
                 workspace_mode, state,
                 permission_mode, ask_on_risk, bypass_all_permissions,
-                created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms,
-                current_agent_id
+                created_at_ms, updated_at_ms,
+                COALESCE(
+                    (SELECT MAX(timestamp_ms)
+                     FROM agent_timeline_items
+                     WHERE agent_timeline_items.session_id = agent_sessions.session_id),
+                    created_at_ms
+                ) AS last_message_at_ms,
+                archived_at_ms, deleted_at_ms, current_agent_id
             FROM agent_sessions
             WHERE deleted_at_ms IS NULL AND archived_at_ms IS NULL
-            ORDER BY updated_at_ms DESC
+            ORDER BY last_message_at_ms DESC, session_id DESC
             "
         };
         let mut stmt = conn.prepare(sql).map_err(storage_err(
@@ -11455,9 +11473,10 @@ fn map_agent_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSession> 
         },
         created_at_ms: row.get(10)?,
         updated_at_ms: row.get(11)?,
-        archived_at_ms: row.get(12)?,
-        deleted_at_ms: row.get(13)?,
-        agent_id: parse_id_sql(row.get(14)?, AgentId::parse)?,
+        last_message_at_ms: row.get(12)?,
+        archived_at_ms: row.get(13)?,
+        deleted_at_ms: row.get(14)?,
+        agent_id: parse_id_sql(row.get(15)?, AgentId::parse)?,
     })
 }
 
@@ -12075,6 +12094,7 @@ mod tests {
             safety: AgentSessionSafety::workspace_write_ask_on_risk(),
             created_at_ms: now,
             updated_at_ms: now,
+            last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
         };
@@ -12377,6 +12397,7 @@ mod tests {
             safety: AgentSessionSafety::workspace_write_ask_on_risk(),
             created_at_ms: now,
             updated_at_ms: now,
+            last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
         };
@@ -13124,6 +13145,7 @@ mod tests {
             safety: AgentSessionSafety::workspace_write_ask_on_risk(),
             created_at_ms: now,
             updated_at_ms: now,
+            last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
         };
@@ -15357,6 +15379,7 @@ mod tests {
             safety: AgentSessionSafety::workspace_write_ask_on_risk(),
             created_at_ms: now,
             updated_at_ms: now,
+            last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
         };
@@ -15614,6 +15637,7 @@ mod tests {
             safety: AgentSessionSafety::workspace_write_ask_on_risk(),
             created_at_ms: 200,
             updated_at_ms: 200,
+            last_message_at_ms: 200,
             archived_at_ms: None,
             deleted_at_ms: None,
         };
@@ -15666,6 +15690,59 @@ mod tests {
     }
 
     #[test]
+    fn session_last_message_time_ignores_state_updates() {
+        let temp = temp_db_path("session-last-message-time");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let (_project, workspace) = WorkspaceRepository::ensure(
+            &conn,
+            "/tmp/vibex-db-session-last-message-time-test",
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "Last message time".to_string(),
+            project_id: workspace.project_id.clone(),
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path,
+            workspace_mode: workspace.mode,
+            agent_id: AgentId::parse("codex").unwrap(),
+            state: AgentSessionState::Initializing,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: 100,
+            updated_at_ms: 100,
+            last_message_at_ms: 100,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        TimelineRepository::insert_session_and_append_many(
+            &mut conn,
+            &session,
+            &[TimelineAppend {
+                source: TimelineSource::User,
+                payload: TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "hello".to_string(),
+                    attachments: Vec::new(),
+                }),
+                timestamp_ms: Some(200),
+                correlation_id: None,
+                provider_correlation_id: None,
+                redaction_state: TimelineRedactionState::None,
+                execution_attribution: None,
+            }],
+        )
+        .unwrap();
+        SessionRepository::update_state(&conn, &session.id, AgentSessionState::Idle).unwrap();
+
+        let loaded = SessionRepository::get(&conn, &session.id).unwrap().unwrap();
+        assert_eq!(loaded.last_message_at_ms, 200);
+        assert!(loaded.updated_at_ms > loaded.last_message_at_ms);
+
+        cleanup_db(temp);
+    }
+
+    #[test]
     fn timeline_forward_pagination_preserves_complete_long_turn() {
         let temp = temp_db_path("timeline-long-turn");
         let mut conn = open_database(&temp).unwrap();
@@ -15690,6 +15767,7 @@ mod tests {
             safety: AgentSessionSafety::workspace_write_ask_on_risk(),
             created_at_ms: now,
             updated_at_ms: now,
+            last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
         };

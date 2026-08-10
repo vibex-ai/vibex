@@ -1658,6 +1658,10 @@ and `AdapterDiagnosticsRepository`.
 - `AgentSession.id` is the only primary session id crossing UI/API boundaries.
   `AgentSession.agentId` is required. Profile/Model, binding/generation,
   Adapter, process, and ACP-native ids remain outside the session DTO.
+- `AgentSession.updatedAtMs` tracks session state and metadata mutations.
+  Sidebar display and ordering use `lastMessageAtMs`, derived from the latest
+  persisted timeline item and falling back to `createdAtMs` for an empty
+  session. Opening or switching sessions must not change that message time.
 - Online registration and dispatch use only exact ACP route keys. A non-ACP
   route/provider is rejected, and a missing exact route has no Native or
   ProviderKind fallback.

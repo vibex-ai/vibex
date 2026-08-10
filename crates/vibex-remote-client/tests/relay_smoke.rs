@@ -70,6 +70,7 @@ async fn relay_e2ee_remote_v2_handshake_rpc_event_revoke_and_reconnect_smoke() {
         safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
         created_at_ms: now,
         updated_at_ms: now,
+        last_message_at_ms: now,
         archived_at_ms: None,
         deleted_at_ms: None,
     };

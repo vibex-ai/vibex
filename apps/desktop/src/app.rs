@@ -3292,7 +3292,7 @@ struct SessionSearchResult {
     agent_id: AgentId,
     session_title: String,
     project_name: String,
-    updated_at_ms: i64,
+    last_message_at_ms: i64,
     excerpt: Option<String>,
     target: Option<SessionSearchTarget>,
 }
@@ -12488,6 +12488,7 @@ impl VibexWorkbench {
             safety: AgentSessionSafety::workspace_write_ask_on_risk(),
             created_at_ms: optimistic_submitted_at_ms,
             updated_at_ms: optimistic_submitted_at_ms,
+            last_message_at_ms: optimistic_submitted_at_ms,
             archived_at_ms: None,
             deleted_at_ms: None,
         };
@@ -13591,7 +13592,7 @@ impl VibexWorkbench {
     fn session_search_results(&self, cx: &App) -> Vec<SessionSearchResult> {
         let query = normalized_session_search_query(self.session_search.read(cx).value().as_ref());
         let mut sessions = self.sessions.iter().collect::<Vec<_>>();
-        sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_ms));
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.last_message_at_ms));
         let mut results = Vec::new();
         for session in sessions {
             let selected = self.selected_session_id.as_ref() == Some(&session.id);
@@ -13621,7 +13622,7 @@ impl VibexWorkbench {
                     agent_id,
                     session_title: session.title.clone(),
                     project_name,
-                    updated_at_ms: session.updated_at_ms,
+                    last_message_at_ms: session.last_message_at_ms,
                     excerpt: None,
                     target: None,
                 });
@@ -13633,7 +13634,7 @@ impl VibexWorkbench {
                     agent_id: agent_id.clone(),
                     session_title: session.title.clone(),
                     project_name: project_name.clone(),
-                    updated_at_ms: session.updated_at_ms,
+                    last_message_at_ms: session.last_message_at_ms,
                     excerpt: None,
                     target: None,
                 });
@@ -13653,10 +13654,10 @@ impl VibexWorkbench {
                     agent_id: agent_id.clone(),
                     session_title: session.title.clone(),
                     project_name: project_name.clone(),
-                    updated_at_ms: if document.timestamp_ms > 0 {
+                    last_message_at_ms: if document.timestamp_ms > 0 {
                         document.timestamp_ms
                     } else {
-                        session.updated_at_ms
+                        session.last_message_at_ms
                     },
                     excerpt: Some(excerpt),
                     target: Some(SessionSearchTarget {
@@ -16805,8 +16806,11 @@ impl VibexWorkbench {
         let state_label = (display_state != AgentSessionState::Error)
             .then(|| sidebar_session_state_label(display_state, strings))
             .flatten();
-        let time_label =
-            format_sidebar_session_time(session.updated_at_ms, self.resolved_locale(), strings);
+        let time_label = format_sidebar_session_time(
+            session.last_message_at_ms,
+            self.resolved_locale(),
+            strings,
+        );
         let active_session_drag = self.sidebar_session_drag_state.clone().filter(|state| {
             cx.has_active_drag() && state.workspace_id == session.workspace_id.as_str()
         });
@@ -26487,8 +26491,11 @@ impl VibexWorkbench {
                                 &rendered_query,
                                 highlight,
                             );
-                            let timestamp =
-                                format_sidebar_session_time(result.updated_at_ms, locale, strings);
+                            let timestamp = format_sidebar_session_time(
+                                result.last_message_at_ms,
+                                locale,
+                                strings,
+                            );
                             let aria_label = format!("{title}, {detail}");
                             let agent_color = if selected {
                                 cx.theme().accent_foreground.opacity(0.88)

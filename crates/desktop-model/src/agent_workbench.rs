@@ -67,7 +67,7 @@ pub fn project_sidebar_rows(
                     .get(session.id.as_str())
                     .copied()
                     .unwrap_or(usize::MAX),
-                std::cmp::Reverse(session.updated_at_ms),
+                std::cmp::Reverse(session.last_message_at_ms),
                 session.id.as_str(),
             )
         });
@@ -1412,6 +1412,7 @@ mod tests {
             safety: AgentSessionSafety::workspace_write_ask_on_risk(),
             created_at_ms: 0,
             updated_at_ms,
+            last_message_at_ms: updated_at_ms,
             archived_at_ms: None,
             deleted_at_ms: None,
         }

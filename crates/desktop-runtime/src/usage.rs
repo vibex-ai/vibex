@@ -859,6 +859,7 @@ mod tests {
             safety: AgentSessionSafety::workspace_write_ask_on_risk(),
             created_at_ms: 1,
             updated_at_ms: 1,
+            last_message_at_ms: 1,
             archived_at_ms: None,
             deleted_at_ms: None,
         };
@@ -908,6 +909,7 @@ mod tests {
             safety: AgentSessionSafety::workspace_write_ask_on_risk(),
             created_at_ms: 1,
             updated_at_ms: 1,
+            last_message_at_ms: 1,
             archived_at_ms: None,
             deleted_at_ms: None,
         };

@@ -79,6 +79,10 @@ pub struct AgentSession {
     pub safety: AgentSessionSafety,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// Timestamp of the latest persisted timeline item. This is independent
+    /// from `updated_at_ms`, which also changes for session state and metadata.
+    #[serde(default)]
+    pub last_message_at_ms: i64,
     pub archived_at_ms: Option<i64>,
     pub deleted_at_ms: Option<i64>,
 }

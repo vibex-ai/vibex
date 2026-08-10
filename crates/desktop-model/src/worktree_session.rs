@@ -910,7 +910,7 @@ fn sort_sessions(
                 .get(session.id.as_str())
                 .copied()
                 .unwrap_or(usize::MAX),
-            std::cmp::Reverse(session.updated_at_ms),
+            std::cmp::Reverse(session.last_message_at_ms),
             session.id.as_str().to_string(),
         )
     });
@@ -1016,6 +1016,7 @@ mod tests {
             safety: AgentSessionSafety::workspace_write_ask_on_risk(),
             created_at_ms: 1,
             updated_at_ms: 1,
+            last_message_at_ms: 1,
             archived_at_ms: None,
             deleted_at_ms: None,
         }
@@ -1164,7 +1165,7 @@ mod tests {
         let first = session(&checkout, "First", AgentSessionState::Idle);
         let second = session(&checkout, "Second", AgentSessionState::Idle);
         let mut newest = session(&checkout, "Newest", AgentSessionState::Initializing);
-        newest.updated_at_ms = 2;
+        newest.last_message_at_ms = 2;
         let session_order = vec![
             second.id.as_str().to_string(),
             first.id.as_str().to_string(),
