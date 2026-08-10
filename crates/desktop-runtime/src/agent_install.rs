@@ -22,6 +22,7 @@ use tokio::process::Command;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::time::timeout;
 use url::Url;
+use vibex_agent_acp::sanitize_inherited_appimage_environment;
 use vibex_config_switch::ProviderConfigService;
 use vibex_core::{
     AgentCommandConfig, AgentId, AgentListRequest, AgentManagedDistributionKind,
@@ -3070,6 +3071,7 @@ async fn run_process_probe(
     failure_code: &str,
     message: &str,
 ) -> VibexResult<Output> {
+    sanitize_inherited_appimage_environment(command.as_std_mut());
     let output = timeout(probe_timeout, command.output())
         .await
         .map_err(|_| VibexError::process(timeout_code, message))?
@@ -3088,6 +3090,7 @@ async fn run_install_command(
     failure_code: &str,
     message: &str,
 ) -> VibexResult<()> {
+    sanitize_inherited_appimage_environment(command.as_std_mut());
     let status = timeout(INSTALL_TIMEOUT, command.status())
         .await
         .map_err(|_| VibexError::process(timeout_code, message))?

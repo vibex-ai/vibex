@@ -2,6 +2,9 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 #[cfg(target_os = "linux")]
 const APPIMAGE_PATH_LIST_KEYS: &[&str] = &[
     "PATH",
@@ -25,8 +28,16 @@ const APPIMAGE_LAUNCHER_KEYS: &[&str] = &[
     "PYTHONDONTWRITEBYTECODE",
 ];
 
-/// Prevent Linux AppImage runtime paths from leaking into host ACP processes.
+/// Configure ACP child processes without leaking AppImage paths or opening
+/// standalone Windows console windows.
 pub fn sanitize_inherited_appimage_environment(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
     #[cfg(target_os = "linux")]
     {
         let Some(app_dir) = std::env::var_os("APPDIR").map(PathBuf::from) else {
