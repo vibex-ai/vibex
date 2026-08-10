@@ -2711,8 +2711,7 @@ impl AcpSessionAttachment {
                 if !text.is_empty() {
                     let process = self.process();
                     let is_codex = process.event_enricher == AgentEventEnricherKind::Codex;
-                    let phase = agent_message_phase(update)
-                        .or_else(|| (!is_codex).then_some(AgentMessagePhase::FinalAnswer));
+                    let phase = agent_message_phase(update);
                     let is_unattributed = update.get("messageId").and_then(Value::as_str).is_none();
                     // codex-acp forwards most Codex errors as unattributed text and
                     // still returns end_turn, so recover the retry boundary here.
@@ -23745,7 +23744,7 @@ for line in sys.stdin:
                 AcpEvent::AssistantDelta {
                     text_delta, phase, ..
                 } => {
-                    assert_eq!(phase, Some(AgentMessagePhase::FinalAnswer));
+                    assert_eq!(phase, None);
                     streamed_text.push_str(&text_delta);
                 }
                 AcpEvent::AssistantMessage { text, is_final } => {
@@ -23791,6 +23790,14 @@ for line in sys.stdin:
             }
         }));
         let segment_events = payload.finish_turn(true).unwrap();
+        assert!(segment_events.iter().any(|event| matches!(
+            event,
+            AcpEvent::AssistantDelta { text_delta, phase: None, .. } if text_delta == "intro"
+        )));
+        assert!(segment_events.iter().any(|event| matches!(
+            event,
+            AcpEvent::AssistantDelta { text_delta, phase: None, .. } if text_delta == "conclusion"
+        )));
         assert!(segment_events.iter().any(|event| {
             matches!(
                 event,
