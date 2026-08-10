@@ -6082,6 +6082,11 @@ impl ManagementCenter {
                                             .truncate()
                                             .text_sm()
                                             .font_medium()
+                                            .text_color(if added {
+                                                cx.theme().foreground
+                                            } else {
+                                                cx.theme().foreground.opacity(0.72)
+                                            })
                                             .child(agent.label.clone()),
                                     )
                                     .when(update_available, |title| title.child(update_indicator))
@@ -15510,6 +15515,7 @@ mod tests {
         assert!(!render_agents.contains("management-agent-catalog-"));
         assert!(render_agents.contains("cx.theme().primary.opacity(0.08)"));
         assert!(render_agents.contains("cx.theme().accent"));
+        assert!(render_agents.contains("cx.theme().foreground.opacity(0.72)"));
         assert!(!render_agents.contains("cx.theme().primary.opacity(0.11)"));
         assert!(!render_agents.contains(".shadow_sm()"));
         assert!(!render_agents.contains(".w(px(3.0))"));
