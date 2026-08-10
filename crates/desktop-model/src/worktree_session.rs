@@ -905,6 +905,7 @@ fn sort_sessions(
     sessions.sort_by_key(|session| {
         (
             !pinned.contains(session.id.as_str()),
+            positions.contains_key(session.id.as_str()),
             positions
                 .get(session.id.as_str())
                 .copied()
@@ -1153,6 +1154,48 @@ mod tests {
         assert_eq!(projects[0].workspaces.len(), 2);
         assert_eq!(projects[0].compact_sessions.len(), 2);
         assert_eq!(projects[0].workspaces[1].agent_summary.running, 1);
+    }
+
+    #[test]
+    fn sidebar_projection_places_new_sessions_before_persisted_manual_order() {
+        let project = project();
+        let checkout = workspace(&project, WorkspaceMode::CurrentCheckout, "/repo");
+        let pinned = session(&checkout, "Pinned", AgentSessionState::Idle);
+        let first = session(&checkout, "First", AgentSessionState::Idle);
+        let second = session(&checkout, "Second", AgentSessionState::Idle);
+        let mut newest = session(&checkout, "Newest", AgentSessionState::Initializing);
+        newest.updated_at_ms = 2;
+        let session_order = vec![
+            second.id.as_str().to_string(),
+            first.id.as_str().to_string(),
+            pinned.id.as_str().to_string(),
+        ];
+        let pinned_session_ids = BTreeSet::from([pinned.id.as_str().to_string()]);
+
+        let projects = sidebar_project_projections(
+            &[(project, checkout)],
+            &[pinned, first, second, newest],
+            &BTreeMap::new(),
+            &[],
+            &session_order,
+            &pinned_session_ids,
+            "",
+        );
+
+        fn titles(sessions: &[AgentSession]) -> Vec<&str> {
+            sessions
+                .iter()
+                .map(|session| session.title.as_str())
+                .collect::<Vec<_>>()
+        }
+        assert_eq!(
+            titles(&projects[0].workspaces[0].sessions),
+            ["Pinned", "Newest", "Second", "First"]
+        );
+        assert_eq!(
+            titles(&projects[0].compact_sessions),
+            ["Pinned", "Newest", "Second", "First"]
+        );
     }
 
     #[test]

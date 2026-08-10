@@ -941,6 +941,9 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   drop may reorder only another session in the same project and pin band; the
   deterministic `SidebarState.row_order` mutation owns before/after insertion and
   the UI persists it only after a real move.
+- A session absent from persisted `SidebarState.row_order` is newly discovered.
+  Sort newly discovered sessions by recency ahead of manually ordered sessions in
+  the same pin band, while pinned sessions remain above unpinned sessions.
 - GPUI dispatches a typed `on_drag_move` callback to every rendered target that
   listens for that drag type. A row that does not contain the pointer must not
   clear the shared reorder target established by the row that does contain it.
