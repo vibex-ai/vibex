@@ -110,6 +110,11 @@ provider_model_runtime_option_snapshots(
   `session/set_model` result. A failed model probe records its attempt and error
   without blocking the Provider save or removing an existing successful model
   snapshot.
+- When `session/new.configOptions` advertises the model as a config option, the
+  model probe uses `session/set_config_option` first because Agents such as
+  OpenCode return the selected model's complete mode, effort, and generic option
+  set only from that response. If the operation is rejected, the probe falls
+  back to `session/set_model` and re-registers its bounded config-update waiter.
 - Ordinary catalog reads load the SQLite Agent fallback, persisted model
   snapshots, and current in-memory Profile evidence; they never start an ACP
   process. Provider mutations trigger only the asynchronous missing-model

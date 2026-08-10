@@ -158,7 +158,7 @@ impl RuntimeOptionCatalogService {
                     && agent.installed
                     && snapshots
                         .get(&agent.id)
-                        .is_none_or(|snapshot| snapshot.last_success_at_ms.is_none())
+                        .is_none_or(|snapshot| !agent_snapshot_is_reusable(&agent.id, snapshot))
             })
             .map(|agent| agent.id)
             .collect::<Vec<_>>();
@@ -201,7 +201,9 @@ impl RuntimeOptionCatalogService {
                     && (model_ids.iter().any(|model_id| {
                         snapshots
                             .get(&(profile.id.clone(), model_id.clone()))
-                            .is_none_or(|snapshot| snapshot.last_success_at_ms.is_none())
+                            .is_none_or(|snapshot| {
+                                !model_snapshot_is_reusable(&profile.agent_id, snapshot)
+                            })
                     }) || snapshots.keys().any(|(profile_id, model_id)| {
                         profile_id == &profile.id && !model_ids.contains(model_id)
                     }))
@@ -252,7 +254,7 @@ impl RuntimeOptionCatalogService {
             };
             if snapshots
                 .get(&(profile.id.clone(), model_id.clone()))
-                .is_some_and(|snapshot| snapshot.last_success_at_ms.is_some())
+                .is_some_and(|snapshot| model_snapshot_is_reusable(&profile.agent_id, snapshot))
             {
                 result.cached_models.push(key);
                 continue;
@@ -316,7 +318,7 @@ impl RuntimeOptionCatalogService {
             return Ok(RuntimeOptionProbeResult::default());
         }
         if let Some(snapshot) = self.snapshot_map()?.get(agent_id)
-            && snapshot.last_success_at_ms.is_some()
+            && agent_snapshot_is_reusable(agent_id, snapshot)
         {
             return Ok(RuntimeOptionProbeResult {
                 cached_agent_ids: vec![agent_id.clone()],
@@ -327,7 +329,7 @@ impl RuntimeOptionCatalogService {
         let _probe_guard = self.probe_lock.lock().await;
         // Re-check after waiting for another setup probe to finish.
         if let Some(snapshot) = self.snapshot_map()?.get(agent_id)
-            && snapshot.last_success_at_ms.is_some()
+            && agent_snapshot_is_reusable(agent_id, snapshot)
         {
             return Ok(RuntimeOptionProbeResult {
                 cached_agent_ids: vec![agent_id.clone()],
@@ -719,6 +721,41 @@ fn configured_model_ids(profile: &ProviderProfile) -> Vec<String> {
     models.sort();
     models.dedup();
     models
+}
+
+fn agent_snapshot_is_reusable(
+    agent_id: &AgentId,
+    snapshot: &AgentRuntimeOptionSnapshotRecord,
+) -> bool {
+    snapshot.last_success_at_ms.is_some()
+        && (agent_id.as_str() != "opencode"
+            || snapshot
+                .session_config
+                .as_ref()
+                .is_some_and(session_config_has_mode))
+}
+
+fn model_snapshot_is_reusable(
+    agent_id: &AgentId,
+    snapshot: &ProviderModelRuntimeOptionSnapshotRecord,
+) -> bool {
+    snapshot.last_success_at_ms.is_some()
+        && (agent_id.as_str() != "opencode"
+            || snapshot
+                .session_config
+                .as_ref()
+                .is_some_and(session_config_has_mode))
+}
+
+fn session_config_has_mode(config: &vibex_core::AgentSessionConfigProbe) -> bool {
+    !config.modes.is_empty()
+        || config.options.iter().any(|option| {
+            option.id.eq_ignore_ascii_case("mode")
+                || option
+                    .category
+                    .as_deref()
+                    .is_some_and(|category| category.eq_ignore_ascii_case("mode"))
+        })
 }
 
 #[async_trait]
@@ -1439,5 +1476,58 @@ mod tests {
 
         catalog.delete_agent_snapshot(&agent_id).unwrap();
         assert!(catalog.snapshot_summaries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn opencode_successful_snapshots_without_mode_evidence_are_reprobed() {
+        let opencode = AgentId::parse("opencode").unwrap();
+        let other = AgentId::parse("other-agent").unwrap();
+        let empty_config = AgentSessionConfigProbe {
+            models: Vec::new(),
+            modes: Vec::new(),
+            reasoning_efforts: Vec::new(),
+            options: Vec::new(),
+        };
+        let mode_config = AgentSessionConfigProbe {
+            modes: vec![mode("build", Some("Build"))],
+            ..empty_config.clone()
+        };
+        let agent_snapshot = |config| AgentRuntimeOptionSnapshotRecord {
+            agent_id: opencode.clone(),
+            session_config: Some(config),
+            last_success_at_ms: Some(1),
+            last_attempt_at_ms: 1,
+            last_error_code: None,
+        };
+        let model_snapshot = |config| ProviderModelRuntimeOptionSnapshotRecord {
+            provider_profile_id: ProviderProfileId::parse("provider_opencode").unwrap(),
+            model_id: "provider/model".to_string(),
+            agent_id: opencode.clone(),
+            session_config: Some(config),
+            last_success_at_ms: Some(1),
+            last_attempt_at_ms: 1,
+            last_error_code: None,
+        };
+
+        assert!(!agent_snapshot_is_reusable(
+            &opencode,
+            &agent_snapshot(empty_config.clone())
+        ));
+        assert!(agent_snapshot_is_reusable(
+            &opencode,
+            &agent_snapshot(mode_config.clone())
+        ));
+        assert!(agent_snapshot_is_reusable(
+            &other,
+            &agent_snapshot(empty_config.clone())
+        ));
+        assert!(!model_snapshot_is_reusable(
+            &opencode,
+            &model_snapshot(empty_config)
+        ));
+        assert!(model_snapshot_is_reusable(
+            &opencode,
+            &model_snapshot(mode_config)
+        ));
     }
 }

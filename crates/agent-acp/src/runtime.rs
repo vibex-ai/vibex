@@ -122,8 +122,8 @@ use crate::session_attachment_registry::{
 };
 use crate::session_config::{
     CanonicalSessionConfigKey, SessionConfigFieldKind, SessionConfigFieldRequest,
-    SessionConfigOperationEvidence, SessionConfigPlan, SessionConfigPlanner, validate_effort_value,
-    validate_model_value,
+    SessionConfigOperationEvidence, SessionConfigPlan, SessionConfigPlanner, normalize_identifier,
+    validate_effort_value, validate_model_value,
 };
 use crate::session_restore::{
     RestoreCapabilityEvidence, RestoreCapabilityMap, classify_restore_error,
@@ -12739,14 +12739,63 @@ async fn probe_runtime_session_config_with_config(
                         "ACP session/new did not return a session identity",
                     )
                 })?;
-            let config_update = process.register_probe_config_update(native_session_id);
-            let response = process
-                .request(
-                    AcpOperation::SessionSetModel.method(),
-                    protocol::build_session_set_model_params(native_session_id, model_id),
-                    ACP_PROBE_TIMEOUT,
-                )
-                .await?;
+            let model_config_id = config_options_array(&session).and_then(|options| {
+                options.iter().find_map(|option| {
+                    let id = option
+                        .get("id")
+                        .or_else(|| option.get("configId"))
+                        .and_then(Value::as_str)?;
+                    let category = option
+                        .get("category")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    (normalize_identifier(id) == "model"
+                        || normalize_identifier(category) == "model")
+                        .then(|| id.to_string())
+                })
+            });
+            let initial_config_update = process.register_probe_config_update(native_session_id);
+            let (response, config_update) = if let Some(config_id) = model_config_id {
+                match process
+                    .request(
+                        AcpOperation::SessionSetConfigOption.method(),
+                        protocol::build_session_set_config_option_raw_params(
+                            native_session_id,
+                            &config_id,
+                            json!(model_id),
+                        ),
+                        ACP_PROBE_TIMEOUT,
+                    )
+                    .await
+                {
+                    Ok(response) => (response, initial_config_update),
+                    Err(_) => {
+                        process.cancel_probe_config_update(native_session_id);
+                        let fallback_config_update =
+                            process.register_probe_config_update(native_session_id);
+                        let response = process
+                            .request(
+                                AcpOperation::SessionSetModel.method(),
+                                protocol::build_session_set_model_params(
+                                    native_session_id,
+                                    model_id,
+                                ),
+                                ACP_PROBE_TIMEOUT,
+                            )
+                            .await?;
+                        (response, fallback_config_update)
+                    }
+                }
+            } else {
+                let response = process
+                    .request(
+                        AcpOperation::SessionSetModel.method(),
+                        protocol::build_session_set_model_params(native_session_id, model_id),
+                        ACP_PROBE_TIMEOUT,
+                    )
+                    .await?;
+                (response, initial_config_update)
+            };
             let config_update = if response_has_config_options(&response) {
                 process.cancel_probe_config_update(native_session_id);
                 None
@@ -15136,11 +15185,17 @@ fn runtime_prompt_content(text: &str, attachments: &[ProviderTurnAttachment]) ->
             continue;
         }
         if let Some(path) = attachment.local_path.as_ref() {
-            content.push(json!({
+            let mut block = json!({
                 "type": "resource_link",
-                "uri": format!("file://{}", path.display()),
+                "uri": local_attachment_uri(path),
                 "name": attachment.label
-            }));
+            });
+            if let Some(mime_type) = attachment.mime_type.as_deref()
+                && let Some(object) = block.as_object_mut()
+            {
+                object.insert("mimeType".to_string(), json!(mime_type));
+            }
+            content.push(block);
         } else if let Some(uri) = attachment.uri.as_ref() {
             content.push(json!({
                 "type": "resource_link",
@@ -15154,6 +15209,12 @@ fn runtime_prompt_content(text: &str, attachments: &[ProviderTurnAttachment]) ->
         content.push(json!({ "type": "text", "text": text }));
     }
     content
+}
+
+fn local_attachment_uri(path: &Path) -> String {
+    url::Url::from_file_path(path)
+        .map(|uri| uri.to_string())
+        .unwrap_or_else(|_| format!("file://{}", path.display()))
 }
 
 fn image_content_block(attachment: &ProviderTurnAttachment) -> Option<Value> {
@@ -17710,9 +17771,43 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
             json!({
                 "type": "resource_link",
                 "uri": "file:///tmp/notes.txt",
-                "name": "notes.txt"
+                "name": "notes.txt",
+                "mimeType": "text/plain"
             })
         );
+    }
+
+    #[test]
+    fn oversized_images_keep_their_mime_type_as_resource_links() {
+        let path = std::env::temp_dir().join(format!(
+            "vibex-acp-oversized-image-{}.png",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &path,
+            vec![0_u8; (ACP_IMAGE_ATTACHMENT_BYTE_LIMIT + 1) as usize],
+        )
+        .unwrap();
+        let attachment = ProviderTurnAttachment {
+            label: "capture.png".to_string(),
+            mime_type: Some("image/png".to_string()),
+            uri: Some(format!("file://{}", path.display())),
+            local_path: Some(path.clone()),
+        };
+
+        let content = runtime_prompt_content("inspect", &[attachment]);
+        let expected_uri = local_attachment_uri(&path);
+
+        assert_eq!(
+            content[1],
+            json!({
+                "type": "resource_link",
+                "uri": expected_uri,
+                "name": "capture.png",
+                "mimeType": "image/png"
+            })
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -18234,10 +18329,37 @@ for line in sys.stdin:
                     {"value": model_2, "label": "Model 2"},
                 ],
             })
+        options = [option]
+        if config_id == "model" and model_config_updates:
+            thought_levels = ["none", "on"] if value == model_2 else ["none", "high", "max"]
+            options.extend([
+                {
+                    "id": "effort",
+                    "category": "thought_level",
+                    "label": "Effort",
+                    "type": "select",
+                    "currentValue": thought_levels[-1],
+                    "options": [
+                        {"value": effort, "label": effort.title()}
+                        for effort in thought_levels
+                    ],
+                },
+                {
+                    "id": "mode",
+                    "category": "mode",
+                    "label": "Session Mode",
+                    "type": "select",
+                    "currentValue": "build",
+                    "options": [
+                        {"value": "build", "label": "Build"},
+                        {"value": "review", "label": "Review"},
+                    ],
+                },
+            ])
         send({
             "jsonrpc": "2.0",
             "id": mid,
-            "result": {"configOptions": [option]},
+            "result": {"configOptions": options},
         })
     elif method == "session/list":
         send({
@@ -25802,9 +25924,10 @@ for line in sys.stdin:
         let model_request = fixture
             .request_log()
             .into_iter()
-            .find(|entry| entry["method"] == "session/set_model")
+            .find(|entry| entry["method"] == "session/set_config_option")
             .expect("model-scoped probe must select its target model");
-        assert_eq!(model_request["params"]["modelId"], "mock/model-2");
+        assert_eq!(model_request["params"]["configId"], "model");
+        assert_eq!(model_request["params"]["value"], "mock/model-2");
         fixture.cleanup();
     }
 
