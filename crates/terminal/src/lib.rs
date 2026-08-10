@@ -6,11 +6,11 @@ use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::Duration;
 
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, PtySystem, native_pty_system};
 use serde::Serialize;
 use vibex_core::{
     TerminalCreateRequest, TerminalId, TerminalOutputChunk, TerminalResizeRequest, TerminalSession,
@@ -43,9 +43,9 @@ pub struct TerminalManager {
 
 struct TerminalRuntime {
     session: TerminalSession,
-    master: PtyMaster,
     writer: Arc<Mutex<PtyWriter>>,
     child: PtyChild,
+    master: PtyMaster,
     buffer: Arc<Mutex<TerminalBuffer>>,
     exit_status: Option<TerminalProcessExitStatus>,
     persist_on_shutdown: bool,
@@ -181,7 +181,8 @@ impl TerminalManager {
         let cols = if request.cols == 0 { 80 } else { request.cols };
         let shell = request
             .shell
-            .filter(|value| !value.trim().is_empty())
+            .map(|value| normalize_shell(&value))
+            .filter(|value| !value.is_empty())
             .unwrap_or_else(default_shell);
         let title = request
             .title
@@ -281,7 +282,7 @@ impl TerminalManager {
         let shell = if session.shell.trim().is_empty() {
             default_shell()
         } else {
-            session.shell
+            normalize_shell(&session.shell)
         };
         let title = if session.title.trim().is_empty() {
             shell_title(&shell)
@@ -307,6 +308,7 @@ impl TerminalManager {
     ) -> VibexResult<TerminalSession> {
         let shell = session.shell.clone();
         let mut command = CommandBuilder::new(&shell);
+        configure_interactive_shell(&mut command, &shell);
         command.cwd(cwd.as_os_str());
         sanitize_terminal_environment(&mut command);
         self.spawn_runtime_with_command(cwd, session, command, true)
@@ -363,12 +365,17 @@ impl TerminalManager {
                 .with_diagnostic("error", err.to_string())
         })?;
         let writer = Arc::new(Mutex::new(writer));
-        spawn_reader_thread(terminal_id.clone(), reader, writer.clone(), buffer.clone());
+        spawn_reader_thread(
+            terminal_id.clone(),
+            reader,
+            Arc::downgrade(&writer),
+            buffer.clone(),
+        );
         let runtime = TerminalRuntime {
             session: session.clone(),
-            master: pair.master,
             writer,
             child,
+            master: pair.master,
             buffer,
             exit_status: None,
             persist_on_shutdown,
@@ -499,7 +506,7 @@ impl TerminalManager {
         &self,
         request: &TerminalSwitchShellRequest,
     ) -> VibexResult<TerminalSession> {
-        let shell = request.shell.trim();
+        let shell = normalize_shell(&request.shell);
         if shell.is_empty() {
             return Err(VibexError::validation(
                 "terminal_shell_missing",
@@ -524,16 +531,16 @@ impl TerminalManager {
         };
 
         refresh_exit_status(&mut runtime)?;
-        if runtime.session.status == TerminalStatus::Running
-            && let Err(err) = runtime.child.kill()
-        {
-            self.lock_sessions()?
-                .insert(request.terminal_id.clone(), runtime);
-            return Err(VibexError::process(
-                "terminal_shell_switch_kill_failed",
-                "failed to stop existing terminal process",
-            )
-            .with_diagnostic("error", err.to_string()));
+        if runtime.session.status == TerminalStatus::Running {
+            if let Err(err) = runtime.child.kill() {
+                self.lock_sessions()?
+                    .insert(request.terminal_id.clone(), runtime);
+                return Err(VibexError::process(
+                    "terminal_shell_switch_kill_failed",
+                    "failed to stop existing terminal process",
+                )
+                .with_diagnostic("error", err.to_string()));
+            }
         }
 
         let cwd = PathBuf::from(&runtime.session.cwd)
@@ -551,7 +558,7 @@ impl TerminalManager {
         }
 
         let mut session = runtime.session;
-        session.shell = shell.to_string();
+        session.shell = shell;
         session.status = TerminalStatus::Running;
         session.updated_at_ms = unix_timestamp_ms();
         session.closed_at_ms = None;
@@ -559,20 +566,22 @@ impl TerminalManager {
     }
 
     pub fn kill(&self, terminal_id: &TerminalId) -> VibexResult<TerminalSession> {
-        let mut sessions = self.lock_sessions()?;
-        let mut runtime = sessions.remove(terminal_id).ok_or_else(|| {
+        // Remove the runtime before touching the child. Windows ConPTY cleanup
+        // can block while the reader thread is unwinding, and the registry
+        // lock must remain available to that thread and to UI polling.
+        let mut runtime = self.lock_sessions()?.remove(terminal_id).ok_or_else(|| {
             VibexError::validation("terminal_not_found", "terminal session was not found")
         })?;
         refresh_exit_status(&mut runtime)?;
-        if runtime.session.status == TerminalStatus::Running
-            && let Err(err) = runtime.child.kill()
-        {
-            sessions.insert(terminal_id.clone(), runtime);
-            return Err(VibexError::process(
-                "terminal_kill_failed",
-                "failed to kill terminal process",
-            )
-            .with_diagnostic("error", err.to_string()));
+        if runtime.session.status == TerminalStatus::Running {
+            if let Err(err) = runtime.child.kill() {
+                self.lock_sessions()?.insert(terminal_id.clone(), runtime);
+                return Err(VibexError::process(
+                    "terminal_kill_failed",
+                    "failed to kill terminal process",
+                )
+                .with_diagnostic("error", err.to_string()));
+            }
         }
         runtime.session.status = TerminalStatus::Killed;
         runtime.session.updated_at_ms = unix_timestamp_ms();
@@ -618,10 +627,12 @@ impl TerminalManager {
     /// Stops every owned PTY and returns the final session snapshots for
     /// persistence by the desktop composition root.
     pub fn shutdown_all(&self) -> VibexResult<TerminalShutdownReport> {
-        let mut sessions = self.lock_sessions()?;
-        let mut stopped = Vec::with_capacity(sessions.len());
+        let runtimes = {
+            let mut sessions = self.lock_sessions()?;
+            std::mem::take(&mut *sessions)
+        };
+        let mut stopped = Vec::with_capacity(runtimes.len());
         let mut failures = Vec::new();
-        let runtimes = std::mem::take(&mut *sessions);
         for (terminal_id, mut runtime) in runtimes {
             if runtime.session.status == TerminalStatus::Running
                 && let Err(error) = runtime.child.kill()
@@ -634,7 +645,7 @@ impl TerminalManager {
                     .with_diagnostic("terminalId", terminal_id.to_string())
                     .with_diagnostic("error", error.to_string()),
                 );
-                sessions.insert(terminal_id, runtime);
+                self.lock_sessions()?.insert(terminal_id, runtime);
                 continue;
             }
             runtime.session.status = TerminalStatus::Killed;
@@ -688,7 +699,7 @@ impl Default for TerminalManager {
 fn spawn_reader_thread(
     terminal_id: TerminalId,
     mut reader: Box<dyn Read + Send>,
-    writer: Arc<Mutex<PtyWriter>>,
+    writer: Weak<Mutex<PtyWriter>>,
     buffer: Arc<Mutex<TerminalBuffer>>,
 ) {
     thread::spawn(move || {
@@ -699,6 +710,9 @@ fn spawn_reader_thread(
                 Ok(0) => break,
                 Ok(count) => {
                     push_raw_output(&buffer, &bytes[..count]);
+                    let Some(writer) = writer.upgrade() else {
+                        break;
+                    };
                     let output = match writer.lock() {
                         Ok(mut writer) => {
                             compatibility_responder.filter(&bytes[..count], writer.as_mut())
@@ -912,7 +926,15 @@ fn restore_cwd(workspace_root: &Path, cwd: &str) -> PathBuf {
 fn default_shell() -> String {
     #[cfg(target_os = "windows")]
     {
-        std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())
+        std::env::var("COMSPEC")
+            .ok()
+            .map(|shell| normalize_shell(&shell))
+            .filter(|shell| !shell.is_empty())
+            .unwrap_or_else(|| {
+                std::env::var("SystemRoot")
+                    .map(|root| format!(r#"{root}\System32\cmd.exe"#))
+                    .unwrap_or_else(|_| "cmd.exe".to_string())
+            })
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -920,6 +942,32 @@ fn default_shell() -> String {
         std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
     }
 }
+
+fn normalize_shell(shell: &str) -> String {
+    let shell = shell.trim();
+    #[cfg(target_os = "windows")]
+    {
+        shell.trim_matches('"').to_string()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        shell.to_string()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn configure_interactive_shell(command: &mut CommandBuilder, shell: &str) {
+    let shell_name = Path::new(shell)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(shell);
+    if shell_name.eq_ignore_ascii_case("cmd") || shell_name.eq_ignore_ascii_case("cmd.exe") {
+        command.arg("/K");
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn configure_interactive_shell(_: &mut CommandBuilder, _: &str) {}
 
 #[cfg(target_os = "linux")]
 fn sanitize_terminal_environment(command: &mut CommandBuilder) {
@@ -1210,6 +1258,20 @@ mod tests {
     }
 
     #[test]
+    fn shell_command_ignores_outer_whitespace() {
+        assert_eq!(normalize_shell("  shell  "), "shell");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_shell_command_ignores_outer_quotes() {
+        assert_eq!(
+            normalize_shell(r#""C:\Windows\System32\cmd.exe""#),
+            r#"C:\Windows\System32\cmd.exe"#
+        );
+    }
+
+    #[test]
     fn terminal_manager_captures_output_and_kills_session() {
         let manager = TerminalManager::new();
         let workspace_id = WorkspaceId::new();
@@ -1229,22 +1291,38 @@ mod tests {
         manager
             .write(&TerminalWriteRequest {
                 terminal_id: session.id.clone(),
-                data: format!("printf {MARKER}\\n"),
+                data: terminal_marker_input(),
             })
             .unwrap();
         let mut marker_seen = false;
+        let mut observed_output = String::new();
+        let mut observed_status = TerminalStatus::Running;
         for _ in 0..20 {
             let snapshot = manager.snapshot(&session.id).unwrap();
-            marker_seen = snapshot
+            observed_output = snapshot
                 .chunks
                 .iter()
-                .any(|chunk| chunk.data.contains(MARKER));
+                .map(|chunk| chunk.data.as_str())
+                .collect();
+            observed_status = snapshot.session.status;
+            marker_seen = observed_output.contains(MARKER);
             if marker_seen {
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(marker_seen);
+        if !marker_seen {
+            let _ = manager.kill(&session.id);
+        }
+        assert!(
+            marker_seen,
+            "terminal status {observed_status:?}, output {observed_output:?}"
+        );
+        assert_eq!(
+            observed_status,
+            TerminalStatus::Running,
+            "interactive shell exited after one command: {observed_output:?}"
+        );
         let resized = manager
             .resize(&TerminalResizeRequest {
                 terminal_id: session.id.clone(),
@@ -1255,6 +1333,16 @@ mod tests {
         assert_eq!(resized.rows, 30);
         let killed = manager.kill(&session.id).unwrap();
         assert_eq!(killed.status, TerminalStatus::Killed);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn terminal_marker_input() -> String {
+        format!("echo {MARKER}\r")
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn terminal_marker_input() -> String {
+        format!("printf {MARKER}\n")
     }
 
     #[test]

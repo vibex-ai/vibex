@@ -905,7 +905,12 @@ impl TerminalSurface {
         };
         let tab = self.tabs.remove(index);
         self.owned_terminal_ids.remove(tab.session.id.as_str());
-        let _ = self.manager.kill(&tab.session.id);
+        let manager = self.manager.clone();
+        let terminal_id = tab.session.id;
+        cx.background_spawn(async move {
+            let _ = manager.kill(&terminal_id);
+        })
+        .detach();
         self.active_tab = if self.tabs.is_empty() {
             None
         } else {
@@ -1838,11 +1843,21 @@ impl Render for TerminalSurface {
 
 impl Drop for TerminalSurface {
     fn drop(&mut self) {
-        for tab in &self.tabs {
-            if self.owned_terminal_ids.contains(tab.session.id.as_str()) {
-                let _ = self.manager.kill(&tab.session.id);
-            }
+        let terminal_ids = self
+            .tabs
+            .iter()
+            .filter(|tab| self.owned_terminal_ids.contains(tab.session.id.as_str()))
+            .map(|tab| tab.session.id.clone())
+            .collect::<Vec<_>>();
+        if terminal_ids.is_empty() {
+            return;
         }
+        let manager = self.manager.clone();
+        let _ = std::thread::spawn(move || {
+            for terminal_id in terminal_ids {
+                let _ = manager.kill(&terminal_id);
+            }
+        });
     }
 }
 

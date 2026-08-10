@@ -9,7 +9,7 @@ repository.workspace = true
 [dependencies]
 alacritty_terminal.workspace = true
 vibex-terminal-ui = { path = "../vibex-terminal-ui" }
-portable-pty = "0.9"
+portable-pty = { package = "xpty", version = "0.3.6" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
