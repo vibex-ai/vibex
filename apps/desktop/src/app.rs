@@ -15495,16 +15495,6 @@ impl VibexWorkbench {
             .when(is_macos, |this| {
                 this.on_double_click(|_, window, _| window.titlebar_double_click())
             })
-            .when(!is_web, |this| {
-                this.window_control_area(WindowControlArea::Drag).when(
-                    is_linux && is_client_decorated,
-                    |this| {
-                        this.on_mouse_down(MouseButton::Right, |event, window, _| {
-                            window.show_window_menu(event.position)
-                        })
-                    },
-                )
-            })
             .on_mouse_down_out(window.listener_for(&drag_state, |state, _, _, _| {
                 state.should_move = false;
             }))
@@ -15532,6 +15522,16 @@ impl VibexWorkbench {
                     .h_full()
                     .flex_1()
                     .items_center()
+                    .when(!is_web, |this| {
+                        this.window_control_area(WindowControlArea::Drag).when(
+                            is_linux && is_client_decorated,
+                            |this| {
+                                this.on_mouse_down(MouseButton::Right, |event, window, _| {
+                                    window.show_window_menu(event.position)
+                                })
+                            },
+                        )
+                    })
                     .child(
                         h_flex()
                             .h_full()
@@ -39352,6 +39352,28 @@ mod tests {
     fn title_bar_uses_the_workspace_leaf_name() {
         assert_eq!(workspace_display_name("/home/user/code/vibex"), "vibex");
         assert_eq!(workspace_display_name("/home/user/code/vibex/"), "vibex");
+    }
+
+    #[test]
+    fn title_bar_keeps_windows_controls_outside_the_drag_region() {
+        let source = include_str!("app.rs");
+        let title_bar = source
+            .split_once("    fn render_title_bar(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_agent_sidebar("))
+            .map(|(body, _)| body)
+            .expect("title bar should remain inspectable");
+        let content = title_bar
+            .find(".child(\n                h_flex()")
+            .expect("title-bar content region should exist");
+        let drag = title_bar
+            .find(".window_control_area(WindowControlArea::Drag)")
+            .expect("title-bar drag region should exist");
+        let controls = title_bar
+            .find("workbench_window_controls(wide_window_controls, cx)")
+            .expect("native window controls should exist");
+
+        assert!(content < drag);
+        assert!(drag < controls);
     }
 
     #[test]
