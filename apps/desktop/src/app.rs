@@ -18429,8 +18429,10 @@ impl VibexWorkbench {
             .min_w_0()
             .max_w(px(392.0))
             .flex_1()
-            .rounded(px(7.0))
-            .bg(muted_color.opacity(0.55))
+            .items_center()
+            .gap_1()
+            .rounded(px(10.0))
+            .bg(muted_color.opacity(0.34))
             .p(px(2.0))
             .child(
                 Button::new("new-session-location-current")
@@ -18441,7 +18443,7 @@ impl VibexWorkbench {
                     .flex_1()
                     .justify_center()
                     .selected(!worktree_selected)
-                    .icon(IconName::Folder)
+                    .icon(Icon::default().path("icons/vibex/monitor.svg"))
                     .label(current_location_label)
                     .disabled(self.agent_action_pending)
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -18750,7 +18752,8 @@ impl VibexWorkbench {
                     .min_w_0()
                     .flex_wrap()
                     .items_center()
-                    .gap_2()
+                    .gap_1()
+                    .px_1()
                     .child(workspace_button)
                     .child(location_control)
                     .when(worktree_selected, |this| {
@@ -18882,11 +18885,11 @@ impl VibexWorkbench {
                             .mt_4()
                             .min_w_0()
                             .overflow_hidden()
-                            .rounded(px(28.0))
+                            .rounded(px(20.0))
                             .border_1()
-                            .border_color(cx.theme().primary.opacity(0.15))
+                            .border_color(cx.theme().border.opacity(0.72))
                             .bg(card_color)
-                            .shadow_xl()
+                            .shadow_lg()
                             .on_prepaint(move |bounds, _, cx| {
                                 let _ = surface_geometry_entity.update(cx, |this, cx| {
                                     if this.new_session_composer_geometry.surface_bounds
@@ -19098,6 +19101,15 @@ impl VibexWorkbench {
                                     .gap_2()
                                     .p_4()
                                     .pt_1()
+                                    .child(
+                                        v_flex()
+                                            .w_full()
+                                            .min_w_0()
+                                            .border_b_1()
+                                            .border_color(cx.theme().border.opacity(0.42))
+                                            .pb_2()
+                                            .child(workspace_controls),
+                                    )
                                     .when(has_agent_choices, |this| {
                                         this.child(
                                             h_flex()
@@ -19156,15 +19168,6 @@ impl VibexWorkbench {
                                                 ),
                                         )
                                     })
-                                    .child(
-                                        v_flex()
-                                            .w_full()
-                                            .min_w_0()
-                                            .border_t_1()
-                                            .border_color(cx.theme().border.opacity(0.50))
-                                            .pt_2()
-                                            .child(workspace_controls),
-                                    )
                                     .when_some(self.new_session_error.clone(), |this, error| {
                                         this.child(
                                             div()
@@ -39209,6 +39212,13 @@ mod tests {
         assert!(panel.contains("new-session-worktree-settings-popover"));
         assert!(panel.contains("new-session-default-worktree"));
         assert!(panel.contains("can_create_worktree && !fixed_workspace"));
+        let context_row = panel
+            .rfind(".child(workspace_controls)")
+            .expect("workspace context row should be mounted");
+        let runtime_row = panel
+            .find(".when(has_agent_choices")
+            .expect("runtime controls should be mounted");
+        assert!(context_row < runtime_row);
 
         let sidebar = source
             .split_once("    fn render_agent_sidebar(")
