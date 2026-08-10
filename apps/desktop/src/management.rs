@@ -78,7 +78,8 @@ const MANAGEMENT_PROVIDER_ROW_HEIGHT: f32 = 72.0;
 const MANAGEMENT_PROVIDER_ROW_GAP: f32 = 8.0;
 const MANAGEMENT_PROVIDER_DRAG_PREVIEW_WIDTH: f32 = 520.0;
 const MANAGEMENT_PROVIDER_REORDER_ANIMATION_MS: u64 = 160;
-const MANAGEMENT_PROVIDER_ROW_ACTION_SIZE: f32 = 40.0;
+const MANAGEMENT_AGENT_ROW_ACTION_SIZE: f32 = 40.0;
+const MANAGEMENT_PROVIDER_ROW_ACTION_SIZE: f32 = 48.0;
 const PROVIDER_API_KEY_PLACEHOLDER: &str = "API Key";
 const PROVIDER_OPTION_WEBSITE_URL: &str = "ccSwitchWebsiteUrl";
 const PROVIDER_OPTION_CC_SWITCH_DB_PATH: &str = "ccSwitchDbPath";
@@ -6209,7 +6210,7 @@ impl ManagementCenter {
                                     )))
                                     .small()
                                     .outline()
-                                    .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
+                                    .size(px(MANAGEMENT_AGENT_ROW_ACTION_SIZE))
                                     .icon(IconName::Plus)
                                     .tooltip(management_add_label())
                                     .loading(
@@ -15519,6 +15520,7 @@ mod tests {
         assert!(install.contains("icons/vibex/download.svg"));
         assert!(install.contains("icons/vibex/trash-2.svg"));
         assert!(render.contains("MANAGEMENT_PROVIDER_ROW_ACTION_SIZE"));
+        assert_eq!(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE, 48.0);
         assert!(render.contains(".icon(IconName::Plus)"));
         assert!(render.contains("icons/vibex/trash-2.svg"));
         assert!(
