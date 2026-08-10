@@ -157,7 +157,6 @@ struct ManagementCopy {
     search_agents: &'static str,
     search_mcp: &'static str,
     search_skills: &'static str,
-    remove: &'static str,
     add_configuration: &'static str,
     import_configuration: &'static str,
     provider_configuration: &'static str,
@@ -180,7 +179,6 @@ fn management_copy() -> ManagementCopy {
             search_agents: "Search Agent",
             search_mcp: "Search MCP",
             search_skills: "Search Skills",
-            remove: "Remove",
             add_configuration: "Add config",
             import_configuration: "Import existing config",
             provider_configuration: "Model provider configuration",
@@ -200,7 +198,6 @@ fn management_copy() -> ManagementCopy {
             search_agents: "搜索 Agent",
             search_mcp: "搜索 MCP",
             search_skills: "搜索技能",
-            remove: "移除",
             add_configuration: "添加配置",
             import_configuration: "导入已有配置",
             provider_configuration: "模型供应商配置",
@@ -220,7 +217,6 @@ fn management_copy() -> ManagementCopy {
             search_agents: "搜尋 Agent",
             search_mcp: "搜尋 MCP",
             search_skills: "搜尋技能",
-            remove: "移除",
             add_configuration: "新增配置",
             import_configuration: "匯入既有配置",
             provider_configuration: "模型供應商配置",
@@ -5753,7 +5749,6 @@ impl ManagementCenter {
     }
 
     fn render_agents(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let copy = management_copy();
         let query = self.agent_search.read(cx).value().trim().to_lowercase();
         let mut agents = self
             .snapshot
@@ -5778,19 +5773,12 @@ impl ManagementCenter {
             let row_select_id = id.clone();
             let keyboard_select_id = id.clone();
             let toggle_id = id.clone();
-            let remove_id = id.clone();
-            let remove_label = agent.label.clone();
-            let remove_managed = agent.managed_install.managed;
             let probe_id = id.clone();
             let add_id = id.clone();
             let added = agent.added;
             let managed_installing = matches!(
                 mutation,
                 Some(ManagementMutation::AgentInstall(active_id)) if active_id == &id
-            );
-            let managed_uninstalling = matches!(
-                mutation,
-                Some(ManagementMutation::AgentUninstall(active_id)) if active_id == &id
             );
             let selected = (added || agent.managed_install.managed || managed_installing)
                 && self.selected_agent_id.as_deref() == Some(id.as_str());
@@ -5945,36 +5933,6 @@ impl ManagementCenter {
                                         this.toggle_agent(toggle_id.clone(), *checked, cx)
                                     })),
                                 )
-                            })
-                            .when(added, |actions| {
-                                actions.child(button_with_aria_label(
-                                    Button::new(SharedString::from(format!(
-                                        "management-agent-remove-{remove_id}"
-                                    )))
-                                    .small()
-                                    .ghost()
-                                    .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
-                                    .icon(IconName::CircleX)
-                                    .tooltip(copy.remove)
-                                    .loading(managed_uninstalling)
-                                    .disabled(pending)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        cx.stop_propagation();
-                                        if remove_managed {
-                                            this.confirm_managed_delete(
-                                                ManagedDeleteTarget::Agent {
-                                                    id: remove_id.clone(),
-                                                    label: remove_label.clone(),
-                                                },
-                                                window,
-                                                cx,
-                                            );
-                                        } else {
-                                            this.set_agent_added(remove_id.clone(), false, cx);
-                                        }
-                                    })),
-                                    copy.remove,
-                                ))
                             })
                             .when(!added, |actions| {
                                 actions.child(button_with_aria_label(
@@ -7239,9 +7197,7 @@ impl ManagementCenter {
                 let action_icon = match method.kind {
                     AgentAuthMethodKind::Agent => Icon::new(IconName::ArrowRight),
                     AgentAuthMethodKind::Environment => Icon::new(IconName::Check),
-                    AgentAuthMethodKind::Terminal => {
-                        Icon::default().path("icons/vibex/file-terminal.svg")
-                    }
+                    AgentAuthMethodKind::Terminal => Icon::new(IconName::ArrowRight),
                 };
                 let submit_disabled = pending
                     || (method.kind == AgentAuthMethodKind::Environment
@@ -7718,7 +7674,7 @@ impl ManagementCenter {
                 )))
                 .small()
                 .danger()
-                .icon(IconName::Delete)
+                .icon(Icon::default().path("icons/vibex/trash-2.svg"))
                 .loading(uninstalling)
                 .disabled(pending)
                 .on_click(cx.listener({
@@ -8235,7 +8191,7 @@ impl ManagementCenter {
                                 Button::new("provider-add-configuration")
                                     .small()
                                     .primary()
-                                    .icon(Icon::default().path("icons/vibex/plug-zap.svg"))
+                                    .icon(IconName::Plus)
                                     .disabled(pending)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.open_profile_creator(window, cx);
@@ -14985,7 +14941,13 @@ mod tests {
 
         assert!(install.contains("management_card_with_icon("));
         assert!(install.contains("icons/vibex/download.svg"));
+        assert!(install.contains("icons/vibex/trash-2.svg"));
         assert!(render.contains("MANAGEMENT_PROVIDER_ROW_ACTION_SIZE"));
+        assert!(render.contains(".icon(IconName::Plus)"));
+        assert!(
+            authentication
+                .contains("AgentAuthMethodKind::Terminal => Icon::new(IconName::ArrowRight)")
+        );
         assert!(action_helper.contains(".size(px(MANAGEMENT_DETAIL_ACTION_HEIGHT))"));
         assert!(action_helper.contains(".tooltip(label.clone())"));
         assert!(action_helper.contains("button_with_aria_label("));
@@ -15112,6 +15074,7 @@ mod tests {
         assert!(!render_agents.contains("management-agent-select-"));
         assert!(render_agents.contains("agents.sort_by_cached_key(management_agent_sort_key);"));
         assert!(render_agents.contains("management-agent-add-{add_id}"));
+        assert!(!render_agents.contains("management-agent-remove-"));
         assert!(!render_agents.contains("management-agent-catalog-"));
         assert!(render_agents.contains("cx.theme().primary.opacity(0.08)"));
         assert!(render_agents.contains("cx.theme().accent"));
