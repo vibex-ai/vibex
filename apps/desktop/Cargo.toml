@@ -57,6 +57,9 @@ vibex-db = { path = "../../crates/db" }
 vibex-remote-client = { path = "../../crates/vibex-remote-client" }
 vibex-remote = { path = "../../crates/remote" }
 
+[build-dependencies]
+embed-resource = "3.0"
+
 [[bin]]
 name = "vibex-desktop"
 path = "src/main.rs"
