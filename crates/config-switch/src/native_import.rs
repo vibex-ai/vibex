@@ -1535,6 +1535,7 @@ fn profile_request_from_item(item: ProviderNativeImportItem) -> ProviderProfileC
             display_name: None,
             enabled: true,
             wire_api: None,
+            capabilities: Default::default(),
         })
         .collect();
 

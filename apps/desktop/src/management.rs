@@ -2548,6 +2548,7 @@ impl ManagementCenter {
                 display_name: None,
                 enabled: true,
                 wire_api: None,
+                capabilities: Default::default(),
             }],
         );
         self.profile_model_draft
@@ -13133,6 +13134,7 @@ fn normalized_provider_models(
                 .map(str::to_string),
             enabled: model.enabled,
             wire_api: model.wire_api,
+            capabilities: Default::default(),
         });
     }
     normalized
@@ -15011,18 +15013,21 @@ mod tests {
                 display_name: Some("  Primary  ".into()),
                 enabled: true,
                 wire_api: None,
+                capabilities: Default::default(),
             },
             vibex_core::ProviderConfiguredModel {
                 id: "gpt-5".into(),
                 display_name: Some("Duplicate".into()),
                 enabled: false,
                 wire_api: Some(vibex_core::ProviderModelWireApi::OpenaiResponses),
+                capabilities: Default::default(),
             },
             vibex_core::ProviderConfiguredModel {
                 id: "   ".into(),
                 display_name: None,
                 enabled: true,
                 wire_api: None,
+                capabilities: Default::default(),
             },
         ];
         assert_eq!(normalized_provider_models(&models).len(), 1);
@@ -15036,12 +15041,14 @@ mod tests {
                     display_name: Some("Detected GPT-5".into()),
                     enabled: true,
                     wire_api: Some(vibex_core::ProviderModelWireApi::OpenaiResponses),
+                    capabilities: Default::default(),
                 },
                 vibex_core::ProviderConfiguredModel {
                     id: "claude-sonnet".into(),
                     display_name: None,
                     enabled: true,
                     wire_api: Some(vibex_core::ProviderModelWireApi::AnthropicMessages),
+                    capabilities: Default::default(),
                 },
             ],
         );

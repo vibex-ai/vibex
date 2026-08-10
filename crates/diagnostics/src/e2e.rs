@@ -196,6 +196,7 @@ fn e2e_agent_manager(db_path: &Path) -> VibexResult<AgentManager> {
         display_name: Some("E2E Stub".to_string()),
         enabled: true,
         wire_api: None,
+        capabilities: Default::default(),
     }];
     let conn = open_database(db_path)?;
     ProviderProfileRepository::update(&conn, &profile)?;

@@ -520,6 +520,7 @@ async fn prepare_workspace_fixture(state: &HarnessState) -> ApiResult<()> {
                             display_name: None,
                             enabled: true,
                             wire_api: None,
+                            capabilities: Default::default(),
                         })
                         .collect(),
                 ),

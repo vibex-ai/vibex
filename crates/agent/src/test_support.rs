@@ -57,6 +57,7 @@ impl TestRuntimeHarness {
                     display_name: Some("Test model".to_string()),
                     enabled: true,
                     wire_api: None,
+                    capabilities: Default::default(),
                 }],
                 reasoning_effort: None,
                 sandbox_defaults: None,

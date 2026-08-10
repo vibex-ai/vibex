@@ -27,9 +27,9 @@ use vibex_core::{
     ModelProviderProxyPolicy, ProjectionAuthState, ProjectionDescriptorMatch,
     ProjectionEvidenceState, ProjectionOverlayPreview, ProjectionSecretEnvReference,
     ProjectionTargetKind, ProjectionTargetPreview, ProjectionVerificationState,
-    ProviderBindingMetadata, ProviderCredentialSecretMutationRequest, ProviderSecretBackend,
-    ProviderSecretSetupState, ProviderSwitchBehavior, RequestId, VibexError, VibexResult,
-    unix_timestamp_ms,
+    ProviderBindingMetadata, ProviderCredentialSecretMutationRequest, ProviderModelCapabilities,
+    ProviderSecretBackend, ProviderSecretSetupState, ProviderSwitchBehavior, RequestId, VibexError,
+    VibexResult, unix_timestamp_ms,
 };
 use vibex_db::{
     AgentModelProviderBindingRepository, AgentRuntimeProfileRepository,
@@ -1744,15 +1744,18 @@ fn opencode_overlay(
             .get_mut("models")
             .and_then(serde_json::Value::as_object_mut)
         {
-            let display_name = provider
+            let catalog_entry = provider
                 .configured_models
                 .iter()
-                .find(|entry| entry.id == model.provider_model_id)
-                .and_then(|entry| entry.display_name.clone());
+                .find(|entry| entry.id == model.provider_model_id);
             let mut model_config = serde_json::Map::new();
-            if let Some(display_name) = display_name {
+            if let Some(display_name) = catalog_entry.and_then(|entry| entry.display_name.clone()) {
                 model_config.insert("name".to_string(), serde_json::Value::String(display_name));
             }
+            opencode_apply_model_capabilities(
+                &mut model_config,
+                catalog_entry.map(|entry| &entry.capabilities),
+            );
             models.insert(
                 opencode_model_key(&provider_id, &model.agent_model_id),
                 serde_json::Value::Object(model_config),
@@ -1923,6 +1926,74 @@ fn opencode_provider_identity<'a>(
         format!("{base_provider_id}-{suffix}")
     };
     (provider_id, npm)
+}
+
+/// Project declared Model capabilities into an OpenCode model object.
+///
+/// OpenCode resolves every capability it is not told about to `false`, because
+/// a Vibex-generated provider id never matches a models.dev provider and so
+/// inherits no upstream metadata. An omitted flag therefore reads as
+/// "unsupported" and silently disables reasoning depth, run modes, and image
+/// input for the Model.
+///
+/// Only explicitly declared capabilities are emitted. An undeclared field stays
+/// absent so a Model with nothing declared still projects as `{}`, which keeps
+/// the documented empty-model-object contract intact. Vibex never infers a
+/// capability from a Model id.
+///
+/// OpenCode derives its own run-mode variants from `reasoning` plus the Model
+/// id, so Vibex declares the capability and leaves the effort levels to
+/// OpenCode.
+fn opencode_apply_model_capabilities(
+    model_config: &mut serde_json::Map<String, serde_json::Value>,
+    capabilities: Option<&ProviderModelCapabilities>,
+) {
+    let Some(capabilities) = capabilities.filter(|capabilities| !capabilities.is_empty()) else {
+        return;
+    };
+    if let Some(reasoning) = capabilities.reasoning {
+        model_config.insert("reasoning".to_string(), serde_json::Value::Bool(reasoning));
+    }
+    if let Some(temperature) = capabilities.temperature {
+        model_config.insert(
+            "temperature".to_string(),
+            serde_json::Value::Bool(temperature),
+        );
+    }
+
+    // `attachment` gates prompt attachments as a whole; `modalities.input`
+    // gates the individual part types. OpenCode needs both to accept an image.
+    let image_input = capabilities.image_input.unwrap_or(false);
+    let pdf_input = capabilities.pdf_input.unwrap_or(false);
+    if capabilities.image_input.is_some() || capabilities.pdf_input.is_some() {
+        model_config.insert(
+            "attachment".to_string(),
+            serde_json::Value::Bool(image_input || pdf_input),
+        );
+        let mut input = vec![serde_json::Value::String("text".to_string())];
+        if image_input {
+            input.push(serde_json::Value::String("image".to_string()));
+        }
+        if pdf_input {
+            input.push(serde_json::Value::String("pdf".to_string()));
+        }
+        model_config.insert(
+            "modalities".to_string(),
+            serde_json::json!({
+                "input": input,
+                "output": ["text"],
+            }),
+        );
+    }
+
+    // OpenCode requires both bounds together, and treats zero as "unknown".
+    if let (Some(context), Some(output)) = (capabilities.context_tokens, capabilities.output_tokens)
+    {
+        model_config.insert(
+            "limit".to_string(),
+            serde_json::json!({ "context": context, "output": output }),
+        );
+    }
 }
 
 fn opencode_model_key(provider_id: &str, model_id: &str) -> String {
@@ -3127,6 +3198,7 @@ mod tests {
                 display_name: None,
                 enabled: true,
                 metadata: Vec::new(),
+                capabilities: Default::default(),
             }],
             default_model_id: Some("model-a".to_string()),
             headers: Vec::new(),
@@ -3455,6 +3527,7 @@ mod tests {
                 display_name: Some("Matrix Model".to_string()),
                 enabled: true,
                 metadata: Vec::new(),
+                capabilities: Default::default(),
             }],
             default_model_id: Some("provider-model".to_string()),
             headers: Vec::new(),
@@ -4005,6 +4078,104 @@ mod tests {
             overlay["provider"]["fake"]["models"]["model-a"]["name"],
             "Model A"
         );
+    }
+
+    #[test]
+    fn opencode_overlay_projects_declared_model_capabilities() {
+        let (mut provider, _, binding, _) = fixture(ConfigOverlayStrategy::OpenCodeInlineProvider);
+        provider.configured_models[0].capabilities = ProviderModelCapabilities {
+            reasoning: Some(true),
+            temperature: Some(false),
+            image_input: Some(true),
+            pdf_input: Some(true),
+            context_tokens: Some(1_000_000),
+            output_tokens: Some(128_000),
+        };
+        let endpoint = provider.endpoints.first().unwrap();
+
+        let content = opencode_overlay(&provider, &binding, Some(endpoint)).unwrap();
+        let overlay: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let model = &overlay["provider"]["fake"]["models"]["model-a"];
+
+        // Reasoning is what unlocks OpenCode's run-mode variants; Vibex declares
+        // the capability and lets OpenCode derive the effort levels.
+        assert_eq!(model["reasoning"], serde_json::json!(true));
+        assert_eq!(model["temperature"], serde_json::json!(false));
+        assert_eq!(model["attachment"], serde_json::json!(true));
+        assert_eq!(
+            model["modalities"],
+            serde_json::json!({ "input": ["text", "image", "pdf"], "output": ["text"] })
+        );
+        assert_eq!(
+            model["limit"],
+            serde_json::json!({ "context": 1_000_000, "output": 128_000 })
+        );
+        assert!(
+            model.get("variants").is_none(),
+            "variants are derived by OpenCode, never projected by Vibex"
+        );
+    }
+
+    #[test]
+    fn opencode_overlay_projects_image_input_without_pdf() {
+        let (mut provider, _, binding, _) = fixture(ConfigOverlayStrategy::OpenCodeInlineProvider);
+        provider.configured_models[0].capabilities = ProviderModelCapabilities {
+            image_input: Some(true),
+            ..ProviderModelCapabilities::default()
+        };
+        let endpoint = provider.endpoints.first().unwrap();
+
+        let content = opencode_overlay(&provider, &binding, Some(endpoint)).unwrap();
+        let overlay: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let model = &overlay["provider"]["fake"]["models"]["model-a"];
+
+        assert_eq!(model["attachment"], serde_json::json!(true));
+        assert_eq!(
+            model["modalities"]["input"],
+            serde_json::json!(["text", "image"])
+        );
+        // Undeclared capabilities stay absent rather than being guessed.
+        assert!(model.get("reasoning").is_none());
+        assert!(model.get("limit").is_none());
+    }
+
+    #[test]
+    fn opencode_overlay_omits_partial_token_limits() {
+        let (mut provider, _, binding, _) = fixture(ConfigOverlayStrategy::OpenCodeInlineProvider);
+        provider.configured_models[0].capabilities = ProviderModelCapabilities {
+            context_tokens: Some(1_000_000),
+            ..ProviderModelCapabilities::default()
+        };
+        let endpoint = provider.endpoints.first().unwrap();
+
+        let content = opencode_overlay(&provider, &binding, Some(endpoint)).unwrap();
+        let overlay: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+        // OpenCode needs both bounds; a half-declared limit is worse than none.
+        assert_eq!(
+            overlay["provider"]["fake"]["models"]["model-a"],
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn opencode_overlay_projects_explicitly_disabled_capabilities() {
+        let (mut provider, _, binding, _) = fixture(ConfigOverlayStrategy::OpenCodeInlineProvider);
+        provider.configured_models[0].capabilities = ProviderModelCapabilities {
+            reasoning: Some(false),
+            image_input: Some(false),
+            ..ProviderModelCapabilities::default()
+        };
+        let endpoint = provider.endpoints.first().unwrap();
+
+        let content = opencode_overlay(&provider, &binding, Some(endpoint)).unwrap();
+        let overlay: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let model = &overlay["provider"]["fake"]["models"]["model-a"];
+
+        // A declared "false" is a real statement and must survive the round trip.
+        assert_eq!(model["reasoning"], serde_json::json!(false));
+        assert_eq!(model["attachment"], serde_json::json!(false));
+        assert_eq!(model["modalities"]["input"], serde_json::json!(["text"]));
     }
 
     #[test]
@@ -4625,6 +4796,7 @@ mod tests {
                 display_name: Some("Unused".to_string()),
                 enabled: false,
                 metadata: Vec::new(),
+                capabilities: Default::default(),
             });
         let mut updated = service
             .update_model_provider_profile(ModelProviderProfileUpdateRequest {

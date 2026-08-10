@@ -1098,6 +1098,44 @@ impl ProviderModelWireApi {
     }
 }
 
+/// Explicitly declared per-Model runtime capabilities.
+///
+/// Every field is tri-state. `None` means "not declared", never "unsupported":
+/// Vibex must not infer a capability from a Model id, and an undeclared field
+/// is omitted from Agent projections so the Agent keeps its own defaults. Only
+/// an explicit declaration or live probe may associate a capability with a
+/// Model. See `.trellis/spec/backend/agent-session-protocol.md`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderModelCapabilities {
+    /// Model performs internal reasoning. Agents that expose reasoning depth or
+    /// run modes gate those controls on this flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
+    /// Model accepts image parts in a prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_input: Option<bool>,
+    /// Model accepts PDF parts in a prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdf_input: Option<bool>,
+    /// Model honours an explicit sampling temperature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<bool>,
+    /// Total context window in tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u32>,
+    /// Maximum output tokens per response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u32>,
+}
+
+impl ProviderModelCapabilities {
+    /// True when no capability was declared, so projections emit nothing.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderConfiguredModel {
@@ -1106,6 +1144,8 @@ pub struct ProviderConfiguredModel {
     pub enabled: bool,
     #[serde(default)]
     pub wire_api: Option<ProviderModelWireApi>,
+    #[serde(default)]
+    pub capabilities: ProviderModelCapabilities,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

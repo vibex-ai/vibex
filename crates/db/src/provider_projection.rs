@@ -1524,6 +1524,7 @@ fn legacy_model_catalog(profile: &ProviderProfile) -> Vec<ModelProviderCatalogEn
             display_name: None,
             enabled: true,
             wire_api: None,
+            capabilities: vibex_core::ProviderModelCapabilities::default(),
         });
     }
     models
@@ -1533,6 +1534,7 @@ fn legacy_model_catalog(profile: &ProviderProfile) -> Vec<ModelProviderCatalogEn
             display_name: model.display_name,
             enabled: model.enabled,
             metadata: Vec::new(),
+            capabilities: model.capabilities,
         })
         .collect()
 }
@@ -1582,6 +1584,7 @@ fn legacy_configured_model_bindings(
             display_name: None,
             enabled: true,
             wire_api: None,
+            capabilities: Default::default(),
         });
     }
     models
@@ -2118,6 +2121,7 @@ mod tests {
             display_name: None,
             enabled: true,
             wire_api: None,
+            capabilities: Default::default(),
         }];
         profile.secrets = vec![available_secret(profile.id.clone())];
         ProviderProfileRepository::insert(&conn, &profile).unwrap();
@@ -2186,6 +2190,7 @@ mod tests {
             display_name: None,
             enabled: true,
             wire_api: None,
+            capabilities: Default::default(),
         })
         .collect();
         ProviderProfileRepository::insert(&conn, &profile).unwrap();
@@ -2307,6 +2312,7 @@ mod tests {
             display_name: None,
             enabled: true,
             wire_api: None,
+            capabilities: Default::default(),
         }];
         profile
             .provider_options
@@ -2399,6 +2405,7 @@ mod tests {
             display_name: None,
             enabled: true,
             wire_api: Some(ProviderModelWireApi::GoogleGenerativeAi),
+            capabilities: Default::default(),
         }];
 
         let records = map_legacy_projection_records(&conn, &profile).unwrap();
@@ -2453,6 +2460,7 @@ mod tests {
                 display_name: None,
                 enabled: true,
                 metadata: Vec::new(),
+                capabilities: Default::default(),
             }],
             default_model_id: Some("shared-model".to_string()),
             headers: Vec::new(),
@@ -2507,6 +2515,7 @@ mod tests {
             display_name: None,
             enabled: true,
             wire_api: Some(ProviderModelWireApi::OpenaiChatCompletions),
+            capabilities: Default::default(),
         }];
         ProviderProfileRepository::insert(&conn, &profile).unwrap();
 

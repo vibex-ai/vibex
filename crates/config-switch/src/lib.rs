@@ -782,6 +782,7 @@ impl ProviderConfigService {
                     display_name: None,
                     enabled: true,
                     wire_api: None,
+                    capabilities: Default::default(),
                 })
                 .collect(),
             diagnostics,
@@ -1194,6 +1195,7 @@ impl ProviderConfigService {
                     display_name: None,
                     enabled: true,
                     wire_api: None,
+                    capabilities: Default::default(),
                 })
                 .collect(),
             reasoning_effort: None,
@@ -1572,6 +1574,7 @@ impl ProviderConfigService {
                         display_name: None,
                         enabled: true,
                         wire_api: None,
+                        capabilities: Default::default(),
                     })
                     .collect(),
             ),
@@ -8342,6 +8345,7 @@ mod tests {
             display_name: None,
             enabled: true,
             wire_api: Some(vibex_core::ProviderModelWireApi::OpenaiChatCompletions),
+            capabilities: Default::default(),
         };
 
         let create_error = service
@@ -8762,6 +8766,7 @@ mod tests {
                     display_name: Some("GPT Test".to_string()),
                     enabled: true,
                     wire_api: Some(vibex_core::ProviderModelWireApi::AnthropicMessages),
+                    capabilities: Default::default(),
                 }],
                 reasoning_effort: None,
                 sandbox_defaults: None,
@@ -8860,6 +8865,7 @@ mod tests {
                     display_name: Some("GPT Test".to_string()),
                     enabled: true,
                     wire_api: None,
+                    capabilities: Default::default(),
                 }],
                 reasoning_effort: None,
                 sandbox_defaults: None,
@@ -9061,6 +9067,7 @@ mod tests {
                     display_name: None,
                     enabled: true,
                     wire_api: Some(vibex_core::ProviderModelWireApi::GoogleGenerativeAi),
+                    capabilities: Default::default(),
                 }],
                 reasoning_effort: None,
                 sandbox_defaults: None,
@@ -9128,6 +9135,7 @@ mod tests {
                     display_name: None,
                     enabled: true,
                     wire_api: Some(vibex_core::ProviderModelWireApi::AwsBedrockConverse),
+                    capabilities: Default::default(),
                 }],
                 reasoning_effort: None,
                 sandbox_defaults: None,

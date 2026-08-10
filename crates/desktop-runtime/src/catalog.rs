@@ -942,6 +942,7 @@ mod tests {
             display_name: Some(format!("{id} label")),
             enabled: true,
             wire_api: None,
+            capabilities: Default::default(),
         }
     }
 

@@ -17772,6 +17772,7 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
             display_name: Some("GPT Test".to_string()),
             enabled: true,
             wire_api: None,
+            capabilities: Default::default(),
         }];
         profile.provider_options = vibex_core::ProviderOptions {
             schema_version: 1,
@@ -17857,18 +17858,21 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
                 display_name: Some("GPT Responses".to_string()),
                 enabled: true,
                 wire_api: Some(ProviderModelWireApi::OpenaiResponses),
+                capabilities: Default::default(),
             },
             vibex_core::ProviderConfiguredModel {
                 id: "gpt-chat".to_string(),
                 display_name: Some("GPT Chat".to_string()),
                 enabled: true,
                 wire_api: Some(ProviderModelWireApi::OpenaiChatCompletions),
+                capabilities: Default::default(),
             },
             vibex_core::ProviderConfiguredModel {
                 id: "claude-test".to_string(),
                 display_name: Some("Claude Test".to_string()),
                 enabled: true,
                 wire_api: Some(ProviderModelWireApi::AnthropicMessages),
+                capabilities: Default::default(),
             },
         ];
         profile.provider_options = vibex_core::ProviderOptions {

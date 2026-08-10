@@ -115,6 +115,10 @@ pub struct ModelProviderCatalogEntry {
     pub enabled: bool,
     #[serde(default)]
     pub metadata: Vec<ProviderBindingMetadata>,
+    /// Declared capabilities for this Model. Undeclared fields stay `None` and
+    /// are omitted from Agent config overlays.
+    #[serde(default)]
+    pub capabilities: crate::ProviderModelCapabilities,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1809,10 +1813,60 @@ mod tests {
             display_name: None,
             enabled: true,
             metadata: Vec::new(),
+            capabilities: crate::ProviderModelCapabilities::default(),
         };
         let encoded = serde_json::to_string(&model).unwrap();
         assert!(!encoded.contains("wire"));
         assert!(!encoded.contains("sdk"));
+    }
+
+    #[test]
+    fn undeclared_model_capabilities_round_trip_as_absent() {
+        let entry = ModelProviderCatalogEntry {
+            id: "shared-model".to_string(),
+            display_name: None,
+            enabled: true,
+            metadata: Vec::new(),
+            capabilities: crate::ProviderModelCapabilities::default(),
+        };
+
+        // An undeclared capability must not serialize, so it can never be read
+        // back as an explicit "unsupported".
+        let encoded = serde_json::to_string(&entry).unwrap();
+        assert!(!encoded.contains("reasoning"), "{encoded}");
+        assert!(!encoded.contains("imageInput"), "{encoded}");
+        assert!(!encoded.contains("contextTokens"), "{encoded}");
+
+        // Rows written before this field existed still load.
+        let legacy: ModelProviderCatalogEntry = serde_json::from_str(
+            r#"{"id":"shared-model","displayName":null,"enabled":true,"metadata":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy, entry);
+        assert!(legacy.capabilities.is_empty());
+    }
+
+    #[test]
+    fn declared_model_capabilities_round_trip() {
+        let entry = ModelProviderCatalogEntry {
+            id: "shared-model".to_string(),
+            display_name: None,
+            enabled: true,
+            metadata: Vec::new(),
+            capabilities: crate::ProviderModelCapabilities {
+                reasoning: Some(true),
+                image_input: Some(true),
+                context_tokens: Some(200_000),
+                ..Default::default()
+            },
+        };
+
+        let encoded = serde_json::to_string(&entry).unwrap();
+        let decoded: ModelProviderCatalogEntry = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, entry);
+        assert!(!decoded.capabilities.is_empty());
+        // A declared `false` stays distinguishable from "not declared".
+        assert_eq!(decoded.capabilities.pdf_input, None);
     }
 
     #[test]

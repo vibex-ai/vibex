@@ -399,6 +399,7 @@ async fn fixture_setup(State(state): State<Arc<HarnessState>>) -> Json<Value> {
                                 display_name: None,
                                 enabled: true,
                                 wire_api: None,
+                                capabilities: Default::default(),
                             })
                             .collect(),
                     ),

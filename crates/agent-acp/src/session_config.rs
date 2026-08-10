@@ -1743,12 +1743,14 @@ mod tests {
                     display_name: Some("GPT-5".to_string()),
                     enabled: true,
                     wire_api: None,
+                    capabilities: Default::default(),
                 },
                 ProviderConfiguredModel {
                     id: "disabled".to_string(),
                     display_name: None,
                     enabled: false,
                     wire_api: None,
+                    capabilities: Default::default(),
                 },
             ],
             secret_setup_state: ProviderSecretSetupState::Available,
@@ -1898,6 +1900,7 @@ mod tests {
                 display_name: None,
                 enabled: true,
                 wire_api: None,
+                capabilities: Default::default(),
             }],
             secret_setup_state: ProviderSecretSetupState::Available,
             updated_at_ms: 1,
@@ -2001,6 +2004,7 @@ mod tests {
             display_name: None,
             enabled: false,
             wire_api: None,
+            capabilities: Default::default(),
         }];
         assert!(
             build_runtime_option_catalog(&[agent], &[explicitly_disabled], &evidence)
