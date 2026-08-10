@@ -5993,38 +5993,22 @@ impl ManagementCenter {
             let show_install_prompt = added
                 && !agent.managed_install.managed
                 && agent.install_status == vibex_core::AgentInstallStatus::Missing;
-            let status_missing = added
-                && (show_install_prompt
-                    || (agent.enabled
-                        && agent.runtime_status != vibex_core::AgentRuntimeStatus::Ready));
             let status_label = management_agent_status_label(&agent);
-            let status_tooltip = SharedString::from(status_label);
-            let status_indicator = div()
-                .id(SharedString::from(format!("management-agent-status-{id}")))
+            let update_available = agent.managed_install.status
+                == vibex_core::AgentManagedInstallStatus::UpdateAvailable;
+            let update_label = management_agent_update_available_label();
+            let update_tooltip = SharedString::from(update_label);
+            let update_indicator = div()
+                .id(SharedString::from(format!("management-agent-update-{id}")))
                 .role(Role::Image)
-                .aria_label(status_label)
+                .aria_label(update_label)
                 .size(px(16.0))
                 .flex_none()
                 .flex()
                 .items_center()
                 .justify_center()
-                .when(status_missing, |indicator| {
-                    indicator
-                        .text_sm()
-                        .font_bold()
-                        .text_color(cx.theme().danger)
-                        .child("!")
-                })
-                .when(!status_missing, |indicator| {
-                    indicator.child(div().size(px(6.0)).rounded(px(3.0)).bg(
-                        if added && agent.enabled {
-                            cx.theme().success
-                        } else {
-                            cx.theme().muted_foreground.opacity(0.55)
-                        },
-                    ))
-                })
-                .tooltip(move |window, cx| Tooltip::new(status_tooltip.clone()).build(window, cx));
+                .child(div().size(px(6.0)).rounded(px(3.0)).bg(cx.theme().success))
+                .tooltip(move |window, cx| Tooltip::new(update_tooltip.clone()).build(window, cx));
             let profile_count = self
                 .snapshot
                 .profiles
@@ -6100,7 +6084,7 @@ impl ManagementCenter {
                                             .font_medium()
                                             .child(agent.label.clone()),
                                     )
-                                    .child(status_indicator)
+                                    .when(update_available, |title| title.child(update_indicator))
                                     .child(div().flex_1()),
                             )
                             .when(show_install_prompt, |actions| {
@@ -13522,6 +13506,10 @@ fn management_agent_toggle_selector_label() -> &'static str {
     )
 }
 
+fn management_agent_update_available_label() -> &'static str {
+    management_locale_text("ACP update available", "ACP 有可用更新", "ACP 有可用更新")
+}
+
 fn management_install_label() -> &'static str {
     management_locale_text("Install", "安装", "安裝")
 }
@@ -15527,6 +15515,25 @@ mod tests {
         assert!(!render_agents.contains(".w(px(3.0))"));
         assert!(!render_agents.contains("cx.theme().ring.opacity(0.60)"));
         assert!(render_agents.matches("cx.stop_propagation();").count() >= 4);
+    }
+
+    #[test]
+    fn agent_sidebar_dot_only_marks_available_acp_updates() {
+        let source = include_str!("management.rs");
+        let render_agents = source
+            .split_once("    fn render_agents(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_mcp_sidebar("))
+            .map(|(body, _)| body)
+            .expect("Agent sidebar renderer should remain inspectable");
+
+        assert!(render_agents.contains("let update_available = agent.managed_install.status"));
+        assert!(render_agents.contains("AgentManagedInstallStatus::UpdateAvailable"));
+        assert!(render_agents.contains(".when(update_available, |title|"));
+        assert!(render_agents.contains("management_agent_update_available_label()"));
+        assert!(render_agents.contains("cx.theme().success"));
+        assert!(!render_agents.contains("status_missing"));
+        assert!(!render_agents.contains("cx.theme().muted_foreground.opacity(0.55)"));
+        assert!(!render_agents.contains("agent.runtime_status"));
     }
 
     #[test]
