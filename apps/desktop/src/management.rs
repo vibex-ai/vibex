@@ -3853,37 +3853,40 @@ impl ManagementCenter {
 
     fn finish_provider_profile_drag(
         &mut self,
-        drag: &ProviderDisplayOrderDrag,
+        agent_id: &str,
+        profile_id: &str,
         cx: &mut Context<Self>,
     ) {
-        let target = self.provider_display_order_drop_target.take();
-        let state = self.provider_display_order_drag_state.take();
-        let valid_drag = state.as_ref().is_some_and(|state| {
-            state.agent_id == drag.agent_id && state.profile_id == drag.profile_id
-        });
-        if valid_drag && let Some(target) = target {
-            self.reorder_provider_profiles(&drag.profile_id, &target.profile_id, target.after, cx);
-        } else {
-            cx.notify();
+        let valid_drag = self
+            .provider_display_order_drag_state
+            .as_ref()
+            .is_some_and(|state| state.agent_id == agent_id && state.profile_id == profile_id);
+        if !valid_drag {
+            return;
         }
+        self.provider_display_order_drop_target = None;
+        let state = self
+            .provider_display_order_drag_state
+            .take()
+            .expect("validated provider drag state above");
+        if state.preview_ids == state.original_ids {
+            cx.notify();
+            return;
+        }
+        self.persist_provider_profile_order(&state.agent_id, state.preview_ids, cx);
     }
 
-    fn reorder_provider_profiles(
+    fn persist_provider_profile_order(
         &mut self,
-        moving_id: &str,
-        target_id: &str,
-        after: bool,
+        agent_id: &str,
+        ordered_ids: Vec<String>,
         cx: &mut Context<Self>,
     ) {
-        let Some(agent_id) = self.selected_agent_id.clone() else {
-            return;
-        };
-        let current_ids = self.ordered_provider_profile_ids(&agent_id);
-        let ordered_ids = reordered_provider_profile_ids(&current_ids, moving_id, target_id, after);
+        let current_ids = self.ordered_provider_profile_ids(agent_id);
         if ordered_ids == current_ids {
             return;
         }
-        let Ok(parsed_agent_id) = AgentId::parse(agent_id.clone()) else {
+        let Ok(parsed_agent_id) = AgentId::parse(agent_id.to_string()) else {
             return;
         };
         let Some(runtime) = self.runtime.clone() else {
@@ -3910,7 +3913,7 @@ impl ManagementCenter {
             }));
         cx.notify();
         self.begin_simple_task(
-            ManagementMutation::ProviderDisplayOrder(agent_id),
+            ManagementMutation::ProviderDisplayOrder(agent_id.to_string()),
             cx,
             async move {
                 runtime
@@ -8206,6 +8209,10 @@ impl ManagementCenter {
             let drag_entity = cx.weak_entity();
             let drag_agent_id = selected_agent_id.clone();
             let drag_profile_id = id.clone();
+            let release_agent_id = selected_agent_id.clone();
+            let release_profile_id = id.clone();
+            let release_out_agent_id = selected_agent_id.clone();
+            let release_out_profile_id = id.clone();
             let drag_handle = div()
                 .id(SharedString::from(format!("provider-drag-handle-{id}")))
                 .flex_none()
@@ -8228,6 +8235,26 @@ impl ManagementCenter {
                         .path("icons/vibex/grip-vertical.svg")
                         .size(px(18.0))
                         .text_color(cx.theme().muted_foreground.opacity(0.65)),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.finish_provider_profile_drag(
+                            &release_agent_id,
+                            &release_profile_id,
+                            cx,
+                        );
+                    }),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.finish_provider_profile_drag(
+                            &release_out_agent_id,
+                            &release_out_profile_id,
+                            cx,
+                        );
+                    }),
                 )
                 .on_drag(drag_payload, move |drag, _, _, cx| {
                     cx.stop_propagation();
@@ -8262,8 +8289,6 @@ impl ManagementCenter {
                     });
             let move_agent_id = selected_agent_id.clone();
             let move_profile_id = id.clone();
-            let drop_agent_id = selected_agent_id.clone();
-            let drop_profile_id = id.clone();
             let row = div()
                 .id(SharedString::from(format!("provider-row-{id}")))
                 .group(hover_group)
@@ -8338,21 +8363,6 @@ impl ManagementCenter {
                         }
                     },
                 ))
-                .on_drop(
-                    cx.listener(move |this, drag: &ProviderDisplayOrderDrag, _, cx| {
-                        let target_matches = this
-                            .provider_display_order_drop_target
-                            .as_ref()
-                            .is_some_and(|target| target.profile_id == drop_profile_id);
-                        if drag.agent_id == drop_agent_id && target_matches {
-                            this.finish_provider_profile_drag(drag, cx);
-                        } else {
-                            this.provider_display_order_drag_state = None;
-                            this.provider_display_order_drop_target = None;
-                            cx.notify();
-                        }
-                    }),
-                )
                 .child(drag_handle)
                 .child(selectable)
                 .child(actions);
@@ -15164,8 +15174,10 @@ mod tests {
         assert!(render.contains("provider-drag-handle-"));
         assert!(render.contains(".cursor_grab()"));
         assert!(render.contains(".on_drag_move(cx.listener("));
-        assert!(render.contains(".on_drop("));
+        assert!(render.contains(".on_mouse_up_out("));
         assert!(render.contains("finish_provider_profile_drag("));
+        assert!(source.contains("state.preview_ids"));
+        assert!(source.contains("persist_provider_profile_order("));
         assert!(render.contains("provider_display_order_drop_target"));
         assert!(source.contains("ProviderDisplayOrderDragState"));
         assert!(render.contains("MANAGEMENT_PROVIDER_ROW_HEIGHT"));
