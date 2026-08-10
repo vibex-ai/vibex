@@ -12737,6 +12737,8 @@ impl VibexWorkbench {
                         initial_message_error,
                         refreshed_session,
                     ))) => {
+                        let initial_message_completed =
+                            initial_message_sent && initial_message_error.is_none();
                         if initial_message_error.is_some() {
                             this.discard_optimistic_user_message(&session_id);
                         }
@@ -12762,6 +12764,33 @@ impl VibexWorkbench {
                         }
                         this.reconcile_sidebar_state();
                         this.refresh_workspace_contexts(cx);
+                        let has_queued_messages = this
+                            .composer_queue
+                            .iter()
+                            .any(|message| message.session_id == session_id);
+                        let steering = this
+                            .composer_queue_steering_session_ids
+                            .remove(session_id.as_str());
+                        let interrupted = this
+                            .composer_queue_interrupted_session_ids
+                            .remove(session_id.as_str());
+                        if initial_message_completed || steering || interrupted {
+                            this.maybe_dispatch_next_composer_queue_message(
+                                &session_id,
+                                if steering {
+                                    ComposerQueueDispatchBehavior::AfterInterrupt
+                                } else if initial_message_completed {
+                                    ComposerQueueDispatchBehavior::AfterCompletion
+                                } else {
+                                    ComposerQueueDispatchBehavior::Automatic
+                                },
+                                window,
+                                cx,
+                            );
+                        } else if has_queued_messages {
+                            this.composer_queue_paused_session_ids
+                                .insert(session_id.as_str().to_string());
+                        }
                     }
                     Ok(Err(error)) => {
                         this.fail_pending_new_session(
@@ -37505,6 +37534,38 @@ mod tests {
         assert!(pending_open.contains("self.install_optimistic_user_message(message);"));
         assert!(pending_open.contains("self.set_session_turn_pending(&session_id, true);"));
         assert!(pending_open.contains("self.agent_loading = false;"));
+    }
+
+    #[test]
+    fn new_session_initial_turn_completion_advances_the_composer_queue() {
+        let source = include_str!("app.rs");
+        let submit = source
+            .split_once("    fn submit_new_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn choose_runtime_selection("))
+            .map(|(body, _)| body)
+            .expect("new-session submission should remain inspectable");
+        let completion = submit
+            .split_once("            let outcome = runner.await;")
+            .map(|(_, body)| body)
+            .expect("new-session completion should remain inspectable");
+
+        let clear_pending = completion
+            .find("this.set_session_turn_pending(session_id, false);")
+            .expect("the initial turn should clear its local pending fence");
+        let clear_action = completion
+            .find("this.agent_action_pending = false;")
+            .expect("the new-session action lock should be released");
+        let dispatch = completion
+            .find("this.maybe_dispatch_next_composer_queue_message(")
+            .expect("successful initial turns should advance the Composer queue");
+
+        assert!(clear_pending < clear_action && clear_action < dispatch);
+        assert!(completion.contains("initial_message_completed"));
+        assert!(completion.contains("ComposerQueueDispatchBehavior::AfterCompletion"));
+        assert!(completion.contains("ComposerQueueDispatchBehavior::AfterInterrupt"));
+        assert!(completion.contains("composer_queue_steering_session_ids"));
+        assert!(completion.contains("composer_queue_interrupted_session_ids"));
+        assert!(completion.contains("composer_queue_paused_session_ids"));
     }
 
     #[test]

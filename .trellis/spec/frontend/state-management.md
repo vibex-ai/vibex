@@ -1046,7 +1046,10 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   queue dispatch may ignore a lagging sidebar `Running` snapshot. The local
   per-session turn-pending flag and an authoritative `NeedsInput` state remain
   hard fences, and the dispatch must still honor the global action lock, queue
-  pause state, and Auto/Manual send mode.
+  pause state, and Auto/Manual send mode. This same completion path applies to
+  the initial prompt of a newly created Session: release the new-session action
+  lock before advancing the queue, preserve pause behavior after prompt failure
+  or a user interrupt, and honor an explicit queued-message steer request.
 - Auto-continue is a safe local preference persisted in `DesktopUiStateV1`.
   Store project defaults separately from per-session boolean overrides so an
   explicit session disable survives restart even when its project default is
