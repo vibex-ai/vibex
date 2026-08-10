@@ -3242,6 +3242,12 @@ ProviderConfigService::{
   the generated provider id selected by that model's Wire API; Responses,
   Chat Completions, Anthropic Messages, Google Generative AI, and AWS Bedrock
   Converse therefore use their exact `provider/model` runtime namespaces.
+- The legacy `ProviderProfile` compatibility mirror maps a Claude product model
+  with a standalone `default`, `opus`, `sonnet`, or `haiku` family token to that
+  Claude ACP model alias while preserving the full `provider_model_id` as the
+  product identity. Other Claude model ids pass through unchanged. The
+  idempotent startup backfill repairs older mirrored rows that incorrectly used
+  the full Provider model id as the Claude Agent model id.
 - OpenCode model qualification is idempotent. A historical or imported
   `agent_model_id` that already starts with the generated provider id is used
   once, never expanded to `provider/provider/model` in either the overlay or
@@ -3327,7 +3333,8 @@ ProviderConfigService::{
   conservative unknown/manual behavior, all eight credential variants, and
   Codex Responses-only model binding.
 - Database tests assert v37 idempotent migration/backfill, three-entity CRUD and
-  revision CAS, legacy id preservation, and one Provider bound to two runtimes.
+  revision CAS, legacy id preservation, Claude legacy model alias repair, and
+  one Provider bound to two runtimes.
 - Config-switch tests assert deterministic env/JSON/TOML/YAML projection,
   private permissions, path/symlink rejection, late Secret resolution,
   redacted `Debug`/preview, selective stale propagation, and omission of an

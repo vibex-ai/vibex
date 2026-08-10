@@ -1604,7 +1604,7 @@ fn legacy_configured_model_bindings(
             Ok(AgentConfiguredModelBinding {
                 id: legacy_model_binding_id(binding_id, index)?,
                 provider_model_id: model.id.clone(),
-                agent_model_id: model.id,
+                agent_model_id: legacy_agent_model_id(&profile.agent_id, &model.id),
                 wire_protocol_id,
                 sdk_adapter_id,
                 deployment: None,
@@ -1613,6 +1613,20 @@ fn legacy_configured_model_bindings(
             })
         })
         .collect()
+}
+
+fn legacy_agent_model_id(agent_id: &AgentId, provider_model_id: &str) -> String {
+    if agent_id.as_str() != "claude" {
+        return provider_model_id.to_string();
+    }
+
+    provider_model_id
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .find_map(|part| {
+            let part = part.to_ascii_lowercase();
+            matches!(part.as_str(), "default" | "opus" | "sonnet" | "haiku").then_some(part)
+        })
+        .unwrap_or_else(|| provider_model_id.to_string())
 }
 
 fn legacy_headers(
@@ -2133,6 +2147,74 @@ mod tests {
             .unwrap()
             .len(),
             1
+        );
+    }
+
+    #[test]
+    fn legacy_claude_model_families_project_to_acp_aliases_and_repair_existing_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let mut profile = ProviderProfile::local_default(ProviderKind::Claude);
+        profile.id = ProviderProfileId::new();
+        profile.status = ProviderProfileStatus::Enabled;
+        profile.default_model = Some("claude-opus-5".to_string());
+        profile.configured_models = [
+            "claude-opus-5",
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5",
+            "custom-model",
+        ]
+        .into_iter()
+        .map(|id| ProviderConfiguredModel {
+            id: id.to_string(),
+            display_name: None,
+            enabled: true,
+            wire_api: None,
+        })
+        .collect();
+        ProviderProfileRepository::insert(&conn, &profile).unwrap();
+
+        let records =
+            ProviderProjectionCompatibilityRepository::sync_legacy_profile(&conn, &profile)
+                .unwrap();
+        assert_eq!(
+            records
+                .binding
+                .configured_models
+                .iter()
+                .map(|model| (
+                    model.provider_model_id.as_str(),
+                    model.agent_model_id.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("claude-opus-5", "opus"),
+                ("claude-sonnet-4-5", "sonnet"),
+                ("claude-haiku-4-5", "haiku"),
+                ("custom-model", "custom-model"),
+            ]
+        );
+
+        conn.execute(
+            "UPDATE agent_configured_model_bindings
+             SET agent_model_id = provider_model_id
+             WHERE agent_model_provider_binding_id = ?1",
+            [records.binding.id.as_str()],
+        )
+        .unwrap();
+
+        ProviderProjectionCompatibilityRepository::backfill_legacy_profiles(&conn).unwrap();
+        let repaired = AgentModelProviderBindingRepository::get(&conn, &records.binding.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            repaired
+                .configured_models
+                .iter()
+                .map(|model| model.agent_model_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["opus", "sonnet", "haiku", "custom-model"]
         );
     }
 
