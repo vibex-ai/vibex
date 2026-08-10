@@ -8262,6 +8262,8 @@ impl ManagementCenter {
                     });
             let move_agent_id = selected_agent_id.clone();
             let move_profile_id = id.clone();
+            let drop_agent_id = selected_agent_id.clone();
+            let drop_profile_id = id.clone();
             let row = div()
                 .id(SharedString::from(format!("provider-row-{id}")))
                 .group(hover_group)
@@ -8336,6 +8338,21 @@ impl ManagementCenter {
                         }
                     },
                 ))
+                .on_drop(
+                    cx.listener(move |this, drag: &ProviderDisplayOrderDrag, _, cx| {
+                        let target_matches = this
+                            .provider_display_order_drop_target
+                            .as_ref()
+                            .is_some_and(|target| target.profile_id == drop_profile_id);
+                        if drag.agent_id == drop_agent_id && target_matches {
+                            this.finish_provider_profile_drag(drag, cx);
+                        } else {
+                            this.provider_display_order_drag_state = None;
+                            this.provider_display_order_drop_target = None;
+                            cx.notify();
+                        }
+                    }),
+                )
                 .child(drag_handle)
                 .child(selectable)
                 .child(actions);
@@ -8354,19 +8371,6 @@ impl ManagementCenter {
             };
             profile_rows = profile_rows.child(row);
         }
-
-        let drop_agent_id = selected_agent_id.clone();
-        profile_rows = profile_rows.on_drop(cx.listener(
-            move |this, drag: &ProviderDisplayOrderDrag, _, cx| {
-                if drag.agent_id == drop_agent_id {
-                    this.finish_provider_profile_drag(drag, cx);
-                } else {
-                    this.provider_display_order_drag_state = None;
-                    this.provider_display_order_drop_target = None;
-                    cx.notify();
-                }
-            },
-        ));
 
         let installation = self.render_agent_installation_card(&selected_agent, window, cx);
         let provider_configuration = v_flex()
