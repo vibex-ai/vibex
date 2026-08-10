@@ -183,6 +183,12 @@ const RIGHT_ACTIVITY_BAR_VERTICAL_PADDING: f32 = 8.0;
 const UNSUPPORTED_RIGHT_RAIL_WEB_BUILTINS: &[&str] = &["doubao", "kimi", "yuanbao"];
 const SIDEBAR_INLINE_TRANSITION_DURATION: Duration = Duration::from_millis(200);
 const SIDEBAR_FLOATING_TRANSITION_DURATION: Duration = Duration::from_millis(200);
+const SIDEBAR_REORDER_TRANSITION_DURATION: Duration = Duration::from_millis(160);
+const SIDEBAR_REORDER_ROW_HEIGHT: f32 = 32.0;
+const SIDEBAR_PROJECT_REORDER_GAP: f32 = 4.0;
+const SIDEBAR_SESSION_REORDER_GAP: f32 = 2.0;
+const SIDEBAR_DRAG_PREVIEW_WIDTH: f32 = 280.0;
+const SIDEBAR_DRAG_HORIZONTAL_SLOP: f32 = 16.0;
 const STARTUP_LOADING_INDICATOR_DELAY: Duration = Duration::from_secs(5);
 const STARTUP_LOADING_MIN_DURATION: Duration = Duration::from_secs(1);
 // Tauri parity: submission locators poll `agent_get_message_submission` every 500ms.
@@ -2999,22 +3005,41 @@ struct SidebarSessionDrag {
     session_id: VibexSessionId,
     workspace_id: String,
     label: SharedString,
+    agent_id: String,
+    pinned: bool,
 }
 
 impl Render for SidebarSessionDrag {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
+            .w(px(SIDEBAR_DRAG_PREVIEW_WIDTH))
+            .h(px(SIDEBAR_REORDER_ROW_HEIGHT))
+            .min_w_0()
             .gap_2()
-            .px_3()
-            .py_1()
-            .rounded_sm()
+            .px_2()
+            .rounded(px(8.0))
             .border_1()
             .border_color(cx.theme().drag_border)
             .bg(cx.theme().sidebar)
             .text_color(cx.theme().sidebar_foreground)
-            .shadow_md()
-            .child(Icon::new(IconName::ChevronsUpDown).small())
-            .child(self.label.clone())
+            .shadow_lg()
+            .opacity(0.94)
+            .when(self.pinned, |this| {
+                this.child(
+                    sidebar_icon("icons/vibex/pin.svg")
+                        .size(px(12.0))
+                        .text_color(cx.theme().warning),
+                )
+            })
+            .child(sidebar_agent_logo(&self.agent_id, false, cx))
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .truncate()
+                    .text_sm()
+                    .child(self.label.clone()),
+            )
     }
 }
 
@@ -3022,6 +3047,14 @@ impl Render for SidebarSessionDrag {
 struct SidebarSessionDropTarget {
     session_id: VibexSessionId,
     after: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidebarSessionDragState {
+    workspace_id: String,
+    session_id: VibexSessionId,
+    original_ids: Vec<String>,
+    preview_ids: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -3033,17 +3066,28 @@ struct SidebarProjectDrag {
 impl Render for SidebarProjectDrag {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
+            .w(px(SIDEBAR_DRAG_PREVIEW_WIDTH))
+            .h(px(SIDEBAR_REORDER_ROW_HEIGHT))
+            .min_w_0()
             .gap_2()
-            .px_3()
-            .py_1()
-            .rounded_sm()
+            .px_2()
+            .rounded(px(8.0))
             .border_1()
             .border_color(cx.theme().drag_border)
             .bg(cx.theme().sidebar)
             .text_color(cx.theme().sidebar_foreground)
-            .shadow_md()
+            .shadow_lg()
+            .opacity(0.94)
             .child(Icon::new(IconName::Folder).small())
-            .child(self.label.clone())
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .truncate()
+                    .text_sm()
+                    .font_semibold()
+                    .child(self.label.clone()),
+            )
     }
 }
 
@@ -3051,6 +3095,13 @@ impl Render for SidebarProjectDrag {
 struct SidebarProjectDropTarget {
     project_id: String,
     after: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidebarProjectDragState {
+    project_id: String,
+    original_ids: Vec<String>,
+    preview_ids: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -3335,6 +3386,8 @@ pub struct VibexWorkbench {
     sidebar_batch_mode: bool,
     sidebar_renaming_session_id: Option<VibexSessionId>,
     sidebar_rename_error: Option<String>,
+    sidebar_project_drag_state: Option<SidebarProjectDragState>,
+    sidebar_session_drag_state: Option<SidebarSessionDragState>,
     sidebar_project_drop_target: Option<SidebarProjectDropTarget>,
     sidebar_session_drop_target: Option<SidebarSessionDropTarget>,
     new_session_agent_drop_target: Option<NewSessionAgentDropTarget>,
@@ -3874,6 +3927,8 @@ impl VibexWorkbench {
             sidebar_batch_mode: false,
             sidebar_renaming_session_id: None,
             sidebar_rename_error: None,
+            sidebar_project_drag_state: None,
+            sidebar_session_drag_state: None,
             sidebar_project_drop_target: None,
             sidebar_session_drop_target: None,
             new_session_agent_drop_target: None,
@@ -6034,6 +6089,237 @@ impl VibexWorkbench {
         }
         self.queue_ui_state();
         cx.notify();
+    }
+
+    fn start_sidebar_project_drag(
+        &mut self,
+        project_id: &str,
+        cursor_offset_y: f32,
+        source_was_collapsed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let original_ids = self
+            .sidebar_workspace_groups("")
+            .iter()
+            .map(|group| group.project.id.as_str().to_string())
+            .collect::<Vec<_>>();
+        if !original_ids.iter().any(|id| id == project_id) {
+            return;
+        }
+        let initial_target = if source_was_collapsed {
+            reorder_target_from_cursor_offset(
+                &original_ids,
+                project_id,
+                cursor_offset_y,
+                SIDEBAR_REORDER_ROW_HEIGHT,
+                SIDEBAR_PROJECT_REORDER_GAP,
+            )
+        } else {
+            let moving_index = original_ids.iter().position(|id| id == project_id);
+            let displacement = cursor_offset_y - SIDEBAR_REORDER_ROW_HEIGHT / 2.0;
+            let index_delta = if displacement > SIDEBAR_REORDER_ROW_HEIGHT {
+                1
+            } else if displacement < -SIDEBAR_REORDER_ROW_HEIGHT {
+                -1
+            } else {
+                0
+            };
+            moving_index.and_then(|moving_index| {
+                let target_index = moving_index
+                    .saturating_add_signed(index_delta)
+                    .min(original_ids.len().saturating_sub(1));
+                (target_index != moving_index).then(|| {
+                    (
+                        original_ids[target_index].clone(),
+                        target_index > moving_index,
+                    )
+                })
+            })
+        };
+        let preview_ids = initial_target
+            .as_ref()
+            .map(|(target_id, after)| {
+                reordered_string_ids(&original_ids, project_id, target_id, *after)
+            })
+            .unwrap_or_else(|| original_ids.clone());
+        self.sidebar_project_drag_state = Some(SidebarProjectDragState {
+            project_id: project_id.to_string(),
+            preview_ids,
+            original_ids,
+        });
+        self.sidebar_project_drop_target = initial_target
+            .map(|(project_id, after)| SidebarProjectDropTarget { project_id, after });
+        cx.notify();
+    }
+
+    fn preview_sidebar_project_reorder(
+        &mut self,
+        drag: &SidebarProjectDrag,
+        target_id: &str,
+        after: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self
+            .sidebar_project_drag_state
+            .as_mut()
+            .filter(|state| state.project_id == drag.project_id)
+        else {
+            return;
+        };
+        let next_target = SidebarProjectDropTarget {
+            project_id: target_id.to_string(),
+            after,
+        };
+        let next_ids =
+            reordered_string_ids(&state.original_ids, &drag.project_id, target_id, after);
+        if self.sidebar_project_drop_target.as_ref() == Some(&next_target)
+            && state.preview_ids == next_ids
+        {
+            return;
+        }
+        state.preview_ids = next_ids;
+        self.sidebar_project_drop_target = Some(next_target);
+        cx.notify();
+    }
+
+    fn finish_sidebar_project_drag(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        let valid_drag = self
+            .sidebar_project_drag_state
+            .as_ref()
+            .is_some_and(|state| state.project_id == project_id);
+        if !valid_drag {
+            return;
+        }
+        self.sidebar_project_drop_target = None;
+        let state = self
+            .sidebar_project_drag_state
+            .take()
+            .expect("validated sidebar project drag state above");
+        if let Some((target_id, after)) =
+            reorder_target_from_preview(&state.original_ids, &state.preview_ids, &state.project_id)
+        {
+            self.move_project_order_relative(&state.project_id, &target_id, after, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn start_sidebar_session_drag(
+        &mut self,
+        drag: &SidebarSessionDrag,
+        cursor_offset_y: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let original_ids = self
+            .sidebar_workspace_groups("")
+            .iter()
+            .flat_map(|group| group.workspaces.iter())
+            .find(|workspace| workspace.workspace.id.as_str() == drag.workspace_id)
+            .map(|workspace| {
+                workspace
+                    .sessions
+                    .iter()
+                    .map(|session| session.id.as_str().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !original_ids.iter().any(|id| id == drag.session_id.as_str()) {
+            return;
+        }
+        let initial_target = reorder_target_from_cursor_offset(
+            &original_ids,
+            drag.session_id.as_str(),
+            cursor_offset_y,
+            SIDEBAR_REORDER_ROW_HEIGHT,
+            SIDEBAR_SESSION_REORDER_GAP,
+        );
+        let preview_ids = initial_target
+            .as_ref()
+            .map(|(target_id, after)| {
+                reordered_string_ids(&original_ids, drag.session_id.as_str(), target_id, *after)
+            })
+            .unwrap_or_else(|| original_ids.clone());
+        self.sidebar_session_drag_state = Some(SidebarSessionDragState {
+            workspace_id: drag.workspace_id.clone(),
+            session_id: drag.session_id.clone(),
+            preview_ids,
+            original_ids,
+        });
+        self.sidebar_session_drop_target = initial_target.and_then(|(session_id, after)| {
+            VibexSessionId::parse(session_id)
+                .ok()
+                .map(|session_id| SidebarSessionDropTarget { session_id, after })
+        });
+        cx.notify();
+    }
+
+    fn preview_sidebar_session_reorder(
+        &mut self,
+        drag: &SidebarSessionDrag,
+        target_id: &VibexSessionId,
+        after: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.sidebar_session_drag_state.as_mut().filter(|state| {
+            state.workspace_id == drag.workspace_id && state.session_id == drag.session_id
+        }) else {
+            return;
+        };
+        let next_target = SidebarSessionDropTarget {
+            session_id: target_id.clone(),
+            after,
+        };
+        let next_ids = reordered_string_ids(
+            &state.original_ids,
+            drag.session_id.as_str(),
+            target_id.as_str(),
+            after,
+        );
+        if self.sidebar_session_drop_target.as_ref() == Some(&next_target)
+            && state.preview_ids == next_ids
+        {
+            return;
+        }
+        state.preview_ids = next_ids;
+        self.sidebar_session_drop_target = Some(next_target);
+        cx.notify();
+    }
+
+    fn finish_sidebar_session_drag(
+        &mut self,
+        workspace_id: &str,
+        session_id: &VibexSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let valid_drag = self
+            .sidebar_session_drag_state
+            .as_ref()
+            .is_some_and(|state| {
+                state.workspace_id == workspace_id && state.session_id == *session_id
+            });
+        if !valid_drag {
+            return;
+        }
+        self.sidebar_session_drop_target = None;
+        let state = self
+            .sidebar_session_drag_state
+            .take()
+            .expect("validated sidebar session drag state above");
+        if let Some((target_id, after)) = reorder_target_from_preview(
+            &state.original_ids,
+            &state.preview_ids,
+            state.session_id.as_str(),
+        ) {
+            self.move_session_order_relative(
+                &state.workspace_id,
+                state.session_id.as_str(),
+                &target_id,
+                after,
+                cx,
+            );
+        } else {
+            cx.notify();
+        }
     }
 
     fn move_project_order_relative(
@@ -15343,6 +15629,19 @@ impl VibexWorkbench {
     fn render_agent_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let strings = self.strings();
         let groups = self.sidebar_workspace_groups("");
+        let active_project_drag = self
+            .sidebar_project_drag_state
+            .clone()
+            .filter(|_| cx.has_active_drag());
+        let mut ordered_groups = groups.iter().collect::<Vec<_>>();
+        if let Some(drag) = active_project_drag.as_ref() {
+            ordered_groups.sort_by_key(|group| {
+                drag.preview_ids
+                    .iter()
+                    .position(|id| id == group.project.id.as_str())
+                    .unwrap_or(usize::MAX)
+            });
+        }
         let reorder_enabled = !self.sidebar_batch_mode;
         let all_session_ids = self
             .sessions
@@ -15362,8 +15661,8 @@ impl VibexWorkbench {
                 self.selected_session()
                     .map(|session| session.workspace_id.as_str().to_string())
             });
-        let mut group_elements = Vec::with_capacity(groups.len());
-        for group in groups.iter() {
+        let mut group_elements = Vec::with_capacity(ordered_groups.len());
+        for group in ordered_groups {
             let active = group.workspaces.iter().any(|workspace| {
                 sidebar_project_is_active(
                     selected_workspace_id.as_deref(),
@@ -15731,10 +16030,19 @@ impl VibexWorkbench {
         else {
             return Empty.into_any_element();
         };
-        let collapsed = self
+        let active_project_drag = self
+            .sidebar_project_drag_state
+            .clone()
+            .filter(|_| cx.has_active_drag());
+        let active_session_drag = self
+            .sidebar_session_drag_state
+            .clone()
+            .filter(|_| cx.has_active_drag());
+        let project_was_collapsed = self
             .sidebar_state
             .collapsed_ids
             .contains(&project_id_string);
+        let collapsed = active_project_drag.is_some() || project_was_collapsed;
         let project_session_ids = group
             .compact_sessions
             .iter()
@@ -15955,7 +16263,11 @@ impl VibexWorkbench {
                     if group.compact_sessions.is_empty() {
                         session_elements.push(sidebar_empty_sessions(strings, cx));
                     } else {
-                        for session in &group.compact_sessions {
+                        let sessions = sidebar_sessions_with_drag_preview(
+                            &group.compact_sessions,
+                            active_session_drag.as_ref(),
+                        );
+                        for session in &sessions {
                             session_elements.push(self.render_sidebar_session(
                                 session,
                                 reorder_enabled,
@@ -15983,10 +16295,32 @@ impl VibexWorkbench {
             project_id: project_id_string.clone(),
             label: project_name.into(),
         };
+        let reorder_offset = active_project_drag
+            .as_ref()
+            .and_then(|drag| {
+                sidebar_reorder_row_offset(
+                    &drag.original_ids,
+                    &drag.preview_ids,
+                    &project_id_string,
+                )
+            })
+            .map(|rows| {
+                px(rows as f32 * (SIDEBAR_REORDER_ROW_HEIGHT + SIDEBAR_PROJECT_REORDER_GAP))
+            });
+        let reorder_animation_id = active_project_drag
+            .as_ref()
+            .zip(self.sidebar_project_drop_target.as_ref())
+            .map(|(drag, target)| {
+                format!(
+                    "sidebar-project-reorder-{}-{}-{}-{}",
+                    drag.project_id, target.project_id, target.after, project_id_string
+                )
+            });
         let drag_entity = cx.weak_entity();
         let drag_target_project_id = project_id_string.clone();
-        let drop_target_project_id = project_id_string.clone();
-        v_flex()
+        let release_project_id = project_id_string.clone();
+        let release_out_project_id = project_id_string.clone();
+        let project = v_flex()
             .id(format!("sidebar-project-{project_id_string}"))
             .relative()
             .w_full()
@@ -16004,47 +16338,64 @@ impl VibexWorkbench {
                 )
             })
             .when(reorder_enabled, |this| {
-                this.on_drag(drag_payload, move |drag, _, _, cx| {
+                this.on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.finish_sidebar_project_drag(&release_project_id, cx);
+                    }),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.finish_sidebar_project_drag(&release_out_project_id, cx);
+                    }),
+                )
+                .on_drag(drag_payload, move |drag, cursor_offset, _, cx| {
                     cx.stop_propagation();
                     let _ = drag_entity.update(cx, |this, cx| {
-                        this.sidebar_project_drop_target = None;
-                        cx.notify();
+                        this.start_sidebar_project_drag(
+                            &drag.project_id,
+                            f32::from(cursor_offset.y),
+                            project_was_collapsed,
+                            cx,
+                        );
                     });
                     cx.new(|_| drag.clone())
                 })
                 .on_drag_move(cx.listener(
                     move |this, event: &DragMoveEvent<SidebarProjectDrag>, _, cx| {
-                        let drag = event.drag(cx);
-                        let next = (event.bounds.contains(&event.event.position)
-                            && drag.project_id != drag_target_project_id)
+                        let drag = event.drag(cx).clone();
+                        let position = event.event.position;
+                        let inside_target = position.x
+                            >= event.bounds.left() - px(SIDEBAR_DRAG_HORIZONTAL_SLOP)
+                            && position.x
+                                <= event.bounds.right() + px(SIDEBAR_DRAG_HORIZONTAL_SLOP)
+                            && position.y
+                                >= event.bounds.top() - px(SIDEBAR_PROJECT_REORDER_GAP / 2.0)
+                            && position.y
+                                <= event.bounds.bottom() + px(SIDEBAR_PROJECT_REORDER_GAP / 2.0);
+                        let next = (inside_target && drag.project_id != drag_target_project_id)
                             .then_some(SidebarProjectDropTarget {
                                 project_id: drag_target_project_id.clone(),
-                                after: event.event.position.y >= event.bounds.center().y,
+                                after: position.y >= event.bounds.center().y,
                             });
-                        if this.sidebar_project_drop_target != next {
-                            this.sidebar_project_drop_target = next;
-                            cx.notify();
-                        }
-                    },
-                ))
-                .on_drop(cx.listener(
-                    move |this, drag: &SidebarProjectDrag, _, cx| {
-                        let target = this.sidebar_project_drop_target.take();
-                        if let Some(target) =
-                            target.filter(|target| target.project_id == drop_target_project_id)
-                        {
-                            this.move_project_order_relative(
-                                &drag.project_id,
-                                &target.project_id,
-                                target.after,
+                        if let Some(next) = next {
+                            this.preview_sidebar_project_reorder(
+                                &drag,
+                                &next.project_id,
+                                next.after,
                                 cx,
                             );
-                        } else {
-                            cx.notify();
                         }
                     },
                 ))
             })
+            .when(
+                active_project_drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.project_id == project_id_string),
+                |this| this.opacity(0.45),
+            )
             .child(project_row)
             .when(!collapsed, |this| {
                 this.child(
@@ -16062,8 +16413,16 @@ impl VibexWorkbench {
                         )
                         .children(session_elements),
                 )
-            })
-            .into_any_element()
+            });
+        if let (Some(offset), Some(animation_id)) = (reorder_offset, reorder_animation_id) {
+            Transition::new(SIDEBAR_REORDER_TRANSITION_DURATION)
+                .ease(ease_out_cubic)
+                .slide_y(offset, px(0.0))
+                .apply(project, animation_id)
+                .into_any_element()
+        } else {
+            project.into_any_element()
+        }
     }
 
     fn render_sidebar_workspace(
@@ -16197,11 +16556,16 @@ impl VibexWorkbench {
                     })),
             );
 
-        let sessions = if projection.sessions.is_empty() {
+        let active_session_drag = self
+            .sidebar_session_drag_state
+            .clone()
+            .filter(|_| cx.has_active_drag());
+        let sessions =
+            sidebar_sessions_with_drag_preview(&projection.sessions, active_session_drag.as_ref());
+        let sessions = if sessions.is_empty() {
             vec![sidebar_empty_sessions(strings, cx)]
         } else {
-            projection
-                .sessions
+            sessions
                 .iter()
                 .map(|session| {
                     self.render_sidebar_session(session, reorder_enabled, false, strings, cx)
@@ -16413,6 +16777,9 @@ impl VibexWorkbench {
             .flatten();
         let time_label =
             format_sidebar_session_time(session.updated_at_ms, self.resolved_locale(), strings);
+        let active_session_drag = self.sidebar_session_drag_state.clone().filter(|state| {
+            cx.has_active_drag() && state.workspace_id == session.workspace_id.as_str()
+        });
         let active_drop_after = self
             .sidebar_session_drop_target
             .as_ref()
@@ -16423,19 +16790,47 @@ impl VibexWorkbench {
             session_id: session.id.clone(),
             workspace_id: session.workspace_id.as_str().to_string(),
             label: session.title.clone().into(),
+            agent_id: sidebar_agent_id.as_str().to_string(),
+            pinned,
         };
+        let reorder_offset = active_session_drag
+            .as_ref()
+            .and_then(|drag| {
+                sidebar_reorder_row_offset(
+                    &drag.original_ids,
+                    &drag.preview_ids,
+                    session.id.as_str(),
+                )
+            })
+            .map(|rows| {
+                px(rows as f32 * (SIDEBAR_REORDER_ROW_HEIGHT + SIDEBAR_SESSION_REORDER_GAP))
+            });
+        let reorder_animation_id = active_session_drag
+            .as_ref()
+            .zip(self.sidebar_session_drop_target.as_ref())
+            .map(|(drag, target)| {
+                format!(
+                    "sidebar-session-reorder-{}-{}-{}-{}",
+                    drag.session_id.as_str(),
+                    target.session_id.as_str(),
+                    target.after,
+                    session.id.as_str()
+                )
+            });
         let drag_entity = cx.weak_entity();
         let drag_target_session_id = session.id.clone();
         let drag_target_workspace_id = session.workspace_id.as_str().to_string();
-        let drop_target_session_id = session.id.clone();
-        let drop_target_workspace_id = session.workspace_id.as_str().to_string();
+        let release_session_id = session.id.clone();
+        let release_workspace_id = session.workspace_id.as_str().to_string();
+        let release_out_session_id = session.id.clone();
+        let release_out_workspace_id = session.workspace_id.as_str().to_string();
         let selection_indicator_state = if batch_selected {
             SidebarSelectionState::Checked
         } else {
             SidebarSelectionState::Unchecked
         };
 
-        div()
+        let row = div()
             .id(format!("sidebar-session-row-{session_id_string}"))
             .group(hover_group.clone())
             .relative()
@@ -16462,50 +16857,70 @@ impl VibexWorkbench {
                 )
             })
             .when(reorder_enabled, |this| {
-                this.on_drag(drag_payload, move |drag, _, _, cx| {
+                this.on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.finish_sidebar_session_drag(
+                            &release_workspace_id,
+                            &release_session_id,
+                            cx,
+                        );
+                    }),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.finish_sidebar_session_drag(
+                            &release_out_workspace_id,
+                            &release_out_session_id,
+                            cx,
+                        );
+                    }),
+                )
+                .on_drag(drag_payload, move |drag, cursor_offset, _, cx| {
                     cx.stop_propagation();
                     let _ = drag_entity.update(cx, |this, cx| {
-                        this.sidebar_session_drop_target = None;
-                        cx.notify();
+                        this.start_sidebar_session_drag(drag, f32::from(cursor_offset.y), cx);
                     });
                     cx.new(|_| drag.clone())
                 })
                 .on_drag_move(cx.listener(
                     move |this, event: &DragMoveEvent<SidebarSessionDrag>, _, cx| {
-                        let drag = event.drag(cx);
-                        let next = (event.bounds.contains(&event.event.position)
+                        let drag = event.drag(cx).clone();
+                        let position = event.event.position;
+                        let inside_target = position.x
+                            >= event.bounds.left() - px(SIDEBAR_DRAG_HORIZONTAL_SLOP)
+                            && position.x
+                                <= event.bounds.right() + px(SIDEBAR_DRAG_HORIZONTAL_SLOP)
+                            && position.y
+                                >= event.bounds.top() - px(SIDEBAR_SESSION_REORDER_GAP / 2.0)
+                            && position.y
+                                <= event.bounds.bottom() + px(SIDEBAR_SESSION_REORDER_GAP / 2.0);
+                        let next = (inside_target
                             && drag.session_id != drag_target_session_id
-                            && drag.workspace_id == drag_target_workspace_id)
+                            && drag.workspace_id == drag_target_workspace_id
+                            && drag.pinned == pinned)
                             .then_some(SidebarSessionDropTarget {
                                 session_id: drag_target_session_id.clone(),
-                                after: event.event.position.y >= event.bounds.center().y,
+                                after: position.y >= event.bounds.center().y,
                             });
-                        if this.sidebar_session_drop_target != next {
-                            this.sidebar_session_drop_target = next;
-                            cx.notify();
-                        }
-                    },
-                ))
-                .on_drop(cx.listener(
-                    move |this, drag: &SidebarSessionDrag, _, cx| {
-                        let target = this.sidebar_session_drop_target.take();
-                        if let Some(target) = target.filter(|target| {
-                            target.session_id == drop_target_session_id
-                                && drag.workspace_id == drop_target_workspace_id
-                        }) {
-                            this.move_session_order_relative(
-                                &drag.workspace_id,
-                                drag.session_id.as_str(),
-                                target.session_id.as_str(),
-                                target.after,
+                        if let Some(next) = next {
+                            this.preview_sidebar_session_reorder(
+                                &drag,
+                                &next.session_id,
+                                next.after,
                                 cx,
                             );
-                        } else {
-                            cx.notify();
                         }
                     },
                 ))
             })
+            .when(
+                active_session_drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.session_id == session.id),
+                |this| this.opacity(0.45),
+            )
             .child(
                 h_flex()
                     .id(format!("sidebar-session-select-{session_id_string}"))
@@ -16793,8 +17208,16 @@ impl VibexWorkbench {
                                 })),
                         ),
                 )
-            })
-            .into_any_element()
+            });
+        if let (Some(offset), Some(animation_id)) = (reorder_offset, reorder_animation_id) {
+            Transition::new(SIDEBAR_REORDER_TRANSITION_DURATION)
+                .ease(ease_out_cubic)
+                .slide_y(offset, px(0.0))
+                .apply(row, animation_id)
+                .into_any_element()
+        } else {
+            row.into_any_element()
+        }
     }
 
     fn render_runtime_choice_popover(
@@ -27539,6 +27962,111 @@ fn move_string_relative(
     true
 }
 
+fn reordered_string_ids(
+    ordered_ids: &[String],
+    moving_id: &str,
+    target_id: &str,
+    after: bool,
+) -> Vec<String> {
+    let mut reordered = ordered_ids.to_vec();
+    let _ = move_string_relative(&mut reordered, moving_id, target_id, after);
+    reordered
+}
+
+fn reorder_target_from_preview(
+    original_ids: &[String],
+    preview_ids: &[String],
+    moving_id: &str,
+) -> Option<(String, bool)> {
+    let original_index = original_ids.iter().position(|id| id == moving_id)?;
+    let preview_index = preview_ids.iter().position(|id| id == moving_id)?;
+    if preview_index == original_index {
+        return None;
+    }
+    if preview_index < original_index {
+        preview_ids
+            .get(preview_index + 1)
+            .cloned()
+            .map(|target_id| (target_id, false))
+    } else {
+        preview_index
+            .checked_sub(1)
+            .and_then(|index| preview_ids.get(index))
+            .cloned()
+            .map(|target_id| (target_id, true))
+    }
+}
+
+fn reorder_target_from_cursor_offset(
+    ordered_ids: &[String],
+    moving_id: &str,
+    cursor_offset_y: f32,
+    row_height: f32,
+    row_gap: f32,
+) -> Option<(String, bool)> {
+    let moving_index = ordered_ids.iter().position(|id| id == moving_id)?;
+    let stride = row_height + row_gap;
+    if stride <= 0.0 {
+        return None;
+    }
+    let row_delta = ((cursor_offset_y - row_height / 2.0) / stride).round() as isize;
+    if row_delta == 0 {
+        return None;
+    }
+    let target_index = moving_index
+        .saturating_add_signed(row_delta)
+        .min(ordered_ids.len().saturating_sub(1));
+    (target_index != moving_index).then(|| {
+        (
+            ordered_ids[target_index].clone(),
+            target_index > moving_index,
+        )
+    })
+}
+
+fn sidebar_reorder_row_offset(
+    original_ids: &[String],
+    preview_ids: &[String],
+    row_id: &str,
+) -> Option<isize> {
+    let original_index = original_ids.iter().position(|id| id == row_id)?;
+    let preview_index = preview_ids.iter().position(|id| id == row_id)?;
+    let offset = isize::try_from(original_index).ok()? - isize::try_from(preview_index).ok()?;
+    (offset != 0).then_some(offset)
+}
+
+fn sidebar_sessions_with_drag_preview(
+    sessions: &[AgentSession],
+    drag: Option<&SidebarSessionDragState>,
+) -> Vec<AgentSession> {
+    let Some(drag) = drag else {
+        return sessions.to_vec();
+    };
+    let mut reordered = sessions.to_vec();
+    let slots = sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, session)| {
+            session.workspace_id.as_str() == drag.workspace_id
+                && drag.original_ids.iter().any(|id| id == session.id.as_str())
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if slots.len() != drag.preview_ids.len() {
+        return reordered;
+    }
+    for (slot, session_id) in slots.into_iter().zip(&drag.preview_ids) {
+        let Some(session) = sessions
+            .iter()
+            .find(|session| session.id.as_str() == session_id)
+        else {
+            return sessions.to_vec();
+        };
+        reordered[slot] = session.clone();
+    }
+    reordered
+}
+
 fn sidebar_selection_state(
     session_ids: &[String],
     selected_ids: &BTreeSet<String>,
@@ -35659,6 +36187,60 @@ mod tests {
 
         assert!(move_string_relative(&mut order, "gemini", "claude", false,));
         assert_eq!(order, ["gemini", "claude", "codex"]);
+    }
+
+    #[test]
+    fn sidebar_reorder_preview_supports_fast_motion_and_release() {
+        let ids = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let target = reorder_target_from_cursor_offset(
+            &ids,
+            "b",
+            SIDEBAR_REORDER_ROW_HEIGHT / 2.0
+                + 2.0 * (SIDEBAR_REORDER_ROW_HEIGHT + SIDEBAR_SESSION_REORDER_GAP),
+            SIDEBAR_REORDER_ROW_HEIGHT,
+            SIDEBAR_SESSION_REORDER_GAP,
+        );
+        assert_eq!(target, Some(("d".to_string(), true)));
+
+        let preview = reordered_string_ids(&ids, "b", "d", true);
+        assert_eq!(preview, ["a", "c", "d", "b"]);
+        assert_eq!(
+            reorder_target_from_preview(&ids, &preview, "b"),
+            Some(("d".to_string(), true))
+        );
+        assert_eq!(sidebar_reorder_row_offset(&ids, &preview, "b"), Some(-2));
+        assert_eq!(sidebar_reorder_row_offset(&ids, &preview, "c"), Some(1));
+    }
+
+    #[test]
+    fn sidebar_project_and_session_drags_use_full_preview_and_reorder_animation() {
+        let source = include_str!("app.rs");
+        let project = source
+            .split_once("    fn render_sidebar_project(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_workspace("))
+            .map(|(body, _)| body)
+            .expect("project renderer should remain inspectable");
+        let session = source
+            .split_once("    fn render_sidebar_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_choice_popover("))
+            .map(|(body, _)| body)
+            .expect("session renderer should remain inspectable");
+
+        assert!(source.contains("SidebarProjectDragState"));
+        assert!(source.contains("SidebarSessionDragState"));
+        assert!(source.contains("SIDEBAR_DRAG_PREVIEW_WIDTH"));
+        assert!(project.contains("active_project_drag.is_some() || project_was_collapsed"));
+        assert!(project.contains("preview_sidebar_project_reorder("));
+        assert!(project.contains("finish_sidebar_project_drag("));
+        assert!(project.contains("Transition::new(SIDEBAR_REORDER_TRANSITION_DURATION)"));
+        assert!(session.contains("preview_sidebar_session_reorder("));
+        assert!(session.contains("finish_sidebar_session_drag("));
+        assert!(session.contains("Transition::new(SIDEBAR_REORDER_TRANSITION_DURATION)"));
+        assert!(project.contains(".on_mouse_up_out("));
+        assert!(session.contains(".on_mouse_up_out("));
     }
 
     #[test]

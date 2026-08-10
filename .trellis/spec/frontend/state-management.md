@@ -941,6 +941,14 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   drop may reorder only another session in the same project and pin band; the
   deterministic `SidebarState.row_order` mutation owns before/after insertion and
   the UI persists it only after a real move.
+- GPUI dispatches a typed `on_drag_move` callback to every rendered target that
+  listens for that drag type. A row that does not contain the pointer must not
+  clear the shared reorder target established by the row that does contain it.
+  Keep the last valid preview order, widen row hit testing across the inter-row
+  gap, and commit that preview from the drag source's inside/outside mouse-release
+  handlers instead of requiring the animated target row to remain under the
+  pointer. Project reordering may transiently collapse project children so target
+  geometry stays fixed; restore the persisted collapsed state after release.
 - When runtime selection is `failed_using_previous`, Retry re-enqueues the
   remembered desired selection through the durable selector, while Reset
   requests the effective selection. Neither action mutates effective state

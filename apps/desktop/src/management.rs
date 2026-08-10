@@ -3805,19 +3805,34 @@ impl ManagementCenter {
         &mut self,
         agent_id: &str,
         profile_id: &str,
+        cursor_offset_y: f32,
         cx: &mut Context<Self>,
     ) {
         let original_ids = self.ordered_provider_profile_ids(agent_id);
         if !original_ids.iter().any(|id| id == profile_id) {
             return;
         }
+        let initial_target = reorder_target_from_cursor_offset(
+            &original_ids,
+            profile_id,
+            cursor_offset_y,
+            MANAGEMENT_PROVIDER_ROW_HEIGHT,
+            MANAGEMENT_PROVIDER_ROW_GAP,
+        );
+        let preview_ids = initial_target
+            .as_ref()
+            .map(|(target_id, after)| {
+                reordered_provider_profile_ids(&original_ids, profile_id, target_id, *after)
+            })
+            .unwrap_or_else(|| original_ids.clone());
         self.provider_display_order_drag_state = Some(ProviderDisplayOrderDragState {
             agent_id: agent_id.to_string(),
             profile_id: profile_id.to_string(),
-            preview_ids: original_ids.clone(),
+            preview_ids,
             original_ids,
         });
-        self.provider_display_order_drop_target = None;
+        self.provider_display_order_drop_target = initial_target
+            .map(|(profile_id, after)| ProviderDisplayOrderDropTarget { profile_id, after });
         cx.notify();
     }
 
@@ -8256,10 +8271,15 @@ impl ManagementCenter {
                         );
                     }),
                 )
-                .on_drag(drag_payload, move |drag, _, _, cx| {
+                .on_drag(drag_payload, move |drag, cursor_offset, _, cx| {
                     cx.stop_propagation();
                     let _ = drag_entity.update(cx, |this, cx| {
-                        this.start_provider_profile_drag(&drag_agent_id, &drag_profile_id, cx);
+                        this.start_provider_profile_drag(
+                            &drag_agent_id,
+                            &drag_profile_id,
+                            f32::from(cursor_offset.y),
+                            cx,
+                        );
                     });
                     cx.new(|_| drag.clone())
                 });
@@ -8344,12 +8364,19 @@ impl ManagementCenter {
                 .on_drag_move(cx.listener(
                     move |this, event: &DragMoveEvent<ProviderDisplayOrderDrag>, _, cx| {
                         let drag = event.drag(cx).clone();
-                        let next = (event.bounds.contains(&event.event.position)
+                        let position = event.event.position;
+                        let inside_target = position.x >= event.bounds.left() - px(24.0)
+                            && position.x <= event.bounds.right() + px(24.0)
+                            && position.y
+                                >= event.bounds.top() - px(MANAGEMENT_PROVIDER_ROW_GAP / 2.0)
+                            && position.y
+                                <= event.bounds.bottom() + px(MANAGEMENT_PROVIDER_ROW_GAP / 2.0);
+                        let next = (inside_target
                             && drag.agent_id == move_agent_id
                             && drag.profile_id != move_profile_id)
                             .then_some(ProviderDisplayOrderDropTarget {
                                 profile_id: move_profile_id.clone(),
-                                after: event.event.position.y >= event.bounds.center().y,
+                                after: position.y >= event.bounds.center().y,
                             });
                         if let Some(next) = next {
                             this.preview_provider_profile_reorder(
@@ -8358,8 +8385,6 @@ impl ManagementCenter {
                                 next.after,
                                 cx,
                             );
-                        } else if this.provider_display_order_drop_target.take().is_some() {
-                            cx.notify();
                         }
                     },
                 ))
@@ -12624,6 +12649,33 @@ fn reordered_provider_profile_ids(
     ids
 }
 
+fn reorder_target_from_cursor_offset(
+    ordered_ids: &[String],
+    moving_id: &str,
+    cursor_offset_y: f32,
+    row_height: f32,
+    row_gap: f32,
+) -> Option<(String, bool)> {
+    let moving_index = ordered_ids.iter().position(|id| id == moving_id)?;
+    let stride = row_height + row_gap;
+    if stride <= 0.0 {
+        return None;
+    }
+    let row_delta = ((cursor_offset_y - row_height / 2.0) / stride).round() as isize;
+    if row_delta == 0 {
+        return None;
+    }
+    let target_index = moving_index
+        .saturating_add_signed(row_delta)
+        .min(ordered_ids.len().saturating_sub(1));
+    (target_index != moving_index).then(|| {
+        (
+            ordered_ids[target_index].clone(),
+            target_index > moving_index,
+        )
+    })
+}
+
 fn provider_reorder_row_offset(
     original_ids: &[String],
     preview_ids: &[String],
@@ -15212,6 +15264,36 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(reordered_provider_profile_ids(&ids, "b", "b", false), ids);
+    }
+
+    #[test]
+    fn provider_reorder_fast_initial_motion_selects_a_target() {
+        let ids = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reorder_target_from_cursor_offset(
+                &ids,
+                "b",
+                MANAGEMENT_PROVIDER_ROW_HEIGHT / 2.0
+                    + 2.0 * (MANAGEMENT_PROVIDER_ROW_HEIGHT + MANAGEMENT_PROVIDER_ROW_GAP),
+                MANAGEMENT_PROVIDER_ROW_HEIGHT,
+                MANAGEMENT_PROVIDER_ROW_GAP,
+            ),
+            Some(("d".to_string(), true))
+        );
+        assert_eq!(
+            reorder_target_from_cursor_offset(
+                &ids,
+                "c",
+                MANAGEMENT_PROVIDER_ROW_HEIGHT / 2.0
+                    - 2.0 * (MANAGEMENT_PROVIDER_ROW_HEIGHT + MANAGEMENT_PROVIDER_ROW_GAP),
+                MANAGEMENT_PROVIDER_ROW_HEIGHT,
+                MANAGEMENT_PROVIDER_ROW_GAP,
+            ),
+            Some(("a".to_string(), false))
+        );
     }
 
     #[test]
