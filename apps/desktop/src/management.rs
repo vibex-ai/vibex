@@ -78,8 +78,7 @@ const MANAGEMENT_PROVIDER_ROW_HEIGHT: f32 = 72.0;
 const MANAGEMENT_PROVIDER_ROW_GAP: f32 = 8.0;
 const MANAGEMENT_PROVIDER_DRAG_PREVIEW_WIDTH: f32 = 520.0;
 const MANAGEMENT_PROVIDER_REORDER_ANIMATION_MS: u64 = 160;
-const MANAGEMENT_AGENT_ROW_ACTION_SIZE: f32 = 40.0;
-const MANAGEMENT_PROVIDER_ROW_ACTION_SIZE: f32 = 48.0;
+const MANAGEMENT_PROVIDER_ROW_ACTION_SIZE: f32 = 40.0;
 const PROVIDER_API_KEY_PLACEHOLDER: &str = "API Key";
 const PROVIDER_OPTION_WEBSITE_URL: &str = "ccSwitchWebsiteUrl";
 const PROVIDER_OPTION_CC_SWITCH_DB_PATH: &str = "ccSwitchDbPath";
@@ -6210,7 +6209,7 @@ impl ManagementCenter {
                                     )))
                                     .small()
                                     .outline()
-                                    .size(px(MANAGEMENT_AGENT_ROW_ACTION_SIZE))
+                                    .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
                                     .icon(IconName::Plus)
                                     .tooltip(management_add_label())
                                     .loading(
@@ -8184,10 +8183,11 @@ impl ManagementCenter {
                 .pr_3()
                 .invisible()
                 .group_hover(&hover_group, |style| style.visible());
+            // The semantic size controls the icon; the explicit size keeps the button at 40px.
             if !is_default {
                 actions = actions.child(button_with_aria_label(
                     Button::new(SharedString::from(format!("provider-default-{default_id}")))
-                        .xsmall()
+                        .large()
                         .secondary()
                         .compact()
                         .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
@@ -8207,15 +8207,11 @@ impl ManagementCenter {
             actions = actions
                 .child(button_with_aria_label(
                     Button::new(SharedString::from(format!("provider-edit-{id}")))
-                        .xsmall()
+                        .large()
                         .secondary()
                         .compact()
                         .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
-                        .icon(
-                            Icon::default()
-                                .path("icons/vibex/pencil.svg")
-                                .size(px(18.0)),
-                        )
+                        .icon(Icon::default().path("icons/vibex/pencil.svg"))
                         .disabled(pending)
                         .tooltip(management_locale_text(
                             "Edit configuration",
@@ -8231,7 +8227,7 @@ impl ManagementCenter {
                     Button::new(SharedString::from(format!(
                         "provider-duplicate-{duplicate_id}"
                     )))
-                    .xsmall()
+                    .large()
                     .secondary()
                     .compact()
                     .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
@@ -8249,15 +8245,11 @@ impl ManagementCenter {
                 ))
                 .child(button_with_aria_label(
                     Button::new(SharedString::from(format!("provider-test-{test_id}")))
-                        .xsmall()
+                        .large()
                         .secondary()
                         .compact()
                         .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
-                        .icon(
-                            Icon::default()
-                                .path("icons/vibex/activity.svg")
-                                .size(px(18.0)),
-                        )
+                        .icon(Icon::default().path("icons/vibex/activity.svg"))
                         .loading(testing)
                         .disabled(pending)
                         .tooltip(if testing {
@@ -8272,7 +8264,7 @@ impl ManagementCenter {
                 ))
                 .child(button_with_aria_label(
                     Button::new(SharedString::from(format!("provider-delete-{delete_id}")))
-                        .xsmall()
+                        .large()
                         .danger()
                         .compact()
                         .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
@@ -15283,6 +15275,7 @@ mod tests {
         assert!(render.contains(".invisible()"));
         assert!(render.contains(".group_hover(&hover_group, |style| style.visible())"));
         for action in [
+            "provider-default-",
             "provider-edit-",
             "provider-duplicate-",
             "provider-test-",
@@ -15291,6 +15284,16 @@ mod tests {
             assert!(
                 render.contains(action),
                 "missing visible provider action: {action}"
+            );
+            let action_body = render
+                .split_once(action)
+                .map(|(_, tail)| tail)
+                .expect("Provider action should remain inspectable");
+            assert!(
+                action_body
+                    .find(".large()")
+                    .is_some_and(|index| index < 260),
+                "Provider action icon must use the large icon size: {action}"
             );
         }
         for action in [
@@ -15520,7 +15523,7 @@ mod tests {
         assert!(install.contains("icons/vibex/download.svg"));
         assert!(install.contains("icons/vibex/trash-2.svg"));
         assert!(render.contains("MANAGEMENT_PROVIDER_ROW_ACTION_SIZE"));
-        assert_eq!(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE, 48.0);
+        assert_eq!(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE, 40.0);
         assert!(render.contains(".icon(IconName::Plus)"));
         assert!(render.contains("icons/vibex/trash-2.svg"));
         assert!(
