@@ -11812,6 +11812,7 @@ impl VibexWorkbench {
             previous_session_id: self.selected_session_id.clone(),
         });
         self.upsert_session_snapshot(session);
+        self.invalidate_sidebar_projection_cache();
         self.optimistic_runtime_selections
             .insert(session_id.as_str().to_string(), selection);
         if has_initial_message {
@@ -37530,6 +37531,16 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn update_pending_new_session_workspace("))
             .map(|(body, _)| body)
             .expect("pending-session navigation should remain inspectable");
+        let snapshot = pending_open
+            .find("self.upsert_session_snapshot(session);")
+            .expect("the pending Session should enter the sidebar source immediately");
+        let invalidate = pending_open
+            .find("self.invalidate_sidebar_projection_cache();")
+            .expect("the pending Session should invalidate the cached sidebar projection");
+        let select = pending_open
+            .find("self.select_session_with_history(session_id, false, cx);")
+            .expect("the pending Session should be selected immediately");
+        assert!(snapshot < invalidate && invalidate < select);
         assert!(pending_open.contains("self.select_session_with_history(session_id, false, cx);"));
         assert!(pending_open.contains("self.install_optimistic_user_message(message);"));
         assert!(pending_open.contains("self.set_session_turn_pending(&session_id, true);"));
