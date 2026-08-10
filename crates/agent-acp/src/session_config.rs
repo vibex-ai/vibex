@@ -716,7 +716,15 @@ pub fn build_runtime_option_catalog_for_agents(
         {
             model_ids.insert(model.clone(), model);
         }
-        let availability = catalog_availability(agent, profile_evidence.as_ref());
+        let availability = catalog_availability(
+            agent,
+            profile_evidence.as_ref(),
+            !profile.configured_models.is_empty()
+                || profile
+                    .default_model
+                    .as_deref()
+                    .is_some_and(|model| !model.trim().is_empty()),
+        );
         for (model_id, model_label) in model_ids {
             options.push(SessionRuntimeOption {
                 selection: SessionRuntimeSelection {
@@ -825,7 +833,7 @@ pub fn build_runtime_option_catalog(
             );
         }
 
-        let availability = catalog_availability(agent, evidence);
+        let availability = catalog_availability(agent, evidence, has_explicit_model_configuration);
         let fallback_modes = catalog_modes(evidence);
         let fallback_features = catalog_features(evidence);
         for (model_id, model_label) in configured_models {
@@ -898,13 +906,15 @@ pub fn build_runtime_option_catalog(
 fn catalog_availability(
     agent: &AgentSnapshotEntry,
     evidence: Option<&RuntimeOptionCatalogProfileEvidence>,
+    has_explicit_model_configuration: bool,
 ) -> RuntimeOptionAvailability {
     if matches!(
         agent.config_status,
         AgentConfigStatus::NeedsConfiguration | AgentConfigStatus::Unknown
     ) {
         RuntimeOptionAvailability::RequiresConfiguration
-    } else if evidence.is_some_and(|value| value.temporarily_unavailable)
+    } else if (!has_explicit_model_configuration
+        && evidence.is_some_and(|value| value.temporarily_unavailable))
         || matches!(
             agent.runtime_status,
             AgentRuntimeStatus::Unavailable | AgentRuntimeStatus::ProbeFailed
@@ -1806,7 +1816,9 @@ mod tests {
                         &[("ask", "Ask"), ("auto", "Automatic")],
                     ),
                 ],
-                temporarily_unavailable: false,
+                // A failed Agent-level probe must not hide an explicitly
+                // configured Provider Profile model.
+                temporarily_unavailable: true,
             },
         )]);
 
@@ -1823,6 +1835,10 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.options.len(), 1);
         assert_eq!(first.options[0].selection.model_id, "gpt-5");
+        assert_eq!(
+            first.options[0].availability,
+            RuntimeOptionAvailability::Available
+        );
         assert_eq!(first.options[0].reasoning_efforts[0].value, "high");
         assert_eq!(first.options[0].modes[0].value, "build");
         assert_eq!(first.options[0].features.len(), 2);
