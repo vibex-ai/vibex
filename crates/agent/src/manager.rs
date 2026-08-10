@@ -354,6 +354,27 @@ impl AgentManager {
         self.create_session_with_timeline(request, Vec::new()).await
     }
 
+    /// Creates a session with an identifier reserved by the caller.
+    ///
+    /// Desktop uses this to render the session before the provider runtime has
+    /// finished initializing. The identifier is still persisted and validated
+    /// by the manager, so the optimistic view and the authoritative session
+    /// share one route.
+    pub async fn create_session_with_id(
+        &self,
+        request: CreateAgentSessionRequest,
+        session_id: VibexSessionId,
+    ) -> VibexResult<AgentSession> {
+        self.create_session_with_timeline_and_materialization(
+            request,
+            Vec::new(),
+            |_| {},
+            InitialRuntimeMaterialization::WaitForReady,
+            Some(session_id),
+        )
+        .await
+    }
+
     /// Creates the durable Logical Session and queues its initial ACP runtime
     /// materialization without waiting for process startup or `session/new`.
     /// Callers that submit a first message must use the durable message queue,
@@ -367,6 +388,22 @@ impl AgentManager {
             Vec::new(),
             |_| {},
             InitialRuntimeMaterialization::Deferred,
+            None,
+        )
+        .await
+    }
+
+    pub async fn create_session_deferred_with_id(
+        &self,
+        request: CreateAgentSessionRequest,
+        session_id: VibexSessionId,
+    ) -> VibexResult<AgentSession> {
+        self.create_session_with_timeline_and_materialization(
+            request,
+            Vec::new(),
+            |_| {},
+            InitialRuntimeMaterialization::Deferred,
+            Some(session_id),
         )
         .await
     }
@@ -394,6 +431,7 @@ impl AgentManager {
             initial_timeline,
             on_created,
             InitialRuntimeMaterialization::WaitForReady,
+            None,
         )
         .await
     }
@@ -404,6 +442,7 @@ impl AgentManager {
         initial_timeline: Vec<TimelineAppend>,
         on_created: F,
         materialization: InitialRuntimeMaterialization,
+        requested_session_id: Option<VibexSessionId>,
     ) -> VibexResult<AgentSession>
     where
         F: FnOnce(AgentSession) + Send,
@@ -451,7 +490,7 @@ impl AgentManager {
         }
         let now = unix_timestamp_ms();
         let session = AgentSession {
-            id: VibexSessionId::new(),
+            id: requested_session_id.unwrap_or_default(),
             title: request
                 .title
                 .clone()

@@ -62,17 +62,18 @@ use vibex_core::{
     AgentCommandDiscoverRequest, AgentCommandDiscoverResponse, AgentCommandEntry,
     AgentCommandExecuteRequest, AgentCommandExecutionBehavior, AgentCommandSelectionBehavior,
     AgentCommandSourceKind, AgentCommandTrigger, AgentId, AgentListRequest, AgentMessagePhase,
-    AgentSession, AgentSessionRuntimeSelectionState, AgentSessionState, AgentSnapshotEntry,
-    AgentTokenUsage, AttachRuntimeRequest, CancelAgentSessionRuntimeSwitchRequest,
-    ContinueAgentTurnRequest, CreateAgentSessionRequest, DetachRuntimeRequest, ElicitationField,
-    ElicitationFieldKind, ElicitationRequest, ElicitationResolutionAction,
-    ExternalSessionImportCandidateStatus, ExternalSessionImportRequest, FetchTimelineRequest,
-    FileEntryKind, FileTreeRequest, ForkAgentSessionRequest, GetMessageSubmissionRequest,
-    GitProjectEligibilityState, GitProjectIneligibleReason, GitWorktreeAssistanceSessionRequest,
-    GitWorktreeConflictKind, GitWorktreeOperationRecord, GitWorktreeOperationStatus,
-    MessageAttachment, MessageSubmissionState, MessageSubmissionStatus, OpenWorkspaceRequest,
-    PermissionResolution, PermissionResponseKind, PlanStepStatus, ProjectId, ProjectRecord,
-    PromptId, ProviderBindingMetadata, ProviderKind, ProviderProfileId, ProviderProfileStatus,
+    AgentSession, AgentSessionRuntimeSelectionState, AgentSessionSafety, AgentSessionState,
+    AgentSnapshotEntry, AgentTokenUsage, AttachRuntimeRequest,
+    CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
+    DetachRuntimeRequest, ElicitationField, ElicitationFieldKind, ElicitationRequest,
+    ElicitationResolutionAction, ExternalSessionImportCandidateStatus,
+    ExternalSessionImportRequest, FetchTimelineRequest, FileEntryKind, FileTreeRequest,
+    ForkAgentSessionRequest, GetMessageSubmissionRequest, GitProjectEligibilityState,
+    GitProjectIneligibleReason, GitWorktreeAssistanceSessionRequest, GitWorktreeConflictKind,
+    GitWorktreeOperationRecord, GitWorktreeOperationStatus, MessageAttachment,
+    MessageSubmissionState, MessageSubmissionStatus, OpenWorkspaceRequest, PermissionResolution,
+    PermissionResponseKind, PlanStepStatus, ProjectId, ProjectRecord, PromptId,
+    ProviderBindingMetadata, ProviderKind, ProviderProfileId, ProviderProfileStatus,
     ProviderProfileSummary, RenameAgentSessionRequest, RequestId, ResolvePermissionRequest,
     RightRailPlugin, RightRailPluginCreateRequest, RightRailPluginDeleteRequest, RightRailPluginId,
     RightRailPluginKind, RightRailPluginReorderRequest, RightRailPluginStatus,
@@ -3189,8 +3190,25 @@ enum NewSessionCreateSignal {
         AgentSession,
         Option<Vec<(ProjectRecord, WorkspaceRecord)>>,
         bool,
-        Option<OptimisticUserMessage>,
     ),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingNewSession {
+    session_id: VibexSessionId,
+    previous_session_id: Option<VibexSessionId>,
+}
+
+#[derive(Clone)]
+struct SubmittedNewSessionDraft {
+    raw_text: String,
+    attachments: Vec<InlineComposerAttachment>,
+    command_entry: Option<AgentCommandEntry>,
+}
+
+struct NewSessionFailure {
+    code: String,
+    message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3322,6 +3340,7 @@ pub struct VibexWorkbench {
     new_session_agent_drop_target: Option<NewSessionAgentDropTarget>,
     collapsed_project_restore: Option<BTreeSet<String>>,
     selected_session_id: Option<VibexSessionId>,
+    pending_new_session: Option<PendingNewSession>,
     new_session_open: bool,
     new_session_draft_initialized: bool,
     new_session_project_menu_open: bool,
@@ -3860,6 +3879,7 @@ impl VibexWorkbench {
             new_session_agent_drop_target: None,
             collapsed_project_restore: None,
             selected_session_id,
+            pending_new_session: None,
             new_session_open: false,
             new_session_draft_initialized: false,
             new_session_project_menu_open: false,
@@ -4548,7 +4568,7 @@ impl VibexWorkbench {
                     }
                     match outcome {
                         Ok(Ok((sessions, workspaces, agents, profiles))) => {
-                            let sessions = if reconciles_optimistic_session_deletions {
+                            let mut sessions = if reconciles_optimistic_session_deletions {
                                 this.optimistic_session_deletion_reconciliation_pending = false;
                                 this.optimistically_removed_session_ids.clear();
                                 sessions
@@ -4562,6 +4582,20 @@ impl VibexWorkbench {
                                     })
                                     .collect()
                             };
+                            let pending_session =
+                                this.pending_new_session.as_ref().and_then(|pending| {
+                                    this.sessions
+                                        .iter()
+                                        .find(|session| session.id == pending.session_id)
+                                        .cloned()
+                                });
+                            if let Some(pending_session) = pending_session
+                                && !sessions
+                                    .iter()
+                                    .any(|session| session.id == pending_session.id)
+                            {
+                                sessions.insert(0, pending_session);
+                            }
                             let sessions_empty = sessions.is_empty();
                             let preferred = this
                                 .selected_session_id
@@ -6466,12 +6500,7 @@ impl VibexWorkbench {
     }
 
     fn selected_agent_session_state(&self) -> Option<AgentSessionState> {
-        let selected_session_id = self.selected_session_id.as_ref()?;
-        let state = self
-            .sessions
-            .iter()
-            .find(|session| &session.id == selected_session_id)
-            .map(|session| session.state);
+        let state = self.selected_session().map(|session| session.state);
         if self.agent_turn_pending {
             Some(AgentSessionState::Running)
         } else {
@@ -6624,7 +6653,7 @@ impl VibexWorkbench {
         if record_history && navigation_changed {
             self.push_current_navigation_entry();
         }
-        self.agent_action_pending = false;
+        self.agent_action_pending = self.pending_new_session.is_some();
         self.agent_turn_pending = self.session_turn_pending(&session_id);
         self.agent_error = None;
         self.timeline_scroll_to_latest_pending = false;
@@ -6680,6 +6709,14 @@ impl VibexWorkbench {
             }
             Some(ComposerTarget::NewSession) => self.clear_suggestions(),
             None => {}
+        }
+        if self
+            .pending_new_session
+            .as_ref()
+            .is_some_and(|pending| pending.session_id == session_id)
+        {
+            self.agent_loading = false;
+            return;
         }
         let workspace_id = self
             .sessions
@@ -6998,7 +7035,6 @@ impl VibexWorkbench {
         let policy = runtime.polling_policy();
         let (signal_tx, mut signal_rx) = mpsc::unbounded_channel();
         let poll_session_id = session_id.clone();
-        let session_id = session_id;
         let runner_session_id = poll_session_id.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             let mut after_sequence = after_sequence;
@@ -11476,6 +11512,131 @@ impl VibexWorkbench {
         self.new_session_command_entry = command_entry;
     }
 
+    fn open_pending_new_session(
+        &mut self,
+        session: AgentSession,
+        selection: SessionRuntimeSelection,
+        optimistic_message: Option<OptimisticUserMessage>,
+        has_initial_message: bool,
+        cx: &mut Context<Self>,
+    ) -> u64 {
+        let session_id = session.id.clone();
+        self.pending_new_session = Some(PendingNewSession {
+            session_id: session_id.clone(),
+            previous_session_id: self.selected_session_id.clone(),
+        });
+        self.upsert_session_snapshot(session);
+        self.optimistic_runtime_selections
+            .insert(session_id.as_str().to_string(), selection);
+        if has_initial_message {
+            self.set_session_turn_pending(&session_id, true);
+        }
+        self.select_session_with_history(session_id, false, cx);
+        if let Some(message) = optimistic_message {
+            self.install_optimistic_user_message(message);
+        }
+        self.agent_action_pending = true;
+        self.agent_loading = false;
+        self.session_generation
+    }
+
+    fn update_pending_new_session_workspace(&mut self, workspace: &WorkspaceRecord) {
+        let Some(session_id) = self
+            .pending_new_session
+            .as_ref()
+            .map(|pending| pending.session_id.clone())
+        else {
+            return;
+        };
+        let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+        else {
+            return;
+        };
+        session.project_id = workspace.project_id.clone();
+        session.workspace_id = workspace.id.clone();
+        session.workspace_root.clone_from(&workspace.root_path);
+        session.workspace_mode = workspace.mode;
+        session.updated_at_ms = workspace.updated_at_ms;
+        self.invalidate_sidebar_projection_cache();
+    }
+
+    fn fail_pending_new_session(
+        &mut self,
+        session_id: &VibexSessionId,
+        generation: u64,
+        draft: SubmittedNewSessionDraft,
+        failure: NewSessionFailure,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .pending_new_session
+            .as_ref()
+            .is_none_or(|pending| pending.session_id != *session_id)
+        {
+            return;
+        }
+        let pending = self
+            .pending_new_session
+            .take()
+            .expect("pending new session should still match");
+        let active = self.session_generation == generation
+            && self.selected_session_id.as_ref() == Some(session_id);
+
+        self.sessions.retain(|session| session.id != *session_id);
+        self.optimistic_runtime_selections
+            .remove(session_id.as_str());
+        self.discard_optimistic_user_message(session_id);
+        self.set_session_turn_pending(session_id, false);
+        self.agent_session_view_cache.remove(session_id.as_str());
+        self.agent_session_view_lru
+            .retain(|cached_session_id| cached_session_id != session_id.as_str());
+        self.agent_action_pending = false;
+        self.restore_new_session_message_draft(
+            draft.raw_text,
+            draft.attachments,
+            draft.command_entry,
+            window,
+            cx,
+        );
+        self.new_session_draft_initialized = true;
+        self.new_session_workspace.mark_failed(failure.code);
+        self.new_session_error = Some(failure.message);
+        self.reconcile_sidebar_state();
+
+        if active {
+            if let Some(previous_session_id) =
+                pending.previous_session_id.filter(|previous_session_id| {
+                    self.sessions
+                        .iter()
+                        .any(|session| session.id == *previous_session_id)
+                })
+            {
+                self.select_session_with_history(previous_session_id, false, cx);
+            } else {
+                self.session_generation = self.session_generation.saturating_add(1);
+                self.selected_session_id = None;
+                self.timeline = TimelineModel::default();
+                self.timeline_row_sizes = Rc::new(Vec::new());
+                self.invalidate_timeline_render_caches();
+                self.runtime_selection = None;
+                self.token_usage = None;
+                self.agent_loading = false;
+                self.agent_turn_pending = false;
+                self.queue_agent_ui_state();
+            }
+            self.new_session_open = true;
+            self.new_session_input
+                .update(cx, |input, cx| input.focus(window, cx));
+            self.sync_composer_command_entry(ComposerTarget::NewSession, cx);
+            self.refresh_active_suggestions(ComposerTarget::NewSession, cx);
+        }
+        cx.notify();
+    }
+
     fn current_checkout_for_project(
         &self,
         project_id: &ProjectId,
@@ -11972,9 +12133,11 @@ impl VibexWorkbench {
             None
         };
         let raw_text = self.new_session_input.read(cx).value().to_string();
-        let draft_raw_text = raw_text.clone();
-        let draft_attachments = self.new_session_attachments.clone();
-        let draft_command_entry = self.new_session_command_entry.clone();
+        let draft = SubmittedNewSessionDraft {
+            raw_text: raw_text.clone(),
+            attachments: self.new_session_attachments.clone(),
+            command_entry: self.new_session_command_entry.clone(),
+        };
         let (text, attachments) =
             composer_submission_payload(&raw_text, &self.new_session_attachments);
         self.sync_composer_command_entry(ComposerTarget::NewSession, cx);
@@ -12000,14 +12163,67 @@ impl VibexWorkbench {
         let title = session_title_from_first_message(&text);
         let has_initial_message = !text.trim().is_empty() || !attachments.is_empty();
         let deferred_creation = command_invocation.is_none();
-        let optimistic_item_id = TimelineItemId::new();
         let optimistic_submitted_at_ms = unix_timestamp_ms();
+        let optimistic_session_id = VibexSessionId::new();
+        let optimistic_workspace = selected_workspace
+            .as_ref()
+            .or(origin_workspace.as_ref())
+            .cloned();
+        let optimistic_session = AgentSession {
+            id: optimistic_session_id.clone(),
+            title: title
+                .clone()
+                .unwrap_or_else(|| format!("{} session", selection.agent_id)),
+            project_id: optimistic_workspace
+                .as_ref()
+                .map(|workspace| workspace.project_id.clone())
+                .or_else(|| self.new_session_workspace.project_id.clone())
+                .unwrap_or_default(),
+            workspace_id: optimistic_workspace
+                .as_ref()
+                .map(|workspace| workspace.id.clone())
+                .or_else(|| self.new_session_workspace.origin_workspace_id.clone())
+                .unwrap_or_default(),
+            workspace_root: optimistic_workspace
+                .as_ref()
+                .map(|workspace| workspace.root_path.clone())
+                .unwrap_or_else(|| self.new_session_workspace.project_root.clone()),
+            workspace_mode: optimistic_workspace
+                .as_ref()
+                .map(|workspace| workspace.mode)
+                .unwrap_or(if create_worktree {
+                    WorkspaceMode::VibexWorktree
+                } else {
+                    WorkspaceMode::CurrentCheckout
+                }),
+            agent_id: selection.agent_id.clone(),
+            state: AgentSessionState::Initializing,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: optimistic_submitted_at_ms,
+            updated_at_ms: optimistic_submitted_at_ms,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        let optimistic_message = has_initial_message.then(|| OptimisticUserMessage {
+            session_id: optimistic_session_id.clone(),
+            item_id: TimelineItemId::new(),
+            after_sequence: 0,
+            submitted_at_ms: optimistic_submitted_at_ms,
+            text: text.clone(),
+            attachments: attachments.clone(),
+        });
         self.new_session_workspace.begin_submission();
-        self.agent_action_pending = true;
         self.new_session_error = None;
         self.clear_new_session_message_draft(window, cx);
         self.clear_suggestions();
-        let generation = self.session_generation;
+        let generation = self.open_pending_new_session(
+            optimistic_session,
+            selection.clone(),
+            optimistic_message,
+            has_initial_message,
+            cx,
+        );
+        let pending_session_id = optimistic_session_id.clone();
         let backend = self.backend.clone();
         let (created_tx, mut created_rx) = mpsc::unbounded_channel();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
@@ -12046,27 +12262,18 @@ impl VibexWorkbench {
                 runtime
                     .agent()
                     .manager()
-                    .create_session_deferred(create_request)
+                    .create_session_deferred_with_id(create_request, optimistic_session_id)
                     .await?
             } else {
                 runtime
                     .agent()
                     .manager()
-                    .create_session(create_request)
+                    .create_session_with_id(create_request, optimistic_session_id)
                     .await?
             };
             let workspaces = runtime.workspace().list().ok();
             let session_id = session.id.clone();
             let message_runtime = runtime.clone();
-            let optimistic_message =
-                (has_initial_message && deferred_creation).then(|| OptimisticUserMessage {
-                    session_id: session.id.clone(),
-                    item_id: optimistic_item_id,
-                    after_sequence: 0,
-                    submitted_at_ms: optimistic_submitted_at_ms,
-                    text: text.clone(),
-                    attachments: attachments.clone(),
-                });
             let initial_message = if has_initial_message {
                 let initial_text = text;
                 let initial_attachments = attachments;
@@ -12128,7 +12335,6 @@ impl VibexWorkbench {
                     session.clone(),
                     workspaces,
                     has_initial_message,
-                    optimistic_message,
                 ),
                 initial_message,
             )
@@ -12155,6 +12361,7 @@ impl VibexWorkbench {
                         let _ = entity.update_in(cx, |this, _window, cx| {
                             this.new_session_workspace
                                 .mark_workspace_ready(workspace.clone());
+                            this.update_pending_new_session_workspace(&workspace);
                             if let Some(project) =
                                 this.new_session_workspace.project_id.as_ref().and_then(
                                     |project_id| {
@@ -12179,41 +12386,45 @@ impl VibexWorkbench {
                         session,
                         workspaces,
                         has_initial_message,
-                        optimistic_message,
                     ) => {
                         let update = entity.update_in(cx, |this, window, cx| {
                             if let Some(workspaces) = workspaces {
                                 this.workspaces = workspaces;
                             }
                             let session_id = session.id.clone();
+                            if this
+                                .pending_new_session
+                                .as_ref()
+                                .is_some_and(|pending| pending.session_id == session_id)
+                            {
+                                this.pending_new_session = None;
+                            }
                             this.upsert_session_snapshot(session);
                             if has_initial_message {
                                 this.set_session_turn_pending(&session_id, true);
                             }
                             this.reconcile_sidebar_state();
                             let created_session_id = session_id.clone();
-                            let turn_generation =
-                                if this.session_generation == generation && this.new_session_open {
-                                    this.new_session_workspace
-                                        .mark_stage(if has_initial_message {
-                                            NewSessionSubmissionStage::SendingPrompt
-                                        } else {
-                                            NewSessionSubmissionStage::StartingAgent
-                                        });
-                                    this.select_session_with_history(session_id.clone(), false, cx);
-                                    if has_initial_message {
-                                        this.rebuild_timeline_sizes();
-                                        Some(this.session_generation)
+                            let turn_generation = if this.session_generation == generation
+                                && this.selected_session_id.as_ref() == Some(&session_id)
+                            {
+                                this.new_session_workspace
+                                    .mark_stage(if has_initial_message {
+                                        NewSessionSubmissionStage::SendingPrompt
                                     } else {
-                                        None
-                                    }
+                                        NewSessionSubmissionStage::StartingAgent
+                                    });
+                                this.select_session_with_history(session_id.clone(), false, cx);
+                                if has_initial_message {
+                                    this.rebuild_timeline_sizes();
+                                    Some(this.session_generation)
                                 } else {
-                                    this.agent_action_pending = false;
                                     None
-                                };
-                            if let Some(optimistic_message) = optimistic_message {
-                                this.install_optimistic_user_message(optimistic_message);
-                            }
+                                }
+                            } else {
+                                this.agent_action_pending = false;
+                                None
+                            };
                             this.clear_submitted_new_session_draft(window, cx);
                             this.refresh_workspace_contexts(cx);
                             cx.notify();
@@ -12267,39 +12478,30 @@ impl VibexWorkbench {
                         this.refresh_workspace_contexts(cx);
                     }
                     Ok(Err(error)) => {
-                        if let Some(session_id) = created_session_id.as_ref() {
-                            this.discard_optimistic_user_message(session_id);
-                        }
-                        if this.session_generation == generation && this.new_session_open {
-                            this.restore_new_session_message_draft(
-                                draft_raw_text.clone(),
-                                draft_attachments.clone(),
-                                draft_command_entry.clone(),
-                                window,
-                                cx,
-                            );
-                            this.new_session_workspace.mark_failed(error.code.clone());
-                            this.new_session_error =
-                                Some(format!("{}: {}", error.code, error.message));
-                        }
+                        this.fail_pending_new_session(
+                            &pending_session_id,
+                            generation,
+                            draft.clone(),
+                            NewSessionFailure {
+                                code: error.code.clone(),
+                                message: format!("{}: {}", error.code, error.message),
+                            },
+                            window,
+                            cx,
+                        );
                     }
                     Err(error) => {
-                        if let Some(session_id) = created_session_id.as_ref() {
-                            this.discard_optimistic_user_message(session_id);
-                        }
-                        if this.session_generation == generation && this.new_session_open {
-                            this.restore_new_session_message_draft(
-                                draft_raw_text,
-                                draft_attachments,
-                                draft_command_entry,
-                                window,
-                                cx,
-                            );
-                            this.new_session_workspace
-                                .mark_failed("new_session_task_failed");
-                            this.new_session_error =
-                                Some(format!("session creation failed: {error}"));
-                        }
+                        this.fail_pending_new_session(
+                            &pending_session_id,
+                            generation,
+                            draft,
+                            NewSessionFailure {
+                                code: "new_session_task_failed".to_string(),
+                                message: format!("session creation failed: {error}"),
+                            },
+                            window,
+                            cx,
+                        );
                     }
                 }
                 cx.notify();
@@ -32487,7 +32689,7 @@ fn user_message_inline_document(
                     continue;
                 }
                 let composer_attachment = composer_attachment_from_message(
-                    &attachment,
+                    attachment,
                     format!("message-attachment:{next_node_id}"),
                 );
                 let start = source.len();
@@ -36660,9 +36862,7 @@ mod tests {
             1
         );
         assert_eq!(
-            submit
-                .matches("this.restore_new_session_message_draft(")
-                .count(),
+            submit.matches("this.fail_pending_new_session(").count(),
             2,
             "both session-creation failure paths should restore the draft"
         );
@@ -36690,6 +36890,39 @@ mod tests {
         assert!(clear_draft.contains("input.set_value(\"\", window, cx)"));
         assert!(clear_draft.contains("self.new_session_attachments = attachments;"));
         assert!(clear_draft.contains("self.new_session_command_entry = command_entry;"));
+    }
+
+    #[test]
+    fn new_session_submission_opens_the_conversation_before_background_creation() {
+        let source = include_str!("app.rs");
+        let submit = source
+            .split_once("    fn submit_new_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn choose_runtime_selection("))
+            .map(|(body, _)| body)
+            .expect("new-session submission should remain inspectable");
+        let optimistic_message = submit
+            .find("let optimistic_message =")
+            .expect("the first user message should be projected optimistically");
+        let open = submit
+            .find("self.open_pending_new_session(")
+            .expect("submission should immediately open the pending conversation");
+        let background_creation = submit
+            .find("let runner = gpui_tokio::Tokio::spawn")
+            .expect("authoritative creation should remain asynchronous");
+
+        assert!(optimistic_message < open && open < background_creation);
+        assert!(submit.contains("create_session_deferred_with_id("));
+        assert!(submit.contains("create_session_with_id("));
+
+        let pending_open = source
+            .split_once("    fn open_pending_new_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn update_pending_new_session_workspace("))
+            .map(|(body, _)| body)
+            .expect("pending-session navigation should remain inspectable");
+        assert!(pending_open.contains("self.select_session_with_history(session_id, false, cx);"));
+        assert!(pending_open.contains("self.install_optimistic_user_message(message);"));
+        assert!(pending_open.contains("self.set_session_turn_pending(&session_id, true);"));
+        assert!(pending_open.contains("self.agent_loading = false;"));
     }
 
     #[test]
@@ -38273,16 +38506,21 @@ mod tests {
             .find("NewSessionCreateSignal::WorkspaceReady")
             .expect("authoritative Workspace should be announced immediately");
         let session_create = submit
-            .find(".create_session_deferred(create_request)")
+            .find(".create_session_deferred_with_id(create_request, optimistic_session_id)")
             .expect("Session should be created after the Workspace is ready");
         assert!(worktree_create < workspace_ready);
         assert!(workspace_ready < session_create);
-        assert!(submit.contains(".create_session(create_request)"));
+        assert!(submit.contains(".create_session_with_id(create_request, optimistic_session_id)"));
         assert!(submit.contains(".with_idempotency_key("));
         assert!(submit.contains(".with_expected_revision("));
         assert!(submit.contains("mark_workspace_ready(workspace.clone())"));
-        assert!(submit.contains("mark_failed(error.code.clone())"));
-        assert!(submit.contains("this.restore_new_session_message_draft("));
+        let failure = source
+            .split_once("    fn fail_pending_new_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn current_checkout_for_project("))
+            .map(|(body, _)| body)
+            .expect("new-session failure handling should remain inspectable");
+        assert!(failure.contains("self.new_session_workspace.mark_failed(failure.code);"));
+        assert!(submit.contains("this.fail_pending_new_session("));
         assert!(!submit.contains("this.composer_attachments = draft_attachments.clone()"));
     }
 
