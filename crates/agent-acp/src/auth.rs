@@ -20,6 +20,7 @@ const AUTH_TERMINAL_ENV_LIMIT: usize = 64;
 const AUTH_TERMINAL_ARG_TEXT_LIMIT: usize = 4096;
 const AUTH_TERMINAL_ENV_VALUE_LIMIT: usize = 16 * 1024;
 const AUTH_TERMINAL_COMMAND_LIMIT: usize = 4096;
+const KNOWN_TERMINAL_LOGIN_METHOD_ID: &str = "vibex-cli-login";
 
 #[derive(Clone)]
 pub(crate) struct AcpTerminalAuthSpec {
@@ -177,6 +178,68 @@ pub(crate) fn parse_initialize_auth_catalog(
     }
 }
 
+pub(crate) fn append_known_terminal_auth_fallback(
+    parsed: &mut ParsedAcpAuthCatalog,
+    agent_id: &AgentId,
+    command: &str,
+    base_args: &[String],
+    base_env: &[(String, String)],
+    cwd: Option<String>,
+) -> bool {
+    if parsed
+        .catalog
+        .methods
+        .iter()
+        .any(|method| method.id == KNOWN_TERMINAL_LOGIN_METHOD_ID)
+    {
+        return false;
+    }
+    let (acp_mode, title, description) = match agent_id.as_str() {
+        "auggie" => (
+            "--acp",
+            "Sign in to Augment CLI",
+            "Open the Augment CLI login flow in a terminal.",
+        ),
+        "kiro" => (
+            "acp",
+            "Sign in to Kiro CLI",
+            "Open the Kiro CLI login flow in a terminal.",
+        ),
+        _ => return false,
+    };
+    let mut login_args = base_args.to_vec();
+    let Some(mode) = login_args.last_mut() else {
+        return false;
+    };
+    if mode != acp_mode {
+        return false;
+    }
+    *mode = "login".to_string();
+    let Some(terminal) = standard_terminal_spec(
+        title,
+        command,
+        &login_args,
+        base_env,
+        Vec::new(),
+        BTreeMap::new(),
+        cwd,
+    ) else {
+        return false;
+    };
+    parsed.catalog.methods.push(AgentAuthMethod {
+        id: KNOWN_TERMINAL_LOGIN_METHOD_ID.to_string(),
+        name: title.to_string(),
+        description: Some(description.to_string()),
+        kind: AgentAuthMethodKind::Terminal,
+        environment: Vec::new(),
+        credential_link: None,
+    });
+    parsed
+        .terminal_methods
+        .insert(KNOWN_TERMINAL_LOGIN_METHOD_ID.to_string(), terminal);
+    true
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LegacyTerminalAuth {
@@ -286,6 +349,73 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn known_cli_login_fallbacks_replace_the_acp_mode_argument() {
+        for (agent_id, base_args, expected_args) in [
+            (
+                "auggie",
+                vec!["/managed/augment.mjs".to_string(), "--acp".to_string()],
+                vec!["/managed/augment.mjs".to_string(), "login".to_string()],
+            ),
+            ("kiro", vec!["acp".to_string()], vec!["login".to_string()]),
+        ] {
+            let agent_id = AgentId::parse(agent_id).unwrap();
+            let mut parsed = parse_initialize_auth_catalog(
+                agent_id.clone(),
+                &json!({ "protocolVersion": 1, "authMethods": [] }),
+                "/managed/agent",
+                &base_args,
+                &[],
+                Some("/workspace".to_string()),
+            );
+
+            assert!(append_known_terminal_auth_fallback(
+                &mut parsed,
+                &agent_id,
+                "/managed/agent",
+                &base_args,
+                &[],
+                Some("/workspace".to_string()),
+            ));
+            assert_eq!(parsed.catalog.methods.len(), 1);
+            assert_eq!(
+                parsed.catalog.methods[0].kind,
+                AgentAuthMethodKind::Terminal
+            );
+            assert_eq!(
+                parsed
+                    .terminal_methods
+                    .get(KNOWN_TERMINAL_LOGIN_METHOD_ID)
+                    .unwrap()
+                    .args,
+                expected_args
+            );
+        }
+    }
+
+    #[test]
+    fn known_cli_login_fallbacks_fail_closed_for_unexpected_commands() {
+        let agent_id = AgentId::parse("kiro").unwrap();
+        let mut parsed = parse_initialize_auth_catalog(
+            agent_id.clone(),
+            &json!({ "protocolVersion": 1, "authMethods": [] }),
+            "/managed/kiro-cli",
+            &["serve".to_string()],
+            &[],
+            None,
+        );
+
+        assert!(!append_known_terminal_auth_fallback(
+            &mut parsed,
+            &agent_id,
+            "/managed/kiro-cli",
+            &["serve".to_string()],
+            &[],
+            None,
+        ));
+        assert!(parsed.catalog.methods.is_empty());
+    }
 
     #[test]
     fn parses_all_auth_method_shapes_without_exposing_terminal_env_values() {

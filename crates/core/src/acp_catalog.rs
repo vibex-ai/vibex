@@ -54,9 +54,9 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "agoragentic-acp",
         "Agoragentic",
         "Agent marketplace with 174+ AI capabilities. Browse, invoke, and pay for agent services settled in USDC on Base L2.",
-        "1.3.3",
+        "1.3.6",
         "https://agoragentic.com",
-        &["npx", "-y", "agoragentic-mcp@1.3.3", "--acp"],
+        &["npx", "-y", "agoragentic-mcp@1.3.6", "--acp"],
     ),
     AcpAgentCatalogEntry::new(
         "amp-acp",
@@ -200,12 +200,13 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "fast-agent",
         "fast-agent",
         "Code and build agents with comprehensive multi-provider support",
-        "0.7.21",
+        "0.10.4",
         "https://fast-agent.ai/acp/",
         &[
             "uvx",
+            "--prerelease=allow",
             "--from",
-            "fast-agent-acp==0.7.21",
+            "fast-agent-mcp==0.10.4",
             "fast-agent-acp",
             "-x",
         ],
@@ -415,6 +416,31 @@ mod tests {
         let pi = entries.iter().find(|entry| entry.id == "pi").unwrap();
         assert_eq!(pi.version, "0.0.33");
         assert_eq!(pi.command, &["npx", "-y", "pi-acp@0.0.33"]);
+        let agoragentic = entries
+            .iter()
+            .find(|entry| entry.id == "agoragentic-acp")
+            .unwrap();
+        assert_eq!(agoragentic.version, "1.3.6");
+        assert_eq!(
+            agoragentic.command,
+            &["npx", "-y", "agoragentic-mcp@1.3.6", "--acp"]
+        );
+        let fast_agent = entries
+            .iter()
+            .find(|entry| entry.id == "fast-agent")
+            .unwrap();
+        assert_eq!(fast_agent.version, "0.10.4");
+        assert_eq!(
+            fast_agent.command,
+            &[
+                "uvx",
+                "--prerelease=allow",
+                "--from",
+                "fast-agent-mcp==0.10.4",
+                "fast-agent-acp",
+                "-x"
+            ]
+        );
         assert!(!entries.iter().any(|entry| entry.id == "corust-agent"));
     }
 }

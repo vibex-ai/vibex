@@ -7894,7 +7894,13 @@ mod tests {
             (
                 "fast-agent",
                 "uvx",
-                &["--from", "fast-agent-acp==0.7.21", "fast-agent-acp", "-x"][..],
+                &[
+                    "--prerelease=allow",
+                    "--from",
+                    "fast-agent-mcp==0.10.4",
+                    "fast-agent-acp",
+                    "-x",
+                ][..],
             ),
             ("cursor", "cursor-agent", &["acp"][..]),
             ("kimi-cli", "kimi", &["acp"][..]),

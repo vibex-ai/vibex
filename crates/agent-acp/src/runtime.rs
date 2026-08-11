@@ -64,18 +64,19 @@ use vibex_config_switch::{
 use vibex_config_switch::{CodexProviderRuntimeConfig, codex_runtime_config_from_profile};
 use vibex_core::{
     AcpAdapterId, AcpProcessStrategy, AcpProviderConfig, AcpProviderEnvSource, ActiveWorkKind,
-    AgentAuthCatalog, AgentAuthMethodKind, AgentAuthenticateRequest, AgentAuthenticateResult,
-    AgentCommandConfig, AgentEventRawOutput, AgentEventRawOutputMode, AgentId, AgentLogoutRequest,
-    AgentMessagePhase, AgentModelCapabilities, AgentModelListRequest, AgentModelListSource,
-    AgentProviderProjectionRegistry, AgentReasoningEffort, AgentRuntimeProbeStatus,
-    AgentRuntimeRouteKey, AgentSessionConfigProbe, AgentSessionRestoreCompatibility,
-    AgentSessionRestoreCompatibilityKey, AgentSessionRestoreMethod, AgentSessionRestoreOutcome,
-    AgentSessionState, AgentTokenUsage, AgentUsageCounterOrigin, AgentUsageExecution,
-    AgentUsageExecutionContext, AgentUsageExecutionStatus, AgentUsageExecutionStatusUpdate,
-    AgentUsageObservation, AgentUsageObservationSource, AgentUsageTokenValues, BindingState,
-    ElicitationAnswerValue, ElicitationField, ElicitationFieldKind, ElicitationOption,
-    ElicitationRequest, ElicitationRequestStatus, ElicitationResolutionAction,
-    ElicitationStringFormat, ExternalSessionContinuationStatus, ExternalSessionImportCandidate,
+    AgentAuthCatalog, AgentAuthMethodKind, AgentAuthStatus, AgentAuthenticateRequest,
+    AgentAuthenticateResult, AgentCommandConfig, AgentEventRawOutput, AgentEventRawOutputMode,
+    AgentId, AgentLogoutRequest, AgentMessagePhase, AgentModelCapabilities, AgentModelListRequest,
+    AgentModelListSource, AgentProviderProjectionRegistry, AgentReasoningEffort,
+    AgentRuntimeProbeStatus, AgentRuntimeRouteKey, AgentSessionConfigProbe,
+    AgentSessionRestoreCompatibility, AgentSessionRestoreCompatibilityKey,
+    AgentSessionRestoreMethod, AgentSessionRestoreOutcome, AgentSessionState, AgentTokenUsage,
+    AgentUsageCounterOrigin, AgentUsageExecution, AgentUsageExecutionContext,
+    AgentUsageExecutionStatus, AgentUsageExecutionStatusUpdate, AgentUsageObservation,
+    AgentUsageObservationSource, AgentUsageTokenValues, BindingState, ElicitationAnswerValue,
+    ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationRequest,
+    ElicitationRequestStatus, ElicitationResolutionAction, ElicitationStringFormat,
+    ExternalSessionContinuationStatus, ExternalSessionImportCandidate,
     ExternalSessionImportCandidateStatus, ExternalSessionImportSource, MAX_AGENT_USAGE_TOKEN_VALUE,
     NativeStateHomeId, PermissionActionDetail, PermissionRequest, PermissionRequestStatus,
     PermissionResponseKind, PermissionResponseOption, PermissionRiskCategory, PlanStepPayload,
@@ -100,7 +101,7 @@ use vibex_db::{
     SessionRepository, SwitchOperationRecord, apply_migrations, open_database,
 };
 
-use crate::auth::parse_initialize_auth_catalog;
+use crate::auth::{append_known_terminal_auth_fallback, parse_initialize_auth_catalog};
 use crate::process_environment::sanitize_inherited_appimage_environment;
 use crate::process_registry::{
     AcpProcessCrash, AcpProcessHandle, AcpProcessInstanceId, AcpProcessRegistry, AcpProcessStatus,
@@ -173,6 +174,7 @@ const ACP_ELICITATION_TEXT_LIMIT: usize = 4 * 1024;
 const ACP_PENDING_COMMAND_CATALOG_LIMIT: usize = 16;
 const ACP_TERMINAL_OUTPUT_LIMIT: usize = 24 * 1024;
 const ACP_PROCESS_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const ACP_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 const ACP_PERMISSION_CANCELLED_RESPONSE: &str = "cancelled";
 const OPENCODE_AGENT_ID: &str = "opencode";
 const OPENCODE_DEFAULT_MODEL: &str = "opencode-default";
@@ -1057,6 +1059,36 @@ fn provider_terminal_error_text(text: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+}
+
+fn acp_authentication_required_text(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    [
+        "authentication required",
+        "not authenticated",
+        "not logged in",
+        "login required",
+        "please log in",
+        "please login",
+        "unauthorized",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn provider_authentication_required_error(
+    method: &str,
+    rpc_message: &str,
+    stderr_summary: &str,
+) -> VibexError {
+    VibexError::provider(
+        "provider_authentication_required",
+        "Agent authentication is required",
+    )
+    .with_recovery_hint("Sign in from the Agent authentication settings, then retry.")
+    .with_diagnostic("method", method)
+    .with_diagnostic("rpcMessage", redact_summary(rpc_message))
+    .with_diagnostic("stderrSummary", redact_summary(stderr_summary))
 }
 
 fn append_bounded_assistant_text(buffer: &mut String, truncated: &mut bool, text: &str) {
@@ -3585,6 +3617,8 @@ impl AcpProcess {
                 }),
             )),
             Ok(Ok(Err(failure))) => {
+                let failure_requires_authentication =
+                    acp_authentication_required_text(&failure.message);
                 let latest_stream_error = drained_opencode_stream_error.or_else(|| {
                     prompt_session_id.as_deref().and_then(|native_session_id| {
                         self.with_routed_native(
@@ -3600,6 +3634,17 @@ impl AcpProcess {
                         .as_deref()
                         .unwrap_or(failure.message.as_str()),
                 );
+                let stderr_summary = self.stderr_summary().unwrap_or_default();
+                if failure_requires_authentication
+                    || acp_authentication_required_text(&rpc_message)
+                    || acp_authentication_required_text(&stderr_summary)
+                {
+                    return Err(provider_authentication_required_error(
+                        method,
+                        &rpc_message,
+                        &stderr_summary,
+                    ));
+                }
                 if latest_stream_error.is_some() || failure.code == OPENCODE_MODEL_API_ERROR_CODE {
                     Err(VibexError::provider(
                         OPENCODE_MODEL_API_ERROR_CODE,
@@ -3611,7 +3656,7 @@ impl AcpProcess {
                     .with_diagnostic("method", method)
                     .with_diagnostic("rpcCode", failure.code)
                     .with_diagnostic("rpcMessage", rpc_message)
-                    .with_diagnostic("stderrSummary", self.stderr_summary().unwrap_or_default()))
+                    .with_diagnostic("stderrSummary", stderr_summary))
                 } else {
                     // §7.2 error taxonomy: `-32601` is a single-operation
                     // downgrade signal; callers inspect `protocolErrorKind`
@@ -3630,16 +3675,27 @@ impl AcpProcess {
                     .with_diagnostic("protocolErrorKind", classified.kind())
                     .with_diagnostic("rpcCode", failure.code)
                     .with_diagnostic("rpcMessage", rpc_message)
-                    .with_diagnostic("stderrSummary", self.stderr_summary().unwrap_or_default()))
+                    .with_diagnostic("stderrSummary", stderr_summary))
                 }
             }
-            Ok(Err(_)) => Err(VibexError::process(
-                "acp_process_exited",
-                "ACP agent process exited before returning a JSON-RPC response",
-            )
-            .with_diagnostic("method", method)
-            .with_diagnostic("command", self.command_display.clone())
-            .with_diagnostic("stderrSummary", self.stderr_summary().unwrap_or_default())),
+            Ok(Err(_)) => {
+                let stderr_summary = self.wait_for_stderr_summary().await.unwrap_or_default();
+                if acp_authentication_required_text(&stderr_summary) {
+                    Err(provider_authentication_required_error(
+                        method,
+                        "",
+                        &stderr_summary,
+                    ))
+                } else {
+                    Err(VibexError::process(
+                        "acp_process_exited",
+                        "ACP agent process exited before returning a JSON-RPC response",
+                    )
+                    .with_diagnostic("method", method)
+                    .with_diagnostic("command", self.command_display.clone())
+                    .with_diagnostic("stderrSummary", stderr_summary))
+                }
+            }
             Err(_) => Err(VibexError::process(
                 "acp_request_timeout",
                 "ACP agent did not answer the JSON-RPC request in time",
@@ -3717,6 +3773,17 @@ impl AcpProcess {
             .lock()
             .ok()
             .and_then(|debug_log| debug_log.trailing_stderr())
+    }
+
+    async fn wait_for_stderr_summary(&self) -> Option<String> {
+        let deadline = Instant::now() + ACP_STDERR_DRAIN_TIMEOUT;
+        loop {
+            let summary = self.stderr_summary();
+            if summary.is_some() || Instant::now() >= deadline {
+                return summary;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
     }
 
     fn with_routed_native<R>(
@@ -12650,6 +12717,31 @@ async fn launch_agent_auth_process(
     {
         Ok(initialize) => initialize,
         Err(error) => {
+            if error.code == "provider_authentication_required" && process.terminal_auth_enabled {
+                let mut parsed = parse_initialize_auth_catalog(
+                    agent_id.clone(),
+                    &json!({ "protocolVersion": 1, "authMethods": [] }),
+                    &config.command,
+                    &effective_args,
+                    &env_overlays,
+                    Some(cwd.to_string_lossy().into_owned()),
+                );
+                parsed.catalog.status = AgentAuthStatus::AuthenticationRequired;
+                if append_known_terminal_auth_fallback(
+                    &mut parsed,
+                    agent_id,
+                    &config.command,
+                    &effective_args,
+                    &env_overlays,
+                    Some(cwd.to_string_lossy().into_owned()),
+                ) {
+                    return Ok(AgentAuthProcess {
+                        process,
+                        profile_id,
+                        parsed,
+                    });
+                }
+            }
             process.shutdown().await;
             return Err(error);
         }
@@ -12657,6 +12749,14 @@ async fn launch_agent_auth_process(
     let mut parsed = parse_initialize_auth_catalog(
         agent_id.clone(),
         &initialize,
+        &config.command,
+        &effective_args,
+        &env_overlays,
+        Some(cwd.to_string_lossy().into_owned()),
+    );
+    append_known_terminal_auth_fallback(
+        &mut parsed,
+        agent_id,
         &config.command,
         &effective_args,
         &env_overlays,
@@ -15848,6 +15948,48 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    async fn json_rpc_authentication_failures_use_the_stable_auth_error() {
+        let process = test_process(
+            AcpProcessInstanceId::new(),
+            None,
+            None,
+            None,
+            Arc::new(DisabledAcpTerminalHost),
+            false,
+            false,
+        );
+        let (response, receiver) = oneshot::channel();
+        response
+            .send(Err(AcpRpcFailure {
+                code: "-32000".to_string(),
+                message: "Authentication required: run `auggie login`".to_string(),
+                data_kind: protocol::AcpRpcFailureDataKind::Other,
+            }))
+            .unwrap();
+
+        let result = process
+            .finish_started_request(
+                AcpOperation::SessionNew.method(),
+                Duration::from_secs(1),
+                StartedAcpRequest {
+                    id: 1,
+                    prompt_session_id: None,
+                    response: receiver,
+                    registration_release: None,
+                },
+            )
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("authentication failure must not return an ACP response"),
+        };
+
+        assert_eq!(error.code, "provider_authentication_required");
+        assert_eq!(error.message, "Agent authentication is required");
+        assert!(error.recovery_hint.is_some());
+    }
+
     fn lifecycle_spawn_snapshot(profile_id: ProviderProfileId) -> ProcessSpawnConfigSnapshot {
         ProcessSpawnConfigSnapshot {
             agent_id: vibex_core::AgentId::parse("opencode").unwrap(),
@@ -18068,6 +18210,7 @@ prompt_mode = os.environ.get("VIBEX_MOCK_ACP_PROMPT_MODE", "success")
 restore_mode = os.environ.get("VIBEX_MOCK_ACP_RESTORE_MODE", "success")
 advertise_resume = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_RESUME") == "true"
 advertise_auth = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_AUTH") == "true"
+initialize_mode = os.environ.get("VIBEX_MOCK_ACP_INITIALIZE_MODE", "success")
 session_new_delay = float(os.environ.get("VIBEX_MOCK_ACP_SESSION_NEW_DELAY", "0"))
 fail_first_session_new = os.environ.get("VIBEX_MOCK_ACP_FAIL_FIRST_SESSION_NEW") == "true"
 model_prefix = os.environ.get("VIBEX_MOCK_ACP_MODEL_PREFIX", "").strip("/")
@@ -18091,6 +18234,13 @@ for line in sys.stdin:
     method = msg.get("method")
     mid = msg.get("id")
     if method == "initialize":
+        if initialize_mode == "auth_rpc":
+            send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32003, "message": "Authentication required: run the CLI login command"}})
+            continue
+        if initialize_mode == "auth_exit":
+            sys.stderr.write("You are not logged in, please log in with the CLI login command\n")
+            sys.stderr.flush()
+            raise SystemExit(1)
         capabilities = {
             "loadSession": True,
             "listSessions": True,
@@ -19062,6 +19212,27 @@ for line in sys.stdin:
                 .unwrap();
         }
 
+        fn configure_known_auth_fallback(&self, acp_mode: &str, initialize_mode: &str) {
+            let service = self.service();
+            let mut config = service
+                .get_acp_profile_config(self.profile_id.clone())
+                .unwrap();
+            config.args.push(acp_mode.to_string());
+            config.env.push(vibex_core::AcpProviderEnvReference {
+                key: "VIBEX_MOCK_ACP_INITIALIZE_MODE".to_string(),
+                source: AcpProviderEnvSource::Literal,
+                value: Some(initialize_mode.to_string()),
+                secret_lookup_key: None,
+                redacted_hint: "mock initialize mode".to_string(),
+            });
+            service
+                .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                    provider_profile_id: self.profile_id.clone(),
+                    config,
+                })
+                .unwrap();
+        }
+
         fn set_session_new_delay(&self, delay_seconds: &str) {
             let service = self.service();
             let mut config = service
@@ -19206,6 +19377,60 @@ for line in sys.stdin:
             "browser-login"
         );
         fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn known_cli_auth_fallbacks_remain_available_before_login() {
+        for (label, agent, acp_mode, initialize_mode, expected_status) in [
+            (
+                "augment-known-auth",
+                "auggie",
+                "--acp",
+                "success",
+                AgentAuthStatus::Unknown,
+            ),
+            (
+                "kiro-known-auth",
+                "kiro",
+                "acp",
+                "auth_exit",
+                AgentAuthStatus::AuthenticationRequired,
+            ),
+        ] {
+            let agent_id = AgentId::parse(agent).unwrap();
+            let Some(fixture) = MockAcpFixture::create_for_agent(label, Some(agent_id.clone()))
+            else {
+                return;
+            };
+            fixture.configure_known_auth_fallback(acp_mode, initialize_mode);
+            let terminal_host = Arc::new(MockTerminalHost::default());
+            let client =
+                AcpRuntimeClient::with_terminal_host(fixture.service(), terminal_host.clone());
+
+            let catalog = client
+                .list_auth_methods(&agent_id, Some(&fixture.profile_id))
+                .await
+                .unwrap();
+            assert_eq!(catalog.status, expected_status);
+            assert_eq!(catalog.methods.len(), 1);
+            assert_eq!(catalog.methods[0].kind, AgentAuthMethodKind::Terminal);
+
+            let authenticated = client
+                .authenticate_agent(AgentAuthenticateRequest {
+                    agent_id,
+                    provider_profile_id: Some(fixture.profile_id.clone()),
+                    method_id: catalog.methods[0].id.clone(),
+                })
+                .await
+                .unwrap();
+            assert!(authenticated.terminal.is_some());
+            let requests = terminal_host.auth_requests.lock().unwrap();
+            let request = requests.last().unwrap();
+            assert_eq!(request.args.last().map(String::as_str), Some("login"));
+            assert!(!request.args.iter().any(|arg| arg == acp_mode));
+            drop(requests);
+            fixture.cleanup();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

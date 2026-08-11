@@ -49,6 +49,16 @@ Vibex error categories. Required behavior:
 - Include native request id or event id when available.
 - Distinguish unsupported capability from transient process failure.
 - Record raw fallback data in debug logs, not in normal user messages.
+- An ACP JSON-RPC error or early process exit whose raw bounded message clearly
+  says authentication/login is required maps to
+  `provider/provider_authentication_required`, with a sign-in recovery hint,
+  instead of the generic `acp_rpc_error` or `acp_process_exited`. Classify the
+  original bounded text before redaction removes the discriminating wording;
+  diagnostics still store only the redacted form.
+- When an ACP process exits before its response, allow one short bounded stderr
+  drain before classifying the failure. Absence of an explicit authentication
+  signal remains `process/acp_process_exited`; do not infer authentication from
+  an empty channel close alone.
 
 ## Permission Errors
 

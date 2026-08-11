@@ -111,9 +111,13 @@ if (process.platform === "win32") {
 }
 "#;
 const AMP_CLI_PACKAGE: &str = "@ampcode/cli";
+const AGORAGENTIC_CLI_PACKAGE: &str = "agoragentic-mcp";
 const AUTOHAND_CLI_PACKAGE: &str = "autohand-cli";
 const CODEWHALE_CLI_PACKAGE: &str = "codewhale";
+const FAST_AGENT_CLI_PACKAGE: &str = "fast-agent-mcp";
 const HERMES_CLI_PACKAGE: &str = "hermes-agent";
+const MINION_ACP_RUNTIME_PACKAGE: &str = "agent-client-protocol";
+const MINION_ACP_RUNTIME_VERSION: &str = "0.8.1";
 const NODE_RELEASE_INDEX_URL: &str = "https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt";
 const UV_RELEASE_DOWNLOAD_BASE: &str = "https://github.com/astral-sh/uv/releases/latest/download";
 const AGENT_NODE_PATH_ENV: &str = "VIBEX_AGENT_NODE_PATH";
@@ -264,6 +268,7 @@ impl AgentInstallService {
         if let Some(record) = self.read_record(&agent_id)?
             && record_has_usable_installation(&record)
             && managed_companion_installation_is_usable(&agent_id, &record)
+            && managed_uvx_runtime_dependencies_are_current(&agent_id, &record)
             && windows_npm_installation_is_current(&record)
         {
             self.config_service.reconcile_agent_acp_runtime(
@@ -300,11 +305,17 @@ impl AgentInstallService {
             && self
                 .managed_runtime_version_is_newer(&agent_id, existing.as_ref())
                 .await?;
+        let compatibility_update = existing_is_usable
+            && existing.as_ref().is_some_and(|record| {
+                !managed_uvx_runtime_dependencies_are_current(&agent_id, record)
+            });
         let status = match installed_version.as_deref() {
             Some(version) if version_is_newer(version, &entry.version) => {
                 AgentManagedInstallStatus::UpdateAvailable
             }
-            Some(_) if runtime_update => AgentManagedInstallStatus::UpdateAvailable,
+            Some(_) if runtime_update || compatibility_update => {
+                AgentManagedInstallStatus::UpdateAvailable
+            }
             Some(_) => AgentManagedInstallStatus::Installed,
             None => AgentManagedInstallStatus::NotInstalled,
         };
@@ -508,6 +519,7 @@ impl AgentInstallService {
                         && installed_distribution_kind(Path::new(root)) == Some(distribution_kind)
                 })
                 && record.command.as_ref().is_some_and(command_is_available)
+                && managed_uvx_runtime_dependencies_are_current(&agent_id, record)
                 && windows_npm_installation_is_current(record)
                 && latest_npm_companion(&agent_id).is_none()
                 && node_runtime.as_ref().is_none_or(|runtime| {
@@ -775,6 +787,14 @@ impl AgentInstallService {
         agent: ManagedCliAgent,
     ) -> VibexResult<(String, RegistryEntry)> {
         let entry = match agent {
+            ManagedCliAgent::Agoragentic => {
+                self.load_latest_npm_entry(
+                    agent.registry_id(),
+                    AGORAGENTIC_CLI_PACKAGE,
+                    vec!["--acp".to_string()],
+                )
+                .await?
+            }
             ManagedCliAgent::Codewhale => {
                 self.load_latest_npm_entry(
                     agent.registry_id(),
@@ -782,6 +802,24 @@ impl AgentInstallService {
                     vec!["serve".to_string(), "--acp".to_string()],
                 )
                 .await?
+            }
+            ManagedCliAgent::FastAgent => {
+                let version = self
+                    .fetch_latest_pypi_version(FAST_AGENT_CLI_PACKAGE)
+                    .await?;
+                RegistryEntry {
+                    id: agent.registry_id().to_string(),
+                    version: version.clone(),
+                    distribution: RegistryDistribution {
+                        binary: None,
+                        npx: None,
+                        uvx: Some(RegistryUvxDistribution {
+                            package: format!("{FAST_AGENT_CLI_PACKAGE}=={version}"),
+                            args: vec!["-x".to_string()],
+                        }),
+                        kiro: None,
+                    },
+                }
             }
             ManagedCliAgent::Hermes => {
                 let version = self.fetch_latest_pypi_version(HERMES_CLI_PACKAGE).await?;
@@ -993,6 +1031,7 @@ impl AgentInstallService {
             version: entry.version.clone(),
             fingerprint: fingerprint.clone(),
             runtime_version: runtime_package.map(|package| package.version),
+            runtime_dependencies: BTreeMap::new(),
             distribution_kind: AgentManagedDistributionKind::Binary,
             launch,
         };
@@ -1118,6 +1157,7 @@ impl AgentInstallService {
             version: entry.version.clone(),
             fingerprint: fingerprint.clone(),
             runtime_version: Some(kiro.version),
+            runtime_dependencies: BTreeMap::new(),
             distribution_kind: AgentManagedDistributionKind::Binary,
             launch: ManifestLaunch::Binary {
                 command: command_rel.to_string_lossy().into_owned(),
@@ -1259,6 +1299,7 @@ impl AgentInstallService {
                 .as_ref()
                 .map(|package| package.version.clone())
                 .or_else(|| (agent_id.as_str() == "codewhale").then(|| package.version.clone())),
+            runtime_dependencies: BTreeMap::new(),
             distribution_kind: AgentManagedDistributionKind::Npm,
             launch: ManifestLaunch::Node {
                 node: node.node.to_string_lossy().into_owned(),
@@ -1379,6 +1420,8 @@ impl AgentInstallService {
         uv: UvRuntime,
     ) -> VibexResult<InstalledAgent> {
         let package = parse_exact_uvx_spec(&uvx.package, &entry.version)?;
+        let runtime_dependencies = managed_uvx_runtime_dependencies(agent_id);
+        let allow_prereleases = managed_uvx_allows_prereleases(agent_id);
         let entry_point_identity = managed_uvx_entry_point(agent_id).unwrap_or(&package.name);
         let args_identity = serde_json::to_string(&uvx.args).map_err(|error| {
             VibexError::validation(
@@ -1388,16 +1431,27 @@ impl AgentInstallService {
             .with_diagnostic("error", error.to_string())
         })?;
         let uv_identity = uv.fingerprint_identity();
-        let fingerprint = distribution_fingerprint(&[
-            entry.id.as_str(),
-            entry.version.as_str(),
-            uvx.package.as_str(),
-            package.name.as_str(),
-            package.version.as_str(),
-            entry_point_identity,
-            args_identity.as_str(),
-            uv_identity.as_str(),
-        ]);
+        let mut fingerprint_parts = vec![
+            entry.id.clone(),
+            entry.version.clone(),
+            uvx.package.clone(),
+            package.name.clone(),
+            package.version.clone(),
+            entry_point_identity.to_string(),
+            args_identity,
+            uv_identity,
+            format!("allowPrereleases={allow_prereleases}"),
+        ];
+        fingerprint_parts.extend(
+            runtime_dependencies
+                .iter()
+                .map(VerifiedUvxPackage::exact_spec),
+        );
+        let fingerprint_refs = fingerprint_parts
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let fingerprint = distribution_fingerprint(&fingerprint_refs);
         let target_root = self.version_root(agent_id, &entry.version, &fingerprint)?;
         if let Some(installed) = load_or_remove_cached_installation(&target_root, &fingerprint)? {
             return Ok(installed);
@@ -1448,8 +1502,17 @@ impl AgentInstallService {
             .arg("--keyring-provider")
             .arg("disabled")
             .arg("--link-mode")
-            .arg("copy")
+            .arg("copy");
+        if allow_prereleases {
+            install_command.arg("--prerelease").arg("allow");
+        }
+        install_command
             .arg(package.exact_spec())
+            .args(
+                runtime_dependencies
+                    .iter()
+                    .map(VerifiedUvxPackage::exact_spec),
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1472,6 +1535,18 @@ impl AgentInstallService {
             .with_diagnostic("package", package.name)
             .with_diagnostic("expectedVersion", package.version)
             .with_diagnostic("actualVersion", installed_package.version));
+        }
+        for dependency in &runtime_dependencies {
+            let installed_dependency = inspect_uvx_package(&python, &dependency.name).await?;
+            if installed_dependency.version != dependency.version {
+                return Err(VibexError::validation(
+                    "agent_uvx_runtime_dependency_version_mismatch",
+                    "uvx installed an incompatible ACP runtime dependency",
+                )
+                .with_diagnostic("package", dependency.name.clone())
+                .with_diagnostic("expectedVersion", dependency.version.clone())
+                .with_diagnostic("actualVersion", installed_dependency.version));
+            }
         }
         let executable = select_uvx_entry_point(entry_point_identity, &installed_package.scripts)?;
         let launcher = staging.join("vibex-uvx-launcher.py");
@@ -1496,6 +1571,10 @@ impl AgentInstallService {
             version: entry.version.clone(),
             fingerprint: fingerprint.clone(),
             runtime_version: Some(package.version.clone()),
+            runtime_dependencies: runtime_dependencies
+                .into_iter()
+                .map(|dependency| (dependency.name, dependency.version))
+                .collect(),
             distribution_kind: AgentManagedDistributionKind::Uvx,
             launch: ManifestLaunch::Python {
                 python: python_rel.to_string_lossy().into_owned(),
@@ -2405,7 +2484,9 @@ struct RegistryEntry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ManagedCliAgent {
+    Agoragentic,
     Codewhale,
+    FastAgent,
     Hermes,
     Kiro,
 }
@@ -2413,7 +2494,9 @@ enum ManagedCliAgent {
 impl ManagedCliAgent {
     fn for_agent(agent_id: &AgentId) -> Option<Self> {
         match agent_id.as_str() {
+            "agoragentic-acp" => Some(Self::Agoragentic),
             "codewhale" => Some(Self::Codewhale),
+            "fast-agent" => Some(Self::FastAgent),
             "hermes" => Some(Self::Hermes),
             "kiro" => Some(Self::Kiro),
             _ => None,
@@ -2422,7 +2505,9 @@ impl ManagedCliAgent {
 
     fn registry_id(self) -> &'static str {
         match self {
+            Self::Agoragentic => "agoragentic-acp",
             Self::Codewhale => "codewhale",
+            Self::FastAgent => "fast-agent",
             Self::Hermes => "hermes",
             Self::Kiro => "kiro",
         }
@@ -2589,6 +2674,8 @@ struct InstallManifest {
     fingerprint: String,
     #[serde(default)]
     runtime_version: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    runtime_dependencies: BTreeMap<String, String>,
     distribution_kind: AgentManagedDistributionKind,
     launch: ManifestLaunch,
 }
@@ -2815,9 +2902,25 @@ fn latest_npm_companion(agent_id: &AgentId) -> Option<&'static str> {
 
 fn managed_uvx_entry_point(agent_id: &AgentId) -> Option<&'static str> {
     match agent_id.as_str() {
+        "fast-agent" => Some("fast-agent-acp"),
         "hermes" => Some("hermes"),
         _ => None,
     }
+}
+
+fn managed_uvx_runtime_dependencies(agent_id: &AgentId) -> Vec<VerifiedUvxPackage> {
+    match agent_id.as_str() {
+        "minion-code" => vec![VerifiedUvxPackage {
+            name: MINION_ACP_RUNTIME_PACKAGE.to_string(),
+            extras: Vec::new(),
+            version: MINION_ACP_RUNTIME_VERSION.to_string(),
+        }],
+        _ => Vec::new(),
+    }
+}
+
+fn managed_uvx_allows_prereleases(agent_id: &AgentId) -> bool {
+    agent_id.as_str() == "fast-agent"
 }
 
 fn npm_companion_command(agent_id: &AgentId) -> Option<&'static str> {
@@ -3755,7 +3858,7 @@ const {{ pathToFileURL }} = require("node:url");
 require(path.join(__dirname, {windows_hook}));
 const adapter = path.join(__dirname, {adapter_script});
 import(pathToFileURL(adapter).href).catch((error) => {{
-  console.error("Failed to start {label} ACP adapter:", error);
+  console.error("Failed to start", {label}, "ACP adapter:", error);
   process.exitCode = 1;
 }});
 "#
@@ -3828,7 +3931,7 @@ const companionCommand = process.platform === "win32" ? {windows_command} : {com
 process.env[{environment}] = path.join(__dirname, "node_modules", ".bin", companionCommand);
 const adapter = path.join(__dirname, {adapter_script});
 import(pathToFileURL(adapter).href).catch((error) => {{
-  console.error("Failed to start {label} ACP adapter:", error);
+  console.error("Failed to start", {label}, "ACP adapter:", error);
   process.exitCode = 1;
 }});
 "#
@@ -3905,7 +4008,7 @@ process.env[{environment}] = path.join(__dirname, "node_modules", ".bin", compan
 const adapter = path.join(__dirname, {adapter_binary});
 const child = spawn(adapter, process.argv.slice(2), {{ stdio: "inherit", env: process.env }});
 child.on("error", (error) => {{
-  console.error("Failed to start {label} ACP adapter:", error);
+  console.error("Failed to start", {label}, "ACP adapter:", error);
   process.exitCode = 1;
 }});
 child.on("close", (code, signal) => {{
@@ -4237,6 +4340,26 @@ fn managed_companion_installation_is_usable(
         .is_ok()
     });
     runtime_version_is_valid && runtime_command_is_valid
+}
+
+fn managed_uvx_runtime_dependencies_are_current(
+    agent_id: &AgentId,
+    record: &AgentManagedInstallationRecord,
+) -> bool {
+    let expected = managed_uvx_runtime_dependencies(agent_id)
+        .into_iter()
+        .map(|dependency| (dependency.name, dependency.version))
+        .collect::<BTreeMap<_, _>>();
+    if expected.is_empty() {
+        return true;
+    }
+    let Some(root) = record.install_root.as_deref().map(Path::new) else {
+        return false;
+    };
+    fs::read(root.join("vibex-install.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<InstallManifest>(&bytes).ok())
+        .is_some_and(|manifest| manifest.runtime_dependencies == expected)
 }
 
 fn windows_npm_installation_is_current(record: &AgentManagedInstallationRecord) -> bool {
@@ -5409,7 +5532,13 @@ mod tests {
             require_registry_id(&AgentId::parse("minion-code").unwrap()).unwrap(),
             "minion-code"
         );
-        for agent_id in ["codewhale", "hermes", "kiro"] {
+        for agent_id in [
+            "agoragentic-acp",
+            "codewhale",
+            "fast-agent",
+            "hermes",
+            "kiro",
+        ] {
             assert_eq!(
                 require_registry_id(&AgentId::parse(agent_id).unwrap()).unwrap(),
                 agent_id
@@ -5496,6 +5625,47 @@ mod tests {
     }
 
     #[test]
+    fn generated_npm_launchers_are_valid_javascript() {
+        let sources = [
+            npm_windows_adapter_launcher_source(
+                &AgentId::parse("codex").unwrap(),
+                Path::new("node_modules/adapter/dist/index.js"),
+            )
+            .unwrap(),
+            npm_companion_launcher_source(
+                &AgentId::parse("amp-acp").unwrap(),
+                Path::new("node_modules/adapter/dist/index.js"),
+            )
+            .unwrap(),
+            npm_companion_binary_launcher_source(
+                &AgentId::parse("amp-acp").unwrap(),
+                Path::new("amp-acp"),
+            )
+            .unwrap(),
+        ];
+        let temp = tempfile::tempdir().unwrap();
+        for (index, source) in sources.iter().enumerate() {
+            let launcher = temp.path().join(format!("launcher-{index}.cjs"));
+            fs::write(&launcher, source).unwrap();
+            let output = match std::process::Command::new("node")
+                .arg("--check")
+                .arg(&launcher)
+                .output()
+            {
+                Ok(output) => output,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+                Err(error) => panic!("Node.js syntax check failed to start: {error}"),
+            };
+            assert!(
+                output.status.success(),
+                "generated launcher was invalid: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(source.contains("console.error(\"Failed to start\","));
+        }
+    }
+
+    #[test]
     fn exact_npm_specs_reject_ranges_and_identity_drift() {
         assert_eq!(
             parse_exact_npm_spec("@scope/agent@1.2.3", "1.2.3").unwrap(),
@@ -5531,6 +5701,30 @@ mod tests {
         assert!(parse_exact_uvx_spec("agent>=1.2.3", "1.2.3").is_err());
         assert!(parse_exact_uvx_spec("agent@1.2.4", "1.2.3").is_err());
         assert!(parse_exact_uvx_spec("agent@https://example.com/agent.whl", "1.2.3").is_err());
+    }
+
+    #[test]
+    fn managed_uvx_compatibility_overrides_are_exact_and_agent_scoped() {
+        let minion = AgentId::parse("minion-code").unwrap();
+        assert_eq!(
+            managed_uvx_runtime_dependencies(&minion),
+            vec![VerifiedUvxPackage {
+                name: MINION_ACP_RUNTIME_PACKAGE.to_string(),
+                extras: Vec::new(),
+                version: MINION_ACP_RUNTIME_VERSION.to_string(),
+            }]
+        );
+        assert!(managed_uvx_runtime_dependencies(&AgentId::parse("hermes").unwrap()).is_empty());
+        assert_eq!(
+            managed_uvx_entry_point(&AgentId::parse("fast-agent").unwrap()),
+            Some("fast-agent-acp")
+        );
+        assert!(managed_uvx_allows_prereleases(
+            &AgentId::parse("fast-agent").unwrap()
+        ));
+        assert!(!managed_uvx_allows_prereleases(
+            &AgentId::parse("minion-code").unwrap()
+        ));
     }
 
     #[test]
@@ -5943,6 +6137,7 @@ mod tests {
             version: "0.9.30".to_string(),
             fingerprint: "fixture".to_string(),
             runtime_version: None,
+            runtime_dependencies: BTreeMap::new(),
             distribution_kind: AgentManagedDistributionKind::Uvx,
             launch: ManifestLaunch::Python {
                 python: "venv/bin/python".to_string(),
@@ -6073,6 +6268,7 @@ printf '%s\n' '{"version":"1.2.3","scripts":["test-package"]}'
                 version: "0.2.1".to_string(),
                 fingerprint: "fixture".to_string(),
                 runtime_version: Some("0.9.4".to_string()),
+                runtime_dependencies: BTreeMap::new(),
                 distribution_kind: AgentManagedDistributionKind::Npm,
                 launch: ManifestLaunch::Node {
                     node: adapter.to_string_lossy().into_owned(),
@@ -6086,6 +6282,69 @@ printf '%s\n' '{"version":"1.2.3","scripts":["test-package"]}'
         assert!(load_installed_agent(&root, "fixture").is_ok());
         fs::remove_file(companion).unwrap();
         assert!(load_installed_agent(&root, "fixture").is_err());
+    }
+
+    #[test]
+    fn legacy_minion_installations_require_acp_runtime_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("minion-code");
+        fs::create_dir_all(&root).unwrap();
+        let command = root.join("minion-code");
+        fs::write(&command, b"fixture").unwrap();
+        let manifest_path = root.join("vibex-install.json");
+        let mut manifest = InstallManifest {
+            registry_agent_id: "minion-code".to_string(),
+            version: "0.1.44".to_string(),
+            fingerprint: "legacy-fixture".to_string(),
+            runtime_version: Some("0.1.44".to_string()),
+            runtime_dependencies: BTreeMap::new(),
+            distribution_kind: AgentManagedDistributionKind::Uvx,
+            launch: ManifestLaunch::Binary {
+                command: "minion-code".to_string(),
+                args: Vec::new(),
+            },
+        };
+        write_json_private(&manifest_path, &manifest).unwrap();
+        assert!(
+            !fs::read_to_string(&manifest_path)
+                .unwrap()
+                .contains("runtimeDependencies")
+        );
+
+        let agent_id = AgentId::parse("minion-code").unwrap();
+        let record = AgentManagedInstallationRecord {
+            agent_id: agent_id.clone(),
+            registry_agent_id: "minion-code".to_string(),
+            state: AgentManagedInstallState {
+                managed: true,
+                status: AgentManagedInstallStatus::Installed,
+                distribution_kind: Some(AgentManagedDistributionKind::Uvx),
+                installed_version: Some("0.1.44".to_string()),
+                available_version: Some("0.1.44".to_string()),
+                last_error_code: None,
+                last_error_message: None,
+                updated_at_ms: Some(1),
+            },
+            command: Some(AgentCommandConfig {
+                command: command.to_string_lossy().into_owned(),
+                args: Vec::new(),
+            }),
+            install_root: Some(root.to_string_lossy().into_owned()),
+            updated_at_ms: 1,
+        };
+        assert!(record_has_usable_installation(&record));
+        assert!(!managed_uvx_runtime_dependencies_are_current(
+            &agent_id, &record
+        ));
+
+        manifest.runtime_dependencies.insert(
+            MINION_ACP_RUNTIME_PACKAGE.to_string(),
+            MINION_ACP_RUNTIME_VERSION.to_string(),
+        );
+        write_json_private(&manifest_path, &manifest).unwrap();
+        assert!(managed_uvx_runtime_dependencies_are_current(
+            &agent_id, &record
+        ));
     }
 
     #[test]
@@ -6153,6 +6412,7 @@ printf '%s\n' '{"version":"1.2.3","scripts":["test-package"]}'
                 version: "0.0.33".to_string(),
                 fingerprint: "fixture".to_string(),
                 runtime_version: None,
+                runtime_dependencies: BTreeMap::new(),
                 distribution_kind: AgentManagedDistributionKind::Npm,
                 launch: ManifestLaunch::Node {
                     node: node.to_string_lossy().into_owned(),
@@ -6183,6 +6443,7 @@ printf '%s\n' '{"version":"1.2.3","scripts":["test-package"]}'
             version: "0.9.0".to_string(),
             fingerprint: "fixture".to_string(),
             runtime_version: None,
+            runtime_dependencies: BTreeMap::new(),
             distribution_kind: AgentManagedDistributionKind::Binary,
             launch: ManifestLaunch::Node {
                 node: node.to_string_lossy().into_owned(),

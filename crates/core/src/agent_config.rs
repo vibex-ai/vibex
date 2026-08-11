@@ -435,9 +435,9 @@ impl AgentSnapshotEntry {
 
 /// Maps Vibex's stable Agent ids onto managed ACP identities.
 ///
-/// Most ids are upstream ACP Registry identities. CodeWhale, Hermes, and Kiro
-/// use Vibex-owned latest-channel distributions because their ACP-capable CLIs
-/// are not currently published as installable Registry entries.
+/// Most ids are upstream ACP Registry identities. Agoragentic, CodeWhale,
+/// fast-agent, Hermes, and Kiro use Vibex-owned latest-channel distributions
+/// when their Registry entry is absent, stale, or not directly executable.
 pub fn acp_registry_agent_id(agent_id: &AgentId) -> Option<&'static str> {
     match agent_id.as_str() {
         "claude" => return Some("claude-acp"),
@@ -733,7 +733,13 @@ mod tests {
             (
                 "fast-agent",
                 "uvx",
-                &["--from", "fast-agent-acp==0.7.21", "fast-agent-acp", "-x"][..],
+                &[
+                    "--prerelease=allow",
+                    "--from",
+                    "fast-agent-mcp==0.10.4",
+                    "fast-agent-acp",
+                    "-x",
+                ][..],
             ),
             ("cursor", "cursor-agent", &["acp"][..]),
         ] {
@@ -785,13 +791,12 @@ mod tests {
             acp_registry_agent_id(&AgentId::parse("pi").unwrap()),
             Some("pi-acp")
         );
-        for managed in ["fast-agent", "minion-code"] {
-            assert_eq!(
-                acp_registry_agent_id(&AgentId::parse(managed).unwrap()),
-                Some(managed),
-                "{managed} must use its Registry uvx distribution"
-            );
-        }
+        let registry_uvx_managed = "minion-code";
+        assert_eq!(
+            acp_registry_agent_id(&AgentId::parse(registry_uvx_managed).unwrap()),
+            Some(registry_uvx_managed),
+            "{registry_uvx_managed} must use its Registry uvx distribution"
+        );
         for managed in [
             "cortex-code",
             "crow-cli",
@@ -807,7 +812,13 @@ mod tests {
                 "{managed} must use its Registry binary distribution"
             );
         }
-        for latest_managed in ["codewhale", "hermes", "kiro"] {
+        for latest_managed in [
+            "agoragentic-acp",
+            "codewhale",
+            "fast-agent",
+            "hermes",
+            "kiro",
+        ] {
             assert_eq!(
                 acp_registry_agent_id(&AgentId::parse(latest_managed).unwrap()),
                 Some(latest_managed),
@@ -849,7 +860,13 @@ mod tests {
             pi.managed_install.status,
             AgentManagedInstallStatus::NotInstalled
         );
-        for agent_id in ["codewhale", "hermes", "kiro"] {
+        for agent_id in [
+            "agoragentic-acp",
+            "codewhale",
+            "fast-agent",
+            "hermes",
+            "kiro",
+        ] {
             let definition = definitions
                 .iter()
                 .find(|definition| definition.id.as_str() == agent_id)

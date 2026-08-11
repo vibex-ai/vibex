@@ -138,6 +138,13 @@ AcpProviderEnvReference {
 - Runtime resolution reads the selected Profile's references at process launch;
   authentication changes do not write native Agent config files or global user
   home state.
+- A documented CLI whose ACP mode cannot advertise authentication before login
+  may expose an Agent-scoped terminal login fallback. The fallback must match
+  the exact known ACP launch argument and replace only that argument with
+  `login`; unexpected commands fail closed. An authentication-required
+  initialize exit may still return this catalog entry when terminal auth is
+  enabled, while Agents without a configured fallback retain the original
+  structured error.
 - Secret values and resolved keychain material are absent from Profile JSON,
   diagnostics, Debug, runtime-option snapshots, and projection previews.
 
@@ -154,6 +161,8 @@ AcpProviderEnvReference {
 | Required value is absent and no existing reference is preserved | `agent_auth_env_value_required`. |
 | Keychain write/readback fails | return the storage error and restore every already-applied keychain value. |
 | Profile transaction fails after keychain writes | return the storage error and report `keychainRollbackFailures` only when restoration also fails. |
+| Known CLI exits initialize because login is required | return `authentication_required` with its terminal login fallback when terminal auth is enabled. |
+| Known Agent id with an unexpected ACP command shape | expose no synthetic login method; return the original catalog/error. |
 
 ### 5. Good / Base / Bad Cases
 
@@ -181,6 +190,9 @@ AcpProviderEnvReference {
   contain lookup metadata only, never plaintext values.
 - Runtime authentication tests assert the selected Profile's env overlay is
   used and another Profile's secret is never injected.
+- ACP auth/runtime tests assert known terminal fallbacks replace the exact ACP
+  mode with `login`, fail closed for unexpected commands, and remain available
+  when a known CLI exits initialize before login.
 
 ### 7. Wrong vs Correct
 
@@ -2589,30 +2601,46 @@ AgentManagedInstallationRecord {
   tarball, executable, and lockfile identity checks. The generated launcher
   sets `PI_ACP_PI_COMMAND` to that tree's `.bin/pi` command; it never depends
   on or replaces a user-global Pi installation.
-- Five additional Agent CLIs use their official latest published release when
+- Seven additional Agent CLIs use their official latest published release when
   Add, Upgrade, or Check for updates resolves an installation: CodeWhale uses
   npm `codewhale/latest`; Hermes uses PyPI `hermes-agent` with the `[acp]`
   extra; Kiro uses the stable latest CLI manifest; Amp uses npm
-  `@ampcode/cli/latest`; and Autohand uses npm `autohand-cli/latest`. The
-  resolved release is converted to an exact version before installation and
-  recorded in `runtimeVersion`; no floating package range reaches npm or uv.
-- CodeWhale and Hermes expose ACP from the CLI itself (`codewhale serve --acp`
-  and `hermes acp`). Kiro launches `kiro-cli acp`. Kiro archives and their
-  SHA-256 values come from the official manifest; Linux installs into a staged
-  private home, macOS retains the private app bundle from the DMG, and Windows
-  retains the MSI administrative-extract tree. Unsupported manifest platforms
-  fail closed.
+  `@ampcode/cli/latest`; Autohand uses npm `autohand-cli/latest`; Agoragentic
+  uses npm `agoragentic-mcp/latest`; and fast-agent uses PyPI
+  `fast-agent-mcp/latest`. The resolved release is converted to an exact
+  version before installation and recorded in `runtimeVersion`; no floating
+  package range reaches npm or uv.
+- Agoragentic, CodeWhale, fast-agent, and Hermes expose ACP from their CLI
+  (`agoragentic-mcp --acp`, `codewhale serve --acp`, `fast-agent-acp -x`, and
+  `hermes acp`). fast-agent installs from `fast-agent-mcp`, not the incompatible
+  wrapper distribution, and may explicitly allow prereleases while resolving
+  its exact upstream dependency set. Kiro launches `kiro-cli acp`. Kiro
+  archives and their SHA-256 values come from the official manifest; Linux
+  installs into a staged private home, macOS retains the private app bundle
+  from the DMG, and Windows retains the MSI administrative-extract tree.
+  Unsupported manifest platforms fail closed.
 - Amp and Autohand keep their ACP Adapter and latest CLI in the same isolated
   npm tree. Their generated launchers set `AMP_CLI_PATH` or `AUTOHAND_CMD` to
   that tree's `.bin/amp` or `.bin/autohand` command before importing the
-  Adapter. These five managed CLIs never probe, prefer, replace, or depend on a
-  user-global Agent CLI from `PATH`; only Node/npm and uv toolchain discovery
-  may reuse verified user/system executables.
+  Adapter. These managed latest-channel CLIs never probe, prefer, replace, or
+  depend on a user-global Agent CLI from `PATH`; only Node/npm and uv toolchain
+  discovery may reuse verified user/system executables.
+- Minion Code installs the exact `agent-client-protocol==0.8.1` compatibility
+  dependency beside its exact Agent package. The install manifest records this
+  dependency version, and startup repair, explicit update checks, and
+  same-version install cache hits all require that exact manifest entry. A
+  legacy Minion manifest without it is `UpdateAvailable` and must be rebuilt
+  even when both Agent versions are `0.1.44`.
+- Generated Node launchers encode display labels as JavaScript values rather
+  than interpolating them inside string literals. Tests syntax-check every
+  launcher shape with `node --check` so a label cannot make an otherwise
+  verified installation fail before ACP initialize.
 - "Latest" is resolved only during Add, explicit Upgrade/install, or Check for
   updates. Desktop startup restores a healthy recorded installation without a
   network lookup or silent upgrade. Check for updates compares both the
-  Adapter version and any separately recorded Pi, Amp, or Autohand CLI runtime
-  version.
+  Adapter version, any separately recorded Pi, Amp, or Autohand CLI runtime
+  version, and any Agent-scoped exact compatibility dependency recorded in the
+  install manifest.
 - npm Agents select Node/npm in this order: explicit
   `VIBEX_AGENT_NODE_PATH`/`VIBEX_AGENT_NPM_PATH` configuration, system
   `node`/`npm` from `PATH`, then a downloaded Vibex-managed Node.js 22 runtime.
@@ -2635,9 +2663,10 @@ AgentManagedInstallationRecord {
   disables keyring providers, and copies packages instead of linking them.
   Each package is installed into a Python 3.12 relocatable venv inside the
   staged Agent version. Vibex verifies installed metadata has the exact
-  Registry version and an unambiguous console entry point, then launches it
-  through a metadata-based Python launcher so staging publication does not
-  leave absolute paths behind.
+  Registry version, every declared compatibility dependency has its exact
+  version, and the console entry point is unambiguous. It then launches through
+  a metadata-based Python launcher so staging publication does not leave
+  absolute paths behind.
 - npm always uses an isolated Vibex cache and blank user/global npm config,
   regardless of runtime source. The user and global config paths must be
   distinct: npm rejects one file assigned to both configuration levels as a
@@ -2648,10 +2677,11 @@ AgentManagedInstallationRecord {
   executable paths are bounded and traversal-safe.
 - A usable installed SemVer may not be replaced by a lower Registry or latest
   channel SemVer.
-  Exact-version cache hits are idempotent; an invalid cache entry is removed
-  and rebuilt. Pending install/upgrade/uninstall rows are reconciled on the
-  next startup using actual install-root and command-file checks, not only a
-  version field.
+  Exact-version cache hits are idempotent only when the install manifest also
+  matches every Agent-scoped runtime compatibility dependency; an invalid or
+  legacy cache entry is removed and rebuilt. Pending install/upgrade/uninstall
+  rows are reconciled on the next startup using install-root, command-file, and
+  manifest compatibility checks, not only a version field.
 - Uninstall owns the cross-layer transition: it marks the operation pending,
   removes Agent config and authentication snapshots, removes managed files and
   the installation row, and leaves the Agent disabled/deleted. If a later step
@@ -2689,6 +2719,9 @@ AgentManagedInstallationRecord {
   and continue through system then managed runtime fallback. Missing or
   non-exact `uvx` package specs, installed-version mismatches, and ambiguous
   console entry points fail closed without activating a partial install.
+- Missing or mismatched Agent-scoped runtime dependency in an otherwise usable
+  same-version install -> `UpdateAvailable` and rebuild; do not report it as
+  current based on the Agent version alone.
 - Identical `npm_config_userconfig` and `npm_config_globalconfig` paths -> an
   invalid internal command configuration; construct distinct blank files and
   do not rely on npm to accept the duplicate load.
@@ -2736,7 +2769,9 @@ AgentManagedInstallationRecord {
   malformed/old Node rejection, distinct empty user/global npm configs,
   Pi's dual-package lock, latest runtime companion, and local launcher,
   Amp/Autohand latest companion binding, Autohand bin selection, Kiro manifest
-  platform selection,
+  platform selection, generated Node launcher syntax, Agoragentic/fast-agent
+  latest-channel resolution, Minion's exact ACP runtime dependency and legacy
+  same-version manifest repair,
   explicit/system/managed `uv` selection and fallback, exact `uvx` and Hermes
   `[acp]` extra parsing, metadata entry-point validation, relocatable Python
   cache recovery, interrupted recovery, and uninstall cleanup.
