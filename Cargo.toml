@@ -87,6 +87,7 @@ qrcode = { version = "0.14.1", default-features = false }
 hkdf = "0.12"
 hmac = "0.12"
 ignore = "0.4"
+libc = "0.2"
 rand_core = "0.6"
 tower = { version = "0.5", features = ["util"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }

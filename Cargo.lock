@@ -9808,6 +9808,7 @@ dependencies = [
  "async-trait",
  "base64",
  "command-group",
+ "libc",
  "rusqlite",
  "semver 1.0.28",
  "serde",

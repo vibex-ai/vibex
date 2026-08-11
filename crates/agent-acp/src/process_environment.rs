@@ -2,6 +2,34 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Remove the ACP child from the desktop's controlling terminal before the
+/// process-group hook moves it into the background. Some CLIs open `/dev/tty`
+/// for interactive services even in ACP mode; a background process group that
+/// does so is stopped by `SIGTTIN` and never answers the ACP handshake.
+#[cfg(unix)]
+pub fn detach_from_controlling_terminal(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: the hook only performs async-signal-safe syscalls between fork
+    // and exec. It does not allocate, lock, or access shared Rust state.
+    unsafe {
+        command.pre_exec(|| {
+            const DEV_TTY: &[u8] = b"/dev/tty\0";
+            // The child may not have a controlling terminal (for example in a
+            // service or test process), so failure to open it is expected.
+            let fd = libc::open(DEV_TTY.as_ptr().cast(), libc::O_RDWR | libc::O_CLOEXEC);
+            if fd >= 0 {
+                libc::ioctl(fd, libc::TIOCNOTTY);
+                libc::close(fd);
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+pub fn detach_from_controlling_terminal(_command: &mut Command) {}
+
 #[cfg(windows)]
 pub(crate) const WINDOWS_CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -89,6 +117,19 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::*;
+
+    #[test]
+    fn acp_child_does_not_inherit_the_controlling_terminal() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(
+            "if dd if=/dev/tty of=/dev/null count=0 2>/dev/null; then exit 42; else exit 0; fi",
+        );
+        detach_from_controlling_terminal(&mut command);
+
+        let status = command.status().unwrap();
+
+        assert!(status.success());
+    }
 
     #[test]
     fn appimage_environment_keeps_only_host_paths() {

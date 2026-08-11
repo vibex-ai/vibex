@@ -2585,6 +2585,11 @@ logout({})
 - A terminal auth process advertises `clientCapabilities.auth.terminal` only
   when a real terminal host exists. Headless hosts filter terminal methods and
   never return a fake terminal id.
+- Every ACP child is launched with stdio pipes and must detach itself from the
+  desktop's controlling terminal before entering its background process group.
+  Some CLIs open `/dev/tty` for interactive services even in ACP mode; leaving
+  the child attached lets job control deliver `SIGTTIN`, which stalls
+  `initialize` and prevents authentication discovery from completing.
 - Auth discovery and mutation results are fenced by `(agent_id,
   provider_profile_id?)` and a monotonically increasing UI generation. A late
   result may not replace a newly selected Agent/Profile or reattach a terminal.
@@ -2640,6 +2645,9 @@ logout({})
   keep its workspace terminal after the user leaves the Agent.
 - Bad: put authentication behind a global management mutex, cancel by raw ACP
   process id, or drop only the UI future while leaving the auth process alive.
+- Bad: assume `--acp` prevents every interactive terminal access; a CLI that
+  opens `/dev/tty` from a background process group can be stopped before it
+  answers ACP, leaving a leaked authentication process behind.
 
 ### 6. Tests Required
 
@@ -2652,6 +2660,9 @@ logout({})
   stable cancelled completion, idempotent late cancel, and successful restart.
 - The no-terminal-host test asserts `auth.terminal == false` and that terminal
   methods are filtered from the catalog.
+- `cargo test -p vibex-agent-acp process_environment::tests --locked` asserts
+  an ACP child cannot reopen the controlling terminal; run it once under a
+  pseudo-terminal to cover the job-control boundary.
 - `cargo test -p vibex-config-switch agent_auth_environment --locked` covers
   exact key names, blank preservation, explicit clear, keychain rollback, and
   secret-free projections.

@@ -102,7 +102,9 @@ use vibex_db::{
 };
 
 use crate::auth::{append_known_terminal_auth_fallback, parse_initialize_auth_catalog};
-use crate::process_environment::sanitize_inherited_appimage_environment;
+use crate::process_environment::{
+    detach_from_controlling_terminal, sanitize_inherited_appimage_environment,
+};
 use crate::process_registry::{
     AcpProcessCrash, AcpProcessHandle, AcpProcessInstanceId, AcpProcessRegistry, AcpProcessStatus,
     MultiSessionContractEvidence, ProcessAcquireKey, ProcessExitReporter, ProcessLease,
@@ -9193,6 +9195,7 @@ impl AcpRuntimeClient {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         sanitize_inherited_appimage_environment(command.as_std_mut());
+        detach_from_controlling_terminal(command.as_std_mut());
         for key in PARENT_SESSION_ENV_KEYS {
             command.env_remove(key);
         }
