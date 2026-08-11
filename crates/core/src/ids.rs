@@ -96,6 +96,7 @@ vibex_id!(AgentModelProviderBindingId, "agent_provider_binding");
 vibex_id!(AgentConfiguredModelBindingId, "agent_model_binding");
 vibex_id!(AgentProviderProjectionDescriptorId, "projection");
 vibex_id!(AgentRuntimeProbeId, "agent_probe");
+vibex_id!(AgentAuthenticationOperationId, "agent_auth");
 vibex_id!(McpServerId, "mcp");
 vibex_id!(SkillId, "skill");
 vibex_id!(PromptId, "prompt");

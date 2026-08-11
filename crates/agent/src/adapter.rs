@@ -9,14 +9,15 @@ use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 use vibex_core::{
     AgentAuthCatalog, AgentAuthenticateRequest, AgentAuthenticateResult,
-    AgentCommandDiscoverRequest, AgentCommandDiscoverResponse, AgentCommandExecuteRequest, AgentId,
-    AgentLogoutRequest, AgentModelListResponse, AgentModelListSource, AgentSessionConfigProbe,
-    AgentSessionSafety, AgentUsageCounterOrigin, AgentUsageExecution, AgentUsageExecutionContext,
-    AgentUsageExecutionStatusUpdate, AgentUsageObservation, ElicitationResolution,
-    ExternalSessionImportCandidate, MessageAttachment, MessageSubmissionId, PermissionResolution,
-    ProviderBinding, ProviderBindingMetadata, ProviderCapabilities, ProviderKind,
-    ProviderProfileId, RuntimeBindingId, SessionRuntimeSelection, TimelinePayload,
-    TimelineRedactionState, TimelineSource, VibexError, VibexResult, VibexSessionId,
+    AgentAuthenticationCancelRequest, AgentCommandDiscoverRequest, AgentCommandDiscoverResponse,
+    AgentCommandExecuteRequest, AgentId, AgentLogoutRequest, AgentModelListResponse,
+    AgentModelListSource, AgentSessionConfigProbe, AgentSessionSafety, AgentUsageCounterOrigin,
+    AgentUsageExecution, AgentUsageExecutionContext, AgentUsageExecutionStatusUpdate,
+    AgentUsageObservation, ElicitationResolution, ExternalSessionImportCandidate,
+    MessageAttachment, MessageSubmissionId, PermissionResolution, ProviderBinding,
+    ProviderBindingMetadata, ProviderCapabilities, ProviderKind, ProviderProfileId,
+    RuntimeBindingId, SessionRuntimeSelection, TimelinePayload, TimelineRedactionState,
+    TimelineSource, VibexError, VibexResult, VibexSessionId,
 };
 
 #[derive(Debug, Clone)]
@@ -444,6 +445,16 @@ pub trait AgentProvider: Send + Sync {
         Err(VibexError::capability(
             "agent_authenticate_unsupported",
             "authentication is not supported by this provider",
+        ))
+    }
+
+    async fn cancel_agent_authentication(
+        &self,
+        _request: AgentAuthenticationCancelRequest,
+    ) -> VibexResult<bool> {
+        Err(VibexError::capability(
+            "agent_authentication_cancel_unsupported",
+            "cancelling authentication is not supported by this provider",
         ))
     }
 

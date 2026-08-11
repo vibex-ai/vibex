@@ -51,7 +51,8 @@ pub use agent::{
 pub use agent_auth::{
     AgentAuthCatalog, AgentAuthEnvironmentUpdateRequest, AgentAuthEnvironmentValue,
     AgentAuthEnvironmentVariable, AgentAuthMethod, AgentAuthMethodKind, AgentAuthStatus,
-    AgentAuthenticateRequest, AgentAuthenticateResult, AgentLogoutRequest,
+    AgentAuthenticateRequest, AgentAuthenticateResult, AgentAuthenticationCancelRequest,
+    AgentLogoutRequest,
 };
 pub use agent_config::{
     AgentCatalogListResponse, AgentCommandConfig, AgentConfig, AgentConfigStatus, AgentDefinition,
@@ -129,7 +130,7 @@ pub use git::{
     managed_worktree_name_slug,
 };
 pub use ids::{
-    AgentConfiguredModelBindingId, AgentModelProviderBindingId,
+    AgentAuthenticationOperationId, AgentConfiguredModelBindingId, AgentModelProviderBindingId,
     AgentProviderProjectionDescriptorId, AgentRuntimeProbeId, AgentRuntimeProfileId,
     AutomationEdgeId, AutomationGraphId, AutomationNodeId, AutomationRunId, AutomationRunStepId,
     ChannelId, CorrelationId, DeviceId, EventId, HookId, McpServerId, MessageSubmissionId,

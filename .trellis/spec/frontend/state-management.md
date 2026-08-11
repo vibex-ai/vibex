@@ -1609,12 +1609,16 @@ ManagementCenter {
   agent_auth_scope: Option<auth_scope>,
   agent_auth_catalog: Option<AgentAuthCatalog>,
   agent_auth_inputs: Map<(method_id, env_name), InputState>,
+  agent_auth_operations: Map<agent_id, {
+    operation_id, scope, method_id, phase: Running | Cancelling
+  }>,
   agent_auth_terminal: Option<TerminalAuthActionDescriptor>,
   agent_auth_terminal_state: None | Running | Succeeded | Failed
 }
 
 load_agent_auth(force) -> BackendFuture<AgentAuthCatalog>
-authenticate_agent(method_id) -> BackendFuture<(AgentAuthCatalog, terminal?)>
+authenticate_agent(method_id, operation_id) -> BackendFuture<(AgentAuthCatalog, terminal?)>
+cancel_agent_authentication(agent_id, operation_id) -> BackendFuture<bool>
 logout_agent() -> BackendFuture<AgentAuthCatalog>
 ```
 
@@ -1646,6 +1650,17 @@ logout_agent() -> BackendFuture<AgentAuthCatalog>
 - The UI exposes refresh/retry, loading, unavailable, not-verified,
   authentication-required, authenticated, and terminal-pending states without
   making a hover-only primary action.
+- Authentication and logout use the existing Agent-keyed mutation lane, never
+  the global Management mutation slot. A pending login blocks conflicting
+  actions only for its target Agent; other Agents and their sessions remain
+  usable. The operation task is retained independently from the currently
+  selected auth scope so navigation cannot detach the backend work.
+- While an Agent/environment authenticate call is waiting, that method's action
+  becomes an accessible danger Stop action. The first click changes its phase
+  to `Cancelling`, disables repeat clicks, and invokes the typed cancel request.
+  A running terminal method uses the same Stop action and kills its temporary
+  PTY. Successful cancellation clears pending state without presenting an error,
+  after which the original sign-in action is available again.
 
 ### 4. Validation & Error Matrix
 
@@ -1655,6 +1670,9 @@ logout_agent() -> BackendFuture<AgentAuthCatalog>
 | Discovery completes for an old scope/generation | ignore it; keep the current Agent/Profile state. |
 | Environment method has no Profile | keep the action disabled and show the Profile-required state. |
 | Required credential is explicitly cleared | refresh catalog, mark authentication required, and do not invoke ACP authenticate. |
+| Selected method has a Running auth operation | render Stop; keep other methods for that Agent disabled. |
+| Stop is clicked | transition to Cancelling once, cancel by exact operation id, and wait for authoritative completion. |
+| Backend returns `agent_authentication_cancelled` | clear Agent-keyed pending state, keep auth required, and allow restart without an error notification. |
 | Terminal callback is stale or terminal was closed | kill/release the old terminal if still owned; do not alter current auth state. |
 | Terminal exits non-zero or by signal | show failed state and the structured exit diagnostic only. |
 | Logout is not advertised | do not render the logout action. |
@@ -1667,11 +1685,15 @@ logout_agent() -> BackendFuture<AgentAuthCatalog>
   remains independent because the method id is part of the key.
 - Good: a terminal login remains visible while running, then reports its final
   output and refreshes auth status after exit.
+- Good: Codex browser login remains waiting while another Agent can be toggled
+  or used; the Codex action becomes Stop and returns to Sign in after cancellation.
 - Base: an Agent advertises no methods; the page shows a compact unavailable
   state and still allows Provider Profile management.
 - Bad: show runtime validation or projection debug cards beside auth methods,
   fill a configured secret into an InputState, or let a stale callback replace
   the selected Agent's credentials.
+- Bad: store login in `ManagementCenter.mutation`, disable every Agent action,
+  or make closing the settings window the only way to abandon browser login.
 
 ### 6. Tests Required
 
@@ -1681,6 +1703,9 @@ logout_agent() -> BackendFuture<AgentAuthCatalog>
   configured values are represented by a placeholder only.
 - Generation/scope tests assert stale discovery, mutation, logout, and terminal
   monitor callbacks do not mutate current state.
+- Agent-keyed mutation tests assert auth reports its target Agent rather than
+  occupying the global lane; renderer tests assert Running/Cancelling actions
+  expose Stop and invoke `cancel_agent_authentication`.
 - Terminal tests assert bounded surface creation, final output retention,
   success/failure/signal classification, and temporary-terminal cleanup.
 - Run the locked `vibex-desktop`, `vibex-desktop-runtime`, and `vibex-terminal`
@@ -1693,6 +1718,7 @@ logout_agent() -> BackendFuture<AgentAuthCatalog>
 ```rust
 self.auth_catalog = response.catalog;
 self.auth_inputs.insert(variable.name, input);
+self.mutation = Some(ManagementMutation::AgentAuth(method_id));
 ```
 
 #### Correct
@@ -1705,6 +1731,22 @@ if response.generation == self.agent_auth_generation
     self.agent_auth_inputs
         .insert((method_id, variable_name), input);
 }
+self.agent_mutations.insert(
+    agent_id.clone(),
+    ManagementMutation::AgentAuth {
+        agent_id: agent_id.clone(),
+        action: method_id.clone(),
+    },
+);
+self.agent_auth_operations.insert(
+    agent_id,
+    AgentAuthPendingOperation {
+        operation_id,
+        scope,
+        method_id,
+        phase: AgentAuthOperationPhase::Running,
+    },
+);
 ```
 
 The view owns transient presentation state; `DesktopRuntime` and the ACP

@@ -29,13 +29,13 @@ use vibex_agent::{
 use vibex_config_switch::{ProviderConfigService, acp_capabilities_from_config};
 use vibex_core::{
     AcpProviderConfig, AcpProviderEnvSource, AcpProviderProfileCreateRequest, AgentAuthCatalog,
-    AgentAuthenticateRequest, AgentAuthenticateResult, AgentCommandDiscoverRequest,
-    AgentCommandDiscoverResponse, AgentCommandEntry, AgentCommandExecuteRequest,
-    AgentCommandExecutionBehavior, AgentCommandSelectionBehavior, AgentCommandSourceKind,
-    AgentCommandTrigger, AgentEventRawExtension, AgentLogoutRequest, AgentMessageDeltaPayload,
-    AgentMessagePayload, AgentMessagePhase, AgentModelCapabilities, AgentModelListResponse,
-    AgentModelListSource, AgentReasoningEffort, AgentSessionConfigProbe, AgentSessionSafety,
-    AgentUsageCounterOrigin, AgentUsageExecutionContext, ElicitationRequest,
+    AgentAuthenticateRequest, AgentAuthenticateResult, AgentAuthenticationCancelRequest,
+    AgentCommandDiscoverRequest, AgentCommandDiscoverResponse, AgentCommandEntry,
+    AgentCommandExecuteRequest, AgentCommandExecutionBehavior, AgentCommandSelectionBehavior,
+    AgentCommandSourceKind, AgentCommandTrigger, AgentEventRawExtension, AgentLogoutRequest,
+    AgentMessageDeltaPayload, AgentMessagePayload, AgentMessagePhase, AgentModelCapabilities,
+    AgentModelListResponse, AgentModelListSource, AgentReasoningEffort, AgentSessionConfigProbe,
+    AgentSessionSafety, AgentUsageCounterOrigin, AgentUsageExecutionContext, ElicitationRequest,
     ExternalSessionImportCandidate, MessageSubmissionId, PermissionActionDetail, PermissionRequest,
     PermissionRequestStatus, PermissionResponseKind, PermissionResponseOption,
     PermissionRiskCategory, PlanPayload, PlanStepPayload, ProviderBinding, ProviderBindingMetadata,
@@ -400,6 +400,16 @@ pub trait AcpClient: Send + Sync {
         Err(VibexError::capability(
             "acp_authenticate_unsupported",
             "ACP authentication is not supported by this adapter",
+        ))
+    }
+
+    async fn cancel_agent_authentication(
+        &self,
+        _request: AgentAuthenticationCancelRequest,
+    ) -> VibexResult<bool> {
+        Err(VibexError::capability(
+            "acp_authentication_cancel_unsupported",
+            "cancelling ACP authentication is not supported by this adapter",
         ))
     }
 
@@ -2006,6 +2016,13 @@ impl AgentProvider for AcpAgentProvider {
         request: AgentAuthenticateRequest,
     ) -> VibexResult<AgentAuthenticateResult> {
         self.client.authenticate_agent(request).await
+    }
+
+    async fn cancel_agent_authentication(
+        &self,
+        request: AgentAuthenticationCancelRequest,
+    ) -> VibexResult<bool> {
+        self.client.cancel_agent_authentication(request).await
     }
 
     async fn logout_agent(&self, request: AgentLogoutRequest) -> VibexResult<()> {

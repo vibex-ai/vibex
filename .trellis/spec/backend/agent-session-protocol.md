@@ -2538,8 +2538,13 @@ AgentProvider::list_auth_methods(agent_id, provider_profile_id?)
   -> AgentAuthCatalog {
        agent_id, methods[], supports_logout, status, refreshed_at_ms
      }
-AgentProvider::authenticate_agent(AgentAuthenticateRequest)
+AgentProvider::authenticate_agent(AgentAuthenticateRequest {
+  operation_id, agent_id, provider_profile_id?, method_id
+})
   -> AgentAuthenticateResult { method_id, terminal? }
+AgentProvider::cancel_agent_authentication(
+  AgentAuthenticationCancelRequest { operation_id, agent_id }
+) -> bool
 AgentProvider::logout_agent(AgentLogoutRequest) -> ()
 
 AgentAuthMethod {
@@ -2583,6 +2588,18 @@ logout({})
 - Auth discovery and mutation results are fenced by `(agent_id,
   provider_profile_id?)` and a monotonically increasing UI generation. A late
   result may not replace a newly selected Agent/Profile or reattach a terminal.
+- Every authenticate call carries a product-level
+  `AgentAuthenticationOperationId`. The ACP runtime reserves it before process
+  initialization, associates it with the dedicated temporary auth process, and
+  permits at most one active authentication per Agent. Operations for different
+  Agents remain independent and may run concurrently with normal Agent work.
+- Cancelling an active operation marks it cancelled before awaiting process
+  shutdown, closes its full process group, fails any pending initialize or
+  authenticate request, and normalizes the final result to
+  `agent_authentication_cancelled`. Cancellation does not expose or accept an
+  ACP process instance id. Cancelling an operation that already finished is an
+  idempotent `false`; the same Agent may immediately start a new operation with
+  a new id after the old operation finishes.
 - A terminal monitor retains the final output in the shared terminal buffer,
   classifies exit code `0` without a signal as success, and reports non-zero or
   signaled exits as `agent_terminal_auth_failed`. Closing or changing scope
@@ -2597,6 +2614,10 @@ logout({})
 | Provider Profile is missing for an environment method | `agent_auth_profile_required`. |
 | Profile belongs to another Agent or is not ACP | `agent_auth_profile_mismatch` / `agent_auth_profile_kind_invalid`. |
 | Requested method id was not in the latest initialize catalog | `agent_auth_method_not_advertised`; do not send `authenticate`. |
+| A second authentication starts for the same Agent | `agent_authentication_in_progress`; do not launch another process. |
+| Cancel targets an active operation for another Agent | `agent_authentication_operation_agent_mismatch`; do not stop either process. |
+| Cancel targets an active operation | shut down its temporary process and complete authenticate with `agent_authentication_cancelled`. |
+| Cancel targets an operation that already finished | return `false`; do not affect a newer operation. |
 | Agent does not advertise logout | `agent_logout_not_advertised`; do not send `logout`. |
 | Terminal host is unavailable | do not expose terminal methods; never fabricate a successful descriptor. |
 | Auth terminal exits non-zero or by signal | `agent_terminal_auth_failed` with exit metadata only. |
@@ -2609,12 +2630,16 @@ logout({})
   PTY for terminal login, and refreshes the catalog after completion.
 - Good: two Profiles for one Agent keep independent keychain references and
   switching Profiles changes only the projected credentials used for auth.
+- Good: one browser login waits indefinitely, another Agent continues to work,
+  and Stop closes only the waiting login; a new login can then start normally.
 - Base: an Agent advertises no auth methods; the detail view shows its normal
   unavailable/not-verified state without static login controls.
 - Bad: render a generic `API_KEY` field for every Agent, call `authenticate`
   with a stale method id, or include an env value in a descriptor/log.
 - Bad: treat a terminal process that exits with a signal as authenticated or
   keep its workspace terminal after the user leaves the Agent.
+- Bad: put authentication behind a global management mutex, cancel by raw ACP
+  process id, or drop only the UI future while leaving the auth process alive.
 
 ### 6. Tests Required
 
@@ -2622,6 +2647,9 @@ logout({})
   bounds, exact ids, logout capability, and terminal-value redaction.
 - `cargo test -p vibex-agent-acp agent_auth_methods_authenticate_terminal_and_logout_round_trip --locked`
   covers all method kinds and exact wire calls.
+- `cargo test -p vibex-agent-acp hanging_agent_authentication_can_be_cancelled_without_blocking_and_restarted --locked`
+  asserts independent discovery while login waits, process-backed cancellation,
+  stable cancelled completion, idempotent late cancel, and successful restart.
 - The no-terminal-host test asserts `auth.terminal == false` and that terminal
   methods are filtered from the catalog.
 - `cargo test -p vibex-config-switch agent_auth_environment --locked` covers
@@ -2647,6 +2675,17 @@ let catalog = agent.list_auth_methods(agent_id, profile_id).await?;
 for method in catalog.methods {
     render_dynamic_auth_method(method);
 }
+let operation_id = AgentAuthenticationOperationId::new();
+agent.authenticate_agent(AgentAuthenticateRequest {
+    operation_id: operation_id.clone(),
+    agent_id: agent_id.clone(),
+    provider_profile_id: profile_id,
+    method_id,
+}).await?;
+agent.cancel_agent_authentication(AgentAuthenticationCancelRequest {
+    operation_id,
+    agent_id,
+}).await?;
 ```
 
 The Agent owns the method contract; Vibex owns the common UI, Profile secret

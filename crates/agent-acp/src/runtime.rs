@@ -65,18 +65,18 @@ use vibex_config_switch::{CodexProviderRuntimeConfig, codex_runtime_config_from_
 use vibex_core::{
     AcpAdapterId, AcpProcessStrategy, AcpProviderConfig, AcpProviderEnvSource, ActiveWorkKind,
     AgentAuthCatalog, AgentAuthMethodKind, AgentAuthStatus, AgentAuthenticateRequest,
-    AgentAuthenticateResult, AgentCommandConfig, AgentEventRawOutput, AgentEventRawOutputMode,
-    AgentId, AgentLogoutRequest, AgentMessagePhase, AgentModelCapabilities, AgentModelListRequest,
-    AgentModelListSource, AgentProviderProjectionRegistry, AgentReasoningEffort,
-    AgentRuntimeProbeStatus, AgentRuntimeRouteKey, AgentSessionConfigProbe,
-    AgentSessionRestoreCompatibility, AgentSessionRestoreCompatibilityKey,
-    AgentSessionRestoreMethod, AgentSessionRestoreOutcome, AgentSessionState, AgentTokenUsage,
-    AgentUsageCounterOrigin, AgentUsageExecution, AgentUsageExecutionContext,
-    AgentUsageExecutionStatus, AgentUsageExecutionStatusUpdate, AgentUsageObservation,
-    AgentUsageObservationSource, AgentUsageTokenValues, BindingState, ElicitationAnswerValue,
-    ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationRequest,
-    ElicitationRequestStatus, ElicitationResolutionAction, ElicitationStringFormat,
-    ExternalSessionContinuationStatus, ExternalSessionImportCandidate,
+    AgentAuthenticateResult, AgentAuthenticationCancelRequest, AgentAuthenticationOperationId,
+    AgentCommandConfig, AgentEventRawOutput, AgentEventRawOutputMode, AgentId, AgentLogoutRequest,
+    AgentMessagePhase, AgentModelCapabilities, AgentModelListRequest, AgentModelListSource,
+    AgentProviderProjectionRegistry, AgentReasoningEffort, AgentRuntimeProbeStatus,
+    AgentRuntimeRouteKey, AgentSessionConfigProbe, AgentSessionRestoreCompatibility,
+    AgentSessionRestoreCompatibilityKey, AgentSessionRestoreMethod, AgentSessionRestoreOutcome,
+    AgentSessionState, AgentTokenUsage, AgentUsageCounterOrigin, AgentUsageExecution,
+    AgentUsageExecutionContext, AgentUsageExecutionStatus, AgentUsageExecutionStatusUpdate,
+    AgentUsageObservation, AgentUsageObservationSource, AgentUsageTokenValues, BindingState,
+    ElicitationAnswerValue, ElicitationField, ElicitationFieldKind, ElicitationOption,
+    ElicitationRequest, ElicitationRequestStatus, ElicitationResolutionAction,
+    ElicitationStringFormat, ExternalSessionContinuationStatus, ExternalSessionImportCandidate,
     ExternalSessionImportCandidateStatus, ExternalSessionImportSource, MAX_AGENT_USAGE_TOKEN_VALUE,
     NativeStateHomeId, PermissionActionDetail, PermissionRequest, PermissionRequestStatus,
     PermissionResponseKind, PermissionResponseOption, PermissionRiskCategory, PlanStepPayload,
@@ -4925,6 +4925,8 @@ pub struct AcpRuntimeClient {
         Mutex<HashMap<RuntimeBindingId, AgentSessionRestoreCompatibilityKey>>,
     restore_results: Mutex<HashMap<String, vibex_core::AgentSessionRestoreResult>>,
     session_operation_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    agent_authentication_operations:
+        Mutex<HashMap<AgentAuthenticationOperationId, ActiveAgentAuthentication>>,
     prompt_gate_sessions: Mutex<BTreeSet<VibexSessionId>>,
     process_registry: AcpProcessRegistry<AcpProcess>,
     observability: Arc<RuntimeObservability>,
@@ -7453,6 +7455,7 @@ impl AcpRuntimeClient {
             restore_compatibility_keys: Mutex::new(HashMap::new()),
             restore_results: Mutex::new(HashMap::new()),
             session_operation_locks: Mutex::new(HashMap::new()),
+            agent_authentication_operations: Mutex::new(HashMap::new()),
             prompt_gate_sessions: Mutex::new(BTreeSet::new()),
             process_registry: AcpProcessRegistry::with_observability(observability.clone()),
             observability,
@@ -7495,6 +7498,7 @@ impl AcpRuntimeClient {
             restore_compatibility_keys: Mutex::new(HashMap::new()),
             restore_results: Mutex::new(HashMap::new()),
             session_operation_locks: Mutex::new(HashMap::new()),
+            agent_authentication_operations: Mutex::new(HashMap::new()),
             prompt_gate_sessions: Mutex::new(BTreeSet::new()),
             process_registry: AcpProcessRegistry::with_observability(observability.clone()),
             observability,
@@ -7512,6 +7516,73 @@ impl AcpRuntimeClient {
 
     pub fn observability(&self) -> Arc<RuntimeObservability> {
         self.observability.clone()
+    }
+
+    fn begin_agent_authentication(&self, request: &AgentAuthenticateRequest) -> VibexResult<()> {
+        let mut operations = self
+            .agent_authentication_operations
+            .lock()
+            .map_err(|_| lock_poisoned_error("agentAuthenticationOperations"))?;
+        if operations.contains_key(&request.operation_id) {
+            return Err(VibexError::conflict(
+                "agent_authentication_operation_exists",
+                "Agent authentication operation is already active",
+            ));
+        }
+        if operations
+            .values()
+            .any(|operation| operation.agent_id == request.agent_id)
+        {
+            return Err(VibexError::conflict(
+                "agent_authentication_in_progress",
+                "Another authentication operation is already active for this Agent",
+            ));
+        }
+        operations.insert(
+            request.operation_id.clone(),
+            ActiveAgentAuthentication {
+                agent_id: request.agent_id.clone(),
+                process: None,
+                cancel_requested: false,
+            },
+        );
+        Ok(())
+    }
+
+    fn attach_agent_authentication_process(
+        &self,
+        operation_id: &AgentAuthenticationOperationId,
+        process: Arc<AcpProcess>,
+    ) -> VibexResult<bool> {
+        let mut operations = self
+            .agent_authentication_operations
+            .lock()
+            .map_err(|_| lock_poisoned_error("agentAuthenticationOperations"))?;
+        let operation = operations.get_mut(operation_id).ok_or_else(|| {
+            VibexError::conflict(
+                "agent_authentication_operation_missing",
+                "Agent authentication operation is no longer active",
+            )
+        })?;
+        if operation.cancel_requested {
+            return Ok(false);
+        }
+        operation.process = Some(process);
+        Ok(true)
+    }
+
+    fn finish_agent_authentication(
+        &self,
+        operation_id: &AgentAuthenticationOperationId,
+    ) -> VibexResult<bool> {
+        self.agent_authentication_operations
+            .lock()
+            .map_err(|_| lock_poisoned_error("agentAuthenticationOperations"))
+            .map(|mut operations| {
+                operations
+                    .remove(operation_id)
+                    .is_some_and(|operation| operation.cancel_requested)
+            })
     }
 
     /// Latest product-safe session evidence keyed by Provider Profile. The
@@ -12646,10 +12717,24 @@ struct AgentAuthProcess {
     parsed: crate::auth::ParsedAcpAuthCatalog,
 }
 
+struct ActiveAgentAuthentication {
+    agent_id: AgentId,
+    process: Option<Arc<AcpProcess>>,
+    cancel_requested: bool,
+}
+
+fn agent_authentication_cancelled_error() -> VibexError {
+    VibexError::conflict(
+        "agent_authentication_cancelled",
+        "Agent authentication was stopped",
+    )
+}
+
 async fn launch_agent_auth_process(
     client: &AcpRuntimeClient,
     agent_id: &AgentId,
     provider_profile_id: Option<&ProviderProfileId>,
+    operation_id: Option<&AgentAuthenticationOperationId>,
 ) -> VibexResult<AgentAuthProcess> {
     let (profile_id, config, cwd, env_overlays) = if let Some(profile_id) = provider_profile_id {
         let profile = client
@@ -12707,6 +12792,12 @@ async fn launch_agent_auth_process(
             None,
         )
         .await?;
+    if let Some(operation_id) = operation_id
+        && !client.attach_agent_authentication_process(operation_id, Arc::clone(&process))?
+    {
+        process.shutdown().await;
+        return Err(agent_authentication_cancelled_error());
+    }
     let initialize = match process
         .request(
             AcpOperation::Initialize.method(),
@@ -12957,7 +13048,7 @@ impl AcpClient for AcpRuntimeClient {
         agent_id: &AgentId,
         provider_profile_id: Option<&ProviderProfileId>,
     ) -> VibexResult<AgentAuthCatalog> {
-        let auth = launch_agent_auth_process(self, agent_id, provider_profile_id).await?;
+        let auth = launch_agent_auth_process(self, agent_id, provider_profile_id, None).await?;
         let catalog = auth.parsed.catalog;
         auth.process.shutdown().await;
         Ok(catalog)
@@ -12967,85 +13058,132 @@ impl AcpClient for AcpRuntimeClient {
         &self,
         request: AgentAuthenticateRequest,
     ) -> VibexResult<AgentAuthenticateResult> {
-        let auth = launch_agent_auth_process(
-            self,
-            &request.agent_id,
-            request.provider_profile_id.as_ref(),
-        )
-        .await?;
-        let method = auth
-            .parsed
-            .catalog
-            .methods
-            .iter()
-            .find(|method| method.id == request.method_id)
-            .cloned()
-            .ok_or_else(|| {
-                VibexError::validation(
-                    "agent_auth_method_not_advertised",
-                    "Agent did not advertise the selected authentication method",
-                )
-                .with_diagnostic("agentId", request.agent_id.as_str())
-                .with_diagnostic("methodId", request.method_id.as_str())
-            });
+        self.begin_agent_authentication(&request)?;
+        let operation_id = request.operation_id.clone();
         let result = async {
-            match method {
-                Ok(method) if method.kind == AgentAuthMethodKind::Terminal => {
-                    let terminal = auth
-                        .parsed
-                        .terminal_methods
-                        .get(&request.method_id)
-                        .cloned()
-                        .ok_or_else(|| {
-                            VibexError::provider(
-                                "agent_terminal_auth_descriptor_missing",
-                                "Agent terminal authentication method is incomplete",
+            let auth = launch_agent_auth_process(
+                self,
+                &request.agent_id,
+                request.provider_profile_id.as_ref(),
+                Some(&operation_id),
+            )
+            .await?;
+            let method = auth
+                .parsed
+                .catalog
+                .methods
+                .iter()
+                .find(|method| method.id == request.method_id)
+                .cloned()
+                .ok_or_else(|| {
+                    VibexError::validation(
+                        "agent_auth_method_not_advertised",
+                        "Agent did not advertise the selected authentication method",
+                    )
+                    .with_diagnostic("agentId", request.agent_id.as_str())
+                    .with_diagnostic("methodId", request.method_id.as_str())
+                });
+            let result = async {
+                match method {
+                    Ok(method) if method.kind == AgentAuthMethodKind::Terminal => {
+                        let terminal = auth
+                            .parsed
+                            .terminal_methods
+                            .get(&request.method_id)
+                            .cloned()
+                            .ok_or_else(|| {
+                                VibexError::provider(
+                                    "agent_terminal_auth_descriptor_missing",
+                                    "Agent terminal authentication method is incomplete",
+                                )
+                            })?;
+                        let descriptor = auth.process.terminal_host.terminal_auth_descriptor(
+                            AcpTerminalAuthRequest {
+                                provider_profile_id: auth.profile_id.clone(),
+                                method_id: request.method_id.clone(),
+                                title: terminal.title,
+                                command: terminal.command,
+                                args: terminal.args,
+                                cwd: terminal.cwd,
+                                env: terminal.env,
+                            },
+                        )?;
+                        Ok(AgentAuthenticateResult {
+                            method_id: request.method_id,
+                            terminal: Some(descriptor),
+                        })
+                    }
+                    Ok(method)
+                        if method.kind == AgentAuthMethodKind::Environment
+                            && request.provider_profile_id.is_none() =>
+                    {
+                        Err(VibexError::validation(
+                            "agent_auth_profile_required",
+                            "Environment authentication requires a Provider Profile",
+                        ))
+                    }
+                    Ok(_) => {
+                        auth.process
+                            .request(
+                                AcpOperation::Authenticate.method(),
+                                protocol::build_authenticate_params(&request.method_id),
+                                ACP_HANDSHAKE_TIMEOUT,
                             )
-                        })?;
-                    let descriptor = auth.process.terminal_host.terminal_auth_descriptor(
-                        AcpTerminalAuthRequest {
-                            provider_profile_id: auth.profile_id.clone(),
-                            method_id: request.method_id.clone(),
-                            title: terminal.title,
-                            command: terminal.command,
-                            args: terminal.args,
-                            cwd: terminal.cwd,
-                            env: terminal.env,
-                        },
-                    )?;
-                    Ok(AgentAuthenticateResult {
-                        method_id: request.method_id,
-                        terminal: Some(descriptor),
-                    })
+                            .await?;
+                        Ok(AgentAuthenticateResult {
+                            method_id: request.method_id,
+                            terminal: None,
+                        })
+                    }
+                    Err(error) => Err(error),
                 }
-                Ok(method)
-                    if method.kind == AgentAuthMethodKind::Environment
-                        && request.provider_profile_id.is_none() =>
-                {
-                    Err(VibexError::validation(
-                        "agent_auth_profile_required",
-                        "Environment authentication requires a Provider Profile",
-                    ))
-                }
-                Ok(_) => {
-                    auth.process
-                        .request(
-                            AcpOperation::Authenticate.method(),
-                            protocol::build_authenticate_params(&request.method_id),
-                            ACP_HANDSHAKE_TIMEOUT,
-                        )
-                        .await?;
-                    Ok(AgentAuthenticateResult {
-                        method_id: request.method_id,
-                        terminal: None,
-                    })
-                }
-                Err(error) => Err(error),
             }
+            .await;
+            auth.process.shutdown().await;
+            result
         }
         .await;
-        auth.process.shutdown().await;
+        let cancelled = self.finish_agent_authentication(&operation_id)?;
+        if cancelled {
+            if let Ok(authenticated) = &result
+                && let Some(terminal_id) = authenticated
+                    .terminal
+                    .as_ref()
+                    .and_then(|terminal| terminal.terminal_id.as_ref())
+                && let Some(terminal_host) = self.terminal_host.as_ref()
+            {
+                let _ = terminal_host.kill(terminal_id).await;
+            }
+            return Err(agent_authentication_cancelled_error());
+        }
         result
+    }
+
+    async fn cancel_agent_authentication(
+        &self,
+        request: AgentAuthenticationCancelRequest,
+    ) -> VibexResult<bool> {
+        let process = {
+            let mut operations = self
+                .agent_authentication_operations
+                .lock()
+                .map_err(|_| lock_poisoned_error("agentAuthenticationOperations"))?;
+            let Some(operation) = operations.get_mut(&request.operation_id) else {
+                return Ok(false);
+            };
+            if operation.agent_id != request.agent_id {
+                return Err(VibexError::validation(
+                    "agent_authentication_operation_agent_mismatch",
+                    "Authentication operation belongs to another Agent",
+                ));
+            }
+            operation.cancel_requested = true;
+            operation.process.clone()
+        };
+        if let Some(process) = process {
+            process.shutdown().await;
+        }
+        Ok(true)
     }
 
     async fn logout_agent(&self, request: AgentLogoutRequest) -> VibexResult<()> {
@@ -13053,6 +13191,7 @@ impl AcpClient for AcpRuntimeClient {
             self,
             &request.agent_id,
             request.provider_profile_id.as_ref(),
+            None,
         )
         .await?;
         let result = if auth.parsed.catalog.supports_logout {
@@ -18210,6 +18349,7 @@ prompt_mode = os.environ.get("VIBEX_MOCK_ACP_PROMPT_MODE", "success")
 restore_mode = os.environ.get("VIBEX_MOCK_ACP_RESTORE_MODE", "success")
 advertise_resume = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_RESUME") == "true"
 advertise_auth = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_AUTH") == "true"
+authenticate_hangs = os.environ.get("VIBEX_MOCK_ACP_AUTHENTICATE_HANG") == "true"
 initialize_mode = os.environ.get("VIBEX_MOCK_ACP_INITIALIZE_MODE", "success")
 session_new_delay = float(os.environ.get("VIBEX_MOCK_ACP_SESSION_NEW_DELAY", "0"))
 fail_first_session_new = os.environ.get("VIBEX_MOCK_ACP_FAIL_FIRST_SESSION_NEW") == "true"
@@ -18286,6 +18426,8 @@ for line in sys.stdin:
             "id": mid,
             "result": result,
         })
+    elif method == "authenticate" and authenticate_hangs:
+        continue
     elif method == "authenticate" or method == "logout":
         send({"jsonrpc": "2.0", "id": mid, "result": {}})
     elif method == "model/list":
@@ -19212,6 +19354,29 @@ for line in sys.stdin:
                 .unwrap();
         }
 
+        fn set_authentication_hang(&self, hang: bool) {
+            let service = self.service();
+            let mut config = service
+                .get_acp_profile_config(self.profile_id.clone())
+                .unwrap();
+            config
+                .env
+                .retain(|entry| entry.key != "VIBEX_MOCK_ACP_AUTHENTICATE_HANG");
+            config.env.push(vibex_core::AcpProviderEnvReference {
+                key: "VIBEX_MOCK_ACP_AUTHENTICATE_HANG".to_string(),
+                source: AcpProviderEnvSource::Literal,
+                value: Some(hang.to_string()),
+                secret_lookup_key: None,
+                redacted_hint: "mock hanging authentication".to_string(),
+            });
+            service
+                .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                    provider_profile_id: self.profile_id.clone(),
+                    config,
+                })
+                .unwrap();
+        }
+
         fn configure_known_auth_fallback(&self, acp_mode: &str, initialize_mode: &str) {
             let service = self.service();
             let mut config = service
@@ -19319,6 +19484,7 @@ for line in sys.stdin:
 
         let browser = client
             .authenticate_agent(AgentAuthenticateRequest {
+                operation_id: AgentAuthenticationOperationId::new(),
                 agent_id: agent_id.clone(),
                 provider_profile_id: Some(fixture.profile_id.clone()),
                 method_id: "browser-login".to_string(),
@@ -19328,6 +19494,7 @@ for line in sys.stdin:
         assert!(browser.terminal.is_none());
         let environment = client
             .authenticate_agent(AgentAuthenticateRequest {
+                operation_id: AgentAuthenticationOperationId::new(),
                 agent_id: agent_id.clone(),
                 provider_profile_id: Some(fixture.profile_id.clone()),
                 method_id: "api-key".to_string(),
@@ -19337,6 +19504,7 @@ for line in sys.stdin:
         assert!(environment.terminal.is_none());
         let terminal = client
             .authenticate_agent(AgentAuthenticateRequest {
+                operation_id: AgentAuthenticationOperationId::new(),
                 agent_id: agent_id.clone(),
                 provider_profile_id: Some(fixture.profile_id.clone()),
                 method_id: "terminal-login".to_string(),
@@ -19379,6 +19547,113 @@ for line in sys.stdin:
         fixture.cleanup();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn hanging_agent_authentication_can_be_cancelled_without_blocking_and_restarted() {
+        let agent_id = AgentId::parse("codex").unwrap();
+        let Some(fixture) =
+            MockAcpFixture::create_for_agent("agent-auth-cancel", Some(agent_id.clone()))
+        else {
+            return;
+        };
+        fixture.enable_auth_methods();
+        fixture.set_authentication_hang(true);
+        let client = Arc::new(AcpRuntimeClient::new(fixture.service()));
+        let operation_id = AgentAuthenticationOperationId::new();
+        let auth_task = {
+            let client = Arc::clone(&client);
+            let agent_id = agent_id.clone();
+            let profile_id = fixture.profile_id.clone();
+            let operation_id = operation_id.clone();
+            tokio::spawn(async move {
+                client
+                    .authenticate_agent(AgentAuthenticateRequest {
+                        operation_id,
+                        agent_id,
+                        provider_profile_id: Some(profile_id),
+                        method_id: "browser-login".to_string(),
+                    })
+                    .await
+            })
+        };
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if logged_request_count(&fixture.request_log(), "authenticate") == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("hanging authenticate request should reach the Agent");
+
+        let catalog = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.list_auth_methods(&agent_id, Some(&fixture.profile_id)),
+        )
+        .await
+        .expect("auth discovery must remain independent from a pending login")
+        .unwrap();
+        assert!(
+            catalog
+                .methods
+                .iter()
+                .any(|method| method.id == "browser-login")
+        );
+
+        assert!(
+            client
+                .cancel_agent_authentication(AgentAuthenticationCancelRequest {
+                    operation_id: operation_id.clone(),
+                    agent_id: agent_id.clone(),
+                })
+                .await
+                .unwrap()
+        );
+        let error = tokio::time::timeout(Duration::from_secs(2), auth_task)
+            .await
+            .expect("cancelled authentication should finish promptly")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, "agent_authentication_cancelled");
+        assert!(
+            client
+                .agent_authentication_operations
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !client
+                .cancel_agent_authentication(AgentAuthenticationCancelRequest {
+                    operation_id,
+                    agent_id: agent_id.clone(),
+                })
+                .await
+                .unwrap()
+        );
+
+        fixture.set_authentication_hang(false);
+        let restarted = client
+            .authenticate_agent(AgentAuthenticateRequest {
+                operation_id: AgentAuthenticationOperationId::new(),
+                agent_id,
+                provider_profile_id: Some(fixture.profile_id.clone()),
+                method_id: "browser-login".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(restarted.terminal.is_none());
+        assert!(
+            client
+                .agent_authentication_operations
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        fixture.cleanup();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn known_cli_auth_fallbacks_remain_available_before_login() {
         for (label, agent, acp_mode, initialize_mode, expected_status) in [
@@ -19417,6 +19692,7 @@ for line in sys.stdin:
 
             let authenticated = client
                 .authenticate_agent(AgentAuthenticateRequest {
+                    operation_id: AgentAuthenticationOperationId::new(),
                     agent_id,
                     provider_profile_id: Some(fixture.profile_id.clone()),
                     method_id: catalog.methods[0].id.clone(),

@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-use crate::{AgentId, ProviderProfileId, TerminalAuthActionDescriptor};
+use crate::{
+    AgentAuthenticationOperationId, AgentId, ProviderProfileId, TerminalAuthActionDescriptor,
+};
 
 /// Product-level ACP authentication method. Protocol-specific payloads stay in
 /// the ACP adapter; settings surfaces receive only safe fields they can render.
@@ -57,9 +59,16 @@ pub struct AgentAuthCatalog {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentAuthenticateRequest {
+    pub operation_id: AgentAuthenticationOperationId,
     pub agent_id: AgentId,
     pub provider_profile_id: Option<ProviderProfileId>,
     pub method_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentAuthenticationCancelRequest {
+    pub operation_id: AgentAuthenticationOperationId,
+    pub agent_id: AgentId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

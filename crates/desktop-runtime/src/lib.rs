@@ -36,11 +36,11 @@ use vibex_agent_acp::{
 };
 use vibex_config_switch::{ProviderConfigService, ProviderProfileChangeListener};
 use vibex_core::{
-    AgentAuthCatalog, AgentAuthenticateRequest, AgentAuthenticateResult, AgentLogoutRequest,
-    AgentRuntimeKind, AgentSession, FetchTimelineRequest, OpenWorkspaceRequest, ProjectId,
-    ProjectRecord, ProviderProfileId, TerminalCreateRequest, TerminalId, TerminalSession,
-    TerminalSwitchShellRequest, TimelinePage, VibexError, VibexResult, WorkspaceId, WorkspaceMode,
-    WorkspaceRecord,
+    AgentAuthCatalog, AgentAuthenticateRequest, AgentAuthenticateResult,
+    AgentAuthenticationCancelRequest, AgentLogoutRequest, AgentRuntimeKind, AgentSession,
+    FetchTimelineRequest, OpenWorkspaceRequest, ProjectId, ProjectRecord, ProviderProfileId,
+    TerminalCreateRequest, TerminalId, TerminalSession, TerminalSwitchShellRequest, TimelinePage,
+    VibexError, VibexResult, WorkspaceId, WorkspaceMode, WorkspaceRecord,
 };
 use vibex_db::{
     TerminalSessionRepository, WorkspaceRepository, apply_migrations, default_database_path,
@@ -438,6 +438,13 @@ impl AgentHandle {
         request: AgentAuthenticateRequest,
     ) -> VibexResult<AgentAuthenticateResult> {
         self.manager.authenticate_agent(request).await
+    }
+
+    pub async fn cancel_authentication(
+        &self,
+        request: AgentAuthenticationCancelRequest,
+    ) -> VibexResult<bool> {
+        self.manager.cancel_agent_authentication(request).await
     }
 
     pub async fn logout(&self, request: AgentLogoutRequest) -> VibexResult<()> {

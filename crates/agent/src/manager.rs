@@ -6,13 +6,13 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc};
 use vibex_core::{
     AgentAuthCatalog, AgentAuthenticateRequest, AgentAuthenticateResult,
-    AgentCommandDiscoverRequest, AgentCommandDiscoverResponse, AgentCommandEntry,
-    AgentCommandExecuteRequest, AgentCommandExecuteResult, AgentCommandExecuteStatus,
-    AgentCommandExecutionBehavior, AgentCommandSelectionBehavior, AgentCommandSourceKind,
-    AgentCommandTrigger, AgentConfig, AgentId, AgentLogoutRequest, AgentModelListRequest,
-    AgentModelListResponse, AgentModelListSource, AgentSession, AgentSessionConfigProbe,
-    AgentSessionRestoreMethod, AgentSessionSafety, AgentSessionState, AgentUsageCounterOrigin,
-    AgentUsageExecutionContext, AgentUsageStreamAttribution, BindingState,
+    AgentAuthenticationCancelRequest, AgentCommandDiscoverRequest, AgentCommandDiscoverResponse,
+    AgentCommandEntry, AgentCommandExecuteRequest, AgentCommandExecuteResult,
+    AgentCommandExecuteStatus, AgentCommandExecutionBehavior, AgentCommandSelectionBehavior,
+    AgentCommandSourceKind, AgentCommandTrigger, AgentConfig, AgentId, AgentLogoutRequest,
+    AgentModelListRequest, AgentModelListResponse, AgentModelListSource, AgentSession,
+    AgentSessionConfigProbe, AgentSessionRestoreMethod, AgentSessionSafety, AgentSessionState,
+    AgentUsageCounterOrigin, AgentUsageExecutionContext, AgentUsageStreamAttribution, BindingState,
     ContinueAgentTurnRequest, CreateAgentSessionRequest, ElicitationRequest,
     ExternalSessionContinuationStatus, ExternalSessionImportCandidate,
     ExternalSessionImportCandidateStatus, ExternalSessionImportDiagnostic,
@@ -2387,6 +2387,16 @@ impl AgentManager {
             self.resolve_enabled_agent(Some(request.agent_id.clone()), ProviderKind::Acp, true)?;
         let provider = self.runtime(&self.route_for_agent(&resolved_agent.agent_id)?)?;
         provider.authenticate_agent(request).await
+    }
+
+    pub async fn cancel_agent_authentication(
+        &self,
+        request: AgentAuthenticationCancelRequest,
+    ) -> VibexResult<bool> {
+        let resolved_agent =
+            self.resolve_enabled_agent(Some(request.agent_id.clone()), ProviderKind::Acp, false)?;
+        let provider = self.runtime(&self.route_for_agent(&resolved_agent.agent_id)?)?;
+        provider.cancel_agent_authentication(request).await
     }
 
     pub async fn logout_agent(&self, request: AgentLogoutRequest) -> VibexResult<()> {

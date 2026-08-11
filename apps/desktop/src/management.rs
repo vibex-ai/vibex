@@ -30,7 +30,8 @@ use gpui_component::{
 };
 use vibex_core::{
     AgentAuthCatalog, AgentAuthEnvironmentUpdateRequest, AgentAuthEnvironmentValue,
-    AgentAuthMethodKind, AgentAuthStatus, AgentAuthenticateRequest, AgentId, AgentListRequest,
+    AgentAuthMethodKind, AgentAuthStatus, AgentAuthenticateRequest,
+    AgentAuthenticationCancelRequest, AgentAuthenticationOperationId, AgentId, AgentListRequest,
     AgentSnapshotEntry, AgentUpdateConfigRequest, AutomationGraphCreateRequest, AutomationGraphId,
     AutomationGraphListRequest, AutomationGraphStatus, AutomationRun, AutomationRunCancelRequest,
     AutomationRunId, AutomationRunListRequest, AutomationRunResumeRequest,
@@ -387,7 +388,7 @@ enum ManagementMutation {
     ProfileDelete(String),
     AcpConfig(String),
     ProviderProbe(String),
-    AgentAuth(String),
+    AgentAuth { agent_id: String, action: String },
     ProviderPreview(String),
     ProviderDisplayOrder(String),
     AgentToggle(String),
@@ -427,6 +428,20 @@ enum AgentAuthTerminalState {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentAuthOperationPhase {
+    Running,
+    Cancelling,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentAuthPendingOperation {
+    operation_id: AgentAuthenticationOperationId,
+    scope: (String, Option<String>),
+    method_id: String,
+    phase: AgentAuthOperationPhase,
+}
+
 enum AgentAuthTerminalCompletion {
     Authenticated {
         catalog: Option<AgentAuthCatalog>,
@@ -443,7 +458,7 @@ impl ManagementMutation {
             Self::ProfileDelete(id) => format!("profile:delete:{id}"),
             Self::AcpConfig(id) => format!("provider:acp-config:{id}"),
             Self::ProviderProbe(id) => format!("provider:probe:{id}"),
-            Self::AgentAuth(id) => format!("agent:auth:{id}"),
+            Self::AgentAuth { agent_id, action } => format!("agent:auth:{agent_id}:{action}"),
             Self::ProviderPreview(id) => format!("provider:preview:{id}"),
             Self::ProviderDisplayOrder(id) => format!("provider:display-order:{id}"),
             Self::AgentToggle(id) => format!("agent:toggle:{id}"),
@@ -484,7 +499,8 @@ impl ManagementMutation {
                     .rsplit_once(':')
                     .map_or(action.as_str(), |(_, agent_id)| agent_id),
             ),
-            Self::AgentInstall(agent_id)
+            Self::AgentAuth { agent_id, .. }
+            | Self::AgentInstall(agent_id)
             | Self::AgentUpdateCheck(agent_id)
             | Self::AgentUninstall(agent_id)
             | Self::ProviderDisplayOrder(agent_id) => Some(agent_id),
@@ -560,6 +576,8 @@ pub struct ManagementCenter {
     profile_secret_task: Option<Task<()>>,
     agent_mutation_tasks: BTreeMap<String, Task<()>>,
     agent_auth_task: Option<Task<()>>,
+    agent_auth_operation_tasks: BTreeMap<String, Task<()>>,
+    agent_auth_cancel_tasks: BTreeMap<String, Task<()>>,
     agent_auth_terminal_monitor_task: Option<Task<()>>,
     discover_agents_after_refresh: bool,
     mcp_import_open: bool,
@@ -577,6 +595,7 @@ pub struct ManagementCenter {
     agent_auth_generation: u64,
     agent_auth_inputs: BTreeMap<String, Entity<InputState>>,
     agent_auth_clear_values: BTreeSet<String>,
+    agent_auth_operations: BTreeMap<String, AgentAuthPendingOperation>,
     agent_auth_terminal: Option<TerminalAuthActionDescriptor>,
     agent_auth_terminal_surface: Option<(String, Entity<TerminalSurface>)>,
     agent_auth_terminal_state: Option<AgentAuthTerminalState>,
@@ -947,6 +966,8 @@ impl ManagementCenter {
             profile_secret_task: None,
             agent_mutation_tasks: BTreeMap::new(),
             agent_auth_task: None,
+            agent_auth_operation_tasks: BTreeMap::new(),
+            agent_auth_cancel_tasks: BTreeMap::new(),
             agent_auth_terminal_monitor_task: None,
             discover_agents_after_refresh: false,
             mcp_import_open: false,
@@ -965,6 +986,7 @@ impl ManagementCenter {
             agent_auth_generation: 0,
             agent_auth_inputs: BTreeMap::new(),
             agent_auth_clear_values: BTreeSet::new(),
+            agent_auth_operations: BTreeMap::new(),
             agent_auth_terminal: None,
             agent_auth_terminal_surface: None,
             agent_auth_terminal_state: None,
@@ -1441,6 +1463,10 @@ impl ManagementCenter {
         let Ok(agent_id) = AgentId::parse(scope.0.clone()) else {
             return;
         };
+        let agent_id_key = agent_id.as_str().to_string();
+        if self.agent_mutations.contains_key(&agent_id_key) {
+            return;
+        }
         let provider_profile_id = scope
             .1
             .as_ref()
@@ -1482,16 +1508,31 @@ impl ManagementCenter {
             .collect::<Vec<_>>();
         let required_credential_cleared = values.iter().any(|value| value.clear && !value.optional);
         let generation = self.agent_auth_generation;
-        self.mutation = Some(ManagementMutation::AgentAuth(method.id.clone()));
+        let operation_id = AgentAuthenticationOperationId::new();
+        let mutation = ManagementMutation::AgentAuth {
+            agent_id: agent_id_key.clone(),
+            action: method.id.clone(),
+        };
+        self.agent_mutations
+            .insert(agent_id_key.clone(), mutation.clone());
+        self.agent_auth_operations.insert(
+            agent_id_key.clone(),
+            AgentAuthPendingOperation {
+                operation_id: operation_id.clone(),
+                scope: scope.clone(),
+                method_id: method.id.clone(),
+                phase: AgentAuthOperationPhase::Running,
+            },
+        );
         self.agent_auth_error = None;
         let active_locale = locale::current_locale();
         let entity = cx.weak_entity();
         let method_id_for_request = method.id.clone();
-        let method_id_for_callback = method.id.clone();
         let scope_for_callback = scope.clone();
         let runtime_for_callback = runtime.clone();
         let agent_id_for_monitor = agent_id.clone();
         let provider_profile_id_for_monitor = provider_profile_id.clone();
+        let operation_id_for_request = operation_id.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             if method.kind == AgentAuthMethodKind::Environment && !values.is_empty() {
                 runtime
@@ -1518,6 +1559,7 @@ impl ManagementCenter {
             let result = runtime
                 .agent()
                 .authenticate(AgentAuthenticateRequest {
+                    operation_id: operation_id_for_request,
                     agent_id: agent_id.clone(),
                     provider_profile_id: provider_profile_id.clone(),
                     method_id: method_id_for_request,
@@ -1534,27 +1576,29 @@ impl ManagementCenter {
             };
             Ok::<_, VibexError>((catalog, result.terminal, false))
         });
-        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+        let completed_mutation = mutation;
+        let agent_id_for_callback = agent_id_key.clone();
+        let operation_id_for_callback = operation_id.clone();
+        let task = cx.spawn(async move |_, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
-                let operation_is_current = agent_auth_scope_matches(
+                let operation_is_registered = this
+                    .agent_auth_operations
+                    .get(&agent_id_for_callback)
+                    .is_some_and(|operation| operation.operation_id == operation_id_for_callback);
+                if operation_is_registered {
+                    this.agent_auth_operations.remove(&agent_id_for_callback);
+                }
+                if this.agent_mutations.get(&agent_id_for_callback) == Some(&completed_mutation) {
+                    this.agent_mutations.remove(&agent_id_for_callback);
+                }
+                let scope_is_current = agent_auth_scope_matches(
                     this.agent_auth_generation,
                     this.agent_auth_scope.as_ref(),
                     generation,
                     &scope_for_callback,
-                ) && matches!(
-                    this.mutation,
-                    Some(ManagementMutation::AgentAuth(ref action))
-                        if action == &method_id_for_callback
                 );
-                if !operation_is_current {
-                    if matches!(
-                        this.mutation,
-                        Some(ManagementMutation::AgentAuth(ref action))
-                            if action == &method_id_for_callback
-                    ) {
-                        this.mutation = None;
-                    }
+                if !operation_is_registered || !scope_is_current {
                     if let Ok(Ok((_, Some(terminal), _))) = &outcome
                         && let Some(terminal_id) = terminal.terminal_id.as_ref()
                     {
@@ -1566,7 +1610,6 @@ impl ManagementCenter {
                     cx.notify();
                     return;
                 }
-                this.mutation = None;
                 match outcome {
                     Ok(Ok((catalog, terminal, credential_removed))) => {
                         let terminal_started = terminal
@@ -1629,6 +1672,21 @@ impl ManagementCenter {
                             .to_string()
                         });
                     }
+                    Ok(Err(error)) if error.code == "agent_authentication_cancelled" => {
+                        if let Some(catalog) = this.agent_auth_catalog.as_mut() {
+                            catalog.status = AgentAuthStatus::AuthenticationRequired;
+                        }
+                        this.agent_auth_error = None;
+                        this.notice = Some(
+                            management_locale_text_for(
+                                active_locale,
+                                "Agent authentication stopped",
+                                "已终止 Agent 登录认证",
+                                "已終止 Agent 登入驗證",
+                            )
+                            .to_string(),
+                        );
+                    }
                     Ok(Err(error)) => {
                         this.agent_auth_error = Some(format!("{}: {}", error.code, error.message));
                     }
@@ -1645,7 +1703,97 @@ impl ManagementCenter {
                 }
                 cx.notify();
             });
-        }));
+        });
+        self.agent_auth_operation_tasks
+            .retain(|_, existing| !existing.is_ready());
+        self.agent_auth_operation_tasks.insert(agent_id_key, task);
+        cx.notify();
+    }
+
+    fn cancel_agent_authentication(
+        &mut self,
+        agent_id: String,
+        operation_id: AgentAuthenticationOperationId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(operation) = self.agent_auth_operations.get_mut(&agent_id) else {
+            return;
+        };
+        if operation.operation_id != operation_id
+            || operation.phase == AgentAuthOperationPhase::Cancelling
+        {
+            return;
+        }
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        let Ok(parsed_agent_id) = AgentId::parse(agent_id.clone()) else {
+            return;
+        };
+        operation.phase = AgentAuthOperationPhase::Cancelling;
+        self.agent_auth_error = None;
+        let request = AgentAuthenticationCancelRequest {
+            operation_id: operation_id.clone(),
+            agent_id: parsed_agent_id,
+        };
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            for attempt in 0..40 {
+                if runtime
+                    .agent()
+                    .cancel_authentication(request.clone())
+                    .await?
+                {
+                    return Ok::<_, VibexError>(true);
+                }
+                if attempt < 39 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+            Ok(false)
+        });
+        let entity = cx.weak_entity();
+        let agent_id_for_callback = agent_id.clone();
+        let task = cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                let Some(operation) = this
+                    .agent_auth_operations
+                    .get_mut(&agent_id_for_callback)
+                    .filter(|operation| operation.operation_id == operation_id)
+                else {
+                    return;
+                };
+                match outcome {
+                    Ok(Ok(true)) => {}
+                    Ok(Ok(false)) => {
+                        operation.phase = AgentAuthOperationPhase::Running;
+                        this.agent_auth_error = Some(
+                            "agent_authentication_cancel_not_found: Authentication operation could not be stopped"
+                                .to_string(),
+                        );
+                    }
+                    Ok(Err(error)) => {
+                        operation.phase = AgentAuthOperationPhase::Running;
+                        this.agent_auth_error = Some(format!("{}: {}", error.code, error.message));
+                    }
+                    Err(error) => {
+                        operation.phase = AgentAuthOperationPhase::Running;
+                        this.agent_auth_error = Some(format!(
+                            "{}: {error}",
+                            management_error_text(
+                                "Stopping authentication failed",
+                                "终止认证失败",
+                                "終止驗證失敗",
+                            )
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.agent_auth_cancel_tasks
+            .retain(|_, existing| !existing.is_ready());
+        self.agent_auth_cancel_tasks.insert(agent_id, task);
         cx.notify();
     }
 
@@ -1660,12 +1808,21 @@ impl ManagementCenter {
         let Ok(agent_id) = AgentId::parse(scope.0.clone()) else {
             return;
         };
+        let agent_id_key = agent_id.as_str().to_string();
+        if self.agent_mutations.contains_key(&agent_id_key) {
+            return;
+        }
         let provider_profile_id = scope
             .1
             .as_ref()
             .and_then(|profile_id| vibex_core::ProviderProfileId::parse(profile_id.clone()).ok());
         let generation = self.agent_auth_generation;
-        self.mutation = Some(ManagementMutation::AgentAuth("logout".to_string()));
+        let mutation = ManagementMutation::AgentAuth {
+            agent_id: agent_id_key.clone(),
+            action: "logout".to_string(),
+        };
+        self.agent_mutations
+            .insert(agent_id_key.clone(), mutation.clone());
         self.agent_auth_error = None;
         let active_locale = locale::current_locale();
         let entity = cx.weak_entity();
@@ -1685,29 +1842,26 @@ impl ManagementCenter {
             catalog.status = AgentAuthStatus::AuthenticationRequired;
             Ok::<_, VibexError>(catalog)
         });
-        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+        let completed_mutation = mutation;
+        let agent_id_for_callback = agent_id_key.clone();
+        let task = cx.spawn(async move |_, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
-                let operation_is_current = agent_auth_scope_matches(
+                let operation_is_registered =
+                    this.agent_mutations.get(&agent_id_for_callback) == Some(&completed_mutation);
+                if operation_is_registered {
+                    this.agent_mutations.remove(&agent_id_for_callback);
+                }
+                let scope_is_current = agent_auth_scope_matches(
                     this.agent_auth_generation,
                     this.agent_auth_scope.as_ref(),
                     generation,
                     &scope_for_callback,
-                ) && matches!(
-                    this.mutation,
-                    Some(ManagementMutation::AgentAuth(ref action)) if action == "logout"
                 );
-                if !operation_is_current {
-                    if matches!(
-                        this.mutation,
-                        Some(ManagementMutation::AgentAuth(ref action)) if action == "logout"
-                    ) {
-                        this.mutation = None;
-                    }
+                if !operation_is_registered || !scope_is_current {
                     cx.notify();
                     return;
                 }
-                this.mutation = None;
                 match outcome {
                     Ok(Ok(catalog)) => {
                         this.agent_auth_catalog = Some(catalog);
@@ -1734,7 +1888,10 @@ impl ManagementCenter {
                 }
                 cx.notify();
             });
-        }));
+        });
+        self.agent_mutation_tasks
+            .retain(|_, existing| !existing.is_ready());
+        self.agent_mutation_tasks.insert(agent_id_key, task);
         cx.notify();
     }
 
@@ -7301,11 +7458,16 @@ impl ManagementCenter {
     ) -> AnyElement {
         self.ensure_agent_auth_inputs(window, cx);
         self.ensure_agent_auth_terminal_surface(window, cx);
+        let selected_agent_id = self.selected_agent_id.clone();
+        let active_auth_operation = selected_agent_id
+            .as_deref()
+            .and_then(|agent_id| self.agent_auth_operations.get(agent_id))
+            .cloned();
+        let selected_agent_pending = selected_agent_id
+            .as_deref()
+            .is_some_and(|agent_id| self.agent_mutations.contains_key(agent_id));
         let pending = self.mutation.is_some()
-            || self
-                .selected_agent_id
-                .as_deref()
-                .is_some_and(|agent_id| self.agent_mutations.contains_key(agent_id))
+            || selected_agent_pending
             || self.agent_auth_terminal_state == Some(AgentAuthTerminalState::Running);
         let selected_profile_label = self
             .selected_management_provider_profile()
@@ -7314,6 +7476,13 @@ impl ManagementCenter {
         let catalog = self.agent_auth_catalog.clone();
         let status = if !auth_available {
             management_locale_text("Agent disabled", "Agent 已停用", "Agent 已停用")
+        } else if active_auth_operation
+            .as_ref()
+            .is_some_and(|operation| operation.phase == AgentAuthOperationPhase::Cancelling)
+        {
+            management_locale_text("Stopping sign-in", "正在终止登录", "正在終止登入")
+        } else if active_auth_operation.is_some() {
+            management_locale_text("Signing in", "正在登录", "正在登入")
         } else if let Some(catalog) = catalog.as_ref() {
             match catalog.status {
                 AgentAuthStatus::Authenticated => {
@@ -7334,6 +7503,12 @@ impl ManagementCenter {
         let supports_logout = catalog
             .as_ref()
             .is_some_and(|catalog| catalog.supports_logout);
+        let logout_loading = selected_agent_id.as_deref().is_some_and(|agent_id| {
+            matches!(
+                self.agent_mutations.get(agent_id),
+                Some(ManagementMutation::AgentAuth { action, .. }) if action == "logout"
+            )
+        });
         let mut content = v_flex().w_full().min_w_0().gap_3().child(
             h_flex()
                 .w_full()
@@ -7391,11 +7566,7 @@ impl ManagementCenter {
                                     .small()
                                     .danger()
                                     .icon(IconName::ExternalLink)
-                                    .loading(matches!(
-                                        self.mutation,
-                                        Some(ManagementMutation::AgentAuth(ref action))
-                                            if action == "logout"
-                                    ))
+                                    .loading(logout_loading)
                                     .disabled(pending)
                                     .on_click(cx.listener(|this, _, _, cx| this.logout_agent(cx))),
                                 management_locale_text("Sign out", "退出登录", "登出"),
@@ -7447,76 +7618,123 @@ impl ManagementCenter {
                 ));
             }
             for method in catalog.methods {
-                let method_loading = matches!(
-                    self.mutation,
-                    Some(ManagementMutation::AgentAuth(ref action)) if action == &method.id
-                );
-                let action_label = match method.kind {
-                    AgentAuthMethodKind::Agent => management_locale_text("Sign in", "登录", "登入"),
-                    AgentAuthMethodKind::Environment => {
-                        management_locale_text("Save and sign in", "保存并登录", "儲存並登入")
-                    }
-                    AgentAuthMethodKind::Terminal => management_locale_text(
-                        "Open sign-in terminal",
-                        "打开登录终端",
-                        "開啟登入終端",
-                    ),
-                };
-                let action_icon = match method.kind {
-                    AgentAuthMethodKind::Agent => Icon::new(IconName::ArrowRight),
-                    AgentAuthMethodKind::Environment => Icon::new(IconName::Check),
-                    AgentAuthMethodKind::Terminal => Icon::new(IconName::ArrowRight),
-                };
+                let method_operation = active_auth_operation
+                    .as_ref()
+                    .filter(|operation| operation.method_id == method.id)
+                    .cloned();
+                let terminal_method_running = self.agent_auth_terminal_state
+                    == Some(AgentAuthTerminalState::Running)
+                    && self
+                        .agent_auth_terminal
+                        .as_ref()
+                        .is_some_and(|terminal| terminal.id == method.id);
                 let submit_disabled = pending
                     || (method.kind == AgentAuthMethodKind::Environment
                         && self.selected_provider_profile_id.is_none());
                 let submit_method_id = method.id.clone();
-                let mut method_content =
-                    v_flex()
-                        .w_full()
-                        .min_w_0()
-                        .gap_3()
-                        .border_t_1()
-                        .border_color(cx.theme().border.opacity(0.75))
-                        .pt_3()
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .min_w_0()
-                                .items_start()
-                                .justify_between()
-                                .gap_3()
-                                .child(
-                                    v_flex()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .gap_1()
-                                        .child(div().text_sm().font_semibold().child(method.name))
-                                        .when_some(method.description, |title, description| {
-                                            title.child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .child(description),
-                                            )
-                                        }),
+                let action_button_id =
+                    SharedString::from(format!("agent-auth-submit-{}", method.id));
+                let (action_button, action_label) = if let Some(operation) = method_operation {
+                    let cancelling = operation.phase == AgentAuthOperationPhase::Cancelling;
+                    let stop_agent_id = operation.scope.0;
+                    let stop_operation_id = operation.operation_id;
+                    (
+                        Button::new(action_button_id)
+                            .small()
+                            .danger()
+                            .icon(IconName::Close)
+                            .loading(cancelling)
+                            .disabled(cancelling)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.cancel_agent_authentication(
+                                    stop_agent_id.clone(),
+                                    stop_operation_id.clone(),
+                                    cx,
                                 )
-                                .child(management_detail_icon_action(
-                                    Button::new(SharedString::from(format!(
-                                        "agent-auth-submit-{}",
-                                        method.id
-                                    )))
-                                    .small()
-                                    .primary()
-                                    .icon(action_icon)
-                                    .loading(method_loading)
-                                    .disabled(submit_disabled)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.authenticate_agent(submit_method_id.clone(), cx)
-                                    })),
-                                    action_label,
-                                )),
-                        );
+                            })),
+                        if cancelling {
+                            management_locale_text(
+                                "Stopping sign-in",
+                                "正在终止登录",
+                                "正在終止登入",
+                            )
+                        } else {
+                            management_locale_text("Stop sign-in", "终止登录", "終止登入")
+                        },
+                    )
+                } else if terminal_method_running {
+                    (
+                        Button::new(action_button_id)
+                            .small()
+                            .danger()
+                            .icon(IconName::Close)
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.close_agent_auth_terminal(cx)),
+                            ),
+                        management_locale_text("Stop sign-in", "终止登录", "終止登入"),
+                    )
+                } else {
+                    let action_label = match method.kind {
+                        AgentAuthMethodKind::Agent => {
+                            management_locale_text("Sign in", "登录", "登入")
+                        }
+                        AgentAuthMethodKind::Environment => {
+                            management_locale_text("Save and sign in", "保存并登录", "儲存並登入")
+                        }
+                        AgentAuthMethodKind::Terminal => management_locale_text(
+                            "Open sign-in terminal",
+                            "打开登录终端",
+                            "開啟登入終端",
+                        ),
+                    };
+                    let action_icon = match method.kind {
+                        AgentAuthMethodKind::Agent => Icon::new(IconName::ArrowRight),
+                        AgentAuthMethodKind::Environment => Icon::new(IconName::Check),
+                        AgentAuthMethodKind::Terminal => Icon::new(IconName::ArrowRight),
+                    };
+                    (
+                        Button::new(action_button_id)
+                            .small()
+                            .primary()
+                            .icon(action_icon)
+                            .disabled(submit_disabled)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.authenticate_agent(submit_method_id.clone(), cx)
+                            })),
+                        action_label,
+                    )
+                };
+                let mut method_content = v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_3()
+                    .border_t_1()
+                    .border_color(cx.theme().border.opacity(0.75))
+                    .pt_3()
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .items_start()
+                            .justify_between()
+                            .gap_3()
+                            .child(
+                                v_flex()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .gap_1()
+                                    .child(div().text_sm().font_semibold().child(method.name))
+                                    .when_some(method.description, |title, description| {
+                                        title.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(description),
+                                        )
+                                    }),
+                            )
+                            .child(management_detail_icon_action(action_button, action_label)),
+                    );
 
                 for variable in method.environment {
                     let key = agent_auth_input_key(&method.id, &variable.name);
@@ -14621,6 +14839,13 @@ mod tests {
                 ManagementMutation::AgentToggle("probe:opencode".into()),
                 "opencode",
             ),
+            (
+                ManagementMutation::AgentAuth {
+                    agent_id: "auggie".into(),
+                    action: "browser-login".into(),
+                },
+                "auggie",
+            ),
             (ManagementMutation::AgentInstall("pi".into()), "pi"),
             (
                 ManagementMutation::AgentUpdateCheck("gemini".into()),
@@ -15359,7 +15584,7 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("for variable in method.environment"))
             .map(|(body, _)| body)
             .expect("Authentication method header should remain inspectable");
-        assert!(header.contains("agent-auth-submit-"));
+        assert!(render.contains("agent-auth-submit-"));
         assert!(header.contains("management_detail_icon_action("));
         assert!(!render.contains("justify_end().child(management_detail_icon_action(\n                            Button::new(SharedString::from(format!(\n                                \"agent-auth-submit-"));
     }
@@ -15567,6 +15792,8 @@ mod tests {
             "AgentAuthMethodKind::Environment",
             "AgentAuthMethodKind::Terminal",
             "agent-auth-logout",
+            "Stop sign-in",
+            "cancel_agent_authentication",
             "agent_auth_terminal_surface",
             ".mask_toggle()",
             "Clear saved value",
