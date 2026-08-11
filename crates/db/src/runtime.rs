@@ -2499,10 +2499,12 @@ impl RuntimeSwitchRepository {
         Ok(records)
     }
 
-    /// Committed switches whose target is still the session's current
-    /// binding. Startup reconciliation replays their idempotent activation
-    /// hook to cover a crash after the commit transaction but before attach.
-    pub fn list_committed_current(conn: &Connection) -> VibexResult<Vec<RuntimeSwitchRecord>> {
+    /// Committed switches whose target is still the session's current binding
+    /// and whose post-commit activation did not durably finish. Startup
+    /// reconciliation replays only this bounded crash window.
+    pub fn list_committed_current_pending_activation(
+        conn: &Connection,
+    ) -> VibexResult<Vec<RuntimeSwitchRecord>> {
         let mut stmt = conn
             .prepare(
                 "SELECT rs.switch_id
@@ -2512,6 +2514,7 @@ impl RuntimeSwitchRepository {
                    AND rs.target_binding_id IS NOT NULL
                    AND sessions.current_binding_id = rs.target_binding_id
                    AND sessions.deleted_at_ms IS NULL
+                   AND rs.activation_completed_at_ms IS NULL
                    AND NOT EXISTS (
                        SELECT 1 FROM runtime_switches newer
                        WHERE newer.session_id = rs.session_id
@@ -2562,6 +2565,36 @@ impl RuntimeSwitchRepository {
             }
         }
         Ok(records)
+    }
+
+    /// Durably closes the post-Commit activation crash window. The update is
+    /// idempotent so an activation replay may safely mark the same switch again.
+    pub fn mark_activation_completed(
+        conn: &Connection,
+        switch_id: &RuntimeSwitchId,
+    ) -> VibexResult<()> {
+        let changed = conn
+            .execute(
+                "UPDATE runtime_switches
+                 SET activation_completed_at_ms = COALESCE(activation_completed_at_ms, ?2)
+                 WHERE switch_id = ?1 AND status = ?3",
+                params![
+                    switch_id.as_str(),
+                    unix_timestamp_ms(),
+                    enum_to_db(&RuntimeSwitchStatus::Committed)?,
+                ],
+            )
+            .map_err(storage_err(
+                "runtime_switch_activation_mark_failed",
+                "failed to mark runtime switch activation complete",
+            ))?;
+        if changed == 0 {
+            return Err(cas_conflict(
+                "runtime_switch_activation_mark_conflict",
+                "runtime switch is not committed for activation completion",
+            ));
+        }
+        Ok(())
     }
 
     /// §17.4 — sessions whose pending switch pointer is still set; used to
@@ -8162,7 +8195,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_current_scan_follows_authoritative_session_pointer() {
+    fn pending_activation_scan_requires_current_pointer_and_incomplete_marker() {
         let temp = temp_db_path("committed-current-scan");
         let mut conn = open_database(&temp).unwrap();
         apply_migrations(&mut conn).unwrap();
@@ -8216,17 +8249,31 @@ mod tests {
             },
         )
         .unwrap();
-        let committed = RuntimeSwitchRepository::list_committed_current(&conn).unwrap();
+        let committed =
+            RuntimeSwitchRepository::list_committed_current_pending_activation(&conn).unwrap();
         assert_eq!(committed.len(), 1);
         assert_eq!(committed[0].switch_id, reserved.switch_id);
 
+        RuntimeSwitchRepository::mark_activation_completed(&conn, &reserved.switch_id).unwrap();
+        RuntimeSwitchRepository::mark_activation_completed(&conn, &reserved.switch_id).unwrap();
+        assert!(
+            RuntimeSwitchRepository::list_committed_current_pending_activation(&conn)
+                .unwrap()
+                .is_empty()
+        );
+
+        conn.execute(
+            "UPDATE runtime_switches SET activation_completed_at_ms = NULL WHERE switch_id = ?1",
+            params![reserved.switch_id.as_str()],
+        )
+        .unwrap();
         conn.execute(
             "UPDATE agent_sessions SET current_binding_id = ?2 WHERE session_id = ?1",
             params![session_id.as_str(), source.binding_id.as_str()],
         )
         .unwrap();
         assert!(
-            RuntimeSwitchRepository::list_committed_current(&conn)
+            RuntimeSwitchRepository::list_committed_current_pending_activation(&conn)
                 .unwrap()
                 .is_empty()
         );

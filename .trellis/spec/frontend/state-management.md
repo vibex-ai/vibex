@@ -601,8 +601,8 @@ SubmissionLocator {
   desiredRuntime, createdAtMs
 }
 
-Desktop attach role -> owner
-Remote attach role  -> viewer
+Desktop history attach role -> viewer
+Remote history attach role  -> viewer
 ```
 
 ### 3. Contracts
@@ -620,9 +620,12 @@ Remote attach role  -> viewer
   `sessionId + bindingId + activationGeneration` snapshot. A mismatch clears
   live state and triggers selection/snapshot recovery. Historical Timeline
   items remain valid logical-session history.
-- Desktop uses event-assisted recovery plus bounded polling and an Owner lease.
-  Remote uses cursor polling and a Viewer lease. Stream reset or epoch change
-  discards the cursor and refetches; push delivery is never correctness proof.
+- Desktop uses event-assisted recovery plus bounded polling and a Viewer lease
+  for selected-session history. Remote uses cursor polling and a Viewer lease.
+  Message or command work materializes through the backend worker path; merely
+  selecting history never requires runtime ownership. Stream reset or epoch
+  change discards the cursor and refetches; push delivery is never correctness
+  proof.
 - Ordinary send calls the durable send API directly with the displayed desired
   runtime and a stable message idempotency key. It does not await the switch and
   is not disabled by another pending submission.
@@ -794,9 +797,9 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
 - A session switch clears view-local pending state from the previous generation.
   The durable backend operation may finish, but its stale completion cannot keep
   the newly selected session disabled or replace its state.
-- Initial load starts generation-fenced sibling work for the Owner lease,
+- Initial load starts generation-fenced sibling work for the Viewer lease,
   authoritative timeline, and runtime selection. Only the authoritative timeline
-  controls `agent_loading`: Owner materialization, runtime catalog/model probes,
+  controls `agent_loading`: Viewer heartbeat, runtime catalog/model probes,
   and terminal metadata must not delay persisted history. After the timeline is
   ready, merge live events with the 300 ms timeline fallback and 2-second runtime
   poll. Sequence gaps, lag, or cursor reset mark the model for authoritative
@@ -807,7 +810,7 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   authoritative timeline restoration continue under their workbench loading and
   error states; they must not retain or reopen the brand overlay. Later session
   switches must not reopen it either.
-- Switching sessions detaches the previous Owner and starts the configured
+- Switching sessions detaches the previous Viewer and starts the configured
   30-second heartbeat for the selected session. Polling and heartbeat intervals
   come from `DesktopPollingPolicy`, not view-local constants.
 - Correlation ids are not a streaming-text boundary: ACP chunks may omit them or
@@ -1297,7 +1300,7 @@ attach Owner -> wait for provider restore -> fetch persisted timeline
 ```text
 adjacent compatible deltas -> one stable row -> adjacent final replaces body
 switch opened session -> restore bounded cache -> refresh authoritative prefix
-fetch persisted timeline -> end loading; attach Owner in the background
+fetch persisted timeline -> end loading; attach Viewer in the background
 ```
 
 #### Wrong

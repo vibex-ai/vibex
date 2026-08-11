@@ -73,7 +73,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 43;
+pub const CURRENT_SCHEMA_VERSION: i64 = 44;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -1723,6 +1723,26 @@ const MIGRATIONS: &[Migration] = &[
             );
             CREATE INDEX IF NOT EXISTS idx_agent_model_provider_display_order
                 ON agent_model_provider_display_order(agent_id, order_index, provider_profile_id);
+        ",
+    },
+    Migration {
+        version: 44,
+        name: "runtime_switch_activation_completion",
+        sql: "
+            ALTER TABLE runtime_switches
+                ADD COLUMN activation_completed_at_ms INTEGER NULL;
+
+            -- Older releases returned a successful switch only after activation.
+            -- Treat their committed rows as complete so upgrading does not eagerly
+            -- restore every historical session. Any later provider work can still
+            -- rematerialize the durable current binding on demand.
+            UPDATE runtime_switches
+            SET activation_completed_at_ms = COALESCE(committed_at_ms, updated_at_ms)
+            WHERE status = 'committed';
+
+            CREATE INDEX IF NOT EXISTS idx_runtime_switches_pending_activation
+                ON runtime_switches(status, activation_completed_at_ms)
+                WHERE activation_completed_at_ms IS NULL;
         ",
     },
 ];
@@ -12047,6 +12067,104 @@ mod tests {
     }
 
     #[test]
+    fn schema_v44_backfills_completed_runtime_switch_activations() {
+        let temp = temp_db_path("schema-v44-runtime-switch-activation");
+        let mut conn = open_database(&temp).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at_ms INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 43)
+        {
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(migration.sql).unwrap();
+            tx.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at_ms)
+                 VALUES (?1, ?2, ?3)",
+                params![migration.version, migration.name, unix_timestamp_ms()],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let now = unix_timestamp_ms();
+        conn.execute(
+            "INSERT INTO projects (project_id, name, root_path, created_at_ms, updated_at_ms)
+             VALUES ('project_v44', 'V44', '/tmp/vibex-v44', ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO workspaces (
+                workspace_id, project_id, root_path, mode, created_at_ms, updated_at_ms
+             ) VALUES (
+                'workspace_v44', 'project_v44', '/tmp/vibex-v44',
+                'current_checkout', ?1, ?1
+             )",
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agent_sessions (
+                session_id, title, project_id, workspace_id, workspace_root, workspace_mode,
+                state, permission_mode, ask_on_risk, bypass_all_permissions,
+                created_at_ms, updated_at_ms, current_agent_id, current_binding_id
+             ) VALUES (
+                'session_v44', 'V44 session', 'project_v44', 'workspace_v44',
+                '/tmp/vibex-v44', 'current_checkout', 'idle', 'workspace_write', 1, 0,
+                ?1, ?1, 'codex', 'binding_v44'
+             )",
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO runtime_switches (
+                switch_id, session_id, idempotency_key, source_revision,
+                desired_selection_revision, target_binding_id, target_agent_id,
+                target_adapter_id, target_profile_id, status,
+                created_at_ms, updated_at_ms, committed_at_ms
+             ) VALUES (
+                'switch_v44', 'session_v44', 'v44-backfill', 0, 1, 'binding_v44',
+                'codex', 'codex-acp', 'provider_v44', 'committed', ?1, ?1, ?1
+             )",
+            params![now],
+        )
+        .unwrap();
+
+        assert_eq!(
+            apply_migrations(&mut conn).unwrap(),
+            vec!["44:runtime_switch_activation_completion"]
+        );
+        let activation_completed_at_ms: Option<i64> = conn
+            .query_row(
+                "SELECT activation_completed_at_ms
+                 FROM runtime_switches WHERE switch_id = 'switch_v44'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(activation_completed_at_ms, Some(now));
+        let pending_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_runtime_switches_pending_activation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_index, 1);
+
+        drop(conn);
+        cleanup_db(temp);
+    }
+
+    #[test]
     fn schema_v32_marks_existing_runtime_bindings_zero_baseline_unavailable() {
         let temp = temp_db_path("schema-v32-zero-baseline-upgrade");
         let mut conn = open_database(&temp).unwrap();
@@ -12128,7 +12246,8 @@ mod tests {
                 "40:agent_auth_catalog_snapshots",
                 "41:agent_managed_installations",
                 "42:provider_model_runtime_option_snapshots",
-                "43:agent_model_provider_display_order"
+                "43:agent_model_provider_display_order",
+                "44:runtime_switch_activation_completion"
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -12274,7 +12393,8 @@ mod tests {
                 "40:agent_auth_catalog_snapshots",
                 "41:agent_managed_installations",
                 "42:provider_model_runtime_option_snapshots",
-                "43:agent_model_provider_display_order"
+                "43:agent_model_provider_display_order",
+                "44:runtime_switch_activation_completion"
             ]
         );
         assert_eq!(
@@ -13844,7 +13964,8 @@ mod tests {
                 "40:agent_auth_catalog_snapshots",
                 "41:agent_managed_installations",
                 "42:provider_model_runtime_option_snapshots",
-                "43:agent_model_provider_display_order"
+                "43:agent_model_provider_display_order",
+                "44:runtime_switch_activation_completion"
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)

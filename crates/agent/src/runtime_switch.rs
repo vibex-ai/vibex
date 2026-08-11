@@ -699,11 +699,11 @@ impl RuntimeSwitchCoordinator {
     }
 
     pub async fn reconcile_on_startup(&self) -> VibexResult<RuntimeSwitchReconcileReport> {
-        let (switches, committed_current) = {
+        let (switches, committed_current_pending_activation) = {
             let conn = self.open_connection()?;
             (
                 RuntimeSwitchRepository::list_non_terminal(&conn)?,
-                RuntimeSwitchRepository::list_committed_current(&conn)?,
+                RuntimeSwitchRepository::list_committed_current_pending_activation(&conn)?,
             )
         };
         let mut report = RuntimeSwitchReconcileReport::default();
@@ -722,7 +722,7 @@ impl RuntimeSwitchCoordinator {
                 }
             }
         }
-        for record in committed_current {
+        for record in committed_current_pending_activation {
             let intent = match SwitchIntent::from_record(&record) {
                 Ok(intent) => intent,
                 Err(error) => {
@@ -1974,6 +1974,10 @@ impl RuntimeSwitchCoordinator {
                 )
                 .with_diagnostic("causeCode", error.code)
             })?;
+        {
+            let conn = self.open_connection()?;
+            RuntimeSwitchRepository::mark_activation_completed(&conn, &intent.switch_id)?;
+        }
         self.inner
             .active_work
             .set_prompt_gate(&intent.session_id, false)
@@ -2044,6 +2048,10 @@ impl RuntimeSwitchCoordinator {
             .executor
             .activate(intent, &attachment, state.activation_generation)
             .await?;
+        {
+            let conn = self.open_connection()?;
+            RuntimeSwitchRepository::mark_activation_completed(&conn, &intent.switch_id)?;
+        }
         self.inner
             .active_work
             .set_prompt_gate(&intent.session_id, false)
@@ -3938,7 +3946,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_replays_activation_for_a_previously_committed_current_switch() {
+    async fn startup_skips_activation_for_a_completed_committed_current_switch() {
         let env = TestEnvironment::new("committed-activation");
         env.coordinator
             .request_switch(env.request("committed-activation"))
@@ -3947,24 +3955,21 @@ mod tests {
         env.executor.clear_calls();
         let report = env.coordinator.reconcile_on_startup().await.unwrap();
         assert!(report.errors.is_empty());
-        assert!(report.outcomes.iter().any(|outcome| {
-            outcome.status == RuntimeSwitchStatus::Committed
-                && outcome.switch_id == env.switch_by_key("committed-activation").switch_id
-        }));
+        assert!(report.outcomes.is_empty());
         let calls = env.executor.calls();
         assert_eq!(
             calls
                 .iter()
                 .filter(|call| call.starts_with("activate:"))
                 .count(),
-            1
+            0
         );
         assert_eq!(
             calls
                 .iter()
                 .filter(|call| *call == "cleanup_source")
                 .count(),
-            1
+            0
         );
     }
 
@@ -4265,7 +4270,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_live_mutations_persist_binding_generation_and_reactivate_latest_only() {
+    async fn repeated_live_mutations_do_not_reactivate_after_completion() {
         let env = TestEnvironment::new("repeated-live");
         env.executor.set_assessment(live_assessment());
         let mut first = env.request("repeated-live-1");
@@ -4293,7 +4298,7 @@ mod tests {
                 .iter()
                 .filter(|outcome| outcome.status == RuntimeSwitchStatus::Committed)
                 .count(),
-            1
+            0
         );
         let calls = env.executor.calls();
         assert_eq!(
@@ -4301,7 +4306,7 @@ mod tests {
                 .iter()
                 .filter(|call| call.starts_with("activate:"))
                 .count(),
-            1
+            0
         );
         assert!(!calls.iter().any(|call| call == "cleanup_source"));
     }

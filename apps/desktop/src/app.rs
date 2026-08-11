@@ -7285,7 +7285,10 @@ impl VibexWorkbench {
                             AttachRuntimeRequest {
                                 session_id: heartbeat_session_id.clone(),
                                 client_id: client_id.clone(),
-                                role: RuntimeLeaseRole::Owner,
+                                // Selecting history is read-only. A Viewer lease keeps an
+                                // existing runtime warm without spawning one; message and
+                                // command dispatch materialize the runtime when work begins.
+                                role: RuntimeLeaseRole::Viewer,
                             },
                             "desktop",
                         )
@@ -35794,6 +35797,8 @@ mod tests {
         assert!(projection.contains(".get_selection_state("));
         assert!(!projection.contains("list_terminals("));
         assert!(heartbeat.contains(".attach_runtime("));
+        assert!(heartbeat.contains("role: RuntimeLeaseRole::Viewer"));
+        assert!(!heartbeat.contains("role: RuntimeLeaseRole::Owner"));
     }
 
     #[test]

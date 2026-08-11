@@ -2136,6 +2136,7 @@ mod tests {
                 "41:agent_managed_installations",
                 "42:provider_model_runtime_option_snapshots",
                 "43:agent_model_provider_display_order",
+                "44:runtime_switch_activation_completion",
             ]
         );
         assert_eq!(

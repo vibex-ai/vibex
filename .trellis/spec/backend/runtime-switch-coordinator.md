@@ -76,7 +76,8 @@ RuntimeSwitchRepository::{
     fail, cancel, supersede, mark_ambiguous_external_effect,
     try_acquire_worker_lease, renew_worker_lease, release_worker_lease,
     confirm_committed, revert_committing_to_prepared,
-    list_non_terminal, list_committed_current,
+    list_non_terminal, list_committed_current_pending_activation,
+    mark_activation_completed,
 }
 
 SwitchOperationJournalRepository::{
@@ -168,11 +169,12 @@ SwitchOperationJournalRepository::{
   selection, switch status, and clears pending.
 - The public request awaits a separately spawned driver, so dropping the caller
   cannot cancel the durable drive or Commit critical section.
-- Only after Commit succeeds may the executor activate the target and reopen
-  prompts. If activation fails after the durable Commit, keep prompt admission
-  closed until startup reconciliation successfully replays activation. Activation
-  and source cleanup are idempotent. LiveMutation never calls source cleanup
-  because source and target are identical.
+- Only after Commit succeeds may the executor activate the target. Successful
+  activation durably writes `activation_completed_at_ms` before prompts reopen.
+  If activation fails, or the process exits between Commit and that marker, keep
+  prompt admission closed until startup reconciliation successfully replays the
+  pending activation. Activation and source cleanup are idempotent. LiveMutation
+  never calls source cleanup because source and target are identical.
 
 #### Startup reconciliation
 
@@ -194,16 +196,25 @@ SwitchOperationJournalRepository::{
 | Prepared | Reacquire and health-check the durable target before Commit. |
 | Committing + target current | Confirm Committed and replay idempotent activation. |
 | Committing + source current | Revert to Prepared, revalidate, and Commit once. |
-| Committed target still current | Replay only the newest switch activation for that session. |
+| Committed target still current, activation marker absent | Replay only the newest pending switch activation for that session, then mark it complete. |
+| Committed target still current, activation marker present | Do not acquire a process or attachment; later Owner/background work materializes the durable binding on demand. |
 | Terminal with pending pointer | CAS-clear pending without touching current. |
 | Missing switch with pending pointer | CAS-clear the orphan pointer. |
 
-For a committed same-binding LiveMutation at durable generation `N`, startup
-activation accepts only two attachment states: fence `N - 1` is advanced
-exactly once to `N`, while fence `N` is an idempotent already-activated replay.
-Every other generation or a different binding/process/native fence fails
-closed. Reconciliation must never apply the live mutation twice or advance to
-`N + 1` merely because the durable switch is replayed.
+Migration 44 treats pre-marker Committed rows as already activated. This is a
+one-time upgrade boundary: those releases normally returned success only after
+activation, process-local prompt gates cannot survive an application restart,
+and any real later work still materializes the durable current binding before a
+provider operation. Switches committed after migration 44 always use the marker
+and retain the exact crash-window replay above.
+
+For a pending committed same-binding LiveMutation at durable generation `N`,
+startup activation accepts only two attachment states: fence `N - 1` is
+advanced exactly once to `N`, while fence `N` is an idempotent
+already-activated replay. Every other generation or a different
+binding/process/native fence fails closed. A completed activation marker skips
+the replay entirely, so reconciliation must never apply the live mutation
+twice or advance to `N + 1` merely because the durable switch is scanned.
 
 ### 4. Validation & Error Matrix
 
@@ -220,7 +231,7 @@ closed. Reconciliation must never apply the live mutation twice or advance to
 | Non-retryable AboutToSend without durable evidence | `runtime_switch_ambiguous_external_effect`; never resend create. |
 | Desired selection changes before Commit | Superseded; source current, target Failed/cleaned. |
 | Target binding missing at Commit | Transaction rollback with `runtime_switch_target_binding_missing`. |
-| Activate fails after Commit | Keep Committed authoritative and prompt admission closed; surface activation error, then activate and reopen on startup replay. |
+| Activate fails after Commit | Keep Committed authoritative and prompt admission closed; leave the activation marker empty, surface the error, then activate, mark, and reopen on startup replay. |
 | Committed LiveMutation attachment is not exactly `N - 1` or `N` | `runtime_switch_generation_invalid` or the exact attachment-fence conflict; keep prompts closed and do not mutate generation. |
 
 ### 5. Good/Base/Bad Cases
@@ -237,8 +248,9 @@ closed. Reconciliation must never apply the live mutation twice or advance to
   source idle in SQLite without provider cancellation confirmation.
 - Bad: handle an Adapter regression by registering a Native runtime or reading
   a legacy provider binding instead of selecting a verified ACP descriptor.
-- Bad: treat Committed as fully activated. A crash can occur after the DB
-  transaction and before attachment activation, so startup must replay it.
+- Bad: treat Committed alone as fully activated. A crash can occur after the DB
+  transaction and before attachment activation, so startup must replay rows
+  whose activation marker is still empty.
 - Bad: accept any attachment generation below `N`, increment an already-`N`
   handle to `N + 1`, or rerun the provider config mutation during replay.
 
@@ -253,8 +265,9 @@ closed. Reconciliation must never apply the live mutation twice or advance to
 - Multiple active Wait categories assert that the earliest deadline terminates
   the switch and reopens the gate.
 - Hot switch: prepare failure, Superseded, same-binding LiveMutation generation,
-  caller drop shield, target cleanup, source pointer preservation, and an
-  activation failure that stays closed until startup replay succeeds.
+  caller drop shield, target cleanup, source pointer preservation, completed
+  activation startup skip, and an activation failure that stays closed until
+  startup replay succeeds.
 - Restore fallback: an explicit fresh-allowed or ACP fatal resume failure
   records the failed restore operation, appends one create operation, and
   commits through the normal fresh bridge path; authentication, transient, and

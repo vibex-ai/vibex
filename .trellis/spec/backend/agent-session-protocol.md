@@ -479,6 +479,11 @@ request: terminal/create { id, params.sessionId, ... }
 - A live attachment is keyed by surrogate `RuntimeBindingId`; a
   `VibexSessionId` selects current attachment state but is never reused as the
   binding id.
+- Opening or selecting a session for history inspection requests a Viewer lease.
+  Viewer attachment may keep an already materialized runtime warm, but it must
+  not create a process or restore a native session. Actual message/command work
+  materializes through an internal worker lease; an Owner lease is reserved for
+  clients that explicitly request runtime ownership.
 - The native route lookup key is exactly
   `(AcpProcessInstanceId, native_session_id)`. Delivery then checks all four
   fence fields and requires the attachment to be committed and current.

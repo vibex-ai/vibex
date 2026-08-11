@@ -104,6 +104,13 @@ for Config Center presentation order. It is independent from failover storage;
 replacement of one Agent's complete profile-id list runs in a transaction and
 profile deletion removes its display-order rows.
 
+Migration 44 adds `runtime_switches.activation_completed_at_ms`. A newly
+committed switch leaves the marker empty until its target attachment activates;
+startup recovery scans only current committed rows with an empty marker. The
+migration backfills older committed rows from their commit/update timestamp so
+upgrading does not eagerly restore every historical Agent session. Durable
+bindings remain lazily materializable when real work later needs them.
+
 ## Transactions
 
 Use transactions for multi-record state transitions:
