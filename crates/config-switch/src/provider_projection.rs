@@ -1452,12 +1452,6 @@ fn apply_agent_projection_defaults(
                     .to_string(),
             );
         }
-        "fast-agent" => {
-            if let Some(model) = projection_model_id(model) {
-                let model = model.strip_prefix("generic.").unwrap_or(model);
-                env.insert("FAST_AGENT_MODEL".to_string(), format!("generic.{model}"));
-            }
-        }
         "kimi" => {
             let provider_type = match projection_wire_protocol(model) {
                 vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => "anthropic",
@@ -3310,7 +3304,7 @@ mod tests {
         runtime_home_env_key: Option<&'static str>,
     }
 
-    fn typed_projection_expectations() -> [TypedProjectionExpectation; 18] {
+    fn typed_projection_expectations() -> [TypedProjectionExpectation; 17] {
         [
             TypedProjectionExpectation {
                 agent_id: "copilot",
@@ -3356,15 +3350,6 @@ mod tests {
                 overlay_path: Some("settings.json"),
                 overlay_format: Some("json"),
                 runtime_home_env_key: Some("FACTORY_HOME_OVERRIDE"),
-            },
-            TypedProjectionExpectation {
-                agent_id: "fast-agent",
-                base_url_key: Some("GENERIC_BASE_URL"),
-                secret_env_key: "GENERIC_API_KEY",
-                model_env_key: Some("FAST_AGENT_MODEL"),
-                overlay_path: None,
-                overlay_format: None,
-                runtime_home_env_key: None,
             },
             TypedProjectionExpectation {
                 agent_id: "gemini",
@@ -3811,7 +3796,7 @@ mod tests {
     fn all_typed_catalog_projectors_map_provider_env_secret_model_and_private_state() {
         let descriptors = vibex_core::catalog_projection_descriptors().unwrap();
         let expectations = typed_projection_expectations();
-        assert_eq!(expectations.len(), 18);
+        assert_eq!(expectations.len(), 17);
 
         for expected in expectations {
             let descriptor = descriptors
@@ -3922,14 +3907,7 @@ mod tests {
             }
             if let Some(model_key) = expected.model_env_key {
                 let model = non_secret_env.get(model_key).unwrap();
-                assert_eq!(
-                    model,
-                    if expected.agent_id == "fast-agent" {
-                        "generic.agent-model"
-                    } else {
-                        "agent-model"
-                    }
-                );
+                assert_eq!(model, "agent-model");
             }
             match expected.agent_id {
                 "codewhale" => assert_eq!(

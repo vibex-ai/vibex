@@ -7891,17 +7891,6 @@ mod tests {
                     "--experimental-skills",
                 ][..],
             ),
-            (
-                "fast-agent",
-                "uvx",
-                &[
-                    "--prerelease=allow",
-                    "--from",
-                    "fast-agent-mcp==0.10.4",
-                    "fast-agent-acp",
-                    "-x",
-                ][..],
-            ),
             ("cursor", "cursor-agent", &["acp"][..]),
             ("kimi-cli", "kimi", &["acp"][..]),
         ] {
@@ -9808,7 +9797,7 @@ mod tests {
                 "{agent_id} must only probe its code-owned executable name"
             );
         }
-        for pinned_agent in ["dirac", "factory-droid", "fast-agent", "pi", "qwen-code"] {
+        for pinned_agent in ["dirac", "factory-droid", "pi", "qwen-code"] {
             assert_eq!(trusted_version_probe_binary_names(pinned_agent), None);
         }
     }

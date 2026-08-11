@@ -393,14 +393,11 @@ const FILE_INTEGRATION_ASSETS: &[(&str, &[u8])] = &[
 ];
 
 const AGENT_BRAND_ASSETS: &[(&str, &[u8])] = &[
-    bundled_icon_asset!("agents/agoragentic-acp.svg"),
     bundled_icon_asset!("agents/amp-acp.svg"),
     bundled_icon_asset!("agents/auggie.svg"),
-    bundled_icon_asset!("agents/autohand.svg"),
     bundled_icon_asset!("agents/cline.svg"),
     bundled_icon_asset!("agents/codebuddy-code.svg"),
     bundled_icon_asset!("agents/codewhale.svg"),
-    bundled_icon_asset!("agents/cortex-code.svg"),
     bundled_icon_asset!("agents/crow-cli.svg"),
     bundled_icon_asset!("agents/cursor.svg"),
     bundled_icon_asset!("agents/deepagents.svg"),
@@ -408,7 +405,6 @@ const AGENT_BRAND_ASSETS: &[(&str, &[u8])] = &[
     bundled_icon_asset!("agents/dimcode.svg"),
     bundled_icon_asset!("agents/dirac.svg"),
     bundled_icon_asset!("agents/factory-droid.svg"),
-    bundled_icon_asset!("agents/fast-agent.svg"),
     bundled_icon_asset!("agents/glm-acp-agent.svg"),
     bundled_icon_asset!("agents/goose.svg"),
     bundled_icon_asset!("agents/grok.svg"),
@@ -423,7 +419,6 @@ const AGENT_BRAND_ASSETS: &[(&str, &[u8])] = &[
     bundled_icon_asset!("agents/pi.svg"),
     bundled_icon_asset!("agents/poolside.svg"),
     bundled_icon_asset!("agents/qoder.svg"),
-    bundled_icon_asset!("agents/sigit.svg"),
     bundled_icon_asset!("agents/stakpak.svg"),
     bundled_icon_asset!("agents/vtcode.svg"),
 ];
@@ -454,20 +449,12 @@ const fn themed_agent_asset(path: &'static str) -> BrandAsset {
 
 const CATALOG_AGENT_BRANDS: &[(&str, BrandAsset)] = &[
     (
-        "agoragentic-acp",
-        colored_agent_asset("icons/vibex/agents/agoragentic-acp.svg"),
-    ),
-    (
         "amp-acp",
         colored_agent_asset("icons/vibex/agents/amp-acp.svg"),
     ),
     (
         "auggie",
         themed_agent_asset("icons/vibex/agents/auggie.svg"),
-    ),
-    (
-        "autohand",
-        themed_agent_asset("icons/vibex/agents/autohand.svg"),
     ),
     ("cline", themed_agent_asset("icons/vibex/agents/cline.svg")),
     (
@@ -477,10 +464,6 @@ const CATALOG_AGENT_BRANDS: &[(&str, BrandAsset)] = &[
     (
         "codewhale",
         colored_agent_asset("icons/vibex/agents/codewhale.svg"),
-    ),
-    (
-        "cortex-code",
-        colored_agent_asset("icons/vibex/agents/cortex-code.svg"),
     ),
     (
         "crow-cli",
@@ -503,10 +486,6 @@ const CATALOG_AGENT_BRANDS: &[(&str, BrandAsset)] = &[
     (
         "factory-droid",
         themed_agent_asset("icons/vibex/agents/factory-droid.svg"),
-    ),
-    (
-        "fast-agent",
-        colored_agent_asset("icons/vibex/agents/fast-agent.svg"),
     ),
     (
         "glm-acp-agent",
@@ -537,7 +516,6 @@ const CATALOG_AGENT_BRANDS: &[(&str, BrandAsset)] = &[
         themed_agent_asset("icons/vibex/agents/poolside.svg"),
     ),
     ("qoder", colored_agent_asset("icons/vibex/agents/qoder.svg")),
-    ("sigit", themed_agent_asset("icons/vibex/agents/sigit.svg")),
     (
         "stakpak",
         themed_agent_asset("icons/vibex/agents/stakpak.svg"),
@@ -781,15 +759,12 @@ fn agent_brand_intrinsic_width(path: &str) -> Option<u16> {
         "icons/vibex/opencode.svg" => Some(16),
         "icons/vibex/gemini.svg" => Some(32),
         "icons/vibex/qwen.svg" | "icons/vibex/claude.svg" => Some(256),
-        "icons/vibex/agents/agoragentic-acp.svg"
-        | "icons/vibex/agents/crow-cli.svg"
-        | "icons/vibex/agents/kimi.svg" => Some(100),
+        "icons/vibex/agents/crow-cli.svg" | "icons/vibex/agents/kimi.svg" => Some(100),
         "icons/vibex/agents/amp-acp.svg" => Some(28),
         "icons/vibex/agents/codebuddy-code.svg" => Some(40),
         "icons/vibex/agents/codewhale.svg" | "icons/vibex/agents/qoder.svg" => Some(180),
-        "icons/vibex/agents/dimcode.svg" | "icons/vibex/agents/cortex-code.svg" => Some(256),
+        "icons/vibex/agents/dimcode.svg" => Some(256),
         "icons/vibex/agents/junie.svg" => Some(128),
-        "icons/vibex/agents/fast-agent.svg" => Some(256),
         "icons/vibex/agents/mistral-vibe.svg" => Some(512),
         "icons/vibex/agents/kiro.svg" => Some(1200),
         _ => None,
@@ -896,12 +871,10 @@ mod tests {
             "Google Gemini",
             "OpenCode",
             "Qwen Code",
-            "agoragentic-acp",
             "amp-acp",
             "codebuddy-code",
             "codewhale",
             "dimcode",
-            "fast-agent",
             "kimi",
             "kiro",
             "qoder",
@@ -920,7 +893,6 @@ mod tests {
 
         for identity in [
             "auggie",
-            "autohand",
             "cline",
             "cursor",
             "deepagents",
@@ -936,7 +908,6 @@ mod tests {
             "nova",
             "pi",
             "poolside",
-            "sigit",
             "stakpak",
             "vtcode",
         ] {
@@ -1002,14 +973,11 @@ mod tests {
 
         for identity in [
             "OpenCode",
-            "agoragentic-acp",
             "amp-acp",
             "codebuddy-code",
             "codewhale",
-            "cortex-code",
             "crow-cli",
             "dimcode",
-            "fast-agent",
             "junie",
             "kimi",
             "kiro",

@@ -2601,28 +2601,23 @@ AgentManagedInstallationRecord {
   tarball, executable, and lockfile identity checks. The generated launcher
   sets `PI_ACP_PI_COMMAND` to that tree's `.bin/pi` command; it never depends
   on or replaces a user-global Pi installation.
-- Seven additional Agent CLIs use their official latest published release when
+- Four additional Agent CLIs use their official latest published release when
   Add, Upgrade, or Check for updates resolves an installation: CodeWhale uses
   npm `codewhale/latest`; Hermes uses PyPI `hermes-agent` with the `[acp]`
-  extra; Kiro uses the stable latest CLI manifest; Amp uses npm
-  `@ampcode/cli/latest`; Autohand uses npm `autohand-cli/latest`; Agoragentic
-  uses npm `agoragentic-mcp/latest`; and fast-agent uses PyPI
-  `fast-agent-mcp/latest`. The resolved release is converted to an exact
-  version before installation and recorded in `runtimeVersion`; no floating
-  package range reaches npm or uv.
-- Agoragentic, CodeWhale, fast-agent, and Hermes expose ACP from their CLI
-  (`agoragentic-mcp --acp`, `codewhale serve --acp`, `fast-agent-acp -x`, and
-  `hermes acp`). fast-agent installs from `fast-agent-mcp`, not the incompatible
-  wrapper distribution, and may explicitly allow prereleases while resolving
-  its exact upstream dependency set. Kiro launches `kiro-cli acp`. Kiro
+  extra; Kiro uses the stable latest CLI manifest; and Amp uses npm
+  `@ampcode/cli/latest`. The resolved release is converted to an exact version
+  before installation and recorded in `runtimeVersion`; no floating package
+  range reaches npm or uv.
+- CodeWhale and Hermes expose ACP from their CLI (`codewhale serve --acp` and
+  `hermes acp`). Kiro launches `kiro-cli acp`. Kiro
   archives and their SHA-256 values come from the official manifest; Linux
   installs into a staged private home, macOS retains the private app bundle
   from the DMG, and Windows retains the MSI administrative-extract tree.
   Unsupported manifest platforms fail closed.
-- Amp and Autohand keep their ACP Adapter and latest CLI in the same isolated
-  npm tree. Their generated launchers set `AMP_CLI_PATH` or `AUTOHAND_CMD` to
-  that tree's `.bin/amp` or `.bin/autohand` command before importing the
-  Adapter. These managed latest-channel CLIs never probe, prefer, replace, or
+- Amp keeps its ACP Adapter and latest CLI in the same isolated npm tree. Its
+  generated launcher sets `AMP_CLI_PATH` to that tree's `.bin/amp` command
+  before importing the Adapter. This managed latest-channel CLI never probes,
+  prefers, replaces, or
   depend on a user-global Agent CLI from `PATH`; only Node/npm and uv toolchain
   discovery may reuse verified user/system executables.
 - Minion Code installs the exact `agent-client-protocol==0.8.1` compatibility
@@ -2638,7 +2633,7 @@ AgentManagedInstallationRecord {
 - "Latest" is resolved only during Add, explicit Upgrade/install, or Check for
   updates. Desktop startup restores a healthy recorded installation without a
   network lookup or silent upgrade. Check for updates compares both the
-  Adapter version, any separately recorded Pi, Amp, or Autohand CLI runtime
+  Adapter version, any separately recorded Pi or Amp CLI runtime
   version, and any Agent-scoped exact compatibility dependency recorded in the
   install manifest.
 - npm Agents select Node/npm in this order: explicit
@@ -2768,9 +2763,8 @@ AgentManagedInstallationRecord {
   downgrade rejection, explicit/system/managed Node selection and fallback,
   malformed/old Node rejection, distinct empty user/global npm configs,
   Pi's dual-package lock, latest runtime companion, and local launcher,
-  Amp/Autohand latest companion binding, Autohand bin selection, Kiro manifest
-  platform selection, generated Node launcher syntax, Agoragentic/fast-agent
-  latest-channel resolution, Minion's exact ACP runtime dependency and legacy
+  Amp latest companion binding, Kiro manifest platform selection, generated
+  Node launcher syntax, Minion's exact ACP runtime dependency and legacy
   same-version manifest repair,
   explicit/system/managed `uv` selection and fallback, exact `uvx` and Hermes
   `[acp]` extra parsing, metadata entry-point validation, relocatable Python
@@ -3446,8 +3440,8 @@ validated code-owned overlay under the private runtime root.
 ### 1. Scope / Trigger
 
 - Trigger: Config Center creates or updates an ACP Provider Profile for one of
-  these 17 catalog Agents: `copilot`, `codewhale`, `crow-cli`, `dirac`,
-  `factory-droid`, `fast-agent`, `goose`, `grok`, `hermes`, `kilo`, `kimi`,
+  these 16 catalog Agents: `copilot`, `codewhale`, `crow-cli`, `dirac`,
+  `factory-droid`, `goose`, `grok`, `hermes`, `kilo`, `kimi`,
   `mistral-vibe`, `poolside`, `pi`, `qwen-code`, `stakpak`, or `vtcode`.
 - Trigger: an explicit Config Center refresh changes the detected Agent
   version, or a session/probe must start with the selected Profile's endpoint,
@@ -3497,10 +3491,10 @@ ResolvedAgentProviderProjection {
 
 ### 3. Contracts
 
-- The 17 descriptors accept their researched catalog versions and later
+- The 16 descriptors accept their researched catalog versions and later
   semantic versions: Copilot `>=1.0.78`, CodeWhale `>=0.8.55`, crow-cli
-  `>=0.1.23`, Dirac `>=0.4.1`, Factory Droid `>=0.153.1`, fast-agent
-  `>=0.7.21`, Goose `>=1.33.1`, Grok `>=0.2.11`, Hermes `>=0.19.0`, Kilo
+  `>=0.1.23`, Dirac `>=0.4.1`, Factory Droid `>=0.153.1`, Goose `>=1.33.1`,
+  Grok `>=0.2.11`, Hermes `>=0.19.0`, Kilo
   `>=7.2.40`, Kimi `>=0.11.0`, Mistral Vibe `>=2.9.3`, Poolside `>=1.0.0`,
   Pi `>=0.0.33`, Qwen Code `>=0.18.4`, Stakpak `>=0.3.80`, and VT Code
   `>=0.96.14`. Older, missing, manual, or non-semantic versions never inherit
@@ -3508,16 +3502,15 @@ ResolvedAgentProviderProjection {
 - Explicit refresh may run `<binary> --version` only for these trusted binary
   names: `copilot`, `codewhale`, `crow-cli`, `goose`, `grok`, `hermes`, `kilo`,
   `kimi`, `vibe-acp`, `pool`, `stakpak`, and `vtcode`. Dirac, Factory Droid,
-  fast-agent, Pi, and Qwen Code derive the catalog version only when the
+  Pi, and Qwen Code derive the catalog version only when the
   complete `npx`/`uvx` command and argument vector exactly match the pinned
   catalog entry. Ordinary catalog reads remain process-free.
-- The five environment projectors use these process contracts:
+- The four environment projectors use these process contracts:
 
 | Agent | Endpoint / Secret / Model | Additional selection or state |
 | --- | --- | --- |
 | Copilot | `COPILOT_PROVIDER_BASE_URL` / `COPILOT_PROVIDER_API_KEY` / `COPILOT_MODEL` | `COPILOT_HOME` points at the private projection root. |
 | CodeWhale | `CODEWHALE_BASE_URL` / `OPENAI_API_KEY` / `CODEWHALE_MODEL` | `CODEWHALE_PROVIDER=openai`; `CODEWHALE_HOME` is private. |
-| fast-agent | `GENERIC_BASE_URL` / `GENERIC_API_KEY` / `FAST_AGENT_MODEL` | The model is normalized to `generic.<model>`. |
 | Kimi | `KIMI_MODEL_BASE_URL` / `KIMI_MODEL_API_KEY` / `KIMI_MODEL_NAME` | `KIMI_MODEL_PROVIDER_TYPE` follows the Wire API; `KIMI_CODE_HOME` is private. |
 | Poolside | `POOLSIDE_STANDALONE_BASE_URL` / `POOLSIDE_API_KEY` / `POOLSIDE_STANDALONE_MODEL` | A trailing `/v1` is removed before launch. |
 
@@ -3555,7 +3548,7 @@ ResolvedAgentProviderProjection {
   for that Agent before notifying Profile listeners. Profile endpoint, Secret
   reference, model, Wire API, overlay, home-key, or process-argument changes
   alter the fingerprint and mark the old process stale.
-- All 17 descriptors use `RestartAndResume`. A save does not mutate or kill the
+- All 16 descriptors use `RestartAndResume`. A save does not mutate or kill the
   current process in place; the switch coordinator prepares the new projection,
   restores the logical session when supported, commits the new binding, and
   then drains the old runtime.
@@ -3583,7 +3576,7 @@ ResolvedAgentProviderProjection {
 - Good: Grok registers a custom model and sets `[models].default` to that model;
   Crow and Stakpak probes receive the same materialized config arguments as
   real sessions.
-- Base: Copilot, fast-agent, or Poolside needs no config file. The process
+- Base: Copilot or Poolside needs no config file. The process
   receives only its typed endpoint/key/model environment plus safe runtime
   metadata.
 - Bad: apply a `1.33.1` Goose overlay to Goose `1.32.9`, a missing version, or
@@ -3596,14 +3589,14 @@ ResolvedAgentProviderProjection {
 ### 6. Tests Required
 
 - Core `catalog_projection_contracts_are_explicit_and_conservative` asserts all
-  17 ids, catalog-derived `>=` semantic-version compatibility, typed
-  provider/model boundaries, `VibexPrivate`, and `RestartAndResume`; the six
+  16 ids, catalog-derived `>=` semantic-version compatibility, typed
+  provider/model boundaries, `VibexPrivate`, and `RestartAndResume`; the five
   blocked Agents remain conservative.
 - DB `pinned_catalog_commands_supply_exact_versions_only_for_full_command_matches`
-  asserts the five fixed-command identities and fail-closed mismatches.
+  asserts the four fixed-command identities and fail-closed mismatches.
 - Config-switch
   `all_typed_catalog_projectors_map_provider_env_secret_model_and_private_state`
-  parses every JSON/TOML/YAML overlay, checks all 17 endpoint/key/model
+  parses every JSON/TOML/YAML overlay, checks all 16 endpoint/key/model
   projections, Goose/Grok selection, home paths, Crow/Stakpak args, fingerprint
   drift, and Secret redaction. Version-probe tests assert the 12 trusted system
   binary names.
@@ -3721,7 +3714,7 @@ check:agent-provider-runtime[:self-test]
   projection preview. The observed origin and exact target model must both
   match. A provider string with no planned safe identity, or the same model name
   served by a different origin, remains blocked.
-- The checked evidence capture includes all 39 entries, hashes every bound
+- The checked evidence capture includes all 34 entries, hashes every bound
   implementation surface, scans forbidden Secret/native/path fields, and rejects
   binary-only or false live-switch claims. Missing accounts, licenses, cloud
   projects, or local model assets produce `blocked/not_run`; they never count as
@@ -3748,7 +3741,7 @@ check:agent-provider-runtime[:self-test]
 - Good: a Goose `>=1.33.1` runtime receives only its documented projection,
   the isolated probe confirms the planned safe origin plus exact model, and
   evidence remains scoped to the matching descriptor and runtime version.
-- Good: an exact Autohand descriptor without a typed projector remains
+- Good: an exact Cline descriptor without a typed projector remains
   `Unverified`, has no runtime home/fingerprint, and returns its stable
   capability diagnostic.
 - Base: a licensed Agent is unavailable on the capture machine; the manifest
@@ -3761,7 +3754,7 @@ check:agent-provider-runtime[:self-test]
 
 ### 6. Tests Required
 
-- Core tests cover exact builtin and semantic-range catalog 39-entry
+- Core tests cover exact builtin and semantic-range catalog 34-entry
   catalog/descriptor/manifest identity, per-entry conservative diagnostics,
   and the two explicit environment descriptors.
 - ACP probe tests cover duplicate isolation keys, bounded cleanup, independent

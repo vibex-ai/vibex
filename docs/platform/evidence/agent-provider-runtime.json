@@ -3,9 +3,9 @@
   "status": "passed",
   "claimScope": "manifest_and_contract",
   "realRuntimeVerification": "blocked",
-  "capturedAt": "2026-08-09T03:15:46.434Z",
+  "capturedAt": "2026-08-11T06:39:55.903Z",
   "source": {
-    "captureParentCommit": "e4e01270d38453b933b0172b7ca1357baac17664",
+    "captureParentCommit": "9b059f48a71c48f0859239f765bfcd92646873f4",
     "rustToolchain": "rustc-1.97.0",
     "sourceInputRoots": [
       "crates/core/src/acp_catalog.rs",
@@ -53,27 +53,27 @@
       "crates/vibex-ui/Cargo.toml",
       "apps/desktop/Cargo.toml"
     ],
-    "sourceInputTreeSha256": "71ef3fc19b676e3f393e2227605c13dbd5a915e9c0521822dce9090e649771e5",
+    "sourceInputTreeSha256": "83842fd6775df2ccd18a1e40386b3def3632cbfafb776c43b523fd518d1b55a8",
     "bindings": {
-      "catalog": "43caa8cfba59ee6c92f92e8e16fb5c789665791ddbb3d45acabb4b7a61c6c5d0",
-      "manifest": "a7dcd5154b5681cd10fe0b71ac4b2c815e106c6ba4dc7782c1fe6dcf857e9efe",
-      "probe": "f29f32434b98aa1b131fab25c0d71e5f3716e16d18d8ed1f889897af650c1581",
-      "database": "c0ddc4cb8f43510c3bc7737af615b022ed3d4083556a0389cb813f7a01412555",
-      "remote": "cca712dc885a20fa5dbf4ec8d0db5d603015c7b87d1f879f458d88d29cb70905",
-      "ui": "977aaaf340811d56a7413d48c1488ae4dd7dc34d200e51970091c03dc5c8c04b",
-      "switch": "599e83811eea20587b22de0556d1ef672b80d1fcdd335e8b8dd59eeb04406308",
-      "scripts": "4b85e8061180d809d2df0d8b3de8a3e93a1724cef464c02dd9ef6870b5f4dc86",
-      "packageMetadata": "ce644f6fff1360cbac4c638cb82bec12b939e1bee1a56c6cfdb3481d4345341a"
+      "catalog": "bdc87ebdab402b8cc7f34192da8bd0e7db914c30672064412920d520af2e207a",
+      "manifest": "0f67c6211fb00c7dfe4f82400fda7f7095993c19c35dafc3ab9a8e4febbab847",
+      "probe": "230f0152e8677893f5f518a87887319e24350286c57c37bd197375fe6841b738",
+      "database": "f08e74e841050d51e4587167a48f3e3268c3132261a04d07f13aa179f17c2ec9",
+      "remote": "a058842c99911355e411e3e18aa5ff8b72cd40c6b21029d2819e1431c168e929",
+      "ui": "f0b069eddde413a8f7061158ce5809bc4d1be4377f619d088a7a59aba6addb37",
+      "switch": "d758f60e370cd99701faff26ca254abf4bee36b8b583c6bfd28c6285f78f5a19",
+      "scripts": "4593dcd79a383f4875b98ecbd5db6e457cd725e44537d0f716f1f3e832e4cdd8",
+      "packageMetadata": "0975d1120f3880725f4862f7717cbd80d4e517072611782c12fa0afa1d549e91"
     },
-    "cargoLockSha256": "1f1bee10326503e236af53f9e5242462f871def4ccf3f665a803d4555368eced",
+    "cargoLockSha256": "8d8bd3b75f3d71566b925df34c84893e5e6c6a6a021c825696565047cc6c5598",
     "packageJsonSha256": "4e1c85256422478413b0e9c5f0e046295bbe260944dd7d93a59b1c190ed7d739",
-    "rolloutManifestSha256": "fd583933fc1c72fcc52dad8874128df8cdd04008f28671aacc5728f4ef10279a"
+    "rolloutManifestSha256": "9b8cb4e4abac655a6e906a28ac020660a0ed2322cce49f6827e5d071423a4f05"
   },
   "manifest": {
     "schemaVersion": "agent-provider-runtime-manifest.v1",
-    "totalAgents": 39,
+    "totalAgents": 34,
     "builtinCount": 3,
-    "catalogCount": 36,
+    "catalogCount": 31,
     "entries": [
       {
         "agentId": "claude",
@@ -140,27 +140,6 @@
         "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
-        "agentId": "agoragentic-acp",
-        "catalogVersion": "1.3.3",
-        "adapterId": "agoragentic-acp",
-        "descriptorId": "projection_agoragentic_acp_runtime_v1",
-        "descriptorVersion": "1",
-        "versionPolicy": {
-          "kind": "exact"
-        },
-        "capabilityMode": "service_marketplace",
-        "runtimeHomeStrategy": "agent_managed",
-        "switchBehavior": "agent_managed",
-        "credentialKinds": [
-          "managed_subscription"
-        ],
-        "modelInterfaces": [],
-        "evidenceState": "service_marketplace",
-        "sourceEvidenceReference": "research/acp-agent/agoragentic-acp@1.3.3",
-        "smokeId": "agent-provider-agoragentic-acp",
-        "capabilityDiagnosticCode": null
-      },
-      {
         "agentId": "amp-acp",
         "catalogVersion": "0.7.0",
         "adapterId": "amp-acp",
@@ -205,25 +184,6 @@
         "capabilityDiagnosticCode": null
       },
       {
-        "agentId": "autohand",
-        "catalogVersion": "0.2.1",
-        "adapterId": "autohand-acp",
-        "descriptorId": "projection_autohand_runtime_v1",
-        "descriptorVersion": "1",
-        "versionPolicy": {
-          "kind": "exact"
-        },
-        "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "none",
-        "switchBehavior": "unverified",
-        "credentialKinds": [],
-        "modelInterfaces": [],
-        "evidenceState": "unverified",
-        "sourceEvidenceReference": "research/acp-agent/autohand@0.2.1",
-        "smokeId": "agent-provider-autohand",
-        "capabilityDiagnosticCode": "agent_projection_typed_projector_not_implemented"
-      },
-      {
         "agentId": "cline",
         "catalogVersion": "3.0.29",
         "adapterId": "cline-acp",
@@ -263,6 +223,7 @@
             "wireProtocolId": "openai_chat_completions",
             "sdkAdapterId": null,
             "transport": "https",
+            "integrationKind": "direct",
             "userSelectable": false,
             "processScoped": true
           }
@@ -293,6 +254,7 @@
             "wireProtocolId": "openai_chat_completions",
             "sdkAdapterId": null,
             "transport": "https",
+            "integrationKind": "direct",
             "userSelectable": false,
             "processScoped": true
           }
@@ -323,6 +285,7 @@
             "wireProtocolId": "openai_chat_completions",
             "sdkAdapterId": null,
             "transport": "https",
+            "integrationKind": "direct",
             "userSelectable": false,
             "processScoped": true
           }
@@ -330,28 +293,6 @@
         "evidenceState": "documented",
         "sourceEvidenceReference": "research/acp-agent/codewhale@0.8.55",
         "smokeId": "agent-provider-codewhale",
-        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
-      },
-      {
-        "agentId": "cortex-code",
-        "catalogVersion": "1.0.73",
-        "adapterId": "cortex-code-acp",
-        "descriptorId": "projection_cortex_code_runtime_v1",
-        "descriptorVersion": "1",
-        "versionPolicy": {
-          "kind": "exact"
-        },
-        "capabilityMode": "cloud_credential",
-        "runtimeHomeStrategy": "agent_managed",
-        "switchBehavior": "restart_and_resume",
-        "credentialKinds": [
-          "snowflake",
-          "o_auth"
-        ],
-        "modelInterfaces": [],
-        "evidenceState": "documented",
-        "sourceEvidenceReference": "research/acp-agent/cortex-code@1.0.73",
-        "smokeId": "agent-provider-cortex-code",
         "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
@@ -375,6 +316,7 @@
             "wireProtocolId": "openai_chat_completions",
             "sdkAdapterId": null,
             "transport": "https",
+            "integrationKind": "direct",
             "userSelectable": false,
             "processScoped": true
           }
@@ -487,6 +429,7 @@
             "wireProtocolId": "openai_chat_completions",
             "sdkAdapterId": null,
             "transport": "https",
+            "integrationKind": "direct",
             "userSelectable": false,
             "processScoped": true
           }
@@ -517,6 +460,7 @@
             "wireProtocolId": "openai_responses",
             "sdkAdapterId": null,
             "transport": "https",
+            "integrationKind": "direct",
             "userSelectable": true,
             "processScoped": true
           },
@@ -524,6 +468,7 @@
             "wireProtocolId": "openai_chat_completions",
             "sdkAdapterId": null,
             "transport": "https",
+            "integrationKind": "direct",
             "userSelectable": true,
             "processScoped": true
           },
@@ -531,6 +476,7 @@
             "wireProtocolId": "anthropic_messages",
             "sdkAdapterId": null,
             "transport": "https",
+            "integrationKind": "direct",
             "userSelectable": true,
             "processScoped": true
           }
@@ -541,14 +487,14 @@
         "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
-        "agentId": "fast-agent",
-        "catalogVersion": "0.7.21",
-        "adapterId": "fast-agent-acp",
-        "descriptorId": "projection_fast_agent_runtime_v1",
+        "agentId": "gemini",
+        "catalogVersion": "0.47.0",
+        "adapterId": "gemini-acp",
+        "descriptorId": "projection_gemini_runtime_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
           "kind": "detected_semver",
-          "requirement": ">=0.7.21"
+          "requirement": ">=0.47.0"
         },
         "capabilityMode": "replaceable_provider",
         "runtimeHomeStrategy": "vibex_private",
@@ -558,36 +504,14 @@
         ],
         "modelInterfaces": [
           {
-            "wireProtocolId": "openai_chat_completions",
+            "wireProtocolId": "google_generative_ai",
             "sdkAdapterId": null,
             "transport": "https",
+            "integrationKind": "direct",
             "userSelectable": false,
             "processScoped": true
           }
         ],
-        "evidenceState": "documented",
-        "sourceEvidenceReference": "research/acp-agent/fast-agent@0.7.21",
-        "smokeId": "agent-provider-fast-agent",
-        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
-      },
-      {
-        "agentId": "gemini",
-        "catalogVersion": "0.47.0",
-        "adapterId": "gemini-acp",
-        "descriptorId": "projection_gemini_runtime_v1",
-        "descriptorVersion": "1",
-        "versionPolicy": {
-          "kind": "exact"
-        },
-        "capabilityMode": "cloud_credential",
-        "runtimeHomeStrategy": "agent_managed",
-        "switchBehavior": "restart_and_resume",
-        "credentialKinds": [
-          "o_auth",
-          "api_key",
-          "gcp"
-        ],
-        "modelInterfaces": [],
         "evidenceState": "documented",
         "sourceEvidenceReference": "research/acp-agent/gemini@0.47.0",
         "smokeId": "agent-provider-gemini",
@@ -614,6 +538,7 @@
             "wireProtocolId": "openai_chat_completions",
             "sdkAdapterId": null,
             "transport": "https",
+            "integrationKind": "direct",
             "userSelectable": false,
             "processScoped": true
           }
@@ -644,6 +569,7 @@
             "wireProtocolId": "openai_chat_completions",
             "sdkAdapterId": null,
             "transport": "https",
+            "integrationKind": "direct",
             "userSelectable": false,
             "processScoped": true
           }
@@ -674,21 +600,8 @@
             "wireProtocolId": "openai_responses",
             "sdkAdapterId": null,
             "transport": "https",
-            "userSelectable": true,
-            "processScoped": true
-          },
-          {
-            "wireProtocolId": "openai_chat_completions",
-            "sdkAdapterId": null,
-            "transport": "https",
-            "userSelectable": true,
-            "processScoped": true
-          },
-          {
-            "wireProtocolId": "anthropic_messages",
-            "sdkAdapterId": null,
-            "transport": "https",
-            "userSelectable": true,
+            "integrationKind": "direct",
+            "userSelectable": false,
             "processScoped": true
           }
         ],
@@ -718,7 +631,32 @@
             "wireProtocolId": "openai_chat_completions",
             "sdkAdapterId": null,
             "transport": "https",
-            "userSelectable": false,
+            "integrationKind": "direct",
+            "userSelectable": true,
+            "processScoped": true
+          },
+          {
+            "wireProtocolId": "anthropic_messages",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "integrationKind": "direct",
+            "userSelectable": true,
+            "processScoped": true
+          },
+          {
+            "wireProtocolId": "openai_responses",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "integrationKind": "direct",
+            "userSelectable": true,
+            "processScoped": true
+          },
+          {
+            "wireProtocolId": "aws_bedrock_converse",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "integrationKind": "direct",
+            "userSelectable": true,
             "processScoped": true
           }
         ],
@@ -770,6 +708,7 @@
             "wireProtocolId": "openai_chat_completions",
             "sdkAdapterId": null,
             "transport": "https",
+            "integrationKind": "direct",
             "userSelectable": false,
             "processScoped": true
           }
@@ -822,6 +761,7 @@
             "wireProtocolId": "openai_chat_completions",
             "sdkAdapterId": null,
             "transport": "https",
+            "integrationKind": "direct",
             "userSelectable": true,
             "processScoped": true
           },
@@ -829,6 +769,7 @@
             "wireProtocolId": "anthropic_messages",
             "sdkAdapterId": null,
             "transport": "https",
+            "integrationKind": "direct",
             "userSelectable": true,
             "processScoped": true
           }
@@ -878,6 +819,7 @@
             "wireProtocolId": "openai_chat_completions",
             "sdkAdapterId": null,
             "transport": "https",
+            "integrationKind": "direct",
             "userSelectable": true,
             "processScoped": true
           },
@@ -885,6 +827,7 @@
             "wireProtocolId": "openai_responses",
             "sdkAdapterId": null,
             "transport": "https",
+            "integrationKind": "direct",
             "userSelectable": true,
             "processScoped": true
           },
@@ -892,6 +835,7 @@
             "wireProtocolId": "anthropic_messages",
             "sdkAdapterId": null,
             "transport": "https",
+            "integrationKind": "direct",
             "userSelectable": true,
             "processScoped": true
           }
@@ -941,6 +885,7 @@
             "wireProtocolId": "openai_chat_completions",
             "sdkAdapterId": null,
             "transport": "https",
+            "integrationKind": "direct",
             "userSelectable": false,
             "processScoped": true
           }
@@ -971,6 +916,7 @@
             "wireProtocolId": "openai_chat_completions",
             "sdkAdapterId": null,
             "transport": "https",
+            "integrationKind": "direct",
             "userSelectable": true,
             "processScoped": true
           },
@@ -978,6 +924,7 @@
             "wireProtocolId": "openai_responses",
             "sdkAdapterId": null,
             "transport": "https",
+            "integrationKind": "direct",
             "userSelectable": true,
             "processScoped": true
           },
@@ -985,6 +932,7 @@
             "wireProtocolId": "anthropic_messages",
             "sdkAdapterId": null,
             "transport": "https",
+            "integrationKind": "direct",
             "userSelectable": true,
             "processScoped": true
           }
@@ -1037,6 +985,7 @@
             "wireProtocolId": "openai_chat_completions",
             "sdkAdapterId": null,
             "transport": "https",
+            "integrationKind": "direct",
             "userSelectable": false,
             "processScoped": true
           }
@@ -1045,27 +994,6 @@
         "sourceEvidenceReference": "research/acp-agent/qwen-code@0.18.4",
         "smokeId": "agent-provider-qwen-code",
         "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
-      },
-      {
-        "agentId": "sigit",
-        "catalogVersion": "1.0.3",
-        "adapterId": "sigit-acp",
-        "descriptorId": "projection_sigit_runtime_v1",
-        "descriptorVersion": "1",
-        "versionPolicy": {
-          "kind": "exact"
-        },
-        "capabilityMode": "local_model",
-        "runtimeHomeStrategy": "vibex_private",
-        "switchBehavior": "restart_fresh_and_bridge",
-        "credentialKinds": [
-          "local"
-        ],
-        "modelInterfaces": [],
-        "evidenceState": "local",
-        "sourceEvidenceReference": "research/acp-agent/sigit@1.0.3",
-        "smokeId": "agent-provider-sigit",
-        "capabilityDiagnosticCode": null
       },
       {
         "agentId": "stakpak",
@@ -1088,6 +1016,7 @@
             "wireProtocolId": "openai_chat_completions",
             "sdkAdapterId": null,
             "transport": "https",
+            "integrationKind": "direct",
             "userSelectable": false,
             "processScoped": true
           }
@@ -1118,6 +1047,7 @@
             "wireProtocolId": "openai_chat_completions",
             "sdkAdapterId": null,
             "transport": "https",
+            "integrationKind": "direct",
             "userSelectable": false,
             "processScoped": true
           }
@@ -1258,41 +1188,6 @@
       "recordedAt": null
     },
     {
-      "agentId": "agoragentic-acp",
-      "smokeId": "agent-provider-agoragentic-acp",
-      "catalogVersion": "1.3.3",
-      "descriptorId": "projection_agoragentic_acp_runtime_v1",
-      "descriptorVersion": "1",
-      "versionPolicy": "exact",
-      "capabilityMode": "service_marketplace",
-      "switchBehavior": "agent_managed",
-      "status": "blocked",
-      "execution": "not_run",
-      "diagnosticCode": "operator_prerequisites_unavailable",
-      "detectedIdentity": null,
-      "descriptorMatch": "not_checked",
-      "projectionFingerprint": null,
-      "facts": {
-        "binaryIdentity": "blocked",
-        "acpHandshake": "blocked",
-        "authentication": "blocked",
-        "session": "blocked",
-        "modelCatalog": "blocked",
-        "modelSelection": "blocked",
-        "providerProjection": "blocked",
-        "sessionResume": "blocked",
-        "switchCompatibility": "blocked",
-        "redaction": "blocked"
-      },
-      "redactionPassed": false,
-      "sourceSurvivedPrepareFailure": false,
-      "providerVerified": false,
-      "liveSwitchVerified": false,
-      "binaryOnlyVerified": false,
-      "sourceEvidenceReference": "research/acp-agent/agoragentic-acp@1.3.3",
-      "recordedAt": null
-    },
-    {
       "agentId": "amp-acp",
       "smokeId": "agent-provider-amp-acp",
       "catalogVersion": "0.7.0",
@@ -1360,41 +1255,6 @@
       "liveSwitchVerified": false,
       "binaryOnlyVerified": false,
       "sourceEvidenceReference": "research/acp-agent/auggie@0.30.0",
-      "recordedAt": null
-    },
-    {
-      "agentId": "autohand",
-      "smokeId": "agent-provider-autohand",
-      "catalogVersion": "0.2.1",
-      "descriptorId": "projection_autohand_runtime_v1",
-      "descriptorVersion": "1",
-      "versionPolicy": "exact",
-      "capabilityMode": "replaceable_provider",
-      "switchBehavior": "unverified",
-      "status": "blocked",
-      "execution": "not_run",
-      "diagnosticCode": "agent_projection_typed_projector_not_implemented",
-      "detectedIdentity": null,
-      "descriptorMatch": "not_checked",
-      "projectionFingerprint": null,
-      "facts": {
-        "binaryIdentity": "blocked",
-        "acpHandshake": "blocked",
-        "authentication": "blocked",
-        "session": "blocked",
-        "modelCatalog": "blocked",
-        "modelSelection": "blocked",
-        "providerProjection": "blocked",
-        "sessionResume": "blocked",
-        "switchCompatibility": "blocked",
-        "redaction": "blocked"
-      },
-      "redactionPassed": false,
-      "sourceSurvivedPrepareFailure": false,
-      "providerVerified": false,
-      "liveSwitchVerified": false,
-      "binaryOnlyVerified": false,
-      "sourceEvidenceReference": "research/acp-agent/autohand@0.2.1",
       "recordedAt": null
     },
     {
@@ -1535,41 +1395,6 @@
       "liveSwitchVerified": false,
       "binaryOnlyVerified": false,
       "sourceEvidenceReference": "research/acp-agent/codewhale@0.8.55",
-      "recordedAt": null
-    },
-    {
-      "agentId": "cortex-code",
-      "smokeId": "agent-provider-cortex-code",
-      "catalogVersion": "1.0.73",
-      "descriptorId": "projection_cortex_code_runtime_v1",
-      "descriptorVersion": "1",
-      "versionPolicy": "exact",
-      "capabilityMode": "cloud_credential",
-      "switchBehavior": "restart_and_resume",
-      "status": "blocked",
-      "execution": "not_run",
-      "diagnosticCode": "operator_prerequisites_unavailable",
-      "detectedIdentity": null,
-      "descriptorMatch": "not_checked",
-      "projectionFingerprint": null,
-      "facts": {
-        "binaryIdentity": "blocked",
-        "acpHandshake": "blocked",
-        "authentication": "blocked",
-        "session": "blocked",
-        "modelCatalog": "blocked",
-        "modelSelection": "blocked",
-        "providerProjection": "blocked",
-        "sessionResume": "blocked",
-        "switchCompatibility": "blocked",
-        "redaction": "blocked"
-      },
-      "redactionPassed": false,
-      "sourceSurvivedPrepareFailure": false,
-      "providerVerified": false,
-      "liveSwitchVerified": false,
-      "binaryOnlyVerified": false,
-      "sourceEvidenceReference": "research/acp-agent/cortex-code@1.0.73",
       "recordedAt": null
     },
     {
@@ -1818,48 +1643,13 @@
       "recordedAt": null
     },
     {
-      "agentId": "fast-agent",
-      "smokeId": "agent-provider-fast-agent",
-      "catalogVersion": "0.7.21",
-      "descriptorId": "projection_fast_agent_runtime_v1",
-      "descriptorVersion": "1",
-      "versionPolicy": "detected_semver",
-      "capabilityMode": "replaceable_provider",
-      "switchBehavior": "restart_and_resume",
-      "status": "blocked",
-      "execution": "not_run",
-      "diagnosticCode": "operator_prerequisites_unavailable",
-      "detectedIdentity": null,
-      "descriptorMatch": "not_checked",
-      "projectionFingerprint": null,
-      "facts": {
-        "binaryIdentity": "blocked",
-        "acpHandshake": "blocked",
-        "authentication": "blocked",
-        "session": "blocked",
-        "modelCatalog": "blocked",
-        "modelSelection": "blocked",
-        "providerProjection": "blocked",
-        "sessionResume": "blocked",
-        "switchCompatibility": "blocked",
-        "redaction": "blocked"
-      },
-      "redactionPassed": false,
-      "sourceSurvivedPrepareFailure": false,
-      "providerVerified": false,
-      "liveSwitchVerified": false,
-      "binaryOnlyVerified": false,
-      "sourceEvidenceReference": "research/acp-agent/fast-agent@0.7.21",
-      "recordedAt": null
-    },
-    {
       "agentId": "gemini",
       "smokeId": "agent-provider-gemini",
       "catalogVersion": "0.47.0",
       "descriptorId": "projection_gemini_runtime_v1",
       "descriptorVersion": "1",
-      "versionPolicy": "exact",
-      "capabilityMode": "cloud_credential",
+      "versionPolicy": "detected_semver",
+      "capabilityMode": "replaceable_provider",
       "switchBehavior": "restart_and_resume",
       "status": "blocked",
       "execution": "not_run",
@@ -2413,41 +2203,6 @@
       "recordedAt": null
     },
     {
-      "agentId": "sigit",
-      "smokeId": "agent-provider-sigit",
-      "catalogVersion": "1.0.3",
-      "descriptorId": "projection_sigit_runtime_v1",
-      "descriptorVersion": "1",
-      "versionPolicy": "exact",
-      "capabilityMode": "local_model",
-      "switchBehavior": "restart_fresh_and_bridge",
-      "status": "blocked",
-      "execution": "not_run",
-      "diagnosticCode": "operator_prerequisites_unavailable",
-      "detectedIdentity": null,
-      "descriptorMatch": "not_checked",
-      "projectionFingerprint": null,
-      "facts": {
-        "binaryIdentity": "blocked",
-        "acpHandshake": "blocked",
-        "authentication": "blocked",
-        "session": "blocked",
-        "modelCatalog": "blocked",
-        "modelSelection": "blocked",
-        "providerProjection": "blocked",
-        "sessionResume": "blocked",
-        "switchCompatibility": "blocked",
-        "redaction": "blocked"
-      },
-      "redactionPassed": false,
-      "sourceSurvivedPrepareFailure": false,
-      "providerVerified": false,
-      "liveSwitchVerified": false,
-      "binaryOnlyVerified": false,
-      "sourceEvidenceReference": "research/acp-agent/sigit@1.0.3",
-      "recordedAt": null
-    },
-    {
       "agentId": "stakpak",
       "smokeId": "agent-provider-stakpak",
       "catalogVersion": "0.3.80",
@@ -2577,8 +2332,8 @@
     "absolutePathPersisted": false
   },
   "summary": {
-    "totalAgents": 39,
-    "blockedRealSmokes": 39,
+    "totalAgents": 34,
+    "blockedRealSmokes": 34,
     "passedRealSmokes": 0,
     "providerVerifiedAgents": 0,
     "liveSwitchVerifiedAgents": 0,

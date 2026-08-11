@@ -2075,7 +2075,6 @@ mod tests {
         for (agent_id, expected_version) in [
             ("dirac", "0.4.1"),
             ("factory-droid", "0.153.1"),
-            ("fast-agent", "0.7.21"),
             ("pi", "0.0.33"),
             ("qwen-code", "0.18.4"),
         ] {

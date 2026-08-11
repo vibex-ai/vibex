@@ -259,12 +259,10 @@ fn at_least_or_manual(version: &str) -> (AgentVersionPolicy, AgentVersionCompati
 
 fn mode_for(agent_id: &str) -> AgentProviderCapabilityMode {
     match agent_id {
-        "agoragentic-acp" => AgentProviderCapabilityMode::ServiceMarketplace,
-        "sigit" => AgentProviderCapabilityMode::LocalModel,
         "amp-acp" | "auggie" | "cursor" | "devin" | "junie" | "qoder" => {
             AgentProviderCapabilityMode::AgentManaged
         }
-        "cortex-code" | "kiro" => AgentProviderCapabilityMode::CloudCredential,
+        "kiro" => AgentProviderCapabilityMode::CloudCredential,
         _ => AgentProviderCapabilityMode::ReplaceableProvider,
     }
 }
@@ -348,11 +346,6 @@ fn catalog_projection_shape(
                 "CODEWHALE_BASE_URL",
                 "OPENAI_API_KEY",
                 "CODEWHALE_MODEL",
-            )),
-            "fast-agent" => Ok(environment_projection_shape(
-                "GENERIC_BASE_URL",
-                "GENERIC_API_KEY",
-                "FAST_AGENT_MODEL",
             )),
             "kimi" => Ok(environment_projection_shape_with_interfaces(
                 "KIMI_MODEL_BASE_URL",
@@ -482,28 +475,6 @@ fn catalog_projection_shape(
     }
 
     Ok(match mode {
-        AgentProviderCapabilityMode::ServiceMarketplace => CatalogProjectionShape {
-            provider_control: AgentProviderControl::ServiceMarketplace,
-            credential_control: AgentCredentialControl::ServiceMarketplace,
-            model_control: AgentModelControl::ServiceMarketplace,
-            credential_kinds: vec![AgentCredentialKind::ManagedSubscription],
-            model_interfaces: Vec::new(),
-            runtime_home_strategy: AgentRuntimeHomeStrategy::AgentManaged,
-            switch_behavior: ProviderSwitchBehavior::AgentManaged,
-            evidence_state: ProjectionEvidenceState::ServiceMarketplace,
-            capability_diagnostic_code: None,
-        },
-        AgentProviderCapabilityMode::LocalModel => CatalogProjectionShape {
-            provider_control: AgentProviderControl::LocalModel,
-            credential_control: AgentCredentialControl::Local,
-            model_control: AgentModelControl::LocalModel,
-            credential_kinds: vec![AgentCredentialKind::Local],
-            model_interfaces: Vec::new(),
-            runtime_home_strategy: AgentRuntimeHomeStrategy::VibexPrivate,
-            switch_behavior: ProviderSwitchBehavior::RestartFreshAndBridge,
-            evidence_state: ProjectionEvidenceState::Local,
-            capability_diagnostic_code: None,
-        },
         AgentProviderCapabilityMode::AgentManaged => CatalogProjectionShape {
             provider_control: AgentProviderControl::AgentManaged,
             credential_control: AgentCredentialControl::OAuthAgentManaged,
@@ -520,12 +491,6 @@ fn catalog_projection_shape(
         },
         AgentProviderCapabilityMode::CloudCredential => {
             let (credential_control, credential_kinds) = match agent_id {
-                "cortex-code" => (
-                    AgentCredentialControl::AdvertisedAuthMethod {
-                        method_ids: vec!["snowflake_connection".to_string(), "oauth".to_string()],
-                    },
-                    vec![AgentCredentialKind::Snowflake, AgentCredentialKind::OAuth],
-                ),
                 "kiro" => (
                     AgentCredentialControl::AdvertisedAuthMethod {
                         method_ids: vec!["agent_login".to_string(), "aws_chain".to_string()],
@@ -554,6 +519,13 @@ fn catalog_projection_shape(
                 evidence_state: ProjectionEvidenceState::Documented,
                 capability_diagnostic_code: Some("agent_projection_runtime_verification_required"),
             }
+        }
+        AgentProviderCapabilityMode::LocalModel
+        | AgentProviderCapabilityMode::ServiceMarketplace => {
+            return Err(VibexError::validation(
+                "agent_rollout_legacy_capability_mode",
+                "legacy Agent capability modes are no longer supported",
+            ));
         }
         AgentProviderCapabilityMode::Unsupported => CatalogProjectionShape {
             provider_control: AgentProviderControl::Unsupported,
@@ -653,7 +625,6 @@ fn catalog_interface(
 
 fn conservative_replaceable_shape(agent_id: &str) -> VibexResult<CatalogProjectionShape> {
     let diagnostic = match agent_id {
-        "autohand" => "agent_projection_typed_projector_not_implemented",
         "cline" | "dimcode" | "minion-code" | "nova" => {
             "agent_projection_auth_boundary_not_runtime_verified"
         }
@@ -777,10 +748,11 @@ pub fn validate_rollout_manifest(entries: &[AgentProviderRolloutManifestEntry]) 
         .iter()
         .map(|entry| entry.agent_id.as_str())
         .collect::<BTreeSet<_>>();
-    if entries.len() != 39 || actual.len() != entries.len() {
+    let expected_count = acp_agent_catalog_entries().len() + 3;
+    if entries.len() != expected_count || actual.len() != entries.len() {
         return Err(VibexError::conflict(
             "agent_rollout_manifest_coverage_invalid",
-            "rollout manifest must contain exactly 39 unique Agent ids",
+            format!("rollout manifest must contain exactly {expected_count} unique Agent ids"),
         ));
     }
     let catalog_actual = actual
@@ -1309,17 +1281,7 @@ mod tests {
     fn manifest_has_exact_catalog_coverage_and_unique_routes() {
         let manifest = agent_provider_rollout_manifest().unwrap();
         validate_rollout_manifest(&manifest).unwrap();
-        assert_eq!(manifest.len(), 39);
-        assert!(
-            manifest
-                .iter()
-                .any(|entry| entry.agent_id.as_str() == "agoragentic-acp")
-        );
-        assert!(
-            manifest
-                .iter()
-                .any(|entry| entry.agent_id.as_str() == "sigit")
-        );
+        assert_eq!(manifest.len(), 34);
         assert!(manifest.iter().any(|entry| entry.agent_id.as_str() == "pi"));
         assert!(
             manifest
@@ -1605,7 +1567,6 @@ mod tests {
             "crow-cli",
             "dirac",
             "factory-droid",
-            "fast-agent",
             "gemini",
             "goose",
             "grok",
@@ -1619,16 +1580,9 @@ mod tests {
             "stakpak",
             "vtcode",
         ];
-        let blocked_projectors = [
-            "autohand",
-            "cline",
-            "deepagents",
-            "dimcode",
-            "minion-code",
-            "nova",
-        ];
-        assert_eq!(typed_projectors.len(), 18);
-        assert_eq!(blocked_projectors.len(), 6);
+        let blocked_projectors = ["cline", "deepagents", "dimcode", "minion-code", "nova"];
+        assert_eq!(typed_projectors.len(), 17);
+        assert_eq!(blocked_projectors.len(), 5);
 
         for descriptor in descriptors
             .iter()
@@ -1740,7 +1694,7 @@ mod tests {
                 "{agent_id} has a typed model-provider projector"
             );
         }
-        for agent_id in ["sigit", "agoragentic-acp", "cline"] {
+        for agent_id in ["cline"] {
             assert!(
                 !supported.contains(&AgentId::parse(agent_id).unwrap()),
                 "{agent_id} must not expose model-provider configuration"
@@ -1807,7 +1761,7 @@ mod tests {
         let mut descriptor = catalog_projection_descriptors()
             .unwrap()
             .into_iter()
-            .find(|descriptor| descriptor.route.agent_id.as_str() == "autohand")
+            .find(|descriptor| descriptor.route.agent_id.as_str() == "cline")
             .unwrap();
         descriptor.evidence.diagnostic_code = None;
         assert_eq!(
@@ -1816,7 +1770,7 @@ mod tests {
         );
 
         descriptor.evidence.diagnostic_code =
-            Some("agent_projection_typed_projector_not_implemented".to_string());
+            Some("agent_projection_auth_boundary_not_runtime_verified".to_string());
         descriptor
             .credential_kinds
             .push(AgentCredentialKind::ApiKey);

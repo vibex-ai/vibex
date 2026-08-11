@@ -51,14 +51,6 @@ impl AcpAgentCatalogEntry {
 
 const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
     AcpAgentCatalogEntry::new(
-        "agoragentic-acp",
-        "Agoragentic",
-        "Agent marketplace with 174+ AI capabilities. Browse, invoke, and pay for agent services settled in USDC on Base L2.",
-        "1.3.6",
-        "https://agoragentic.com",
-        &["npx", "-y", "agoragentic-mcp@1.3.6", "--acp"],
-    ),
-    AcpAgentCatalogEntry::new(
         "amp-acp",
         "Amp",
         "ACP wrapper for Amp - the frontier coding agent",
@@ -75,14 +67,6 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         &["npx", "-y", "@augmentcode/auggie@0.30.0", "--acp"],
     )
     .with_env(&[("AUGMENT_DISABLE_AUTO_UPDATE", "1")]),
-    AcpAgentCatalogEntry::new(
-        "autohand",
-        "Autohand Code",
-        "Autohand Code - AI coding agent powered by Autohand AI",
-        "0.2.1",
-        "https://www.autohand.ai/cli/",
-        &["npx", "-y", "@autohandai/autohand-acp@0.2.1"],
-    ),
     AcpAgentCatalogEntry::new(
         "cline",
         "Cline",
@@ -119,14 +103,6 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "0.8.55",
         "https://codewhale.net/",
         &["codewhale", "serve", "--acp"],
-    ),
-    AcpAgentCatalogEntry::new(
-        "cortex-code",
-        "Cortex Code",
-        "Snowflake's Cortex Code coding agent",
-        "1.0.73",
-        "https://docs.snowflake.com/en/user-guide/cortex-code/cortex-code-cli",
-        &["cortex", "acp", "serve"],
     ),
     AcpAgentCatalogEntry::new(
         "crow-cli",
@@ -196,21 +172,6 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         ("FACTORY_DROID_AUTO_UPDATE_ENABLED", "false"),
     ])
     .without_mcp_server_support(),
-    AcpAgentCatalogEntry::new(
-        "fast-agent",
-        "fast-agent",
-        "Code and build agents with comprehensive multi-provider support",
-        "0.10.4",
-        "https://fast-agent.ai/acp/",
-        &[
-            "uvx",
-            "--prerelease=allow",
-            "--from",
-            "fast-agent-mcp==0.10.4",
-            "fast-agent-acp",
-            "-x",
-        ],
-    ),
     AcpAgentCatalogEntry::new(
         "gemini",
         "Gemini CLI",
@@ -353,14 +314,6 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         ],
     ),
     AcpAgentCatalogEntry::new(
-        "sigit",
-        "siGit Code",
-        "Local-first coding agent. Runs entirely on your machine with optional on-device LLM inference via Onde.",
-        "1.0.3",
-        "https://github.com/getsigit/sigit",
-        &["sigit"],
-    ),
-    AcpAgentCatalogEntry::new(
         "stakpak",
         "Stakpak",
         "Open-source DevOps agent in Rust with enterprise-grade security",
@@ -392,7 +345,7 @@ mod tests {
     #[test]
     fn catalog_ids_and_presets_are_unique_and_commands_are_complete() {
         let entries = acp_agent_catalog_entries();
-        assert_eq!(entries.len(), 36);
+        assert_eq!(entries.len(), 31);
 
         let ids = entries
             .iter()
@@ -416,31 +369,6 @@ mod tests {
         let pi = entries.iter().find(|entry| entry.id == "pi").unwrap();
         assert_eq!(pi.version, "0.0.33");
         assert_eq!(pi.command, &["npx", "-y", "pi-acp@0.0.33"]);
-        let agoragentic = entries
-            .iter()
-            .find(|entry| entry.id == "agoragentic-acp")
-            .unwrap();
-        assert_eq!(agoragentic.version, "1.3.6");
-        assert_eq!(
-            agoragentic.command,
-            &["npx", "-y", "agoragentic-mcp@1.3.6", "--acp"]
-        );
-        let fast_agent = entries
-            .iter()
-            .find(|entry| entry.id == "fast-agent")
-            .unwrap();
-        assert_eq!(fast_agent.version, "0.10.4");
-        assert_eq!(
-            fast_agent.command,
-            &[
-                "uvx",
-                "--prerelease=allow",
-                "--from",
-                "fast-agent-mcp==0.10.4",
-                "fast-agent-acp",
-                "-x"
-            ]
-        );
         assert!(!entries.iter().any(|entry| entry.id == "corust-agent"));
     }
 }

@@ -435,9 +435,9 @@ impl AgentSnapshotEntry {
 
 /// Maps Vibex's stable Agent ids onto managed ACP identities.
 ///
-/// Most ids are upstream ACP Registry identities. Agoragentic, CodeWhale,
-/// fast-agent, Hermes, and Kiro use Vibex-owned latest-channel distributions
-/// when their Registry entry is absent, stale, or not directly executable.
+/// Most ids are upstream ACP Registry identities. CodeWhale, Hermes, and Kiro
+/// use Vibex-owned latest-channel distributions when their Registry entry is
+/// absent, stale, or not directly executable.
 pub fn acp_registry_agent_id(agent_id: &AgentId) -> Option<&'static str> {
     match agent_id.as_str() {
         "claude" => return Some("claude-acp"),
@@ -679,17 +679,14 @@ mod tests {
             .map(|definition| definition.id.as_str())
             .collect::<std::collections::BTreeSet<_>>();
         let expected = [
-            "agoragentic-acp",
             "amp-acp",
             "auggie",
-            "autohand",
             "claude",
             "cline",
             "codebuddy-code",
             "codex",
             "codewhale",
             "copilot",
-            "cortex-code",
             "crow-cli",
             "cursor",
             "deepagents",
@@ -697,7 +694,6 @@ mod tests {
             "dimcode",
             "dirac",
             "factory-droid",
-            "fast-agent",
             "gemini",
             "glm-acp-agent",
             "goose",
@@ -715,7 +711,6 @@ mod tests {
             "poolside",
             "qoder",
             "qwen-code",
-            "sigit",
             "stakpak",
             "vtcode",
         ]
@@ -730,17 +725,6 @@ mod tests {
         let definitions = builtin_agent_definitions();
         for (agent_id, command, args) in [
             ("glm-acp-agent", "npx", &["-y", "glm-acp-agent@1.1.4"][..]),
-            (
-                "fast-agent",
-                "uvx",
-                &[
-                    "--prerelease=allow",
-                    "--from",
-                    "fast-agent-mcp==0.10.4",
-                    "fast-agent-acp",
-                    "-x",
-                ][..],
-            ),
             ("cursor", "cursor-agent", &["acp"][..]),
         ] {
             let definition = definitions
@@ -797,28 +781,14 @@ mod tests {
             Some(registry_uvx_managed),
             "{registry_uvx_managed} must use its Registry uvx distribution"
         );
-        for managed in [
-            "cortex-code",
-            "crow-cli",
-            "cursor",
-            "devin",
-            "junie",
-            "stakpak",
-            "vtcode",
-        ] {
+        for managed in ["crow-cli", "cursor", "devin", "junie", "stakpak", "vtcode"] {
             assert_eq!(
                 acp_registry_agent_id(&AgentId::parse(managed).unwrap()),
                 Some(managed),
                 "{managed} must use its Registry binary distribution"
             );
         }
-        for latest_managed in [
-            "agoragentic-acp",
-            "codewhale",
-            "fast-agent",
-            "hermes",
-            "kiro",
-        ] {
+        for latest_managed in ["codewhale", "hermes", "kiro"] {
             assert_eq!(
                 acp_registry_agent_id(&AgentId::parse(latest_managed).unwrap()),
                 Some(latest_managed),
@@ -860,13 +830,7 @@ mod tests {
             pi.managed_install.status,
             AgentManagedInstallStatus::NotInstalled
         );
-        for agent_id in [
-            "agoragentic-acp",
-            "codewhale",
-            "fast-agent",
-            "hermes",
-            "kiro",
-        ] {
+        for agent_id in ["codewhale", "hermes", "kiro"] {
             let definition = definitions
                 .iter()
                 .find(|definition| definition.id.as_str() == agent_id)
