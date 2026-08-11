@@ -19691,6 +19691,13 @@ for line in sys.stdin:
                 "failure_rpc",
                 AgentAuthStatus::Unknown,
             ),
+            (
+                "poolside-known-auth",
+                "poolside",
+                "acp",
+                "success",
+                AgentAuthStatus::Unknown,
+            ),
         ] {
             let agent_id = AgentId::parse(agent).unwrap();
             let Some(fixture) = MockAcpFixture::create_for_agent(label, Some(agent_id.clone()))

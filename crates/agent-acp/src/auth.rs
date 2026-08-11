@@ -20,6 +20,7 @@ const AUTH_TERMINAL_ENV_LIMIT: usize = 64;
 const AUTH_TERMINAL_ARG_TEXT_LIMIT: usize = 4096;
 const AUTH_TERMINAL_ENV_VALUE_LIMIT: usize = 16 * 1024;
 const AUTH_TERMINAL_COMMAND_LIMIT: usize = 4096;
+const CODEWHALE_TERMINAL_AUTH_METHOD_ID: &str = "codewhale-terminal-auth";
 const KNOWN_TERMINAL_LOGIN_METHOD_ID: &str = "vibex-cli-login";
 const PI_TERMINAL_LOGIN_METHOD_ID: &str = "pi_terminal_login";
 
@@ -123,10 +124,15 @@ pub(crate) fn parse_initialize_auth_catalog(
                 )
             }
             SchemaAuthMethod::Terminal(method) => {
+                let Some(terminal_base_args) =
+                    first_class_terminal_auth_base_args(&agent_id, &id, base_args)
+                else {
+                    continue;
+                };
                 let terminal = standard_terminal_spec(
                     &name,
                     command,
-                    base_args,
+                    terminal_base_args,
                     base_env,
                     method.args,
                     method.env.into_iter().collect(),
@@ -212,6 +218,12 @@ pub(crate) fn append_known_terminal_auth_fallback(
             Vec::new(),
             "Sign in to Kiro CLI",
             "Open the Kiro CLI login flow in a terminal.",
+        ),
+        "poolside" => (
+            Some("acp"),
+            Vec::new(),
+            "Sign in to Poolside CLI",
+            "Open the Poolside CLI login flow in a terminal.",
         ),
         "pi" => (
             None,
@@ -312,6 +324,20 @@ fn valid_method_id(value: &str) -> bool {
         && !value.chars().any(char::is_control)
 }
 
+fn first_class_terminal_auth_base_args<'a>(
+    agent_id: &AgentId,
+    method_id: &str,
+    base_args: &'a [String],
+) -> Option<&'a [String]> {
+    if agent_id.as_str() != "codewhale" || method_id != CODEWHALE_TERMINAL_AUTH_METHOD_ID {
+        return Some(base_args);
+    }
+
+    let prefix_len = base_args.len().checked_sub(2)?;
+    (base_args[prefix_len] == "serve" && base_args[prefix_len + 1] == "--acp")
+        .then_some(&base_args[..prefix_len])
+}
+
 fn standard_terminal_spec(
     title: &str,
     command: &str,
@@ -368,13 +394,25 @@ mod tests {
 
     #[test]
     fn known_cli_login_fallbacks_replace_the_acp_mode_argument() {
-        for (agent_id, base_args, expected_args) in [
+        for (agent_id, base_args, expected_title, expected_args) in [
             (
                 "auggie",
                 vec!["/managed/augment.mjs".to_string(), "--acp".to_string()],
+                "Sign in to Augment CLI",
                 vec!["/managed/augment.mjs".to_string(), "login".to_string()],
             ),
-            ("kiro", vec!["acp".to_string()], vec!["login".to_string()]),
+            (
+                "kiro",
+                vec!["acp".to_string()],
+                "Sign in to Kiro CLI",
+                vec!["login".to_string()],
+            ),
+            (
+                "poolside",
+                vec!["acp".to_string()],
+                "Sign in to Poolside CLI",
+                vec!["login".to_string()],
+            ),
         ] {
             let agent_id = AgentId::parse(agent_id).unwrap();
             let mut parsed = parse_initialize_auth_catalog(
@@ -398,6 +436,15 @@ mod tests {
             assert_eq!(
                 parsed.catalog.methods[0].kind,
                 AgentAuthMethodKind::Terminal
+            );
+            assert_eq!(parsed.catalog.methods[0].name, expected_title);
+            assert_eq!(
+                parsed
+                    .terminal_methods
+                    .get(KNOWN_TERMINAL_LOGIN_METHOD_ID)
+                    .unwrap()
+                    .title,
+                expected_title
             );
             assert_eq!(
                 parsed
@@ -447,25 +494,27 @@ mod tests {
 
     #[test]
     fn known_cli_login_fallbacks_fail_closed_for_unexpected_commands() {
-        let agent_id = AgentId::parse("kiro").unwrap();
-        let mut parsed = parse_initialize_auth_catalog(
-            agent_id.clone(),
-            &json!({ "protocolVersion": 1, "authMethods": [] }),
-            "/managed/kiro-cli",
-            &["serve".to_string()],
-            &[],
-            None,
-        );
+        for agent in ["kiro", "poolside"] {
+            let agent_id = AgentId::parse(agent).unwrap();
+            let mut parsed = parse_initialize_auth_catalog(
+                agent_id.clone(),
+                &json!({ "protocolVersion": 1, "authMethods": [] }),
+                "/managed/agent-cli",
+                &["serve".to_string()],
+                &[],
+                None,
+            );
 
-        assert!(!append_known_terminal_auth_fallback(
-            &mut parsed,
-            &agent_id,
-            "/managed/kiro-cli",
-            &["serve".to_string()],
-            &[],
-            None,
-        ));
-        assert!(parsed.catalog.methods.is_empty());
+            assert!(!append_known_terminal_auth_fallback(
+                &mut parsed,
+                &agent_id,
+                "/managed/agent-cli",
+                &["serve".to_string()],
+                &[],
+                None,
+            ));
+            assert!(parsed.catalog.methods.is_empty());
+        }
     }
 
     #[test]
@@ -532,6 +581,85 @@ mod tests {
                 ("AUTH_TOKEN".to_string(), "never-render-me".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn codewhale_terminal_auth_replaces_the_acp_mode_and_preserves_launcher_prefixes() {
+        for (command, base_args, expected_args) in [
+            (
+                "codewhale",
+                vec!["serve".to_string(), "--acp".to_string()],
+                vec![
+                    "auth".to_string(),
+                    "set".to_string(),
+                    "--provider".to_string(),
+                    "deepseek".to_string(),
+                ],
+            ),
+            (
+                "/usr/bin/node",
+                vec![
+                    "/managed/codewhale.js".to_string(),
+                    "serve".to_string(),
+                    "--acp".to_string(),
+                ],
+                vec![
+                    "/managed/codewhale.js".to_string(),
+                    "auth".to_string(),
+                    "set".to_string(),
+                    "--provider".to_string(),
+                    "deepseek".to_string(),
+                ],
+            ),
+        ] {
+            let parsed = parse_initialize_auth_catalog(
+                AgentId::parse("codewhale").unwrap(),
+                &json!({
+                    "authMethods": [{
+                        "id": CODEWHALE_TERMINAL_AUTH_METHOD_ID,
+                        "name": "Set Codewhale API key",
+                        "type": "terminal",
+                        "args": ["auth", "set", "--provider", "deepseek"]
+                    }]
+                }),
+                command,
+                &base_args,
+                &[(
+                    "CODEWHALE_HOME".to_string(),
+                    "/private/codewhale".to_string(),
+                )],
+                Some("/workspace".to_string()),
+            );
+
+            let terminal = parsed
+                .terminal_methods
+                .get(CODEWHALE_TERMINAL_AUTH_METHOD_ID)
+                .expect("CodeWhale terminal auth should remain available");
+            assert_eq!(terminal.args, expected_args);
+            assert_eq!(terminal.env[0].0, "CODEWHALE_HOME");
+        }
+    }
+
+    #[test]
+    fn codewhale_terminal_auth_fails_closed_for_an_unknown_acp_launch_shape() {
+        let parsed = parse_initialize_auth_catalog(
+            AgentId::parse("codewhale").unwrap(),
+            &json!({
+                "authMethods": [{
+                    "id": CODEWHALE_TERMINAL_AUTH_METHOD_ID,
+                    "name": "Set Codewhale API key",
+                    "type": "terminal",
+                    "args": ["auth", "set", "--provider", "deepseek"]
+                }]
+            }),
+            "codewhale",
+            &["unexpected-acp-mode".to_string()],
+            &[],
+            None,
+        );
+
+        assert!(parsed.catalog.methods.is_empty());
+        assert!(parsed.terminal_methods.is_empty());
     }
 
     #[test]

@@ -2568,7 +2568,13 @@ logout({})
 
 - `AgentAuthCatalog` is rebuilt from the selected Agent's actual
   `initialize.authMethods`; static provider tables may supply defaults for
-  command/profile setup but never invent the visible method list.
+  command/profile setup but never invent the visible method list. A narrow
+  compatibility fallback may append a documented CLI terminal-login method
+  when an Agent omits it, but only when both the exact Agent id and configured
+  launch shape match. Auggie, Kiro, and Poolside replace their trailing ACP
+  mode with `login`; Pi preserves its launcher prefix and appends
+  `--terminal-login`. Every fallback preserves the resolved
+  command/environment/cwd and remains hidden without a terminal host.
 - Method ids remain exact and are bounded, deduplicated, and checked against
   the same initialize result before `authenticate` is sent. Unknown method
   shapes are ignored or conservatively treated as Agent-owned methods by the
@@ -2577,6 +2583,11 @@ logout({})
   an ACP Provider Profile, save each exact advertised key, then call
   `authenticate` with that Profile's projected environment. Terminal methods
   use the shared PTY host and return a redacted `TerminalAuthActionDescriptor`.
+  CodeWhale's verified `codewhale-terminal-auth` method replaces the trailing
+  `serve --acp` launch mode with its advertised `auth set --provider ...`
+  arguments while preserving any managed launcher prefix such as
+  `node <script>`; an unexpected launch shape fails closed instead of appending
+  auth arguments to the ACP server command.
 - `supports_logout` is true only when `agentCapabilities.auth.logout` is an
   object. Logout is optional and must be rejected as an unsupported capability
   when the Agent did not advertise it.
@@ -2652,7 +2663,9 @@ logout({})
 ### 6. Tests Required
 
 - `cargo test -p vibex-agent-acp auth::tests --locked` covers method parsing,
-  bounds, exact ids, logout capability, and terminal-value redaction.
+  bounds, exact ids, logout capability, terminal-value redaction, the
+  fail-closed Auggie/Kiro/Poolside/Pi CLI login mappings, and CodeWhale
+  terminal auth argument replacement across direct and managed launchers.
 - `cargo test -p vibex-agent-acp agent_auth_methods_authenticate_terminal_and_logout_round_trip --locked`
   covers all method kinds and exact wire calls.
 - `cargo test -p vibex-agent-acp hanging_agent_authentication_can_be_cancelled_without_blocking_and_restarted --locked`
