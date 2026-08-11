@@ -21,6 +21,7 @@ const AUTH_TERMINAL_ARG_TEXT_LIMIT: usize = 4096;
 const AUTH_TERMINAL_ENV_VALUE_LIMIT: usize = 16 * 1024;
 const AUTH_TERMINAL_COMMAND_LIMIT: usize = 4096;
 const KNOWN_TERMINAL_LOGIN_METHOD_ID: &str = "vibex-cli-login";
+const PI_TERMINAL_LOGIN_METHOD_ID: &str = "pi_terminal_login";
 
 #[derive(Clone)]
 pub(crate) struct AcpTerminalAuthSpec {
@@ -186,48 +187,63 @@ pub(crate) fn append_known_terminal_auth_fallback(
     base_env: &[(String, String)],
     cwd: Option<String>,
 ) -> bool {
+    let method_id = if agent_id.as_str() == "pi" {
+        PI_TERMINAL_LOGIN_METHOD_ID
+    } else {
+        KNOWN_TERMINAL_LOGIN_METHOD_ID
+    };
     if parsed
         .catalog
         .methods
         .iter()
-        .any(|method| method.id == KNOWN_TERMINAL_LOGIN_METHOD_ID)
+        .any(|method| method.id == method_id)
     {
         return false;
     }
-    let (acp_mode, title, description) = match agent_id.as_str() {
+    let (acp_mode, terminal_args, title, description) = match agent_id.as_str() {
         "auggie" => (
-            "--acp",
+            Some("--acp"),
+            Vec::new(),
             "Sign in to Augment CLI",
             "Open the Augment CLI login flow in a terminal.",
         ),
         "kiro" => (
-            "acp",
+            Some("acp"),
+            Vec::new(),
             "Sign in to Kiro CLI",
             "Open the Kiro CLI login flow in a terminal.",
+        ),
+        "pi" => (
+            None,
+            vec!["--terminal-login".to_string()],
+            "Launch pi in the terminal",
+            "Start pi in an interactive terminal to configure API keys or login.",
         ),
         _ => return false,
     };
     let mut login_args = base_args.to_vec();
-    let Some(mode) = login_args.last_mut() else {
-        return false;
-    };
-    if mode != acp_mode {
-        return false;
+    if let Some(acp_mode) = acp_mode {
+        let Some(mode) = login_args.last_mut() else {
+            return false;
+        };
+        if mode != acp_mode {
+            return false;
+        }
+        *mode = "login".to_string();
     }
-    *mode = "login".to_string();
     let Some(terminal) = standard_terminal_spec(
         title,
         command,
         &login_args,
         base_env,
-        Vec::new(),
+        terminal_args,
         BTreeMap::new(),
         cwd,
     ) else {
         return false;
     };
     parsed.catalog.methods.push(AgentAuthMethod {
-        id: KNOWN_TERMINAL_LOGIN_METHOD_ID.to_string(),
+        id: method_id.to_string(),
         name: title.to_string(),
         description: Some(description.to_string()),
         kind: AgentAuthMethodKind::Terminal,
@@ -236,7 +252,7 @@ pub(crate) fn append_known_terminal_auth_fallback(
     });
     parsed
         .terminal_methods
-        .insert(KNOWN_TERMINAL_LOGIN_METHOD_ID.to_string(), terminal);
+        .insert(method_id.to_string(), terminal);
     true
 }
 
@@ -392,6 +408,41 @@ mod tests {
                 expected_args
             );
         }
+    }
+
+    #[test]
+    fn pi_login_fallback_matches_the_pinned_adapter_method_and_arguments() {
+        let agent_id = AgentId::parse("pi").unwrap();
+        let base_args = vec!["/managed/vibex-acp-companion-launcher.cjs".to_string()];
+        let mut parsed = parse_initialize_auth_catalog(
+            agent_id.clone(),
+            &json!({ "protocolVersion": 1, "authMethods": [] }),
+            "/managed/node",
+            &base_args,
+            &[],
+            Some("/workspace".to_string()),
+        );
+
+        assert!(append_known_terminal_auth_fallback(
+            &mut parsed,
+            &agent_id,
+            "/managed/node",
+            &base_args,
+            &[],
+            Some("/workspace".to_string()),
+        ));
+        assert_eq!(parsed.catalog.methods[0].id, PI_TERMINAL_LOGIN_METHOD_ID);
+        assert_eq!(
+            parsed
+                .terminal_methods
+                .get(PI_TERMINAL_LOGIN_METHOD_ID)
+                .unwrap()
+                .args,
+            vec![
+                "/managed/vibex-acp-companion-launcher.cjs".to_string(),
+                "--terminal-login".to_string(),
+            ]
+        );
     }
 
     #[test]

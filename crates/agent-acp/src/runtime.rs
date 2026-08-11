@@ -12808,7 +12808,12 @@ async fn launch_agent_auth_process(
     {
         Ok(initialize) => initialize,
         Err(error) => {
-            if error.code == "provider_authentication_required" && process.terminal_auth_enabled {
+            let authentication_required = error.code == "provider_authentication_required";
+            let pi_initialize_rpc_failed =
+                agent_id.as_str() == "pi" && error.code == "acp_rpc_error";
+            if process.terminal_auth_enabled
+                && (authentication_required || pi_initialize_rpc_failed)
+            {
                 let mut parsed = parse_initialize_auth_catalog(
                     agent_id.clone(),
                     &json!({ "protocolVersion": 1, "authMethods": [] }),
@@ -12817,7 +12822,9 @@ async fn launch_agent_auth_process(
                     &env_overlays,
                     Some(cwd.to_string_lossy().into_owned()),
                 );
-                parsed.catalog.status = AgentAuthStatus::AuthenticationRequired;
+                if authentication_required {
+                    parsed.catalog.status = AgentAuthStatus::AuthenticationRequired;
+                }
                 if append_known_terminal_auth_fallback(
                     &mut parsed,
                     agent_id,
@@ -18377,6 +18384,9 @@ for line in sys.stdin:
         if initialize_mode == "auth_rpc":
             send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32003, "message": "Authentication required: run the CLI login command"}})
             continue
+        if initialize_mode == "failure_rpc":
+            send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": "Operation failed"}})
+            continue
         if initialize_mode == "auth_exit":
             sys.stderr.write("You are not logged in, please log in with the CLI login command\n")
             sys.stderr.flush()
@@ -19671,6 +19681,13 @@ for line in sys.stdin:
                 "auth_exit",
                 AgentAuthStatus::AuthenticationRequired,
             ),
+            (
+                "pi-known-auth",
+                "pi",
+                "pi-acp@0.0.33",
+                "failure_rpc",
+                AgentAuthStatus::Unknown,
+            ),
         ] {
             let agent_id = AgentId::parse(agent).unwrap();
             let Some(fixture) = MockAcpFixture::create_for_agent(label, Some(agent_id.clone()))
@@ -19702,8 +19719,15 @@ for line in sys.stdin:
             assert!(authenticated.terminal.is_some());
             let requests = terminal_host.auth_requests.lock().unwrap();
             let request = requests.last().unwrap();
-            assert_eq!(request.args.last().map(String::as_str), Some("login"));
-            assert!(!request.args.iter().any(|arg| arg == acp_mode));
+            if agent == "pi" {
+                assert_eq!(
+                    request.args.last().map(String::as_str),
+                    Some("--terminal-login")
+                );
+            } else {
+                assert_eq!(request.args.last().map(String::as_str), Some("login"));
+                assert!(!request.args.iter().any(|arg| arg == acp_mode));
+            }
             drop(requests);
             fixture.cleanup();
         }
