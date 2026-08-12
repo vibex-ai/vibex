@@ -7009,21 +7009,6 @@ impl VibexWorkbench {
             self.timeline_command_expansion.clear();
             self.agent_loading = true;
         }
-        if restored_cached_view
-            && let Some(session_updated_at_ms) = self
-                .sessions
-                .iter()
-                .find(|session| session.id == session_id)
-                .map(|session| session.updated_at_ms)
-        {
-            let ended_normally = latest_timeline_turn_ended_normally(&self.timeline.items);
-            self.cache_auto_continue_turn_status(
-                &session_id,
-                session_updated_at_ms,
-                ended_normally,
-                cx,
-            );
-        }
         self.refresh_agent_token_usage(&session_id);
         match self
             .suggestion_context
@@ -36335,6 +36320,16 @@ mod tests {
             .map(|(body, _)| body)
             .expect("session selection should remain inspectable");
         assert!(selection.contains("self.stash_current_agent_session_view();"));
+        assert!(!selection.contains("latest_timeline_turn_ended_normally"));
+        assert!(!selection.contains("cache_auto_continue_turn_status"));
+
+        let authoritative_load = source
+            .split_once("    fn load_agent_session_timeline(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn refresh_selected_agent_timeline("))
+            .map(|(body, _)| body)
+            .expect("authoritative timeline load should remain inspectable");
+        assert!(authoritative_load.contains("latest_timeline_turn_ended_normally"));
+        assert!(authoritative_load.contains("cache_auto_continue_turn_status"));
     }
 
     #[test]
