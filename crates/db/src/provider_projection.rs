@@ -1623,11 +1623,16 @@ fn legacy_agent_model_id(agent_id: &AgentId, provider_model_id: &str) -> String 
         return provider_model_id.to_string();
     }
 
+    let context_suffix = provider_model_id
+        .ends_with("[1m]")
+        .then_some("[1m]")
+        .unwrap_or_default();
     provider_model_id
         .split(|character: char| !character.is_ascii_alphanumeric())
         .find_map(|part| {
             let part = part.to_ascii_lowercase();
-            matches!(part.as_str(), "default" | "opus" | "sonnet" | "haiku").then_some(part)
+            matches!(part.as_str(), "default" | "opus" | "sonnet" | "haiku")
+                .then(|| format!("{part}{context_suffix}"))
         })
         .unwrap_or_else(|| provider_model_id.to_string())
 }
@@ -2239,6 +2244,49 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["opus", "sonnet", "haiku", "custom-model"]
         );
+    }
+
+    #[test]
+    fn legacy_claude_context_window_suffix_remains_distinct_during_save_and_backfill() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let mut profile = ProviderProfile::local_default(ProviderKind::Claude);
+        profile.id = ProviderProfileId::new();
+        profile.status = ProviderProfileStatus::Enabled;
+        profile.default_model = Some("claude-opus-4-6[1m]".to_string());
+        profile.configured_models = ["claude-opus-4-6", "claude-opus-4-6[1m]"]
+            .into_iter()
+            .map(|id| ProviderConfiguredModel {
+                id: id.to_string(),
+                display_name: None,
+                enabled: true,
+                wire_api: None,
+                capabilities: Default::default(),
+            })
+            .collect();
+        ProviderProfileRepository::insert(&conn, &profile).unwrap();
+
+        let saved = ProviderProjectionCompatibilityRepository::sync_legacy_profile(&conn, &profile)
+            .unwrap();
+        assert_eq!(
+            saved
+                .binding
+                .configured_models
+                .iter()
+                .map(|model| model.agent_model_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["opus", "opus[1m]"]
+        );
+
+        assert_eq!(
+            ProviderProjectionCompatibilityRepository::backfill_legacy_profiles(&conn).unwrap(),
+            0
+        );
+        let restored = AgentModelProviderBindingRepository::get(&conn, &saved.binding.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.configured_models, saved.binding.configured_models);
     }
 
     #[test]
