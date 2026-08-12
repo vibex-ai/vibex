@@ -84,6 +84,7 @@ const MANAGEMENT_PROVIDER_ROW_GAP: f32 = 8.0;
 const MANAGEMENT_PROVIDER_DRAG_PREVIEW_WIDTH: f32 = 520.0;
 const MANAGEMENT_PROVIDER_REORDER_ANIMATION_MS: u64 = 160;
 const MANAGEMENT_PROVIDER_ROW_ACTION_SIZE: f32 = 40.0;
+const MANAGEMENT_AGENT_INSTALL_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const PROVIDER_API_KEY_PLACEHOLDER: &str = "API Key";
 const PROVIDER_OPTION_WEBSITE_URL: &str = "ccSwitchWebsiteUrl";
 const PROVIDER_OPTION_CC_SWITCH_DB_PATH: &str = "ccSwitchDbPath";
@@ -578,6 +579,7 @@ pub struct ManagementCenter {
     notice: Option<String>,
     generation: u64,
     refresh_task: Option<Task<()>>,
+    agent_install_refresh_task: Option<Task<()>>,
     mutation_task: Option<Task<()>>,
     profile_secret_task: Option<Task<()>>,
     agent_mutation_tasks: BTreeMap<String, Task<()>>,
@@ -971,6 +973,7 @@ impl ManagementCenter {
             notice: None,
             generation: 0,
             refresh_task: None,
+            agent_install_refresh_task: None,
             mutation_task: None,
             profile_secret_task: None,
             agent_mutation_tasks: BTreeMap::new(),
@@ -1172,6 +1175,7 @@ impl ManagementCenter {
         self.clear_agent_auth_terminal();
         self.runtime = None;
         self.loading = false;
+        self.agent_install_refresh_task = None;
         self.agent_auth_generation = self.agent_auth_generation.saturating_add(1);
         self.agent_auth_loading = false;
         self.agent_auth_scope = None;
@@ -1279,6 +1283,7 @@ impl ManagementCenter {
         self.native_export_preview = None;
         self.sync_projection_editor();
         self.load_agent_auth(false, cx);
+        self.schedule_agent_install_refresh(cx);
         cx.notify();
     }
 
@@ -1297,10 +1302,12 @@ impl ManagementCenter {
 
     fn current_agent_auth_scope(&self) -> Option<(String, Option<String>)> {
         let agent_id = self.selected_agent_id.as_ref()?;
-        self.snapshot
-            .agents
-            .iter()
-            .find(|agent| agent.id.as_str() == agent_id && agent.added && agent.enabled)?;
+        self.snapshot.agents.iter().find(|agent| {
+            agent.id.as_str() == agent_id
+                && agent.added
+                && agent.enabled
+                && !management_agent_installation_pending(agent.added, &agent.managed_install)
+        })?;
         Some((agent_id.clone(), self.selected_provider_profile_id.clone()))
     }
 
@@ -3107,6 +3114,7 @@ impl ManagementCenter {
         self.devices = snapshot.devices;
         self.sync_projection_editor();
         self.load_agent_auth(false, cx);
+        self.schedule_agent_install_refresh(cx);
         if self.graph_draft.graph_id.is_none() {
             if let Some(graph) = self.snapshot.graphs.first() {
                 self.graph_draft = AutomationGraphDraft::from_graph(graph);
@@ -3123,6 +3131,52 @@ impl ManagementCenter {
         if std::mem::take(&mut self.discover_agents_after_refresh) {
             self.discover_local_agents(cx);
         }
+    }
+
+    fn selected_agent_installation_pending(&self) -> bool {
+        self.selected_agent_id.as_deref().is_some_and(|agent_id| {
+            self.snapshot.agents.iter().any(|agent| {
+                agent.id.as_str() == agent_id
+                    && management_agent_installation_pending(agent.added, &agent.managed_install)
+            })
+        })
+    }
+
+    fn schedule_agent_install_refresh(&mut self, cx: &mut Context<Self>) {
+        if self.agent_install_refresh_task.is_some() || !self.selected_agent_installation_pending()
+        {
+            return;
+        }
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        let background = cx.background_executor().clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            background
+                .timer(MANAGEMENT_AGENT_INSTALL_REFRESH_INTERVAL)
+                .await;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .list_agents(AgentListRequest {
+                    include_disabled: true,
+                })
+        });
+        self.agent_install_refresh_task = Some(cx.spawn(async move |entity, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                this.agent_install_refresh_task = None;
+                if let Ok(Ok(agents)) = outcome {
+                    this.snapshot.agents = agents.agents;
+                }
+                if this.selected_agent_installation_pending() {
+                    this.schedule_agent_install_refresh(cx);
+                } else if !this.loading {
+                    this.refresh(cx);
+                }
+            });
+        }));
     }
 
     fn export_diagnostics(&mut self, cx: &mut Context<Self>) {
@@ -9189,10 +9243,14 @@ impl ManagementCenter {
         };
         let agent_header = management_agent_detail_header(&selected_agent, cx);
         let selected_id = selected_agent.id.as_str().to_string();
-        if matches!(
+        let installation_pending = management_agent_installation_pending(
+            selected_agent.added,
+            &selected_agent.managed_install,
+        ) || matches!(
             self.agent_mutations.get(&selected_id),
             Some(ManagementMutation::AgentInstall(active_id)) if active_id == &selected_id
-        ) {
+        );
+        if installation_pending {
             return v_flex()
                 .w_full()
                 .gap_4()
@@ -14789,6 +14847,20 @@ fn management_agent_update_available_label() -> &'static str {
     management_locale_text("ACP update available", "ACP 有可用更新", "ACP 有可用更新")
 }
 
+fn management_agent_installation_pending(
+    added: bool,
+    state: &vibex_core::AgentManagedInstallState,
+) -> bool {
+    added
+        && state.managed
+        && matches!(
+            state.status,
+            vibex_core::AgentManagedInstallStatus::NotInstalled
+                | vibex_core::AgentManagedInstallStatus::Installing
+                | vibex_core::AgentManagedInstallStatus::Upgrading
+        )
+}
+
 fn management_install_label() -> &'static str {
     management_locale_text("Install", "安装", "安裝")
 }
@@ -15849,6 +15921,65 @@ mod tests {
         );
         assert!(pending.contains_key("codex"));
         assert!(!pending.contains_key("claude"));
+    }
+
+    #[test]
+    fn added_managed_agents_stay_on_the_download_surface_until_installation_finishes() {
+        use vibex_core::{AgentManagedInstallState, AgentManagedInstallStatus};
+
+        for status in [
+            AgentManagedInstallStatus::NotInstalled,
+            AgentManagedInstallStatus::Installing,
+            AgentManagedInstallStatus::Upgrading,
+        ] {
+            let state = AgentManagedInstallState {
+                status,
+                ..AgentManagedInstallState::not_installed()
+            };
+            assert!(management_agent_installation_pending(true, &state));
+        }
+        for status in [
+            AgentManagedInstallStatus::Installed,
+            AgentManagedInstallStatus::UpdateAvailable,
+            AgentManagedInstallStatus::Failed,
+            AgentManagedInstallStatus::Uninstalling,
+        ] {
+            let state = AgentManagedInstallState {
+                status,
+                ..AgentManagedInstallState::not_installed()
+            };
+            assert!(!management_agent_installation_pending(true, &state));
+        }
+
+        assert!(!management_agent_installation_pending(
+            false,
+            &AgentManagedInstallState::not_installed()
+        ));
+        assert!(!management_agent_installation_pending(
+            true,
+            &AgentManagedInstallState::external()
+        ));
+    }
+
+    #[test]
+    fn agent_installation_loading_is_driven_by_persisted_install_state() {
+        let source = include_str!("management.rs");
+        let render = source
+            .split_once("    fn render_providers(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_mcp("))
+            .map(|(body, _)| body)
+            .expect("Provider renderer should remain inspectable");
+        let auth_scope = source
+            .split_once("    fn current_agent_auth_scope(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn load_agent_auth("))
+            .map(|(body, _)| body)
+            .expect("Agent authentication scope should remain inspectable");
+
+        assert!(render.contains("management_agent_installation_pending("));
+        assert!(render.contains("self.render_agent_install_loading("));
+        assert!(auth_scope.contains("!management_agent_installation_pending("));
+        assert!(source.contains("fn schedule_agent_install_refresh("));
+        assert!(source.contains("MANAGEMENT_AGENT_INSTALL_REFRESH_INTERVAL"));
     }
 
     fn provider_options(entries: &[(&str, &str)]) -> vibex_core::ProviderOptions {
