@@ -84,17 +84,17 @@ pub use relay::{
     RelayClientStatus,
 };
 pub use remote_connectivity::{
-    DIRECT_LOOPBACK_BIND_ADDR, DIRECT_LOOPBACK_TARGET, DirectProbeInfo, DirectPublicationProbe,
-    DirectSettings, HttpDirectPublicationProbe, HttpRelayPublicationProbe, MAX_DIRECT_CANDIDATES,
-    ProcessOutput, ProcessRunner, REMOTE_ACCESS_SETTINGS_FILE, REMOTE_CONNECTIVITY_SCHEMA_VERSION,
-    RelayPublicationFeatures, RelayPublicationInfo, RelayPublicationProbe, RelaySettings,
-    RemoteConnectivityController, RemoteConnectivityLoad, RemoteConnectivityMethod,
-    RemoteConnectivitySettingsV1, RemoteConnectivitySnapshot, RemoteConnectivityStore,
-    RemoteMethodSnapshot, RemoteMethodState, RemoteRecoveryAction, RemoteRouteOwnership,
-    RemoteTransitionKind, RemoteTransitionRecord, TAILSCALE_DEFAULT_PORT, TAILSCALE_FALLBACK_PORTS,
-    TailscaleCli, TailscaleInspection, TailscalePublication, TailscaleRoute, TailscaleSettings,
-    TokioProcessRunner, WebAssetResolver, WebBuildDescriptor, normalize_https_origin,
-    parse_tailscale_inspection,
+    DIRECT_LOOPBACK_BIND_ADDR, DIRECT_LOOPBACK_TARGET, DirectProbeInfo, DirectProbeProxyPolicy,
+    DirectPublicationProbe, DirectSettings, HttpDirectPublicationProbe, HttpRelayPublicationProbe,
+    MAX_DIRECT_CANDIDATES, ProcessOutput, ProcessRunner, REMOTE_ACCESS_SETTINGS_FILE,
+    REMOTE_CONNECTIVITY_SCHEMA_VERSION, RelayPublicationFeatures, RelayPublicationInfo,
+    RelayPublicationProbe, RelaySettings, RemoteConnectivityController, RemoteConnectivityLoad,
+    RemoteConnectivityMethod, RemoteConnectivitySettingsV1, RemoteConnectivitySnapshot,
+    RemoteConnectivityStore, RemoteMethodSnapshot, RemoteMethodState, RemoteRecoveryAction,
+    RemoteRouteOwnership, RemoteTransitionKind, RemoteTransitionRecord, TAILSCALE_DEFAULT_PORT,
+    TAILSCALE_FALLBACK_PORTS, TailscaleCli, TailscaleInspection, TailscalePublication,
+    TailscaleRoute, TailscaleSettings, TokioProcessRunner, WebAssetResolver, WebBuildDescriptor,
+    normalize_https_origin, parse_tailscale_inspection,
 };
 pub use usage::AgentUsageService;
 pub use worktree::{WorktreeCoordinator, WorktreeCreateContext};

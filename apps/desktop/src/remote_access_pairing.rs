@@ -2076,6 +2076,21 @@ fn remote_error_label(code: &str) -> &'static str {
                 "此裝置上的 Tailscale 不可用",
             )
         }
+        "remote_direct_probe_client_unavailable" => locale::text(
+            "The direct network check could not start. Restart Vibex and try again",
+            "无法启动直连网络检查，请重启 Vibex 后重试",
+            "無法啟動直連網路檢查，請重新啟動 Vibex 後再試",
+        ),
+        "remote_direct_probe_direct_failed" => locale::text(
+            "The private remote entry could not be reached directly. Check Tailscale Serve or the local firewall",
+            "无法直连私有远程入口，请检查 Tailscale Serve 或本机防火墙",
+            "無法直連私人遠端入口，請檢查 Tailscale Serve 或本機防火牆",
+        ),
+        "remote_direct_probe_failed" => locale::text(
+            "The remote entry could not be verified through the current network or proxy",
+            "无法通过当前网络或代理验证远程入口",
+            "無法透過目前網路或代理驗證遠端入口",
+        ),
         "remote_pairing_offer_expired" | "remote_pairing_offer_unavailable" => locale::text(
             "The pairing offer is no longer active",
             "配对请求已失效",
@@ -2155,6 +2170,34 @@ mod tests {
             gateway_running: true,
             gateway_bound_addr: None,
         }
+    }
+
+    #[test]
+    fn remote_probe_errors_explain_proxy_and_private_route_failures() {
+        assert_eq!(
+            remote_error_label("remote_direct_probe_client_unavailable"),
+            locale::text(
+                "The direct network check could not start. Restart Vibex and try again",
+                "无法启动直连网络检查，请重启 Vibex 后重试",
+                "無法啟動直連網路檢查，請重新啟動 Vibex 後再試",
+            )
+        );
+        assert_eq!(
+            remote_error_label("remote_direct_probe_failed"),
+            locale::text(
+                "The remote entry could not be verified through the current network or proxy",
+                "无法通过当前网络或代理验证远程入口",
+                "無法透過目前網路或代理驗證遠端入口",
+            )
+        );
+        assert_eq!(
+            remote_error_label("remote_direct_probe_direct_failed"),
+            locale::text(
+                "The private remote entry could not be reached directly. Check Tailscale Serve or the local firewall",
+                "无法直连私有远程入口，请检查 Tailscale Serve 或本机防火墙",
+                "無法直連私人遠端入口，請檢查 Tailscale Serve 或本機防火牆",
+            )
+        );
     }
 
     fn offer_response() -> RemoteCreatePairingOfferResponse {

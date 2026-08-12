@@ -792,35 +792,72 @@ pub struct DirectProbeInfo {
 
 #[async_trait]
 pub trait DirectPublicationProbe: Send + Sync {
-    async fn probe(&self, origin: &str) -> VibexResult<DirectProbeInfo>;
+    async fn probe(
+        &self,
+        origin: &str,
+        proxy_policy: DirectProbeProxyPolicy,
+    ) -> VibexResult<DirectProbeInfo>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectProbeProxyPolicy {
+    System,
+    Bypass,
 }
 
 #[derive(Debug, Clone)]
 pub struct HttpDirectPublicationProbe {
-    client: reqwest::Client,
+    system_proxy_client: reqwest::Client,
+    direct_client: Option<reqwest::Client>,
 }
 
 impl Default for HttpDirectPublicationProbe {
     fn default() -> Self {
-        let client = reqwest::Client::builder()
+        let system_proxy_client = reqwest::Client::builder()
             .timeout(DIRECT_PROBE_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { client }
+        let direct_client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(DIRECT_PROBE_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .ok();
+        Self {
+            system_proxy_client,
+            direct_client,
+        }
     }
 }
 
 #[async_trait]
 impl DirectPublicationProbe for HttpDirectPublicationProbe {
-    async fn probe(&self, origin: &str) -> VibexResult<DirectProbeInfo> {
+    async fn probe(
+        &self,
+        origin: &str,
+        proxy_policy: DirectProbeProxyPolicy,
+    ) -> VibexResult<DirectProbeInfo> {
         let origin = normalize_https_origin(origin)?;
         let url = format!("{origin}/api/v2/info");
-        let response = self.client.get(url).send().await.map_err(|_| {
-            VibexError::process(
+        let client = match proxy_policy {
+            DirectProbeProxyPolicy::System => &self.system_proxy_client,
+            DirectProbeProxyPolicy::Bypass => self.direct_client.as_ref().ok_or_else(|| {
+                VibexError::process(
+                    "remote_direct_probe_client_unavailable",
+                    "the proxy-bypassing Direct probe client could not be initialized",
+                )
+            })?,
+        };
+        let response = client.get(url).send().await.map_err(|_| match proxy_policy {
+            DirectProbeProxyPolicy::System => VibexError::process(
                 "remote_direct_probe_failed",
-                "the user-managed Direct origin could not be reached",
-            )
+                "the user-managed Direct origin could not be reached through the current network or proxy",
+            ),
+            DirectProbeProxyPolicy::Bypass => VibexError::process(
+                "remote_direct_probe_direct_failed",
+                "the private Direct origin could not be reached without a proxy",
+            ),
         })?;
         if response.status() != StatusCode::OK {
             return Err(VibexError::process(
@@ -844,6 +881,47 @@ impl DirectPublicationProbe for HttpDirectPublicationProbe {
                 "the user-managed Direct origin returned an invalid info response",
             )
         })
+    }
+}
+
+fn direct_probe_proxy_policy(origin: &str) -> DirectProbeProxyPolicy {
+    let Ok(url) = Url::parse(origin) else {
+        return DirectProbeProxyPolicy::System;
+    };
+    match url.host() {
+        Some(Host::Ipv4(address)) => {
+            let octets = address.octets();
+            if address.is_private()
+                || address.is_loopback()
+                || address.is_link_local()
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+            {
+                DirectProbeProxyPolicy::Bypass
+            } else {
+                DirectProbeProxyPolicy::System
+            }
+        }
+        Some(Host::Ipv6(address)) => {
+            if address.is_loopback() || address.is_unique_local() || address.is_unicast_link_local()
+            {
+                DirectProbeProxyPolicy::Bypass
+            } else {
+                DirectProbeProxyPolicy::System
+            }
+        }
+        Some(Host::Domain(host)) => {
+            let host = host.trim_end_matches('.').to_ascii_lowercase();
+            if host == "localhost"
+                || host.ends_with(".localhost")
+                || host == "ts.net"
+                || host.ends_with(".ts.net")
+            {
+                DirectProbeProxyPolicy::Bypass
+            } else {
+                DirectProbeProxyPolicy::System
+            }
+        }
+        None => DirectProbeProxyPolicy::System,
     }
 }
 
@@ -1968,7 +2046,7 @@ impl RemoteConnectivityController {
         let result = self
             .inner
             .direct_probe
-            .probe(&origin)
+            .probe(&origin, direct_probe_proxy_policy(&origin))
             .await
             .and_then(|info| self.validate_direct_info(&info, &expected_build));
         match result {
@@ -2331,7 +2409,7 @@ impl RemoteConnectivityController {
         let publication = self
             .inner
             .direct_probe
-            .probe(&origin)
+            .probe(&origin, DirectProbeProxyPolicy::Bypass)
             .await
             .and_then(|info| self.validate_direct_info(&info, &expected_build));
         if let Err(error) = publication {
@@ -2819,7 +2897,7 @@ impl RemoteConnectivityController {
         let validation = self
             .inner
             .direct_probe
-            .probe(&origin)
+            .probe(&origin, DirectProbeProxyPolicy::Bypass)
             .await
             .and_then(|info| self.validate_direct_info(&info, &expected_build));
         if let Err(error) = validation {
@@ -2883,7 +2961,7 @@ impl RemoteConnectivityController {
         let result = self
             .inner
             .direct_probe
-            .probe(&origin)
+            .probe(&origin, direct_probe_proxy_policy(&origin))
             .await
             .and_then(|info| self.validate_direct_info(&info, &expected_build));
         if let Err(error) = result {
@@ -3321,6 +3399,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn direct_probe_bypasses_proxies_only_for_private_origins() {
+        for origin in [
+            "https://localhost:8443",
+            "https://gateway.localhost:8443",
+            "https://127.0.0.1:8443",
+            "https://192.168.1.10",
+            "https://100.64.0.1",
+            "https://100.127.255.254",
+            "https://[::1]:8443",
+            "https://[fd00::1]",
+            "https://desktop.tailnet.ts.net:8443",
+            "https://ts.net",
+        ] {
+            assert_eq!(
+                direct_probe_proxy_policy(origin),
+                DirectProbeProxyPolicy::Bypass,
+                "{origin} must not use an environment proxy"
+            );
+        }
+
+        for origin in [
+            "https://direct.example.com",
+            "https://8.8.8.8",
+            "https://100.63.255.255",
+            "https://100.128.0.1",
+            "https://example.ts.net.invalid",
+        ] {
+            assert_eq!(
+                direct_probe_proxy_policy(origin),
+                DirectProbeProxyPolicy::System,
+                "{origin} may use the system proxy"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_probe_fails_closed_when_bypass_client_is_unavailable() {
+        let probe = HttpDirectPublicationProbe {
+            system_proxy_client: reqwest::Client::new(),
+            direct_client: None,
+        };
+
+        let error = probe
+            .probe(
+                "https://desktop.tailnet.ts.net",
+                DirectProbeProxyPolicy::Bypass,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, "remote_direct_probe_client_unavailable");
+    }
+
     #[derive(Default)]
     struct FakeTailscale {
         inspection: Mutex<TailscaleInspection>,
@@ -3383,6 +3515,7 @@ mod tests {
         info: StdMutex<Option<DirectProbeInfo>>,
         gateway: StdMutex<Option<RemoteGateway>>,
         on_probe: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+        policies: StdMutex<Vec<DirectProbeProxyPolicy>>,
         calls: AtomicUsize,
         active: AtomicUsize,
         max_active: AtomicUsize,
@@ -3390,7 +3523,12 @@ mod tests {
 
     #[async_trait]
     impl DirectPublicationProbe for FakeDirectProbe {
-        async fn probe(&self, _origin: &str) -> VibexResult<DirectProbeInfo> {
+        async fn probe(
+            &self,
+            _origin: &str,
+            proxy_policy: DirectProbeProxyPolicy,
+        ) -> VibexResult<DirectProbeInfo> {
+            self.policies.lock().unwrap().push(proxy_policy);
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self
                 .gateway
@@ -3998,6 +4136,10 @@ mod tests {
 
         let snapshot = controller.enable_tailscale(None).await.unwrap();
         assert_eq!(
+            *direct.policies.lock().unwrap(),
+            vec![DirectProbeProxyPolicy::Bypass]
+        );
+        assert_eq!(
             snapshot
                 .method(RemoteConnectivityMethod::TailscaleServe)
                 .unwrap()
@@ -4010,6 +4152,42 @@ mod tests {
             .unwrap();
         assert!(tailscale.remove_calls.lock().unwrap().is_empty());
         assert_eq!(tailscale.inspection.lock().await.routes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn direct_publication_selects_proxy_policy_from_the_origin() {
+        let _guard = CONTROLLER_TEST_LOCK.lock().await;
+        for (origin, expected_policy) in [
+            (
+                "https://direct.example.test",
+                DirectProbeProxyPolicy::System,
+            ),
+            ("https://100.78.36.59", DirectProbeProxyPolicy::Bypass),
+            (
+                "https://desktop.tailnet.ts.net:8443",
+                DirectProbeProxyPolicy::Bypass,
+            ),
+        ] {
+            let directory = tempdir().unwrap();
+            let tailscale = Arc::new(FakeTailscale::default());
+            let direct = Arc::new(FakeDirectProbe::default());
+            let relay = Arc::new(FakeRelayProbe::default());
+            let (controller, gateway, descriptor) =
+                test_controller(directory.path(), tailscale, direct.clone(), relay).await;
+            *direct.info.lock().unwrap() = Some(direct_info(&gateway, &descriptor));
+
+            controller.enable_direct(origin).await.unwrap();
+
+            assert_eq!(
+                *direct.policies.lock().unwrap(),
+                vec![expected_policy],
+                "unexpected proxy policy for {origin}"
+            );
+            controller
+                .disable_method(RemoteConnectivityMethod::Direct)
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]

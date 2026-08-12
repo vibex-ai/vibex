@@ -204,6 +204,13 @@ VIBEX_WEB_GIT_COMMIT
   exact release Web build before publishing a pairing candidate. Persistence
   failure after validation withdraws the candidate and exposes the stable
   storage error.
+- Tailscale Serve validation always uses a proxy-bypassing HTTP client. A
+  user-managed Direct origin also bypasses environment/system proxies when its
+  host is loopback, RFC1918 IPv4, private or link-local IPv6, Tailscale CGNAT
+  `100.64.0.0/10`, or an exact/child `ts.net` name; public Direct and self-hosted
+  Relay origins retain system proxy behavior. Requested bypass must never fall
+  back to a proxy-aware client or mutate process proxy variables/global proxy
+  configuration.
 - Desktop pairing creates a 90-second offer through the controller with only the
   selected permission level; the Gateway injects every validated route. Status
   polling and cancel use the offer id and return only
@@ -235,6 +242,7 @@ VIBEX_WEB_GIT_COMMIT
 | Missing, corrupt, symlinked, or future settings | Quarantine when possible; `remote_connectivity_settings_invalid` or `remote_connectivity_settings_version_unsupported`; enable nothing. |
 | Validated method state cannot persist | `remote_connectivity_settings_*`; remove its candidate and expose `retry`. |
 | Direct identity/protocol/path/security mismatch | `remote_direct_identity_mismatch`, `remote_direct_protocol_incompatible`, `remote_direct_paths_invalid`, or `remote_direct_security_policy_invalid`; publish no candidate. |
+| A proxy-bypassing probe client cannot initialize, or a private/Tailnet origin cannot be reached directly | `remote_direct_probe_client_unavailable` or `remote_direct_probe_direct_failed`; publish no candidate and show actionable recovery. |
 | Web resources are missing, stale, tampered, debug-only, or source-mismatched | `web_assets_missing`, `web_assets_invalid`, or `web_assets_incompatible`; keep normal local Desktop capabilities available. |
 | Tailscale daemon/DNS/CLI is unavailable | Stable `tailscale_daemon_offline`, `tailscale_dns_unavailable`, `tailscale_binary_missing`, or `tailscale_cli_unsupported`; never mutate Serve. |
 | HTTPS 443 is occupied | `tailscale_https_port_confirmation_required` with one free 8443-8450 proposal; no create before confirmation. |
@@ -262,7 +270,8 @@ VIBEX_WEB_GIT_COMMIT
   infer ownership from target alone, remove a whole port containing sibling
   handlers, restart Direct for a Relay-only route change, store an entry merely
   because it was enabled or selected, retain a terminal offer's QR material, or
-  serve an unhashed Service Worker.
+  serve an unhashed Service Worker. Do not clear proxy environment variables or
+  silently retry a requested proxy bypass through the system proxy.
 
 ### 6. Tests Required
 
@@ -278,6 +287,9 @@ VIBEX_WEB_GIT_COMMIT
   restart, stopped-only config replacement, immutable epochs, method-independent
   failure/disable, repair of an interrupted disable, offer status/cancel, and a
   real claim proving that only the entry selected at claim time is persisted.
+- Probe tests cover proxy bypass for Tailscale and private/Tailnet Direct origins,
+  system proxy retention for public Direct origins, and fail-closed behavior when
+  the proxy-bypassing client is unavailable.
 - GPUI pairing tests cover the read-only default, all three permission choices,
   healthy preference fallback, entry switching without offer replacement,
   cancel/expiry/regenerate/close cleanup, narrow layout, clipboard failure, and
