@@ -46,7 +46,9 @@ includesAll(
     "RemoteDevicePermissionLevel::ReadOnly",
     "RemoteDevicePermissionLevel::ApproveOnly",
     "RemoteDevicePermissionLevel::FullControl",
-    "QrCode::new",
+    "QrCode::with_error_correction_level",
+    "EcLevel::L",
+    ".size(qr_size)",
     "fn schedule_offer_poll",
     "fn dismiss",
     "fn copy_pairing_link"

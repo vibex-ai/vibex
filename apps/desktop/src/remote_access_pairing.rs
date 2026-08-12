@@ -1,9 +1,8 @@
 use std::{future::Future, sync::Arc, time::Duration};
 
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, Entity, IntoElement, ObjectFit, Render, RenderImage,
-    SharedString, StyledImage as _, Subscription, Task, WeakEntity, Window, div, img, prelude::*,
-    px,
+    AnyElement, App, ClipboardItem, Context, Entity, IntoElement, Render, RenderImage,
+    SharedString, Subscription, Task, WeakEntity, Window, div, img, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _,
@@ -17,7 +16,7 @@ use gpui_component::{
     v_flex,
 };
 use image::{Frame, Rgba, RgbaImage};
-use qrcode::{Color as QrColor, QrCode};
+use qrcode::{Color as QrColor, EcLevel, QrCode};
 #[cfg(feature = "e2e-test-support")]
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -77,12 +76,14 @@ struct PrivateOfferMaterial {
     launch_fragment: String,
     launch_url: Url,
     qr_image: Arc<RenderImage>,
+    qr_size_px: u32,
 }
 
 struct ActivePairingOffer {
     summary: RemotePairingOfferSummary,
     entries: Vec<PairingEntry>,
     selected_entry: RemoteConnectivityMethod,
+    qr_size_px: u32,
     private: Option<PrivateOfferMaterial>,
 }
 
@@ -110,10 +111,12 @@ impl ActivePairingOffer {
                 )
             })?;
         let private = compose_private_offer(origin, response.launch_fragment)?;
+        let qr_size_px = private.qr_size_px;
         Ok(Self {
             summary: response.offer.summary,
             entries,
             selected_entry,
+            qr_size_px,
             private: Some(private),
         })
     }
@@ -147,7 +150,9 @@ impl ActivePairingOffer {
                     "pairing offer is no longer available",
                 )
             })?;
-        self.private = Some(compose_private_offer(origin, launch_fragment)?);
+        let private = compose_private_offer(origin, launch_fragment)?;
+        self.qr_size_px = private.qr_size_px;
+        self.private = Some(private);
         self.selected_entry = method;
         Ok(())
     }
@@ -1280,7 +1285,7 @@ impl RemoteAccessPairing {
             .into_any_element()
     }
 
-    fn render_offer(&self, compact: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_offer(&self, cx: &mut Context<Self>) -> AnyElement {
         let pending = self.state.pending.is_some();
         let route_available = self.state.connectivity.as_ref().is_some_and(|snapshot| {
             snapshot
@@ -1338,6 +1343,7 @@ impl RemoteAccessPairing {
             .private
             .as_ref()
             .map(|private| private.qr_image.clone());
+        let qr_size = px(offer.qr_size_px as f32);
         let selected_index = offer
             .entries
             .iter()
@@ -1387,6 +1393,7 @@ impl RemoteAccessPairing {
             });
 
         let offer_visual = v_flex()
+            .w_full()
             .min_w_0()
             .items_center()
             .gap_2()
@@ -1394,21 +1401,19 @@ impl RemoteAccessPairing {
                 column.child(
                     div()
                         .id("pairing-qr-secret-region")
-                        .size(px(196.0))
+                        .size(qr_size)
                         .flex_none()
-                        .overflow_hidden()
                         .rounded(px(6.0))
                         .border_1()
                         .border_color(cx.theme().border)
                         .bg(gpui::white())
-                        .p_2()
-                        .child(img(qr).size_full().object_fit(ObjectFit::Contain)),
+                        .child(img(qr).size(qr_size).flex_none()),
                 )
             })
             .when(terminal, |column| {
                 column.child(
                     div()
-                        .size(px(196.0))
+                        .size(qr_size)
                         .flex()
                         .items_center()
                         .justify_center()
@@ -1433,8 +1438,8 @@ impl RemoteAccessPairing {
             });
 
         let offer_controls = v_flex()
+            .w_full()
             .min_w_0()
-            .flex_1()
             .gap_3()
             .child(
                 h_flex()
@@ -1506,23 +1511,13 @@ impl RemoteAccessPairing {
                     ),
             );
 
-        if compact {
-            v_flex()
-                .w_full()
-                .items_center()
-                .gap_4()
-                .child(offer_visual)
-                .child(offer_controls)
-                .into_any_element()
-        } else {
-            h_flex()
-                .w_full()
-                .items_start()
-                .gap_5()
-                .child(offer_visual)
-                .child(offer_controls)
-                .into_any_element()
-        }
+        v_flex()
+            .w_full()
+            .items_center()
+            .gap_4()
+            .child(offer_visual)
+            .child(offer_controls)
+            .into_any_element()
     }
 }
 
@@ -1633,8 +1628,7 @@ impl Render for RemoteAccessPairingE2eDriver {
 }
 
 impl Render for RemoteAccessPairing {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let compact = f32::from(window.viewport_size().width) < 600.0;
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pending = self.state.pending.is_some();
         let selected_method = self.state.selected_method;
         let disable_entity = cx.weak_entity();
@@ -1737,7 +1731,7 @@ impl Render for RemoteAccessPairing {
                 "配对设备",
                 "配對裝置",
             )))
-            .child(self.render_offer(compact, cx))
+            .child(self.render_offer(cx))
     }
 }
 
@@ -1794,16 +1788,17 @@ fn compose_private_offer(
         )
     })?;
     launch_url.set_fragment(Some(fragment));
-    let qr_image = render_qr(launch_url.as_str())?;
+    let (qr_image, qr_size_px) = render_qr(launch_url.as_str())?;
     Ok(PrivateOfferMaterial {
         launch_fragment,
         launch_url,
         qr_image,
+        qr_size_px,
     })
 }
 
-fn render_qr(value: &str) -> VibexResult<Arc<RenderImage>> {
-    let code = QrCode::new(value.as_bytes()).map_err(|_| {
+fn render_qr(value: &str) -> VibexResult<(Arc<RenderImage>, u32)> {
+    let code = QrCode::with_error_correction_level(value.as_bytes(), EcLevel::L).map_err(|_| {
         VibexError::validation(
             "remote_pairing_qr_encode_failed",
             "pairing QR could not be encoded",
@@ -1837,7 +1832,10 @@ fn render_qr(value: &str) -> VibexResult<Arc<RenderImage>> {
             }
         }
     }
-    Ok(Arc::new(RenderImage::new(vec![Frame::new(pixels)])))
+    Ok((
+        Arc::new(RenderImage::new(vec![Frame::new(pixels)])),
+        image_size,
+    ))
 }
 
 fn pairing_entries(summary: &RemotePairingOfferSummary) -> Vec<PairingEntry> {
@@ -2109,8 +2107,10 @@ fn offer_cancel_error_allows_replacement(code: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use vibex_core::{
-        DeviceId, RemotePairingCandidate, RemoteProtocolVersionRange, remote_permissions_for_level,
+        DeviceId, RemotePairingCandidate, RemotePairingOffer, RemoteProtocolVersionRange,
+        remote_permissions_for_level,
     };
     use vibex_desktop_runtime::{
         REMOTE_CONNECTIVITY_SCHEMA_VERSION, RemoteMethodSnapshot, RemoteRecoveryAction,
@@ -2365,5 +2365,63 @@ mod tests {
         let wide = (1_440.0_f32 - 32.0).clamp(280.0, DIALOG_MAX_WIDTH);
         assert_eq!(narrow, 328.0);
         assert_eq!(wide, DIALOG_MAX_WIDTH);
+    }
+
+    #[test]
+    fn realistic_pairing_qr_uses_integer_module_pixels_at_display_size() {
+        let offer = RemotePairingOffer {
+            summary: RemotePairingOfferSummary {
+                format_version: 1,
+                protocol_range: RemoteProtocolVersionRange::v2(),
+                server_id: "server_0123456789abcdef0123456789abcdef".to_string(),
+                server_identity_public_key: "A".repeat(43),
+                offer_id: RequestId::parse("request_0123456789abcdef0123456789abcdef").unwrap(),
+                expires_at_ms: unix_timestamp_ms() + i64::from(PAIRING_OFFER_TTL_MS),
+                direct_candidates: vec![RemotePairingCandidate {
+                    transport: RemotePairingTransport::Tailnet,
+                    url: "https://desktop-name.tail123456.ts.net:8444".to_string(),
+                    relay_room_id: None,
+                    relay_pc_peer_id: None,
+                    relay_pc_public_key: None,
+                }],
+                relay_candidate: None,
+                permission_level: RemoteDevicePermissionLevel::FullControl,
+                granted_permissions: remote_permissions_for_level(
+                    RemoteDevicePermissionLevel::FullControl,
+                ),
+                canceled: false,
+                claimed_device_id: None,
+            },
+            one_time_challenge: format!("pair-{}", "B".repeat(43)),
+        };
+        let launch_fragment = format!(
+            "#/pair/{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&offer).unwrap())
+        );
+        let private = compose_private_offer(
+            "https://desktop-name.tail123456.ts.net:8444",
+            launch_fragment,
+        )
+        .unwrap();
+        let code =
+            QrCode::with_error_correction_level(private.launch_url.as_str().as_bytes(), EcLevel::L)
+                .unwrap();
+        let expected_size = (code.width() + QR_QUIET_ZONE_MODULES * 2) * QR_MODULE_SCALE;
+
+        assert!(private.launch_url.as_str().len() > 900);
+        assert!(
+            expected_size <= 560,
+            "realistic pairing QR grew beyond the desktop dialog: {expected_size}px"
+        );
+        assert_eq!(private.qr_size_px as usize, expected_size);
+        assert_eq!(
+            private.qr_image.size(0).width.0,
+            i32::try_from(expected_size).unwrap()
+        );
+        assert_eq!(
+            private.qr_image.size(0).height.0,
+            i32::try_from(expected_size).unwrap()
+        );
+        assert_eq!(private.qr_size_px as usize % QR_MODULE_SCALE, 0);
     }
 }

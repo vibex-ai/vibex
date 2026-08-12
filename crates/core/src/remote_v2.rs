@@ -745,11 +745,11 @@ impl_unknown_safe_enum!(
 pub struct RemotePairingCandidate {
     pub transport: RemotePairingTransport,
     pub url: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_room_id: Option<crate::RelayRoomId>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_pc_peer_id: Option<crate::RelayPeerId>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_pc_public_key: Option<String>,
 }
 
@@ -764,11 +764,13 @@ pub struct RemotePairingOfferSummary {
     pub expires_at_ms: i64,
     #[serde(default)]
     pub direct_candidates: Vec<RemotePairingCandidate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_candidate: Option<RemotePairingCandidate>,
     pub permission_level: RemoteDevicePermissionLevel,
     #[serde(default)]
     pub granted_permissions: Vec<RemoteActionClass>,
     pub canceled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claimed_device_id: Option<DeviceId>,
 }
 
@@ -1247,6 +1249,60 @@ mod tests {
             cursors: Vec::new(),
         };
         assert!(!format!("{hello:?}").contains("identity-proof-secret"));
+    }
+
+    #[test]
+    fn pairing_offer_omits_absent_optional_routes_and_round_trips() {
+        let offer = RemotePairingOffer {
+            summary: RemotePairingOfferSummary {
+                format_version: 1,
+                protocol_range: RemoteProtocolVersionRange::v2(),
+                server_id: "server-test".to_string(),
+                server_identity_public_key: "server-public".to_string(),
+                offer_id: RequestId::parse("request_offer_compact").unwrap(),
+                expires_at_ms: 100,
+                direct_candidates: vec![RemotePairingCandidate {
+                    transport: RemotePairingTransport::Tailnet,
+                    url: "https://desktop.tailnet.example".to_string(),
+                    relay_room_id: None,
+                    relay_pc_peer_id: None,
+                    relay_pc_public_key: None,
+                }],
+                relay_candidate: None,
+                permission_level: RemoteDevicePermissionLevel::FullControl,
+                granted_permissions: remote_permissions_for_level(
+                    RemoteDevicePermissionLevel::FullControl,
+                ),
+                canceled: false,
+                claimed_device_id: None,
+            },
+            one_time_challenge: "pairing-challenge-secret".to_string(),
+        };
+
+        let encoded = serde_json::to_string(&offer).unwrap();
+        for absent in [
+            "relayRoomId",
+            "relayPcPeerId",
+            "relayPcPublicKey",
+            "relayCandidate",
+            "claimedDeviceId",
+        ] {
+            assert!(
+                !encoded.contains(absent),
+                "serialized absent field {absent}"
+            );
+        }
+        assert!(encoded.contains("grantedPermissions"));
+        assert!(!encoded.contains(":null"));
+
+        let decoded: RemotePairingOffer = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, offer);
+        let candidate = &decoded.summary.direct_candidates[0];
+        assert!(candidate.relay_room_id.is_none());
+        assert!(candidate.relay_pc_peer_id.is_none());
+        assert!(candidate.relay_pc_public_key.is_none());
+        assert!(decoded.summary.relay_candidate.is_none());
+        assert!(decoded.summary.claimed_device_id.is_none());
     }
 
     #[test]
