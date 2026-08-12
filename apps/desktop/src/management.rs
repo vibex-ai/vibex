@@ -1366,18 +1366,7 @@ impl ManagementCenter {
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             let context = if provider_profile_id.is_none() {
-                runtime
-                    .agent()
-                    .list_auth_contexts()?
-                    .into_iter()
-                    .find(|context| context.agent_id == agent_id)
-                    .ok_or_else(|| {
-                        VibexError::conflict(
-                            "agent_auth_context_not_ready",
-                            "Agent default authentication context is not ready",
-                        )
-                    })?
-                    .into()
+                Some(runtime.agent().ensure_default_auth_context(&agent_id)?)
             } else {
                 None
             };
@@ -16823,7 +16812,9 @@ mod tests {
             .map(|(body, _)| body)
             .expect("Agent account lifecycle should remain inspectable");
 
-        assert!(load.contains("list_auth_contexts()"));
+        assert!(load.contains("ensure_default_auth_context(&agent_id)"));
+        assert!(!load.contains("list_auth_contexts()"));
+        assert!(!load.contains("agent_auth_context_not_ready"));
         assert!(load.contains("list_auth_methods("));
         assert!(render.contains("context.as_ref().map(|context| context.status)"));
         assert!(render.contains("shared with the external Agent CLI"));
