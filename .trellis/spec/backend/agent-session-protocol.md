@@ -2811,10 +2811,15 @@ AgentAuthModelCatalogSnapshot {
 - The context stores only a bounded redacted account hint and the method id
   used for the latest successful action. It never stores token, cookie,
   credential-file contents, or the raw state-home path.
-- The compatibility registry must prove `supports_default_state_home` and
-  supplies the exact credential/provider environment keys to unset for an
-  Agent-account launch. The Agent-account path does not apply Provider
-  projection or inject a Provider-specific state home.
+- Every Agent with a valid built-in ACP runtime configuration may use its
+  ordinary process environment and normal default state home for authentication
+  discovery and an Agent-account launch. The Agent-account path does not apply
+  Provider projection or inject a Provider-specific state home.
+- A compatibility descriptor enhances that baseline with exact
+  credential/provider environment keys to unset, verified logout support, and
+  direct model discovery. Absence of a descriptor means conservative inherited
+  environment and ACP session evidence; it does not mean the default state home
+  is unsupported.
 - `authenticate` re-reads the current method catalog, rejects methods whose
   effect requires a Provider Profile, persists one operation row, and uses the
   same Agent/account launch context as verification and later sessions.
@@ -2851,7 +2856,8 @@ AgentAuthModelCatalogSnapshot {
 
 | Condition | Required result |
 | --- | --- |
-| Agent has no verified default-home capability | `agent_default_state_home_unsupported`; do not create a selectable account source. |
+| Agent id is absent from the built-in ACP catalog, or its Agent ACP config is invalid | `agent_not_found` or the typed ACP config validation error; do not create a context. |
+| Agent has no enhanced auth compatibility descriptor | use the ordinary Agent environment, no descriptor env-unsets, no enhanced logout/direct-catalog claim. |
 | A second context is inserted for one Agent | SQLite uniqueness conflict; preserve the first context. |
 | Context id is missing or belongs to another Agent | `agent_auth_context_not_found` or `agent_auth_context_agent_mismatch`; no process. |
 | Expected revision is non-positive or stale | `agent_auth_context_revision_invalid` or `agent_auth_context_revision_conflict`; no external action. |
@@ -2876,9 +2882,10 @@ AgentAuthModelCatalogSnapshot {
 - Base: the Agent reports no models. The source remains selectable as
   “Agent automatically chooses” and the actual model, if later reported, is
   recorded only as effective evidence.
-- Base: an Agent exposes browser and environment methods. Browser/Agent-owned
-  login is offered for the default account; the environment method remains a
-  Provider Profile action.
+- Base: a catalog Agent without a dedicated compatibility descriptor exposes
+  browser and environment methods. Browser/Agent-owned login uses its ordinary
+  default environment; the environment method remains a Provider Profile
+  action, and no enhanced logout/direct-model claim is fabricated.
 - Bad: create a synthetic Provider Profile, set `model_id = "default"`, reuse
   a prior revision's model list, or let a Provider API-key variable leak into
   the Agent-account process.
@@ -2902,6 +2909,10 @@ AgentAuthModelCatalogSnapshot {
 - Desktop runtime tests cover process shutdown before logout, affected-session
   preview, and no automatic Provider fallback. Remote tests cover redaction and
   permission classes.
+- ACP auth tests cover every built-in Agent accepting its valid default ACP
+  configuration, plus a catalog Agent without a dedicated compatibility
+  descriptor creating one default context and discovering methods. An unknown
+  Agent fails before a context is inserted.
 
 ### 7. Wrong vs Correct
 

@@ -5157,89 +5157,72 @@ impl AcpRuntimeSwitchBridge {
                 "Agent session was not found",
             ));
         }
-        let (auth_source_revision, config, runtime_resources, env_unsets) = match &selection
-            .auth_source
-        {
-            RuntimeAuthSource::ProviderProfile {
-                provider_profile_id,
-            } => {
-                let profile = self
-                    .client
-                    .config_service
-                    .get_profile(provider_profile_id)?
-                    .ok_or_else(|| {
-                        runtime_configuration_unavailable("provider_profile_not_found")
-                    })?;
-                if profile.agent_id != selection.agent_id
-                    || profile.kind != ProviderKind::Acp
-                    || profile.status != ProviderProfileStatus::Enabled
-                {
-                    return Err(runtime_configuration_unavailable(
-                        "provider_profile_route_unavailable",
-                    ));
+        let (auth_source_revision, config, runtime_resources, env_unsets) =
+            match &selection.auth_source {
+                RuntimeAuthSource::ProviderProfile {
+                    provider_profile_id,
+                } => {
+                    let profile = self
+                        .client
+                        .config_service
+                        .get_profile(provider_profile_id)?
+                        .ok_or_else(|| {
+                            runtime_configuration_unavailable("provider_profile_not_found")
+                        })?;
+                    if profile.agent_id != selection.agent_id
+                        || profile.kind != ProviderKind::Acp
+                        || profile.status != ProviderProfileStatus::Enabled
+                    {
+                        return Err(runtime_configuration_unavailable(
+                            "provider_profile_route_unavailable",
+                        ));
+                    }
+                    let config = self
+                        .client
+                        .profile_config(provider_profile_id)
+                        .map_err(|error| runtime_configuration_unavailable(&error.code))?;
+                    let runtime_resources = self
+                        .manager
+                        .runtime_resources_for_profile(ProviderKind::Acp, provider_profile_id)?;
+                    (profile.updated_at_ms, config, runtime_resources, Vec::new())
                 }
-                let config = self
-                    .client
-                    .profile_config(provider_profile_id)
-                    .map_err(|error| runtime_configuration_unavailable(&error.code))?;
-                let runtime_resources = self
-                    .manager
-                    .runtime_resources_for_profile(ProviderKind::Acp, provider_profile_id)?;
-                (profile.updated_at_ms, config, runtime_resources, Vec::new())
-            }
-            RuntimeAuthSource::AgentAccount { auth_context_id } => {
-                let context = AgentAuthContextRepository::get_by_id(&conn, auth_context_id)?
-                    .ok_or_else(|| {
-                        runtime_configuration_unavailable("agent_auth_context_not_found")
-                    })?;
-                if context.agent_id != selection.agent_id {
-                    return Err(runtime_configuration_unavailable(
-                        "agent_auth_context_agent_mismatch",
-                    ));
+                RuntimeAuthSource::AgentAccount { auth_context_id } => {
+                    let context = AgentAuthContextRepository::get_by_id(&conn, auth_context_id)?
+                        .ok_or_else(|| {
+                            runtime_configuration_unavailable("agent_auth_context_not_found")
+                        })?;
+                    if context.agent_id != selection.agent_id {
+                        return Err(runtime_configuration_unavailable(
+                            "agent_auth_context_agent_mismatch",
+                        ));
+                    }
+                    if context.status != AgentAuthContextStatus::Authenticated {
+                        return Err(runtime_configuration_unavailable(
+                            "agent_authentication_required",
+                        ));
+                    }
+                    if AgentAuthenticationOperationRepository::get_active_for_context(
+                        &conn,
+                        auth_context_id,
+                    )?
+                    .is_some()
+                    {
+                        return Err(runtime_configuration_unavailable(
+                            "agent_authentication_operation_in_progress",
+                        ));
+                    }
+                    let config = self
+                        .client
+                        .config_service
+                        .get_agent_acp_runtime_config(&selection.agent_id)
+                        .map_err(|error| runtime_configuration_unavailable(&error.code))?;
+                    let runtime_resources = self
+                        .manager
+                        .runtime_resources_for_agent(&selection.agent_id, ProviderKind::Acp)?;
+                    let env_unsets = self.client.agent_account_env_unsets(&selection.agent_id);
+                    (context.revision, config, runtime_resources, env_unsets)
                 }
-                if context.status != AgentAuthContextStatus::Authenticated {
-                    return Err(runtime_configuration_unavailable(
-                        "agent_authentication_required",
-                    ));
-                }
-                if AgentAuthenticationOperationRepository::get_active_for_context(
-                    &conn,
-                    auth_context_id,
-                )?
-                .is_some()
-                {
-                    return Err(runtime_configuration_unavailable(
-                        "agent_authentication_operation_in_progress",
-                    ));
-                }
-                let descriptor = self
-                    .client
-                    .compatibility_registry
-                    .for_agent(&selection.agent_id)
-                    .ok_or_else(|| {
-                        runtime_configuration_unavailable("agent_default_state_home_unsupported")
-                    })?;
-                if !descriptor.auth_context.supports_default_state_home {
-                    return Err(runtime_configuration_unavailable(
-                        "agent_default_state_home_unsupported",
-                    ));
-                }
-                let config = self
-                    .client
-                    .config_service
-                    .get_agent_acp_runtime_config(&selection.agent_id)
-                    .map_err(|error| runtime_configuration_unavailable(&error.code))?;
-                let runtime_resources = self
-                    .manager
-                    .runtime_resources_for_agent(&selection.agent_id, ProviderKind::Acp)?;
-                (
-                    context.revision,
-                    config,
-                    runtime_resources,
-                    descriptor.auth_context.credential_env_keys_to_unset.clone(),
-                )
-            }
-        };
+            };
         let cwd = AcpRuntimeClient::resolve_workspace_cwd(&config, &session.workspace_root)
             .map_err(|error| runtime_configuration_unavailable(&error.code))?;
         let (process_strategy_effective, pool_fallback_reason) = self
@@ -7932,18 +7915,26 @@ impl AcpRuntimeClient {
     }
 
     pub fn supports_agent_account(&self, agent_id: &AgentId) -> bool {
-        self.compatibility_registry
-            .for_agent(agent_id)
-            .is_some_and(|descriptor| descriptor.auth_context.supports_default_state_home)
+        self.validate_agent_account(agent_id).is_ok()
+    }
+
+    pub fn validate_agent_account(&self, agent_id: &AgentId) -> VibexResult<()> {
+        self.config_service
+            .get_agent_acp_runtime_config(agent_id)
+            .map(|_| ())
     }
 
     pub fn supports_agent_account_logout(&self, agent_id: &AgentId) -> bool {
         self.compatibility_registry
             .for_agent(agent_id)
-            .is_some_and(|descriptor| {
-                descriptor.auth_context.supports_default_state_home
-                    && descriptor.auth_context.supports_logout
-            })
+            .is_some_and(|descriptor| descriptor.auth_context.supports_logout)
+    }
+
+    fn agent_account_env_unsets(&self, agent_id: &AgentId) -> Vec<String> {
+        self.compatibility_registry
+            .for_agent(agent_id)
+            .map(|descriptor| descriptor.auth_context.credential_env_keys_to_unset.clone())
+            .unwrap_or_default()
     }
 
     /// Discovers models from the exact default-account launch identity. The
@@ -7968,21 +7959,11 @@ impl AcpRuntimeClient {
                 "Agent authentication context changed before model discovery",
             ));
         }
-        let descriptor = self
-            .compatibility_registry
-            .for_agent(&context.agent_id)
-            .filter(|descriptor| descriptor.auth_context.supports_default_state_home)
-            .ok_or_else(|| {
-                VibexError::capability(
-                    "agent_default_state_home_unsupported",
-                    "Agent does not declare a supported default account state home",
-                )
-            })?;
         let config = self
             .config_service
             .get_agent_acp_runtime_config(&context.agent_id)?;
         let auth_source = RuntimeAuthSource::agent_account(context.id.clone());
-        let env_unsets = descriptor.auth_context.credential_env_keys_to_unset.clone();
+        let env_unsets = self.agent_account_env_unsets(&context.agent_id);
         let spawn_snapshot = self.process_spawn_config_snapshot_for_agent_account(
             &auth_source,
             context.revision,
@@ -7994,7 +7975,10 @@ impl AcpRuntimeClient {
         let runtime_fingerprint = spawn_snapshot.process_spawn_fingerprint();
         let attempted_at_ms = unix_timestamp_ms();
 
-        if descriptor.auth_context.supports_direct_model_catalog
+        if self
+            .compatibility_registry
+            .for_agent(&context.agent_id)
+            .is_some_and(|descriptor| descriptor.auth_context.supports_direct_model_catalog)
             && context.agent_id.as_str() == "codex"
             && let Ok(capabilities) = self
                 .list_runtime_model_capabilities_for_source(
@@ -11586,30 +11570,11 @@ impl AcpRuntimeClient {
                         "Agent account changed after the session binding was captured",
                     ));
                 }
-                let descriptor = self
-                    .compatibility_registry
-                    .for_agent(&context.agent_id)
-                    .ok_or_else(|| {
-                        VibexError::capability(
-                            "agent_default_state_home_unsupported",
-                            "Agent does not declare a supported default account state home",
-                        )
-                    })?;
-                if !descriptor.auth_context.supports_default_state_home {
-                    return Err(VibexError::capability(
-                        "agent_default_state_home_unsupported",
-                        "Agent does not support its default account as a runtime source",
-                    ));
-                }
                 let config = self
                     .config_service
                     .get_agent_acp_runtime_config(&context.agent_id)?;
-                (
-                    context.agent_id,
-                    context.revision,
-                    config,
-                    descriptor.auth_context.credential_env_keys_to_unset.clone(),
-                )
+                let env_unsets = self.agent_account_env_unsets(&context.agent_id);
+                (context.agent_id, context.revision, config, env_unsets)
             }
         };
         let cwd = Self::resolve_workspace_cwd(&config, workspace_root)?;
@@ -13735,26 +13700,11 @@ async fn launch_agent_auth_process(
                 Vec::new(),
             )
         } else {
-            let descriptor = client
-                .compatibility_registry
-                .for_agent(agent_id)
-                .ok_or_else(|| {
-                    VibexError::capability(
-                        "agent_default_state_home_unsupported",
-                        "Agent does not declare a supported default account state home",
-                    )
-                })?;
-            if !descriptor.auth_context.supports_default_state_home {
-                return Err(VibexError::capability(
-                    "agent_default_state_home_unsupported",
-                    "Agent does not support authentication in its default state home",
-                ));
-            }
-            let conn = open_database(client.config_service.database_path())?;
-            let context = AgentAuthContextRepository::ensure_default(&conn, agent_id)?;
             let config = client
                 .config_service
                 .get_agent_acp_runtime_config(agent_id)?;
+            let conn = open_database(client.config_service.database_path())?;
+            let context = AgentAuthContextRepository::ensure_default(&conn, agent_id)?;
             let cwd = AcpRuntimeClient::resolve_probe_cwd(&config, None)?;
             (
                 ProviderProfileId::new(),
@@ -13762,7 +13712,7 @@ async fn launch_agent_auth_process(
                 context.revision,
                 config,
                 cwd,
-                descriptor.auth_context.credential_env_keys_to_unset.clone(),
+                client.agent_account_env_unsets(agent_id),
             )
         };
     let resources = ProviderRuntimeResources::default();
@@ -14951,24 +14901,9 @@ impl AcpClient for AcpRuntimeClient {
         agent_id: &AgentId,
     ) -> VibexResult<AcpRuntimeSessionProbe> {
         let config = self.config_service.get_agent_acp_runtime_config(agent_id)?;
-        let descriptor = self
-            .compatibility_registry
-            .for_agent(agent_id)
-            .ok_or_else(|| {
-                VibexError::capability(
-                    "agent_default_state_home_unsupported",
-                    "Agent does not declare a supported default account state home",
-                )
-            })?;
-        if !descriptor.auth_context.supports_default_state_home {
-            return Err(VibexError::capability(
-                "agent_default_state_home_unsupported",
-                "Agent does not declare a supported default account state home",
-            ));
-        }
         let conn = open_database(self.config_service.database_path())?;
         let context = AgentAuthContextRepository::ensure_default(&conn, agent_id)?;
-        let env_unsets = descriptor.auth_context.credential_env_keys_to_unset.clone();
+        let env_unsets = self.agent_account_env_unsets(agent_id);
         let env_unset_set = env_unsets.iter().collect::<BTreeSet<_>>();
         let env_overlays = agent_probe_env_overlays(&config)
             .into_iter()
@@ -21153,10 +21088,10 @@ for line in sys.stdin:
         }));
     }
 
-    fn configure_mock_agent_account_runtime(fixture: &RuntimeSwitchFixture, agent_id: &AgentId) {
-        let service = fixture.fixture.service();
+    fn configure_mock_default_agent_runtime(fixture: &MockAcpFixture, agent_id: &AgentId) {
+        let service = fixture.service();
         let profile_config = service
-            .get_acp_profile_config(fixture.fixture.profile_id.clone())
+            .get_acp_profile_config(fixture.profile_id.clone())
             .unwrap();
         let env = profile_config
             .env
@@ -21185,6 +21120,10 @@ for line in sys.stdin:
                 params: None,
             })
             .unwrap();
+    }
+
+    fn configure_mock_agent_account_runtime(fixture: &RuntimeSwitchFixture, agent_id: &AgentId) {
+        configure_mock_default_agent_runtime(&fixture.fixture, agent_id);
     }
 
     fn account_model_descriptor(
@@ -21623,15 +21562,57 @@ for line in sys.stdin:
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn unsupported_agent_auth_discovery_does_not_create_a_default_context() {
-        let Some(fixture) = MockAcpFixture::create("unsupported-agent-auth-context") else {
+    async fn catalog_agent_auth_discovery_uses_the_default_environment_without_a_descriptor() {
+        let Some(fixture) = MockAcpFixture::create("catalog-agent-auth-context") else {
+            return;
+        };
+        let agent_id = AgentId::parse(OPENCODE_AGENT_ID).unwrap();
+        fixture.enable_auth_methods();
+        configure_mock_default_agent_runtime(&fixture, &agent_id);
+        let client = fixture.client();
+
+        let catalog = client.list_auth_methods(&agent_id, None).await.unwrap();
+        assert_eq!(catalog.agent_id, agent_id);
+        assert!(
+            catalog
+                .methods
+                .iter()
+                .any(|method| method.id == "browser-login")
+        );
+        let conn = open_database(&fixture.db_path).unwrap();
+        let context = AgentAuthContextRepository::get_by_agent(&conn, &agent_id)
+            .unwrap()
+            .expect("catalog Agent discovery should create its default account context");
+        assert_eq!(context.status, AgentAuthContextStatus::Unverified);
+
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn every_builtin_agent_with_a_valid_acp_config_supports_its_default_account() {
+        let root = tempfile::tempdir().unwrap();
+        let client =
+            AcpRuntimeClient::new(ProviderConfigService::new(root.path().join("vibex.db")));
+
+        for agent in vibex_core::builtin_agent_definitions() {
+            assert!(
+                client.supports_agent_account(&agent.id),
+                "{} should support its ordinary default account environment",
+                agent.id
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_agent_auth_discovery_does_not_create_a_default_context() {
+        let Some(fixture) = MockAcpFixture::create("unknown-agent-auth-context") else {
             return;
         };
         let client = fixture.client();
-        let agent_id = AgentId::parse(OPENCODE_AGENT_ID).unwrap();
+        let agent_id = AgentId::parse("unknown-agent").unwrap();
 
         let error = client.list_auth_methods(&agent_id, None).await.unwrap_err();
-        assert_eq!(error.code, "agent_default_state_home_unsupported");
+        assert_eq!(error.code, "agent_not_found");
         let conn = open_database(&fixture.db_path).unwrap();
         assert!(
             AgentAuthContextRepository::get_by_agent(&conn, &agent_id)

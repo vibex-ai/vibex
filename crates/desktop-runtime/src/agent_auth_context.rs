@@ -66,12 +66,7 @@ impl AgentAuthContextService {
     }
 
     pub fn ensure_default(&self, agent_id: &vibex_core::AgentId) -> VibexResult<AgentAuthContext> {
-        if !self.acp_runtime.supports_agent_account(agent_id) {
-            return Err(VibexError::capability(
-                "agent_default_state_home_unsupported",
-                "Agent does not support its default account as a runtime authentication source",
-            ));
-        }
+        self.acp_runtime.validate_agent_account(agent_id)?;
         let mut conn = open_database(&self.db_path)?;
         apply_migrations(&mut conn)?;
         let existed = AgentAuthContextRepository::get_by_agent(&conn, agent_id)?.is_some();

@@ -3845,7 +3845,6 @@ AcpRuntimeClient::process_spawn_config_snapshot_for_agent_account(
 ) -> redacted spawn snapshot
 
 AgentAuthContextCapabilities {
-  supports_default_state_home,
   credential_env_keys_to_unset[],
   supports_logout,
   supports_direct_model_catalog,
@@ -3861,8 +3860,12 @@ AgentAuthContextCapabilities {
   values never enter the fingerprint, Debug, or persisted preview.
 - AgentAccount launches verify the context/revision, resolve the Agent's normal
   default state home, do not call the Provider projection engine, and do not
-  create an isolated Vibex account home. They unset exactly the Registry-listed
-  Provider/API-key/selector variables before spawn.
+  create an isolated Vibex account home. Every valid built-in ACP Agent may use
+  this baseline with its ordinary Agent process environment.
+- When an enhanced compatibility descriptor exists, AgentAccount launch unsets
+  exactly its Registry-listed Provider/API-key/selector variables. Without a
+  descriptor, the runtime uses no guessed global unset list and makes no
+  enhanced logout or direct-model-discovery claim.
 - The same source-aware launch decision is used by auth, model discovery, and
   real session creation. A successful login process is closed before a fresh
   verification/discovery process starts, so an in-memory credential cannot
@@ -3881,7 +3884,8 @@ AgentAuthContextCapabilities {
 | --- | --- |
 | Provider source lacks a valid enabled ACP Profile | existing Provider route/config validation error; no process. |
 | AgentAccount context missing, Agent mismatch, or revision stale | `agent_auth_context_not_found`, `agent_auth_context_agent_mismatch`, or revision conflict; no projection. |
-| Agent lacks default-home capability | `agent_default_state_home_unsupported`; source unavailable. |
+| Agent is absent from the built-in ACP catalog or has invalid Agent ACP config | `agent_not_found` or the typed ACP config validation error; source unavailable. |
+| Agent lacks an enhanced compatibility descriptor | inherit the ordinary Agent environment; use no descriptor env-unsets and advertise no enhanced logout/direct-model capability. |
 | AgentAccount path sees Provider projection plan | fail closed with source/projection mismatch; do not spawn. |
 | Registry env-unset key is invalid/unbounded | compatibility descriptor validation error; do not guess a global key list. |
 | Secret resolution fails on Provider path | redacted secret/config error; no partial overlay or process. |
@@ -3894,9 +3898,9 @@ AgentAuthContextCapabilities {
   explicitly unset, and both fingerprints remain distinct.
 - Good: model discovery and the first real session use the same account source
   revision and state-home identity, so the discovered entitlement is relevant.
-- Base: an Agent's Registry descriptor does not support direct model listing;
-  the runtime falls back to ACP session evidence or `AgentDefault` without
-  inventing a Provider model.
+- Base: an Agent has no Registry descriptor; the runtime inherits its ordinary
+  environment and falls back to ACP session evidence or `AgentDefault` without
+  inventing a Provider model or enhanced account actions.
 - Bad: set `CODEX_HOME`/equivalent to a Provider temp directory on AgentAccount,
   inherit a parent API key, or copy a token into the Vibex database.
 - Bad: let a Provider projection write into the Agent's default state home or
@@ -3908,7 +3912,10 @@ AgentAuthContextCapabilities {
   legacy compatibility, and source-specific fingerprints.
 - ACP tests cover AgentAccount env unsets, default-home preservation, no
   projection calls, and equal launch identity across auth/probe/session.
-- Registry tests cover descriptor capability validation and bounded env keys.
+- Registry tests cover enhanced descriptor validation and bounded env keys.
+- ACP auth tests cover every built-in Agent accepting its valid default ACP
+  config, a catalog Agent without a descriptor using its ordinary environment,
+  and an unknown Agent failing before context creation.
 - Restore/switch tests reject source/home/revision fingerprint mismatches and
   never reuse a Provider process for an AgentAccount target.
 - Redaction tests inspect Debug, diagnostics, database rows, and remote DTOs for
@@ -3932,8 +3939,11 @@ match selection.auth_source {
         spawn_with_projection(projection)
     }
     RuntimeAuthSource::AgentAccount { auth_context_id } => {
-        let descriptor = registry.auth_context_capabilities(agent_id)?;
-        spawn_with_default_home_and_unsets(auth_context_id, descriptor)
+        let env_unsets = registry
+            .auth_context_capabilities(agent_id)
+            .map(|capabilities| capabilities.credential_env_keys_to_unset)
+            .unwrap_or_default();
+        spawn_with_default_home_and_unsets(auth_context_id, env_unsets)
     }
 }
 ```

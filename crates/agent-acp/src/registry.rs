@@ -147,7 +147,6 @@ pub enum AgentAuthVerificationStrategy {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentAuthContextCapabilities {
-    pub supports_default_state_home: bool,
     pub credential_env_keys_to_unset: Vec<String>,
     pub supports_logout: bool,
     pub supports_account_hint: bool,
@@ -896,7 +895,6 @@ fn claude_descriptor() -> VibexResult<AcpAgentCompatibility> {
         operation_support: base_operation_support(),
         native_state_home_policy: NativeStateHomePolicy::ClaudeConfigDirectory,
         auth_context: AgentAuthContextCapabilities {
-            supports_default_state_home: true,
             credential_env_keys_to_unset: [
                 "ANTHROPIC_API_KEY",
                 "ANTHROPIC_AUTH_TOKEN",
@@ -993,7 +991,6 @@ fn codex_descriptor() -> VibexResult<AcpAgentCompatibility> {
         operation_support: base_operation_support(),
         native_state_home_policy: NativeStateHomePolicy::StableCodexHome,
         auth_context: AgentAuthContextCapabilities {
-            supports_default_state_home: true,
             credential_env_keys_to_unset: [
                 "OPENAI_API_KEY",
                 "OPENAI_BASE_URL",
