@@ -156,6 +156,10 @@ use crate::{
 #[cfg(test)]
 const ACP_PROTOCOL_VERSION: i64 = 1;
 const ACP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+// Browser/device login flows can remain pending while the user completes an
+// external authentication step. This must not inherit the short protocol
+// handshake deadline used for initialize/session requests.
+const ACP_AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const ACP_SESSION_LOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const ACP_PROMPT_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 pub(crate) const ACP_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -14094,7 +14098,7 @@ impl AcpClient for AcpRuntimeClient {
                             .request(
                                 AcpOperation::Authenticate.method(),
                                 protocol::build_authenticate_params(&request.method_id),
-                                ACP_HANDSHAKE_TIMEOUT,
+                                ACP_AUTHENTICATION_TIMEOUT,
                             )
                             .await?;
                         Ok(AgentAuthenticateResult {
