@@ -281,6 +281,11 @@ const PAIRING_UI = Object.freeze({
     detail: "Open the selected Desktop or Relay entry and generate a new offer.",
     status: "The offer was not replayed on another route."
   },
+  access_error: {
+    title: "Desktop entry was blocked",
+    detail: "Check Tailscale, TLS, and Desktop remote access, then scan a new offer.",
+    status: "The app could not use the selected pairing entry."
+  },
   storage_error: {
     title: "This device could not be saved",
     detail: "Local secure storage did not verify the new credential.",
@@ -347,6 +352,7 @@ const PAIRING_SCAN_STATES = new Set([
   "expired",
   "invalid",
   "route_error",
+  "access_error",
   "scan_canceled",
   "camera_denied",
   "scanner_unavailable",
@@ -374,6 +380,9 @@ function pairingErrorState(error, phase = "pairing") {
   if (code.includes("expired")) return { state: "expired", code: parsed.code };
   if (code.includes("entry") || code.includes("route") || code.includes("candidate")) {
     return { state: "route_error", code: parsed.code };
+  }
+  if (code.includes("browser_network_policy") || code.includes("origin_rejected")) {
+    return { state: "access_error", code: parsed.code };
   }
   if (code.includes("storage")) return { state: "storage_error", code: parsed.code };
   if (code.includes("identity") || code.includes("server_pin")) {

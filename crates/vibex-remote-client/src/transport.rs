@@ -2958,6 +2958,8 @@ async fn http_json<T: DeserializeOwned>(request: reqwest::RequestBuilder) -> Bac
             let is_connect = false;
             let code = if error.is_timeout() {
                 "remote_http_timeout"
+            } else if cfg!(target_family = "wasm") {
+                "remote_browser_network_policy"
             } else if is_connect {
                 #[cfg(target_family = "wasm")]
                 {

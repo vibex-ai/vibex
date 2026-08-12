@@ -199,6 +199,7 @@ impl Default for RemoteGatewayConfig {
                 "https://localhost".to_string(),
                 "https://127.0.0.1".to_string(),
                 "https://[::1]".to_string(),
+                "capacitor://localhost".to_string(),
             ],
             static_dir: None,
             web_build: None,
@@ -3717,13 +3718,6 @@ fn origin_allowed(config: &RemoteGatewayConfig, origin: &str, request_host: &str
     {
         return false;
     }
-    let scheme_allowed = match config.tls_policy {
-        RemoteGatewayTlsPolicy::LoopbackHttp => matches!(url.scheme(), "http" | "https"),
-        RemoteGatewayTlsPolicy::TrustedHttpsProxy => url.scheme() == "https",
-    };
-    if !scheme_allowed {
-        return false;
-    }
     let explicitly_allowed = normalize_origin(origin).is_some_and(|origin| {
         config
             .allowed_origins
@@ -3731,6 +3725,18 @@ fn origin_allowed(config: &RemoteGatewayConfig, origin: &str, request_host: &str
             .filter_map(|allowed| normalize_origin(allowed))
             .any(|allowed| allowed == origin)
     });
+    let scheme_allowed = match config.tls_policy {
+        RemoteGatewayTlsPolicy::LoopbackHttp => {
+            matches!(url.scheme(), "http" | "https")
+                || (url.scheme() == "capacitor" && explicitly_allowed)
+        }
+        RemoteGatewayTlsPolicy::TrustedHttpsProxy => {
+            url.scheme() == "https" || (url.scheme() == "capacitor" && explicitly_allowed)
+        }
+    };
+    if !scheme_allowed {
+        return false;
+    }
     explicitly_allowed
         || origin_authority(&url)
             .zip(normalize_authority(request_host))
@@ -3810,7 +3816,7 @@ fn validate_origin_value(origin: &str) -> VibexResult<()> {
 
 fn normalize_origin(origin: &str) -> Option<String> {
     let url = Url::parse(origin.trim()).ok()?;
-    if !matches!(url.scheme(), "http" | "https")
+    if !matches!(url.scheme(), "http" | "https" | "capacitor")
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
@@ -3821,6 +3827,9 @@ fn normalize_origin(origin: &str) -> Option<String> {
         return None;
     }
     let host = url.host_str()?.to_ascii_lowercase();
+    if url.scheme() == "capacitor" && (host != "localhost" || url.port().is_some()) {
+        return None;
+    }
     let host = if host.parse::<std::net::Ipv6Addr>().is_ok() {
         format!("[{host}]")
     } else {
@@ -4721,6 +4730,57 @@ mod tests {
             allowed.headers().get(ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
             "http://127.0.0.1:1428"
         );
+    }
+
+    #[tokio::test]
+    async fn lan_security_perimeter_allows_exact_capacitor_origins_without_loopback_hosts() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = RemoteGatewayConfig::loopback_enabled("127.0.0.1:1428");
+        config.deployment_mode = RemoteGatewayDeploymentMode::Lan;
+        config.tls_policy = RemoteGatewayTlsPolicy::TrustedHttpsProxy;
+        config.allowed_hosts = vec!["desktop.tailnet.ts.net".to_string()];
+        config.allowed_origins = vec![
+            "https://desktop.tailnet.ts.net".to_string(),
+            "https://localhost".to_string(),
+            "capacitor://localhost".to_string(),
+        ];
+        let gateway = test_gateway(&directory, config);
+        let router = gateway.router().unwrap();
+
+        for origin in ["https://localhost", "capacitor://localhost"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method(Method::OPTIONS)
+                        .uri("/api/v2/pairing/claim")
+                        .header(HOST, "desktop.tailnet.ts.net")
+                        .header(ORIGIN, origin)
+                        .header("access-control-request-method", "POST")
+                        .header("access-control-request-headers", "content-type")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{origin}");
+            assert_eq!(
+                response.headers().get(ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+                origin
+            );
+        }
+
+        let loopback_host = router
+            .oneshot(
+                HttpRequest::get("/api/v2/info")
+                    .header(HOST, "localhost")
+                    .header(ORIGIN, "https://localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(loopback_host.status(), StatusCode::MISDIRECTED_REQUEST);
     }
 
     #[tokio::test]

@@ -211,6 +211,16 @@ VIBEX_WEB_GIT_COMMIT
   Relay origins retain system proxy behavior. Requested bypass must never fall
   back to a proxy-aware client or mutate process proxy variables/global proxy
   configuration.
+- A published Direct/Tailscale Gateway separates network Host authority from
+  native-client Origin authority. Allowed Hosts contain only the validated
+  published Direct origins. Android Capacitor `https://localhost` and iOS
+  Capacitor `capacitor://localhost` are exact Origin allowlist entries for
+  claim, ticket, and WebSocket requests; adding either client Origin must never
+  add `localhost` to the LAN Gateway Host allowlist.
+- Native secure storage maps only the platform plugin's exact missing-key
+  results to an unpaired device. Decryption, transport, and malformed-value
+  failures remain typed storage/credential errors and must not be treated as an
+  empty credential store.
 - Desktop pairing creates a 90-second offer through the controller with only the
   selected permission level; the Gateway injects every validated route. Status
   polling and cancel use the offer id and return only
@@ -290,6 +300,9 @@ VIBEX_WEB_GIT_COMMIT
 - Probe tests cover proxy bypass for Tailscale and private/Tailnet Direct origins,
   system proxy retention for public Direct origins, and fail-closed behavior when
   the proxy-bypassing client is unavailable.
+- Gateway perimeter tests cover Android/iOS Capacitor preflight from the exact
+  packaged-app origins while proving that the published LAN Host allowlist still
+  rejects `localhost`.
 - GPUI pairing tests cover the read-only default, all three permission choices,
   healthy preference fallback, entry switching without offer replacement,
   cancel/expiry/regenerate/close cleanup, narrow layout, clipboard failure, and

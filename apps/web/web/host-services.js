@@ -296,6 +296,14 @@ function createBrowserStorage(windowLike) {
   };
 }
 
+function secureStorageKeyMissing(error) {
+  const code = String(error?.code ?? "").toLowerCase();
+  const message = String(error?.message ?? error ?? "").toLowerCase();
+  return code === "not_found" ||
+    message === "key not found" ||
+    message === "item with given key does not exist";
+}
+
 function createSecureStorage(windowLike, capacitor) {
   const secure = plugin(capacitor, "SecureStoragePlugin");
   if (!secure || typeof secure.get !== "function" || typeof secure.set !== "function") {
@@ -311,7 +319,7 @@ function createSecureStorage(windowLike, capacitor) {
       } catch (error) {
         // The plugin uses a rejected promise for a missing key on some
         // platforms.  Treat only an explicit not-found result as empty.
-        if (error?.code === "not_found" || error?.message === "Key not found") return null;
+        if (secureStorageKeyMissing(error)) return null;
         throw Object.assign(new Error("secure storage read failed"), { code: errorCode(error, "secure_storage_read_failed") });
       }
     },

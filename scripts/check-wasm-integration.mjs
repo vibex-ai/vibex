@@ -92,6 +92,7 @@ function checkHostContracts() {
   assert(services.includes("function safeArea()") && services.includes("function viewport()"), "safe-area/viewport host capabilities are missing");
   assert(services.includes("share") && services.includes("openSystemUrl"), "share/system URL host capabilities are missing");
   assert(host.includes("pairing_preview") && host.includes("claim_pairing_fragment"), "Rust pairing bridge is not connected");
+  assert(host.includes('code.includes("browser_network_policy")') && host.includes('state: "access_error"'), "browser pairing policy failures still masquerade as Desktop offline");
   assert(host.indexOf("writeCredentialBundle(credentials)") < host.indexOf("configureRemote(credentials)"), "pairing credentials are not persisted before configure");
   assert(host.indexOf("const verified = await hostServices.readCredentialBundle()") < host.indexOf("configureRemote(credentials)"), "pairing credentials are not read back before configure");
   assert(host.indexOf("configureRemote(credentials)") < host.indexOf("await connectConfigured()", host.indexOf("configureRemote(credentials)")), "pairing runtime connects before configuration");
@@ -292,6 +293,34 @@ async function checkHostServiceRoundTrip() {
   };
   await services.writeCredentialBundle(bundle);
   assert((await services.readCredentialBundle()).expectedServerId === "desktop", "browser storage round-trip failed");
+
+  const nativeStorageWith = (get) => createHostServices({
+    windowLike: { ...windowLike, location: { href: "https://localhost/" } },
+    documentLike,
+    capacitor: {
+      isNativePlatform: () => true,
+      Plugins: {
+        SecureStoragePlugin: {
+          get,
+          async set() {},
+          async remove() {}
+        }
+      }
+    }
+  });
+  const emptyNativeStorage = nativeStorageWith(async () => {
+    throw new Error("Item with given key does not exist");
+  });
+  assert(await emptyNativeStorage.readCredentialBundle() === null, "Android missing secure-storage key is not an unpaired state");
+  let secureStorageFailure = null;
+  try {
+    await nativeStorageWith(async () => {
+      throw new Error("keystore decryption failed");
+    }).readCredentialBundle();
+  } catch (error) {
+    secureStorageFailure = error?.code ?? null;
+  }
+  assert(secureStorageFailure === "secure_storage_read_failed", "secure-storage corruption did not fail closed");
 
   const scannerWith = (scanBarcode) => createHostServices({
     windowLike: { ...windowLike, location: { href: "https://vibex.invalid/" } },

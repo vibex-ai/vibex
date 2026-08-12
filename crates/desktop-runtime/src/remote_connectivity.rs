@@ -55,6 +55,7 @@ const DIRECT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const DIRECT_PROBE_MAX_BYTES: usize = 128 * 1024;
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DESKTOP_BINARY_NAME: &str = "vibex-desktop";
+const CAPACITOR_CLIENT_ORIGINS: [&str; 2] = ["https://localhost", "capacitor://localhost"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -925,6 +926,26 @@ fn direct_probe_proxy_policy(origin: &str) -> DirectProbeProxyPolicy {
     }
 }
 
+fn gateway_authority_allowlists(network_origins: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let allowed_hosts = network_origins
+        .iter()
+        .filter_map(|origin| {
+            Url::parse(origin)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_string))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let allowed_origins = network_origins
+        .into_iter()
+        .chain(CAPACITOR_CLIENT_ORIGINS.map(str::to_string))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    (allowed_hosts, allowed_origins)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RelayPublicationInfo {
@@ -1716,6 +1737,7 @@ struct ControllerState {
 struct ControllerInner {
     store: RemoteConnectivityStore,
     gateway: RemoteGateway,
+    gateway_bind_addr: String,
     relay: RelayClientRuntime,
     tailscale: Arc<dyn TailscalePublication>,
     direct_probe: Arc<dyn DirectPublicationProbe>,
@@ -1762,9 +1784,10 @@ impl RemoteConnectivityController {
         tailscale: Arc<dyn TailscalePublication>,
         direct_probe: Arc<dyn DirectPublicationProbe>,
     ) -> VibexResult<Self> {
-        Self::with_publication_adapters(
+        Self::with_publication_adapters_at(
             home,
             gateway,
+            DIRECT_LOOPBACK_BIND_ADDR.to_string(),
             relay,
             tailscale,
             direct_probe,
@@ -1775,6 +1798,27 @@ impl RemoteConnectivityController {
     pub fn with_publication_adapters(
         home: impl AsRef<Path>,
         gateway: RemoteGateway,
+        relay: RelayClientRuntime,
+        tailscale: Arc<dyn TailscalePublication>,
+        direct_probe: Arc<dyn DirectPublicationProbe>,
+        relay_probe: Arc<dyn RelayPublicationProbe>,
+    ) -> VibexResult<Self> {
+        let gateway_bind_addr = gateway.current_config().service.bind_addr;
+        Self::with_publication_adapters_at(
+            home,
+            gateway,
+            gateway_bind_addr,
+            relay,
+            tailscale,
+            direct_probe,
+            relay_probe,
+        )
+    }
+
+    fn with_publication_adapters_at(
+        home: impl AsRef<Path>,
+        gateway: RemoteGateway,
+        gateway_bind_addr: String,
         relay: RelayClientRuntime,
         tailscale: Arc<dyn TailscalePublication>,
         direct_probe: Arc<dyn DirectPublicationProbe>,
@@ -1793,6 +1837,7 @@ impl RemoteConnectivityController {
             inner: Arc::new(ControllerInner {
                 store,
                 gateway,
+                gateway_bind_addr,
                 relay,
                 tailscale,
                 direct_probe,
@@ -2665,14 +2710,14 @@ impl RemoteConnectivityController {
     async fn configure_gateway(
         &self,
         routes: RemoteGatewayPairingRoutes,
-        allowed_origins: Vec<String>,
+        network_origins: Vec<String>,
         web_assets: Option<(PathBuf, WebBuildDescriptor)>,
         listener_enabled: bool,
     ) -> VibexResult<()> {
         let previous = self.inner.gateway.current_config();
         let mut config = previous.clone();
         config.pairing_routes = routes;
-        config.service.bind_addr = DIRECT_LOOPBACK_BIND_ADDR.to_string();
+        config.service.bind_addr = self.inner.gateway_bind_addr.clone();
         config.service.enabled = listener_enabled;
         config.deployment_mode = if listener_enabled {
             RemoteGatewayDeploymentMode::Lan
@@ -2684,25 +2729,11 @@ impl RemoteConnectivityController {
         } else {
             RemoteGatewayTlsPolicy::LoopbackHttp
         };
-        config.allowed_origins = if listener_enabled {
-            allowed_origins
+        (config.allowed_hosts, config.allowed_origins) = if listener_enabled {
+            gateway_authority_allowlists(network_origins)
         } else {
-            RemoteGatewayConfig::default().allowed_origins
-        };
-        config.allowed_hosts = if listener_enabled {
-            config
-                .allowed_origins
-                .iter()
-                .filter_map(|origin| {
-                    Url::parse(origin)
-                        .ok()
-                        .and_then(|url| url.host_str().map(str::to_string))
-                })
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect()
-        } else {
-            RemoteGatewayConfig::default().allowed_hosts
+            let defaults = RemoteGatewayConfig::default();
+            (defaults.allowed_hosts, defaults.allowed_origins)
         };
         if listener_enabled && config.allowed_hosts.is_empty() {
             return Err(VibexError::validation(
@@ -3435,6 +3466,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn gateway_allowlists_keep_capacitor_origins_out_of_lan_hosts() {
+        let (hosts, origins) = gateway_authority_allowlists(vec![
+            "https://desktop.tailnet.ts.net:8443".to_string(),
+            "https://direct.example.test".to_string(),
+        ]);
+
+        assert_eq!(
+            hosts,
+            vec![
+                "desktop.tailnet.ts.net".to_string(),
+                "direct.example.test".to_string(),
+            ]
+        );
+        assert!(origins.contains(&"https://desktop.tailnet.ts.net:8443".to_string()));
+        assert!(origins.contains(&"https://localhost".to_string()));
+        assert!(origins.contains(&"capacitor://localhost".to_string()));
+        assert!(!hosts.contains(&"localhost".to_string()));
+    }
+
     #[tokio::test]
     async fn direct_probe_fails_closed_when_bypass_client_is_unavailable() {
         let probe = HttpDirectPublicationProbe {
@@ -3588,7 +3639,7 @@ mod tests {
             vibex_remote::RemoteServiceConfig::loopback_disabled(),
         );
         let gateway = RemoteGateway::new(
-            RemoteGatewayConfig::default(),
+            RemoteGatewayConfig::loopback_enabled("127.0.0.1:0"),
             dispatcher.clone(),
             directory.join("vibex.db"),
             directory.join("relay/desktop-identity.json"),
@@ -4035,6 +4086,18 @@ mod tests {
                 .relay_candidate
                 .is_some()
         );
+        let config = gateway.current_config();
+        assert!(
+            config
+                .allowed_origins
+                .contains(&"https://localhost".to_string())
+        );
+        assert!(
+            config
+                .allowed_origins
+                .contains(&"capacitor://localhost".to_string())
+        );
+        assert!(!config.allowed_hosts.contains(&"localhost".to_string()));
         controller
             .disable_method(RemoteConnectivityMethod::Direct)
             .await
