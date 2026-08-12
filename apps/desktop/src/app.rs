@@ -6979,7 +6979,6 @@ impl VibexWorkbench {
         if record_history && navigation_changed {
             self.push_current_navigation_entry();
         }
-        self.agent_action_pending = self.pending_new_session.is_some();
         self.agent_turn_pending = self.session_turn_pending(&session_id);
         self.agent_error = None;
         self.timeline_scroll_to_latest_pending = false;
@@ -11696,9 +11695,6 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.agent_action_pending {
-            return;
-        }
         self.cancel_inline_user_message_edit(cx);
         self.reset_new_session_project_menu(window, cx);
         self.dismiss_sidebar_for_navigation();
@@ -11853,7 +11849,6 @@ impl VibexWorkbench {
         if let Some(message) = optimistic_message {
             self.install_optimistic_user_message(message);
         }
-        self.agent_action_pending = true;
         self.agent_loading = false;
         self.session_generation
     }
@@ -11912,20 +11907,19 @@ impl VibexWorkbench {
         self.agent_session_view_cache.remove(session_id.as_str());
         self.agent_session_view_lru
             .retain(|cached_session_id| cached_session_id != session_id.as_str());
-        self.agent_action_pending = false;
-        self.restore_new_session_message_draft(
-            draft.raw_text,
-            draft.attachments,
-            draft.command_entry,
-            window,
-            cx,
-        );
-        self.new_session_draft_initialized = true;
-        self.new_session_workspace.mark_failed(failure.code);
-        self.new_session_error = Some(failure.message);
         self.reconcile_sidebar_state();
 
-        if active {
+        if active && !self.new_session_open {
+            self.restore_new_session_message_draft(
+                draft.raw_text,
+                draft.attachments,
+                draft.command_entry,
+                window,
+                cx,
+            );
+            self.new_session_draft_initialized = true;
+            self.new_session_workspace.mark_failed(failure.code);
+            self.new_session_error = Some(failure.message);
             if let Some(previous_session_id) =
                 pending.previous_session_id.filter(|previous_session_id| {
                     self.sessions
@@ -12368,7 +12362,8 @@ impl VibexWorkbench {
     }
 
     fn submit_new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.new_session_open || self.agent_action_pending {
+        if !self.new_session_open || self.agent_action_pending || self.pending_new_session.is_some()
+        {
             return;
         }
         if self.new_session_input.update(cx, |input, cx| {
@@ -12741,10 +12736,14 @@ impl VibexWorkbench {
                                     None
                                 }
                             } else {
-                                this.agent_action_pending = false;
                                 None
                             };
-                            this.clear_submitted_new_session_draft(window, cx);
+                            // A user may have already opened and started a fresh draft while
+                            // this request was in flight. Do not erase that draft when the
+                            // earlier creation becomes authoritative.
+                            if !this.new_session_open {
+                                this.clear_submitted_new_session_draft(window, cx);
+                            }
                             this.refresh_workspace_contexts(cx);
                             cx.notify();
                             (created_session_id, turn_generation)
@@ -12762,7 +12761,6 @@ impl VibexWorkbench {
                 if let Some(session_id) = created_session_id.as_ref() {
                     this.set_session_turn_pending(session_id, false);
                 }
-                this.agent_action_pending = false;
                 match outcome {
                     Ok(Ok((
                         session_id,
@@ -16027,7 +16025,6 @@ impl VibexWorkbench {
                             .icon(Icon::new(IconName::Plus).mr_2())
                             .label(strings.sidebar_new_session)
                             .child(div().flex_1())
-                            .disabled(self.agent_action_pending)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.open_new_session(None, window, cx)
                             })),
@@ -16551,7 +16548,6 @@ impl VibexWorkbench {
                                 .h(px(24.0))
                                 .icon(IconName::Plus)
                                 .tooltip(new_session_label)
-                                .disabled(self.agent_action_pending)
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     cx.stop_propagation();
                                     this.open_new_session(
@@ -16855,7 +16851,6 @@ impl VibexWorkbench {
                         "在此工作区新建会话",
                         "在此工作區新增工作階段",
                     ))
-                    .disabled(self.agent_action_pending)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
                         this.open_new_session(
@@ -18613,6 +18608,7 @@ impl VibexWorkbench {
 
         let selected_agent_id = self.new_session_agent_id.clone();
         let has_agent_choices = !agent_choices.is_empty();
+        let creation_pending = self.pending_new_session.is_some();
         let card_color = theme::semantic_color("card", is_dark);
         let muted_color = theme::semantic_color("muted", is_dark);
         let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
@@ -19565,7 +19561,8 @@ impl VibexWorkbench {
             && has_agent_choices
             && self.new_session_runtime_selection.is_some()
             && worktree_form_valid
-            && !self.agent_action_pending;
+            && !self.agent_action_pending
+            && !creation_pending;
         let input_geometry_entity = cx.weak_entity();
         let surface_geometry_entity = cx.weak_entity();
         h_flex()
@@ -19907,7 +19904,7 @@ impl VibexWorkbench {
                                                                 .rounded(px(20.0))
                                                                 .icon(IconName::ArrowUp)
                                                                 .tooltip(strings.new_session_create)
-                                                                .loading(self.agent_action_pending)
+                                                                .loading(creation_pending)
                                                                 .disabled(!can_create)
                                                                 .on_click(cx.listener(
                                                                     |this, _, window, cx| {
@@ -38449,6 +38446,7 @@ mod tests {
         assert!(pending_open.contains("self.install_optimistic_user_message(message);"));
         assert!(pending_open.contains("self.set_session_turn_pending(&session_id, true);"));
         assert!(pending_open.contains("self.agent_loading = false;"));
+        assert!(!pending_open.contains("self.agent_action_pending = true;"));
     }
 
     #[test]
@@ -38467,14 +38465,12 @@ mod tests {
         let clear_pending = completion
             .find("this.set_session_turn_pending(session_id, false);")
             .expect("the initial turn should clear its local pending fence");
-        let clear_action = completion
-            .find("this.agent_action_pending = false;")
-            .expect("the new-session action lock should be released");
         let dispatch = completion
             .find("this.maybe_dispatch_next_composer_queue_message(")
             .expect("successful initial turns should advance the Composer queue");
 
-        assert!(clear_pending < clear_action && clear_action < dispatch);
+        assert!(clear_pending < dispatch);
+        assert!(!completion.contains("this.agent_action_pending = false;"));
         assert!(completion.contains("initial_message_completed"));
         assert!(completion.contains("ComposerQueueDispatchBehavior::AfterCompletion"));
         assert!(completion.contains("ComposerQueueDispatchBehavior::AfterInterrupt"));
@@ -38532,8 +38528,27 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn close_new_session("))
             .map(|(body, _)| body)
             .expect("new-session navigation should remain inspectable");
-        assert!(open_new_session.contains("if self.agent_action_pending"));
+        assert!(!open_new_session.contains("if self.agent_action_pending"));
         assert!(!open_new_session.contains("agent_turn_pending"));
+
+        let new_session_submit = source
+            .split_once("    fn submit_new_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn choose_runtime_selection("))
+            .map(|(body, _)| body)
+            .expect("new-session submission should remain inspectable");
+        assert!(new_session_submit.contains("self.pending_new_session.is_some()"));
+
+        let sidebar = source
+            .split_once("    fn render_agent_sidebar(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_project("))
+            .map(|(body, _)| body)
+            .expect("sidebar should remain inspectable");
+        let new_session_button = sidebar
+            .split_once("Button::new(\"sidebar-new-session\")")
+            .and_then(|(_, tail)| tail.split_once("Button::new(\"sidebar-config-center\")"))
+            .map(|(body, _)| body)
+            .expect("sidebar New Session button should remain inspectable");
+        assert!(!new_session_button.contains(".disabled(self.agent_action_pending)"));
 
         let runtime_switch = source
             .split_once("    fn request_runtime_selection(")
