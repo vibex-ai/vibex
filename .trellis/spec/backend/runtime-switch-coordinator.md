@@ -312,7 +312,7 @@ executor.activate(&target).await?;
 ### 1. Scope / Trigger
 
 - Trigger: an ordinary ACP session is created, queries or changes its
-  product-level Agent/Profile/Model selection, cancels a pending seamless
+  product-level Agent/authentication-source/model selection, cancels a pending seamless
   change, or resumes a durable switch after restart.
 - `RuntimeSelectionService` owns the provider-neutral desired/effective API;
   SQLite remains authoritative and ACP owns only process, attachment and
@@ -581,7 +581,7 @@ SwitchTargetExecutor::build_context_delta(intent, prepared_attachment)
   file contents, or terminal output. The fingerprint is lowercase SHA-256 over
   the versioned canonical sanitized projection.
 - Restore prefers an exact-compatible or explicitly probeable ACP source.
-  Otherwise it selects an Inactive binding with exact Agent/Profile/Adapter,
+  Otherwise it selects an Inactive binding with exact Agent/auth source/Adapter,
   ACP transport, state-home, adapter-compatibility and resume identities. A
   newly reserved target binding keeps its own id/generation and copies the
   selected origin's `last_context_sequence`, `last_summary_sequence`, and
@@ -834,4 +834,157 @@ list candidate hints
 Tauri synchronous setup
   -> pass Tauri's Tokio runtime handle to lifecycle start
   -> schedule the sweep through the explicit handle
+```
+
+## Scenario: Authentication-Source-Aware Runtime Switch
+
+### 1. Scope / Trigger
+
+- Trigger: one logical session changes between a Provider Profile and an
+  Agent's default authenticated account, changes back, or selects another
+  Agent while preserving its authoritative Timeline.
+- The existing reserve/prepare/commit/activate coordinator remains the only
+  switch path. Authentication source is part of target identity and never an
+  in-process credential mutation during an active turn.
+
+### 2. Signatures
+
+```text
+SessionRuntimeSelection {
+  agent_id,
+  auth_source: ProviderProfile { provider_profile_id }
+             | AgentAccount { auth_context_id },
+  model: Explicit { model_id } | AgentDefault,
+  reasoning_effort?, mode_id?, config_values
+}
+
+ResolvedRuntimeSelection {
+  adapter_id, auth_source_revision, session_config?
+}
+
+RuntimeSwitchRequest {
+  session_id, idempotency_key, expected_revision,
+  expected_current_binding_id?, desired_selection_revision,
+  target_adapter_id, target_auth_source_revision,
+  target_selection, requested_policy, active_work_policy,
+  requested_session_config?
+}
+
+RuntimeBinding {
+  ..., auth_source, auth_source_revision,
+  native_state_home_id, process_spawn_fingerprint,
+  restore_compatibility_key, activation_generation
+}
+```
+
+### 3. Contracts
+
+- Resolution validates the selected source belongs to the selected Agent and
+  returns its current revision before the durable switch is enqueued. A
+  Provider source uses its Profile revision; an Agent account requires an
+  `Authenticated` context and no active authentication operation.
+- `target_auth_source` and `target_auth_source_revision` are persisted in the
+  switch row before any process/session side effect. The prepared binding must
+  carry the exact same source and revision or preparation/commit fails closed.
+- Provider launches retain Provider projection and isolated Provider state-home
+  behavior. Agent-account launches use the Agent default state home, omit
+  Provider projection, and unset the Registry-declared credential/provider
+  environment keys. Login, model discovery, and session launch fingerprints
+  are derived from the same context.
+- `AgentDefault` omits a model override. Config convergence accepts a missing
+  explicit model only for this semantic variant; a later Agent-reported model
+  is effective evidence, not a rewrite of desired selection.
+- Restore compatibility includes Agent, ACP adapter compatibility, auth-source
+  kind/id/revision, native state-home identity, runtime fingerprint, workspace,
+  and native-session encoding. Different source kinds or a relogin revision are
+  incompatible unless an Agent-specific descriptor explicitly proves safety.
+- Provider -> AgentAccount and AgentAccount -> Provider use restart-and-resume
+  only when the exact restore key proves compatibility; otherwise they create a
+  quarantined fresh target and Context Bridge before Commit. Returning to a
+  historical source may reuse only a binding with the same current revision.
+- Desired changes immediately and remains durable. Effective selection/current
+  binding change only in the coordinator's atomic Commit. Any source, model,
+  verification, restore, bridge, or config failure keeps the old effective
+  binding and exposes an actionable failure; it never chooses another source.
+- Active turn, permission, Agent terminal, and background work follow the same
+  Wait/Reject/Cancel policy already defined by the coordinator. A source change
+  never mutates credentials inside the running process.
+- Startup reconciliation revalidates the target source revision before
+  continuing Prepared/Committing work. A revision mismatch supersedes/fails the
+  stale intent and never activates its process.
+- A structured authentication-required error for the current Agent-account
+  binding invalidates that exact context revision and closes account processes.
+  Sessions retain desired/effective audit history and require explicit relogin
+  and retry; Provider sources are not selected implicitly.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Source id belongs to another Agent | `agent_auth_context_agent_mismatch` or `provider_profile_route_mismatch`; zero switch side effects. |
+| Account context is not authenticated | `agent_authentication_required`; source remains current. |
+| Authentication operation is active | `agent_authentication_operation_in_progress`; do not resolve an intermediate revision. |
+| Source revision changes after resolve | revision conflict/superseded switch; prepared target never commits. |
+| Explicit account model is not in current snapshot | `agent_auth_model_no_longer_available`; old effective binding remains. |
+| `AgentDefault` is selected | omit model override; do not serialize `default` as a provider model. |
+| Prepared binding source/revision differs from intent | `runtime_switch_prepared_binding_mismatch`; fail closed. |
+| Restore candidate uses another source/revision/home | mark incompatible and use fresh-and-bridge when policy permits. |
+| Authentication expires during a turn | invalidate the exact account revision, fail the turn safely, and never auto-fallback. |
+| App restarts with stale pending account revision | reconciliation re-resolves/revalidates; do not activate stale credentials. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: a Provider-backed session selects the verified Codex default account,
+  waits for the current turn, prepares a fresh account process, bridges missing
+  Timeline context, commits, then later returns to the unchanged Provider
+  binding.
+- Good: account revision changes while a target is Prepared; Commit is rejected,
+  the Provider source stays effective, and the user sees a relogin/retry action.
+- Base: the account has no model catalog, so `AgentDefault` prepares and commits
+  with no model mutation while the Agent may report an effective model later.
+- Bad: reuse a process pool keyed only by Agent id, restore a native session
+  created under another source revision, or update effective selection before
+  the target has converged.
+- Bad: automatically switch to a Provider after account authentication fails;
+  that changes billing, organization, and data-routing boundaries without user
+  consent.
+
+### 6. Tests Required
+
+- Resolver tests cover Provider and AgentAccount revision lookup, Agent/source
+  mismatch, active authentication operations, and `AgentDefault` config shape.
+- Repository tests cover source kind/id/revision round trips, legacy Provider
+  backfill, nullable legacy Profile columns, and source/revision commit fences.
+- Coordinator tests cover both switch directions, cross-Agent accounts,
+  historical return, revision changes before Commit, active-work wait, failure
+  rollback, caller drop, and startup reconciliation.
+- ACP tests assert Provider projection is present only for Provider sources,
+  Registry env unsets are present only for Agent accounts, and process reuse
+  keys include source kind/id/revision.
+- Message/Timeline tests assert the next prompt reaches only the committed
+  binding and attribution remains attached to the source that executed each
+  historical turn.
+- Usage tests assert the same source/revision fence reaches execution facts and
+  that Agent-account facts are not attributed to a synthetic Provider Profile.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+current_process.env = account_credentials
+effective.provider_profile_id = synthetic_profile
+send_next_prompt()
+```
+
+#### Correct
+
+```text
+resolve (auth_source, revision)
+  -> persist desired + switch intent
+  -> wait for active work
+  -> prepare exact-source process/session in quarantine
+  -> revalidate source revision and requested config
+  -> atomically commit effective binding
+  -> activate target and retire/warm the old source
 ```

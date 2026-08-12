@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc};
 use vibex_core::{
-    AgentAuthCatalog, AgentAuthenticateRequest, AgentAuthenticateResult,
+    AgentAuthCatalog, AgentAuthContextStatus, AgentAuthenticateRequest, AgentAuthenticateResult,
     AgentAuthenticationCancelRequest, AgentCommandDiscoverRequest, AgentCommandDiscoverResponse,
     AgentCommandEntry, AgentCommandExecuteRequest, AgentCommandExecuteResult,
     AgentCommandExecuteStatus, AgentCommandExecutionBehavior, AgentCommandSelectionBehavior,
@@ -24,20 +24,21 @@ use vibex_core::{
     ProviderCapabilitiesResponse, ProviderDefaultScopeKind, ProviderKind, ProviderNativeBinding,
     ProviderProfileDefaultScope, ProviderProfileId, ProviderProfileStatus,
     RenameAgentSessionRequest, ResolveElicitationRequest, ResolvePermissionRequest,
-    SendAgentMessageRequest, SessionRuntimeSelection, SessionRuntimeSelectionStatus,
-    SystemNoticeLevel, SystemNoticePayload, TimelineErrorPayload, TimelineItem, TimelineLiveEvent,
-    TimelinePage, TimelinePayload, TimelineRedactionState, TimelineSource, TransportKind,
-    TurnExecutionAttribution, UsageExecutionId, UserMessagePayload, VibexError, VibexResult,
-    VibexSessionId, WorkspaceId, agent_id_for_provider_kind,
+    RuntimeModelSelection, SendAgentMessageRequest, SessionRuntimeSelection,
+    SessionRuntimeSelectionStatus, SystemNoticeLevel, SystemNoticePayload, TimelineErrorPayload,
+    TimelineItem, TimelineLiveEvent, TimelinePage, TimelinePayload, TimelineRedactionState,
+    TimelineSource, TransportKind, TurnExecutionAttribution, UsageExecutionId, UserMessagePayload,
+    VibexError, VibexResult, VibexSessionId, WorkspaceId, agent_id_for_provider_kind,
     agent_session_turn_requires_continuation, builtin_agent_definitions,
     latest_timeline_turn_ended_normally, unix_timestamp_ms,
 };
 use vibex_db::{
-    AgentConfigRepository, AgentDefaultModelProviderProfileRepository,
-    AgentSessionRuntimeRepository, DbConnection, ElicitationRepository, McpServerRepository,
-    MessageSubmissionRepository, PermissionRepository, PromptRepository, ProviderProfileRepository,
-    RuntimeBindingRepository, RuntimeSwitchRepository, SessionRepository, SkillRepository,
-    TimelineAppend, TimelineRepository, WorkspaceRepository, apply_migrations, open_database,
+    AgentAuthContextRepository, AgentAuthenticationOperationRepository, AgentConfigRepository,
+    AgentDefaultModelProviderProfileRepository, AgentSessionRuntimeRepository, DbConnection,
+    ElicitationRepository, McpServerRepository, MessageSubmissionRepository, PermissionRepository,
+    PromptRepository, ProviderProfileRepository, RuntimeBindingRepository, RuntimeSwitchRepository,
+    SessionRepository, SkillRepository, TimelineAppend, TimelineRepository, WorkspaceRepository,
+    apply_migrations, open_database,
 };
 
 use crate::adapter::{
@@ -249,6 +250,14 @@ impl AgentManager {
         self.resolve_runtime_resources(provider_kind, provider_profile_id)
     }
 
+    pub fn runtime_resources_for_agent(
+        &self,
+        agent_id: &AgentId,
+        provider_kind: ProviderKind,
+    ) -> VibexResult<ProviderRuntimeResources> {
+        self.resolve_runtime_resources_for_agent(agent_id, provider_kind)
+    }
+
     pub(crate) fn resolve_initial_runtime_selection(
         &self,
         requested_profile_id: Option<ProviderProfileId>,
@@ -339,8 +348,8 @@ impl AgentManager {
 
         Ok(SessionRuntimeSelection {
             agent_id,
-            provider_profile_id,
-            model_id,
+            auth_source: vibex_core::RuntimeAuthSource::provider_profile(provider_profile_id),
+            model: RuntimeModelSelection::explicit(model_id),
             reasoning_effort: normalize_reasoning_effort(profile.reasoning_effort.as_deref())?,
             mode_id: None,
             config_values: Default::default(),
@@ -460,33 +469,73 @@ impl AgentManager {
         let safety = request
             .safety
             .unwrap_or_else(AgentSessionSafety::workspace_write_ask_on_risk);
-        desired.model_id = desired.model_id.trim().to_string();
-        if desired.model_id.is_empty() {
-            return Err(VibexError::validation(
-                "runtime_selection_model_required",
-                "Agent session creation requires a concrete Catalog model",
-            ));
+        if let RuntimeModelSelection::Explicit { model_id } = &mut desired.model {
+            *model_id = model_id.trim().to_string();
+            if model_id.is_empty() {
+                return Err(VibexError::validation(
+                    "runtime_selection_model_required",
+                    "Agent session creation requires a concrete Catalog model",
+                ));
+            }
         }
         desired.reasoning_effort = normalize_reasoning_effort(desired.reasoning_effort.as_deref())?;
 
         let mut conn = self.open_migrated()?;
         let (_project, workspace) =
             WorkspaceRepository::ensure(&conn, &request.workspace_root, request.workspace_mode)?;
-        let profile = ProviderProfileRepository::get(&conn, &desired.provider_profile_id)?
-            .ok_or_else(|| {
-                VibexError::validation(
-                    "provider_profile_not_found",
-                    "Provider Profile was not found",
-                )
-            })?;
-        if profile.agent_id != desired.agent_id
-            || profile.kind != ProviderKind::Acp
-            || profile.status != ProviderProfileStatus::Enabled
-        {
-            return Err(VibexError::validation(
-                "provider_profile_route_mismatch",
-                "Provider Profile is not enabled for the requested ACP Agent",
-            ));
+        match &desired.auth_source {
+            vibex_core::RuntimeAuthSource::ProviderProfile {
+                provider_profile_id,
+            } => {
+                let profile = ProviderProfileRepository::get(&conn, provider_profile_id)?
+                    .ok_or_else(|| {
+                        VibexError::validation(
+                            "provider_profile_not_found",
+                            "Provider Profile was not found",
+                        )
+                    })?;
+                if profile.agent_id != desired.agent_id
+                    || profile.kind != ProviderKind::Acp
+                    || profile.status != ProviderProfileStatus::Enabled
+                {
+                    return Err(VibexError::validation(
+                        "provider_profile_route_mismatch",
+                        "Provider Profile is not enabled for the requested ACP Agent",
+                    ));
+                }
+            }
+            vibex_core::RuntimeAuthSource::AgentAccount { auth_context_id } => {
+                let context = AgentAuthContextRepository::get_by_id(&conn, auth_context_id)?
+                    .ok_or_else(|| {
+                        VibexError::validation(
+                            "agent_auth_context_not_found",
+                            "Agent authentication context was not found",
+                        )
+                    })?;
+                if context.agent_id != desired.agent_id {
+                    return Err(VibexError::validation(
+                        "agent_auth_context_agent_mismatch",
+                        "Agent authentication context belongs to another Agent",
+                    ));
+                }
+                if context.status != AgentAuthContextStatus::Authenticated {
+                    return Err(VibexError::validation(
+                        "agent_authentication_required",
+                        "Agent default account must be verified before creating a session",
+                    ));
+                }
+                if AgentAuthenticationOperationRepository::get_active_for_context(
+                    &conn,
+                    auth_context_id,
+                )?
+                .is_some()
+                {
+                    return Err(VibexError::conflict(
+                        "agent_authentication_operation_in_progress",
+                        "Agent account authentication must finish before creating a session",
+                    ));
+                }
+            }
         }
         let now = unix_timestamp_ms();
         let session = AgentSession {
@@ -1040,8 +1089,8 @@ impl AgentManager {
             })?;
             let (selection, _binding, _identity, _route_key) =
                 self.durable_session_execution(&conn, &session)?;
+            request.provider_profile_id = selection.provider_profile_id().cloned();
             request.agent_id = Some(selection.agent_id);
-            request.provider_profile_id = Some(selection.provider_profile_id);
             if request.workspace_id.is_none() {
                 request.workspace_id = Some(session.workspace_id);
             }
@@ -1137,7 +1186,7 @@ impl AgentManager {
         let (selection, _binding, _identity, route_key) =
             self.durable_session_execution(&conn, &session)?;
         let provider = self.runtime(&route_key)?;
-        let capabilities = provider.capabilities_for_profile(Some(&selection.provider_profile_id));
+        let capabilities = provider.capabilities_for_profile(selection.provider_profile_id());
         if !capabilities.slash_commands {
             return Err(VibexError::capability(
                 "acp_slash_commands_unsupported",
@@ -1614,7 +1663,7 @@ impl AgentManager {
             }
         };
         let runtime_resources =
-            match self.resolve_runtime_resources(ProviderKind::Acp, &binding.provider_profile_id) {
+            match self.resolve_runtime_resources_for_agent(&session.agent_id, ProviderKind::Acp) {
                 Ok(resources) => resources,
                 Err(error) => {
                     return ProviderTurnAttemptOutcome::Failure(ProviderTurnAttemptFailure {
@@ -1683,7 +1732,8 @@ impl AgentManager {
                         binding_id: identity.binding_id.clone(),
                         activation_generation: identity.activation_generation,
                         agent_id: session.agent_id.clone(),
-                        provider_profile_id: binding.provider_profile_id.clone(),
+                        auth_source: binding.auth_source.clone(),
+                        auth_source_revision: binding.auth_source_revision,
                         model_id: identity.model_id.clone(),
                     },
                 });
@@ -1812,12 +1862,21 @@ impl AgentManager {
         let agent_id = ProviderProfileRepository::get(&conn, provider_profile_id)?
             .map(|profile| profile.agent_id)
             .unwrap_or_else(|| agent_id_for_provider_kind(provider_kind));
+        self.resolve_runtime_resources_for_agent(&agent_id, provider_kind)
+    }
+
+    fn resolve_runtime_resources_for_agent(
+        &self,
+        agent_id: &AgentId,
+        provider_kind: ProviderKind,
+    ) -> VibexResult<ProviderRuntimeResources> {
+        let conn = self.open_migrated()?;
         let mcp_servers =
-            McpServerRepository::list_enabled_for_agent(&conn, &agent_id, provider_kind)?
+            McpServerRepository::list_enabled_for_agent(&conn, agent_id, provider_kind)?
                 .into_iter()
                 .filter_map(runtime_mcp_server_from_record)
                 .collect();
-        let skills = SkillRepository::list_enabled_for_agent(&conn, &agent_id, provider_kind)?
+        let skills = SkillRepository::list_enabled_for_agent(&conn, agent_id, provider_kind)?
             .into_iter()
             .map(|skill| ProviderRuntimeSkill {
                 id: skill.id.as_str().to_string(),
@@ -1843,7 +1902,7 @@ impl AgentManager {
         let (selection, binding, _identity, route_key) =
             self.durable_session_execution(&conn, &session)?;
         let provider = self.runtime(&route_key)?;
-        let capabilities = provider.capabilities_for_profile(Some(&selection.provider_profile_id));
+        let capabilities = provider.capabilities_for_profile(selection.provider_profile_id());
         if !capabilities.permission_requests {
             return Err(VibexError::capability(
                 "acp_permission_resolution_unsupported",
@@ -1958,7 +2017,7 @@ impl AgentManager {
         let (selection, binding, execution_identity, route_key) =
             self.durable_session_execution(&conn, &session)?;
         let provider = self.runtime(&route_key)?;
-        let capabilities = provider.capabilities_for_profile(Some(&selection.provider_profile_id));
+        let capabilities = provider.capabilities_for_profile(selection.provider_profile_id());
         if !capabilities.elicitation {
             return Err(VibexError::capability(
                 "acp_elicitation_resolution_unsupported",
@@ -2083,7 +2142,7 @@ impl AgentManager {
             Err(error) => return Err(error),
         };
         let provider = self.runtime(&route_key)?;
-        let capabilities = provider.capabilities_for_profile(Some(&selection.provider_profile_id));
+        let capabilities = provider.capabilities_for_profile(selection.provider_profile_id());
         if !capabilities.interrupt {
             return Err(VibexError::capability(
                 "acp_interrupt_unsupported",
@@ -2225,7 +2284,7 @@ impl AgentManager {
             })?;
             let (selection, _binding, _identity, _route_key) =
                 self.durable_session_execution(&conn, &session)?;
-            request.provider_profile_id = Some(selection.provider_profile_id);
+            request.provider_profile_id = selection.provider_profile_id().cloned();
             request.agent_id = Some(selection.agent_id);
         }
         let agent_id = request.agent_id.clone().ok_or_else(|| {
@@ -2397,6 +2456,16 @@ impl AgentManager {
             self.resolve_enabled_agent(Some(request.agent_id.clone()), ProviderKind::Acp, false)?;
         let provider = self.runtime(&self.route_for_agent(&resolved_agent.agent_id)?)?;
         provider.cancel_agent_authentication(request).await
+    }
+
+    pub async fn complete_agent_authentication(
+        &self,
+        request: vibex_core::AgentAuthenticationCompleteRequest,
+    ) -> VibexResult<bool> {
+        let resolved_agent =
+            self.resolve_enabled_agent(Some(request.agent_id.clone()), ProviderKind::Acp, false)?;
+        let provider = self.runtime(&self.route_for_agent(&resolved_agent.agent_id)?)?;
+        provider.complete_agent_authentication(request).await
     }
 
     pub async fn logout_agent(&self, request: AgentLogoutRequest) -> VibexResult<()> {
@@ -2678,7 +2747,7 @@ impl AgentManager {
         correlation_id: Option<&vibex_core::CorrelationId>,
     ) -> VibexResult<Vec<TimelineItem>> {
         let capabilities =
-            provider.capabilities_for_profile(Some(&required_runtime.provider_profile_id));
+            provider.capabilities_for_profile(required_runtime.provider_profile_id());
         let resource_summary = turn_resource_summary(
             conn,
             &required_runtime.agent_id,
@@ -2934,7 +3003,7 @@ impl AgentManager {
         let config = &runtime_binding.session_runtime_config_state;
         if runtime_binding.session_id != session.id
             || runtime_binding.agent_id != required_runtime.agent_id
-            || runtime_binding.provider_profile_id != required_runtime.provider_profile_id
+            || runtime_binding.auth_source != required_runtime.auth_source
             || runtime_binding.transport_kind != TransportKind::Acp
             || runtime_binding.binding_state != BindingState::Current
             || runtime_binding.activation_generation != activation_generation
@@ -2952,10 +3021,13 @@ impl AgentManager {
                 "committed runtime binding has no native session",
             )
         })?;
-        let mut metadata = vec![ProviderBindingMetadata {
-            key: PROVIDER_SELECTED_MODEL_METADATA_KEY.to_string(),
-            value: required_runtime.model_id.clone(),
-        }];
+        let mut metadata = Vec::new();
+        if let Some(model_id) = required_runtime.model_id() {
+            metadata.push(ProviderBindingMetadata {
+                key: PROVIDER_SELECTED_MODEL_METADATA_KEY.to_string(),
+                value: model_id.to_string(),
+            });
+        }
         if let Some(reasoning_effort) = required_runtime.reasoning_effort.as_deref() {
             metadata.push(ProviderBindingMetadata {
                 key: PROVIDER_SELECTED_REASONING_EFFORT_METADATA_KEY.to_string(),
@@ -2970,7 +3042,8 @@ impl AgentManager {
         let binding = ProviderBinding {
             session_id: session.id.clone(),
             provider_kind: ProviderKind::Acp,
-            provider_profile_id: runtime_binding.provider_profile_id,
+            auth_source: runtime_binding.auth_source.clone(),
+            auth_source_revision: runtime_binding.auth_source_revision,
             native: ProviderNativeBinding {
                 native_session_id: Some(native_session_id),
                 native_thread_id: None,
@@ -2984,7 +3057,7 @@ impl AgentManager {
         let identity = ProviderTurnExecutionIdentity {
             binding_id: runtime_binding.binding_id,
             activation_generation,
-            model_id: required_runtime.model_id.clone(),
+            model_id: config.effective_model.clone(),
         };
         Ok((binding, identity, route_key))
     }
@@ -3027,46 +3100,155 @@ impl AgentManager {
         identity: &ProviderTurnExecutionIdentity,
     ) -> VibexResult<TurnExecutionAttribution> {
         let conn = self.open_migrated()?;
-        let profile = ProviderProfileRepository::get(&conn, &binding.provider_profile_id)?
+        let runtime_binding = RuntimeBindingRepository::get(&conn, &identity.binding_id)?
             .ok_or_else(|| {
                 VibexError::storage(
-                    "turn_execution_profile_missing",
-                    "provider profile for turn execution attribution was not found",
+                    "turn_execution_binding_missing",
+                    "runtime binding for turn execution attribution was not found",
                 )
             })?;
+        if runtime_binding.auth_source != binding.auth_source {
+            return Err(VibexError::conflict(
+                "turn_execution_auth_source_mismatch",
+                "turn execution authentication source no longer matches its binding",
+            ));
+        }
+        let agent_id = runtime_binding.agent_id.clone();
         let definition = builtin_agent_definitions()
             .into_iter()
-            .find(|definition| definition.id == profile.agent_id)
-            .ok_or_else(|| {
-                VibexError::storage(
-                    "turn_execution_agent_missing",
-                    "Agent definition for turn execution attribution was not found",
-                )
-            })?;
-        let config = AgentConfigRepository::get(&conn, &profile.agent_id)?;
+            .find(|definition| definition.id == agent_id);
+        let config = AgentConfigRepository::get(&conn, &agent_id)?;
         let agent_label = config
             .as_ref()
             .and_then(|config| config.label_override.as_deref())
             .map(str::trim)
             .filter(|label| !label.is_empty())
-            .unwrap_or(&definition.label);
-        let model_label = profile
-            .configured_models
-            .iter()
-            .find(|model| model.id == identity.model_id)
-            .and_then(|model| model.display_name.as_deref())
-            .map(str::trim)
-            .filter(|label| !label.is_empty())
-            .unwrap_or(&identity.model_id);
+            .or_else(|| {
+                definition
+                    .as_ref()
+                    .map(|definition| definition.label.as_str())
+            })
+            .map(str::to_owned)
+            .unwrap_or_else(|| agent_id.to_string());
+        let effective_model_id = identity.model_id.as_deref();
+        // Older callers can provide a committed ProviderBinding without the
+        // newer session-runtime projection. Preserve that compatibility by
+        // deriving a conservative selection from the binding/config while
+        // retaining the strict source check whenever durable state exists.
+        let fallback_runtime_selection = || SessionRuntimeSelection {
+            agent_id: agent_id.clone(),
+            auth_source: binding.auth_source.clone(),
+            model: effective_model_id
+                .map(str::to_owned)
+                .map(RuntimeModelSelection::explicit)
+                .unwrap_or(RuntimeModelSelection::AgentDefault),
+            reasoning_effort: runtime_binding
+                .session_runtime_config_state
+                .effective_reasoning_effort
+                .clone(),
+            mode_id: runtime_binding
+                .session_runtime_config_state
+                .effective_mode
+                .clone(),
+            config_values: runtime_binding
+                .session_runtime_config_state
+                .config_values
+                .iter()
+                .filter_map(|(key, value)| {
+                    value
+                        .effective
+                        .as_ref()
+                        .map(|value| (key.clone(), value.value.clone()))
+                })
+                .collect(),
+        };
+        let runtime_selection = match AgentSessionRuntimeRepository::get_runtime_state(
+            &conn,
+            &binding.session_id,
+        )? {
+            Some(session_state) => {
+                let selection = match session_state.effective_runtime_selection {
+                    Some(selection) => selection,
+                    None if session_state.current_binding_id.is_none()
+                        && session_state.desired_runtime_selection.is_none()
+                        && session_state.runtime_selection_status.is_none() =>
+                    {
+                        fallback_runtime_selection()
+                    }
+                    None => {
+                        return Err(VibexError::storage(
+                            "turn_execution_runtime_selection_missing",
+                            "runtime selection for turn execution attribution was not found",
+                        ));
+                    }
+                };
+                if selection.auth_source != binding.auth_source {
+                    return Err(VibexError::conflict(
+                        "turn_execution_auth_source_mismatch",
+                        "turn execution authentication source no longer matches the effective runtime",
+                    ));
+                }
+                selection
+            }
+            None => fallback_runtime_selection(),
+        };
+        let (auth_source_label, model_label) = match &binding.auth_source {
+            vibex_core::RuntimeAuthSource::ProviderProfile {
+                provider_profile_id,
+            } => {
+                let profile = ProviderProfileRepository::get(&conn, provider_profile_id)?
+                    .ok_or_else(|| {
+                        VibexError::storage(
+                            "turn_execution_profile_missing",
+                            "Provider Profile for turn execution attribution was not found",
+                        )
+                    })?;
+                let effective_model_id = effective_model_id.ok_or_else(|| {
+                    VibexError::storage(
+                        "turn_execution_model_missing",
+                        "Provider turn execution did not report an effective model",
+                    )
+                })?;
+                let model_label = profile
+                    .configured_models
+                    .iter()
+                    .find(|model| model.id == effective_model_id)
+                    .and_then(|model| model.display_name.as_deref())
+                    .map(str::trim)
+                    .filter(|label| !label.is_empty())
+                    .unwrap_or(effective_model_id)
+                    .to_string();
+                (profile.display_name, model_label)
+            }
+            vibex_core::RuntimeAuthSource::AgentAccount { auth_context_id } => {
+                let context = AgentAuthContextRepository::get_by_id(&conn, auth_context_id)?
+                    .ok_or_else(|| {
+                        VibexError::storage(
+                            "turn_execution_auth_context_missing",
+                            "Agent account for turn execution attribution was not found",
+                        )
+                    })?;
+                let label = context
+                    .account_hint
+                    .filter(|hint| !hint.trim().is_empty())
+                    .map(|hint| format!("Default CLI account - {hint}"))
+                    .unwrap_or_else(|| "Default CLI account".to_string());
+                let model_label = effective_model_id
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "Agent default".to_string());
+                (label, model_label)
+            }
+        };
 
         TurnExecutionAttribution::new(
-            profile.agent_id,
-            profile.id,
+            agent_id,
+            binding.auth_source.clone(),
+            runtime_selection.model,
             identity.model_id.clone(),
             identity.binding_id.clone(),
             identity.activation_generation,
             agent_label,
-            profile.display_name,
+            auth_source_label,
             model_label,
         )
         .ok_or_else(|| {
@@ -3847,17 +4029,14 @@ mod tests {
             agent_id.clone(),
             AgentSessionState::Idle,
         );
-        let selection = SessionRuntimeSelection {
-            agent_id: agent_id.clone(),
-            provider_profile_id: provider_profile_id.clone(),
-            model_id: "elicitation-test-model".to_string(),
-            reasoning_effort: None,
-            mode_id: None,
-            config_values: Default::default(),
-        };
+        let selection = SessionRuntimeSelection::provider(
+            agent_id.clone(),
+            provider_profile_id.clone(),
+            "elicitation-test-model",
+        );
         let mut runtime_config = SessionRuntimeConfigState {
-            preferred_model: Some(selection.model_id.clone()),
-            effective_model: Some(selection.model_id.clone()),
+            preferred_model: selection.model_id().map(str::to_string),
+            effective_model: selection.model_id().map(str::to_string),
             ..SessionRuntimeConfigState::default()
         };
         runtime_config.mark_generation_if_converged(0);
@@ -3867,7 +4046,8 @@ mod tests {
             session_id: session.id.clone(),
             agent_id: agent_id.clone(),
             transport_kind: TransportKind::Acp,
-            provider_profile_id,
+            auth_source: selection.auth_source.clone(),
+            auth_source_revision: 1,
             adapter_id: adapter_id.clone(),
             adapter_version: "1.0.0".to_string(),
             adapter_compatibility_identity: "elicitation-test-acp@1".to_string(),
@@ -3878,7 +4058,6 @@ mod tests {
             session_runtime_config_state: runtime_config,
             capability_snapshot: None,
             restore_compatibility_key: None,
-            profile_revision: 1,
             last_context_sequence: 0,
             last_summary_sequence: 0,
             context_bridge_version: 0,
@@ -3899,7 +4078,7 @@ mod tests {
             identity: ProviderTurnExecutionIdentity {
                 binding_id: binding.binding_id.clone(),
                 activation_generation: binding.activation_generation,
-                model_id: selection.model_id.clone(),
+                model_id: Some(selection.model_id().unwrap().to_string()),
             },
             callback_started: tokio::sync::Notify::new(),
             callback_release: tokio::sync::Notify::new(),
@@ -4129,7 +4308,10 @@ mod tests {
                 session_id: session.id.clone(),
                 agent_id,
                 transport_kind: TransportKind::Acp,
-                provider_profile_id: provider_profile_id.clone(),
+                auth_source: vibex_core::RuntimeAuthSource::provider_profile(
+                    provider_profile_id.clone(),
+                ),
+                auth_source_revision: 1,
                 adapter_id: AcpAdapterId::parse("opencode-acp").unwrap(),
                 adapter_version: "1.0.0".to_string(),
                 adapter_compatibility_identity: "opencode-acp@1".to_string(),
@@ -4140,7 +4322,6 @@ mod tests {
                 session_runtime_config_state: SessionRuntimeConfigState::default(),
                 capability_snapshot: None,
                 restore_compatibility_key: None,
-                profile_revision: 1,
                 last_context_sequence: 0,
                 last_summary_sequence: 0,
                 context_bridge_version: 0,
@@ -4157,12 +4338,13 @@ mod tests {
         let identity = ProviderTurnExecutionIdentity {
             binding_id,
             activation_generation: 3,
-            model_id: "usage-test-model".to_string(),
+            model_id: Some("usage-test-model".to_string()),
         };
         let provider_binding = ProviderBinding {
             session_id: session.id.clone(),
             provider_kind: ProviderKind::Acp,
-            provider_profile_id,
+            auth_source: vibex_core::RuntimeAuthSource::provider_profile(provider_profile_id),
+            auth_source_revision: 1,
             native: ProviderNativeBinding {
                 native_session_id: Some("native-usage-origin-test".to_string()),
                 ..ProviderNativeBinding::empty()
@@ -4507,14 +4689,7 @@ mod tests {
             agent_id.clone(),
             AgentSessionState::Running,
         );
-        let desired = SessionRuntimeSelection {
-            agent_id,
-            provider_profile_id: profile_id,
-            model_id: "claude-test-model".to_string(),
-            reasoning_effort: None,
-            mode_id: None,
-            config_values: Default::default(),
-        };
+        let desired = SessionRuntimeSelection::provider(agent_id, profile_id, "claude-test-model");
         let switch = AgentSessionRuntimeRepository::enqueue_initial_runtime_switch(
             &mut conn,
             RuntimeSwitchId::new(),
@@ -4525,6 +4700,7 @@ mod tests {
                 expected_selection_revision: 0,
                 target_binding_id: RuntimeBindingId::new(),
                 target_adapter_id: AcpAdapterId::parse("claude-agent-acp").unwrap(),
+                target_auth_source_revision: 1,
                 desired: desired.clone(),
                 requested_policy: RuntimeSwitchPolicy::Automatic,
                 active_work_policy: RuntimeSwitchActiveWorkPolicy::default(),
@@ -4587,14 +4763,11 @@ mod tests {
             agent_id.clone(),
             AgentSessionState::Initializing,
         );
-        let selection = SessionRuntimeSelection {
+        let selection = SessionRuntimeSelection::provider(
             agent_id,
-            provider_profile_id: ProviderProfileId::parse("provider_acp_claude").unwrap(),
-            model_id: "claude-test-model".to_string(),
-            reasoning_effort: None,
-            mode_id: None,
-            config_values: Default::default(),
-        };
+            ProviderProfileId::parse("provider_acp_claude").unwrap(),
+            "claude-test-model",
+        );
         let runtime_switch = AgentSessionRuntimeRepository::enqueue_initial_runtime_switch(
             &mut conn,
             RuntimeSwitchId::new(),
@@ -4605,6 +4778,7 @@ mod tests {
                 expected_selection_revision: 0,
                 target_binding_id: RuntimeBindingId::new(),
                 target_adapter_id: AcpAdapterId::parse("claude-agent-acp").unwrap(),
+                target_auth_source_revision: 1,
                 desired: selection.clone(),
                 requested_policy: RuntimeSwitchPolicy::Automatic,
                 active_work_policy: RuntimeSwitchActiveWorkPolicy::default(),
@@ -4681,14 +4855,11 @@ mod tests {
             agent_id.clone(),
             AgentSessionState::Running,
         );
-        let selection = SessionRuntimeSelection {
+        let selection = SessionRuntimeSelection::provider(
             agent_id,
-            provider_profile_id: ProviderProfileId::parse("provider_acp_claude").unwrap(),
-            model_id: "claude-test-model".to_string(),
-            reasoning_effort: None,
-            mode_id: None,
-            config_values: Default::default(),
-        };
+            ProviderProfileId::parse("provider_acp_claude").unwrap(),
+            "claude-test-model",
+        );
         let runtime_switch = AgentSessionRuntimeRepository::enqueue_initial_runtime_switch(
             &mut conn,
             RuntimeSwitchId::new(),
@@ -4699,6 +4870,7 @@ mod tests {
                 expected_selection_revision: 0,
                 target_binding_id: RuntimeBindingId::new(),
                 target_adapter_id: AcpAdapterId::parse("claude-agent-acp").unwrap(),
+                target_auth_source_revision: 1,
                 desired: selection.clone(),
                 requested_policy: RuntimeSwitchPolicy::Automatic,
                 active_work_policy: RuntimeSwitchActiveWorkPolicy::default(),
@@ -4756,14 +4928,11 @@ mod tests {
             .send_message(SendAgentMessageRequest {
                 session_id: VibexSessionId::new(),
                 message_idempotency_key: "missing-coordinator".to_string(),
-                desired_runtime: SessionRuntimeSelection {
-                    agent_id: AgentId::parse("claude").unwrap(),
-                    provider_profile_id: ProviderProfileId::parse("provider_acp_claude").unwrap(),
-                    model_id: "claude-test-model".to_string(),
-                    reasoning_effort: None,
-                    mode_id: None,
-                    config_values: Default::default(),
-                },
+                desired_runtime: SessionRuntimeSelection::provider(
+                    AgentId::parse("claude").unwrap(),
+                    ProviderProfileId::parse("provider_acp_claude").unwrap(),
+                    "claude-test-model",
+                ),
                 text: "hello".to_string(),
                 attachments: Vec::new(),
                 reasoning_effort: None,

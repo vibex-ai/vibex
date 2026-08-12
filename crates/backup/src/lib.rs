@@ -935,7 +935,10 @@ mod tests {
                 session_id: session.id.clone(),
                 agent_id: session.agent_id.clone(),
                 transport_kind: TransportKind::Acp,
-                provider_profile_id: provider_profile_id.clone(),
+                auth_source: vibex_core::RuntimeAuthSource::provider_profile(
+                    provider_profile_id.clone(),
+                ),
+                auth_source_revision: 1,
                 adapter_id: AcpAdapterId::parse("usage-test-adapter").unwrap(),
                 adapter_version: "1.0.0".to_string(),
                 adapter_compatibility_identity: "usage-test-compatibility".to_string(),
@@ -946,7 +949,6 @@ mod tests {
                 session_runtime_config_state: SessionRuntimeConfigState::default(),
                 capability_snapshot: None,
                 restore_compatibility_key: None,
-                profile_revision: 1,
                 last_context_sequence: 0,
                 last_summary_sequence: 0,
                 context_bridge_version: 0,
@@ -977,8 +979,9 @@ mod tests {
                 binding_id,
                 activation_generation: 1,
                 agent_id: session.agent_id,
-                provider_profile_id,
-                model_id: "backup-test-model".to_string(),
+                auth_source: vibex_core::RuntimeAuthSource::provider_profile(provider_profile_id),
+                auth_source_revision: 1,
+                model_id: Some("backup-test-model".to_string()),
             },
         }
         .dispatched_at(binding_created_at_ms.saturating_add(1));

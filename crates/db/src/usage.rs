@@ -1,10 +1,10 @@
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use vibex_core::{
-    AgentId, AgentTurnUsageFact, AgentUsageCounterOrigin, AgentUsageCoverage, AgentUsageExecution,
-    AgentUsageExecutionStatus, AgentUsageExecutionStatusUpdate, AgentUsageObservation,
-    AgentUsageReportedFields, AgentUsageTokenValues, MessageSubmissionId, ProjectId,
-    ProviderProfileId, RuntimeBindingId, UsageExecutionId, VibexError, VibexResult, VibexSessionId,
-    WorkspaceId,
+    AgentAuthContextId, AgentId, AgentTurnUsageFact, AgentUsageCounterOrigin, AgentUsageCoverage,
+    AgentUsageExecution, AgentUsageExecutionStatus, AgentUsageExecutionStatusUpdate,
+    AgentUsageObservation, AgentUsageReportedFields, AgentUsageTokenValues, MessageSubmissionId,
+    ProjectId, ProviderProfileId, RuntimeAuthSource, RuntimeAuthSourceKind, RuntimeBindingId,
+    UsageExecutionId, VibexError, VibexResult, VibexSessionId, WorkspaceId,
 };
 
 use crate::{enum_from_db, enum_to_db, storage_err};
@@ -37,7 +37,7 @@ pub struct AgentUsageFactProjection {
     pub fact: AgentTurnUsageFact,
     pub agent_label: String,
     pub project_label: String,
-    pub provider_profile_label: String,
+    pub auth_source_label: String,
     pub session_label: String,
 }
 
@@ -48,8 +48,9 @@ struct AgentUsageCheckpoint {
     binding_id: RuntimeBindingId,
     last_activation_generation: i64,
     agent_id: AgentId,
-    provider_profile_id: ProviderProfileId,
-    last_model_id: String,
+    auth_source: RuntimeAuthSource,
+    auth_source_revision: i64,
+    last_model_id: Option<String>,
     reset_epoch: i64,
     counter_origin: AgentUsageCounterOrigin,
     cumulative: AgentUsageTokenValues,
@@ -314,7 +315,8 @@ impl AgentUsageRepository {
                 binding_id: observation.stream.binding_id.clone(),
                 last_activation_generation: observation.stream.activation_generation,
                 agent_id: observation.stream.agent_id.clone(),
-                provider_profile_id: observation.stream.provider_profile_id.clone(),
+                auth_source: observation.stream.auth_source.clone(),
+                auth_source_revision: observation.stream.auth_source_revision,
                 last_model_id: observation.stream.model_id.clone(),
                 reset_epoch: next_reset_epoch,
                 counter_origin: if reset_epoch_started {
@@ -365,13 +367,25 @@ impl AgentUsageRepository {
                 SELECT {},
                        COALESCE(NULLIF(a.label_override, ''), f.agent_id),
                        COALESCE(NULLIF(p.name, ''), f.project_id),
-                       COALESCE(NULLIF(pp.display_name, ''), f.provider_profile_id),
+                       CASE f.auth_source_kind
+                           WHEN 'provider_profile' THEN
+                               COALESCE(NULLIF(pp.display_name, ''), f.auth_source_id)
+                           WHEN 'agent_account' THEN
+                               COALESCE(
+                                   NULLIF(ac.account_hint_redacted, ''),
+                                   COALESCE(NULLIF(a.label_override, ''), f.agent_id)
+                               )
+                           ELSE f.auth_source_id
+                       END,
                        COALESCE(NULLIF(s.title, ''), f.session_id)
                 FROM agent_turn_usage_facts f
                 LEFT JOIN agent_configs a ON a.agent_id = f.agent_id
                 LEFT JOIN projects p ON p.project_id = f.project_id
                 LEFT JOIN provider_profiles pp
                     ON pp.provider_profile_id = f.provider_profile_id
+                LEFT JOIN agent_auth_contexts ac
+                    ON ac.auth_context_id = f.auth_source_id
+                   AND f.auth_source_kind = 'agent_account'
                 LEFT JOIN agent_sessions s ON s.session_id = f.session_id
                 WHERE f.dispatched_at_ms >= ?1 AND f.dispatched_at_ms < ?2
                 ORDER BY f.dispatched_at_ms ASC, f.usage_execution_id ASC
@@ -387,10 +401,10 @@ impl AgentUsageRepository {
             .query_map(params![start_at_ms, end_at_ms, limit as i64], |row| {
                 Ok((
                     read_raw_fact(row)?,
-                    row.get::<_, String>(35)?,
-                    row.get::<_, String>(36)?,
-                    row.get::<_, String>(37)?,
                     row.get::<_, String>(38)?,
+                    row.get::<_, String>(39)?,
+                    row.get::<_, String>(40)?,
+                    row.get::<_, String>(41)?,
                 ))
             })
             .map_err(storage_err(
@@ -398,8 +412,8 @@ impl AgentUsageRepository {
                 "failed to query Agent usage facts",
             ))?;
         rows.map(|row| {
-            let (raw, agent_label, project_label, provider_profile_label, session_label) = row
-                .map_err(storage_err(
+            let (raw, agent_label, project_label, auth_source_label, session_label) =
+                row.map_err(storage_err(
                     "agent_usage_query_row_failed",
                     "failed to read Agent usage fact row",
                 ))?;
@@ -407,7 +421,7 @@ impl AgentUsageRepository {
                 fact: decode_raw_fact(raw)?,
                 agent_label,
                 project_label,
-                provider_profile_label,
+                auth_source_label,
                 session_label,
             })
         })
@@ -432,11 +446,48 @@ impl AgentUsageRepository {
     }
 }
 
+fn decode_usage_auth_source(
+    kind: String,
+    source_id: String,
+    legacy_provider_profile_id: Option<String>,
+) -> VibexResult<RuntimeAuthSource> {
+    match enum_from_db::<RuntimeAuthSourceKind>(kind)? {
+        RuntimeAuthSourceKind::ProviderProfile => {
+            if legacy_provider_profile_id.as_deref() != Some(source_id.as_str()) {
+                return Err(VibexError::storage(
+                    "agent_usage_auth_source_legacy_mismatch",
+                    "Provider usage attribution does not match its compatibility column",
+                ));
+            }
+            Ok(RuntimeAuthSource::provider_profile(
+                ProviderProfileId::parse(source_id)?,
+            ))
+        }
+        RuntimeAuthSourceKind::AgentAccount => {
+            if legacy_provider_profile_id.is_some() {
+                return Err(VibexError::storage(
+                    "agent_usage_auth_source_legacy_mismatch",
+                    "Agent account usage attribution must not contain a Provider Profile",
+                ));
+            }
+            Ok(RuntimeAuthSource::agent_account(AgentAuthContextId::parse(
+                source_id,
+            )?))
+        }
+    }
+}
+
 fn validate_execution(execution: &AgentUsageExecution) -> VibexResult<()> {
     if execution.stream.activation_generation < 0
+        || execution.stream.auth_source_revision < 0
         || execution.dispatched_at_ms < 0
-        || execution.stream.model_id.trim().is_empty()
-        || execution.stream.model_id.len() > 512
+        || execution.stream.model_id.as_ref().is_some_and(|model_id| {
+            model_id.trim().is_empty()
+                || model_id.len() > 512
+                || model_id.chars().any(char::is_control)
+        })
+        || (execution.stream.auth_source.provider_profile_id().is_some()
+            && execution.stream.model_id.is_none())
     {
         return Err(VibexError::validation(
             "agent_usage_execution_invalid",
@@ -475,16 +526,17 @@ fn record_execution_on_conn(
         INSERT INTO agent_turn_usage_facts (
             usage_execution_id, message_submission_id, session_id, project_id, workspace_id,
             binding_id, activation_generation, reset_epoch, agent_id, provider_profile_id,
-            model_id, execution_status, input_delta, output_delta, thought_delta,
+            auth_source_kind, auth_source_id, auth_source_revision, model_id, execution_status,
+            input_delta, output_delta, thought_delta,
             cached_read_delta, cached_write_delta, total_delta, cumulative_input_after,
             cumulative_output_after, cumulative_thought_after, cumulative_cached_read_after,
             cumulative_cached_write_after, cumulative_total_after, context_window_used_tokens,
             context_window_size_tokens, reported_fields, coverage, last_source, reset_reason,
             dispatched_at_ms, completed_at_ms, last_observed_at_ms, created_at_ms, updated_at_ms
         ) VALUES (
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11,
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
             NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-            NULL, NULL, 0, ?12, NULL, NULL, ?13, NULL, NULL, ?13, ?13
+            NULL, NULL, 0, ?15, NULL, NULL, ?16, NULL, NULL, ?16, ?16
         )
         ",
         params![
@@ -499,7 +551,14 @@ fn record_execution_on_conn(
             execution.stream.binding_id.as_str(),
             execution.stream.activation_generation,
             execution.stream.agent_id.as_str(),
-            execution.stream.provider_profile_id.as_str(),
+            execution
+                .stream
+                .auth_source
+                .provider_profile_id()
+                .map(ProviderProfileId::as_str),
+            enum_to_db(&execution.stream.auth_source.kind())?,
+            execution.stream.auth_source.id(),
+            execution.stream.auth_source_revision,
             execution.stream.model_id,
             enum_to_db(&AgentUsageExecutionStatus::Dispatched)?,
             enum_to_db(&AgentUsageCoverage::Unreported)?,
@@ -522,7 +581,8 @@ fn execution_matches_fact(execution: &AgentUsageExecution, fact: &AgentTurnUsage
         && execution.stream.binding_id == fact.binding_id
         && execution.stream.activation_generation == fact.activation_generation
         && execution.stream.agent_id == fact.agent_id
-        && execution.stream.provider_profile_id == fact.provider_profile_id
+        && execution.stream.auth_source == fact.auth_source
+        && execution.stream.auth_source_revision == fact.auth_source_revision
         && execution.stream.model_id == fact.model_id
 }
 
@@ -833,14 +893,15 @@ fn upsert_checkpoint(tx: &Transaction<'_>, checkpoint: &AgentUsageCheckpoint) ->
         "
         INSERT INTO agent_usage_checkpoints (
             usage_stream_id, session_id, binding_id, last_activation_generation, agent_id,
-            provider_profile_id, last_model_id, reset_epoch, counter_origin,
+            provider_profile_id, auth_source_kind, auth_source_id, auth_source_revision,
+            last_model_id, reset_epoch, counter_origin,
             cumulative_input_tokens, cumulative_output_tokens, cumulative_thought_tokens,
             cumulative_cached_read_tokens, cumulative_cached_write_tokens,
             cumulative_total_tokens, last_usage_execution_id, last_observation_sequence,
             created_at_ms, updated_at_ms
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-            ?16, ?17, ?18, ?19
+            ?16, ?17, ?18, ?19, ?20, ?21, ?22
         )
         ON CONFLICT(usage_stream_id) DO UPDATE SET
             session_id = excluded.session_id,
@@ -848,6 +909,9 @@ fn upsert_checkpoint(tx: &Transaction<'_>, checkpoint: &AgentUsageCheckpoint) ->
             last_activation_generation = excluded.last_activation_generation,
             agent_id = excluded.agent_id,
             provider_profile_id = excluded.provider_profile_id,
+            auth_source_kind = excluded.auth_source_kind,
+            auth_source_id = excluded.auth_source_id,
+            auth_source_revision = excluded.auth_source_revision,
             last_model_id = excluded.last_model_id,
             reset_epoch = excluded.reset_epoch,
             counter_origin = excluded.counter_origin,
@@ -867,7 +931,13 @@ fn upsert_checkpoint(tx: &Transaction<'_>, checkpoint: &AgentUsageCheckpoint) ->
             checkpoint.binding_id.as_str(),
             checkpoint.last_activation_generation,
             checkpoint.agent_id.as_str(),
-            checkpoint.provider_profile_id.as_str(),
+            checkpoint
+                .auth_source
+                .provider_profile_id()
+                .map(ProviderProfileId::as_str),
+            enum_to_db(&checkpoint.auth_source.kind())?,
+            checkpoint.auth_source.id(),
+            checkpoint.auth_source_revision,
             checkpoint.last_model_id,
             checkpoint.reset_epoch,
             enum_to_db(&checkpoint.counter_origin)?,
@@ -906,7 +976,8 @@ fn get_checkpoint(
         .query_row(
             "
             SELECT usage_stream_id, session_id, binding_id, last_activation_generation,
-                   agent_id, provider_profile_id, last_model_id, reset_epoch, counter_origin,
+                   agent_id, provider_profile_id, auth_source_kind, auth_source_id,
+                   auth_source_revision, last_model_id, reset_epoch, counter_origin,
                    cumulative_input_tokens, cumulative_output_tokens,
                    cumulative_thought_tokens, cumulative_cached_read_tokens,
                    cumulative_cached_write_tokens, cumulative_total_tokens,
@@ -923,20 +994,23 @@ fn get_checkpoint(
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(5)?,
                     row.get::<_, String>(6)?,
-                    row.get::<_, i64>(7)?,
-                    row.get::<_, String>(8)?,
-                    row.get::<_, Option<i64>>(9)?,
-                    row.get::<_, Option<i64>>(10)?,
-                    row.get::<_, Option<i64>>(11)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, String>(11)?,
                     row.get::<_, Option<i64>>(12)?,
                     row.get::<_, Option<i64>>(13)?,
                     row.get::<_, Option<i64>>(14)?,
-                    row.get::<_, Option<String>>(15)?,
-                    row.get::<_, i64>(16)?,
-                    row.get::<_, i64>(17)?,
-                    row.get::<_, i64>(18)?,
+                    row.get::<_, Option<i64>>(15)?,
+                    row.get::<_, Option<i64>>(16)?,
+                    row.get::<_, Option<i64>>(17)?,
+                    row.get::<_, Option<String>>(18)?,
+                    row.get::<_, i64>(19)?,
+                    row.get::<_, i64>(20)?,
+                    row.get::<_, i64>(21)?,
                 ))
             },
         )
@@ -952,27 +1026,28 @@ fn get_checkpoint(
             binding_id: RuntimeBindingId::parse(raw.2)?,
             last_activation_generation: raw.3,
             agent_id: AgentId::parse(raw.4)?,
-            provider_profile_id: ProviderProfileId::parse(raw.5)?,
-            last_model_id: raw.6,
-            reset_epoch: raw.7,
-            counter_origin: enum_from_db(raw.8)?,
+            auth_source: decode_usage_auth_source(raw.6, raw.7, raw.5)?,
+            auth_source_revision: raw.8,
+            last_model_id: raw.9,
+            reset_epoch: raw.10,
+            counter_origin: enum_from_db(raw.11)?,
             cumulative: AgentUsageTokenValues {
-                input_tokens: token_from_db(raw.9)?,
-                output_tokens: token_from_db(raw.10)?,
-                thought_tokens: token_from_db(raw.11)?,
-                cached_read_tokens: token_from_db(raw.12)?,
-                cached_write_tokens: token_from_db(raw.13)?,
-                total_tokens: token_from_db(raw.14)?,
+                input_tokens: token_from_db(raw.12)?,
+                output_tokens: token_from_db(raw.13)?,
+                thought_tokens: token_from_db(raw.14)?,
+                cached_read_tokens: token_from_db(raw.15)?,
+                cached_write_tokens: token_from_db(raw.16)?,
+                total_tokens: token_from_db(raw.17)?,
             },
-            last_usage_execution_id: raw.15.map(UsageExecutionId::parse).transpose()?,
-            last_observation_sequence: u64::try_from(raw.16).map_err(|_| {
+            last_usage_execution_id: raw.18.map(UsageExecutionId::parse).transpose()?,
+            last_observation_sequence: u64::try_from(raw.19).map_err(|_| {
                 VibexError::storage(
                     "agent_usage_checkpoint_sequence_invalid",
                     "stored Agent usage checkpoint sequence was invalid",
                 )
             })?,
-            created_at_ms: raw.17,
-            updated_at_ms: raw.18,
+            created_at_ms: raw.20,
+            updated_at_ms: raw.21,
         })
     })
     .transpose()
@@ -1074,6 +1149,9 @@ fn fact_columns(alias: &str) -> String {
         "reset_epoch",
         "agent_id",
         "provider_profile_id",
+        "auth_source_kind",
+        "auth_source_id",
+        "auth_source_revision",
         "model_id",
         "execution_status",
         "input_delta",
@@ -1117,8 +1195,11 @@ struct RawUsageFact {
     activation_generation: i64,
     reset_epoch: i64,
     agent_id: String,
-    provider_profile_id: String,
-    model_id: String,
+    provider_profile_id: Option<String>,
+    auth_source_kind: String,
+    auth_source_id: String,
+    auth_source_revision: i64,
+    model_id: Option<String>,
     execution_status: String,
     delta: [Option<i64>; 6],
     cumulative_after: [Option<i64>; 6],
@@ -1147,35 +1228,38 @@ fn read_raw_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawUsageFact> {
         reset_epoch: row.get(7)?,
         agent_id: row.get(8)?,
         provider_profile_id: row.get(9)?,
-        model_id: row.get(10)?,
-        execution_status: row.get(11)?,
+        auth_source_kind: row.get(10)?,
+        auth_source_id: row.get(11)?,
+        auth_source_revision: row.get(12)?,
+        model_id: row.get(13)?,
+        execution_status: row.get(14)?,
         delta: [
-            row.get(12)?,
-            row.get(13)?,
-            row.get(14)?,
             row.get(15)?,
             row.get(16)?,
             row.get(17)?,
-        ],
-        cumulative_after: [
             row.get(18)?,
             row.get(19)?,
             row.get(20)?,
+        ],
+        cumulative_after: [
             row.get(21)?,
             row.get(22)?,
             row.get(23)?,
+            row.get(24)?,
+            row.get(25)?,
+            row.get(26)?,
         ],
-        context_window_used_tokens: row.get(24)?,
-        context_window_size_tokens: row.get(25)?,
-        reported_fields: row.get(26)?,
-        coverage: row.get(27)?,
-        last_source: row.get(28)?,
-        reset_reason: row.get(29)?,
-        dispatched_at_ms: row.get(30)?,
-        completed_at_ms: row.get(31)?,
-        last_observed_at_ms: row.get(32)?,
-        created_at_ms: row.get(33)?,
-        updated_at_ms: row.get(34)?,
+        context_window_used_tokens: row.get(27)?,
+        context_window_size_tokens: row.get(28)?,
+        reported_fields: row.get(29)?,
+        coverage: row.get(30)?,
+        last_source: row.get(31)?,
+        reset_reason: row.get(32)?,
+        dispatched_at_ms: row.get(33)?,
+        completed_at_ms: row.get(34)?,
+        last_observed_at_ms: row.get(35)?,
+        created_at_ms: row.get(36)?,
+        updated_at_ms: row.get(37)?,
     })
 }
 
@@ -1193,7 +1277,12 @@ fn decode_raw_fact(raw: RawUsageFact) -> VibexResult<AgentTurnUsageFact> {
         activation_generation: raw.activation_generation,
         reset_epoch: raw.reset_epoch,
         agent_id: AgentId::parse(raw.agent_id)?,
-        provider_profile_id: ProviderProfileId::parse(raw.provider_profile_id)?,
+        auth_source: decode_usage_auth_source(
+            raw.auth_source_kind,
+            raw.auth_source_id,
+            raw.provider_profile_id,
+        )?,
+        auth_source_revision: raw.auth_source_revision,
         model_id: raw.model_id,
         execution_status: enum_from_db(raw.execution_status)?,
         delta: AgentUsageTokenValues {
@@ -1325,6 +1414,7 @@ mod tests {
             deleted_at_ms: None,
         };
         SessionRepository::insert(conn, &session).unwrap();
+        let provider_profile_id = ProviderProfileId::new();
         let context = AgentUsageExecutionContext {
             usage_execution_id: UsageExecutionId::new(),
             message_submission_id: None,
@@ -1335,8 +1425,9 @@ mod tests {
                 binding_id: RuntimeBindingId::new(),
                 activation_generation: 1,
                 agent_id: AgentId::parse("opencode").unwrap(),
-                provider_profile_id: ProviderProfileId::new(),
-                model_id: "test-model".to_string(),
+                auth_source: RuntimeAuthSource::provider_profile(provider_profile_id),
+                auth_source_revision: 1,
+                model_id: Some("test-model".to_string()),
             },
         };
         let usage_migration_applied_at_ms = conn
@@ -1363,21 +1454,31 @@ mod tests {
             "
             INSERT INTO session_runtime_bindings (
                 binding_id, session_id, agent_id, transport_kind, adapter_id, adapter_version,
-                adapter_compatibility_identity, provider_profile_id, native_state_home_id,
+                adapter_compatibility_identity, provider_profile_id, profile_revision,
+                auth_source_kind, auth_source_id, auth_source_revision, native_state_home_id,
                 process_spawn_fingerprint, session_runtime_config_state_json, binding_state,
                 activation_generation, created_at_ms, updated_at_ms, usage_zero_baseline_state,
                 usage_zero_baseline_execution_id, usage_zero_baseline_activation_generation
             ) VALUES (
                 ?1, ?2, ?3, 'acp', 'usage-test-adapter', '1.0.0',
-                'usage-test-compatibility', ?4, 'usage-test-home',
-                'usage-test-fingerprint', '{}', 'current', ?7, ?5, ?5, 'claimed', ?6, ?7
+                'usage-test-compatibility', ?4, ?5, ?6, ?7, ?8, 'usage-test-home',
+                'usage-test-fingerprint', '{}', 'current', ?11, ?9, ?9, 'claimed', ?10, ?11
             )
             ",
             params![
                 context.stream.binding_id.as_str(),
                 context.stream.session_id.as_str(),
                 context.stream.agent_id.as_str(),
-                context.stream.provider_profile_id.as_str(),
+                context
+                    .stream
+                    .auth_source
+                    .provider_profile_id()
+                    .unwrap()
+                    .as_str(),
+                context.stream.auth_source_revision,
+                enum_to_db(&context.stream.auth_source.kind()).unwrap(),
+                context.stream.auth_source.id(),
+                context.stream.auth_source_revision,
                 binding_created_at_ms,
                 context.usage_execution_id.as_str(),
                 context.stream.activation_generation,
@@ -1696,7 +1797,7 @@ mod tests {
 
         let mut next = context;
         next.usage_execution_id = UsageExecutionId::new();
-        next.stream.model_id = "switched-model".to_string();
+        next.stream.model_id = Some("switched-model".to_string());
         let second = next.dispatched_at(3_000);
         AgentUsageRepository::apply_observation(
             &mut conn,
@@ -1712,16 +1813,16 @@ mod tests {
         let fact = AgentUsageRepository::get_fact(&conn, &second.usage_execution_id)
             .unwrap()
             .unwrap();
-        assert_eq!(fact.model_id, "switched-model");
+        assert_eq!(fact.model_id.as_deref(), Some("switched-model"));
         assert_eq!(fact.delta.total_tokens, Some(500));
-        let checkpoint_model: String = conn
+        let checkpoint_model: Option<String> = conn
             .query_row(
                 "SELECT last_model_id FROM agent_usage_checkpoints WHERE binding_id = ?1",
                 params![second.stream.binding_id.as_str()],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(checkpoint_model, "switched-model");
+        assert_eq!(checkpoint_model.as_deref(), Some("switched-model"));
         cleanup(&path);
     }
 

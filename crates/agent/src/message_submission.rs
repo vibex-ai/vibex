@@ -1102,7 +1102,11 @@ mod tests {
             self.dispatched.lock().unwrap().push((
                 request.session_id.clone(),
                 request.message_idempotency_key.clone(),
-                request.desired_runtime.model_id.clone(),
+                request
+                    .desired_runtime
+                    .model_id()
+                    .unwrap_or_default()
+                    .to_string(),
             ));
             self.started.notify_one();
             if self.block.swap(false, Ordering::SeqCst) {
@@ -1160,14 +1164,11 @@ mod tests {
     }
 
     fn selection(model: &str) -> SessionRuntimeSelection {
-        SessionRuntimeSelection {
-            agent_id: AgentId::parse("codex").unwrap(),
-            provider_profile_id: ProviderProfileId::parse("provider_codex_local").unwrap(),
-            model_id: model.to_string(),
-            reasoning_effort: None,
-            mode_id: None,
-            config_values: Default::default(),
-        }
+        SessionRuntimeSelection::provider(
+            AgentId::parse("codex").unwrap(),
+            ProviderProfileId::parse("provider_codex_local").unwrap(),
+            model,
+        )
     }
 
     fn seed_session(
@@ -1300,7 +1301,8 @@ mod tests {
                 target_binding_id: None,
                 target_agent_id: desired.agent_id.clone(),
                 target_adapter_id: AcpAdapterId::parse("test-acp-adapter").unwrap(),
-                target_profile_id: desired.provider_profile_id.clone(),
+                target_auth_source: desired.auth_source.clone(),
+                target_auth_source_revision: 1,
                 requested_policy: None,
                 active_work_policy: None,
                 requested_session_config: None,

@@ -141,6 +141,21 @@ pub enum NativeStateHomePolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentAuthVerificationStrategy {
+    InitializeThenSessionConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentAuthContextCapabilities {
+    pub supports_default_state_home: bool,
+    pub credential_env_keys_to_unset: Vec<String>,
+    pub supports_logout: bool,
+    pub supports_account_hint: bool,
+    pub supports_direct_model_catalog: bool,
+    pub verification_strategy: AgentAuthVerificationStrategy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptStrategy {
     ClaudeJsonl,
     CodexRollout,
@@ -328,6 +343,7 @@ pub struct AcpAgentCompatibility {
     pub restore_policy: RestorePolicy,
     pub operation_support: BTreeMap<AcpOperation, VersionedOperationDescriptor>,
     pub native_state_home_policy: NativeStateHomePolicy,
+    pub auth_context: AgentAuthContextCapabilities,
     pub config_option_alias_compatibility: ConfigOptionAliasCompatibility,
     pub config_option_aliases: BTreeMap<String, Vec<String>>,
     pub transcript_strategy: TranscriptStrategy,
@@ -879,6 +895,24 @@ fn claude_descriptor() -> VibexResult<AcpAgentCompatibility> {
         restore_policy: RestorePolicy::LoadThenNew,
         operation_support: base_operation_support(),
         native_state_home_policy: NativeStateHomePolicy::ClaudeConfigDirectory,
+        auth_context: AgentAuthContextCapabilities {
+            supports_default_state_home: true,
+            credential_env_keys_to_unset: [
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "ANTHROPIC_BASE_URL",
+                "CLAUDE_CONFIG_DIR",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+                "__VIBEX_PROVIDER_PROJECTION_FINGERPRINT",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+            supports_logout: true,
+            supports_account_hint: false,
+            supports_direct_model_catalog: false,
+            verification_strategy: AgentAuthVerificationStrategy::InitializeThenSessionConfig,
+        },
         config_option_alias_compatibility: ConfigOptionAliasCompatibility {
             adapter_version_requirement: parse_requirement(
                 CLAUDE_CONFIG_ALIAS_VERSION_REQUIREMENT,
@@ -958,6 +992,25 @@ fn codex_descriptor() -> VibexResult<AcpAgentCompatibility> {
         restore_policy: RestorePolicy::ResumeThenLoadThenNew,
         operation_support: base_operation_support(),
         native_state_home_policy: NativeStateHomePolicy::StableCodexHome,
+        auth_context: AgentAuthContextCapabilities {
+            supports_default_state_home: true,
+            credential_env_keys_to_unset: [
+                "OPENAI_API_KEY",
+                "OPENAI_BASE_URL",
+                "CODEX_API_KEY",
+                "CODEX_HOME",
+                "MODEL_PROVIDER",
+                "DEFAULT_AUTH_REQUEST",
+                "__VIBEX_PROVIDER_PROJECTION_FINGERPRINT",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+            supports_logout: true,
+            supports_account_hint: false,
+            supports_direct_model_catalog: true,
+            verification_strategy: AgentAuthVerificationStrategy::InitializeThenSessionConfig,
+        },
         config_option_alias_compatibility: ConfigOptionAliasCompatibility {
             adapter_version_requirement: parse_requirement(
                 CODEX_CONFIG_ALIAS_VERSION_REQUIREMENT,

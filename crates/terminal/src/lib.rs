@@ -531,16 +531,16 @@ impl TerminalManager {
         };
 
         refresh_exit_status(&mut runtime)?;
-        if runtime.session.status == TerminalStatus::Running {
-            if let Err(err) = runtime.child.kill() {
-                self.lock_sessions()?
-                    .insert(request.terminal_id.clone(), runtime);
-                return Err(VibexError::process(
-                    "terminal_shell_switch_kill_failed",
-                    "failed to stop existing terminal process",
-                )
-                .with_diagnostic("error", err.to_string()));
-            }
+        if runtime.session.status == TerminalStatus::Running
+            && let Err(err) = runtime.child.kill()
+        {
+            self.lock_sessions()?
+                .insert(request.terminal_id.clone(), runtime);
+            return Err(VibexError::process(
+                "terminal_shell_switch_kill_failed",
+                "failed to stop existing terminal process",
+            )
+            .with_diagnostic("error", err.to_string()));
         }
 
         let cwd = PathBuf::from(&runtime.session.cwd)
@@ -573,15 +573,15 @@ impl TerminalManager {
             VibexError::validation("terminal_not_found", "terminal session was not found")
         })?;
         refresh_exit_status(&mut runtime)?;
-        if runtime.session.status == TerminalStatus::Running {
-            if let Err(err) = runtime.child.kill() {
-                self.lock_sessions()?.insert(terminal_id.clone(), runtime);
-                return Err(VibexError::process(
-                    "terminal_kill_failed",
-                    "failed to kill terminal process",
-                )
-                .with_diagnostic("error", err.to_string()));
-            }
+        if runtime.session.status == TerminalStatus::Running
+            && let Err(err) = runtime.child.kill()
+        {
+            self.lock_sessions()?.insert(terminal_id.clone(), runtime);
+            return Err(VibexError::process(
+                "terminal_kill_failed",
+                "failed to kill terminal process",
+            )
+            .with_diagnostic("error", err.to_string()));
         }
         runtime.session.status = TerminalStatus::Killed;
         runtime.session.updated_at_ms = unix_timestamp_ms();

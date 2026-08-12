@@ -59,6 +59,8 @@ mod agent_provider_probe;
 pub use agent_provider_probe::*;
 mod usage;
 pub use usage::*;
+mod agent_auth_context;
+pub use agent_auth_context::*;
 
 pub type DbConnection = Connection;
 
@@ -73,7 +75,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 44;
+pub const CURRENT_SCHEMA_VERSION: i64 = 47;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -1743,6 +1745,95 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_runtime_switches_pending_activation
                 ON runtime_switches(status, activation_completed_at_ms)
                 WHERE activation_completed_at_ms IS NULL;
+        ",
+    },
+    Migration {
+        version: 45,
+        name: "agent_auth_context_and_runtime_source",
+        sql: "
+            CREATE TABLE IF NOT EXISTS agent_auth_contexts (
+                auth_context_id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL,
+                account_hint_redacted TEXT NULL,
+                authenticated_via_method TEXT NULL,
+                revision INTEGER NOT NULL CHECK(revision > 0),
+                last_verified_at_ms INTEGER NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_auth_contexts_status
+                ON agent_auth_contexts(status, updated_at_ms);
+
+            CREATE TABLE IF NOT EXISTS agent_authentication_operations (
+                operation_id TEXT PRIMARY KEY,
+                auth_context_id TEXT NOT NULL
+                    REFERENCES agent_auth_contexts(auth_context_id) ON DELETE CASCADE,
+                expected_context_revision INTEGER NOT NULL CHECK(expected_context_revision > 0),
+                method_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                error_code TEXT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_authentication_operations_active
+                ON agent_authentication_operations(auth_context_id)
+                WHERE state IN (
+                    'queued', 'discovering_methods', 'authenticating', 'awaiting_user',
+                    'verifying', 'cancelling'
+                );
+
+            CREATE TABLE IF NOT EXISTS agent_auth_model_catalog_snapshots (
+                auth_context_id TEXT NOT NULL
+                    REFERENCES agent_auth_contexts(auth_context_id) ON DELETE CASCADE,
+                auth_context_revision INTEGER NOT NULL CHECK(auth_context_revision > 0),
+                runtime_fingerprint TEXT NOT NULL,
+                discovery_source TEXT NOT NULL,
+                status TEXT NOT NULL,
+                catalog_json TEXT NOT NULL,
+                last_success_at_ms INTEGER NULL,
+                last_attempt_at_ms INTEGER NOT NULL,
+                last_error_code TEXT NULL,
+                PRIMARY KEY(auth_context_id, auth_context_revision, runtime_fingerprint)
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_auth_model_catalog_attempt
+                ON agent_auth_model_catalog_snapshots(auth_context_id, last_attempt_at_ms);
+
+            ALTER TABLE session_runtime_bindings ADD COLUMN auth_source_kind TEXT NULL;
+            ALTER TABLE session_runtime_bindings ADD COLUMN auth_source_id TEXT NULL;
+            ALTER TABLE session_runtime_bindings ADD COLUMN auth_source_revision INTEGER NULL;
+            UPDATE session_runtime_bindings
+            SET auth_source_kind = 'provider_profile',
+                auth_source_id = provider_profile_id,
+                auth_source_revision = profile_revision
+            WHERE auth_source_kind IS NULL;
+
+            ALTER TABLE runtime_switches ADD COLUMN target_auth_source_kind TEXT NULL;
+            ALTER TABLE runtime_switches ADD COLUMN target_auth_source_id TEXT NULL;
+            ALTER TABLE runtime_switches ADD COLUMN target_auth_source_revision INTEGER NULL;
+            UPDATE runtime_switches
+            SET target_auth_source_kind = 'provider_profile',
+                target_auth_source_id = target_profile_id,
+                target_auth_source_revision = 0
+            WHERE target_auth_source_kind IS NULL;
+
+            ALTER TABLE agent_usage_checkpoints ADD COLUMN auth_source_kind TEXT NULL;
+            ALTER TABLE agent_usage_checkpoints ADD COLUMN auth_source_id TEXT NULL;
+            ALTER TABLE agent_usage_checkpoints ADD COLUMN auth_source_revision INTEGER NULL;
+            UPDATE agent_usage_checkpoints
+            SET auth_source_kind = 'provider_profile',
+                auth_source_id = provider_profile_id,
+                auth_source_revision = 0
+            WHERE auth_source_kind IS NULL;
+
+            ALTER TABLE agent_turn_usage_facts ADD COLUMN auth_source_kind TEXT NULL;
+            ALTER TABLE agent_turn_usage_facts ADD COLUMN auth_source_id TEXT NULL;
+            ALTER TABLE agent_turn_usage_facts ADD COLUMN auth_source_revision INTEGER NULL;
+            UPDATE agent_turn_usage_facts
+            SET auth_source_kind = 'provider_profile',
+                auth_source_id = provider_profile_id,
+                auth_source_revision = 0
+            WHERE auth_source_kind IS NULL;
         ",
     },
 ];
@@ -9999,12 +10090,590 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
         applied.push(format!("{}:{}", migration.version, migration.name));
     }
 
+    apply_runtime_auth_source_table_rebuild(conn, &mut applied)?;
+    apply_usage_model_id_nullable_table_rebuild(conn, &mut applied)?;
+
     // Seed compatibility Profiles before the v37 backfill while no caller
     // transaction is active. Repository reads may run inside a transaction and
     // must not start the backfill's own transaction.
     ProviderProfileRepository::ensure_local_defaults(conn)?;
     ProviderProjectionCompatibilityRepository::backfill_legacy_profiles(conn)?;
     Ok(applied)
+}
+
+fn apply_runtime_auth_source_table_rebuild(
+    conn: &mut Connection,
+    applied: &mut Vec<String>,
+) -> VibexResult<()> {
+    const VERSION: i64 = 46;
+    const NAME: &str = "runtime_auth_source_nullable_legacy_columns";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+
+    // SQLite cannot change a NOT NULL constraint in place. Foreign keys must
+    // be disabled outside the rebuild transaction so child tables keep their
+    // references while the two parent tables are replaced.
+    conn.pragma_update(None, "foreign_keys", false)
+        .map_err(storage_err(
+            "migration_foreign_keys_disable_failed",
+            "failed to disable foreign keys for runtime auth source migration",
+        ))?;
+    let migration_result = (|| -> VibexResult<()> {
+        let tx = conn.transaction().map_err(storage_err(
+            "migration_transaction_failed",
+            "failed to start runtime auth source migration transaction",
+        ))?;
+        tx.execute_batch(
+            "
+            CREATE TABLE session_runtime_bindings_v46 (
+                binding_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+                agent_id TEXT NOT NULL,
+                transport_kind TEXT NOT NULL,
+                adapter_id TEXT NOT NULL,
+                adapter_version TEXT NOT NULL,
+                adapter_compatibility_identity TEXT NOT NULL,
+                provider_profile_id TEXT NULL,
+                profile_revision INTEGER NULL,
+                auth_source_kind TEXT NOT NULL,
+                auth_source_id TEXT NOT NULL,
+                auth_source_revision INTEGER NOT NULL CHECK(auth_source_revision >= 0),
+                native_session_id TEXT NULL,
+                native_state_home_id TEXT NOT NULL,
+                provider_resume_identity TEXT NULL,
+                process_spawn_fingerprint TEXT NOT NULL,
+                session_runtime_config_state_json TEXT NOT NULL,
+                capability_snapshot_json TEXT NULL,
+                restore_compatibility_key_json TEXT NULL,
+                last_context_sequence INTEGER NOT NULL DEFAULT 0,
+                last_summary_sequence INTEGER NOT NULL DEFAULT 0,
+                context_bridge_version INTEGER NOT NULL DEFAULT 0,
+                activation_generation INTEGER NOT NULL DEFAULT 0,
+                binding_state TEXT NOT NULL,
+                created_by_switch_id TEXT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                usage_zero_baseline_state TEXT NOT NULL DEFAULT 'unavailable'
+                    CHECK(usage_zero_baseline_state IN ('available', 'claimed', 'unavailable')),
+                usage_zero_baseline_execution_id TEXT NULL,
+                usage_zero_baseline_activation_generation INTEGER NULL
+                    CHECK(usage_zero_baseline_activation_generation >= 0),
+                CHECK(
+                    (auth_source_kind = 'provider_profile'
+                        AND provider_profile_id = auth_source_id
+                        AND profile_revision = auth_source_revision)
+                    OR
+                    (auth_source_kind = 'agent_account'
+                        AND provider_profile_id IS NULL
+                        AND profile_revision IS NULL)
+                )
+            );
+            INSERT INTO session_runtime_bindings_v46 (
+                binding_id, session_id, agent_id, transport_kind, adapter_id,
+                adapter_version, adapter_compatibility_identity, provider_profile_id,
+                profile_revision, auth_source_kind, auth_source_id, auth_source_revision,
+                native_session_id, native_state_home_id, provider_resume_identity,
+                process_spawn_fingerprint, session_runtime_config_state_json,
+                capability_snapshot_json, restore_compatibility_key_json,
+                last_context_sequence, last_summary_sequence, context_bridge_version,
+                activation_generation, binding_state, created_by_switch_id, created_at_ms,
+                updated_at_ms, usage_zero_baseline_state, usage_zero_baseline_execution_id,
+                usage_zero_baseline_activation_generation
+            )
+            SELECT
+                binding_id, session_id, agent_id, transport_kind, adapter_id,
+                adapter_version, adapter_compatibility_identity, provider_profile_id,
+                profile_revision, auth_source_kind, auth_source_id, auth_source_revision,
+                native_session_id, native_state_home_id, provider_resume_identity,
+                process_spawn_fingerprint, session_runtime_config_state_json,
+                capability_snapshot_json, restore_compatibility_key_json,
+                last_context_sequence, last_summary_sequence, context_bridge_version,
+                activation_generation, binding_state, created_by_switch_id, created_at_ms,
+                updated_at_ms, usage_zero_baseline_state, usage_zero_baseline_execution_id,
+                usage_zero_baseline_activation_generation
+            FROM session_runtime_bindings;
+            DROP TABLE session_runtime_bindings;
+            ALTER TABLE session_runtime_bindings_v46 RENAME TO session_runtime_bindings;
+            CREATE INDEX idx_session_runtime_bindings_route
+                ON session_runtime_bindings(
+                    session_id, agent_id, auth_source_kind, auth_source_id,
+                    adapter_compatibility_identity
+                );
+            CREATE INDEX idx_session_runtime_bindings_session
+                ON session_runtime_bindings(session_id, binding_state);
+
+            CREATE TABLE runtime_switches_v46 (
+                switch_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+                idempotency_key TEXT NOT NULL,
+                source_revision INTEGER NOT NULL,
+                source_binding_id TEXT NULL,
+                desired_selection_revision INTEGER NOT NULL,
+                target_binding_id TEXT NULL,
+                target_agent_id TEXT NOT NULL,
+                target_adapter_id TEXT NOT NULL,
+                target_profile_id TEXT NULL,
+                target_auth_source_kind TEXT NOT NULL,
+                target_auth_source_id TEXT NOT NULL,
+                target_auth_source_revision INTEGER NOT NULL
+                    CHECK(target_auth_source_revision >= 0),
+                requested_policy_json TEXT NULL,
+                active_work_policy_json TEXT NULL,
+                requested_session_config_json TEXT NULL,
+                restore_compatibility_result_json TEXT NULL,
+                status TEXT NOT NULL,
+                error_code TEXT NULL,
+                error_detail_redacted TEXT NULL,
+                worker_lease_owner TEXT NULL,
+                worker_lease_deadline_ms INTEGER NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                committed_at_ms INTEGER NULL,
+                activation_completed_at_ms INTEGER NULL,
+                UNIQUE(session_id, idempotency_key),
+                CHECK(
+                    (target_auth_source_kind = 'provider_profile'
+                        AND target_profile_id = target_auth_source_id)
+                    OR
+                    (target_auth_source_kind = 'agent_account'
+                        AND target_profile_id IS NULL)
+                )
+            );
+            INSERT INTO runtime_switches_v46 (
+                switch_id, session_id, idempotency_key, source_revision,
+                source_binding_id, desired_selection_revision, target_binding_id,
+                target_agent_id, target_adapter_id, target_profile_id,
+                target_auth_source_kind, target_auth_source_id, target_auth_source_revision,
+                requested_policy_json, active_work_policy_json,
+                requested_session_config_json, restore_compatibility_result_json,
+                status, error_code, error_detail_redacted, worker_lease_owner,
+                worker_lease_deadline_ms, created_at_ms, updated_at_ms, committed_at_ms,
+                activation_completed_at_ms
+            )
+            SELECT
+                switch_id, session_id, idempotency_key, source_revision,
+                source_binding_id, desired_selection_revision, target_binding_id,
+                target_agent_id, target_adapter_id, target_profile_id,
+                target_auth_source_kind, target_auth_source_id, target_auth_source_revision,
+                requested_policy_json, active_work_policy_json,
+                requested_session_config_json, restore_compatibility_result_json,
+                status, error_code, error_detail_redacted, worker_lease_owner,
+                worker_lease_deadline_ms, created_at_ms, updated_at_ms, committed_at_ms,
+                activation_completed_at_ms
+            FROM runtime_switches;
+            DROP TABLE runtime_switches;
+            ALTER TABLE runtime_switches_v46 RENAME TO runtime_switches;
+            CREATE INDEX idx_runtime_switches_session_status
+                ON runtime_switches(session_id, status);
+            CREATE INDEX idx_runtime_switches_pending_activation
+                ON runtime_switches(status, activation_completed_at_ms)
+                WHERE activation_completed_at_ms IS NULL;
+
+            CREATE TABLE agent_usage_checkpoints_v46 (
+                usage_stream_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL
+                    REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+                binding_id TEXT NOT NULL,
+                last_activation_generation INTEGER NOT NULL
+                    CHECK(last_activation_generation >= 0),
+                agent_id TEXT NOT NULL,
+                provider_profile_id TEXT NULL,
+                auth_source_kind TEXT NOT NULL,
+                auth_source_id TEXT NOT NULL,
+                auth_source_revision INTEGER NOT NULL CHECK(auth_source_revision >= 0),
+                last_model_id TEXT NOT NULL,
+                reset_epoch INTEGER NOT NULL CHECK(reset_epoch >= 0),
+                counter_origin TEXT NOT NULL,
+                cumulative_input_tokens INTEGER NULL CHECK(cumulative_input_tokens >= 0),
+                cumulative_output_tokens INTEGER NULL CHECK(cumulative_output_tokens >= 0),
+                cumulative_thought_tokens INTEGER NULL CHECK(cumulative_thought_tokens >= 0),
+                cumulative_cached_read_tokens INTEGER NULL
+                    CHECK(cumulative_cached_read_tokens >= 0),
+                cumulative_cached_write_tokens INTEGER NULL
+                    CHECK(cumulative_cached_write_tokens >= 0),
+                cumulative_total_tokens INTEGER NULL CHECK(cumulative_total_tokens >= 0),
+                last_usage_execution_id TEXT NULL,
+                last_observation_sequence INTEGER NOT NULL
+                    CHECK(last_observation_sequence >= 0),
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                UNIQUE(session_id, binding_id),
+                CHECK(
+                    (auth_source_kind = 'provider_profile'
+                        AND provider_profile_id = auth_source_id)
+                    OR
+                    (auth_source_kind = 'agent_account'
+                        AND provider_profile_id IS NULL)
+                )
+            );
+            INSERT INTO agent_usage_checkpoints_v46 (
+                usage_stream_id, session_id, binding_id, last_activation_generation,
+                agent_id, provider_profile_id, auth_source_kind, auth_source_id,
+                auth_source_revision, last_model_id, reset_epoch, counter_origin,
+                cumulative_input_tokens, cumulative_output_tokens,
+                cumulative_thought_tokens, cumulative_cached_read_tokens,
+                cumulative_cached_write_tokens, cumulative_total_tokens,
+                last_usage_execution_id, last_observation_sequence, created_at_ms, updated_at_ms
+            )
+            SELECT
+                usage_stream_id, session_id, binding_id, last_activation_generation,
+                agent_id, provider_profile_id, auth_source_kind, auth_source_id,
+                auth_source_revision, last_model_id, reset_epoch, counter_origin,
+                cumulative_input_tokens, cumulative_output_tokens,
+                cumulative_thought_tokens, cumulative_cached_read_tokens,
+                cumulative_cached_write_tokens, cumulative_total_tokens,
+                last_usage_execution_id, last_observation_sequence, created_at_ms, updated_at_ms
+            FROM agent_usage_checkpoints;
+            DROP TABLE agent_usage_checkpoints;
+            ALTER TABLE agent_usage_checkpoints_v46 RENAME TO agent_usage_checkpoints;
+            CREATE INDEX idx_agent_usage_checkpoints_session
+                ON agent_usage_checkpoints(session_id, updated_at_ms);
+
+            CREATE TABLE agent_turn_usage_facts_v46 (
+                usage_execution_id TEXT PRIMARY KEY,
+                message_submission_id TEXT NULL,
+                session_id TEXT NOT NULL
+                    REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+                project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+                binding_id TEXT NOT NULL,
+                activation_generation INTEGER NOT NULL CHECK(activation_generation >= 0),
+                reset_epoch INTEGER NOT NULL CHECK(reset_epoch >= 0),
+                agent_id TEXT NOT NULL,
+                provider_profile_id TEXT NULL,
+                auth_source_kind TEXT NOT NULL,
+                auth_source_id TEXT NOT NULL,
+                auth_source_revision INTEGER NOT NULL CHECK(auth_source_revision >= 0),
+                model_id TEXT NOT NULL,
+                execution_status TEXT NOT NULL,
+                input_delta INTEGER NULL CHECK(input_delta >= 0),
+                output_delta INTEGER NULL CHECK(output_delta >= 0),
+                thought_delta INTEGER NULL CHECK(thought_delta >= 0),
+                cached_read_delta INTEGER NULL CHECK(cached_read_delta >= 0),
+                cached_write_delta INTEGER NULL CHECK(cached_write_delta >= 0),
+                total_delta INTEGER NULL CHECK(total_delta >= 0),
+                cumulative_input_after INTEGER NULL CHECK(cumulative_input_after >= 0),
+                cumulative_output_after INTEGER NULL CHECK(cumulative_output_after >= 0),
+                cumulative_thought_after INTEGER NULL CHECK(cumulative_thought_after >= 0),
+                cumulative_cached_read_after INTEGER NULL CHECK(cumulative_cached_read_after >= 0),
+                cumulative_cached_write_after INTEGER NULL CHECK(cumulative_cached_write_after >= 0),
+                cumulative_total_after INTEGER NULL CHECK(cumulative_total_after >= 0),
+                context_window_used_tokens INTEGER NULL CHECK(context_window_used_tokens >= 0),
+                context_window_size_tokens INTEGER NULL CHECK(context_window_size_tokens > 0),
+                reported_fields INTEGER NOT NULL CHECK(reported_fields >= 0),
+                coverage TEXT NOT NULL,
+                last_source TEXT NULL,
+                reset_reason TEXT NULL,
+                dispatched_at_ms INTEGER NOT NULL,
+                completed_at_ms INTEGER NULL,
+                last_observed_at_ms INTEGER NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                CHECK(
+                    (auth_source_kind = 'provider_profile'
+                        AND provider_profile_id = auth_source_id)
+                    OR
+                    (auth_source_kind = 'agent_account'
+                        AND provider_profile_id IS NULL)
+                )
+            );
+            INSERT INTO agent_turn_usage_facts_v46 (
+                usage_execution_id, message_submission_id, session_id, project_id,
+                workspace_id, binding_id, activation_generation, reset_epoch, agent_id,
+                provider_profile_id, auth_source_kind, auth_source_id, auth_source_revision,
+                model_id, execution_status, input_delta, output_delta, thought_delta,
+                cached_read_delta, cached_write_delta, total_delta, cumulative_input_after,
+                cumulative_output_after, cumulative_thought_after, cumulative_cached_read_after,
+                cumulative_cached_write_after, cumulative_total_after, context_window_used_tokens,
+                context_window_size_tokens, reported_fields, coverage, last_source, reset_reason,
+                dispatched_at_ms, completed_at_ms, last_observed_at_ms, created_at_ms, updated_at_ms
+            )
+            SELECT
+                usage_execution_id, message_submission_id, session_id, project_id,
+                workspace_id, binding_id, activation_generation, reset_epoch, agent_id,
+                provider_profile_id, auth_source_kind, auth_source_id, auth_source_revision,
+                model_id, execution_status, input_delta, output_delta, thought_delta,
+                cached_read_delta, cached_write_delta, total_delta, cumulative_input_after,
+                cumulative_output_after, cumulative_thought_after, cumulative_cached_read_after,
+                cumulative_cached_write_after, cumulative_total_after, context_window_used_tokens,
+                context_window_size_tokens, reported_fields, coverage, last_source, reset_reason,
+                dispatched_at_ms, completed_at_ms, last_observed_at_ms, created_at_ms, updated_at_ms
+            FROM agent_turn_usage_facts;
+            DROP TABLE agent_turn_usage_facts;
+            ALTER TABLE agent_turn_usage_facts_v46 RENAME TO agent_turn_usage_facts;
+            CREATE INDEX idx_agent_turn_usage_facts_dispatch
+                ON agent_turn_usage_facts(dispatched_at_ms, usage_execution_id);
+            CREATE INDEX idx_agent_turn_usage_facts_session
+                ON agent_turn_usage_facts(session_id, dispatched_at_ms);
+            CREATE INDEX idx_agent_turn_usage_facts_project
+                ON agent_turn_usage_facts(project_id, dispatched_at_ms);
+            CREATE INDEX idx_agent_turn_usage_facts_agent
+                ON agent_turn_usage_facts(agent_id, dispatched_at_ms);
+            CREATE INDEX idx_agent_turn_usage_facts_auth_source
+                ON agent_turn_usage_facts(auth_source_kind, auth_source_id, dispatched_at_ms);
+            CREATE INDEX idx_agent_turn_usage_facts_profile
+                ON agent_turn_usage_facts(provider_profile_id, dispatched_at_ms)
+                WHERE provider_profile_id IS NOT NULL;
+            CREATE INDEX idx_agent_turn_usage_facts_model
+                ON agent_turn_usage_facts(model_id, dispatched_at_ms);
+            ",
+        )
+        .map_err(storage_err(
+            "migration_apply_failed",
+            "failed to rebuild runtime auth source tables",
+        ))?;
+
+        let foreign_key_violation = tx
+            .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
+            .optional()
+            .map_err(storage_err(
+                "migration_foreign_key_check_failed",
+                "failed to validate runtime auth source migration foreign keys",
+            ))?;
+        if foreign_key_violation.is_some() {
+            return Err(VibexError::storage(
+                "migration_foreign_key_violation",
+                "runtime auth source migration would violate a foreign key",
+            ));
+        }
+        tx.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+            params![VERSION, NAME, unix_timestamp_ms()],
+        )
+        .map_err(storage_err(
+            "migration_record_failed",
+            "failed to record runtime auth source migration",
+        ))?;
+        tx.commit().map_err(storage_err(
+            "migration_commit_failed",
+            "failed to commit runtime auth source migration",
+        ))?;
+        Ok(())
+    })();
+    let enable_result = conn
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(storage_err(
+            "migration_foreign_keys_enable_failed",
+            "failed to restore foreign key enforcement after runtime auth source migration",
+        ));
+    migration_result?;
+    enable_result?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
+
+fn apply_usage_model_id_nullable_table_rebuild(
+    conn: &mut Connection,
+    applied: &mut Vec<String>,
+) -> VibexResult<()> {
+    const VERSION: i64 = 47;
+    const NAME: &str = "agent_default_usage_model_nullable";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+
+    let tx = conn.transaction().map_err(storage_err(
+        "migration_transaction_failed",
+        "failed to start Agent usage model migration transaction",
+    ))?;
+    tx.execute_batch(
+        "
+        CREATE TABLE agent_usage_checkpoints_v47 (
+            usage_stream_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL
+                REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+            binding_id TEXT NOT NULL,
+            last_activation_generation INTEGER NOT NULL
+                CHECK(last_activation_generation >= 0),
+            agent_id TEXT NOT NULL,
+            provider_profile_id TEXT NULL,
+            auth_source_kind TEXT NOT NULL,
+            auth_source_id TEXT NOT NULL,
+            auth_source_revision INTEGER NOT NULL CHECK(auth_source_revision >= 0),
+            last_model_id TEXT NULL,
+            reset_epoch INTEGER NOT NULL CHECK(reset_epoch >= 0),
+            counter_origin TEXT NOT NULL,
+            cumulative_input_tokens INTEGER NULL CHECK(cumulative_input_tokens >= 0),
+            cumulative_output_tokens INTEGER NULL CHECK(cumulative_output_tokens >= 0),
+            cumulative_thought_tokens INTEGER NULL CHECK(cumulative_thought_tokens >= 0),
+            cumulative_cached_read_tokens INTEGER NULL
+                CHECK(cumulative_cached_read_tokens >= 0),
+            cumulative_cached_write_tokens INTEGER NULL
+                CHECK(cumulative_cached_write_tokens >= 0),
+            cumulative_total_tokens INTEGER NULL CHECK(cumulative_total_tokens >= 0),
+            last_usage_execution_id TEXT NULL,
+            last_observation_sequence INTEGER NOT NULL
+                CHECK(last_observation_sequence >= 0),
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            UNIQUE(session_id, binding_id),
+            CHECK(last_model_id IS NOT NULL OR auth_source_kind = 'agent_account'),
+            CHECK(
+                (auth_source_kind = 'provider_profile'
+                    AND provider_profile_id = auth_source_id)
+                OR
+                (auth_source_kind = 'agent_account'
+                    AND provider_profile_id IS NULL)
+            )
+        );
+        INSERT INTO agent_usage_checkpoints_v47 (
+            usage_stream_id, session_id, binding_id, last_activation_generation,
+            agent_id, provider_profile_id, auth_source_kind, auth_source_id,
+            auth_source_revision, last_model_id, reset_epoch, counter_origin,
+            cumulative_input_tokens, cumulative_output_tokens,
+            cumulative_thought_tokens, cumulative_cached_read_tokens,
+            cumulative_cached_write_tokens, cumulative_total_tokens,
+            last_usage_execution_id, last_observation_sequence, created_at_ms, updated_at_ms
+        )
+        SELECT
+            usage_stream_id, session_id, binding_id, last_activation_generation,
+            agent_id, provider_profile_id, auth_source_kind, auth_source_id,
+            auth_source_revision,
+            CASE
+                WHEN auth_source_kind = 'agent_account' AND last_model_id = 'agent_default'
+                    THEN NULL
+                ELSE last_model_id
+            END,
+            reset_epoch, counter_origin,
+            cumulative_input_tokens, cumulative_output_tokens,
+            cumulative_thought_tokens, cumulative_cached_read_tokens,
+            cumulative_cached_write_tokens, cumulative_total_tokens,
+            last_usage_execution_id, last_observation_sequence, created_at_ms, updated_at_ms
+        FROM agent_usage_checkpoints;
+        DROP TABLE agent_usage_checkpoints;
+        ALTER TABLE agent_usage_checkpoints_v47 RENAME TO agent_usage_checkpoints;
+        CREATE INDEX idx_agent_usage_checkpoints_session
+            ON agent_usage_checkpoints(session_id, updated_at_ms);
+
+        CREATE TABLE agent_turn_usage_facts_v47 (
+            usage_execution_id TEXT PRIMARY KEY,
+            message_submission_id TEXT NULL,
+            session_id TEXT NOT NULL
+                REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+            project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+            workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+            binding_id TEXT NOT NULL,
+            activation_generation INTEGER NOT NULL CHECK(activation_generation >= 0),
+            reset_epoch INTEGER NOT NULL CHECK(reset_epoch >= 0),
+            agent_id TEXT NOT NULL,
+            provider_profile_id TEXT NULL,
+            auth_source_kind TEXT NOT NULL,
+            auth_source_id TEXT NOT NULL,
+            auth_source_revision INTEGER NOT NULL CHECK(auth_source_revision >= 0),
+            model_id TEXT NULL,
+            execution_status TEXT NOT NULL,
+            input_delta INTEGER NULL CHECK(input_delta >= 0),
+            output_delta INTEGER NULL CHECK(output_delta >= 0),
+            thought_delta INTEGER NULL CHECK(thought_delta >= 0),
+            cached_read_delta INTEGER NULL CHECK(cached_read_delta >= 0),
+            cached_write_delta INTEGER NULL CHECK(cached_write_delta >= 0),
+            total_delta INTEGER NULL CHECK(total_delta >= 0),
+            cumulative_input_after INTEGER NULL CHECK(cumulative_input_after >= 0),
+            cumulative_output_after INTEGER NULL CHECK(cumulative_output_after >= 0),
+            cumulative_thought_after INTEGER NULL CHECK(cumulative_thought_after >= 0),
+            cumulative_cached_read_after INTEGER NULL CHECK(cumulative_cached_read_after >= 0),
+            cumulative_cached_write_after INTEGER NULL CHECK(cumulative_cached_write_after >= 0),
+            cumulative_total_after INTEGER NULL CHECK(cumulative_total_after >= 0),
+            context_window_used_tokens INTEGER NULL CHECK(context_window_used_tokens >= 0),
+            context_window_size_tokens INTEGER NULL CHECK(context_window_size_tokens > 0),
+            reported_fields INTEGER NOT NULL CHECK(reported_fields >= 0),
+            coverage TEXT NOT NULL,
+            last_source TEXT NULL,
+            reset_reason TEXT NULL,
+            dispatched_at_ms INTEGER NOT NULL,
+            completed_at_ms INTEGER NULL,
+            last_observed_at_ms INTEGER NULL,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            CHECK(model_id IS NOT NULL OR auth_source_kind = 'agent_account'),
+            CHECK(
+                (auth_source_kind = 'provider_profile'
+                    AND provider_profile_id = auth_source_id)
+                OR
+                (auth_source_kind = 'agent_account'
+                    AND provider_profile_id IS NULL)
+            )
+        );
+        INSERT INTO agent_turn_usage_facts_v47 (
+            usage_execution_id, message_submission_id, session_id, project_id,
+            workspace_id, binding_id, activation_generation, reset_epoch, agent_id,
+            provider_profile_id, auth_source_kind, auth_source_id, auth_source_revision,
+            model_id, execution_status, input_delta, output_delta, thought_delta,
+            cached_read_delta, cached_write_delta, total_delta, cumulative_input_after,
+            cumulative_output_after, cumulative_thought_after, cumulative_cached_read_after,
+            cumulative_cached_write_after, cumulative_total_after, context_window_used_tokens,
+            context_window_size_tokens, reported_fields, coverage, last_source, reset_reason,
+            dispatched_at_ms, completed_at_ms, last_observed_at_ms, created_at_ms, updated_at_ms
+        )
+        SELECT
+            usage_execution_id, message_submission_id, session_id, project_id,
+            workspace_id, binding_id, activation_generation, reset_epoch, agent_id,
+            provider_profile_id, auth_source_kind, auth_source_id, auth_source_revision,
+            CASE
+                WHEN auth_source_kind = 'agent_account' AND model_id = 'agent_default'
+                    THEN NULL
+                ELSE model_id
+            END,
+            execution_status, input_delta, output_delta, thought_delta,
+            cached_read_delta, cached_write_delta, total_delta, cumulative_input_after,
+            cumulative_output_after, cumulative_thought_after, cumulative_cached_read_after,
+            cumulative_cached_write_after, cumulative_total_after, context_window_used_tokens,
+            context_window_size_tokens, reported_fields, coverage, last_source, reset_reason,
+            dispatched_at_ms, completed_at_ms, last_observed_at_ms, created_at_ms, updated_at_ms
+        FROM agent_turn_usage_facts;
+        DROP TABLE agent_turn_usage_facts;
+        ALTER TABLE agent_turn_usage_facts_v47 RENAME TO agent_turn_usage_facts;
+        CREATE INDEX idx_agent_turn_usage_facts_dispatch
+            ON agent_turn_usage_facts(dispatched_at_ms, usage_execution_id);
+        CREATE INDEX idx_agent_turn_usage_facts_session
+            ON agent_turn_usage_facts(session_id, dispatched_at_ms);
+        CREATE INDEX idx_agent_turn_usage_facts_project
+            ON agent_turn_usage_facts(project_id, dispatched_at_ms);
+        CREATE INDEX idx_agent_turn_usage_facts_agent
+            ON agent_turn_usage_facts(agent_id, dispatched_at_ms);
+        CREATE INDEX idx_agent_turn_usage_facts_auth_source
+            ON agent_turn_usage_facts(auth_source_kind, auth_source_id, dispatched_at_ms);
+        CREATE INDEX idx_agent_turn_usage_facts_profile
+            ON agent_turn_usage_facts(provider_profile_id, dispatched_at_ms)
+            WHERE provider_profile_id IS NOT NULL;
+        CREATE INDEX idx_agent_turn_usage_facts_model
+            ON agent_turn_usage_facts(model_id, dispatched_at_ms)
+            WHERE model_id IS NOT NULL;
+        ",
+    )
+    .map_err(storage_err(
+        "migration_apply_failed",
+        "failed to make Agent usage model attribution nullable",
+    ))?;
+
+    let foreign_key_violation = tx
+        .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
+        .optional()
+        .map_err(storage_err(
+            "migration_foreign_key_check_failed",
+            "failed to validate Agent usage model migration foreign keys",
+        ))?;
+    if foreign_key_violation.is_some() {
+        return Err(VibexError::storage(
+            "migration_foreign_key_violation",
+            "Agent usage model migration would violate a foreign key",
+        ));
+    }
+    tx.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record Agent usage model migration",
+    ))?;
+    tx.commit().map_err(storage_err(
+        "migration_commit_failed",
+        "failed to commit Agent usage model migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
 }
 
 pub fn current_schema_version(conn: &Connection) -> VibexResult<i64> {
@@ -12067,6 +12736,203 @@ mod tests {
     }
 
     #[test]
+    fn schema_v47_converts_only_agent_default_usage_models_to_null() {
+        let temp = temp_db_path("schema-v47-agent-default-usage");
+        let mut conn = open_database(&temp).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at_ms INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        for migration in MIGRATIONS {
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(migration.sql).unwrap();
+            tx.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at_ms)
+                 VALUES (?1, ?2, ?3)",
+                params![migration.version, migration.name, unix_timestamp_ms()],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let mut applied = Vec::new();
+        apply_runtime_auth_source_table_rebuild(&mut conn, &mut applied).unwrap();
+        assert_eq!(applied, ["46:runtime_auth_source_nullable_legacy_columns"]);
+        assert_eq!(current_schema_version(&conn).unwrap(), 46);
+
+        let workspace_root = std::env::temp_dir().join(format!(
+            "vibex-schema-v47-agent-default-usage-{}",
+            RequestId::new().as_str()
+        ));
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let now = unix_timestamp_ms();
+        let agent_id = AgentId::parse("codex").unwrap();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "Pre-v47 Agent default usage".to_string(),
+            project_id: project.id,
+            workspace_id: workspace.id,
+            workspace_root: workspace.root_path,
+            workspace_mode: workspace.mode,
+            agent_id: agent_id.clone(),
+            state: AgentSessionState::Idle,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_message_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        SessionRepository::insert(&conn, &session).unwrap();
+        let auth_context = AgentAuthContextRepository::ensure_default(&conn, &agent_id).unwrap();
+
+        for (stream_id, binding_id, source_kind, source_id, profile_id, model_id) in [
+            (
+                "stream_v47_agent",
+                "binding_v47_agent",
+                "agent_account",
+                auth_context.id.as_str(),
+                None,
+                "agent_default",
+            ),
+            (
+                "stream_v47_provider",
+                "binding_v47_provider",
+                "provider_profile",
+                "provider_v47",
+                Some("provider_v47"),
+                "provider-model",
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO agent_usage_checkpoints (
+                    usage_stream_id, session_id, binding_id, last_activation_generation,
+                    agent_id, provider_profile_id, auth_source_kind, auth_source_id,
+                    auth_source_revision, last_model_id, reset_epoch, counter_origin,
+                    last_observation_sequence, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, 1, ?8, 0, 'known_zero', 1, ?9, ?9)",
+                params![
+                    stream_id,
+                    session.id.as_str(),
+                    binding_id,
+                    agent_id.as_str(),
+                    profile_id,
+                    source_kind,
+                    source_id,
+                    model_id,
+                    now,
+                ],
+            )
+            .unwrap();
+        }
+
+        for (execution_id, binding_id, source_kind, source_id, profile_id, model_id) in [
+            (
+                "execution_v47_agent",
+                "binding_v47_agent",
+                "agent_account",
+                auth_context.id.as_str(),
+                None,
+                "agent_default",
+            ),
+            (
+                "execution_v47_provider",
+                "binding_v47_provider",
+                "provider_profile",
+                "provider_v47",
+                Some("provider_v47"),
+                "provider-model",
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO agent_turn_usage_facts (
+                    usage_execution_id, session_id, project_id, workspace_id, binding_id,
+                    activation_generation, reset_epoch, agent_id, provider_profile_id,
+                    auth_source_kind, auth_source_id, auth_source_revision, model_id,
+                    execution_status, total_delta, cumulative_total_after, reported_fields,
+                    coverage, dispatched_at_ms, created_at_ms, updated_at_ms
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, 1, 0, ?6, ?7, ?8, ?9, 1, ?10,
+                    'completed', 100, 100, 32, 'complete', ?11, ?11, ?11
+                 )",
+                params![
+                    execution_id,
+                    session.id.as_str(),
+                    session.project_id.as_str(),
+                    session.workspace_id.as_str(),
+                    binding_id,
+                    agent_id.as_str(),
+                    profile_id,
+                    source_kind,
+                    source_id,
+                    model_id,
+                    now,
+                ],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            apply_migrations(&mut conn).unwrap(),
+            ["47:agent_default_usage_model_nullable"]
+        );
+        let agent_models: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT c.last_model_id, f.model_id
+                 FROM agent_usage_checkpoints c
+                 JOIN agent_turn_usage_facts f ON f.binding_id = c.binding_id
+                 WHERE c.usage_stream_id = 'stream_v47_agent'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(agent_models, (None, None));
+        let provider_models: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT c.last_model_id, f.model_id
+                 FROM agent_usage_checkpoints c
+                 JOIN agent_turn_usage_facts f ON f.binding_id = c.binding_id
+                 WHERE c.usage_stream_id = 'stream_v47_provider'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            provider_models,
+            (
+                Some("provider-model".to_string()),
+                Some("provider-model".to_string())
+            )
+        );
+
+        assert!(
+            conn.execute(
+                "UPDATE agent_usage_checkpoints SET last_model_id = NULL
+                 WHERE usage_stream_id = 'stream_v47_provider'",
+                [],
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "UPDATE agent_turn_usage_facts SET model_id = NULL
+                 WHERE usage_execution_id = 'execution_v47_provider'",
+                [],
+            )
+            .is_err()
+        );
+
+        drop(conn);
+        cleanup_db(temp);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
     fn schema_v44_backfills_completed_runtime_switch_activations() {
         let temp = temp_db_path("schema-v44-runtime-switch-activation");
         let mut conn = open_database(&temp).unwrap();
@@ -12139,7 +13005,12 @@ mod tests {
 
         assert_eq!(
             apply_migrations(&mut conn).unwrap(),
-            vec!["44:runtime_switch_activation_completion"]
+            vec![
+                "44:runtime_switch_activation_completion",
+                "45:agent_auth_context_and_runtime_source",
+                "46:runtime_auth_source_nullable_legacy_columns",
+                "47:agent_default_usage_model_nullable",
+            ]
         );
         let activation_completed_at_ms: Option<i64> = conn
             .query_row(
@@ -12247,7 +13118,10 @@ mod tests {
                 "41:agent_managed_installations",
                 "42:provider_model_runtime_option_snapshots",
                 "43:agent_model_provider_display_order",
-                "44:runtime_switch_activation_completion"
+                "44:runtime_switch_activation_completion",
+                "45:agent_auth_context_and_runtime_source",
+                "46:runtime_auth_source_nullable_legacy_columns",
+                "47:agent_default_usage_model_nullable"
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -12394,7 +13268,10 @@ mod tests {
                 "41:agent_managed_installations",
                 "42:provider_model_runtime_option_snapshots",
                 "43:agent_model_provider_display_order",
-                "44:runtime_switch_activation_completion"
+                "44:runtime_switch_activation_completion",
+                "45:agent_auth_context_and_runtime_source",
+                "46:runtime_auth_source_nullable_legacy_columns",
+                "47:agent_default_usage_model_nullable"
             ]
         );
         assert_eq!(
@@ -12523,12 +13400,12 @@ mod tests {
         };
         SessionRepository::insert(&conn, &session).unwrap();
         let selection = SessionRuntimeSelection {
-            agent_id: session.agent_id.clone(),
-            provider_profile_id: ProviderProfileId::parse("provider_acp_cutover").unwrap(),
-            model_id: "claude-sonnet".to_string(),
             reasoning_effort: Some("high".to_string()),
-            mode_id: None,
-            config_values: Default::default(),
+            ..SessionRuntimeSelection::provider(
+                session.agent_id.clone(),
+                ProviderProfileId::parse("provider_acp_cutover").unwrap(),
+                "claude-sonnet",
+            )
         };
         let switch_id = RuntimeSwitchId::new();
         let target_binding_id = RuntimeBindingId::new();
@@ -12542,6 +13419,7 @@ mod tests {
                 expected_selection_revision: 0,
                 target_binding_id: target_binding_id.clone(),
                 target_adapter_id: AcpAdapterId::parse("claude-agent-acp").unwrap(),
+                target_auth_source_revision: 1,
                 desired: selection.clone(),
                 requested_policy: RuntimeSwitchPolicy::Automatic,
                 active_work_policy: RuntimeSwitchActiveWorkPolicy::default(),
@@ -12561,7 +13439,8 @@ mod tests {
                 session_id: session.id.clone(),
                 agent_id: session.agent_id.clone(),
                 transport_kind: TransportKind::Acp,
-                provider_profile_id: selection.provider_profile_id.clone(),
+                auth_source: selection.auth_source.clone(),
+                auth_source_revision: 1,
                 adapter_id: AcpAdapterId::parse("claude-agent-acp").unwrap(),
                 adapter_version: "0.58.1".to_string(),
                 adapter_compatibility_identity: "adapter=claude-agent-acp@0.58.1".to_string(),
@@ -12572,7 +13451,6 @@ mod tests {
                 session_runtime_config_state: SessionRuntimeConfigState::default(),
                 capability_snapshot: None,
                 restore_compatibility_key: None,
-                profile_revision: 1,
                 last_context_sequence: 0,
                 last_summary_sequence: 0,
                 context_bridge_version: 0,
@@ -13965,7 +14843,10 @@ mod tests {
                 "41:agent_managed_installations",
                 "42:provider_model_runtime_option_snapshots",
                 "43:agent_model_provider_display_order",
-                "44:runtime_switch_activation_completion"
+                "44:runtime_switch_activation_completion",
+                "45:agent_auth_context_and_runtime_source",
+                "46:runtime_auth_source_nullable_legacy_columns",
+                "47:agent_default_usage_model_nullable"
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
@@ -15522,8 +16403,9 @@ mod tests {
         .unwrap();
         let attribution = TurnExecutionAttribution::new(
             AgentId::parse("codex").unwrap(),
-            profile_id.clone(),
-            "gpt-5",
+            vibex_core::RuntimeAuthSource::provider_profile(profile_id.clone()),
+            vibex_core::RuntimeModelSelection::explicit("gpt-5"),
+            Some("gpt-5".to_string()),
             RuntimeBindingId::parse("binding_current").unwrap(),
             3,
             "Codex",
@@ -15576,8 +16458,9 @@ mod tests {
         assert_eq!(coalesced.execution_attribution, Some(attribution.view()));
         let stale_attribution = TurnExecutionAttribution::new(
             AgentId::parse("codex").unwrap(),
-            profile_id,
-            "gpt-5",
+            vibex_core::RuntimeAuthSource::provider_profile(profile_id),
+            vibex_core::RuntimeModelSelection::explicit("gpt-5"),
+            Some("gpt-5".to_string()),
             RuntimeBindingId::parse("binding_stale").unwrap(),
             2,
             "Codex",

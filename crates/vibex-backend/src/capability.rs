@@ -18,6 +18,8 @@ pub enum BackendOperation {
     AgentRespondElicitation,
     AgentManageSession,
     AgentSwitchRuntime,
+    AgentAuthRead,
+    AgentAuthManage,
     WorkspaceList,
     WorkspaceOpen,
     WorkspaceDelete,
@@ -137,6 +139,8 @@ impl BackendCapabilitySnapshot {
                 AgentRespondElicitation,
                 AgentManageSession,
                 AgentSwitchRuntime,
+                AgentAuthRead,
+                AgentAuthManage,
             ]),
             workspace: DomainCapabilities::available([
                 WorkspaceList,

@@ -10,11 +10,13 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::agent_auth::AgentAuthModelCatalogStatus;
 use crate::agent_config::AgentId;
 use crate::error::{VibexError, VibexResult};
 use crate::ids::{
-    EventId, NativeStateHomeId, ProviderProfileId, RuntimeBindingId, RuntimeClientId,
-    RuntimeLeaseId, RuntimeProcessId, RuntimeStreamId, RuntimeSwitchId, VibexSessionId,
+    AgentAuthContextId, EventId, NativeStateHomeId, ProviderProfileId, RuntimeBindingId,
+    RuntimeClientId, RuntimeLeaseId, RuntimeProcessId, RuntimeStreamId, RuntimeSwitchId,
+    VibexSessionId,
 };
 use crate::permission::PermissionRequest;
 use crate::provider::ProviderSessionConfigValue;
@@ -303,6 +305,8 @@ fn normalize_restore_identity(
 #[serde(rename_all = "camelCase")]
 pub struct AgentSessionRestoreCompatibilityKey {
     pub agent_id: AgentId,
+    pub auth_source: RuntimeAuthSource,
+    pub auth_source_revision: i64,
     pub native_session_id: String,
     pub native_state_home_id: NativeStateHomeId,
     pub adapter_compatibility_identity: String,
@@ -316,6 +320,8 @@ impl fmt::Debug for AgentSessionRestoreCompatibilityKey {
         formatter
             .debug_struct("AgentSessionRestoreCompatibilityKey")
             .field("agent_id", &self.agent_id)
+            .field("auth_source", &self.auth_source)
+            .field("auth_source_revision", &self.auth_source_revision)
             .field("native_session_id", &"<redacted>")
             .field("native_state_home_id", &self.native_state_home_id)
             .field("adapter_compatibility_identity", &"<redacted>")
@@ -336,6 +342,8 @@ impl AgentSessionRestoreCompatibilityKey {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         agent_id: AgentId,
+        auth_source: RuntimeAuthSource,
+        auth_source_revision: i64,
         native_session_id: impl Into<String>,
         native_state_home_id: NativeStateHomeId,
         adapter_compatibility_identity: impl Into<String>,
@@ -343,6 +351,12 @@ impl AgentSessionRestoreCompatibilityKey {
         provider_resume_identity: impl Into<String>,
         workspace_identity: impl Into<String>,
     ) -> VibexResult<Self> {
+        if auth_source_revision < 0 {
+            return Err(VibexError::validation(
+                "restore_auth_source_revision_invalid",
+                "auth source revision must not be negative",
+            ));
+        }
         let native_session_id = normalize_restore_identity(native_session_id, "native_session_id")?;
         let adapter_compatibility_identity = normalize_restore_identity(
             adapter_compatibility_identity,
@@ -357,6 +371,8 @@ impl AgentSessionRestoreCompatibilityKey {
             .transpose()?;
         Ok(Self {
             agent_id,
+            auth_source,
+            auth_source_revision,
             native_session_id,
             native_state_home_id,
             adapter_compatibility_identity,
@@ -376,6 +392,9 @@ impl<'de> Deserialize<'de> for AgentSessionRestoreCompatibilityKey {
         #[serde(rename_all = "camelCase")]
         struct Wire {
             agent_id: AgentId,
+            auth_source: Option<RuntimeAuthSource>,
+            auth_source_revision: Option<i64>,
+            provider_profile_id: Option<ProviderProfileId>,
             native_session_id: String,
             native_state_home_id: NativeStateHomeId,
             adapter_compatibility_identity: String,
@@ -384,8 +403,17 @@ impl<'de> Deserialize<'de> for AgentSessionRestoreCompatibilityKey {
             workspace_identity: String,
         }
         let wire = Wire::deserialize(deserializer)?;
+        let auth_source = wire
+            .auth_source
+            .or_else(|| {
+                wire.provider_profile_id
+                    .map(RuntimeAuthSource::provider_profile)
+            })
+            .ok_or_else(|| serde::de::Error::missing_field("authSource"))?;
         Self::new(
             wire.agent_id,
+            auth_source,
+            wire.auth_source_revision.unwrap_or_default(),
             wire.native_session_id,
             wire.native_state_home_id,
             wire.adapter_compatibility_identity,
@@ -411,6 +439,8 @@ pub enum AgentSessionRestoreMethod {
 #[serde(rename_all = "snake_case")]
 pub enum RestoreIncompatibilityReason {
     AgentMismatch,
+    AuthSourceMismatch,
+    AuthSourceRevisionMismatch,
     NativeStateHomeMismatch,
     AdapterCompatibilityMismatch,
     AgentStateFormatMismatch,
@@ -476,6 +506,101 @@ pub struct AgentSessionRestoreStrategy {
     pub allow_fresh: bool,
 }
 
+/// Stable credential identity selected by a logical session. Authentication
+/// methods are intentionally absent: they describe how to update an Agent
+/// account, not which credentials a runtime uses.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum RuntimeAuthSource {
+    ProviderProfile {
+        provider_profile_id: ProviderProfileId,
+    },
+    AgentAccount {
+        auth_context_id: AgentAuthContextId,
+    },
+}
+
+impl RuntimeAuthSource {
+    pub fn provider_profile(provider_profile_id: ProviderProfileId) -> Self {
+        Self::ProviderProfile {
+            provider_profile_id,
+        }
+    }
+
+    pub fn agent_account(auth_context_id: AgentAuthContextId) -> Self {
+        Self::AgentAccount { auth_context_id }
+    }
+
+    pub fn kind(&self) -> RuntimeAuthSourceKind {
+        match self {
+            Self::ProviderProfile { .. } => RuntimeAuthSourceKind::ProviderProfile,
+            Self::AgentAccount { .. } => RuntimeAuthSourceKind::AgentAccount,
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        match self {
+            Self::ProviderProfile {
+                provider_profile_id,
+            } => provider_profile_id.as_str(),
+            Self::AgentAccount { auth_context_id } => auth_context_id.as_str(),
+        }
+    }
+
+    pub fn provider_profile_id(&self) -> Option<&ProviderProfileId> {
+        match self {
+            Self::ProviderProfile {
+                provider_profile_id,
+            } => Some(provider_profile_id),
+            Self::AgentAccount { .. } => None,
+        }
+    }
+
+    pub fn auth_context_id(&self) -> Option<&AgentAuthContextId> {
+        match self {
+            Self::ProviderProfile { .. } => None,
+            Self::AgentAccount { auth_context_id } => Some(auth_context_id),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeAuthSourceKind {
+    ProviderProfile,
+    AgentAccount,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum RuntimeModelSelection {
+    Explicit { model_id: String },
+    AgentDefault,
+}
+
+impl RuntimeModelSelection {
+    pub fn explicit(model_id: impl Into<String>) -> Self {
+        Self::Explicit {
+            model_id: model_id.into(),
+        }
+    }
+
+    pub fn model_id(&self) -> Option<&str> {
+        match self {
+            Self::Explicit { model_id } => Some(model_id),
+            Self::AgentDefault => None,
+        }
+    }
+}
+
 /// §3.4 / §20.2 — durable binding between a logical session and a native
 /// agent session created through a specific agent/profile/adapter route.
 ///
@@ -489,7 +614,8 @@ pub struct RuntimeBinding {
     pub session_id: VibexSessionId,
     pub agent_id: AgentId,
     pub transport_kind: TransportKind,
-    pub provider_profile_id: ProviderProfileId,
+    pub auth_source: RuntimeAuthSource,
+    pub auth_source_revision: i64,
     pub adapter_id: AcpAdapterId,
     pub adapter_version: String,
     pub adapter_compatibility_identity: String,
@@ -500,7 +626,6 @@ pub struct RuntimeBinding {
     pub session_runtime_config_state: SessionRuntimeConfigState,
     pub capability_snapshot: Option<serde_json::Value>,
     pub restore_compatibility_key: Option<AgentSessionRestoreCompatibilityKey>,
-    pub profile_revision: i64,
     pub last_context_sequence: i64,
     pub last_summary_sequence: i64,
     pub context_bridge_version: i64,
@@ -519,7 +644,8 @@ impl fmt::Debug for RuntimeBinding {
             .field("session_id", &self.session_id)
             .field("agent_id", &self.agent_id)
             .field("transport_kind", &self.transport_kind)
-            .field("provider_profile_id", &self.provider_profile_id)
+            .field("auth_source", &self.auth_source)
+            .field("auth_source_revision", &self.auth_source_revision)
             .field("adapter_id", &self.adapter_id)
             .field("adapter_version", &self.adapter_version)
             .field("adapter_compatibility_identity", &"<redacted>")
@@ -538,7 +664,6 @@ impl fmt::Debug for RuntimeBinding {
                 "has_restore_compatibility_key",
                 &self.restore_compatibility_key.is_some(),
             )
-            .field("profile_revision", &self.profile_revision)
             .field("last_context_sequence", &self.last_context_sequence)
             .field("last_summary_sequence", &self.last_summary_sequence)
             .field("context_bridge_version", &self.context_bridge_version)
@@ -552,25 +677,62 @@ impl fmt::Debug for RuntimeBinding {
 }
 
 /// §21.2 — product-level runtime selection submitted by ordinary sessions.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SessionRuntimeSelection {
     pub agent_id: AgentId,
-    pub provider_profile_id: ProviderProfileId,
-    pub model_id: String,
+    pub auth_source: RuntimeAuthSource,
+    pub model: RuntimeModelSelection,
     pub reasoning_effort: Option<String>,
     pub mode_id: Option<String>,
     /// Explicit values for provider-neutral session features advertised by
     /// the selected Agent through ACP `configOptions`.
-    #[serde(default)]
     pub config_values: BTreeMap<String, String>,
 }
 
 impl SessionRuntimeSelection {
+    pub fn provider(
+        agent_id: AgentId,
+        provider_profile_id: ProviderProfileId,
+        model_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            agent_id,
+            auth_source: RuntimeAuthSource::provider_profile(provider_profile_id),
+            model: RuntimeModelSelection::explicit(model_id),
+            reasoning_effort: None,
+            mode_id: None,
+            config_values: BTreeMap::new(),
+        }
+    }
+
+    pub fn agent_default(agent_id: AgentId, auth_context_id: AgentAuthContextId) -> Self {
+        Self {
+            agent_id,
+            auth_source: RuntimeAuthSource::agent_account(auth_context_id),
+            model: RuntimeModelSelection::AgentDefault,
+            reasoning_effort: None,
+            mode_id: None,
+            config_values: BTreeMap::new(),
+        }
+    }
+
+    pub fn provider_profile_id(&self) -> Option<&ProviderProfileId> {
+        self.auth_source.provider_profile_id()
+    }
+
+    pub fn auth_context_id(&self) -> Option<&AgentAuthContextId> {
+        self.auth_source.auth_context_id()
+    }
+
+    pub fn model_id(&self) -> Option<&str> {
+        self.model.model_id()
+    }
+
     /// Optional fields represent explicit overrides. When they are absent, the
     /// Adapter's converged session default remains authoritative.
     pub fn matches_effective_config(&self, config: &SessionRuntimeConfigState) -> bool {
-        config.effective_model.as_deref() == Some(self.model_id.as_str())
+        self.model_id()
+            .is_none_or(|model_id| config.effective_model.as_deref() == Some(model_id))
             && self
                 .reasoning_effort
                 .as_ref()
@@ -586,6 +748,109 @@ impl SessionRuntimeSelection {
                     .and_then(|state| state.effective.as_ref())
                     .is_some_and(|effective| effective.value == *value)
             })
+    }
+}
+
+impl Serialize for SessionRuntimeSelection {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire<'a> {
+            agent_id: &'a AgentId,
+            auth_source: &'a RuntimeAuthSource,
+            model: &'a RuntimeModelSelection,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            provider_profile_id: Option<&'a ProviderProfileId>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            model_id: Option<&'a str>,
+            reasoning_effort: &'a Option<String>,
+            mode_id: &'a Option<String>,
+            config_values: &'a BTreeMap<String, String>,
+        }
+
+        Wire {
+            agent_id: &self.agent_id,
+            auth_source: &self.auth_source,
+            model: &self.model,
+            provider_profile_id: self.provider_profile_id(),
+            model_id: self.model_id(),
+            reasoning_effort: &self.reasoning_effort,
+            mode_id: &self.mode_id,
+            config_values: &self.config_values,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionRuntimeSelection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire {
+            agent_id: AgentId,
+            auth_source: Option<RuntimeAuthSource>,
+            model: Option<RuntimeModelSelection>,
+            provider_profile_id: Option<ProviderProfileId>,
+            model_id: Option<String>,
+            reasoning_effort: Option<String>,
+            mode_id: Option<String>,
+            #[serde(default)]
+            config_values: BTreeMap<String, String>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let auth_source = match (wire.auth_source, wire.provider_profile_id) {
+            (Some(source), Some(legacy)) => {
+                if source.provider_profile_id() != Some(&legacy) {
+                    return Err(serde::de::Error::custom(
+                        "authSource does not match legacy providerProfileId",
+                    ));
+                }
+                source
+            }
+            (Some(source), None) => source,
+            (None, Some(provider_profile_id)) => {
+                RuntimeAuthSource::provider_profile(provider_profile_id)
+            }
+            (None, None) => {
+                return Err(serde::de::Error::missing_field("authSource"));
+            }
+        };
+        let model = match (wire.model, wire.model_id) {
+            (Some(model), Some(legacy)) => {
+                if model.model_id() != Some(legacy.as_str()) {
+                    return Err(serde::de::Error::custom(
+                        "model does not match legacy modelId",
+                    ));
+                }
+                model
+            }
+            (Some(model), None) => model,
+            (None, Some(model_id)) => RuntimeModelSelection::explicit(model_id),
+            (None, None) => {
+                return Err(serde::de::Error::missing_field("model"));
+            }
+        };
+        if model
+            .model_id()
+            .is_some_and(|model_id| model_id.trim().is_empty())
+        {
+            return Err(serde::de::Error::custom("modelId must not be empty"));
+        }
+        Ok(Self {
+            agent_id: wire.agent_id,
+            auth_source,
+            model,
+            reasoning_effort: wire.reasoning_effort,
+            mode_id: wire.mode_id,
+            config_values: wire.config_values,
+        })
     }
 }
 
@@ -676,6 +941,54 @@ pub enum RuntimeOptionAvailability {
     RequiresConfiguration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeAuthSourceAvailability {
+    Available,
+    RequiresAuthentication,
+    Verifying,
+    DiscoveringModels,
+    TemporarilyUnavailable,
+    RequiresConfiguration,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeAuthSourceAction {
+    Authenticate,
+    Verify,
+    RefreshModels,
+    Logout,
+    ConfigureProvider,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeAgentSummary {
+    pub agent_id: AgentId,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeAuthSourceSummary {
+    pub source: RuntimeAuthSource,
+    /// Revision of the credential/configuration identity represented by this
+    /// source. Clients use the catalog revision for stale-write protection;
+    /// this value makes account relogin and Provider edits part of that hash.
+    #[serde(default)]
+    pub auth_source_revision: i64,
+    pub agent_id: AgentId,
+    pub label: String,
+    pub kind: RuntimeAuthSourceKind,
+    pub availability: RuntimeAuthSourceAvailability,
+    pub account_hint: Option<String>,
+    pub model_catalog_status: AgentAuthModelCatalogStatus,
+    #[serde(default)]
+    pub supported_actions: Vec<RuntimeAuthSourceAction>,
+}
+
 /// One selectable Agent/Profile/Model combination. Adapter and native runtime
 /// details deliberately do not cross this boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -683,7 +996,7 @@ pub enum RuntimeOptionAvailability {
 pub struct SessionRuntimeOption {
     pub selection: SessionRuntimeSelection,
     pub agent_label: String,
-    pub provider_profile_label: String,
+    pub auth_source_label: String,
     pub model_label: String,
     pub reasoning_efforts: Vec<SessionConfigValue>,
     pub modes: Vec<SessionConfigValue>,
@@ -699,6 +1012,10 @@ pub struct SessionRuntimeOption {
 #[serde(rename_all = "camelCase")]
 pub struct SessionRuntimeOptionCatalog {
     pub revision: i64,
+    #[serde(default)]
+    pub agents: Vec<RuntimeAgentSummary>,
+    #[serde(default)]
+    pub auth_sources: Vec<RuntimeAuthSourceSummary>,
     pub options: Vec<SessionRuntimeOption>,
 }
 
@@ -1436,12 +1753,13 @@ mod tests {
     #[test]
     fn selection_serde_round_trip() {
         let selection = SessionRuntimeSelection {
-            agent_id: AgentId::parse("claude-code").unwrap(),
-            provider_profile_id: crate::ids::ProviderProfileId::new(),
-            model_id: "claude-sonnet-4-5".to_string(),
             reasoning_effort: Some("high".to_string()),
-            mode_id: None,
             config_values: BTreeMap::from([("web_search".to_string(), "true".to_string())]),
+            ..SessionRuntimeSelection::provider(
+                AgentId::parse("claude-code").unwrap(),
+                crate::ids::ProviderProfileId::new(),
+                "claude-sonnet-4-5",
+            )
         };
         let json = serde_json::to_string(&selection).unwrap();
         let restored: SessionRuntimeSelection = serde_json::from_str(&json).unwrap();
@@ -1468,7 +1786,8 @@ mod tests {
             session_id: VibexSessionId::new(),
             agent_id: AgentId::parse("codex").unwrap(),
             transport_kind: TransportKind::Acp,
-            provider_profile_id: ProviderProfileId::new(),
+            auth_source: RuntimeAuthSource::provider_profile(ProviderProfileId::new()),
+            auth_source_revision: 3,
             adapter_id: AcpAdapterId::parse("codex-acp").unwrap(),
             adapter_version: "0.4.0".to_string(),
             adapter_compatibility_identity: "codex-acp@v1".to_string(),
@@ -1485,7 +1804,6 @@ mod tests {
                 serde_json::json!({"loadSession": true, "private": "capability-secret"}),
             ),
             restore_compatibility_key: None,
-            profile_revision: 3,
             last_context_sequence: 42,
             last_summary_sequence: 0,
             context_bridge_version: 1,
@@ -1516,6 +1834,8 @@ mod tests {
         let workspace = "workspace:/private/repo";
         let key = AgentSessionRestoreCompatibilityKey::new(
             AgentId::parse("codex").unwrap(),
+            RuntimeAuthSource::provider_profile(ProviderProfileId::new()),
+            1,
             format!("  {native}  "),
             NativeStateHomeId::new(),
             " codex-acp@v1 ",
@@ -1544,6 +1864,8 @@ mod tests {
         assert!(
             AgentSessionRestoreCompatibilityKey::new(
                 AgentId::parse("codex").unwrap(),
+                RuntimeAuthSource::provider_profile(ProviderProfileId::new()),
+                1,
                 " ",
                 NativeStateHomeId::new(),
                 "adapter",
@@ -1621,14 +1943,11 @@ mod tests {
 
     #[test]
     fn runtime_selection_matches_adapter_defaults_for_optional_fields() {
-        let selection = SessionRuntimeSelection {
-            agent_id: AgentId::parse("codex").unwrap(),
-            provider_profile_id: ProviderProfileId::parse("provider_acp_codex").unwrap(),
-            model_id: "gpt-test".to_string(),
-            reasoning_effort: None,
-            mode_id: None,
-            config_values: Default::default(),
-        };
+        let selection = SessionRuntimeSelection::provider(
+            AgentId::parse("codex").unwrap(),
+            ProviderProfileId::parse("provider_acp_codex").unwrap(),
+            "gpt-test",
+        );
         let config = SessionRuntimeConfigState {
             effective_model: Some("gpt-test".to_string()),
             effective_reasoning_effort: Some("medium".to_string()),
@@ -1852,12 +2171,12 @@ mod tests {
             expected_revision: 3,
             expected_selection_revision: 7,
             desired: SessionRuntimeSelection {
-                agent_id: AgentId::parse("codex").unwrap(),
-                provider_profile_id: ProviderProfileId::new(),
-                model_id: "gpt-5".to_string(),
                 reasoning_effort: Some("high".to_string()),
-                mode_id: None,
-                config_values: Default::default(),
+                ..SessionRuntimeSelection::provider(
+                    AgentId::parse("codex").unwrap(),
+                    ProviderProfileId::new(),
+                    "gpt-5",
+                )
             },
             interaction: RuntimeSelectionInteraction::Seamless,
         };

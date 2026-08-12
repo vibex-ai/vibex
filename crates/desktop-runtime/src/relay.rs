@@ -1642,17 +1642,12 @@ mod tests {
                     request: SendAgentMessageRequest {
                         session_id: session.id.clone(),
                         message_idempotency_key: "relay-denied-message".to_string(),
-                        desired_runtime: SessionRuntimeSelection {
-                            agent_id: session.agent_id.clone(),
-                            provider_profile_id: vibex_core::ProviderProfileId::parse(
-                                "provider_acp_relay_test",
-                            )
-                            .unwrap(),
-                            model_id: "relay-stub".to_string(),
-                            reasoning_effort: None,
-                            mode_id: None,
-                            config_values: Default::default(),
-                        },
+                        desired_runtime: SessionRuntimeSelection::provider(
+                            session.agent_id.clone(),
+                            vibex_core::ProviderProfileId::parse("provider_acp_relay_test")
+                                .unwrap(),
+                            "relay-stub",
+                        ),
                         text: prompt.to_string(),
                         attachments: Vec::new(),
                         reasoning_effort: None,

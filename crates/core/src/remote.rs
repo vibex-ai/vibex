@@ -8,6 +8,13 @@ use crate::agent::{
     GetMessageSubmissionRequest, MessageSubmissionState, ResolveElicitationRequest,
     ResolvePermissionRequest, SendAgentMessageRequest,
 };
+use crate::agent_auth::{
+    AgentAuthCatalog, AgentAuthContext, AgentAuthContextAuthenticateRequest,
+    AgentAuthContextAuthenticateResult, AgentAuthContextCancelAuthenticationRequest,
+    AgentAuthContextLogoutPreview, AgentAuthContextLogoutRequest, AgentAuthContextMutationResult,
+    AgentAuthContextRefreshModelsRequest, AgentAuthContextVerifyRequest,
+    AgentAuthenticationOperation,
+};
 use crate::agent_provider_runtime::{
     AgentRuntimeProbeCancelRequest, AgentRuntimeProbeListRequest, AgentRuntimeProbeRecord,
     AgentRuntimeProbeStartRequest,
@@ -25,8 +32,8 @@ use crate::git::{
     GitStatusSummary, GitWorktreeLifecycleSnapshot,
 };
 use crate::ids::{
-    AgentRuntimeProbeId, CorrelationId, DeviceId, EventId, RequestId, RuntimeProcessId, TerminalId,
-    VibexSessionId,
+    AgentAuthContextId, AgentRuntimeProbeId, CorrelationId, DeviceId, EventId, RequestId,
+    RuntimeProcessId, TerminalId, VibexSessionId,
 };
 use crate::provider::{
     ProviderFailoverRecommendation, ProviderFailoverRecommendationRequest, ProviderHealthSummary,
@@ -83,6 +90,8 @@ pub struct RemoteCapabilitySummary {
     pub supports_runtime_lifecycle: bool,
     #[serde(default)]
     pub supports_seamless_runtime_selection: bool,
+    #[serde(default)]
+    pub supports_agent_account_auth: bool,
     pub supports_workspace_files: bool,
     pub supports_git: bool,
     #[serde(default)]
@@ -102,6 +111,7 @@ impl RemoteCapabilitySummary {
             supports_agent_sessions: false,
             supports_runtime_lifecycle: false,
             supports_seamless_runtime_selection: false,
+            supports_agent_account_auth: false,
             supports_workspace_files: false,
             supports_git: false,
             supports_worktree_read: false,
@@ -281,6 +291,7 @@ pub enum RemoteActionClass {
     ResolvePermission,
     ResolveElicitation,
     MutateAgentSession,
+    MutateAgentAuthentication,
     MutateFile,
     MutateGit,
     MutateTerminal,
@@ -318,6 +329,7 @@ pub enum RemoteAuditTargetKind {
     Permission,
     Elicitation,
     AgentSession,
+    AgentAuthentication,
     WorkspaceFile,
     Git,
     Terminal,
@@ -371,6 +383,15 @@ pub enum RemoteAgentOperationKind {
     FetchTimeline,
     ResolveOpaqueLocator,
     ListRuntimeOptions,
+    ListAuthContexts,
+    ListAuthMethods,
+    AuthenticateContext,
+    GetAuthenticationOperation,
+    CancelContextAuthentication,
+    VerifyAuthContext,
+    RefreshAuthModels,
+    PreviewAuthLogout,
+    LogoutAuthContext,
     GetRuntimeSelection,
     SetDesiredRuntime,
     CancelRuntimeSwitch,
@@ -483,12 +504,114 @@ pub struct RemoteAgentRuntimeSelectionResponse {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAgentRuntimeOptionsRequest {
     pub auth: RemoteAuthProof,
+    /// Older clients omit this field and receive a Provider-only projection so
+    /// they never deserialize an authentication-source variant they do not know.
+    #[serde(default)]
+    pub supports_agent_account_auth: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAgentRuntimeOptionsResponse {
     pub catalog: SessionRuntimeOptionCatalog,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentAuthContextListRequest {
+    pub auth: RemoteAuthProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentAuthContextListResponse {
+    pub contexts: Vec<AgentAuthContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentAuthMethodListRequest {
+    pub auth: RemoteAuthProof,
+    pub agent_id: crate::AgentId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentAuthMethodListResponse {
+    pub catalog: AgentAuthCatalog,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentAuthenticateContextRequest {
+    pub auth: RemoteAuthProof,
+    pub request: AgentAuthContextAuthenticateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentAuthenticateContextResponse {
+    pub result: AgentAuthContextAuthenticateResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentAuthenticationOperationRequest {
+    pub auth: RemoteAuthProof,
+    pub operation_id: crate::AgentAuthenticationOperationId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentAuthenticationOperationResponse {
+    pub operation: AgentAuthenticationOperation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentCancelContextAuthenticationRequest {
+    pub auth: RemoteAuthProof,
+    pub request: AgentAuthContextCancelAuthenticationRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentAuthContextMutationResponse {
+    pub result: AgentAuthContextMutationResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentVerifyAuthContextRequest {
+    pub auth: RemoteAuthProof,
+    pub request: AgentAuthContextVerifyRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentRefreshAuthModelsRequest {
+    pub auth: RemoteAuthProof,
+    pub request: AgentAuthContextRefreshModelsRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentAuthLogoutPreviewRequest {
+    pub auth: RemoteAuthProof,
+    pub auth_context_id: AgentAuthContextId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentAuthLogoutPreviewResponse {
+    pub preview: AgentAuthContextLogoutPreview,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentLogoutAuthContextRequest {
+    pub auth: RemoteAuthProof,
+    pub request: AgentAuthContextLogoutRequest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -691,6 +814,15 @@ pub enum RemoteAgentRequest {
     FetchTimeline(RemoteAgentTimelineFetchRequest),
     ResolveOpaqueLocator(RemoteAgentDeepLinkResolveRequest),
     ListRuntimeOptions(RemoteAgentRuntimeOptionsRequest),
+    ListAuthContexts(RemoteAgentAuthContextListRequest),
+    ListAuthMethods(RemoteAgentAuthMethodListRequest),
+    AuthenticateContext(RemoteAgentAuthenticateContextRequest),
+    GetAuthenticationOperation(RemoteAgentAuthenticationOperationRequest),
+    CancelContextAuthentication(RemoteAgentCancelContextAuthenticationRequest),
+    VerifyAuthContext(RemoteAgentVerifyAuthContextRequest),
+    RefreshAuthModels(RemoteAgentRefreshAuthModelsRequest),
+    PreviewAuthLogout(RemoteAgentAuthLogoutPreviewRequest),
+    LogoutAuthContext(RemoteAgentLogoutAuthContextRequest),
     GetRuntimeSelection(RemoteAgentRuntimeSelectionRequest),
     SetDesiredRuntime(RemoteAgentSetDesiredRuntimeRequest),
     CancelRuntimeSwitch(RemoteAgentCancelRuntimeSwitchRequest),
@@ -716,6 +848,19 @@ impl RemoteAgentRequest {
             Self::FetchTimeline(_) => RemoteAgentOperationKind::FetchTimeline,
             Self::ResolveOpaqueLocator(_) => RemoteAgentOperationKind::ResolveOpaqueLocator,
             Self::ListRuntimeOptions(_) => RemoteAgentOperationKind::ListRuntimeOptions,
+            Self::ListAuthContexts(_) => RemoteAgentOperationKind::ListAuthContexts,
+            Self::ListAuthMethods(_) => RemoteAgentOperationKind::ListAuthMethods,
+            Self::AuthenticateContext(_) => RemoteAgentOperationKind::AuthenticateContext,
+            Self::GetAuthenticationOperation(_) => {
+                RemoteAgentOperationKind::GetAuthenticationOperation
+            }
+            Self::CancelContextAuthentication(_) => {
+                RemoteAgentOperationKind::CancelContextAuthentication
+            }
+            Self::VerifyAuthContext(_) => RemoteAgentOperationKind::VerifyAuthContext,
+            Self::RefreshAuthModels(_) => RemoteAgentOperationKind::RefreshAuthModels,
+            Self::PreviewAuthLogout(_) => RemoteAgentOperationKind::PreviewAuthLogout,
+            Self::LogoutAuthContext(_) => RemoteAgentOperationKind::LogoutAuthContext,
             Self::GetRuntimeSelection(_) => RemoteAgentOperationKind::GetRuntimeSelection,
             Self::SetDesiredRuntime(_) => RemoteAgentOperationKind::SetDesiredRuntime,
             Self::CancelRuntimeSwitch(_) => RemoteAgentOperationKind::CancelRuntimeSwitch,
@@ -1723,6 +1868,33 @@ mod tests {
     }
 
     #[test]
+    fn remote_authentication_operation_query_uses_canonical_contract() {
+        let operation_id = crate::AgentAuthenticationOperationId::new();
+        let request = RemoteAgentRequest::GetAuthenticationOperation(
+            RemoteAgentAuthenticationOperationRequest {
+                auth: RemoteAuthProof {
+                    device_id: DeviceId::new(),
+                    auth_token: "authentication-operation-token".to_string(),
+                },
+                operation_id: operation_id.clone(),
+            },
+        );
+
+        let json = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(
+            request.operation_kind(),
+            RemoteAgentOperationKind::GetAuthenticationOperation
+        );
+        assert_eq!(json["type"], "get_authentication_operation");
+        assert_eq!(
+            json["data"]["operationId"],
+            serde_json::Value::String(operation_id.as_str().to_string())
+        );
+        assert!(!format!("{request:?}").contains("authentication-operation-token"));
+    }
+
+    #[test]
     fn opaque_deep_link_request_keeps_locator_inside_the_authenticated_agent_rpc() {
         let session_id = VibexSessionId::new();
         let request = RemoteAgentRequest::ResolveOpaqueLocator(RemoteAgentDeepLinkResolveRequest {
@@ -1793,15 +1965,17 @@ mod tests {
         };
         let session_id = VibexSessionId::new();
         let desired = SessionRuntimeSelection {
-            agent_id: AgentId::parse("codex").unwrap(),
-            provider_profile_id: ProviderProfileId::new(),
-            model_id: "model-a".to_string(),
             reasoning_effort: Some("high".to_string()),
             mode_id: Some("plan".to_string()),
-            config_values: Default::default(),
+            ..SessionRuntimeSelection::provider(
+                AgentId::parse("codex").unwrap(),
+                ProviderProfileId::new(),
+                "model-a",
+            )
         };
         let catalog = RemoteAgentRequest::ListRuntimeOptions(RemoteAgentRuntimeOptionsRequest {
             auth: auth.clone(),
+            supports_agent_account_auth: true,
         });
         let set_desired =
             RemoteAgentRequest::SetDesiredRuntime(RemoteAgentSetDesiredRuntimeRequest {

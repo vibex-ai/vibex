@@ -119,6 +119,7 @@ struct RemoteRouterState {
     message_submission: Option<Arc<MessageSubmissionCoordinator>>,
     runtime_catalog: Option<Arc<dyn RemoteRuntimeOptionCatalogSource>>,
     runtime_probes: Option<Arc<dyn RemoteAgentRuntimeProbeSource>>,
+    agent_auth_contexts: Option<Arc<dyn RemoteAgentAuthContextSource>>,
     workbench: Option<RemoteWorkbenchRuntime>,
     provider: Option<RemoteProviderRuntime>,
 }
@@ -126,6 +127,51 @@ struct RemoteRouterState {
 #[async_trait]
 pub trait RemoteRuntimeOptionCatalogSource: Send + Sync {
     async fn list_runtime_options(&self) -> VibexResult<SessionRuntimeOptionCatalog>;
+}
+
+#[async_trait]
+pub trait RemoteAgentAuthContextSource: Send + Sync {
+    async fn list_auth_contexts(&self) -> VibexResult<Vec<vibex_core::AgentAuthContext>>;
+
+    async fn list_auth_methods(
+        &self,
+        agent_id: vibex_core::AgentId,
+    ) -> VibexResult<vibex_core::AgentAuthCatalog>;
+
+    async fn authenticate_context(
+        &self,
+        request: vibex_core::AgentAuthContextAuthenticateRequest,
+    ) -> VibexResult<vibex_core::AgentAuthContextAuthenticateResult>;
+
+    async fn get_authentication_operation(
+        &self,
+        operation_id: vibex_core::AgentAuthenticationOperationId,
+    ) -> VibexResult<vibex_core::AgentAuthenticationOperation>;
+
+    async fn cancel_authentication(
+        &self,
+        request: vibex_core::AgentAuthContextCancelAuthenticationRequest,
+    ) -> VibexResult<vibex_core::AgentAuthContextMutationResult>;
+
+    async fn verify_context(
+        &self,
+        request: vibex_core::AgentAuthContextVerifyRequest,
+    ) -> VibexResult<vibex_core::AgentAuthContextMutationResult>;
+
+    async fn refresh_models(
+        &self,
+        request: vibex_core::AgentAuthContextRefreshModelsRequest,
+    ) -> VibexResult<vibex_core::AgentAuthContextMutationResult>;
+
+    async fn logout_preview(
+        &self,
+        auth_context_id: vibex_core::AgentAuthContextId,
+    ) -> VibexResult<vibex_core::AgentAuthContextLogoutPreview>;
+
+    async fn logout(
+        &self,
+        request: vibex_core::AgentAuthContextLogoutRequest,
+    ) -> VibexResult<vibex_core::AgentAuthContextMutationResult>;
 }
 
 #[async_trait]
@@ -218,6 +264,7 @@ impl RemoteRouterState {
             message_submission: None,
             runtime_catalog: None,
             runtime_probes: None,
+            agent_auth_contexts: None,
             workbench: None,
             provider: None,
         }
@@ -233,6 +280,7 @@ impl RemoteRouterState {
             message_submission: None,
             runtime_catalog: None,
             runtime_probes: None,
+            agent_auth_contexts: None,
             workbench: None,
             provider: None,
         }
@@ -253,6 +301,7 @@ impl RemoteRouterState {
             message_submission: None,
             runtime_catalog: None,
             runtime_probes: None,
+            agent_auth_contexts: None,
             workbench: Some(workbench),
             provider: Some(provider),
         }
@@ -275,6 +324,7 @@ impl RemoteRouterState {
             message_submission: Some(message_submission),
             runtime_catalog: None,
             runtime_probes: None,
+            agent_auth_contexts: None,
             workbench: Some(workbench),
             provider: Some(provider),
         }
@@ -405,6 +455,15 @@ impl RemoteDispatcher {
         source: Arc<dyn RemoteAgentRuntimeProbeSource>,
     ) -> Self {
         self.state.runtime_probes = Some(source);
+        self
+    }
+
+    pub fn with_agent_auth_context_source(
+        mut self,
+        source: Arc<dyn RemoteAgentAuthContextSource>,
+    ) -> Self {
+        self.state.agent_auth_contexts = Some(source);
+        self.state.capabilities.supports_agent_account_auth = true;
         self
     }
 
@@ -865,6 +924,7 @@ fn audit_target_for_action(action: RemoteActionClass) -> RemoteAuditTargetKind {
         RemoteActionClass::ReadAgentSession | RemoteActionClass::MutateAgentSession => {
             RemoteAuditTargetKind::AgentSession
         }
+        RemoteActionClass::MutateAgentAuthentication => RemoteAuditTargetKind::AgentAuthentication,
         RemoteActionClass::ResolvePermission => RemoteAuditTargetKind::Permission,
         RemoteActionClass::ResolveElicitation => RemoteAuditTargetKind::Elicitation,
         RemoteActionClass::MutateFile => RemoteAuditTargetKind::WorkspaceFile,
@@ -890,6 +950,21 @@ fn redact_summary(summary: &str) -> String {
 
 fn remote_error(code: &'static str, message: &'static str) -> VibexError {
     VibexError::new(ErrorCategory::Remote, code, message)
+}
+
+fn safe_remote_agent_auth_error(error: VibexError, message: &'static str) -> VibexError {
+    let code = if !error.code.is_empty()
+        && error.code.len() <= 128
+        && error
+            .code
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        error.code
+    } else {
+        "agent_authentication_failed".to_string()
+    };
+    VibexError::new(error.category, code, message)
 }
 
 async fn health(State(dispatcher): State<RemoteDispatcher>) -> Json<RemoteHealthStatus> {
@@ -1525,10 +1600,248 @@ async fn dispatch_agent_request(
                 Some(request_id),
                 correlation_id,
             )?;
-            let catalog = remote_runtime_catalog(state)?
+            let mut catalog = remote_runtime_catalog(state)?
                 .list_runtime_options()
                 .await?;
+            if !request.supports_agent_account_auth {
+                catalog
+                    .auth_sources
+                    .retain(|source| source.source.provider_profile_id().is_some());
+                catalog
+                    .options
+                    .retain(|option| option.selection.auth_source.provider_profile_id().is_some());
+            }
             serde_json::to_value(RemoteAgentRuntimeOptionsResponse { catalog })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::ListAuthContexts(request) => {
+            authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::ReadAgentSession,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let contexts = remote_agent_auth_contexts(state)?
+                .list_auth_contexts()
+                .await?;
+            serde_json::to_value(vibex_core::RemoteAgentAuthContextListResponse { contexts })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::ListAuthMethods(request) => {
+            authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::ReadAgentSession,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let catalog = remote_agent_auth_contexts(state)?
+                .list_auth_methods(request.agent_id)
+                .await?;
+            serde_json::to_value(vibex_core::RemoteAgentAuthMethodListResponse { catalog })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::AuthenticateContext(request) => {
+            let target_id = request.request.auth_context_id.as_str().to_string();
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentAuthentication,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = remote_agent_auth_contexts(state)?
+                .authenticate_context(request.request)
+                .await
+                .map_err(|error| {
+                    safe_remote_agent_auth_error(error, "Agent account authentication failed")
+                });
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentAuthentication,
+                target_id,
+                "Agent account authentication",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let result = result?;
+            serde_json::to_value(vibex_core::RemoteAgentAuthenticateContextResponse { result })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::GetAuthenticationOperation(request) => {
+            authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentAuthentication,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let operation = remote_agent_auth_contexts(state)?
+                .get_authentication_operation(request.operation_id)
+                .await
+                .map_err(|error| {
+                    safe_remote_agent_auth_error(
+                        error,
+                        "Agent authentication operation could not be read",
+                    )
+                })?;
+            serde_json::to_value(vibex_core::RemoteAgentAuthenticationOperationResponse {
+                operation,
+            })
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::CancelContextAuthentication(request) => {
+            let target_id = request.request.auth_context_id.as_str().to_string();
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentAuthentication,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = remote_agent_auth_contexts(state)?
+                .cancel_authentication(request.request)
+                .await
+                .map_err(|error| {
+                    safe_remote_agent_auth_error(
+                        error,
+                        "Agent account authentication could not be cancelled",
+                    )
+                });
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentAuthentication,
+                target_id,
+                "Agent account authentication cancellation",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let result = result?;
+            serde_json::to_value(vibex_core::RemoteAgentAuthContextMutationResponse { result })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::VerifyAuthContext(request) => {
+            let target_id = request.request.auth_context_id.as_str().to_string();
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentAuthentication,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = remote_agent_auth_contexts(state)?
+                .verify_context(request.request)
+                .await
+                .map_err(|error| {
+                    safe_remote_agent_auth_error(error, "Agent account verification failed")
+                });
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentAuthentication,
+                target_id,
+                "Agent account verification",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let result = result?;
+            serde_json::to_value(vibex_core::RemoteAgentAuthContextMutationResponse { result })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::RefreshAuthModels(request) => {
+            let target_id = request.request.auth_context_id.as_str().to_string();
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentAuthentication,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = remote_agent_auth_contexts(state)?
+                .refresh_models(request.request)
+                .await
+                .map_err(|error| {
+                    safe_remote_agent_auth_error(error, "Agent account model refresh failed")
+                });
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentAuthentication,
+                target_id,
+                "Agent account model refresh",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let result = result?;
+            serde_json::to_value(vibex_core::RemoteAgentAuthContextMutationResponse { result })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::PreviewAuthLogout(request) => {
+            let target_id = request.auth_context_id.as_str().to_string();
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentAuthentication,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let preview = remote_agent_auth_contexts(state)?
+                .logout_preview(request.auth_context_id)
+                .await
+                .map_err(|error| {
+                    safe_remote_agent_auth_error(
+                        error,
+                        "Agent account logout impact could not be inspected",
+                    )
+                });
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentAuthentication,
+                target_id,
+                "Agent account logout impact preview",
+                preview.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let preview = preview?;
+            serde_json::to_value(vibex_core::RemoteAgentAuthLogoutPreviewResponse { preview })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::LogoutAuthContext(request) => {
+            let target_id = request.request.auth_context_id.as_str().to_string();
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentAuthentication,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = remote_agent_auth_contexts(state)?
+                .logout(request.request)
+                .await
+                .map_err(|error| {
+                    safe_remote_agent_auth_error(error, "Agent account logout failed")
+                });
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentAuthentication,
+                target_id,
+                "Agent account logout",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let result = result?;
+            serde_json::to_value(vibex_core::RemoteAgentAuthContextMutationResponse { result })
                 .map_err(remote_payload_encode_error)
         }
         RemoteAgentRequest::GetRuntimeSelection(request) => {
@@ -1837,6 +2150,17 @@ fn remote_runtime_catalog(
         VibexError::capability(
             "remote_agent_runtime_catalog_unavailable",
             "remote Agent runtime option catalog is not available on this service",
+        )
+    })
+}
+
+fn remote_agent_auth_contexts(
+    state: &RemoteRouterState,
+) -> VibexResult<&Arc<dyn RemoteAgentAuthContextSource>> {
+    state.agent_auth_contexts.as_ref().ok_or_else(|| {
+        VibexError::capability(
+            "remote_agent_account_auth_unavailable",
+            "remote Agent account authentication is not available on this service",
         )
     })
 }
@@ -3009,6 +3333,15 @@ mod tests {
         sensitive_execution_state: Vec<String>,
     }
 
+    struct TestAgentAuthContextSource {
+        context: vibex_core::AgentAuthContext,
+        operation: vibex_core::AgentAuthenticationOperation,
+        operation_calls: AtomicUsize,
+        verify_calls: AtomicUsize,
+        refresh_calls: AtomicUsize,
+        sensitive_execution_state: Vec<String>,
+    }
+
     struct TestWorktreeSnapshotSource {
         eligibility: vibex_core::GitProjectEligibility,
         snapshot: vibex_core::GitWorktreeLifecycleSnapshot,
@@ -3022,10 +3355,12 @@ mod tests {
             Self {
                 catalog: SessionRuntimeOptionCatalog {
                     revision: 9,
+                    agents: Vec::new(),
+                    auth_sources: Vec::new(),
                     options: vec![SessionRuntimeOption {
                         selection,
                         agent_label: "Codex".to_string(),
-                        provider_profile_label: "Work".to_string(),
+                        auth_source_label: "Work".to_string(),
                         model_label: "Mock Remote".to_string(),
                         reasoning_efforts: vec![SessionConfigValue {
                             value: "high".to_string(),
@@ -3097,11 +3432,139 @@ mod tests {
         }
     }
 
+    impl TestAgentAuthContextSource {
+        fn new() -> Self {
+            let context = vibex_core::AgentAuthContext {
+                id: vibex_core::AgentAuthContextId::new(),
+                agent_id: AgentId::parse("codex").unwrap(),
+                status: vibex_core::AgentAuthContextStatus::Authenticated,
+                account_hint: Some("work account".to_string()),
+                authenticated_via_method: Some("browser".to_string()),
+                revision: 3,
+                last_verified_at_ms: Some(10),
+                created_at_ms: 1,
+                updated_at_ms: 10,
+            };
+            let operation = vibex_core::AgentAuthenticationOperation {
+                operation_id: vibex_core::AgentAuthenticationOperationId::new(),
+                auth_context_id: context.id.clone(),
+                expected_context_revision: context.revision,
+                method_id: "browser".to_string(),
+                state: vibex_core::AgentAuthenticationOperationState::AwaitingUser,
+                error_code: None,
+                created_at_ms: 11,
+                updated_at_ms: 12,
+            };
+            Self {
+                context,
+                operation,
+                operation_calls: AtomicUsize::new(0),
+                verify_calls: AtomicUsize::new(0),
+                refresh_calls: AtomicUsize::new(0),
+                sensitive_execution_state: vec![
+                    "auth-operation-command-sentinel".to_string(),
+                    "auth-operation-env-value-sentinel".to_string(),
+                    "/home/private-agent-auth-state".to_string(),
+                ],
+            }
+        }
+
+        fn mutation_result(&self) -> vibex_core::AgentAuthContextMutationResult {
+            vibex_core::AgentAuthContextMutationResult {
+                context: self.context.clone(),
+                model_catalog: None,
+                affected_session_ids: Vec::new(),
+            }
+        }
+    }
+
     #[async_trait::async_trait]
     impl RemoteRuntimeOptionCatalogSource for TestRuntimeCatalogSource {
         async fn list_runtime_options(&self) -> VibexResult<SessionRuntimeOptionCatalog> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.catalog.clone())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteAgentAuthContextSource for TestAgentAuthContextSource {
+        async fn list_auth_contexts(&self) -> VibexResult<Vec<vibex_core::AgentAuthContext>> {
+            Ok(vec![self.context.clone()])
+        }
+
+        async fn list_auth_methods(
+            &self,
+            agent_id: AgentId,
+        ) -> VibexResult<vibex_core::AgentAuthCatalog> {
+            Ok(vibex_core::AgentAuthCatalog {
+                agent_id,
+                methods: Vec::new(),
+                supports_logout: true,
+                status: vibex_core::AgentAuthStatus::Authenticated,
+                refreshed_at_ms: 10,
+            })
+        }
+
+        async fn authenticate_context(
+            &self,
+            _request: vibex_core::AgentAuthContextAuthenticateRequest,
+        ) -> VibexResult<vibex_core::AgentAuthContextAuthenticateResult> {
+            Err(VibexError::capability("test_auth_unused", "unused"))
+        }
+
+        async fn get_authentication_operation(
+            &self,
+            operation_id: vibex_core::AgentAuthenticationOperationId,
+        ) -> VibexResult<vibex_core::AgentAuthenticationOperation> {
+            assert_eq!(operation_id, self.operation.operation_id);
+            self.operation_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.operation.clone())
+        }
+
+        async fn cancel_authentication(
+            &self,
+            _request: vibex_core::AgentAuthContextCancelAuthenticationRequest,
+        ) -> VibexResult<vibex_core::AgentAuthContextMutationResult> {
+            Err(VibexError::capability("test_auth_unused", "unused"))
+        }
+
+        async fn verify_context(
+            &self,
+            request: vibex_core::AgentAuthContextVerifyRequest,
+        ) -> VibexResult<vibex_core::AgentAuthContextMutationResult> {
+            assert_eq!(request.auth_context_id, self.context.id);
+            self.verify_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.mutation_result())
+        }
+
+        async fn refresh_models(
+            &self,
+            request: vibex_core::AgentAuthContextRefreshModelsRequest,
+        ) -> VibexResult<vibex_core::AgentAuthContextMutationResult> {
+            assert_eq!(request.auth_context_id, self.context.id);
+            self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+            Err(VibexError::process(
+                "test_auth_refresh_failed",
+                "auth-token-sentinel /home/private-agent-state",
+            ))
+        }
+
+        async fn logout_preview(
+            &self,
+            auth_context_id: vibex_core::AgentAuthContextId,
+        ) -> VibexResult<vibex_core::AgentAuthContextLogoutPreview> {
+            assert_eq!(auth_context_id, self.context.id);
+            Ok(vibex_core::AgentAuthContextLogoutPreview {
+                context: self.context.clone(),
+                affected_session_ids: Vec::new(),
+            })
+        }
+
+        async fn logout(
+            &self,
+            _request: vibex_core::AgentAuthContextLogoutRequest,
+        ) -> VibexResult<vibex_core::AgentAuthContextMutationResult> {
+            Ok(self.mutation_result())
         }
     }
 
@@ -3470,6 +3933,26 @@ mod tests {
     }
 
     #[test]
+    fn agent_authentication_mutations_are_full_control_only_and_have_a_dedicated_target() {
+        assert!(!permission_allows(
+            RemoteDevicePermissionLevel::ReadOnly,
+            RemoteActionClass::MutateAgentAuthentication,
+        ));
+        assert!(!permission_allows(
+            RemoteDevicePermissionLevel::ApproveOnly,
+            RemoteActionClass::MutateAgentAuthentication,
+        ));
+        assert!(permission_allows(
+            RemoteDevicePermissionLevel::FullControl,
+            RemoteActionClass::MutateAgentAuthentication,
+        ));
+        assert_eq!(
+            audit_target_for_action(RemoteActionClass::MutateAgentAuthentication),
+            RemoteAuditTargetKind::AgentAuthentication
+        );
+    }
+
+    #[test]
     fn trust_service_rejects_invalid_and_expired_pairing_codes() {
         let mut conn = vibex_db::DbConnection::open_in_memory().unwrap();
         apply_migrations(&mut conn).unwrap();
@@ -3682,6 +4165,7 @@ mod tests {
             router,
             RemoteAgentRequest::ListRuntimeOptions(RemoteAgentRuntimeOptionsRequest {
                 auth: reader.clone(),
+                supports_agent_account_auth: true,
             }),
         )
         .await;
@@ -3694,6 +4178,175 @@ mod tests {
         assert_eq!(payload.catalog.options[0].agent_label, "Codex");
         assert_eq!(source.calls.load(Ordering::SeqCst), 1);
         assert!(!encoded.contains(&reader.auth_token));
+        cleanup_db(db_path);
+    }
+
+    #[tokio::test]
+    async fn remote_agent_auth_mutations_enforce_permission_and_audit_redacted_outcomes() {
+        let (db_path, manager) = test_agent_manager("agent-auth-mutations");
+        let reader = pair_device(&db_path, RemoteDevicePermissionLevel::ReadOnly, "Reader");
+        let approver = pair_device(
+            &db_path,
+            RemoteDevicePermissionLevel::ApproveOnly,
+            "Approver",
+        );
+        let controller = pair_device(
+            &db_path,
+            RemoteDevicePermissionLevel::FullControl,
+            "Controller",
+        );
+        let source = Arc::new(TestAgentAuthContextSource::new());
+        let context_id = source.context.id.clone();
+        let revision = source.context.revision;
+        let dispatcher =
+            RemoteDispatcher::with_agent_manager(RemoteServiceConfig::loopback_disabled(), manager)
+                .with_agent_auth_context_source(source.clone());
+        let router = build_router_with_dispatcher(dispatcher);
+
+        let verify_request = |auth| {
+            RemoteAgentRequest::VerifyAuthContext(vibex_core::RemoteAgentVerifyAuthContextRequest {
+                auth,
+                request: vibex_core::AgentAuthContextVerifyRequest {
+                    auth_context_id: context_id.clone(),
+                    expected_context_revision: revision,
+                    operation_id: None,
+                },
+            })
+        };
+        let denied_reader = post_agent(router.clone(), verify_request(reader)).await;
+        let denied_approver = post_agent(router.clone(), verify_request(approver)).await;
+        let verified = post_agent(router.clone(), verify_request(controller.clone())).await;
+        let failed_refresh = post_agent(
+            router,
+            RemoteAgentRequest::RefreshAuthModels(
+                vibex_core::RemoteAgentRefreshAuthModelsRequest {
+                    auth: controller.clone(),
+                    request: vibex_core::AgentAuthContextRefreshModelsRequest {
+                        auth_context_id: context_id.clone(),
+                        expected_context_revision: revision,
+                    },
+                },
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            denied_reader.error.unwrap().code,
+            "remote_permission_denied"
+        );
+        assert_eq!(
+            denied_approver.error.unwrap().code,
+            "remote_permission_denied"
+        );
+        assert_eq!(verified.status, RemoteEnvelopeStatus::Ok);
+        assert_eq!(
+            failed_refresh.error.as_ref().unwrap().code,
+            "test_auth_refresh_failed"
+        );
+        assert_eq!(source.verify_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(source.refresh_calls.load(Ordering::SeqCst), 1);
+
+        let encoded_failure = serde_json::to_string(&failed_refresh).unwrap();
+        assert!(!encoded_failure.contains("auth-token-sentinel"));
+        assert!(!encoded_failure.contains("/home/private-agent-state"));
+        assert!(!encoded_failure.contains(&controller.auth_token));
+
+        let connection = open_database(&db_path).unwrap();
+        let audits = RemoteAuditRepository::list(
+            &connection,
+            &RemoteAuditListRequest {
+                device_id: Some(controller.device_id),
+                limit: Some(50),
+            },
+        )
+        .unwrap();
+        assert!(audits.iter().any(|record| {
+            record.target_kind == RemoteAuditTargetKind::AgentAuthentication
+                && record.target_id.as_deref() == Some(context_id.as_str())
+                && record.action == RemoteAuditAction::MutationAllowed
+        }));
+        assert!(audits.iter().any(|record| {
+            record.target_kind == RemoteAuditTargetKind::AgentAuthentication
+                && record.target_id.as_deref() == Some(context_id.as_str())
+                && record.action == RemoteAuditAction::MutationDenied
+        }));
+        assert!(audits.iter().all(|record| {
+            !record.redacted_summary.contains("auth-token-sentinel")
+                && !record
+                    .redacted_summary
+                    .contains("/home/private-agent-state")
+                && !record.redacted_summary.contains(&controller.auth_token)
+        }));
+
+        cleanup_db(db_path);
+    }
+
+    #[tokio::test]
+    async fn remote_authentication_operation_status_is_full_control_and_safe() {
+        let (db_path, manager) = test_agent_manager("agent-auth-operation-status");
+        let reader = pair_device(&db_path, RemoteDevicePermissionLevel::ReadOnly, "Reader");
+        let approver = pair_device(
+            &db_path,
+            RemoteDevicePermissionLevel::ApproveOnly,
+            "Approver",
+        );
+        let controller = pair_device(
+            &db_path,
+            RemoteDevicePermissionLevel::FullControl,
+            "Controller",
+        );
+        let source = Arc::new(TestAgentAuthContextSource::new());
+        let operation_id = source.operation.operation_id.clone();
+        let dispatcher =
+            RemoteDispatcher::with_agent_manager(RemoteServiceConfig::loopback_disabled(), manager)
+                .with_agent_auth_context_source(source.clone());
+        let router = build_router_with_dispatcher(dispatcher);
+        let query = |auth| {
+            RemoteAgentRequest::GetAuthenticationOperation(
+                vibex_core::RemoteAgentAuthenticationOperationRequest {
+                    auth,
+                    operation_id: operation_id.clone(),
+                },
+            )
+        };
+
+        let denied_reader = post_agent(router.clone(), query(reader)).await;
+        let denied_approver = post_agent(router.clone(), query(approver)).await;
+        let response = post_agent(router, query(controller.clone())).await;
+
+        assert_eq!(
+            denied_reader.error.unwrap().code,
+            "remote_permission_denied"
+        );
+        assert_eq!(
+            denied_approver.error.unwrap().code,
+            "remote_permission_denied"
+        );
+        assert_eq!(response.status, RemoteEnvelopeStatus::Ok);
+        let encoded = serde_json::to_string(&response).unwrap();
+        let payload: vibex_core::RemoteAgentAuthenticationOperationResponse =
+            serde_json::from_value(response.payload.unwrap()).unwrap();
+        assert_eq!(payload.operation, source.operation);
+        assert_eq!(source.operation_calls.load(Ordering::SeqCst), 1);
+        assert!(!encoded.contains(&controller.auth_token));
+        for sentinel in &source.sensitive_execution_state {
+            assert!(!encoded.contains(sentinel));
+        }
+
+        let connection = open_database(&db_path).unwrap();
+        let audits = RemoteAuditRepository::list(
+            &connection,
+            &RemoteAuditListRequest {
+                device_id: Some(controller.device_id),
+                limit: Some(50),
+            },
+        )
+        .unwrap();
+        assert!(audits.iter().all(|record| {
+            record.target_kind != RemoteAuditTargetKind::AgentAuthentication
+                || record.action != RemoteAuditAction::MutationAllowed
+        }));
+
         cleanup_db(db_path);
     }
 
@@ -3792,6 +4445,7 @@ mod tests {
                 message_submission: None,
                 runtime_catalog: None,
                 runtime_probes: None,
+                agent_auth_contexts: None,
                 workbench: None,
                 provider: None,
             },
@@ -4970,15 +5624,11 @@ mod tests {
     }
 
     fn remote_test_selection(session: &AgentSession) -> SessionRuntimeSelection {
-        SessionRuntimeSelection {
-            agent_id: session.agent_id.clone(),
-            provider_profile_id: vibex_core::ProviderProfileId::parse("provider_acp_remote_test")
-                .unwrap(),
-            model_id: "mock-remote".to_string(),
-            reasoning_effort: None,
-            mode_id: None,
-            config_values: Default::default(),
-        }
+        SessionRuntimeSelection::provider(
+            session.agent_id.clone(),
+            vibex_core::ProviderProfileId::parse("provider_acp_remote_test").unwrap(),
+            "mock-remote",
+        )
     }
 
     fn append_mock_timeline(manager: &AgentManager, session: &AgentSession, text: &str) {

@@ -86,7 +86,10 @@ impl vibex_agent::AgentProvider for E2eStubAcpProvider {
             binding: vibex_core::ProviderBinding {
                 session_id: request.session_id,
                 provider_kind: ProviderKind::Acp,
-                provider_profile_id: request.provider_profile_id,
+                auth_source: vibex_core::RuntimeAuthSource::provider_profile(
+                    request.provider_profile_id,
+                ),
+                auth_source_revision: 0,
                 native: vibex_core::ProviderNativeBinding::empty(),
                 created_at_ms: now,
                 updated_at_ms: now,
@@ -245,17 +248,12 @@ fn create_e2e_durable_session(
         deleted_at_ms: None,
     };
     SessionRepository::insert(&conn, &session)?;
-    let selection = SessionRuntimeSelection {
-        agent_id: agent_id.clone(),
-        provider_profile_id: profile.id.clone(),
-        model_id: "e2e-stub".to_string(),
-        reasoning_effort: None,
-        mode_id: None,
-        config_values: Default::default(),
-    };
+    let selection =
+        SessionRuntimeSelection::provider(agent_id.clone(), profile.id.clone(), "e2e-stub");
+    let selected_model = selection.model_id().expect("explicit model").to_string();
     let mut runtime_config = SessionRuntimeConfigState {
-        preferred_model: Some(selection.model_id.clone()),
-        effective_model: Some(selection.model_id.clone()),
+        preferred_model: Some(selected_model.clone()),
+        effective_model: Some(selected_model),
         ..SessionRuntimeConfigState::default()
     };
     runtime_config.mark_generation_if_converged(0);
@@ -264,7 +262,8 @@ fn create_e2e_durable_session(
         session_id: session.id.clone(),
         agent_id,
         transport_kind: TransportKind::Acp,
-        provider_profile_id: profile.id,
+        auth_source: vibex_core::RuntimeAuthSource::provider_profile(profile.id),
+        auth_source_revision: profile.updated_at_ms,
         adapter_id: AcpAdapterId::parse("codex-acp")?,
         adapter_version: "e2e".to_string(),
         adapter_compatibility_identity: "adapter=codex-acp@e2e".to_string(),
@@ -275,7 +274,6 @@ fn create_e2e_durable_session(
         session_runtime_config_state: runtime_config,
         capability_snapshot: None,
         restore_compatibility_key: None,
-        profile_revision: profile.updated_at_ms,
         last_context_sequence: 0,
         last_summary_sequence: 0,
         context_bridge_version: vibex_agent::CONTEXT_BRIDGE_VERSION,
@@ -464,7 +462,7 @@ async fn agent_command_protocol(root: &Path) -> VibexResult<E2eRegressionCheck> 
     let discovered = manager
         .discover_commands(AgentCommandDiscoverRequest {
             agent_id: Some(selection.agent_id.clone()),
-            provider_profile_id: Some(selection.provider_profile_id),
+            provider_profile_id: selection.provider_profile_id().cloned(),
             session_id: Some(session.id.clone()),
             workspace_id: Some(session.workspace_id.clone()),
             trigger: None,

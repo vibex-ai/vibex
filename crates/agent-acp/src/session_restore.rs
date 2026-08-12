@@ -66,6 +66,16 @@ pub fn resolve_restore_compatibility(
             reason: RestoreIncompatibilityReason::AgentMismatch,
         };
     }
+    if source.auth_source != target.auth_source {
+        return AgentSessionRestoreCompatibility::Incompatible {
+            reason: RestoreIncompatibilityReason::AuthSourceMismatch,
+        };
+    }
+    if source.auth_source_revision != target.auth_source_revision {
+        return AgentSessionRestoreCompatibility::Incompatible {
+            reason: RestoreIncompatibilityReason::AuthSourceRevisionMismatch,
+        };
+    }
     if source.native_state_home_id != target.native_state_home_id {
         return AgentSessionRestoreCompatibility::Incompatible {
             reason: RestoreIncompatibilityReason::NativeStateHomeMismatch,
@@ -268,11 +278,13 @@ pub fn result_for_success(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vibex_core::{AgentId, NativeStateHomeId};
+    use vibex_core::{AgentId, NativeStateHomeId, ProviderProfileId, RuntimeAuthSource};
 
     fn key(workspace: &str) -> AgentSessionRestoreCompatibilityKey {
         AgentSessionRestoreCompatibilityKey::new(
             AgentId::parse("codex").unwrap(),
+            RuntimeAuthSource::provider_profile(ProviderProfileId::parse("provider_test").unwrap()),
+            1,
             "native-1",
             NativeStateHomeId::parse("statehome_test").unwrap(),
             "codex-acp@v1",
@@ -339,6 +351,23 @@ mod tests {
                     target
                 },
                 RestoreIncompatibilityReason::AgentMismatch,
+            ),
+            (
+                {
+                    let mut target = source.clone();
+                    target.auth_source =
+                        RuntimeAuthSource::provider_profile(ProviderProfileId::new());
+                    target
+                },
+                RestoreIncompatibilityReason::AuthSourceMismatch,
+            ),
+            (
+                {
+                    let mut target = source.clone();
+                    target.auth_source_revision += 1;
+                    target
+                },
+                RestoreIncompatibilityReason::AuthSourceRevisionMismatch,
             ),
             (
                 {

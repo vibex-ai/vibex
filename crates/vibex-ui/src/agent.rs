@@ -1394,6 +1394,8 @@ mod tests {
             Box::pin(async {
                 Ok(SessionRuntimeOptionCatalog {
                     revision: 1,
+                    agents: Vec::new(),
+                    auth_sources: Vec::new(),
                     options: Vec::new(),
                 })
             })
@@ -1514,14 +1516,11 @@ mod tests {
     #[test]
     fn runtime_selection_event_without_switch_projection_applies_to_selected_session() {
         let session = session();
-        let selection = SessionRuntimeSelection {
-            agent_id: AgentId::parse("claude").unwrap(),
-            provider_profile_id: ProviderProfileId::new(),
-            model_id: "claude-sonnet".into(),
-            reasoning_effort: None,
-            mode_id: None,
-            config_values: Default::default(),
-        };
+        let selection = SessionRuntimeSelection::provider(
+            AgentId::parse("claude").unwrap(),
+            ProviderProfileId::new(),
+            "claude-sonnet",
+        );
         let backend = Arc::new(MockAgentBackend::new(session.clone(), Vec::new()));
         let mut controller = AgentWorkflowController::new(backend, capabilities());
         controller.state.selected_session_id = Some(session.id.clone());
@@ -1834,14 +1833,11 @@ mod tests {
         let request = MutationRequest::new(SendAgentMessageRequest {
             session_id: session.id.clone(),
             message_idempotency_key: "message-1".into(),
-            desired_runtime: SessionRuntimeSelection {
-                agent_id: AgentId::parse("codex").unwrap(),
-                provider_profile_id: ProviderProfileId::new(),
-                model_id: "model".into(),
-                reasoning_effort: None,
-                mode_id: None,
-                config_values: Default::default(),
-            },
+            desired_runtime: SessionRuntimeSelection::provider(
+                AgentId::parse("codex").unwrap(),
+                ProviderProfileId::new(),
+                "model",
+            ),
             text: "hello".into(),
             attachments: Vec::new(),
             reasoning_effort: None,
@@ -1876,14 +1872,11 @@ mod tests {
         let request = MutationRequest::new(SendAgentMessageRequest {
             session_id: session.id.clone(),
             message_idempotency_key: "message-2".into(),
-            desired_runtime: SessionRuntimeSelection {
-                agent_id: AgentId::parse("codex").unwrap(),
-                provider_profile_id: ProviderProfileId::new(),
-                model_id: "model".into(),
-                reasoning_effort: None,
-                mode_id: None,
-                config_values: Default::default(),
-            },
+            desired_runtime: SessionRuntimeSelection::provider(
+                AgentId::parse("codex").unwrap(),
+                ProviderProfileId::new(),
+                "model",
+            ),
             text: "hello".into(),
             attachments: Vec::new(),
             reasoning_effort: None,

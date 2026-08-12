@@ -9,10 +9,10 @@ use std::fmt;
 
 use sha2::{Digest, Sha256};
 use vibex_core::{
-    AcpAdapterId, AgentId, NativeStateHomeId, ProviderProfileId, VibexError, VibexResult,
+    AcpAdapterId, AgentId, NativeStateHomeId, RuntimeAuthSource, VibexError, VibexResult,
 };
 
-const FINGERPRINT_DOMAIN: &[u8] = b"vibex/acp/process-spawn-fingerprint/v1";
+const FINGERPRINT_DOMAIN: &[u8] = b"vibex/acp/process-spawn-fingerprint/v2";
 
 /// Immutable configuration required before an ACP process can be spawned.
 ///
@@ -26,17 +26,19 @@ pub struct ProcessSpawnConfigSnapshot {
     pub adapter_id: AcpAdapterId,
     pub adapter_version: String,
     pub adapter_binary_identity: String,
-    pub provider_profile_id: ProviderProfileId,
+    pub auth_source: RuntimeAuthSource,
+    pub auth_source_revision: i64,
     /// A deterministic revision of the process-scoped projection. It is not a
-    /// wall-clock save timestamp, so an equivalent profile can recover the
+    /// wall-clock save timestamp, so an equivalent source can recover the
     /// launch fingerprint after a save/revert cycle.
-    pub profile_revision: i64,
+    pub process_config_revision: i64,
     pub command: String,
     pub args: Vec<String>,
     pub cwd_policy: String,
     pub base_url: Option<String>,
     pub model_provider_id: Option<String>,
     pub non_secret_env: BTreeMap<String, String>,
+    pub env_unsets: BTreeSet<String>,
     pub secret_reference_versions: BTreeMap<String, String>,
     pub mcp_revision: Option<String>,
     pub skills_revision: Option<String>,
@@ -46,6 +48,7 @@ pub struct ProcessSpawnConfigSnapshot {
 impl fmt::Debug for ProcessSpawnConfigSnapshot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let non_secret_env_keys = self.non_secret_env.keys().collect::<Vec<_>>();
+        let env_unset_keys = self.env_unsets.iter().collect::<Vec<_>>();
         let secret_reference_keys = self.secret_reference_versions.keys().collect::<Vec<_>>();
         formatter
             .debug_struct("ProcessSpawnConfigSnapshot")
@@ -53,14 +56,16 @@ impl fmt::Debug for ProcessSpawnConfigSnapshot {
             .field("adapter_id", &self.adapter_id)
             .field("adapter_version", &self.adapter_version)
             .field("adapter_binary_identity", &self.adapter_binary_identity)
-            .field("provider_profile_id", &self.provider_profile_id)
-            .field("profile_revision", &self.profile_revision)
+            .field("auth_source", &self.auth_source)
+            .field("auth_source_revision", &self.auth_source_revision)
+            .field("process_config_revision", &self.process_config_revision)
             .field("command", &redact_text(&self.command))
             .field("args", &format_args!("{} args", self.args.len()))
             .field("cwd_policy", &redact_text(&self.cwd_policy))
             .field("base_url", &self.base_url.as_ref().map(|_| "[redacted]"))
             .field("model_provider_id", &self.model_provider_id)
             .field("non_secret_env_keys", &non_secret_env_keys)
+            .field("env_unset_keys", &env_unset_keys)
             .field("secret_reference_keys", &secret_reference_keys)
             .field("mcp_revision", &self.mcp_revision)
             .field("skills_revision", &self.skills_revision)
@@ -72,7 +77,7 @@ impl fmt::Debug for ProcessSpawnConfigSnapshot {
 impl ProcessSpawnConfigSnapshot {
     /// Sets the deterministic process-scoped content revision.
     pub fn with_content_revision(mut self) -> Self {
-        self.profile_revision = self.content_revision();
+        self.process_config_revision = self.content_revision();
         self
     }
 
@@ -109,8 +114,11 @@ impl ProcessSpawnConfigSnapshot {
         if self.adapter_binary_identity != current.adapter_binary_identity {
             changed.insert(ProcessConfigField::AdapterBinaryIdentity);
         }
-        if self.provider_profile_id != current.provider_profile_id {
-            changed.insert(ProcessConfigField::ProviderProfile);
+        if self.auth_source != current.auth_source {
+            changed.insert(ProcessConfigField::AuthSource);
+        }
+        if self.auth_source_revision != current.auth_source_revision {
+            changed.insert(ProcessConfigField::AuthSourceRevision);
         }
         if self.command != current.command {
             changed.insert(ProcessConfigField::Command);
@@ -129,6 +137,9 @@ impl ProcessSpawnConfigSnapshot {
         }
         if self.non_secret_env != current.non_secret_env {
             changed.insert(ProcessConfigField::NonSecretEnv);
+        }
+        if self.env_unsets != current.env_unsets {
+            changed.insert(ProcessConfigField::EnvUnsets);
         }
         if self.secret_reference_versions != current.secret_reference_versions {
             changed.insert(ProcessConfigField::SecretReferences);
@@ -166,14 +177,24 @@ impl ProcessSpawnConfigSnapshot {
         );
         write_required_field(
             &mut output,
-            b"provider_profile_id",
-            self.provider_profile_id.as_str().as_bytes(),
+            b"auth_source_kind",
+            auth_source_kind(&self.auth_source),
+        );
+        write_required_field(
+            &mut output,
+            b"auth_source_id",
+            self.auth_source.id().as_bytes(),
+        );
+        write_required_field(
+            &mut output,
+            b"auth_source_revision",
+            &self.auth_source_revision.to_be_bytes(),
         );
         if include_revision {
             write_required_field(
                 &mut output,
-                b"profile_revision",
-                &self.profile_revision.to_be_bytes(),
+                b"process_config_revision",
+                &self.process_config_revision.to_be_bytes(),
             );
         }
         write_required_field(&mut output, b"command", self.command.as_bytes());
@@ -186,6 +207,7 @@ impl ProcessSpawnConfigSnapshot {
             self.model_provider_id.as_deref(),
         );
         write_map_field(&mut output, b"non_secret_env", &self.non_secret_env);
+        write_set_field(&mut output, b"env_unsets", &self.env_unsets);
         write_map_field(
             &mut output,
             b"secret_reference_versions",
@@ -213,13 +235,15 @@ pub enum ProcessConfigField {
     Adapter,
     AdapterVersion,
     AdapterBinaryIdentity,
-    ProviderProfile,
+    AuthSource,
+    AuthSourceRevision,
     Command,
     Args,
     CwdPolicy,
     BaseUrl,
     ModelProvider,
     NonSecretEnv,
+    EnvUnsets,
     SecretReferences,
     McpRevision,
     SkillsRevision,
@@ -233,13 +257,15 @@ impl ProcessConfigField {
             Self::Adapter => "adapter",
             Self::AdapterVersion => "adapter_version",
             Self::AdapterBinaryIdentity => "adapter_binary_identity",
-            Self::ProviderProfile => "provider_profile",
+            Self::AuthSource => "auth_source",
+            Self::AuthSourceRevision => "auth_source_revision",
             Self::Command => "command",
             Self::Args => "args",
             Self::CwdPolicy => "cwd_policy",
             Self::BaseUrl => "base_url",
             Self::ModelProvider => "model_provider",
             Self::NonSecretEnv => "non_secret_env",
+            Self::EnvUnsets => "env_unsets",
             Self::SecretReferences => "secret_references",
             Self::McpRevision => "mcp_revision",
             Self::SkillsRevision => "skills_revision",
@@ -282,12 +308,20 @@ impl ProcessConfigStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessConfigStatusEvent {
     pub process_instance_id: String,
-    pub provider_profile_id: ProviderProfileId,
+    pub auth_source: RuntimeAuthSource,
+    pub auth_source_revision: i64,
     pub previous_status: ProcessConfigStatus,
     pub status: ProcessConfigStatus,
     pub previous_fingerprint: String,
     pub current_fingerprint: String,
     pub changed_fields: Vec<String>,
+}
+
+fn auth_source_kind(source: &RuntimeAuthSource) -> &'static [u8] {
+    match source {
+        RuntimeAuthSource::ProviderProfile { .. } => b"provider_profile",
+        RuntimeAuthSource::AgentAccount { .. } => b"agent_account",
+    }
 }
 
 fn write_component(output: &mut Vec<u8>, bytes: &[u8]) {
@@ -327,6 +361,15 @@ fn write_map_field(output: &mut Vec<u8>, name: &[u8], values: &BTreeMap<String, 
     output.extend_from_slice(&(values.len() as u64).to_be_bytes());
     for (key, value) in values {
         write_component(output, key.as_bytes());
+        write_component(output, value.as_bytes());
+    }
+}
+
+fn write_set_field(output: &mut Vec<u8>, name: &[u8], values: &BTreeSet<String>) {
+    write_component(output, name);
+    output.push(1);
+    output.extend_from_slice(&(values.len() as u64).to_be_bytes());
+    for value in values {
         write_component(output, value.as_bytes());
     }
 }
@@ -386,14 +429,18 @@ mod tests {
             adapter_id: AcpAdapterId::parse("codex-acp").unwrap(),
             adapter_version: "1.1.9".to_string(),
             adapter_binary_identity: "sha256:adapter".to_string(),
-            provider_profile_id: ProviderProfileId::parse("provider_codex").unwrap(),
-            profile_revision: 0,
+            auth_source: RuntimeAuthSource::provider_profile(
+                ProviderProfileId::parse("provider_codex").unwrap(),
+            ),
+            auth_source_revision: 7,
+            process_config_revision: 0,
             command: "node".to_string(),
             args: vec!["adapter.js".to_string(), "--stdio".to_string()],
             cwd_policy: "{workspaceRoot}".to_string(),
             base_url: Some("https://api.example.test".to_string()),
             model_provider_id: Some("openai".to_string()),
             non_secret_env: BTreeMap::from([(String::from("LANG"), String::from("C"))]),
+            env_unsets: BTreeSet::new(),
             secret_reference_versions: BTreeMap::from([(
                 String::from("OPENAI_API_KEY"),
                 String::from("ref:sha256:abc"),
@@ -409,13 +456,16 @@ mod tests {
     fn fingerprint_is_deterministic_and_excludes_revision_time() {
         let first = snapshot();
         let mut equivalent = first.clone();
-        equivalent.profile_revision = 42;
+        equivalent.process_config_revision = 42;
         equivalent = equivalent.with_content_revision();
         assert_eq!(
             first.process_spawn_fingerprint(),
             equivalent.process_spawn_fingerprint()
         );
-        assert_eq!(first.profile_revision, equivalent.profile_revision);
+        assert_eq!(
+            first.process_config_revision,
+            equivalent.process_config_revision
+        );
     }
 
     #[test]
@@ -459,7 +509,12 @@ mod tests {
         value.adapter_binary_identity.push_str("-next");
         variants.push(value);
         let mut value = first.clone();
-        value.provider_profile_id = ProviderProfileId::parse("provider_other").unwrap();
+        value.auth_source = RuntimeAuthSource::provider_profile(
+            ProviderProfileId::parse("provider_other").unwrap(),
+        );
+        variants.push(value);
+        let mut value = first.clone();
+        value.auth_source_revision += 1;
         variants.push(value);
         let mut value = first.clone();
         value.command.push_str("-next");
@@ -480,6 +535,9 @@ mod tests {
         value
             .non_secret_env
             .insert("TERM".to_string(), "xterm".to_string());
+        variants.push(value);
+        let mut value = first.clone();
+        value.env_unsets.insert("OPENAI_API_KEY".to_string());
         variants.push(value);
         let mut value = first.clone();
         value

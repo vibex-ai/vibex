@@ -9,6 +9,7 @@ use crate::ids::{
     CorrelationId, ProviderProfileId, RuntimeBindingId, TimelineItemId, VibexSessionId,
 };
 use crate::permission::{PermissionRequest, PermissionResolution};
+use crate::{RuntimeAuthSource, RuntimeModelSelection};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -58,12 +59,13 @@ const TURN_ATTRIBUTION_MODEL_ID_LIMIT: usize = 256;
 #[serde(rename_all = "camelCase")]
 pub struct TurnExecutionAttribution {
     pub agent_id: AgentId,
-    pub provider_profile_id: ProviderProfileId,
-    pub model_id: String,
+    pub auth_source: RuntimeAuthSource,
+    pub model: RuntimeModelSelection,
+    pub effective_model_id: Option<String>,
     pub binding_id: RuntimeBindingId,
     pub activation_generation: i64,
     pub agent_label: String,
-    pub provider_profile_label: String,
+    pub auth_source_label: String,
     pub model_label: String,
 }
 
@@ -71,12 +73,16 @@ pub struct TurnExecutionAttribution {
 #[serde(rename_all = "camelCase")]
 struct TurnExecutionAttributionWire {
     agent_id: AgentId,
-    provider_profile_id: ProviderProfileId,
-    model_id: String,
+    auth_source: Option<RuntimeAuthSource>,
+    provider_profile_id: Option<ProviderProfileId>,
+    model: Option<RuntimeModelSelection>,
+    model_id: Option<String>,
+    effective_model_id: Option<String>,
     binding_id: RuntimeBindingId,
     activation_generation: i64,
     agent_label: String,
-    provider_profile_label: String,
+    #[serde(alias = "providerProfileLabel")]
+    auth_source_label: String,
     model_label: String,
 }
 
@@ -86,14 +92,26 @@ impl<'de> Deserialize<'de> for TurnExecutionAttribution {
         D: Deserializer<'de>,
     {
         let wire = TurnExecutionAttributionWire::deserialize(deserializer)?;
+        let auth_source = wire
+            .auth_source
+            .or_else(|| {
+                wire.provider_profile_id
+                    .map(RuntimeAuthSource::provider_profile)
+            })
+            .ok_or_else(|| serde::de::Error::missing_field("authSource"))?;
+        let model = wire
+            .model
+            .or_else(|| wire.model_id.clone().map(RuntimeModelSelection::explicit))
+            .ok_or_else(|| serde::de::Error::missing_field("model"))?;
         Self::new(
             wire.agent_id,
-            wire.provider_profile_id,
-            wire.model_id,
+            auth_source,
+            model,
+            wire.effective_model_id.or(wire.model_id),
             wire.binding_id,
             wire.activation_generation,
             wire.agent_label,
-            wire.provider_profile_label,
+            wire.auth_source_label,
             wire.model_label,
         )
         .ok_or_else(|| serde::de::Error::custom("invalid turn execution attribution"))
@@ -104,30 +122,44 @@ impl TurnExecutionAttribution {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         agent_id: AgentId,
-        provider_profile_id: ProviderProfileId,
-        model_id: impl Into<String>,
+        auth_source: RuntimeAuthSource,
+        model: RuntimeModelSelection,
+        effective_model_id: Option<String>,
         binding_id: RuntimeBindingId,
         activation_generation: i64,
         agent_label: impl Into<String>,
-        provider_profile_label: impl Into<String>,
+        auth_source_label: impl Into<String>,
         model_label: impl Into<String>,
     ) -> Option<Self> {
         if activation_generation < 0 {
             return None;
         }
-        let model_id = bounded_attribution_value(model_id, TURN_ATTRIBUTION_MODEL_ID_LIMIT)?;
+        let model = match model {
+            RuntimeModelSelection::Explicit { model_id } => RuntimeModelSelection::Explicit {
+                model_id: bounded_attribution_value(model_id, TURN_ATTRIBUTION_MODEL_ID_LIMIT)?,
+            },
+            RuntimeModelSelection::AgentDefault => RuntimeModelSelection::AgentDefault,
+        };
+        let effective_model_id = match effective_model_id {
+            Some(model_id) => Some(bounded_attribution_value(
+                model_id,
+                TURN_ATTRIBUTION_MODEL_ID_LIMIT,
+            )?),
+            None => None,
+        };
         let agent_label = bounded_attribution_value(agent_label, TURN_ATTRIBUTION_LABEL_LIMIT)?;
-        let provider_profile_label =
-            bounded_attribution_value(provider_profile_label, TURN_ATTRIBUTION_LABEL_LIMIT)?;
+        let auth_source_label =
+            bounded_attribution_value(auth_source_label, TURN_ATTRIBUTION_LABEL_LIMIT)?;
         let model_label = bounded_attribution_value(model_label, TURN_ATTRIBUTION_LABEL_LIMIT)?;
         Some(Self {
             agent_id,
-            provider_profile_id,
-            model_id,
+            auth_source,
+            model,
+            effective_model_id,
             binding_id,
             activation_generation,
             agent_label,
-            provider_profile_label,
+            auth_source_label,
             model_label,
         })
     }
@@ -135,7 +167,7 @@ impl TurnExecutionAttribution {
     pub fn view(&self) -> TurnExecutionAttributionView {
         TurnExecutionAttributionView {
             agent_label: self.agent_label.clone(),
-            provider_profile_label: self.provider_profile_label.clone(),
+            auth_source_label: self.auth_source_label.clone(),
             model_label: self.model_label.clone(),
         }
     }
@@ -145,7 +177,8 @@ impl TurnExecutionAttribution {
 #[serde(rename_all = "camelCase")]
 pub struct TurnExecutionAttributionView {
     pub agent_label: String,
-    pub provider_profile_label: String,
+    #[serde(alias = "providerProfileLabel")]
+    pub auth_source_label: String,
     pub model_label: String,
 }
 
@@ -1009,8 +1042,9 @@ mod tests {
     fn sample_turn_attribution() -> TurnExecutionAttribution {
         TurnExecutionAttribution::new(
             AgentId::parse("codex").unwrap(),
-            ProviderProfileId::parse("provider_work").unwrap(),
-            "gpt-5",
+            RuntimeAuthSource::provider_profile(ProviderProfileId::parse("provider_work").unwrap()),
+            RuntimeModelSelection::explicit("gpt-5"),
+            Some("gpt-5".to_string()),
             RuntimeBindingId::parse("binding_current").unwrap(),
             7,
             "Codex",
@@ -1025,8 +1059,9 @@ mod tests {
         let long = "x".repeat(TURN_ATTRIBUTION_LABEL_LIMIT * 2);
         let attribution = TurnExecutionAttribution::new(
             AgentId::parse("codex").unwrap(),
-            ProviderProfileId::parse("provider_work").unwrap(),
-            "gpt-5",
+            RuntimeAuthSource::provider_profile(ProviderProfileId::parse("provider_work").unwrap()),
+            RuntimeModelSelection::explicit("gpt-5"),
+            Some("gpt-5".to_string()),
             RuntimeBindingId::parse("binding_current").unwrap(),
             7,
             long.clone(),
@@ -1035,7 +1070,7 @@ mod tests {
         )
         .unwrap();
         assert!(attribution.agent_label.len() <= TURN_ATTRIBUTION_LABEL_LIMIT);
-        assert!(attribution.provider_profile_label.len() <= TURN_ATTRIBUTION_LABEL_LIMIT);
+        assert!(attribution.auth_source_label.len() <= TURN_ATTRIBUTION_LABEL_LIMIT);
         assert!(attribution.model_label.len() <= TURN_ATTRIBUTION_LABEL_LIMIT);
 
         let encoded = serde_json::to_value(sample_turn_attribution()).unwrap();

@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentId, MessageSubmissionId, ProjectId, ProviderProfileId, RuntimeBindingId, UsageExecutionId,
-    VibexSessionId, WorkspaceId,
+    AgentId, MessageSubmissionId, ProjectId, ProviderProfileId, RuntimeAuthSource,
+    RuntimeBindingId, UsageExecutionId, VibexSessionId, WorkspaceId,
 };
 
 pub const MAX_AGENT_USAGE_TOKEN_VALUE: u64 = i64::MAX as u64;
@@ -140,8 +140,11 @@ pub struct AgentUsageStreamAttribution {
     pub binding_id: RuntimeBindingId,
     pub activation_generation: i64,
     pub agent_id: AgentId,
-    pub provider_profile_id: ProviderProfileId,
-    pub model_id: String,
+    pub auth_source: RuntimeAuthSource,
+    pub auth_source_revision: i64,
+    /// Concrete model reported for the stream. `None` means the Agent used its
+    /// own default and did not disclose an effective model.
+    pub model_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,8 +232,9 @@ pub struct AgentTurnUsageFact {
     pub activation_generation: i64,
     pub reset_epoch: i64,
     pub agent_id: AgentId,
-    pub provider_profile_id: ProviderProfileId,
-    pub model_id: String,
+    pub auth_source: RuntimeAuthSource,
+    pub auth_source_revision: i64,
+    pub model_id: Option<String>,
     pub execution_status: AgentUsageExecutionStatus,
     pub delta: AgentUsageTokenValues,
     pub cumulative_after: AgentUsageTokenValues,
@@ -425,7 +429,7 @@ pub struct AgentUsageTrendBucket {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentUsageDailyModelUsage {
-    pub model_id: String,
+    pub model_id: Option<String>,
     pub label: String,
     pub requests: u64,
     pub total_tokens: AgentUsageMetricValue,

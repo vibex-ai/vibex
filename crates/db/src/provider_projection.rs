@@ -2136,6 +2136,9 @@ mod tests {
                 "42:provider_model_runtime_option_snapshots",
                 "43:agent_model_provider_display_order",
                 "44:runtime_switch_activation_completion",
+                "45:agent_auth_context_and_runtime_source",
+                "46:runtime_auth_source_nullable_legacy_columns",
+                "47:agent_default_usage_model_nullable",
             ]
         );
         assert_eq!(

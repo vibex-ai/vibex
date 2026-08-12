@@ -12,7 +12,12 @@ use vibex_backend::{
     WorkspaceBackend, WorkspaceSummary,
 };
 use vibex_core::{
-    AgentListRequest, AgentListResponse, AgentSession, AgentSessionRuntimeSelectionState,
+    AgentAuthCatalog, AgentAuthContext, AgentAuthContextAuthenticateRequest,
+    AgentAuthContextAuthenticateResult, AgentAuthContextCancelAuthenticationRequest,
+    AgentAuthContextId, AgentAuthContextLogoutPreview, AgentAuthContextLogoutRequest,
+    AgentAuthContextMutationResult, AgentAuthContextRefreshModelsRequest,
+    AgentAuthContextVerifyRequest, AgentAuthenticationOperation, AgentAuthenticationOperationId,
+    AgentId, AgentListRequest, AgentListResponse, AgentSession, AgentSessionRuntimeSelectionState,
     CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
     FetchTimelineRequest, FileMutationRequest, FileReadRequest, FileReadResponse,
     FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest,
@@ -26,21 +31,29 @@ use vibex_core::{
     GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, MessageSubmissionState,
     OpenWorkspaceRequest, ProjectId, ProjectWorkspaceSummary, ProviderHealthSummary,
     ProviderProfileSummary, ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult,
-    RemoteActionClass, RemoteAgentCancelRuntimeSwitchRequest,
-    RemoteAgentCancelRuntimeSwitchResponse, RemoteAgentDeepLinkResolveRequest,
-    RemoteAgentDeepLinkResolveResponse, RemoteAgentInterruptRequest, RemoteAgentInterruptResponse,
-    RemoteAgentMessageSubmissionRequest, RemoteAgentMessageSubmissionResponse, RemoteAgentRequest,
-    RemoteAgentResolveElicitationRequest, RemoteAgentResolveElicitationResponse,
-    RemoteAgentResolvePermissionRequest, RemoteAgentResolvePermissionResponse,
-    RemoteAgentRuntimeOptionsRequest, RemoteAgentRuntimeOptionsResponse,
-    RemoteAgentRuntimeSelectionRequest, RemoteAgentRuntimeSelectionResponse,
-    RemoteAgentSendMessageRequest, RemoteAgentSendMessageResponse, RemoteAgentSessionDetailRequest,
+    RemoteActionClass, RemoteAgentAuthContextListRequest, RemoteAgentAuthContextListResponse,
+    RemoteAgentAuthContextMutationResponse, RemoteAgentAuthLogoutPreviewRequest,
+    RemoteAgentAuthLogoutPreviewResponse, RemoteAgentAuthMethodListRequest,
+    RemoteAgentAuthMethodListResponse, RemoteAgentAuthenticateContextRequest,
+    RemoteAgentAuthenticateContextResponse, RemoteAgentAuthenticationOperationRequest,
+    RemoteAgentAuthenticationOperationResponse, RemoteAgentCancelContextAuthenticationRequest,
+    RemoteAgentCancelRuntimeSwitchRequest, RemoteAgentCancelRuntimeSwitchResponse,
+    RemoteAgentDeepLinkResolveRequest, RemoteAgentDeepLinkResolveResponse,
+    RemoteAgentInterruptRequest, RemoteAgentInterruptResponse, RemoteAgentLogoutAuthContextRequest,
+    RemoteAgentMessageSubmissionRequest, RemoteAgentMessageSubmissionResponse,
+    RemoteAgentRefreshAuthModelsRequest, RemoteAgentRequest, RemoteAgentResolveElicitationRequest,
+    RemoteAgentResolveElicitationResponse, RemoteAgentResolvePermissionRequest,
+    RemoteAgentResolvePermissionResponse, RemoteAgentRuntimeOptionsRequest,
+    RemoteAgentRuntimeOptionsResponse, RemoteAgentRuntimeSelectionRequest,
+    RemoteAgentRuntimeSelectionResponse, RemoteAgentSendMessageRequest,
+    RemoteAgentSendMessageResponse, RemoteAgentSessionDetailRequest,
     RemoteAgentSessionDetailResponse, RemoteAgentSessionListRequest,
     RemoteAgentSessionListResponse, RemoteAgentSetDesiredRuntimeRequest,
     RemoteAgentSetDesiredRuntimeResponse, RemoteAgentTimelineFetchRequest,
-    RemoteAgentTimelineFetchResponse, RemoteAuditListRequest, RemoteAuditRecord, RemoteAuthProof,
-    RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
-    RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeepLinkResolution,
+    RemoteAgentTimelineFetchResponse, RemoteAgentVerifyAuthContextRequest, RemoteAuditListRequest,
+    RemoteAuditRecord, RemoteAuthProof, RemoteCreatePairingCodeRequest,
+    RemoteCreatePairingCodeResponse, RemoteCreatePairingOfferRequest,
+    RemoteCreatePairingOfferResponse, RemoteDeepLinkResolution,
     RemoteDeviceCancelPairingOfferRequest, RemoteDeviceCreatePairingOfferRequest,
     RemoteDeviceDetail, RemoteDeviceListRequest, RemoteDeviceListResponse, RemoteDeviceRequest,
     RemoteDeviceRevokeRequest, RemoteFileDeleteResponse, RemoteFileMutationRequest,
@@ -698,6 +711,7 @@ impl AgentBackend for WebRemoteBackend {
             let payload =
                 RemoteAgentRequest::ListRuntimeOptions(RemoteAgentRuntimeOptionsRequest {
                     auth: this.auth(),
+                    supports_agent_account_auth: true,
                 });
             let value = this
                 .rpc(
@@ -709,6 +723,225 @@ impl AgentBackend for WebRemoteBackend {
                 )
                 .await?;
             Ok(decode::<RemoteAgentRuntimeOptionsResponse>(value)?.catalog)
+        })
+    }
+
+    fn list_agent_auth_contexts(&self) -> BackendFuture<'_, Vec<AgentAuthContext>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteAgentRequest::ListAuthContexts(RemoteAgentAuthContextListRequest {
+                auth: this.auth(),
+            });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<RemoteAgentAuthContextListResponse>(value)?.contexts)
+        })
+    }
+
+    fn list_agent_auth_methods(&self, agent_id: AgentId) -> BackendFuture<'_, AgentAuthCatalog> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteAgentRequest::ListAuthMethods(RemoteAgentAuthMethodListRequest {
+                auth: this.auth(),
+                agent_id,
+            });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<RemoteAgentAuthMethodListResponse>(value)?.catalog)
+        })
+    }
+
+    fn authenticate_agent_context(
+        &self,
+        request: MutationRequest<AgentAuthContextAuthenticateRequest>,
+    ) -> BackendFuture<'_, AgentAuthContextAuthenticateResult> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload =
+                RemoteAgentRequest::AuthenticateContext(RemoteAgentAuthenticateContextRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<RemoteAgentAuthenticateContextResponse>(value)?.result)
+        })
+    }
+
+    fn get_agent_authentication_operation(
+        &self,
+        operation_id: AgentAuthenticationOperationId,
+    ) -> BackendFuture<'_, AgentAuthenticationOperation> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteAgentRequest::GetAuthenticationOperation(
+                RemoteAgentAuthenticationOperationRequest {
+                    auth: this.auth(),
+                    operation_id,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<RemoteAgentAuthenticationOperationResponse>(value)?.operation)
+        })
+    }
+
+    fn cancel_agent_context_authentication(
+        &self,
+        request: MutationRequest<AgentAuthContextCancelAuthenticationRequest>,
+    ) -> BackendFuture<'_, AgentAuthContextMutationResult> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteAgentRequest::CancelContextAuthentication(
+                RemoteAgentCancelContextAuthenticationRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Interactive,
+                )
+                .await?;
+            Ok(decode::<RemoteAgentAuthContextMutationResponse>(value)?.result)
+        })
+    }
+
+    fn verify_agent_auth_context(
+        &self,
+        request: MutationRequest<AgentAuthContextVerifyRequest>,
+    ) -> BackendFuture<'_, AgentAuthContextMutationResult> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload =
+                RemoteAgentRequest::VerifyAuthContext(RemoteAgentVerifyAuthContextRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<RemoteAgentAuthContextMutationResponse>(value)?.result)
+        })
+    }
+
+    fn refresh_agent_auth_models(
+        &self,
+        request: MutationRequest<AgentAuthContextRefreshModelsRequest>,
+    ) -> BackendFuture<'_, AgentAuthContextMutationResult> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload =
+                RemoteAgentRequest::RefreshAuthModels(RemoteAgentRefreshAuthModelsRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<RemoteAgentAuthContextMutationResponse>(value)?.result)
+        })
+    }
+
+    fn preview_agent_auth_logout(
+        &self,
+        auth_context_id: AgentAuthContextId,
+    ) -> BackendFuture<'_, AgentAuthContextLogoutPreview> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload =
+                RemoteAgentRequest::PreviewAuthLogout(RemoteAgentAuthLogoutPreviewRequest {
+                    auth: this.auth(),
+                    auth_context_id,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<RemoteAgentAuthLogoutPreviewResponse>(value)?.preview)
+        })
+    }
+
+    fn logout_agent_auth_context(
+        &self,
+        request: MutationRequest<AgentAuthContextLogoutRequest>,
+    ) -> BackendFuture<'_, AgentAuthContextMutationResult> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload =
+                RemoteAgentRequest::LogoutAuthContext(RemoteAgentLogoutAuthContextRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<RemoteAgentAuthContextMutationResponse>(value)?.result)
         })
     }
 
@@ -2091,6 +2324,7 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
         })
         .unwrap_or_default();
     let has_agent = features.is_empty() || features.contains("agent");
+    let has_agent_account_auth = features.contains("agent_account_auth");
     let has_workbench = features.is_empty() || features.contains("workspace_file");
     let has_git = features.is_empty() || features.contains("git");
     let has_worktree_read = features.contains("git_worktree_read");
@@ -2148,6 +2382,14 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
                 (
                     AgentSwitchRuntime,
                     permits(RemoteActionClass::MutateAgentSession),
+                ),
+                (
+                    AgentAuthRead,
+                    has_agent_account_auth && permits(RemoteActionClass::ReadAgentSession),
+                ),
+                (
+                    AgentAuthManage,
+                    has_agent_account_auth && permits(RemoteActionClass::MutateAgentAuthentication),
                 ),
             ])
         } else {
@@ -2766,5 +3008,34 @@ mod tests {
         let snapshot = remote_capabilities(Some(&without_pairing_route));
         assert!(!snapshot.device.supports(BackendOperation::DevicePairing));
         assert!(snapshot.device.supports(BackendOperation::DeviceList));
+    }
+
+    #[test]
+    fn agent_account_auth_is_advertised_only_when_negotiated_and_permitted() {
+        let info = full_control_server_info(&["agent", "agent_account_auth"]);
+        let snapshot = remote_capabilities(Some(&info));
+        assert!(snapshot.agent.supports(BackendOperation::AgentAuthRead));
+        assert!(snapshot.agent.supports(BackendOperation::AgentAuthManage));
+
+        let without_feature = full_control_server_info(&["agent"]);
+        let snapshot = remote_capabilities(Some(&without_feature));
+        assert!(!snapshot.agent.supports(BackendOperation::AgentAuthRead));
+        assert!(!snapshot.agent.supports(BackendOperation::AgentAuthManage));
+
+        let mut approve_only = info.clone();
+        approve_only.device_permissions = vibex_core::remote_permissions_for_level(
+            vibex_core::RemoteDevicePermissionLevel::ApproveOnly,
+        );
+        let snapshot = remote_capabilities(Some(&approve_only));
+        assert!(snapshot.agent.supports(BackendOperation::AgentAuthRead));
+        assert!(!snapshot.agent.supports(BackendOperation::AgentAuthManage));
+
+        let mut read_only = info;
+        read_only.device_permissions = vibex_core::remote_permissions_for_level(
+            vibex_core::RemoteDevicePermissionLevel::ReadOnly,
+        );
+        let snapshot = remote_capabilities(Some(&read_only));
+        assert!(snapshot.agent.supports(BackendOperation::AgentAuthRead));
+        assert!(!snapshot.agent.supports(BackendOperation::AgentAuthManage));
     }
 }

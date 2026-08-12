@@ -17,7 +17,8 @@ use vibex_agent::{
     RuntimeMetricName, RuntimeMetricOperation, RuntimeMetricResult, RuntimeObservability,
 };
 use vibex_core::{
-    AgentRuntimeRouteKey, ProviderProfileId, VibexError, VibexResult, unix_timestamp_ms,
+    AgentRuntimeRouteKey, ProviderProfileId, RuntimeAuthSource, VibexError, VibexResult,
+    unix_timestamp_ms,
 };
 
 use crate::registry::CapabilitySupport;
@@ -76,7 +77,8 @@ impl WorkspaceScope {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ProcessAcquireKey {
     pub route_key: AgentRuntimeRouteKey,
-    pub provider_profile_id: ProviderProfileId,
+    pub auth_source: RuntimeAuthSource,
+    pub auth_source_revision: i64,
     pub process_spawn_fingerprint: String,
     pub workspace_scope: WorkspaceScope,
 }
@@ -84,12 +86,13 @@ pub struct ProcessAcquireKey {
 impl ProcessAcquireKey {
     pub fn new(
         route_key: AgentRuntimeRouteKey,
-        provider_profile_id: ProviderProfileId,
+        auth_source: RuntimeAuthSource,
+        auth_source_revision: i64,
         process_spawn_fingerprint: impl Into<String>,
         workspace_scope: WorkspaceScope,
     ) -> VibexResult<Self> {
         let fingerprint = process_spawn_fingerprint.into();
-        if fingerprint.trim().is_empty() {
+        if auth_source_revision < 0 || fingerprint.trim().is_empty() {
             return Err(VibexError::validation(
                 "acp_process_spawn_fingerprint_empty",
                 "ACP process acquire keys require a spawn fingerprint",
@@ -97,7 +100,8 @@ impl ProcessAcquireKey {
         }
         Ok(Self {
             route_key,
-            provider_profile_id,
+            auth_source,
+            auth_source_revision,
             process_spawn_fingerprint: fingerprint,
             workspace_scope,
         })
@@ -878,6 +882,25 @@ impl<P: AcpProcessHandle> AcpProcessRegistry<P> {
             .collect())
     }
 
+    /// Resolves process ids for an exact credential source without exposing
+    /// the process key or native session details outside the runtime layer.
+    pub fn process_ids_for_auth_source(
+        &self,
+        auth_source: &RuntimeAuthSource,
+    ) -> VibexResult<Vec<AcpProcessInstanceId>> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| lock_poisoned("state"))?;
+        Ok(state
+            .instances
+            .iter()
+            .filter(|(_, registered)| &registered.key.auth_source == auth_source)
+            .map(|(instance_id, _)| instance_id.clone())
+            .collect())
+    }
+
     /// Atomically claims an idle process for shutdown. The claim removes the
     /// reusable lookup before any await, so a concurrent acquire cannot reuse
     /// a process that is already closing.
@@ -953,7 +976,7 @@ impl<P: AcpProcessHandle> AcpProcessRegistry<P> {
             .instances
             .iter()
             .filter_map(|(instance_id, registered)| {
-                (registered.key.provider_profile_id == *provider_profile_id
+                (registered.key.auth_source.provider_profile_id() == Some(provider_profile_id)
                     && matches!(
                         registered.status,
                         AcpProcessStatus::Starting | AcpProcessStatus::Ready
@@ -1019,7 +1042,8 @@ impl<P: AcpProcessHandle> AcpProcessRegistry<P> {
             registered.config_status = Some(status);
             Some(ProcessConfigStatusEvent {
                 process_instance_id: instance_id.as_str().to_string(),
-                provider_profile_id: registered.key.provider_profile_id.clone(),
+                auth_source: registered.key.auth_source.clone(),
+                auth_source_revision: registered.key.auth_source_revision,
                 previous_status,
                 status,
                 previous_fingerprint,
@@ -1318,7 +1342,10 @@ mod tests {
                 transport_kind: TransportKind::Acp,
                 adapter_id: AcpAdapterId::parse("opencode-acp").unwrap(),
             },
-            ProviderProfileId::parse("provider_profile").unwrap(),
+            RuntimeAuthSource::provider_profile(
+                ProviderProfileId::parse("provider_profile").unwrap(),
+            ),
+            1,
             fingerprint,
             WorkspaceScope::new(temp.path()).unwrap(),
         )
@@ -1331,14 +1358,18 @@ mod tests {
             adapter_id: AcpAdapterId::parse("opencode-acp").unwrap(),
             adapter_version: "1.0.0".to_string(),
             adapter_binary_identity: "command:opencode".to_string(),
-            provider_profile_id: ProviderProfileId::parse("provider_profile").unwrap(),
-            profile_revision: 0,
+            auth_source: RuntimeAuthSource::provider_profile(
+                ProviderProfileId::parse("provider_profile").unwrap(),
+            ),
+            auth_source_revision: 1,
+            process_config_revision: 0,
             command: "opencode".to_string(),
             args: Vec::new(),
             cwd_policy: "{workspaceRoot}".to_string(),
             base_url: Some("https://one.example.test".to_string()),
             model_provider_id: None,
             non_secret_env: BTreeMap::new(),
+            env_unsets: BTreeSet::new(),
             secret_reference_versions: BTreeMap::new(),
             mcp_revision: None,
             skills_revision: None,
@@ -1361,10 +1392,11 @@ mod tests {
         other_route.route_key.adapter_id = AcpAdapterId::parse("other-acp").unwrap();
         assert_ne!(one, other_route);
 
-        let mut other_profile = one.clone();
-        other_profile.provider_profile_id =
-            ProviderProfileId::parse("provider_other_profile").unwrap();
-        assert_ne!(one, other_profile);
+        let mut other_source = one.clone();
+        other_source.auth_source = RuntimeAuthSource::provider_profile(
+            ProviderProfileId::parse("provider_other_profile").unwrap(),
+        );
+        assert_ne!(one, other_source);
         assert!(!format!("{one:?}").contains("session_id"));
         assert!(!format!("{one:?}").contains("binding_id"));
         assert!(!format!("{one:?}").contains("native_session_id"));
@@ -1597,7 +1629,10 @@ mod tests {
                 transport_kind: TransportKind::Acp,
                 adapter_id: AcpAdapterId::parse("opencode-acp").unwrap(),
             },
-            ProviderProfileId::parse("provider_profile").unwrap(),
+            RuntimeAuthSource::provider_profile(
+                ProviderProfileId::parse("provider_profile").unwrap(),
+            ),
+            1,
             launch.process_spawn_fingerprint(),
             WorkspaceScope::new(temp.path()).unwrap(),
         )

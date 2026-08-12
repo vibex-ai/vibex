@@ -2,7 +2,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use vibex_core::{
-    AgentListRequest, AgentListResponse, AgentSession, AgentSessionRuntimeSelectionState,
+    AgentAuthCatalog, AgentAuthContext, AgentAuthContextAuthenticateRequest,
+    AgentAuthContextAuthenticateResult, AgentAuthContextCancelAuthenticationRequest,
+    AgentAuthContextId, AgentAuthContextLogoutPreview, AgentAuthContextLogoutRequest,
+    AgentAuthContextMutationResult, AgentAuthContextRefreshModelsRequest,
+    AgentAuthContextVerifyRequest, AgentAuthenticationOperation, AgentAuthenticationOperationId,
+    AgentId, AgentListRequest, AgentListResponse, AgentSession, AgentSessionRuntimeSelectionState,
     AgentUsageStatistics, AgentUsageStatisticsRequest, CancelAgentSessionRuntimeSwitchRequest,
     ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest, FileMutationRequest,
     FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
@@ -358,6 +363,134 @@ impl AgentBackend for NativeBackend {
                 .agent()
                 .runtime_catalog()
                 .list()
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn list_agent_auth_contexts(&self) -> BackendFuture<'_, Vec<AgentAuthContext>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime.agent().list_auth_contexts().map_err(Into::into)
+        })
+    }
+
+    fn list_agent_auth_methods(&self, agent_id: AgentId) -> BackendFuture<'_, AgentAuthCatalog> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .list_auth_methods(agent_id, None)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn authenticate_agent_context(
+        &self,
+        request: MutationRequest<AgentAuthContextAuthenticateRequest>,
+    ) -> BackendFuture<'_, AgentAuthContextAuthenticateResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .authenticate_context(request.payload)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn get_agent_authentication_operation(
+        &self,
+        operation_id: AgentAuthenticationOperationId,
+    ) -> BackendFuture<'_, AgentAuthenticationOperation> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .authentication_operation(&operation_id)
+                .map_err(Into::into)
+        })
+    }
+
+    fn cancel_agent_context_authentication(
+        &self,
+        request: MutationRequest<AgentAuthContextCancelAuthenticationRequest>,
+    ) -> BackendFuture<'_, AgentAuthContextMutationResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .cancel_context_authentication(request.payload)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn verify_agent_auth_context(
+        &self,
+        request: MutationRequest<AgentAuthContextVerifyRequest>,
+    ) -> BackendFuture<'_, AgentAuthContextMutationResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .verify_auth_context(request.payload)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn refresh_agent_auth_models(
+        &self,
+        request: MutationRequest<AgentAuthContextRefreshModelsRequest>,
+    ) -> BackendFuture<'_, AgentAuthContextMutationResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .refresh_auth_context_models(request.payload)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn preview_agent_auth_logout(
+        &self,
+        auth_context_id: AgentAuthContextId,
+    ) -> BackendFuture<'_, AgentAuthContextLogoutPreview> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .preview_auth_context_logout(&auth_context_id)
+                .map_err(Into::into)
+        })
+    }
+
+    fn logout_agent_auth_context(
+        &self,
+        request: MutationRequest<AgentAuthContextLogoutRequest>,
+    ) -> BackendFuture<'_, AgentAuthContextMutationResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .logout_auth_context(request.payload)
                 .await
                 .map_err(Into::into)
         })

@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use vibex_agent::AgentManager;
 use vibex_agent_acp::{
     AcpRuntimeClient, RuntimeOptionCatalogProfileEvidence, SessionModelCatalogEntry,
-    SessionModelCatalogSource, build_runtime_option_catalog,
+    SessionModelCatalogSource, append_agent_account_runtime_options, build_runtime_option_catalog,
+    refresh_runtime_option_catalog_revision,
 };
 use vibex_config_switch::ProviderConfigService;
 use vibex_core::{
@@ -13,11 +14,14 @@ use vibex_core::{
     ProviderProfileStatus, SessionRuntimeOptionCatalog, VibexError,
 };
 use vibex_db::{
-    AgentConfigRepository, AgentRuntimeOptionSnapshotRecord, AgentRuntimeOptionSnapshotRepository,
-    ProviderModelRuntimeOptionSnapshotRecord, ProviderModelRuntimeOptionSnapshotRepository,
-    ProviderProfileRepository, apply_migrations, open_database,
+    AgentAuthModelCatalogRepository, AgentConfigRepository, AgentRuntimeOptionSnapshotRecord,
+    AgentRuntimeOptionSnapshotRepository, ProviderModelRuntimeOptionSnapshotRecord,
+    ProviderModelRuntimeOptionSnapshotRepository, ProviderProfileRepository, apply_migrations,
+    open_database,
 };
 use vibex_remote::RemoteRuntimeOptionCatalogSource;
+
+use crate::AgentAuthContextService;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeOptionSnapshotSummary {
@@ -52,6 +56,7 @@ pub struct RuntimeOptionCatalogService {
     manager: Arc<AgentManager>,
     provider_config: ProviderConfigService,
     live_runtime: Option<Arc<AcpRuntimeClient>>,
+    auth_contexts: Option<Arc<AgentAuthContextService>>,
     probe_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -61,6 +66,7 @@ impl RuntimeOptionCatalogService {
             manager,
             provider_config,
             live_runtime: None,
+            auth_contexts: None,
             probe_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -74,8 +80,17 @@ impl RuntimeOptionCatalogService {
             manager,
             provider_config,
             live_runtime: Some(live_runtime),
+            auth_contexts: None,
             probe_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    pub fn with_auth_context_service(
+        mut self,
+        auth_contexts: Arc<AgentAuthContextService>,
+    ) -> Self {
+        self.auth_contexts = Some(auth_contexts);
+        self
     }
 
     pub async fn list(&self) -> Result<SessionRuntimeOptionCatalog, VibexError> {
@@ -130,14 +145,90 @@ impl RuntimeOptionCatalogService {
             live_by_profile,
         );
 
-        Ok(build_runtime_option_catalog(
+        let mut catalog = build_runtime_option_catalog(
             &agents.agents,
             &profiles
                 .iter()
                 .map(vibex_core::ProviderProfile::summary)
                 .collect::<Vec<_>>(),
             &evidence_by_profile,
-        ))
+        );
+        let account_fingerprints =
+            self.merge_agent_account_sources(&mut catalog, &agents.agents)?;
+        catalog.auth_sources.sort_by(|left, right| {
+            left.agent_id
+                .cmp(&right.agent_id)
+                .then_with(|| left.kind.cmp(&right.kind))
+                .then_with(|| left.label.cmp(&right.label))
+                .then_with(|| left.source.cmp(&right.source))
+        });
+        catalog.options.sort_by(|left, right| {
+            left.selection
+                .agent_id
+                .cmp(&right.selection.agent_id)
+                .then_with(|| left.selection.auth_source.cmp(&right.selection.auth_source))
+                .then_with(|| left.model_label.cmp(&right.model_label))
+        });
+        refresh_runtime_option_catalog_revision(
+            &mut catalog,
+            account_fingerprints.iter().map(String::as_bytes),
+        );
+        Ok(catalog)
+    }
+
+    fn merge_agent_account_sources(
+        &self,
+        catalog: &mut SessionRuntimeOptionCatalog,
+        agents: &[vibex_core::AgentSnapshotEntry],
+    ) -> Result<Vec<String>, VibexError> {
+        let (Some(runtime), Some(auth_contexts)) =
+            (self.live_runtime.as_ref(), self.auth_contexts.as_ref())
+        else {
+            return Ok(Vec::new());
+        };
+        let contexts = auth_contexts.list()?;
+        let connection = open_database(self.provider_config.database_path())?;
+        let snapshots = AgentAuthModelCatalogRepository::list_current(&connection, &contexts)?;
+        let mut latest_snapshot_by_context = BTreeMap::new();
+        for snapshot in snapshots {
+            let replace = latest_snapshot_by_context
+                .get(&snapshot.auth_context_id)
+                .is_none_or(|current: &vibex_core::AgentAuthModelCatalogSnapshot| {
+                    snapshot.last_attempt_at_ms > current.last_attempt_at_ms
+                });
+            if replace {
+                latest_snapshot_by_context.insert(snapshot.auth_context_id.clone(), snapshot);
+            }
+        }
+        let contexts_by_agent = contexts
+            .iter()
+            .map(|context| (context.agent_id.clone(), context))
+            .collect::<BTreeMap<_, _>>();
+        let mut fingerprints = Vec::new();
+        for agent in agents.iter().filter(|agent| agent.added && agent.enabled) {
+            if !runtime.supports_agent_account(&agent.id) {
+                continue;
+            }
+            let Some(context) = contexts_by_agent.get(&agent.id).copied() else {
+                continue;
+            };
+            let snapshot = latest_snapshot_by_context.get(&context.id);
+            if let Some(snapshot) = snapshot {
+                fingerprints.push(format!(
+                    "{}:{}:{}",
+                    context.id, context.revision, snapshot.runtime_fingerprint
+                ));
+            }
+            append_agent_account_runtime_options(
+                catalog,
+                agent,
+                context,
+                snapshot,
+                runtime.supports_agent_account_logout(&agent.id),
+            );
+        }
+        fingerprints.sort();
+        Ok(fingerprints)
     }
 
     /// Fills missing Agent-owned option snapshots after the runtime is ready.
@@ -770,6 +861,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::AgentAuthCatalogService;
     use tempfile::TempDir;
     use vibex_agent::{
         AgentProvider, ProviderCreateRequest, ProviderSessionHandle, ProviderTurnRequest,
@@ -1033,6 +1125,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn catalog_read_does_not_create_an_account_context_or_probe_an_agent() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("vibex.db");
+        let provider_config = ProviderConfigService::new(&database_path);
+        let agent_id = AgentId::parse("codex").unwrap();
+        provider_config
+            .update_agent_config(AgentUpdateConfigRequest {
+                agent_id: agent_id.clone(),
+                added: Some(true),
+                enabled: Some(true),
+                label_override: None,
+                description_override: None,
+                order_index: None,
+                command: Some(AgentCommandConfig {
+                    command: "/path/that/must/not/be/spawned/by/catalog-read".to_string(),
+                    args: Vec::new(),
+                }),
+                env: None,
+                params: None,
+            })
+            .unwrap();
+        let provider = Arc::new(CountingProvider {
+            calls: AtomicUsize::new(0),
+            model_calls: AtomicUsize::new(0),
+            fail_probe: false,
+        });
+        let mut manager = AgentManager::new(&database_path).unwrap();
+        manager
+            .register_runtime(
+                AgentRuntimeRouteKey {
+                    agent_id: agent_id.clone(),
+                    transport_kind: TransportKind::Acp,
+                    adapter_id: vibex_core::default_acp_adapter_id(&agent_id),
+                },
+                provider.clone(),
+            )
+            .unwrap();
+        let manager = Arc::new(manager);
+        let acp_runtime = Arc::new(AcpRuntimeClient::new(provider_config.clone()));
+        let auth_catalog = Arc::new(AgentAuthCatalogService::new(
+            manager.clone(),
+            provider_config.clone(),
+        ));
+        let auth_contexts = Arc::new(
+            AgentAuthContextService::new(
+                database_path.clone(),
+                manager.clone(),
+                acp_runtime.clone(),
+                Arc::new(vibex_agent_acp::DisabledAcpTerminalHost),
+                auth_catalog,
+            )
+            .unwrap(),
+        );
+        let catalog =
+            RuntimeOptionCatalogService::with_live_runtime(manager, provider_config, acp_runtime)
+                .with_auth_context_service(auth_contexts);
+
+        let connection = open_database(&database_path).unwrap();
+        assert!(
+            vibex_db::AgentAuthContextRepository::list(&connection)
+                .unwrap()
+                .is_empty()
+        );
+        catalog.list().await.unwrap();
+        assert!(
+            vibex_db::AgentAuthContextRepository::list(&connection)
+                .unwrap()
+                .is_empty(),
+            "ordinary catalog reads must not bootstrap durable account state"
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.model_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn runtime_catalog_keeps_agent_owned_profiles_visible() {
         let (_directory, catalog, provider_config, agent_id, _provider) =
             catalog_fixture_for_agent("gemini", false);
@@ -1062,7 +1229,7 @@ mod tests {
         assert!(
             options
                 .iter()
-                .any(|option| option.selection.provider_profile_id == profile.id),
+                .any(|option| option.selection.provider_profile_id() == Some(&profile.id)),
             "runtime catalog must retain Agent-owned profiles hidden from Config Center"
         );
     }
@@ -1105,18 +1272,18 @@ mod tests {
         let profile_options = options
             .iter()
             .filter(|option| {
-                option.selection.provider_profile_id == first_profile.id
-                    || option.selection.provider_profile_id == second_profile.id
+                option.selection.provider_profile_id() == Some(&first_profile.id)
+                    || option.selection.provider_profile_id() == Some(&second_profile.id)
             })
             .collect::<Vec<_>>();
         assert_eq!(profile_options.len(), 2);
         assert!(profile_options.iter().any(|option| {
-            option.selection.provider_profile_id == first_profile.id
-                && option.selection.model_id == "first-model"
+            option.selection.provider_profile_id() == Some(&first_profile.id)
+                && option.selection.model_id() == Some("first-model")
         }));
         assert!(profile_options.iter().any(|option| {
-            option.selection.provider_profile_id == second_profile.id
-                && option.selection.model_id == "second-model"
+            option.selection.provider_profile_id() == Some(&second_profile.id)
+                && option.selection.model_id() == Some("second-model")
         }));
         for option in profile_options {
             assert!(option.modes.iter().any(|mode| mode.value == "plan"));
@@ -1133,8 +1300,8 @@ mod tests {
                     .any(|feature| feature.id == "auto_approve")
             );
             assert_ne!(
-                option.selection.model_id,
-                "model-from-agent-must-not-be-used"
+                option.selection.model_id(),
+                Some("model-from-agent-must-not-be-used")
             );
         }
 
@@ -1146,7 +1313,7 @@ mod tests {
         );
         let options = catalog.list().await.unwrap().options;
         assert!(options.iter().any(|option| {
-            option.selection.provider_profile_id == third_profile.id
+            option.selection.provider_profile_id() == Some(&third_profile.id)
                 && option.modes.iter().any(|mode| mode.value == "plan")
         }));
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
@@ -1169,8 +1336,8 @@ mod tests {
             .options
             .iter()
             .find(|option| {
-                option.selection.provider_profile_id == profile.id
-                    && option.selection.model_id == "gpt-5.6-sol"
+                option.selection.provider_profile_id() == Some(&profile.id)
+                    && option.selection.model_id() == Some("gpt-5.6-sol")
             })
             .unwrap();
         assert!(
@@ -1187,8 +1354,8 @@ mod tests {
         let gpt = options
             .iter()
             .find(|option| {
-                option.selection.provider_profile_id == profile.id
-                    && option.selection.model_id == "gpt-5.6-sol"
+                option.selection.provider_profile_id() == Some(&profile.id)
+                    && option.selection.model_id() == Some("gpt-5.6-sol")
             })
             .unwrap();
         assert_eq!(
@@ -1208,8 +1375,8 @@ mod tests {
         let glm = options
             .iter()
             .find(|option| {
-                option.selection.provider_profile_id == profile.id
-                    && option.selection.model_id == "glm-5.2"
+                option.selection.provider_profile_id() == Some(&profile.id)
+                    && option.selection.model_id() == Some("glm-5.2")
             })
             .unwrap();
         assert!(
@@ -1241,7 +1408,7 @@ mod tests {
         let options = catalog.list().await.unwrap().options;
         let model = options
             .iter()
-            .find(|option| option.selection.provider_profile_id == profile.id)
+            .find(|option| option.selection.provider_profile_id() == Some(&profile.id))
             .unwrap();
         assert!(model.reasoning_efforts.is_empty());
         assert!(model.modes.is_empty());
@@ -1372,17 +1539,17 @@ mod tests {
         let first = catalog
             .options
             .iter()
-            .find(|option| option.selection.provider_profile_id == first_profile.id)
+            .find(|option| option.selection.provider_profile_id() == Some(&first_profile.id))
             .unwrap();
-        assert_eq!(first.selection.model_id, "configured-first");
+        assert_eq!(first.selection.model_id(), Some("configured-first"));
         assert_eq!(first.modes[0].value, "review");
         assert_eq!(first.reasoning_efforts[0].value, "low");
         let second = catalog
             .options
             .iter()
-            .find(|option| option.selection.provider_profile_id == second_profile.id)
+            .find(|option| option.selection.provider_profile_id() == Some(&second_profile.id))
             .unwrap();
-        assert_eq!(second.selection.model_id, "configured-second");
+        assert_eq!(second.selection.model_id(), Some("configured-second"));
         assert_eq!(second.modes[0].value, "plan");
         assert_eq!(second.reasoning_efforts[0].value, "high");
     }

@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use vibex_core::{
-    RuntimeOptionAvailability, SessionConfigValue, SessionRuntimeFeature, SessionRuntimeOption,
-    SessionRuntimeOptionCatalog, SessionRuntimeSelection,
+    RuntimeModelSelection, RuntimeOptionAvailability, SessionConfigValue, SessionRuntimeFeature,
+    SessionRuntimeOption, SessionRuntimeOptionCatalog, SessionRuntimeSelection,
 };
 
 /// One provider-neutral choice in a runtime selector cascade.
@@ -15,7 +15,7 @@ pub struct RuntimeCascadeChoice {
     pub selection: SessionRuntimeSelection,
 }
 
-/// Deterministic Agent → Profile → Model → Effort → Mode projection.
+/// Deterministic Agent -> authentication source -> model -> effort -> mode projection.
 ///
 /// The projection only exposes catalog metadata. Selecting a choice returns a
 /// complete product-level `SessionRuntimeSelection`; the caller still submits
@@ -24,7 +24,8 @@ pub struct RuntimeCascadeChoice {
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeCascadeProjection {
     pub agents: Vec<RuntimeCascadeChoice>,
-    pub profiles: Vec<RuntimeCascadeChoice>,
+    #[serde(alias = "profiles")]
+    pub auth_sources: Vec<RuntimeCascadeChoice>,
     pub models: Vec<RuntimeCascadeChoice>,
     pub reasoning_efforts: Vec<RuntimeCascadeChoice>,
     pub modes: Vec<RuntimeCascadeChoice>,
@@ -48,34 +49,34 @@ impl RuntimeCascadeProjection {
                 option.agent_label.clone(),
             )
         });
-        let profiles = unique_choices(
+        let auth_sources = unique_choices(
             available
                 .iter()
                 .copied()
                 .filter(|option| option.selection.agent_id == desired.agent_id),
             |option| {
                 (
-                    option.selection.provider_profile_id.to_string(),
-                    option.provider_profile_label.clone(),
+                    option.selection.auth_source.id().to_string(),
+                    option.auth_source_label.clone(),
                 )
             },
         );
         let models = unique_choices(
             available.iter().copied().filter(|option| {
                 option.selection.agent_id == desired.agent_id
-                    && option.selection.provider_profile_id == desired.provider_profile_id
+                    && option.selection.auth_source == desired.auth_source
             }),
             |option| {
                 (
-                    option.selection.model_id.clone(),
+                    model_selection_key(&option.selection.model),
                     option.model_label.clone(),
                 )
             },
         );
         let matching = available.iter().copied().filter(|option| {
             option.selection.agent_id == desired.agent_id
-                && option.selection.provider_profile_id == desired.provider_profile_id
-                && option.selection.model_id == desired.model_id
+                && option.selection.auth_source == desired.auth_source
+                && option.selection.model == desired.model
         });
         let reasoning_efforts = config_choices(
             matching.clone(),
@@ -88,8 +89,8 @@ impl RuntimeCascadeProjection {
             .copied()
             .find(|option| {
                 option.selection.agent_id == desired.agent_id
-                    && option.selection.provider_profile_id == desired.provider_profile_id
-                    && option.selection.model_id == desired.model_id
+                    && option.selection.auth_source == desired.auth_source
+                    && option.selection.model == desired.model
             })
             .map(|option| {
                 option
@@ -106,7 +107,7 @@ impl RuntimeCascadeProjection {
 
         Self {
             agents,
-            profiles,
+            auth_sources,
             models,
             reasoning_efforts,
             modes,
@@ -124,7 +125,7 @@ where
     for option in options {
         let (value, label) = key(option);
         values.entry(value).or_insert_with(|| RuntimeCascadeChoice {
-            value: option.selection.model_id.clone(),
+            value: model_selection_key(&option.selection.model),
             label,
             selection: option.selection.clone(),
         });
@@ -136,6 +137,15 @@ where
             choice
         })
         .collect()
+}
+
+fn model_selection_key(model: &RuntimeModelSelection) -> String {
+    match model {
+        RuntimeModelSelection::Explicit { model_id } => format!("model:{model_id}"),
+        // This is a projection key only; never use a provider-looking model id
+        // for the semantic AgentDefault selection.
+        RuntimeModelSelection::AgentDefault => "agent-default".to_string(),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -269,16 +279,13 @@ mod tests {
         mode: &[&str],
     ) -> SessionRuntimeOption {
         SessionRuntimeOption {
-            selection: SessionRuntimeSelection {
-                agent_id: AgentId::parse(agent).unwrap(),
-                provider_profile_id: ProviderProfileId::parse(profile).unwrap(),
-                model_id: model.into(),
-                reasoning_effort: None,
-                mode_id: None,
-                config_values: Default::default(),
-            },
+            selection: SessionRuntimeSelection::provider(
+                AgentId::parse(agent).unwrap(),
+                ProviderProfileId::parse(profile).unwrap(),
+                model,
+            ),
             agent_label: agent.into(),
-            provider_profile_label: profile.into(),
+            auth_source_label: profile.into(),
             model_label: model.into(),
             reasoning_efforts: effort
                 .iter()
@@ -303,6 +310,8 @@ mod tests {
     fn cascade_filters_downstream_dimensions_and_preserves_labels() {
         let catalog = SessionRuntimeOptionCatalog {
             revision: 1,
+            agents: Vec::new(),
+            auth_sources: Vec::new(),
             options: vec![
                 option(
                     "claude",
@@ -318,7 +327,7 @@ mod tests {
         let desired = catalog.options[0].selection.clone();
         let projection = RuntimeCascadeProjection::from_catalog(&catalog, &desired);
         assert_eq!(projection.agents.len(), 2);
-        assert_eq!(projection.profiles.len(), 1);
+        assert_eq!(projection.auth_sources.len(), 1);
         assert_eq!(projection.models.len(), 2);
         assert_eq!(
             projection
@@ -354,6 +363,8 @@ mod tests {
         let projection = RuntimeCascadeProjection::from_catalog(
             &SessionRuntimeOptionCatalog {
                 revision: 2,
+                agents: Vec::new(),
+                auth_sources: Vec::new(),
                 options: vec![runtime],
             },
             &desired,
@@ -398,6 +409,8 @@ mod tests {
         let with_default_projection = RuntimeCascadeProjection::from_catalog(
             &SessionRuntimeOptionCatalog {
                 revision: 3,
+                agents: Vec::new(),
+                auth_sources: Vec::new(),
                 options: vec![with_default.clone()],
             },
             &with_default.selection,
@@ -405,6 +418,8 @@ mod tests {
         let without_default_projection = RuntimeCascadeProjection::from_catalog(
             &SessionRuntimeOptionCatalog {
                 revision: 4,
+                agents: Vec::new(),
+                auth_sources: Vec::new(),
                 options: vec![without_default.clone()],
             },
             &without_default.selection,
@@ -423,17 +438,44 @@ mod tests {
     }
 
     #[test]
+    fn agent_default_uses_a_distinct_projection_key() {
+        let agent_id = AgentId::parse("codex").unwrap();
+        let auth_context_id = vibex_core::AgentAuthContextId::new();
+        let mut runtime = option("codex", "provider_codex", "gpt-5", &[], &[]);
+        runtime.selection = SessionRuntimeSelection::agent_default(agent_id, auth_context_id);
+        let desired = runtime.selection.clone();
+        let projection = RuntimeCascadeProjection::from_catalog(
+            &SessionRuntimeOptionCatalog {
+                revision: 5,
+                agents: Vec::new(),
+                auth_sources: Vec::new(),
+                options: vec![runtime],
+            },
+            &desired,
+        );
+
+        assert_eq!(projection.models.len(), 1);
+        assert_eq!(projection.models[0].value, "agent-default");
+        assert_eq!(
+            projection.models[0].selection.model,
+            RuntimeModelSelection::AgentDefault
+        );
+    }
+
+    #[test]
     fn unavailable_options_do_not_enter_cascade_choices() {
         let mut unavailable = option("claude", "provider_offline", "sonnet", &[], &[]);
         unavailable.availability = RuntimeOptionAvailability::TemporarilyUnavailable;
         let catalog = SessionRuntimeOptionCatalog {
             revision: 2,
+            agents: Vec::new(),
+            auth_sources: Vec::new(),
             options: vec![unavailable],
         };
         let desired = catalog.options[0].selection.clone();
         let projection = RuntimeCascadeProjection::from_catalog(&catalog, &desired);
         assert!(projection.agents.is_empty());
-        assert!(projection.profiles.is_empty());
+        assert!(projection.auth_sources.is_empty());
     }
 
     #[test]
@@ -461,6 +503,8 @@ mod tests {
         let other = option("claude", "provider_claude", "sonnet", &[], &[]);
         let catalog = SessionRuntimeOptionCatalog {
             revision: 3,
+            agents: Vec::new(),
+            auth_sources: Vec::new(),
             options: vec![selected, other],
         };
         let mut desired = catalog.options[0].selection.clone();

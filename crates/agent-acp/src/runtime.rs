@@ -64,10 +64,13 @@ use vibex_config_switch::{
 use vibex_config_switch::{CodexProviderRuntimeConfig, codex_runtime_config_from_profile};
 use vibex_core::{
     AcpAdapterId, AcpProcessStrategy, AcpProviderConfig, AcpProviderEnvSource, ActiveWorkKind,
-    AgentAuthCatalog, AgentAuthMethodKind, AgentAuthStatus, AgentAuthenticateRequest,
-    AgentAuthenticateResult, AgentAuthenticationCancelRequest, AgentAuthenticationOperationId,
-    AgentCommandConfig, AgentEventRawOutput, AgentEventRawOutputMode, AgentId, AgentLogoutRequest,
-    AgentMessagePhase, AgentModelCapabilities, AgentModelListRequest, AgentModelListSource,
+    AgentAuthCatalog, AgentAuthContext, AgentAuthContextStatus, AgentAuthMethodKind,
+    AgentAuthModelCatalogSnapshot, AgentAuthModelCatalogStatus, AgentAuthModelDescriptor,
+    AgentAuthStatus, AgentAuthenticateRequest, AgentAuthenticateResult,
+    AgentAuthenticationCancelRequest, AgentAuthenticationCompleteRequest,
+    AgentAuthenticationOperationId, AgentCommandConfig, AgentEventRawOutput,
+    AgentEventRawOutputMode, AgentId, AgentLogoutRequest, AgentMessagePhase,
+    AgentModelCapabilities, AgentModelDiscoverySource, AgentModelListRequest, AgentModelListSource,
     AgentProviderProjectionRegistry, AgentReasoningEffort, AgentRuntimeProbeStatus,
     AgentRuntimeRouteKey, AgentSessionConfigProbe, AgentSessionRestoreCompatibility,
     AgentSessionRestoreCompatibilityKey, AgentSessionRestoreMethod, AgentSessionRestoreOutcome,
@@ -84,21 +87,24 @@ use vibex_core::{
     ProviderKind, ProviderModelWireApi, ProviderNativeBinding, ProviderProfile, ProviderProfileId,
     ProviderProfileStatus, ProviderSecretBackend, ProviderSessionConfigOption,
     ProviderSessionConfigOptionKind, ProviderSessionConfigState, ProviderSessionConfigValue,
-    RequestId, RuntimeAttachmentSnapshot, RuntimeAttachmentStatus, RuntimeBinding,
-    RuntimeBindingId, RuntimeLeaseRole, RuntimeLeaseRoleCounts, RuntimeLiveMessageSnapshot,
-    RuntimeLiveToolCallSnapshot, RuntimeMaterializationStatus, RuntimeProcessConfigStatus,
-    RuntimeProcessId, RuntimeProcessSnapshot, RuntimeSwitchActiveWorkPolicy, RuntimeSwitchId,
-    RuntimeSwitchPolicy, SessionConfigValue, SessionRuntimeConfigApplyStatus,
-    SessionRuntimeConfigFieldOutcome, SessionRuntimeConfigMutationRequest,
-    SessionRuntimeConfigMutationResult, SessionRuntimeConfigPatch, SessionRuntimeConfigState,
-    SessionRuntimeSelection, SystemNoticeLevel, TerminalAuthActionDescriptor, TerminalId,
-    TimelineRedactionState, ToolCallStatus, TransportKind, VibexError, VibexResult, VibexSessionId,
-    WorkspaceMode, unix_timestamp_ms,
+    RequestId, RuntimeAttachmentSnapshot, RuntimeAttachmentStatus, RuntimeAuthSource,
+    RuntimeBinding, RuntimeBindingId, RuntimeLeaseRole, RuntimeLeaseRoleCounts,
+    RuntimeLiveMessageSnapshot, RuntimeLiveToolCallSnapshot, RuntimeMaterializationStatus,
+    RuntimeModelSelection, RuntimeProcessConfigStatus, RuntimeProcessId, RuntimeProcessSnapshot,
+    RuntimeSwitchActiveWorkPolicy, RuntimeSwitchId, RuntimeSwitchPolicy, SessionConfigValue,
+    SessionRuntimeConfigApplyStatus, SessionRuntimeConfigFieldOutcome,
+    SessionRuntimeConfigMutationRequest, SessionRuntimeConfigMutationResult,
+    SessionRuntimeConfigPatch, SessionRuntimeConfigState, SessionRuntimeSelection,
+    SystemNoticeLevel, TerminalAuthActionDescriptor, TerminalId, TimelineRedactionState,
+    ToolCallStatus, TransportKind, VibexError, VibexResult, VibexSessionId, WorkspaceMode,
+    unix_timestamp_ms,
 };
 use vibex_db::{
-    AgentModelProviderBindingRepository, AgentRuntimeProbeRepository,
-    AgentRuntimeProfileRepository, AgentSessionRuntimeRepository, RuntimeBindingRepository,
-    SessionRepository, SwitchOperationRecord, apply_migrations, open_database,
+    AgentAuthContextRepository, AgentAuthModelCatalogRepository,
+    AgentAuthenticationOperationRepository, AgentModelProviderBindingRepository,
+    AgentRuntimeProbeRepository, AgentRuntimeProfileRepository, AgentSessionRuntimeRepository,
+    RuntimeBindingRepository, SessionRepository, SwitchOperationRecord, apply_migrations,
+    open_database,
 };
 
 use crate::auth::{append_known_terminal_auth_fallback, parse_initialize_auth_catalog};
@@ -278,16 +284,24 @@ pub(crate) enum AcpProcessPurpose {
 }
 
 pub(crate) struct AcpProcessLaunch<'a> {
-    pub(crate) profile_id: &'a ProviderProfileId,
-    /// Agent identity supplied for profile-free setup probes. Normal session
-    /// launches derive it from `profile_id`.
-    pub(crate) agent_id: Option<&'a AgentId>,
+    pub(crate) auth_source: &'a RuntimeAuthSource,
+    pub(crate) auth_source_revision: i64,
+    pub(crate) agent_id: &'a AgentId,
     pub(crate) config: &'a AcpProviderConfig,
     pub(crate) cwd: &'a Path,
     pub(crate) runtime_resources: &'a ProviderRuntimeResources,
+    pub(crate) env_unsets: &'a [String],
     pub(crate) purpose: AcpProcessPurpose,
     pub(crate) process_strategy_effective: AcpProcessStrategy,
     pub(crate) pool_fallback_reason: Option<String>,
+}
+
+struct AcpAuthSourceLaunchContext<'a> {
+    auth_source: &'a RuntimeAuthSource,
+    auth_source_revision: i64,
+    agent_id: &'a AgentId,
+    config: &'a AcpProviderConfig,
+    env_unsets: &'a [String],
 }
 
 /// Values materialized for one process launch. `env_overlays` may contain
@@ -301,6 +315,17 @@ struct ProcessLaunchMaterialization {
 struct ProcessEnvironmentMaterialization {
     env_overlays: Vec<(String, String)>,
     projection: Option<vibex_config_switch::ResolvedAgentProviderProjection>,
+}
+
+struct BindingLaunchContext {
+    agent_id: AgentId,
+    auth_source: RuntimeAuthSource,
+    auth_source_revision: i64,
+    config: AcpProviderConfig,
+    cwd: PathBuf,
+    env_unsets: Vec<String>,
+    process_strategy_effective: AcpProcessStrategy,
+    pool_fallback_reason: Option<String>,
 }
 
 #[derive(Default)]
@@ -1252,7 +1277,8 @@ impl AcpAttachmentRouter {
 struct LegacyAttachmentIdentity {
     binding_id: RuntimeBindingId,
     activation_generation: u64,
-    provider_profile_id: ProviderProfileId,
+    auth_source: RuntimeAuthSource,
+    auth_source_revision: i64,
     attached_process_id: Option<AcpProcessInstanceId>,
 }
 
@@ -1425,7 +1451,9 @@ impl AcpModelIdProjection {
 pub(crate) struct AcpProcess {
     process_instance_id: AcpProcessInstanceId,
     exit_reporter: Option<ProcessExitReporter<AcpProcess>>,
-    provider_profile_id: ProviderProfileId,
+    agent_id: AgentId,
+    auth_source: RuntimeAuthSource,
+    auth_source_revision: i64,
     adapter_version: String,
     compatibility_identity: String,
     event_enricher: AgentEventEnricherKind,
@@ -2483,8 +2511,10 @@ impl AcpSessionAttachment {
         // facts but never become Profile model choices through this cache.
         probe.models.clear();
         let process = self.process();
-        if let Ok(mut evidence) = process.profile_config_evidence.lock() {
-            evidence.insert(process.provider_profile_id.clone(), probe);
+        if let Some(provider_profile_id) = process.auth_source.provider_profile_id()
+            && let Ok(mut evidence) = process.profile_config_evidence.lock()
+        {
+            evidence.insert(provider_profile_id.clone(), probe);
         }
     }
 
@@ -2494,7 +2524,7 @@ impl AcpSessionAttachment {
         }
         let options = extract_config_options(update);
         let process = self.process();
-        let profile_id = process.provider_profile_id.clone();
+        let profile_id = process.auth_source.provider_profile_id().cloned();
         let generation = self.activation_generation();
         let mut runtime_snapshot = None;
         if let Ok(mut state) = self.state.lock() {
@@ -2512,7 +2542,7 @@ impl AcpSessionAttachment {
                         .session_config_state
                         .get_or_insert_with(|| ProviderSessionConfigState {
                             provider_kind: ProviderKind::Acp,
-                            provider_profile_id: Some(profile_id.clone()),
+                            provider_profile_id: profile_id.clone(),
                             native_session_id: Some(self.native_session_id.clone()),
                             current_model: None,
                             models: Vec::new(),
@@ -4928,7 +4958,7 @@ pub struct AcpRuntimeClient {
     restore_results: Mutex<HashMap<String, vibex_core::AgentSessionRestoreResult>>,
     session_operation_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     agent_authentication_operations:
-        Mutex<HashMap<AgentAuthenticationOperationId, ActiveAgentAuthentication>>,
+        Arc<Mutex<HashMap<AgentAuthenticationOperationId, ActiveAgentAuthentication>>>,
     prompt_gate_sessions: Mutex<BTreeSet<VibexSessionId>>,
     process_registry: AcpProcessRegistry<AcpProcess>,
     observability: Arc<RuntimeObservability>,
@@ -4965,10 +4995,13 @@ pub struct AcpRuntimeSwitchBridge {
 }
 
 struct AcpSwitchTargetContext {
-    profile: ProviderProfile,
+    agent_id: AgentId,
+    auth_source: RuntimeAuthSource,
+    auth_source_revision: i64,
     config: AcpProviderConfig,
     cwd: PathBuf,
     runtime_resources: ProviderRuntimeResources,
+    env_unsets: Vec<String>,
     process_strategy_effective: AcpProcessStrategy,
     pool_fallback_reason: Option<String>,
     spawn_snapshot: ProcessSpawnConfigSnapshot,
@@ -5124,42 +5157,113 @@ impl AcpRuntimeSwitchBridge {
                 "Agent session was not found",
             ));
         }
-        let profile = self
-            .client
-            .config_service
-            .get_profile(&selection.provider_profile_id)?
-            .ok_or_else(|| runtime_configuration_unavailable("provider_profile_not_found"))?;
-        if profile.agent_id != selection.agent_id
-            || profile.kind != ProviderKind::Acp
-            || profile.status != ProviderProfileStatus::Enabled
+        let (auth_source_revision, config, runtime_resources, env_unsets) = match &selection
+            .auth_source
         {
-            return Err(runtime_configuration_unavailable(
-                "provider_profile_route_unavailable",
-            ));
-        }
-        let config = self
-            .client
-            .profile_config(&selection.provider_profile_id)
-            .map_err(|error| runtime_configuration_unavailable(&error.code))?;
+            RuntimeAuthSource::ProviderProfile {
+                provider_profile_id,
+            } => {
+                let profile = self
+                    .client
+                    .config_service
+                    .get_profile(provider_profile_id)?
+                    .ok_or_else(|| {
+                        runtime_configuration_unavailable("provider_profile_not_found")
+                    })?;
+                if profile.agent_id != selection.agent_id
+                    || profile.kind != ProviderKind::Acp
+                    || profile.status != ProviderProfileStatus::Enabled
+                {
+                    return Err(runtime_configuration_unavailable(
+                        "provider_profile_route_unavailable",
+                    ));
+                }
+                let config = self
+                    .client
+                    .profile_config(provider_profile_id)
+                    .map_err(|error| runtime_configuration_unavailable(&error.code))?;
+                let runtime_resources = self
+                    .manager
+                    .runtime_resources_for_profile(ProviderKind::Acp, provider_profile_id)?;
+                (profile.updated_at_ms, config, runtime_resources, Vec::new())
+            }
+            RuntimeAuthSource::AgentAccount { auth_context_id } => {
+                let context = AgentAuthContextRepository::get_by_id(&conn, auth_context_id)?
+                    .ok_or_else(|| {
+                        runtime_configuration_unavailable("agent_auth_context_not_found")
+                    })?;
+                if context.agent_id != selection.agent_id {
+                    return Err(runtime_configuration_unavailable(
+                        "agent_auth_context_agent_mismatch",
+                    ));
+                }
+                if context.status != AgentAuthContextStatus::Authenticated {
+                    return Err(runtime_configuration_unavailable(
+                        "agent_authentication_required",
+                    ));
+                }
+                if AgentAuthenticationOperationRepository::get_active_for_context(
+                    &conn,
+                    auth_context_id,
+                )?
+                .is_some()
+                {
+                    return Err(runtime_configuration_unavailable(
+                        "agent_authentication_operation_in_progress",
+                    ));
+                }
+                let descriptor = self
+                    .client
+                    .compatibility_registry
+                    .for_agent(&selection.agent_id)
+                    .ok_or_else(|| {
+                        runtime_configuration_unavailable("agent_default_state_home_unsupported")
+                    })?;
+                if !descriptor.auth_context.supports_default_state_home {
+                    return Err(runtime_configuration_unavailable(
+                        "agent_default_state_home_unsupported",
+                    ));
+                }
+                let config = self
+                    .client
+                    .config_service
+                    .get_agent_acp_runtime_config(&selection.agent_id)
+                    .map_err(|error| runtime_configuration_unavailable(&error.code))?;
+                let runtime_resources = self
+                    .manager
+                    .runtime_resources_for_agent(&selection.agent_id, ProviderKind::Acp)?;
+                (
+                    context.revision,
+                    config,
+                    runtime_resources,
+                    descriptor.auth_context.credential_env_keys_to_unset.clone(),
+                )
+            }
+        };
         let cwd = AcpRuntimeClient::resolve_workspace_cwd(&config, &session.workspace_root)
             .map_err(|error| runtime_configuration_unavailable(&error.code))?;
-        let runtime_resources = self
-            .manager
-            .runtime_resources_for_profile(ProviderKind::Acp, &selection.provider_profile_id)?;
         let (process_strategy_effective, pool_fallback_reason) = self
             .client
-            .pool_decision(&selection.provider_profile_id, &config)?;
-        let spawn_snapshot = self.client.process_spawn_config_snapshot(
-            &selection.provider_profile_id,
-            &config,
+            .pool_decision_for_agent(&selection.agent_id, &config)?;
+        let spawn_snapshot = self.client.process_spawn_config_snapshot_for_source(
+            AcpAuthSourceLaunchContext {
+                auth_source: &selection.auth_source,
+                auth_source_revision,
+                agent_id: &selection.agent_id,
+                config: &config,
+                env_unsets: &env_unsets,
+            },
             &cwd,
             &runtime_resources,
         )?;
         Ok(AcpSwitchTargetContext {
-            profile,
+            agent_id: selection.agent_id.clone(),
+            auth_source: selection.auth_source.clone(),
+            auth_source_revision,
             config,
             cwd,
             runtime_resources,
+            env_unsets,
             process_strategy_effective,
             pool_fallback_reason,
             spawn_snapshot,
@@ -5202,11 +5306,13 @@ impl AcpRuntimeSwitchBridge {
         let lease = self
             .client
             .acquire_initialized_process(AcpProcessLaunch {
-                profile_id: &intent.target_selection.provider_profile_id,
-                agent_id: None,
+                auth_source: &context.auth_source,
+                auth_source_revision: context.auth_source_revision,
+                agent_id: &context.agent_id,
                 config: &context.config,
                 cwd: &context.cwd,
                 runtime_resources: &context.runtime_resources,
+                env_unsets: &context.env_unsets,
                 purpose: AcpProcessPurpose::Session,
                 process_strategy_effective: context.process_strategy_effective,
                 pool_fallback_reason: context.pool_fallback_reason,
@@ -5276,7 +5382,8 @@ impl AcpRuntimeSwitchBridge {
         Ok(LegacyAttachmentIdentity {
             binding_id,
             activation_generation,
-            provider_profile_id: intent.target_selection.provider_profile_id.clone(),
+            auth_source: intent.target_selection.auth_source.clone(),
+            auth_source_revision: intent.target_auth_source_revision,
             attached_process_id: None,
         })
     }
@@ -5294,11 +5401,12 @@ impl AcpRuntimeSwitchBridge {
         intent: &SwitchIntent,
         context: &AcpSwitchTargetContext,
     ) -> VibexResult<ProviderProjectionSwitchAssessment> {
+        let Some(provider_profile_id) = intent.target_selection.provider_profile_id() else {
+            return Ok(ProviderProjectionSwitchAssessment::default());
+        };
         let conn = open_database(&self.db_path)?;
-        let Some(binding) = AgentModelProviderBindingRepository::get_by_legacy_profile(
-            &conn,
-            &intent.target_selection.provider_profile_id,
-        )?
+        let Some(binding) =
+            AgentModelProviderBindingRepository::get_by_legacy_profile(&conn, provider_profile_id)?
         else {
             return Ok(ProviderProjectionSwitchAssessment::default());
         };
@@ -5368,7 +5476,8 @@ impl AcpRuntimeSwitchBridge {
         context: &AcpSwitchTargetContext,
     ) -> bool {
         binding.agent_id == intent.target_selection.agent_id
-            && binding.provider_profile_id == intent.target_selection.provider_profile_id
+            && binding.auth_source == intent.target_selection.auth_source
+            && binding.auth_source_revision == intent.target_auth_source_revision
             && binding.adapter_id == intent.target_adapter_id
             && binding.transport_kind == TransportKind::Acp
             && binding.native_session_id.is_some()
@@ -5384,7 +5493,8 @@ impl AcpRuntimeSwitchBridge {
     fn source_restore_probeable(&self, binding: &RuntimeBinding, intent: &SwitchIntent) -> bool {
         binding.native_session_id.is_some()
             && binding.agent_id == intent.target_selection.agent_id
-            && binding.provider_profile_id == intent.target_selection.provider_profile_id
+            && binding.auth_source == intent.target_selection.auth_source
+            && binding.auth_source_revision == intent.target_auth_source_revision
             && binding.adapter_id == intent.target_adapter_id
             && binding.transport_kind == TransportKind::Acp
     }
@@ -5488,7 +5598,8 @@ impl AcpRuntimeSwitchBridge {
         Ok(ProviderBinding {
             session_id: intent.session_id.clone(),
             provider_kind: ProviderKind::Acp,
-            provider_profile_id: intent.target_selection.provider_profile_id.clone(),
+            auth_source: intent.target_selection.auth_source.clone(),
+            auth_source_revision: intent.target_auth_source_revision,
             native: ProviderNativeBinding {
                 native_session_id: Some(native_session_id),
                 native_thread_id: None,
@@ -5555,6 +5666,8 @@ impl AcpRuntimeSwitchBridge {
         let process = attachment.payload().process();
         let restore_compatibility_key = AgentSessionRestoreCompatibilityKey::new(
             selection.agent_id.clone(),
+            selection.auth_source.clone(),
+            context.auth_source_revision,
             native_session_id.clone(),
             context.spawn_snapshot.native_state_home_id.clone(),
             process.compatibility_identity.clone(),
@@ -5576,7 +5689,8 @@ impl AcpRuntimeSwitchBridge {
             session_id: session_id.clone(),
             agent_id: selection.agent_id.clone(),
             transport_kind: TransportKind::Acp,
-            provider_profile_id: selection.provider_profile_id.clone(),
+            auth_source: selection.auth_source.clone(),
+            auth_source_revision: context.auth_source_revision,
             adapter_id: adapter_id.clone(),
             adapter_version: process.adapter_version.clone(),
             adapter_compatibility_identity: process.compatibility_identity.clone(),
@@ -5587,7 +5701,6 @@ impl AcpRuntimeSwitchBridge {
             session_runtime_config_state: attachment.payload().runtime_config_state(),
             capability_snapshot: None,
             restore_compatibility_key: Some(restore_compatibility_key),
-            profile_revision: context.profile.updated_at_ms,
             last_context_sequence: 0,
             last_summary_sequence: 0,
             context_bridge_version: 0,
@@ -5647,13 +5760,15 @@ impl AcpRuntimeSwitchBridge {
                     "runtime activation generation is invalid",
                 )
             })?,
-            provider_profile_id: binding.provider_profile_id.clone(),
+            auth_source: binding.auth_source.clone(),
+            auth_source_revision: binding.auth_source_revision,
             attached_process_id: None,
         };
         let provider_binding = ProviderBinding {
             session_id: binding.session_id.clone(),
             provider_kind: ProviderKind::Acp,
-            provider_profile_id: binding.provider_profile_id.clone(),
+            auth_source: binding.auth_source.clone(),
+            auth_source_revision: binding.auth_source_revision,
             native: ProviderNativeBinding {
                 native_session_id: Some(native_session_id.clone()),
                 native_thread_id: None,
@@ -5805,6 +5920,7 @@ impl AcpRuntimeSwitchBridge {
             desired_selection_revision: runtime_state.selection_revision,
             target_binding_id: Some(binding_id.clone()),
             target_adapter_id: binding.adapter_id.clone(),
+            target_auth_source_revision: binding.auth_source_revision,
             target_selection: selection,
             requested_policy: RuntimeSwitchPolicy::PreferResume,
             active_work_policy: RuntimeSwitchActiveWorkPolicy::default(),
@@ -5868,7 +5984,8 @@ impl AcpRuntimeSwitchBridge {
                     &LegacyAttachmentIdentity {
                         binding_id: binding_id.clone(),
                         activation_generation: next_generation as u64,
-                        provider_profile_id: binding.provider_profile_id,
+                        auth_source: binding.auth_source,
+                        auth_source_revision: binding.auth_source_revision,
                         attached_process_id: Some(activated.fence().process_instance_id.clone()),
                     },
                     activated.fence().process_instance_id.clone(),
@@ -6048,7 +6165,7 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
         let context = self.target_context(session_id, selection)?;
         let adapter_id = self
             .client
-            .route_key_for_profile(&context.profile)
+            .route_key_for_agent(&context.agent_id)
             .adapter_id;
         if preferred_adapter_id.is_some_and(|preferred| preferred != &adapter_id) {
             return Err(VibexError::conflict(
@@ -6057,27 +6174,94 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
             ));
         }
 
-        let model_id =
-            validate_model_value(&selection.model_id).map_err(runtime_configuration_unavailable)?;
-        let models = self
-            .manager
-            .list_models(AgentModelListRequest {
-                agent_id: Some(selection.agent_id.clone()),
-                provider_profile_id: Some(selection.provider_profile_id.clone()),
-                session_id: None,
-            })
-            .await?;
-        if models.source == AgentModelListSource::Unavailable
-            || !models.models.iter().any(|candidate| candidate == &model_id)
-        {
-            return Err(runtime_configuration_unavailable("model_unavailable"));
+        if selection.provider_profile_id().is_some() && selection.model_id().is_none() {
+            return Err(runtime_configuration_unavailable(
+                "provider_default_model_unsupported",
+            ));
         }
-        let session_probe = if selection.reasoning_effort.is_some() || selection.mode_id.is_some() {
+
+        let model_id = selection
+            .model_id()
+            .map(validate_model_value)
+            .transpose()
+            .map_err(runtime_configuration_unavailable)?;
+        let models = match selection.provider_profile_id() {
+            Some(provider_profile_id) => Some(
+                self.manager
+                    .list_models(AgentModelListRequest {
+                        agent_id: Some(selection.agent_id.clone()),
+                        provider_profile_id: Some(provider_profile_id.clone()),
+                        session_id: None,
+                    })
+                    .await?,
+            ),
+            None => None,
+        };
+        let account_snapshot = if let Some(auth_context_id) = selection.auth_context_id() {
+            let conn = open_database(&self.db_path)?;
+            AgentAuthModelCatalogRepository::get(
+                &conn,
+                auth_context_id,
+                context.auth_source_revision,
+                &context.spawn_snapshot.process_spawn_fingerprint(),
+            )?
+        } else {
+            None
+        };
+        let selected_account_model = if selection.auth_context_id().is_some() {
+            match (&selection.model, account_snapshot.as_ref()) {
+                (RuntimeModelSelection::Explicit { model_id }, Some(snapshot))
+                    if snapshot.status == AgentAuthModelCatalogStatus::Available =>
+                {
+                    snapshot
+                        .models
+                        .iter()
+                        .find(|model| model.model_id == *model_id)
+                }
+                (RuntimeModelSelection::AgentDefault, Some(snapshot))
+                    if matches!(
+                        snapshot.status,
+                        AgentAuthModelCatalogStatus::Available
+                            | AgentAuthModelCatalogStatus::AgentDefaultOnly
+                    ) =>
+                {
+                    None
+                }
+                _ => {
+                    return Err(runtime_configuration_unavailable(
+                        "agent_auth_model_catalog_unavailable",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(model_id) = model_id.as_ref() {
+            let available = if let Some(models) = models.as_ref() {
+                models.source != AgentModelListSource::Unavailable
+                    && models.models.iter().any(|candidate| candidate == model_id)
+            } else {
+                selected_account_model.is_some()
+            };
+            if !available {
+                return Err(runtime_configuration_unavailable("model_unavailable"));
+            }
+        }
+        if selection.auth_context_id().is_some()
+            && matches!(selection.model, RuntimeModelSelection::AgentDefault)
+            && (selection.reasoning_effort.is_some()
+                || selection.mode_id.is_some()
+                || !selection.config_values.is_empty())
+        {
+            return Err(runtime_configuration_unavailable(
+                "agent_default_runtime_options_unavailable",
+            ));
+        }
+        let session_probe = if (selection.reasoning_effort.is_some() || selection.mode_id.is_some())
+            && let Some(provider_profile_id) = selection.provider_profile_id()
+        {
             self.manager
-                .probe_session_config(
-                    selection.agent_id.clone(),
-                    selection.provider_profile_id.clone(),
-                )
+                .probe_session_config(selection.agent_id.clone(), provider_profile_id.clone())
                 .await
                 .ok()
         } else {
@@ -6089,22 +6273,32 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
             // Discovery evidence first; the registry acceptance set keeps
             // selections working when no probe evidence reached this response
             // (the pinned adapter, not this gate, stays the final authority).
-            let supported = models
-                .model_capabilities
-                .iter()
-                .find(|capability| capability.model == model_id)
-                .map(|capability| &capability.reasoning_efforts)
-                .unwrap_or(&models.reasoning_efforts)
-                .iter()
-                .any(|candidate| candidate.value == effort)
-                || session_probe.as_ref().is_some_and(|probe| {
-                    probe
+            let supported = if selection.auth_context_id().is_some() {
+                selected_account_model.is_some_and(|model| {
+                    model
                         .reasoning_efforts
                         .iter()
                         .any(|candidate| candidate.value == effort)
                 })
-                || known_reasoning_effort_values(&context.profile.agent_id)
-                    .contains(&effort.as_str());
+            } else {
+                models.as_ref().is_some_and(|models| {
+                    models
+                        .model_capabilities
+                        .iter()
+                        .find(|capability| {
+                            capability.model == model_id.as_deref().unwrap_or_default()
+                        })
+                        .map(|capability| &capability.reasoning_efforts)
+                        .unwrap_or(&models.reasoning_efforts)
+                        .iter()
+                        .any(|candidate| candidate.value == effort)
+                }) || session_probe.as_ref().is_some_and(|probe| {
+                    probe
+                        .reasoning_efforts
+                        .iter()
+                        .any(|candidate| candidate.value == effort)
+                }) || known_reasoning_effort_values(&context.agent_id).contains(&effort.as_str())
+            };
             if !supported {
                 return Err(runtime_configuration_unavailable(
                     "reasoning_effort_unavailable",
@@ -6113,22 +6307,42 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
         }
         if let Some(mode) = selection.mode_id.as_deref() {
             let mode = validate_effort_value(mode).map_err(runtime_configuration_unavailable)?;
-            let supported = context
-                .config
-                .modes
-                .iter()
-                .any(|candidate| candidate == &mode)
-                || session_probe.as_ref().is_some_and(|probe| {
-                    probe.modes.iter().any(|candidate| candidate.value == mode)
+            let supported = if selection.auth_context_id().is_some() {
+                selected_account_model.is_some_and(|model| {
+                    model.modes.iter().any(|candidate| candidate.value == mode)
                 })
-                || known_session_mode_values(&context.profile.agent_id).contains(&mode.as_str());
+            } else {
+                context
+                    .config
+                    .modes
+                    .iter()
+                    .any(|candidate| candidate == &mode)
+                    || session_probe.as_ref().is_some_and(|probe| {
+                        probe.modes.iter().any(|candidate| candidate.value == mode)
+                    })
+                    || known_session_mode_values(&context.agent_id).contains(&mode.as_str())
+            };
             if !supported {
                 return Err(runtime_configuration_unavailable("mode_unavailable"));
             }
         }
+        if selection.auth_context_id().is_some()
+            && selection.config_values.iter().any(|(id, value)| {
+                selected_account_model.is_none_or(|model| {
+                    !model
+                        .features
+                        .iter()
+                        .any(|feature| feature.id == *id && feature.accepts_value(value))
+                })
+            })
+        {
+            return Err(runtime_configuration_unavailable(
+                "session_feature_unavailable",
+            ));
+        }
 
         let session_config = serde_json::to_value(SessionRuntimeConfigPatch {
-            model_id: Some(model_id),
+            model_id,
             reasoning_effort: selection.reasoning_effort.clone(),
             mode_id: selection.mode_id.clone(),
             config_values: selection.config_values.clone(),
@@ -6142,6 +6356,7 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
         })?;
         Ok(ResolvedRuntimeSelection {
             adapter_id,
+            auth_source_revision: context.auth_source_revision,
             session_config: Some(session_config),
         })
     }
@@ -6164,15 +6379,20 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
         }
         let payload = attachment.payload();
         let process = payload.process();
-        let profile = self
-            .client
-            .config_service
-            .get_profile(&process.provider_profile_id)?
-            .ok_or_else(|| runtime_configuration_unavailable("provider_profile_not_found"))?;
-        if profile.kind != ProviderKind::Acp || profile.status != ProviderProfileStatus::Enabled {
-            return Err(runtime_configuration_unavailable(
-                "provider_profile_route_unavailable",
-            ));
+        if let Some(provider_profile_id) = process.auth_source.provider_profile_id() {
+            let profile = self
+                .client
+                .config_service
+                .get_profile(provider_profile_id)?
+                .ok_or_else(|| runtime_configuration_unavailable("provider_profile_not_found"))?;
+            if profile.kind != ProviderKind::Acp
+                || profile.status != ProviderProfileStatus::Enabled
+                || profile.agent_id != process.agent_id
+            {
+                return Err(runtime_configuration_unavailable(
+                    "provider_profile_route_unavailable",
+                ));
+            }
         }
         let runtime_state = payload.runtime_config_state();
         let generation = attachment.fence().activation_generation as i64;
@@ -6181,13 +6401,23 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
                 "session_config_not_converged",
             ));
         }
-        let model_id = runtime_state
+        let effective_model = runtime_state
             .effective_model
             .as_deref()
-            .ok_or_else(|| runtime_configuration_unavailable("effective_model_unavailable"))
-            .and_then(|value| {
-                validate_model_value(value).map_err(runtime_configuration_unavailable)
-            })?;
+            .map(validate_model_value)
+            .transpose()
+            .map_err(runtime_configuration_unavailable)?;
+        let model = match effective_model {
+            Some(model_id) => RuntimeModelSelection::explicit(model_id),
+            None if matches!(process.auth_source, RuntimeAuthSource::AgentAccount { .. }) => {
+                RuntimeModelSelection::AgentDefault
+            }
+            None => {
+                return Err(runtime_configuration_unavailable(
+                    "effective_model_unavailable",
+                ));
+            }
+        };
         let reasoning_effort = runtime_state
             .effective_reasoning_effort
             .as_deref()
@@ -6201,9 +6431,9 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
             .transpose()
             .map_err(runtime_configuration_unavailable)?;
         let selection = SessionRuntimeSelection {
-            agent_id: profile.agent_id.clone(),
-            provider_profile_id: profile.id.clone(),
-            model_id,
+            agent_id: process.agent_id.clone(),
+            auth_source: process.auth_source.clone(),
+            model,
             reasoning_effort,
             mode_id,
             config_values: runtime_state
@@ -6220,7 +6450,7 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
         let context = self.target_context(session_id, &selection)?;
         let adapter_id = self
             .client
-            .route_key_for_profile(&context.profile)
+            .route_key_for_agent(&context.agent_id)
             .adapter_id;
         let binding = self.build_runtime_binding_for_attachment(
             session_id,
@@ -6255,7 +6485,8 @@ impl SwitchTargetExecutor for AcpRuntimeSwitchBridge {
         let source = self.source_binding(intent)?;
         let same_route = source.as_ref().is_some_and(|source| {
             source.agent_id == intent.target_selection.agent_id
-                && source.provider_profile_id == intent.target_selection.provider_profile_id
+                && source.auth_source == intent.target_selection.auth_source
+                && source.auth_source_revision == intent.target_auth_source_revision
                 && source.adapter_id == intent.target_adapter_id
                 && source.transport_kind == TransportKind::Acp
         });
@@ -6653,7 +6884,8 @@ impl SwitchTargetExecutor for AcpRuntimeSwitchBridge {
             &LegacyAttachmentIdentity {
                 binding_id: attachment.binding.binding_id.clone(),
                 activation_generation: target_generation,
-                provider_profile_id: intent.target_selection.provider_profile_id.clone(),
+                auth_source: intent.target_selection.auth_source.clone(),
+                auth_source_revision: intent.target_auth_source_revision,
                 attached_process_id: Some(activated.fence().process_instance_id.clone()),
             },
             activated.fence().process_instance_id.clone(),
@@ -6837,7 +7069,24 @@ fn runtime_configuration_unavailable(cause_code: &str) -> VibexError {
         "runtime_switch_configuration_unavailable",
         "selected Agent runtime configuration is unavailable",
     )
-    .with_diagnostic("causeCode", redact_summary(cause_code))
+    .with_diagnostic(
+        "causeCode",
+        safe_runtime_configuration_cause_code(cause_code),
+    )
+}
+
+fn safe_runtime_configuration_cause_code(cause_code: &str) -> String {
+    let cause_code = cause_code.trim();
+    if !cause_code.is_empty()
+        && cause_code.len() <= 96
+        && cause_code.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+        })
+    {
+        cause_code.to_string()
+    } else {
+        "runtime_configuration_error".to_string()
+    }
 }
 
 fn map_runtime_switch_acp_error(error: VibexError) -> VibexError {
@@ -7457,7 +7706,7 @@ impl AcpRuntimeClient {
             restore_compatibility_keys: Mutex::new(HashMap::new()),
             restore_results: Mutex::new(HashMap::new()),
             session_operation_locks: Mutex::new(HashMap::new()),
-            agent_authentication_operations: Mutex::new(HashMap::new()),
+            agent_authentication_operations: Arc::new(Mutex::new(HashMap::new())),
             prompt_gate_sessions: Mutex::new(BTreeSet::new()),
             process_registry: AcpProcessRegistry::with_observability(observability.clone()),
             observability,
@@ -7500,7 +7749,7 @@ impl AcpRuntimeClient {
             restore_compatibility_keys: Mutex::new(HashMap::new()),
             restore_results: Mutex::new(HashMap::new()),
             session_operation_locks: Mutex::new(HashMap::new()),
-            agent_authentication_operations: Mutex::new(HashMap::new()),
+            agent_authentication_operations: Arc::new(Mutex::new(HashMap::new())),
             prompt_gate_sessions: Mutex::new(BTreeSet::new()),
             process_registry: AcpProcessRegistry::with_observability(observability.clone()),
             observability,
@@ -7545,6 +7794,7 @@ impl AcpRuntimeClient {
             ActiveAgentAuthentication {
                 agent_id: request.agent_id.clone(),
                 process: None,
+                terminal_id: None,
                 cancel_requested: false,
             },
         );
@@ -7571,6 +7821,77 @@ impl AcpRuntimeClient {
         }
         operation.process = Some(process);
         Ok(true)
+    }
+
+    fn attach_agent_authentication_terminal(
+        &self,
+        operation_id: &AgentAuthenticationOperationId,
+        terminal_id: TerminalId,
+    ) -> VibexResult<bool> {
+        let mut operations = self
+            .agent_authentication_operations
+            .lock()
+            .map_err(|_| lock_poisoned_error("agentAuthenticationOperations"))?;
+        let operation = operations.get_mut(operation_id).ok_or_else(|| {
+            VibexError::conflict(
+                "agent_authentication_operation_missing",
+                "Agent authentication operation is no longer active",
+            )
+        })?;
+        if operation.cancel_requested {
+            return Ok(false);
+        }
+        operation.process = None;
+        operation.terminal_id = Some(terminal_id);
+        Ok(true)
+    }
+
+    fn complete_agent_authentication_operation(
+        &self,
+        request: &AgentAuthenticationCompleteRequest,
+    ) -> VibexResult<bool> {
+        let mut operations = self
+            .agent_authentication_operations
+            .lock()
+            .map_err(|_| lock_poisoned_error("agentAuthenticationOperations"))?;
+        let Some(operation) = operations.get(&request.operation_id) else {
+            return Ok(false);
+        };
+        if operation.agent_id != request.agent_id {
+            return Err(VibexError::validation(
+                "agent_authentication_operation_agent_mismatch",
+                "Authentication operation belongs to another Agent",
+            ));
+        }
+        if operation.terminal_id.is_none() {
+            return Err(VibexError::conflict(
+                "agent_authentication_operation_not_interactive",
+                "Authentication operation has no interactive terminal to complete",
+            ));
+        }
+        operations.remove(&request.operation_id);
+        Ok(true)
+    }
+
+    fn monitor_agent_authentication_terminal(
+        &self,
+        operation_id: AgentAuthenticationOperationId,
+        terminal_id: TerminalId,
+    ) {
+        let Some(terminal_host) = self.terminal_host.clone() else {
+            return;
+        };
+        let operations = Arc::clone(&self.agent_authentication_operations);
+        tokio::spawn(async move {
+            let _ = terminal_host.wait_for_exit(&terminal_id).await;
+            if let Ok(mut operations) = operations.lock()
+                && operations
+                    .get(&operation_id)
+                    .is_some_and(|operation| operation.terminal_id.as_ref() == Some(&terminal_id))
+            {
+                operations.remove(&operation_id);
+            }
+        });
     }
 
     fn finish_agent_authentication(
@@ -7608,6 +7929,316 @@ impl AcpRuntimeClient {
                 transport_kind: TransportKind::Acp,
                 adapter_id: default_adapter_for_agent(agent_id),
             })
+    }
+
+    pub fn supports_agent_account(&self, agent_id: &AgentId) -> bool {
+        self.compatibility_registry
+            .for_agent(agent_id)
+            .is_some_and(|descriptor| descriptor.auth_context.supports_default_state_home)
+    }
+
+    pub fn supports_agent_account_logout(&self, agent_id: &AgentId) -> bool {
+        self.compatibility_registry
+            .for_agent(agent_id)
+            .is_some_and(|descriptor| {
+                descriptor.auth_context.supports_default_state_home
+                    && descriptor.auth_context.supports_logout
+            })
+    }
+
+    /// Discovers models from the exact default-account launch identity. The
+    /// returned fingerprint is a one-way process configuration digest and
+    /// contains no credential material or native state-home path.
+    pub async fn discover_agent_auth_model_catalog(
+        &self,
+        context: &AgentAuthContext,
+    ) -> VibexResult<AgentAuthModelCatalogSnapshot> {
+        let mut conn = open_database(self.config_service.database_path())?;
+        apply_migrations(&mut conn)?;
+        let current =
+            AgentAuthContextRepository::get_by_id(&conn, &context.id)?.ok_or_else(|| {
+                VibexError::validation(
+                    "agent_auth_context_not_found",
+                    "Agent authentication context was not found",
+                )
+            })?;
+        if current.agent_id != context.agent_id || current.revision != context.revision {
+            return Err(VibexError::conflict(
+                "agent_auth_context_revision_conflict",
+                "Agent authentication context changed before model discovery",
+            ));
+        }
+        let descriptor = self
+            .compatibility_registry
+            .for_agent(&context.agent_id)
+            .filter(|descriptor| descriptor.auth_context.supports_default_state_home)
+            .ok_or_else(|| {
+                VibexError::capability(
+                    "agent_default_state_home_unsupported",
+                    "Agent does not declare a supported default account state home",
+                )
+            })?;
+        let config = self
+            .config_service
+            .get_agent_acp_runtime_config(&context.agent_id)?;
+        let auth_source = RuntimeAuthSource::agent_account(context.id.clone());
+        let env_unsets = descriptor.auth_context.credential_env_keys_to_unset.clone();
+        let spawn_snapshot = self.process_spawn_config_snapshot_for_agent_account(
+            &auth_source,
+            context.revision,
+            &context.agent_id,
+            &config,
+            &ProviderRuntimeResources::default(),
+            &env_unsets,
+        )?;
+        let runtime_fingerprint = spawn_snapshot.process_spawn_fingerprint();
+        let attempted_at_ms = unix_timestamp_ms();
+
+        if descriptor.auth_context.supports_direct_model_catalog
+            && context.agent_id.as_str() == "codex"
+            && let Ok(capabilities) = self
+                .list_runtime_model_capabilities_for_source(
+                    &context.agent_id,
+                    &auth_source,
+                    context.revision,
+                    &config,
+                    &env_unsets,
+                )
+                .await
+            && !capabilities.is_empty()
+        {
+            let models = capabilities
+                .into_iter()
+                .map(|capability| AgentAuthModelDescriptor {
+                    label: capability.model.clone(),
+                    model_id: capability.model,
+                    reasoning_efforts: capability
+                        .reasoning_efforts
+                        .into_iter()
+                        .filter_map(|effort| {
+                            validate_effort_value(&effort.value).ok().map(|value| {
+                                SessionConfigValue {
+                                    value,
+                                    label: effort.description,
+                                }
+                            })
+                        })
+                        .collect(),
+                    modes: Vec::new(),
+                    features: Vec::new(),
+                })
+                .collect();
+            return Ok(AgentAuthModelCatalogSnapshot {
+                auth_context_id: context.id.clone(),
+                auth_context_revision: context.revision,
+                runtime_fingerprint,
+                discovery_source: AgentModelDiscoverySource::DirectCatalog,
+                status: AgentAuthModelCatalogStatus::Available,
+                models,
+                last_success_at_ms: Some(attempted_at_ms),
+                last_attempt_at_ms: attempted_at_ms,
+                last_error_code: None,
+            });
+        }
+
+        let probe = probe_runtime_session_config_with_config(
+            self,
+            AcpAuthSourceLaunchContext {
+                auth_source: &auth_source,
+                auth_source_revision: context.revision,
+                agent_id: &context.agent_id,
+                config: &config,
+                env_unsets: &env_unsets,
+            },
+            None,
+            None,
+        )
+        .await?;
+        let one_model = probe.models.len() == 1;
+        let shared_efforts = if one_model {
+            probe
+                .reasoning_efforts
+                .iter()
+                .filter_map(|effort| {
+                    validate_effort_value(&effort.value)
+                        .ok()
+                        .map(|value| SessionConfigValue {
+                            value,
+                            label: effort.description.clone(),
+                        })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let shared_modes = if one_model {
+            probe
+                .modes
+                .iter()
+                .map(|mode| SessionConfigValue {
+                    value: mode.value.clone(),
+                    label: mode.label.clone(),
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let shared_features = if one_model {
+            crate::session_config::runtime_features_from_options(&probe.options)
+        } else {
+            Vec::new()
+        };
+        let models = probe
+            .models
+            .into_iter()
+            .filter_map(|model_id| validate_model_value(&model_id).ok())
+            .map(|model_id| AgentAuthModelDescriptor {
+                label: model_id.clone(),
+                model_id,
+                reasoning_efforts: shared_efforts.clone(),
+                modes: shared_modes.clone(),
+                features: shared_features.clone(),
+            })
+            .collect::<Vec<_>>();
+        Ok(AgentAuthModelCatalogSnapshot {
+            auth_context_id: context.id.clone(),
+            auth_context_revision: context.revision,
+            runtime_fingerprint,
+            discovery_source: if models.is_empty() {
+                AgentModelDiscoverySource::AgentDefault
+            } else {
+                AgentModelDiscoverySource::SessionConfig
+            },
+            status: if models.is_empty() {
+                AgentAuthModelCatalogStatus::AgentDefaultOnly
+            } else {
+                AgentAuthModelCatalogStatus::Available
+            },
+            models,
+            last_success_at_ms: Some(attempted_at_ms),
+            last_attempt_at_ms: attempted_at_ms,
+            last_error_code: None,
+        })
+    }
+
+    async fn list_runtime_model_capabilities_for_source(
+        &self,
+        agent_id: &AgentId,
+        auth_source: &RuntimeAuthSource,
+        auth_source_revision: i64,
+        config: &AcpProviderConfig,
+        env_unsets: &[String],
+    ) -> VibexResult<Vec<AgentModelCapabilities>> {
+        if agent_id.as_str() != "codex" {
+            return Ok(Vec::new());
+        }
+        let probe_cwd = std::env::var("HOME")
+            .map(PathBuf::from)
+            .ok()
+            .filter(|path| path.is_dir())
+            .unwrap_or_else(std::env::temp_dir);
+        let probe_resources = ProviderRuntimeResources::default();
+        let mut process_args = config.args.clone();
+        process_args.extend(["cli".to_string(), "app-server".to_string()]);
+        let materialized_env = match auth_source {
+            RuntimeAuthSource::ProviderProfile {
+                provider_profile_id,
+            } => {
+                let profile = self
+                    .config_service
+                    .get_profile(provider_profile_id)?
+                    .ok_or_else(|| {
+                        VibexError::validation(
+                            "provider_profile_not_found",
+                            "Provider Profile was not found for model capability probing",
+                        )
+                    })?;
+                Some(self.resolve_env_overlays_for_profile(&profile, config, &probe_cwd)?)
+            }
+            RuntimeAuthSource::AgentAccount { .. } => None,
+        };
+        let process = self
+            .spawn_process(
+                AcpProcessInstanceId::new(),
+                AcpProcessLaunch {
+                    auth_source,
+                    auth_source_revision,
+                    agent_id,
+                    config,
+                    cwd: &probe_cwd,
+                    runtime_resources: &probe_resources,
+                    env_unsets,
+                    purpose: AcpProcessPurpose::Probe,
+                    process_strategy_effective: AcpProcessStrategy::PerSession,
+                    pool_fallback_reason: None,
+                },
+                Some(process_args),
+                materialized_env,
+                None,
+            )
+            .await?;
+
+        let probe = async {
+            process
+                .request(
+                    "initialize",
+                    json!({
+                        "capabilities": null,
+                        "clientInfo": {
+                            "name": "vibex-model-probe",
+                            "title": "Vibex model probe",
+                            "version": env!("CARGO_PKG_VERSION")
+                        }
+                    }),
+                    ACP_PROBE_TIMEOUT,
+                )
+                .await?;
+
+            let mut cursor = None;
+            let mut capabilities = BTreeMap::new();
+            for _ in 0..16 {
+                let response = process
+                    .request(
+                        "model/list",
+                        json!({ "cursor": cursor, "limit": null }),
+                        ACP_PROBE_TIMEOUT,
+                    )
+                    .await?;
+                let (page, next_cursor) = parse_codex_model_capabilities_page(&response)?;
+                for capability in page {
+                    capabilities.insert(capability.model.clone(), capability);
+                }
+                let Some(next_cursor) = next_cursor else {
+                    return Ok(capabilities.into_values().collect::<Vec<_>>());
+                };
+                cursor = Some(next_cursor);
+            }
+            Err(VibexError::provider(
+                "codex_model_list_page_limit_exceeded",
+                "Codex model capability probe exceeded the page limit",
+            ))
+        }
+        .await;
+
+        process.shutdown().await;
+        probe
+    }
+
+    /// Terminates every process still holding credentials for an account
+    /// context. Attachment crash handling keeps logical sessions durable and
+    /// forces their next use through the new context revision.
+    pub async fn shutdown_auth_source_processes(
+        &self,
+        auth_source: &RuntimeAuthSource,
+    ) -> VibexResult<usize> {
+        let instance_ids = self
+            .process_registry
+            .process_ids_for_auth_source(auth_source)?;
+        for instance_id in &instance_ids {
+            self.process_registry.shutdown(instance_id).await?;
+            self.process_registry.remove(instance_id)?;
+        }
+        Ok(instance_ids.len())
     }
 
     /// Returns the last bounded restore result for a logical session. This is
@@ -7725,10 +8356,15 @@ impl AcpRuntimeClient {
                     runtime_options_complete: false,
                     source: crate::session_config::SessionModelCatalogSource::Session,
                 });
-        let profile_models = payload.process().provider_profile_id.clone();
-        let profile_models = self
-            .config_service
-            .get_acp_profile_config(profile_models)
+        let profile_models = payload
+            .process()
+            .auth_source
+            .provider_profile_id()
+            .and_then(|profile_id| {
+                self.config_service
+                    .get_acp_profile_config(profile_id.clone())
+                    .ok()
+            })
             .map(|config| config.models)
             .unwrap_or_default();
         Ok(crate::session_config::merge_model_catalog(
@@ -7869,7 +8505,8 @@ impl AcpRuntimeClient {
     fn attachment_identity_candidate(
         &self,
         session_id: &VibexSessionId,
-        provider_profile_id: &ProviderProfileId,
+        auth_source: &RuntimeAuthSource,
+        auth_source_revision: i64,
     ) -> VibexResult<LegacyAttachmentIdentity> {
         let mut identities = self
             .legacy_attachment_identities
@@ -7881,10 +8518,14 @@ impl AcpRuntimeClient {
             None => LegacyAttachmentIdentity {
                 binding_id: RuntimeBindingId::new(),
                 activation_generation: 0,
-                provider_profile_id: provider_profile_id.clone(),
+                auth_source: auth_source.clone(),
+                auth_source_revision,
                 attached_process_id: None,
             },
-            Some(mut identity) if identity.provider_profile_id == *provider_profile_id => {
+            Some(mut identity)
+                if identity.auth_source == *auth_source
+                    && identity.auth_source_revision == auth_source_revision =>
+            {
                 if identity.attached_process_id.is_some() {
                     identity.activation_generation = identity
                         .activation_generation
@@ -7912,7 +8553,8 @@ impl AcpRuntimeClient {
                                 "ACP attachment activation generation is exhausted",
                             )
                         })?,
-                    provider_profile_id: provider_profile_id.clone(),
+                    auth_source: auth_source.clone(),
+                    auth_source_revision,
                     attached_process_id: None,
                 }
             }
@@ -7931,7 +8573,8 @@ impl AcpRuntimeClient {
     fn fresh_attachment_identity(
         &self,
         session_id: &VibexSessionId,
-        provider_profile_id: &ProviderProfileId,
+        auth_source: &RuntimeAuthSource,
+        auth_source_revision: i64,
         previous: &LegacyAttachmentIdentity,
     ) -> VibexResult<LegacyAttachmentIdentity> {
         let candidate = LegacyAttachmentIdentity {
@@ -7944,7 +8587,8 @@ impl AcpRuntimeClient {
                     )
                 },
             )?,
-            provider_profile_id: provider_profile_id.clone(),
+            auth_source: auth_source.clone(),
+            auth_source_revision,
             attached_process_id: None,
         };
         self.legacy_attachment_identities
@@ -8420,14 +9064,7 @@ impl AcpRuntimeClient {
         model: Option<&str>,
     ) -> Option<String> {
         let model = model.map(str::trim).filter(|model| !model.is_empty())?;
-        let profile = self
-            .config_service
-            .get_profile(&process.provider_profile_id)
-            .ok()
-            .flatten();
-        if profile.as_ref().is_some_and(|profile| {
-            profile.agent_id.as_str() == OPENCODE_AGENT_ID && is_opencode_default_model(model)
-        }) {
+        if process.agent_id.as_str() == OPENCODE_AGENT_ID && is_opencode_default_model(model) {
             return None;
         }
         Some(model.to_string())
@@ -8478,7 +9115,8 @@ impl AcpRuntimeClient {
         let route_key = self.route_key(profile_id)?;
         let key = ProcessAcquireKey::new(
             route_key,
-            profile_id.clone(),
+            snapshot.auth_source.clone(),
+            snapshot.auth_source_revision,
             snapshot.process_spawn_fingerprint(),
             workspace_scope,
         )?;
@@ -8487,45 +9125,78 @@ impl AcpRuntimeClient {
 
     fn process_launch_materialization(
         &self,
-        profile_id: &ProviderProfileId,
-        config: &AcpProviderConfig,
-        cwd: &Path,
-        runtime_resources: &ProviderRuntimeResources,
+        launch: &AcpProcessLaunch<'_>,
     ) -> VibexResult<(ProcessAcquireKey, ProcessLaunchMaterialization)> {
-        let profile = self
-            .config_service
-            .get_profile(profile_id)?
-            .ok_or_else(|| {
-                VibexError::validation(
-                    "provider_profile_not_found",
-                    "Provider Profile was not found for ACP process launch",
-                )
-                .with_diagnostic("providerProfileId", profile_id.as_str())
-            })?;
-        // Resolve the actual environment exactly once. The resulting values
-        // are passed to the child only; the snapshot keeps reference metadata.
-        let ProcessEnvironmentMaterialization {
-            env_overlays,
-            projection,
-        } = self.resolve_env_overlays_for_profile_with_projection(&profile, config, cwd)?;
-        let snapshot = self.process_spawn_config_snapshot_from_profile(
-            profile_id,
-            &profile,
-            config,
-            cwd,
-            runtime_resources,
-            ProcessSnapshotLaunchInputs {
-                effective_env: Some(&env_overlays),
-                projection_args: projection
-                    .as_ref()
-                    .map(|projection| projection.process_args.as_slice()),
-            },
-        )?;
-        let workspace_scope = WorkspaceScope::from_canonical(cwd.to_path_buf())?;
-        let route_key = self.route_key_for_profile(&profile);
+        let (snapshot, env_overlays) = match launch.auth_source {
+            RuntimeAuthSource::ProviderProfile {
+                provider_profile_id,
+            } => {
+                let profile = self
+                    .config_service
+                    .get_profile(provider_profile_id)?
+                    .ok_or_else(|| {
+                        VibexError::validation(
+                            "provider_profile_not_found",
+                            "Provider Profile was not found for ACP process launch",
+                        )
+                        .with_diagnostic("providerProfileId", provider_profile_id.as_str())
+                    })?;
+                if profile.agent_id != *launch.agent_id
+                    || profile.updated_at_ms != launch.auth_source_revision
+                {
+                    return Err(VibexError::conflict(
+                        "runtime_auth_source_changed",
+                        "runtime authentication source changed while materializing the process",
+                    ));
+                }
+                // Resolve the actual environment exactly once. The resulting values
+                // are passed to the child only; the snapshot keeps reference metadata.
+                let ProcessEnvironmentMaterialization {
+                    env_overlays,
+                    projection,
+                } = self.resolve_env_overlays_for_profile_with_projection(
+                    &profile,
+                    launch.config,
+                    launch.cwd,
+                )?;
+                let snapshot = self.process_spawn_config_snapshot_from_profile(
+                    provider_profile_id,
+                    &profile,
+                    launch.config,
+                    launch.cwd,
+                    launch.runtime_resources,
+                    ProcessSnapshotLaunchInputs {
+                        effective_env: Some(&env_overlays),
+                        projection_args: projection
+                            .as_ref()
+                            .map(|projection| projection.process_args.as_slice()),
+                    },
+                )?;
+                (snapshot, env_overlays)
+            }
+            RuntimeAuthSource::AgentAccount { .. } => {
+                let env_unsets = launch.env_unsets.iter().collect::<BTreeSet<_>>();
+                let env_overlays = agent_probe_env_overlays(launch.config)
+                    .into_iter()
+                    .filter(|(key, _)| !env_unsets.contains(key))
+                    .collect::<Vec<_>>();
+                let snapshot = self.process_spawn_config_snapshot_for_agent_account(
+                    launch.auth_source,
+                    launch.auth_source_revision,
+                    launch.agent_id,
+                    launch.config,
+                    launch.runtime_resources,
+                    launch.env_unsets,
+                )?;
+                (snapshot, env_overlays)
+            }
+        };
+        let workspace_scope = WorkspaceScope::from_canonical(launch.cwd.to_path_buf())?;
+        let route_key = self.route_key_for_agent(launch.agent_id);
         let key = ProcessAcquireKey::new(
             route_key,
-            profile_id.clone(),
+            snapshot.auth_source.clone(),
+            snapshot.auth_source_revision,
             snapshot.process_spawn_fingerprint(),
             workspace_scope,
         )?;
@@ -8563,6 +9234,118 @@ impl AcpRuntimeClient {
             runtime_resources,
             ProcessSnapshotLaunchInputs::default(),
         )
+    }
+
+    fn process_spawn_config_snapshot_for_source(
+        &self,
+        source: AcpAuthSourceLaunchContext<'_>,
+        cwd: &Path,
+        runtime_resources: &ProviderRuntimeResources,
+    ) -> VibexResult<ProcessSpawnConfigSnapshot> {
+        let AcpAuthSourceLaunchContext {
+            auth_source,
+            auth_source_revision,
+            agent_id,
+            config,
+            env_unsets,
+        } = source;
+        match auth_source {
+            RuntimeAuthSource::ProviderProfile {
+                provider_profile_id,
+            } => {
+                let snapshot = self.process_spawn_config_snapshot(
+                    provider_profile_id,
+                    config,
+                    cwd,
+                    runtime_resources,
+                )?;
+                if snapshot.agent_id != *agent_id
+                    || snapshot.auth_source_revision != auth_source_revision
+                {
+                    return Err(VibexError::conflict(
+                        "runtime_auth_source_changed",
+                        "runtime authentication source changed while resolving launch context",
+                    ));
+                }
+                Ok(snapshot)
+            }
+            RuntimeAuthSource::AgentAccount { .. } => self
+                .process_spawn_config_snapshot_for_agent_account(
+                    auth_source,
+                    auth_source_revision,
+                    agent_id,
+                    config,
+                    runtime_resources,
+                    env_unsets,
+                ),
+        }
+    }
+
+    fn process_spawn_config_snapshot_for_agent_account(
+        &self,
+        auth_source: &RuntimeAuthSource,
+        auth_source_revision: i64,
+        agent_id: &AgentId,
+        config: &AcpProviderConfig,
+        runtime_resources: &ProviderRuntimeResources,
+        env_unsets: &[String],
+    ) -> VibexResult<ProcessSpawnConfigSnapshot> {
+        if auth_source.auth_context_id().is_none() || auth_source_revision <= 0 {
+            return Err(VibexError::validation(
+                "agent_auth_context_revision_invalid",
+                "Agent account launch context requires a positive context revision",
+            ));
+        }
+        let route_key = self.route_key_for_agent(agent_id);
+        let adapter_identity = self.effective_adapter_identity(agent_id, config)?;
+        let terminal_host_available = self.terminal_host_for_config(config).is_some();
+        let env_unsets = env_unsets.iter().cloned().collect::<BTreeSet<_>>();
+        let non_secret_env = agent_probe_env_overlays(config)
+            .into_iter()
+            .filter(|(key, value)| {
+                !env_unsets.contains(key) && !looks_sensitive(key) && !value.trim().is_empty()
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mcp_servers = resolve_acp_mcp_descriptors(config, runtime_resources)?;
+        let mcp_revision = (!mcp_servers.is_empty()).then(|| mcp_servers_fingerprint(&mcp_servers));
+        let skills_revision = runtime_skills_fingerprint(runtime_resources);
+        let mut non_secret_env = non_secret_env;
+        non_secret_env.insert(
+            "__vibex_terminal_tools".to_string(),
+            (terminal_host_available && terminal_tools_enabled(config)).to_string(),
+        );
+        non_secret_env.insert(
+            "__vibex_terminal_auth".to_string(),
+            (terminal_host_available && config.terminal_auth).to_string(),
+        );
+        Ok(ProcessSpawnConfigSnapshot {
+            agent_id: agent_id.clone(),
+            adapter_id: route_key.adapter_id,
+            adapter_version: adapter_identity.adapter_version,
+            adapter_binary_identity: format!(
+                "{};binary={}",
+                adapter_identity.compatibility_identity,
+                binary_identity(&config.command)
+            ),
+            auth_source: auth_source.clone(),
+            auth_source_revision,
+            process_config_revision: 0,
+            command: config.command.clone(),
+            args: effective_acp_process_args(config, agent_id.as_str() == OPENCODE_AGENT_ID),
+            cwd_policy: config
+                .cwd_template
+                .clone()
+                .unwrap_or_else(|| "{workspaceRoot}".to_string()),
+            base_url: None,
+            model_provider_id: None,
+            non_secret_env,
+            env_unsets,
+            secret_reference_versions: BTreeMap::new(),
+            mcp_revision,
+            skills_revision,
+            native_state_home_id: stable_agent_default_state_home_id(auth_source, agent_id)?,
+        }
+        .with_content_revision())
     }
 
     fn process_spawn_config_snapshot_from_profile(
@@ -8642,8 +9425,9 @@ impl AcpRuntimeClient {
                 adapter_identity.compatibility_identity,
                 binary_identity(&config.command)
             ),
-            provider_profile_id: profile_id.clone(),
-            profile_revision: 0,
+            auth_source: RuntimeAuthSource::provider_profile(profile_id.clone()),
+            auth_source_revision: profile.updated_at_ms,
+            process_config_revision: 0,
             command: config.command.clone(),
             args: process_args,
             cwd_policy: config
@@ -8658,6 +9442,7 @@ impl AcpRuntimeClient {
                 .map(ToOwned::to_owned),
             model_provider_id,
             non_secret_env,
+            env_unsets: BTreeSet::new(),
             secret_reference_versions,
             mcp_revision,
             skills_revision,
@@ -8849,9 +9634,6 @@ impl AcpRuntimeClient {
         profile_id: &ProviderProfileId,
         config: &AcpProviderConfig,
     ) -> VibexResult<(AcpProcessStrategy, Option<String>)> {
-        if config.process_strategy == AcpProcessStrategy::PerSession {
-            return Ok((AcpProcessStrategy::PerSession, None));
-        }
         let profile = self
             .config_service
             .get_profile(profile_id)?
@@ -8861,8 +9643,19 @@ impl AcpRuntimeClient {
                     "Provider Profile was not found for ACP process reuse",
                 )
             })?;
-        let descriptor = self.compatibility_registry.for_agent(&profile.agent_id);
-        let effective_identity = self.effective_adapter_identity(&profile.agent_id, config)?;
+        self.pool_decision_for_agent(&profile.agent_id, config)
+    }
+
+    pub(crate) fn pool_decision_for_agent(
+        &self,
+        agent_id: &AgentId,
+        config: &AcpProviderConfig,
+    ) -> VibexResult<(AcpProcessStrategy, Option<String>)> {
+        if config.process_strategy == AcpProcessStrategy::PerSession {
+            return Ok((AcpProcessStrategy::PerSession, None));
+        }
+        let descriptor = self.compatibility_registry.for_agent(agent_id);
+        let effective_identity = self.effective_adapter_identity(agent_id, config)?;
         let descriptor_support = descriptor
             .filter(|_| effective_identity.exact_descriptor)
             .map(|value| value.safe_multi_session.support);
@@ -8875,7 +9668,7 @@ impl AcpRuntimeClient {
             .test_multi_session_identities
             .lock()
             .ok()
-            .and_then(|identities| identities.get(profile.agent_id.as_str()).cloned())
+            .and_then(|identities| identities.get(agent_id.as_str()).cloned())
             .map(|identity| (Some(CapabilitySupport::Supported), Some(identity)))
             .unwrap_or((descriptor_support, expected_identity));
 
@@ -9004,23 +9797,22 @@ impl AcpRuntimeClient {
     fn process_log_context(
         &self,
         process_instance_id: &AcpProcessInstanceId,
-        provider_profile_id: &ProviderProfileId,
+        auth_source: &RuntimeAuthSource,
+        agent_id: &AgentId,
         config: &AcpProviderConfig,
         process_spawn_fingerprint: Option<&str>,
     ) -> VibexResult<RuntimeLogContext> {
         let mut context = RuntimeLogContext::new("acp_process")
             .with_process_instance_id(process_instance_id.as_str())
-            .with_provider_profile_id(provider_profile_id);
+            .with_auth_source(auth_source)
+            .with_agent_id(agent_id);
         if let Some(fingerprint) = process_spawn_fingerprint {
             context = context.with_process_spawn_fingerprint(fingerprint);
         }
-        if let Ok(Some(profile)) = self.config_service.get_profile(provider_profile_id) {
-            context = context.with_agent_id(&profile.agent_id);
-            let identity = self.effective_adapter_identity(&profile.agent_id, config)?;
-            context = context
-                .with_adapter_id(&identity.adapter_id)
-                .with_adapter_version(&identity.adapter_version);
-        }
+        let identity = self.effective_adapter_identity(agent_id, config)?;
+        context = context
+            .with_adapter_id(&identity.adapter_id)
+            .with_adapter_version(&identity.adapter_version);
         Ok(context)
     }
 
@@ -9028,12 +9820,7 @@ impl AcpRuntimeClient {
         &self,
         launch: AcpProcessLaunch<'_>,
     ) -> VibexResult<ProcessLease<AcpProcess>> {
-        let (key, materialization) = self.process_launch_materialization(
-            launch.profile_id,
-            launch.config,
-            launch.cwd,
-            launch.runtime_resources,
-        )?;
+        let (key, materialization) = self.process_launch_materialization(&launch)?;
         let ProcessLaunchMaterialization {
             snapshot: spawn_config,
             env_overlays,
@@ -9081,7 +9868,8 @@ impl AcpRuntimeClient {
         let started = Instant::now();
         let log_context = self.process_log_context(
             &process_instance_id,
-            launch.profile_id,
+            launch.auth_source,
+            launch.agent_id,
             launch.config,
             process_spawn_fingerprint.as_deref(),
         )?;
@@ -9127,32 +9915,29 @@ impl AcpRuntimeClient {
         log_context: RuntimeLogContext,
     ) -> VibexResult<Arc<AcpProcess>> {
         let AcpProcessLaunch {
-            profile_id,
+            auth_source,
+            auth_source_revision,
             agent_id,
             config,
             cwd,
             runtime_resources,
+            env_unsets,
             purpose,
             process_strategy_effective,
             pool_fallback_reason,
         } = launch;
-        let agent_id = match agent_id {
-            Some(agent_id) => agent_id.clone(),
-            None => self
-                .config_service
-                .get_profile(profile_id)?
-                .map(|profile| profile.agent_id)
-                .unwrap_or_else(|| {
-                    vibex_core::AgentId::parse("unknown-agent")
-                        .expect("static fallback agent id is valid")
-                }),
-        };
+        let agent_id = agent_id.clone();
         let adapter_identity = self.effective_adapter_identity(&agent_id, config)?;
-        let model_id_projection = AcpModelIdProjection::new(
-            self.config_service
-                .legacy_agent_provider_model_id_projections(profile_id)?
-                .unwrap_or_default(),
-        )?;
+        let model_id_projection = match auth_source {
+            RuntimeAuthSource::ProviderProfile {
+                provider_profile_id,
+            } => AcpModelIdProjection::new(
+                self.config_service
+                    .legacy_agent_provider_model_id_projections(provider_profile_id)?
+                    .unwrap_or_default(),
+            )?,
+            RuntimeAuthSource::AgentAccount { .. } => AcpModelIdProjection::default(),
+        };
         let command_path = Path::new(&config.command);
         if command_path.is_absolute() && !command_path.is_file() {
             return Err(VibexError::process(
@@ -9167,12 +9952,15 @@ impl AcpRuntimeClient {
             Some(args) => args,
             None => {
                 let mut args = effective_acp_process_args(config, opencode_error_bridge_enabled);
-                if let Some(projection) = self
-                    .config_service
-                    .legacy_agent_provider_projection_runtime_plan(
-                        profile_id,
-                        &workspace_runtime_key(cwd),
-                    )?
+                if let RuntimeAuthSource::ProviderProfile {
+                    provider_profile_id,
+                } = auth_source
+                    && let Some(projection) = self
+                        .config_service
+                        .legacy_agent_provider_projection_runtime_plan(
+                            provider_profile_id,
+                            &workspace_runtime_key(cwd),
+                        )?
                 {
                     append_projection_process_args(
                         agent_id.as_str(),
@@ -9185,7 +9973,18 @@ impl AcpRuntimeClient {
         };
         let env_overlays = match materialized_env {
             Some(env) => env,
-            None => self.resolve_env_overlays(profile_id, config, cwd)?,
+            None => match auth_source {
+                RuntimeAuthSource::ProviderProfile {
+                    provider_profile_id,
+                } => self.resolve_env_overlays(provider_profile_id, config, cwd)?,
+                RuntimeAuthSource::AgentAccount { .. } => {
+                    let env_unsets = env_unsets.iter().collect::<BTreeSet<_>>();
+                    agent_probe_env_overlays(config)
+                        .into_iter()
+                        .filter(|(key, _)| !env_unsets.contains(key))
+                        .collect()
+                }
+            },
         };
         let mut command = Command::new(&config.command);
         command
@@ -9197,6 +9996,9 @@ impl AcpRuntimeClient {
         sanitize_inherited_appimage_environment(command.as_std_mut());
         detach_from_controlling_terminal(command.as_std_mut());
         for key in PARENT_SESSION_ENV_KEYS {
+            command.env_remove(key);
+        }
+        for key in env_unsets {
             command.env_remove(key);
         }
         for (key, value) in env_overlays {
@@ -9257,7 +10059,9 @@ impl AcpRuntimeClient {
                     .exit_reporter(process_instance_id.clone())
             }),
             process_instance_id,
-            provider_profile_id: profile_id.clone(),
+            agent_id,
+            auth_source: auth_source.clone(),
+            auth_source_revision,
             adapter_version: adapter_identity.adapter_version,
             compatibility_identity: adapter_identity.compatibility_identity,
             event_enricher: adapter_identity.event_enricher,
@@ -9431,10 +10235,7 @@ impl AcpRuntimeClient {
                 },
             );
         }
-        if let Ok(Some(profile)) = self
-            .config_service
-            .get_profile(&process.provider_profile_id)
-            && let Some(descriptor) = self.compatibility_registry.for_agent(&profile.agent_id)
+        if let Some(descriptor) = self.compatibility_registry.for_agent(&process.agent_id)
             && descriptor.expected_compatibility_identity().to_string()
                 == process.compatibility_identity
         {
@@ -9519,7 +10320,7 @@ impl AcpRuntimeClient {
         let mut state = AcpAttachmentShared::default();
         apply_session_state_to_attachment(
             &mut state,
-            &process.provider_profile_id,
+            process.auth_source.provider_profile_id(),
             &native_session_id,
             &result,
         );
@@ -9571,7 +10372,7 @@ impl AcpRuntimeClient {
         let mut state = AcpAttachmentShared::default();
         apply_session_state_to_attachment(
             &mut state,
-            &process.provider_profile_id,
+            process.auth_source.provider_profile_id(),
             native_session_id,
             &result,
         );
@@ -9623,7 +10424,7 @@ impl AcpRuntimeClient {
         let mut state = AcpAttachmentShared::default();
         apply_session_state_to_attachment(
             &mut state,
-            &process.provider_profile_id,
+            process.auth_source.provider_profile_id(),
             native_session_id,
             &result,
         );
@@ -9677,16 +10478,13 @@ impl AcpRuntimeClient {
         }
     }
 
-    fn restore_policy_for_profile(
+    fn restore_policy_for_agent(
         &self,
-        profile_id: &ProviderProfileId,
+        agent_id: &AgentId,
         compatibility_identity: &str,
     ) -> RestorePolicy {
-        self.config_service
-            .get_profile(profile_id)
-            .ok()
-            .flatten()
-            .and_then(|profile| self.compatibility_registry.for_agent(&profile.agent_id))
+        self.compatibility_registry
+            .for_agent(agent_id)
             .filter(|descriptor| {
                 descriptor.expected_compatibility_identity().to_string() == compatibility_identity
             })
@@ -9698,26 +10496,40 @@ impl AcpRuntimeClient {
         &self,
         binding: &ProviderBinding,
         cwd: &Path,
-        adapter_compatibility_identity: &str,
+        process: &AcpProcess,
     ) -> VibexResult<Option<AgentSessionRestoreCompatibilityKey>> {
         let Some(native_session_id) = binding.native.native_session_id.clone() else {
             return Ok(None);
         };
-        let profile = self
-            .config_service
-            .get_profile(&binding.provider_profile_id)?
-            .ok_or_else(|| {
-                VibexError::validation(
-                    "provider_profile_not_found",
-                    "Provider Profile was not found for restore compatibility",
-                )
-            })?;
-        let state_home = stable_native_state_home_id(&binding.provider_profile_id, cwd)?;
+        let auth_source_revision = match &binding.auth_source {
+            RuntimeAuthSource::ProviderProfile { .. } if binding.auth_source_revision == 0 => {
+                process.auth_source_revision
+            }
+            _ => binding.auth_source_revision,
+        };
+        if binding.auth_source != process.auth_source
+            || auth_source_revision != process.auth_source_revision
+        {
+            return Err(VibexError::conflict(
+                "restore_auth_source_mismatch",
+                "ACP binding and process authentication sources do not match",
+            ));
+        }
+        let state_home = match &binding.auth_source {
+            RuntimeAuthSource::ProviderProfile {
+                provider_profile_id,
+            } => stable_native_state_home_id(provider_profile_id, cwd)?,
+            RuntimeAuthSource::AgentAccount { .. } => {
+                stable_agent_default_state_home_id(&binding.auth_source, &process.agent_id)?
+            }
+        };
         AgentSessionRestoreCompatibilityKey::new(
-            profile.agent_id,
+            process.agent_id.clone(),
+            binding.auth_source.clone(),
+            auth_source_revision,
             native_session_id,
             state_home,
-            adapter_compatibility_identity.to_string(),
+            process.compatibility_identity.clone(),
             None,
             "acp-session-resume-v1",
             cwd.to_string_lossy().to_string(),
@@ -9753,9 +10565,7 @@ impl AcpRuntimeClient {
         cwd: &Path,
         identity: &LegacyAttachmentIdentity,
     ) -> VibexResult<OpenedAcpSession> {
-        let Some(target_key) =
-            self.restore_key_for_binding(binding, cwd, &process.compatibility_identity)?
-        else {
+        let Some(target_key) = self.restore_key_for_binding(binding, cwd, process)? else {
             self.record_restore_result(
                 &binding.session_id,
                 vibex_core::AgentSessionRestoreResult {
@@ -9805,10 +10615,8 @@ impl AcpRuntimeClient {
                 AgentSessionRestoreOutcome::Unsupported,
             ));
         }
-        let policy = self.restore_policy_for_profile(
-            &binding.provider_profile_id,
-            &process.compatibility_identity,
-        );
+        let policy =
+            self.restore_policy_for_agent(&process.agent_id, &process.compatibility_identity);
         let mut last_outcome = AgentSessionRestoreOutcome::Unsupported;
         let mut attempts = Vec::new();
         for method in restore_methods(policy) {
@@ -10494,7 +11302,7 @@ impl AcpRuntimeClient {
                 // only after the revision/fence check, so a late response
                 // cannot overwrite a replacement generation's view.
                 let process = current.process();
-                let process_profile_id = process.provider_profile_id.clone();
+                let process_profile_id = process.auth_source.provider_profile_id().cloned();
                 let model_ids = extract_model_ids(response)
                     .into_iter()
                     .map(|model| process.product_model_id(&model))
@@ -10504,7 +11312,7 @@ impl AcpRuntimeClient {
                 let current_mode_id = extract_current_mode_id(response);
                 let mut discovery = extract_provider_session_config_state(
                     response,
-                    &process_profile_id,
+                    process_profile_id.as_ref(),
                     Some(&current.native_session_id),
                 );
                 if let Some(discovery) = discovery.as_mut() {
@@ -10707,6 +11515,118 @@ impl AcpRuntimeClient {
             .await
     }
 
+    fn binding_launch_context(
+        &self,
+        binding: &ProviderBinding,
+        workspace_root: &str,
+    ) -> VibexResult<BindingLaunchContext> {
+        let (agent_id, auth_source_revision, config, env_unsets) = match &binding.auth_source {
+            RuntimeAuthSource::ProviderProfile {
+                provider_profile_id,
+            } => {
+                let profile = self
+                    .config_service
+                    .get_profile(provider_profile_id)?
+                    .ok_or_else(|| {
+                        VibexError::validation(
+                            "provider_profile_not_found",
+                            "Provider Profile was not found for ACP session launch",
+                        )
+                    })?;
+                if profile.kind != ProviderKind::Acp
+                    || profile.status != ProviderProfileStatus::Enabled
+                {
+                    return Err(VibexError::validation(
+                        "provider_profile_route_unavailable",
+                        "Provider Profile is not enabled for ACP session launch",
+                    ));
+                }
+                if binding.auth_source_revision != 0
+                    && binding.auth_source_revision != profile.updated_at_ms
+                {
+                    return Err(VibexError::conflict(
+                        "runtime_auth_source_changed",
+                        "Provider Profile changed after the session binding was captured",
+                    ));
+                }
+                let config = self
+                    .config_service
+                    .get_acp_profile_config(profile.id.clone())?;
+                (profile.agent_id, profile.updated_at_ms, config, Vec::new())
+            }
+            RuntimeAuthSource::AgentAccount { auth_context_id } => {
+                let conn = open_database(self.config_service.database_path())?;
+                let context = AgentAuthContextRepository::get_by_id(&conn, auth_context_id)?
+                    .ok_or_else(|| {
+                        VibexError::validation(
+                            "agent_auth_context_not_found",
+                            "Agent authentication context was not found for ACP session launch",
+                        )
+                    })?;
+                if context.status != AgentAuthContextStatus::Authenticated {
+                    return Err(VibexError::provider(
+                        "agent_authentication_required",
+                        "Agent account must be authenticated before the session can run",
+                    ));
+                }
+                if AgentAuthenticationOperationRepository::get_active_for_context(
+                    &conn,
+                    auth_context_id,
+                )?
+                .is_some()
+                {
+                    return Err(VibexError::conflict(
+                        "agent_authentication_operation_in_progress",
+                        "Agent account authentication must finish before launching a session",
+                    ));
+                }
+                if binding.auth_source_revision != context.revision {
+                    return Err(VibexError::conflict(
+                        "runtime_auth_source_changed",
+                        "Agent account changed after the session binding was captured",
+                    ));
+                }
+                let descriptor = self
+                    .compatibility_registry
+                    .for_agent(&context.agent_id)
+                    .ok_or_else(|| {
+                        VibexError::capability(
+                            "agent_default_state_home_unsupported",
+                            "Agent does not declare a supported default account state home",
+                        )
+                    })?;
+                if !descriptor.auth_context.supports_default_state_home {
+                    return Err(VibexError::capability(
+                        "agent_default_state_home_unsupported",
+                        "Agent does not support its default account as a runtime source",
+                    ));
+                }
+                let config = self
+                    .config_service
+                    .get_agent_acp_runtime_config(&context.agent_id)?;
+                (
+                    context.agent_id,
+                    context.revision,
+                    config,
+                    descriptor.auth_context.credential_env_keys_to_unset.clone(),
+                )
+            }
+        };
+        let cwd = Self::resolve_workspace_cwd(&config, workspace_root)?;
+        let (process_strategy_effective, pool_fallback_reason) =
+            self.pool_decision_for_agent(&agent_id, &config)?;
+        Ok(BindingLaunchContext {
+            agent_id,
+            auth_source: binding.auth_source.clone(),
+            auth_source_revision,
+            config,
+            cwd,
+            env_unsets,
+            process_strategy_effective,
+            pool_fallback_reason,
+        })
+    }
+
     /// Ensures a session attachment exists and is the only owner of all
     /// session-scoped ACP state. Process acquisition remains independent from
     /// this session operation lock.
@@ -10718,6 +11638,7 @@ impl AcpRuntimeClient {
     ) -> VibexResult<AcpAttachmentHandle> {
         let operation_lock = self.session_operation_lock(&binding.session_id)?;
         let _operation_guard = operation_lock.lock().await;
+        let launch_context = self.binding_launch_context(binding, workspace_root)?;
 
         if let Some(current) = self.current_attachment(&binding.session_id) {
             let process = current.payload().process();
@@ -10729,7 +11650,10 @@ impl AcpRuntimeClient {
                     .is_none_or(|native_session_id| {
                         current.payload().native_session_id == native_session_id
                     });
-            if process.provider_profile_id == binding.provider_profile_id && native_matches {
+            if process.auth_source == launch_context.auth_source
+                && process.auth_source_revision == launch_context.auth_source_revision
+                && native_matches
+            {
                 self.apply_requested_model_to_attachment(
                     &current,
                     selected_model_from_binding(binding).as_deref(),
@@ -10741,22 +11665,23 @@ impl AcpRuntimeClient {
         }
         self.detach_stale_attachment(&binding.session_id).await;
 
-        let identity =
-            self.attachment_identity_candidate(&binding.session_id, &binding.provider_profile_id)?;
-        let config = self.profile_config(&binding.provider_profile_id)?;
-        let cwd = Self::resolve_workspace_cwd(&config, workspace_root)?;
-        let (effective_strategy, fallback_reason) =
-            self.pool_decision(&binding.provider_profile_id, &config)?;
+        let identity = self.attachment_identity_candidate(
+            &binding.session_id,
+            &launch_context.auth_source,
+            launch_context.auth_source_revision,
+        )?;
         let lease = self
             .acquire_initialized_process(AcpProcessLaunch {
-                profile_id: &binding.provider_profile_id,
-                agent_id: None,
-                config: &config,
-                cwd: &cwd,
+                auth_source: &launch_context.auth_source,
+                auth_source_revision: launch_context.auth_source_revision,
+                agent_id: &launch_context.agent_id,
+                config: &launch_context.config,
+                cwd: &launch_context.cwd,
                 runtime_resources,
+                env_unsets: &launch_context.env_unsets,
                 purpose: AcpProcessPurpose::Session,
-                process_strategy_effective: effective_strategy,
-                pool_fallback_reason: fallback_reason,
+                process_strategy_effective: launch_context.process_strategy_effective,
+                pool_fallback_reason: launch_context.pool_fallback_reason.clone(),
             })
             .await?;
         let selected_model = selected_model_from_binding(binding);
@@ -10764,7 +11689,7 @@ impl AcpRuntimeClient {
         let attachment = if stored_native.is_some() {
             let restore_identity = identity.clone();
             let restore_identity_for_closure = identity.clone();
-            let restore_cwd = cwd.clone();
+            let restore_cwd = launch_context.cwd.clone();
             let restore = self
                 .acquire_attachment(
                     binding.session_id.clone(),
@@ -10793,18 +11718,21 @@ impl AcpRuntimeClient {
                     // it must never reuse the old native-id acquire key.
                     let fresh_identity = self.fresh_attachment_identity(
                         &binding.session_id,
-                        &binding.provider_profile_id,
+                        &launch_context.auth_source,
+                        launch_context.auth_source_revision,
                         &identity,
                     )?;
                     let fresh_lease = self
                         .acquire_initialized_process(AcpProcessLaunch {
-                            profile_id: &binding.provider_profile_id,
-                            agent_id: None,
-                            config: &config,
-                            cwd: &cwd,
+                            auth_source: &launch_context.auth_source,
+                            auth_source_revision: launch_context.auth_source_revision,
+                            agent_id: &launch_context.agent_id,
+                            config: &launch_context.config,
+                            cwd: &launch_context.cwd,
                             runtime_resources,
+                            env_unsets: &launch_context.env_unsets,
                             purpose: AcpProcessPurpose::Session,
-                            process_strategy_effective: effective_strategy,
+                            process_strategy_effective: launch_context.process_strategy_effective,
                             pool_fallback_reason: None,
                         })
                         .await?;
@@ -10852,20 +11780,39 @@ impl AcpRuntimeClient {
         let payload = attachment.payload();
         let process = payload.process();
         let config = payload.runtime_config_state();
-        let profile = self
-            .config_service
-            .get_profile(&process.provider_profile_id)?;
+        let source_available = match &process.auth_source {
+            RuntimeAuthSource::ProviderProfile {
+                provider_profile_id,
+            } => self
+                .config_service
+                .get_profile(provider_profile_id)?
+                .is_some_and(|profile| {
+                    profile.kind == ProviderKind::Acp
+                        && profile.status == ProviderProfileStatus::Enabled
+                        && profile.agent_id == required_runtime.agent_id
+                }),
+            RuntimeAuthSource::AgentAccount { auth_context_id } => {
+                let conn = open_database(self.config_service.database_path())?;
+                AgentAuthContextRepository::get_by_id(&conn, auth_context_id)?.is_some_and(
+                    |context| {
+                        context.agent_id == required_runtime.agent_id
+                            && context.status == AgentAuthContextStatus::Authenticated
+                            && context.revision == process.auth_source_revision
+                    },
+                )
+            }
+        };
         let matches = attachment.state()? == SessionAttachmentState::Committed
             && execution_identity.binding_id == *attachment.binding_id()
             && execution_identity.activation_generation
                 == attachment.fence().activation_generation as i64
-            && execution_identity.model_id == required_runtime.model_id
-            && process.provider_profile_id == required_runtime.provider_profile_id
-            && profile.as_ref().is_some_and(|profile| {
-                profile.kind == ProviderKind::Acp
-                    && profile.status == ProviderProfileStatus::Enabled
-                    && profile.agent_id == required_runtime.agent_id
-            })
+            && required_runtime
+                .model_id()
+                .is_none_or(|model_id| execution_identity.model_id.as_deref() == Some(model_id))
+            && execution_identity.model_id == config.effective_model
+            && process.agent_id == required_runtime.agent_id
+            && process.auth_source == required_runtime.auth_source
+            && source_available
             && required_runtime.matches_effective_config(&config)
             && config.is_applied_to_generation(execution_identity.activation_generation);
         if !matches {
@@ -10987,7 +11934,7 @@ pub(crate) fn validate_restore_response(
 
 fn apply_session_state_to_attachment(
     state: &mut AcpAttachmentShared,
-    provider_profile_id: &ProviderProfileId,
+    provider_profile_id: Option<&ProviderProfileId>,
     native_session_id: &str,
     response: &Value,
 ) {
@@ -11025,11 +11972,8 @@ impl AcpRuntimeClient {
         discovery: &ProviderSessionConfigState,
     ) -> SessionConfigPlanner {
         let aliases = self
-            .config_service
-            .get_profile(&process.provider_profile_id)
-            .ok()
-            .flatten()
-            .and_then(|profile| self.compatibility_registry.for_agent(&profile.agent_id))
+            .compatibility_registry
+            .for_agent(&process.agent_id)
             .and_then(|descriptor| {
                 descriptor.config_option_aliases_for_runtime(
                     &process.adapter_version,
@@ -11087,11 +12031,8 @@ impl AcpRuntimeClient {
                 planner.with_operation_fallback(AcpOperation::SessionSetConfigOption, fallback);
         }
         if let Some(descriptor) = self
-            .config_service
-            .get_profile(&process.provider_profile_id)
-            .ok()
-            .flatten()
-            .and_then(|profile| self.compatibility_registry.for_agent(&profile.agent_id))
+            .compatibility_registry
+            .for_agent(&process.agent_id)
             .filter(|descriptor| {
                 descriptor.expected_compatibility_identity().to_string()
                     == process.compatibility_identity
@@ -11138,7 +12079,7 @@ impl AcpRuntimeClient {
         // evidence for a generic config operation.
         let discovery = discovery.unwrap_or_else(|| ProviderSessionConfigState {
             provider_kind: ProviderKind::Acp,
-            provider_profile_id: Some(process.provider_profile_id.clone()),
+            provider_profile_id: process.auth_source.provider_profile_id().cloned(),
             native_session_id: None,
             current_model: current_model
                 .clone()
@@ -12301,6 +13242,29 @@ fn stable_native_state_home_id(
     NativeStateHomeId::parse(format!("statehome_{}", &digest[..32]))
 }
 
+fn stable_agent_default_state_home_id(
+    auth_source: &RuntimeAuthSource,
+    agent_id: &AgentId,
+) -> VibexResult<NativeStateHomeId> {
+    if !matches!(auth_source, RuntimeAuthSource::AgentAccount { .. }) {
+        return Err(VibexError::validation(
+            "agent_default_state_home_source_invalid",
+            "Agent default state home identity requires an Agent account source",
+        ));
+    }
+    let mut hasher = Sha256::new();
+    hash_component(
+        &mut hasher,
+        b"vibex/acp/agent-default-state-home-resolution/v1",
+    );
+    hash_component(&mut hasher, agent_id.as_str().as_bytes());
+    hash_component(&mut hasher, b"agent_account");
+    hash_component(&mut hasher, auth_source.id().as_bytes());
+    hash_component(&mut hasher, b"system-default-state-home");
+    let digest = hex_digest(hasher.finalize().as_slice());
+    NativeStateHomeId::parse(format!("statehome_{}", &digest[..32]))
+}
+
 fn process_model_provider_id(profile: &ProviderProfile) -> Option<String> {
     opencode_model_provider_id(profile).or_else(|| {
         provider_option_value(
@@ -12723,6 +13687,7 @@ struct AgentAuthProcess {
 struct ActiveAgentAuthentication {
     agent_id: AgentId,
     process: Option<Arc<AcpProcess>>,
+    terminal_id: Option<TerminalId>,
     cancel_requested: bool,
 }
 
@@ -12739,60 +13704,95 @@ async fn launch_agent_auth_process(
     provider_profile_id: Option<&ProviderProfileId>,
     operation_id: Option<&AgentAuthenticationOperationId>,
 ) -> VibexResult<AgentAuthProcess> {
-    let (profile_id, config, cwd, env_overlays) = if let Some(profile_id) = provider_profile_id {
-        let profile = client
-            .config_service
-            .get_profile(profile_id)?
-            .ok_or_else(|| {
-                VibexError::validation(
-                    "provider_profile_not_found",
-                    "Provider Profile was not found for Agent authentication",
+    let (profile_id, auth_source, auth_source_revision, config, cwd, env_unsets) =
+        if let Some(profile_id) = provider_profile_id {
+            let profile = client
+                .config_service
+                .get_profile(profile_id)?
+                .ok_or_else(|| {
+                    VibexError::validation(
+                        "provider_profile_not_found",
+                        "Provider Profile was not found for Agent authentication",
+                    )
+                    .with_diagnostic("providerProfileId", profile_id.as_str())
+                })?;
+            if profile.agent_id != *agent_id {
+                return Err(VibexError::validation(
+                    "agent_auth_profile_mismatch",
+                    "Provider Profile belongs to another Agent",
                 )
-                .with_diagnostic("providerProfileId", profile_id.as_str())
-            })?;
-        if profile.agent_id != *agent_id {
-            return Err(VibexError::validation(
-                "agent_auth_profile_mismatch",
-                "Provider Profile belongs to another Agent",
+                .with_diagnostic("agentId", agent_id.as_str())
+                .with_diagnostic("profileAgentId", profile.agent_id.as_str()));
+            }
+            let config = client.profile_config(profile_id)?;
+            let cwd = AcpRuntimeClient::resolve_probe_cwd(&config, None)?;
+            (
+                profile_id.clone(),
+                RuntimeAuthSource::provider_profile(profile_id.clone()),
+                profile.updated_at_ms,
+                config,
+                cwd,
+                Vec::new(),
             )
-            .with_diagnostic("agentId", agent_id.as_str())
-            .with_diagnostic("profileAgentId", profile.agent_id.as_str()));
-        }
-        let config = client.profile_config(profile_id)?;
-        let cwd = AcpRuntimeClient::resolve_probe_cwd(&config, None)?;
-        let env = client.resolve_env_overlays_for_profile(&profile, &config, &cwd)?;
-        (profile_id.clone(), config, cwd, env)
-    } else {
-        let config = client
-            .config_service
-            .get_agent_acp_runtime_config(agent_id)?;
-        let cwd = AcpRuntimeClient::resolve_probe_cwd(&config, None)?;
-        let env = agent_probe_env_overlays(&config);
-        (ProviderProfileId::new(), config, cwd, env)
+        } else {
+            let descriptor = client
+                .compatibility_registry
+                .for_agent(agent_id)
+                .ok_or_else(|| {
+                    VibexError::capability(
+                        "agent_default_state_home_unsupported",
+                        "Agent does not declare a supported default account state home",
+                    )
+                })?;
+            if !descriptor.auth_context.supports_default_state_home {
+                return Err(VibexError::capability(
+                    "agent_default_state_home_unsupported",
+                    "Agent does not support authentication in its default state home",
+                ));
+            }
+            let conn = open_database(client.config_service.database_path())?;
+            let context = AgentAuthContextRepository::ensure_default(&conn, agent_id)?;
+            let config = client
+                .config_service
+                .get_agent_acp_runtime_config(agent_id)?;
+            let cwd = AcpRuntimeClient::resolve_probe_cwd(&config, None)?;
+            (
+                ProviderProfileId::new(),
+                RuntimeAuthSource::agent_account(context.id),
+                context.revision,
+                config,
+                cwd,
+                descriptor.auth_context.credential_env_keys_to_unset.clone(),
+            )
+        };
+    let resources = ProviderRuntimeResources::default();
+    let launch = AcpProcessLaunch {
+        auth_source: &auth_source,
+        auth_source_revision,
+        agent_id,
+        config: &config,
+        cwd: &cwd,
+        runtime_resources: &resources,
+        env_unsets: &env_unsets,
+        purpose: AcpProcessPurpose::Authentication,
+        process_strategy_effective: AcpProcessStrategy::PerSession,
+        pool_fallback_reason: None,
     };
-    let effective_args =
-        effective_acp_process_args(&config, agent_id.as_str() == OPENCODE_AGENT_ID);
+    let (_, materialization) = client.process_launch_materialization(&launch)?;
+    let effective_args = materialization.snapshot.args.clone();
+    let process_spawn_fingerprint = materialization.snapshot.process_spawn_fingerprint();
+    let env_overlays = materialization.env_overlays;
     let configured_env_keys = env_overlays
         .iter()
         .map(|(key, _)| key.clone())
         .collect::<BTreeSet<_>>();
-    let resources = ProviderRuntimeResources::default();
     let process = client
         .spawn_process(
             AcpProcessInstanceId::new(),
-            AcpProcessLaunch {
-                profile_id: &profile_id,
-                agent_id: Some(agent_id),
-                config: &config,
-                cwd: &cwd,
-                runtime_resources: &resources,
-                purpose: AcpProcessPurpose::Authentication,
-                process_strategy_effective: AcpProcessStrategy::PerSession,
-                pool_fallback_reason: None,
-            },
+            launch,
             Some(effective_args.clone()),
             Some(env_overlays.clone()),
-            None,
+            Some(process_spawn_fingerprint),
         )
         .await?;
     if let Some(operation_id) = operation_id
@@ -12884,12 +13884,17 @@ async fn launch_agent_auth_process(
 
 async fn probe_runtime_session_config_with_config(
     client: &AcpRuntimeClient,
-    profile_id: &ProviderProfileId,
-    agent_id: Option<&AgentId>,
-    config: &AcpProviderConfig,
+    source: AcpAuthSourceLaunchContext<'_>,
     materialized_env: Option<Vec<(String, String)>>,
     target_model: Option<&str>,
 ) -> VibexResult<AcpRuntimeSessionProbe> {
+    let AcpAuthSourceLaunchContext {
+        auth_source,
+        auth_source_revision,
+        agent_id,
+        config,
+        env_unsets,
+    } = source;
     let probe_cwd = std::env::var("HOME")
         .map(PathBuf::from)
         .ok()
@@ -12900,11 +13905,13 @@ async fn probe_runtime_session_config_with_config(
         .spawn_process(
             AcpProcessInstanceId::new(),
             AcpProcessLaunch {
-                profile_id,
+                auth_source,
+                auth_source_revision,
                 agent_id,
                 config,
                 cwd: &probe_cwd,
                 runtime_resources: &probe_resources,
+                env_unsets,
                 purpose: AcpProcessPurpose::Probe,
                 process_strategy_effective: AcpProcessStrategy::PerSession,
                 pool_fallback_reason: None,
@@ -13153,6 +14160,20 @@ impl AcpClient for AcpRuntimeClient {
             result
         }
         .await;
+        if let Ok(authenticated) = &result
+            && let Some(terminal_id) = authenticated
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.terminal_id.clone())
+        {
+            if self.attach_agent_authentication_terminal(&operation_id, terminal_id.clone())? {
+                self.monitor_agent_authentication_terminal(operation_id, terminal_id);
+                return result;
+            }
+            if let Some(terminal_host) = self.terminal_host.as_ref() {
+                let _ = terminal_host.kill(&terminal_id).await;
+            }
+        }
         let cancelled = self.finish_agent_authentication(&operation_id)?;
         if cancelled {
             if let Ok(authenticated) = &result
@@ -13173,7 +14194,7 @@ impl AcpClient for AcpRuntimeClient {
         &self,
         request: AgentAuthenticationCancelRequest,
     ) -> VibexResult<bool> {
-        let process = {
+        let (process, terminal_id) = {
             let mut operations = self
                 .agent_authentication_operations
                 .lock()
@@ -13188,12 +14209,25 @@ impl AcpClient for AcpRuntimeClient {
                 ));
             }
             operation.cancel_requested = true;
-            operation.process.clone()
+            (operation.process.clone(), operation.terminal_id.clone())
         };
         if let Some(process) = process {
             process.shutdown().await;
         }
+        if let Some(terminal_id) = terminal_id {
+            if let Some(terminal_host) = self.terminal_host.as_ref() {
+                terminal_host.kill(&terminal_id).await?;
+            }
+            let _ = self.finish_agent_authentication(&request.operation_id)?;
+        }
         Ok(true)
+    }
+
+    async fn complete_agent_authentication(
+        &self,
+        request: AgentAuthenticationCompleteRequest,
+    ) -> VibexResult<bool> {
+        self.complete_agent_authentication_operation(&request)
     }
 
     async fn logout_agent(&self, request: AgentLogoutRequest) -> VibexResult<()> {
@@ -13230,19 +14264,35 @@ impl AcpClient for AcpRuntimeClient {
             self.detach_attachment(current.fence()).await;
         }
         self.detach_stale_attachment(&request.session_id).await;
-        let identity =
-            self.attachment_identity_candidate(&request.session_id, &request.provider_profile_id)?;
+        let profile = self
+            .config_service
+            .get_profile(&request.provider_profile_id)?
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "provider_profile_not_found",
+                    "Provider Profile was not found for ACP session creation",
+                )
+            })?;
+        let auth_source = RuntimeAuthSource::provider_profile(request.provider_profile_id.clone());
+        let identity = self.attachment_identity_candidate(
+            &request.session_id,
+            &auth_source,
+            profile.updated_at_ms,
+        )?;
         let config = self.profile_config(&request.provider_profile_id)?;
         let cwd = Self::resolve_workspace_cwd(&config, &request.workspace_root)?;
         let (effective_strategy, fallback_reason) =
             self.pool_decision(&request.provider_profile_id, &config)?;
+        let env_unsets = Vec::new();
         let lease = self
             .acquire_initialized_process(AcpProcessLaunch {
-                profile_id: &request.provider_profile_id,
-                agent_id: None,
+                auth_source: &auth_source,
+                auth_source_revision: profile.updated_at_ms,
+                agent_id: &profile.agent_id,
                 config: &config,
                 cwd: &cwd,
                 runtime_resources: &request.runtime_resources,
+                env_unsets: &env_unsets,
                 purpose: AcpProcessPurpose::Session,
                 process_strategy_effective: effective_strategy,
                 pool_fallback_reason: fallback_reason,
@@ -13280,7 +14330,10 @@ impl AcpClient for AcpRuntimeClient {
         // native session state, otherwise the stored binding is echoed and the
         // actual process is (re)spawned lazily on the next turn.
         if let Some(attachment) = self.current_attachment(&binding.session_id)
-            && attachment.payload().process().provider_profile_id == binding.provider_profile_id
+            && attachment.payload().process().auth_source == binding.auth_source
+            && (binding.auth_source_revision == 0
+                || attachment.payload().process().auth_source_revision
+                    == binding.auth_source_revision)
         {
             return Ok(attachment.payload().acp_session());
         }
@@ -13333,16 +14386,7 @@ impl AcpClient for AcpRuntimeClient {
                 &request.runtime_resources,
             )
             .await?;
-        let model_id = attachment
-            .payload()
-            .runtime_config_state()
-            .effective_model
-            .ok_or_else(|| {
-                VibexError::capability(
-                    "turn_execution_model_unavailable",
-                    "ACP attachment did not report an effective model for turn attribution",
-                )
-            })?;
+        let model_id = attachment.payload().runtime_config_state().effective_model;
         Ok(Some(ProviderTurnExecutionIdentity {
             binding_id: attachment.binding_id().clone(),
             activation_generation: attachment.fence().activation_generation as i64,
@@ -13355,18 +14399,31 @@ impl AcpClient for AcpRuntimeClient {
         provider_profile_id: &ProviderProfileId,
         workspace_root: Option<&str>,
     ) -> VibexResult<Vec<ExternalSessionImportCandidate>> {
+        let profile = self
+            .config_service
+            .get_profile(provider_profile_id)?
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "provider_profile_not_found",
+                    "Provider Profile was not found for ACP session listing",
+                )
+            })?;
         let config = self.profile_config(provider_profile_id)?;
         let cwd = Self::resolve_probe_cwd(&config, workspace_root)?;
         let probe_resources = ProviderRuntimeResources::default();
+        let auth_source = RuntimeAuthSource::provider_profile(provider_profile_id.clone());
+        let env_unsets = Vec::new();
         let process = self
             .spawn_process(
                 AcpProcessInstanceId::new(),
                 AcpProcessLaunch {
-                    profile_id: provider_profile_id,
-                    agent_id: None,
+                    auth_source: &auth_source,
+                    auth_source_revision: profile.updated_at_ms,
+                    agent_id: &profile.agent_id,
                     config: &config,
                     cwd: &cwd,
                     runtime_resources: &probe_resources,
+                    env_unsets: &env_unsets,
                     purpose: AcpProcessPurpose::Probe,
                     process_strategy_effective: AcpProcessStrategy::PerSession,
                     pool_fallback_reason: None,
@@ -13428,17 +14485,33 @@ impl AcpClient for AcpRuntimeClient {
             self.detach_attachment(current.fence()).await;
         }
         self.detach_stale_attachment(&request.session_id).await;
-        let identity =
-            self.attachment_identity_candidate(&request.session_id, &request.provider_profile_id)?;
+        let profile = self
+            .config_service
+            .get_profile(&request.provider_profile_id)?
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "provider_profile_not_found",
+                    "Provider Profile was not found for ACP session import",
+                )
+            })?;
+        let auth_source = RuntimeAuthSource::provider_profile(request.provider_profile_id.clone());
+        let identity = self.attachment_identity_candidate(
+            &request.session_id,
+            &auth_source,
+            profile.updated_at_ms,
+        )?;
         let config = self.profile_config(&request.provider_profile_id)?;
         let cwd = Self::resolve_workspace_cwd(&config, &request.workspace_root)?;
+        let env_unsets = Vec::new();
         let lease = self
             .acquire_initialized_process(AcpProcessLaunch {
-                profile_id: &request.provider_profile_id,
-                agent_id: None,
+                auth_source: &auth_source,
+                auth_source_revision: profile.updated_at_ms,
+                agent_id: &profile.agent_id,
                 config: &config,
                 cwd: &cwd,
                 runtime_resources: &request.runtime_resources,
+                env_unsets: &env_unsets,
                 purpose: AcpProcessPurpose::Session,
                 process_strategy_effective: AcpProcessStrategy::PerSession,
                 pool_fallback_reason: Some("acp_import_uses_dedicated_process".to_string()),
@@ -13502,8 +14575,7 @@ impl AcpClient for AcpRuntimeClient {
             || execution_identity.binding_id != *attachment.binding_id()
             || execution_identity.activation_generation
                 != attachment.fence().activation_generation as i64
-            || runtime_state.effective_model.as_deref()
-                != Some(execution_identity.model_id.as_str())
+            || runtime_state.effective_model.as_deref() != execution_identity.model_id.as_deref()
         {
             return Err(VibexError::conflict(
                 "turn_execution_identity_mismatch",
@@ -13746,7 +14818,9 @@ impl AcpClient for AcpRuntimeClient {
         let binding_matches = request.execution_identity.binding_id == *attachment.binding_id()
             && request.execution_identity.activation_generation
                 == attachment.fence().activation_generation as i64
-            && request.binding.provider_profile_id == process.provider_profile_id
+            && request.binding.auth_source == process.auth_source
+            && (request.binding.auth_source_revision == 0
+                || request.binding.auth_source_revision == process.auth_source_revision)
             && request.binding.native.native_session_id.as_deref()
                 == Some(attachment.fence().native_session_id.as_str());
         if !binding_matches {
@@ -13815,11 +14889,25 @@ impl AcpClient for AcpRuntimeClient {
         provider_profile_id: &ProviderProfileId,
     ) -> VibexResult<AcpRuntimeSessionProbe> {
         let config = self.profile_config(provider_profile_id)?;
+        let profile = self
+            .config_service
+            .get_profile(provider_profile_id)?
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "provider_profile_not_found",
+                    "Provider Profile was not found for runtime session probing",
+                )
+            })?;
+        let auth_source = RuntimeAuthSource::provider_profile(provider_profile_id.clone());
         probe_runtime_session_config_with_config(
             self,
-            provider_profile_id,
-            None,
-            &config,
+            AcpAuthSourceLaunchContext {
+                auth_source: &auth_source,
+                auth_source_revision: profile.updated_at_ms,
+                agent_id: &profile.agent_id,
+                config: &config,
+                env_unsets: &[],
+            },
             None,
             None,
         )
@@ -13833,11 +14921,25 @@ impl AcpClient for AcpRuntimeClient {
     ) -> VibexResult<AcpRuntimeSessionProbe> {
         let mut config = self.profile_config(provider_profile_id)?;
         config.models = vec![model_id.to_string()];
+        let profile = self
+            .config_service
+            .get_profile(provider_profile_id)?
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "provider_profile_not_found",
+                    "Provider Profile was not found for model-sensitive probing",
+                )
+            })?;
+        let auth_source = RuntimeAuthSource::provider_profile(provider_profile_id.clone());
         probe_runtime_session_config_with_config(
             self,
-            provider_profile_id,
-            None,
-            &config,
+            AcpAuthSourceLaunchContext {
+                auth_source: &auth_source,
+                auth_source_revision: profile.updated_at_ms,
+                agent_id: &profile.agent_id,
+                config: &config,
+                env_unsets: &[],
+            },
             None,
             Some(model_id),
         )
@@ -13849,25 +14951,43 @@ impl AcpClient for AcpRuntimeClient {
         agent_id: &AgentId,
     ) -> VibexResult<AcpRuntimeSessionProbe> {
         let config = self.config_service.get_agent_acp_runtime_config(agent_id)?;
-        // A setup probe has no Provider Profile by design. The synthetic id is
-        // process bookkeeping only and is never persisted or used for config
-        // resolution; the explicit Agent identity selects the compatibility
-        // descriptor.
-        let probe_profile_id = ProviderProfileId::new();
-        let env_overlays = agent_probe_env_overlays(&config);
-        let mut probe = probe_runtime_session_config_with_config(
+        let descriptor = self
+            .compatibility_registry
+            .for_agent(agent_id)
+            .ok_or_else(|| {
+                VibexError::capability(
+                    "agent_default_state_home_unsupported",
+                    "Agent does not declare a supported default account state home",
+                )
+            })?;
+        if !descriptor.auth_context.supports_default_state_home {
+            return Err(VibexError::capability(
+                "agent_default_state_home_unsupported",
+                "Agent does not declare a supported default account state home",
+            ));
+        }
+        let conn = open_database(self.config_service.database_path())?;
+        let context = AgentAuthContextRepository::ensure_default(&conn, agent_id)?;
+        let env_unsets = descriptor.auth_context.credential_env_keys_to_unset.clone();
+        let env_unset_set = env_unsets.iter().collect::<BTreeSet<_>>();
+        let env_overlays = agent_probe_env_overlays(&config)
+            .into_iter()
+            .filter(|(key, _)| !env_unset_set.contains(key))
+            .collect();
+        let auth_source = RuntimeAuthSource::agent_account(context.id);
+        probe_runtime_session_config_with_config(
             self,
-            &probe_profile_id,
-            Some(agent_id),
-            &config,
+            AcpAuthSourceLaunchContext {
+                auth_source: &auth_source,
+                auth_source_revision: context.revision,
+                agent_id,
+                config: &config,
+                env_unsets: &env_unsets,
+            },
             Some(env_overlays),
             None,
         )
-        .await?;
-        // Model choices are owned by model Provider Profiles, not by this
-        // Agent-level capability snapshot.
-        probe.models.clear();
-        Ok(probe)
+        .await
     }
 
     async fn list_runtime_model_capabilities(
@@ -13884,83 +15004,16 @@ impl AcpClient for AcpRuntimeClient {
                 )
                 .with_diagnostic("providerProfileId", provider_profile_id.as_str())
             })?;
-        if profile.agent_id.as_str() != "codex" {
-            return Ok(Vec::new());
-        }
-
         let config = self.profile_config(provider_profile_id)?;
-        let probe_cwd = std::env::var("HOME")
-            .map(PathBuf::from)
-            .ok()
-            .filter(|path| path.is_dir())
-            .unwrap_or_else(std::env::temp_dir);
-        let probe_resources = ProviderRuntimeResources::default();
-        let mut process_args = config.args.clone();
-        process_args.extend(["cli".to_string(), "app-server".to_string()]);
-        let env_overlays = self.resolve_env_overlays_for_profile(&profile, &config, &probe_cwd)?;
-        let process = self
-            .spawn_process(
-                AcpProcessInstanceId::new(),
-                AcpProcessLaunch {
-                    profile_id: provider_profile_id,
-                    agent_id: None,
-                    config: &config,
-                    cwd: &probe_cwd,
-                    runtime_resources: &probe_resources,
-                    purpose: AcpProcessPurpose::Probe,
-                    process_strategy_effective: AcpProcessStrategy::PerSession,
-                    pool_fallback_reason: None,
-                },
-                Some(process_args),
-                Some(env_overlays),
-                None,
-            )
-            .await?;
-
-        let probe = async {
-            process
-                .request(
-                    "initialize",
-                    json!({
-                        "capabilities": null,
-                        "clientInfo": {
-                            "name": "vibex-model-probe",
-                            "title": "Vibex model probe",
-                            "version": env!("CARGO_PKG_VERSION")
-                        }
-                    }),
-                    ACP_PROBE_TIMEOUT,
-                )
-                .await?;
-
-            let mut cursor = None;
-            let mut capabilities = BTreeMap::new();
-            for _ in 0..16 {
-                let response = process
-                    .request(
-                        "model/list",
-                        json!({ "cursor": cursor, "limit": null }),
-                        ACP_PROBE_TIMEOUT,
-                    )
-                    .await?;
-                let (page, next_cursor) = parse_codex_model_capabilities_page(&response)?;
-                for capability in page {
-                    capabilities.insert(capability.model.clone(), capability);
-                }
-                let Some(next_cursor) = next_cursor else {
-                    return Ok(capabilities.into_values().collect::<Vec<_>>());
-                };
-                cursor = Some(next_cursor);
-            }
-            Err(VibexError::provider(
-                "codex_model_list_page_limit_exceeded",
-                "Codex model capability probe exceeded the page limit",
-            ))
-        }
-        .await;
-
-        process.shutdown().await;
-        probe
+        let auth_source = RuntimeAuthSource::provider_profile(provider_profile_id.clone());
+        self.list_runtime_model_capabilities_for_source(
+            &profile.agent_id,
+            &auth_source,
+            profile.updated_at_ms,
+            &config,
+            &[],
+        )
+        .await
     }
 
     async fn list_session_commands(
@@ -15051,7 +16104,7 @@ fn extract_current_mode_id(response: &Value) -> Option<String> {
 
 fn extract_provider_session_config_state(
     response: &Value,
-    provider_profile_id: &ProviderProfileId,
+    provider_profile_id: Option<&ProviderProfileId>,
     native_session_id: Option<&str>,
 ) -> Option<ProviderSessionConfigState> {
     let models = extract_config_values(model_candidates(response));
@@ -15073,7 +16126,7 @@ fn extract_provider_session_config_state(
 
     Some(ProviderSessionConfigState {
         provider_kind: ProviderKind::Acp,
-        provider_profile_id: Some(provider_profile_id.clone()),
+        provider_profile_id: provider_profile_id.cloned(),
         native_session_id: native_session_id
             .map(str::trim)
             .filter(|value| !value.is_empty() && !looks_sensitive(value))
@@ -15395,7 +16448,7 @@ fn normalize_session_list_candidates(
                 updated_at_ms: session_updated_at_ms(session),
                 session_config_state: extract_provider_session_config_state(
                     session,
-                    provider_profile_id,
+                    Some(provider_profile_id),
                     session
                         .get("sessionId")
                         .or_else(|| session.get("id"))
@@ -15493,6 +16546,7 @@ fn image_content_block(attachment: &ProviderTurnAttachment) -> Option<Value> {
 mod tests {
     use super::*;
     use vibex_agent::AgentProvider;
+    use vibex_core::{AgentAuthenticationOperation, AgentAuthenticationOperationState};
 
     fn test_acp_config(command: &str, args: Vec<String>) -> AcpProviderConfig {
         AcpProviderConfig {
@@ -15747,12 +16801,12 @@ mod tests {
     #[test]
     fn fenced_command_runtime_does_not_require_a_submission_identity() {
         let required_runtime = SessionRuntimeSelection {
-            agent_id: AgentId::parse(OPENCODE_AGENT_ID).unwrap(),
-            provider_profile_id: ProviderProfileId::new(),
-            model_id: "mock/model-1".to_string(),
-            reasoning_effort: None,
             mode_id: Some("build".to_string()),
-            config_values: Default::default(),
+            ..SessionRuntimeSelection::provider(
+                AgentId::parse(OPENCODE_AGENT_ID).unwrap(),
+                ProviderProfileId::new(),
+                "mock/model-1",
+            )
         };
 
         assert_eq!(
@@ -16048,6 +17102,65 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct InteractiveAuthTerminalHost {
+        created_ids: std::sync::Mutex<Vec<TerminalId>>,
+        killed: std::sync::Mutex<Vec<TerminalId>>,
+        released: std::sync::Mutex<Vec<TerminalId>>,
+        waited: std::sync::Mutex<Vec<TerminalId>>,
+        auth_requests: std::sync::Mutex<Vec<AcpTerminalAuthRequest>>,
+    }
+
+    #[async_trait]
+    impl AcpTerminalHost for InteractiveAuthTerminalHost {
+        async fn create(&self, _request: AcpTerminalCreateRequest) -> VibexResult<TerminalId> {
+            let terminal_id = TerminalId::new();
+            self.created_ids.lock().unwrap().push(terminal_id.clone());
+            Ok(terminal_id)
+        }
+
+        async fn kill(&self, terminal_id: &TerminalId) -> VibexResult<()> {
+            self.killed.lock().unwrap().push(terminal_id.clone());
+            Ok(())
+        }
+
+        async fn release(&self, terminal_id: &TerminalId) -> VibexResult<()> {
+            self.released.lock().unwrap().push(terminal_id.clone());
+            Ok(())
+        }
+
+        async fn output(
+            &self,
+            _terminal_id: &TerminalId,
+            _limit: usize,
+        ) -> VibexResult<AcpTerminalOutput> {
+            Ok(AcpTerminalOutput {
+                text: "waiting for login".to_string(),
+                truncated: false,
+            })
+        }
+
+        async fn wait_for_exit(
+            &self,
+            terminal_id: &TerminalId,
+        ) -> VibexResult<AcpTerminalExitStatus> {
+            self.waited.lock().unwrap().push(terminal_id.clone());
+            std::future::pending().await
+        }
+
+        fn terminal_auth_descriptor(
+            &self,
+            request: AcpTerminalAuthRequest,
+        ) -> VibexResult<TerminalAuthActionDescriptor> {
+            self.auth_requests.lock().unwrap().push(request.clone());
+            let terminal_id = TerminalId::new();
+            self.created_ids.lock().unwrap().push(terminal_id.clone());
+            let mut descriptor = redacted_terminal_auth_action_descriptor(request);
+            descriptor.terminal_id = Some(terminal_id);
+            Ok(descriptor)
+        }
+    }
+
     fn test_process(
         process_instance_id: AcpProcessInstanceId,
         exit_reporter: Option<ProcessExitReporter<AcpProcess>>,
@@ -16057,10 +17170,13 @@ mod tests {
         terminal_tools_enabled: bool,
         terminal_auth_enabled: bool,
     ) -> Arc<AcpProcess> {
+        let agent_id = AgentId::parse("opencode").unwrap();
         Arc::new(AcpProcess {
             process_instance_id,
             exit_reporter,
-            provider_profile_id: ProviderProfileId::new(),
+            agent_id,
+            auth_source: RuntimeAuthSource::provider_profile(ProviderProfileId::new()),
+            auth_source_revision: 0,
             adapter_version: "1.0.0".to_string(),
             compatibility_identity: "test-acp@1".to_string(),
             event_enricher: AgentEventEnricherKind::Passthrough,
@@ -16145,14 +17261,16 @@ mod tests {
             adapter_id: vibex_core::AcpAdapterId::parse("opencode-acp").unwrap(),
             adapter_version: "1.0.0".to_string(),
             adapter_binary_identity: "command:mock".to_string(),
-            provider_profile_id: profile_id,
-            profile_revision: 0,
+            auth_source: RuntimeAuthSource::provider_profile(profile_id),
+            auth_source_revision: 0,
+            process_config_revision: 0,
             command: "mock".to_string(),
             args: Vec::new(),
             cwd_policy: "{workspaceRoot}".to_string(),
             base_url: None,
             model_provider_id: None,
             non_secret_env: BTreeMap::new(),
+            env_unsets: BTreeSet::new(),
             secret_reference_versions: BTreeMap::new(),
             mcp_revision: None,
             skills_revision: None,
@@ -16171,7 +17289,8 @@ mod tests {
                 transport_kind: TransportKind::Acp,
                 adapter_id: snapshot.adapter_id.clone(),
             },
-            snapshot.provider_profile_id.clone(),
+            snapshot.auth_source.clone(),
+            snapshot.auth_source_revision,
             snapshot.process_spawn_fingerprint(),
             WorkspaceScope::new(workspace).unwrap(),
         )
@@ -16521,7 +17640,8 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
                 transport_kind: TransportKind::Acp,
                 adapter_id: vibex_core::AcpAdapterId::parse("opencode-acp").unwrap(),
             },
-            ProviderProfileId::new(),
+            RuntimeAuthSource::provider_profile(ProviderProfileId::new()),
+            1,
             "runtime-crash-test",
             WorkspaceScope::new(workspace.path()).unwrap(),
         )
@@ -16617,7 +17737,8 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
                 transport_kind: TransportKind::Acp,
                 adapter_id: vibex_core::AcpAdapterId::parse("opencode-acp").unwrap(),
             },
-            ProviderProfileId::new(),
+            RuntimeAuthSource::provider_profile(ProviderProfileId::new()),
+            1,
             "attachment-registration-race",
             WorkspaceScope::new(workspace.path()).unwrap(),
         )
@@ -16647,7 +17768,8 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
         let identity = LegacyAttachmentIdentity {
             binding_id: binding_id.clone(),
             activation_generation: 0,
-            provider_profile_id: ProviderProfileId::new(),
+            auth_source: RuntimeAuthSource::provider_profile(ProviderProfileId::new()),
+            auth_source_revision: 1,
             attached_process_id: None,
         };
         let process_registry = client.process_registry.clone();
@@ -17319,7 +18441,7 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
                     "currentModelId": "session/model"
                 }
             }),
-            &ProviderProfileId::new(),
+            Some(&ProviderProfileId::new()),
             Some("native-2"),
         )
         .unwrap();
@@ -17577,8 +18699,9 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
             ]
         });
 
-        let state = extract_provider_session_config_state(&response, &profile_id, Some("native-1"))
-            .expect("config state");
+        let state =
+            extract_provider_session_config_state(&response, Some(&profile_id), Some("native-1"))
+                .expect("config state");
 
         assert_eq!(state.provider_kind, ProviderKind::Acp);
         assert_eq!(state.provider_profile_id.as_ref(), Some(&profile_id));
@@ -17927,7 +19050,10 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
         );
         let binding = test_restore_binding(
             &session_id,
-            &process.provider_profile_id,
+            process
+                .auth_source
+                .provider_profile_id()
+                .expect("test process uses a Provider Profile"),
             &handle.fence().native_session_id,
         );
         let callback = AcpElicitationResolution {
@@ -17935,7 +19061,7 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
             execution_identity: ProviderTurnExecutionIdentity {
                 binding_id: handle.binding_id().clone(),
                 activation_generation: handle.fence().activation_generation as i64,
-                model_id: "test-model".to_string(),
+                model_id: Some("test-model".to_string()),
             },
             resolution: vibex_core::ElicitationResolution {
                 request_id: request_id.clone(),
@@ -18358,12 +19484,23 @@ model_config_updates = os.environ.get("VIBEX_MOCK_ACP_MODEL_CONFIG_UPDATES") == 
 prompt_mode = os.environ.get("VIBEX_MOCK_ACP_PROMPT_MODE", "success")
 restore_mode = os.environ.get("VIBEX_MOCK_ACP_RESTORE_MODE", "success")
 advertise_resume = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_RESUME") == "true"
-advertise_auth = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_AUTH") == "true"
-authenticate_hangs = os.environ.get("VIBEX_MOCK_ACP_AUTHENTICATE_HANG") == "true"
+advertise_auth = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_LOGIN") == "true"
+authenticate_hangs = os.environ.get("VIBEX_MOCK_ACP_LOGIN_HANG") == "true"
 initialize_mode = os.environ.get("VIBEX_MOCK_ACP_INITIALIZE_MODE", "success")
 session_new_delay = float(os.environ.get("VIBEX_MOCK_ACP_SESSION_NEW_DELAY", "0"))
 fail_first_session_new = os.environ.get("VIBEX_MOCK_ACP_FAIL_FIRST_SESSION_NEW") == "true"
 model_prefix = os.environ.get("VIBEX_MOCK_ACP_MODEL_PREFIX", "").strip("/")
+
+
+def control_value(name, fallback):
+    if not request_log_path:
+        return fallback
+    try:
+        with open(request_log_path + ".control.json", "r", encoding="utf-8") as handle:
+            value = json.load(handle).get(name)
+            return value if isinstance(value, str) else fallback
+    except (OSError, ValueError):
+        return fallback
 
 
 def runtime_model_id(model_id):
@@ -18689,6 +19826,7 @@ for line in sys.stdin:
             },
         })
     elif method == "session/resume":
+        restore_mode = control_value("restore_mode", restore_mode)
         session_id = msg.get("params", {}).get("sessionId", "mock-import-session")
         if restore_mode == "timeout":
             time.sleep(0.25)
@@ -18731,6 +19869,7 @@ for line in sys.stdin:
                 },
             })
     elif method == "session/load":
+        restore_mode = control_value("restore_mode", restore_mode)
         session_id = msg.get("params", {}).get("sessionId", "mock-import-session")
         if restore_mode == "timeout":
             time.sleep(0.25)
@@ -18814,6 +19953,7 @@ for line in sys.stdin:
             },
         })
     elif method == "session/prompt":
+        prompt_mode = control_value("prompt_mode", prompt_mode)
         session_id = msg["params"]["sessionId"]
         prompt = msg["params"]["prompt"]
         text = prompt[0].get("text", "") if prompt else ""
@@ -19299,38 +20439,23 @@ for line in sys.stdin:
         }
 
         fn set_prompt_mode(&self, mode: &str) {
-            let service = self.service();
-            let mut config = service
-                .get_acp_profile_config(self.profile_id.clone())
-                .unwrap();
-            config.env.push(vibex_core::AcpProviderEnvReference {
-                key: "VIBEX_MOCK_ACP_PROMPT_MODE".to_string(),
-                source: AcpProviderEnvSource::Literal,
-                value: Some(mode.to_string()),
-                secret_lookup_key: None,
-                redacted_hint: "mock prompt mode".to_string(),
-            });
-            service
-                .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
-                    provider_profile_id: self.profile_id.clone(),
-                    config,
-                })
-                .unwrap();
+            self.set_control_value("prompt_mode", mode);
         }
 
         fn set_restore_mode(&self, mode: &str, advertise_resume: bool) {
+            self.set_control_value("restore_mode", mode);
+            if !advertise_resume {
+                return;
+            }
             let service = self.service();
             let mut config = service
                 .get_acp_profile_config(self.profile_id.clone())
                 .unwrap();
-            config.env.push(vibex_core::AcpProviderEnvReference {
-                key: "VIBEX_MOCK_ACP_RESTORE_MODE".to_string(),
-                source: AcpProviderEnvSource::Literal,
-                value: Some(mode.to_string()),
-                secret_lookup_key: None,
-                redacted_hint: "mock restore mode".to_string(),
-            });
-            if advertise_resume {
+            if !config
+                .env
+                .iter()
+                .any(|entry| entry.key == "VIBEX_MOCK_ACP_ADVERTISE_RESUME")
+            {
                 config.env.push(vibex_core::AcpProviderEnvReference {
                     key: "VIBEX_MOCK_ACP_ADVERTISE_RESUME".to_string(),
                     source: AcpProviderEnvSource::Literal,
@@ -19347,13 +20472,25 @@ for line in sys.stdin:
                 .unwrap();
         }
 
+        fn set_control_value(&self, key: &str, value: &str) {
+            let path = PathBuf::from(format!("{}.control.json", self.request_log.display()));
+            let mut control = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| {
+                    serde_json::from_slice::<serde_json::Map<String, Value>>(&bytes).ok()
+                })
+                .unwrap_or_default();
+            control.insert(key.to_string(), Value::String(value.to_string()));
+            std::fs::write(path, serde_json::to_vec(&control).unwrap()).unwrap();
+        }
+
         fn enable_auth_methods(&self) {
             let service = self.service();
             let mut config = service
                 .get_acp_profile_config(self.profile_id.clone())
                 .unwrap();
             config.env.push(vibex_core::AcpProviderEnvReference {
-                key: "VIBEX_MOCK_ACP_ADVERTISE_AUTH".to_string(),
+                key: "VIBEX_MOCK_ACP_ADVERTISE_LOGIN".to_string(),
                 source: AcpProviderEnvSource::Literal,
                 value: Some("true".to_string()),
                 secret_lookup_key: None,
@@ -19374,9 +20511,9 @@ for line in sys.stdin:
                 .unwrap();
             config
                 .env
-                .retain(|entry| entry.key != "VIBEX_MOCK_ACP_AUTHENTICATE_HANG");
+                .retain(|entry| entry.key != "VIBEX_MOCK_ACP_LOGIN_HANG");
             config.env.push(vibex_core::AcpProviderEnvReference {
-                key: "VIBEX_MOCK_ACP_AUTHENTICATE_HANG".to_string(),
+                key: "VIBEX_MOCK_ACP_LOGIN_HANG".to_string(),
                 source: AcpProviderEnvSource::Literal,
                 value: Some(hang.to_string()),
                 secret_lookup_key: None,
@@ -19667,6 +20804,106 @@ for line in sys.stdin:
         fixture.cleanup();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn interactive_authentication_keeps_terminal_ownership_until_cancel_or_complete() {
+        let agent_id = AgentId::parse("codex").unwrap();
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "agent-auth-terminal-ownership",
+            Some(agent_id.clone()),
+        ) else {
+            return;
+        };
+        fixture.enable_auth_methods();
+        let terminal_host = Arc::new(InteractiveAuthTerminalHost::default());
+        let client = AcpRuntimeClient::with_terminal_host(fixture.service(), terminal_host.clone());
+
+        let first_operation_id = AgentAuthenticationOperationId::new();
+        let first = client
+            .authenticate_agent(AgentAuthenticateRequest {
+                operation_id: first_operation_id.clone(),
+                agent_id: agent_id.clone(),
+                provider_profile_id: Some(fixture.profile_id.clone()),
+                method_id: "terminal-login".to_string(),
+            })
+            .await
+            .unwrap();
+        let first_terminal_id = first
+            .terminal
+            .and_then(|terminal| terminal.terminal_id)
+            .expect("interactive authentication must return its shared terminal id");
+        assert!(
+            client
+                .agent_authentication_operations
+                .lock()
+                .unwrap()
+                .get(&first_operation_id)
+                .is_some_and(|operation| {
+                    operation.process.is_none()
+                        && operation.terminal_id.as_ref() == Some(&first_terminal_id)
+                })
+        );
+
+        assert!(
+            client
+                .cancel_agent_authentication(AgentAuthenticationCancelRequest {
+                    operation_id: first_operation_id,
+                    agent_id: agent_id.clone(),
+                })
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            terminal_host.killed.lock().unwrap().as_slice(),
+            std::slice::from_ref(&first_terminal_id)
+        );
+        assert!(
+            client
+                .agent_authentication_operations
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+
+        let restarted_operation_id = AgentAuthenticationOperationId::new();
+        let restarted = client
+            .authenticate_agent(AgentAuthenticateRequest {
+                operation_id: restarted_operation_id.clone(),
+                agent_id: agent_id.clone(),
+                provider_profile_id: Some(fixture.profile_id.clone()),
+                method_id: "terminal-login".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(restarted.terminal.is_some());
+        assert!(
+            client
+                .complete_agent_authentication(AgentAuthenticationCompleteRequest {
+                    operation_id: restarted_operation_id.clone(),
+                    agent_id: agent_id.clone(),
+                })
+                .await
+                .unwrap()
+        );
+        assert!(
+            client
+                .agent_authentication_operations
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !client
+                .complete_agent_authentication(AgentAuthenticationCompleteRequest {
+                    operation_id: restarted_operation_id,
+                    agent_id,
+                })
+                .await
+                .unwrap()
+        );
+
+        fixture.cleanup();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn known_cli_auth_fallbacks_remain_available_before_login() {
         for (label, agent, acp_mode, initialize_mode, expected_status) in [
@@ -19858,7 +21095,8 @@ for line in sys.stdin:
         ProviderBinding {
             session_id: session_id.clone(),
             provider_kind: vibex_core::ProviderKind::Acp,
-            provider_profile_id: profile_id.clone(),
+            auth_source: RuntimeAuthSource::provider_profile(profile_id.clone()),
+            auth_source_revision: 0,
             native: vibex_core::ProviderNativeBinding {
                 native_session_id: session.native_session_id.clone(),
                 native_thread_id: None,
@@ -19879,7 +21117,8 @@ for line in sys.stdin:
         ProviderBinding {
             session_id: session_id.clone(),
             provider_kind: ProviderKind::Acp,
-            provider_profile_id: profile_id.clone(),
+            auth_source: RuntimeAuthSource::provider_profile(profile_id.clone()),
+            auth_source_revision: 0,
             native: vibex_core::ProviderNativeBinding {
                 native_session_id: Some(native_session_id.to_string()),
                 native_thread_id: None,
@@ -19905,6 +21144,79 @@ for line in sys.stdin:
         source_binding: RuntimeBinding,
         source_revision: i64,
         source_selection_revision: i64,
+    }
+
+    fn assert_runtime_configuration_cause(error: &VibexError, expected_cause: &str) {
+        assert_eq!(error.code, "runtime_switch_configuration_unavailable");
+        assert!(error.diagnostics.iter().any(|diagnostic| {
+            diagnostic.key == "causeCode" && diagnostic.value == expected_cause
+        }));
+    }
+
+    fn configure_mock_agent_account_runtime(fixture: &RuntimeSwitchFixture, agent_id: &AgentId) {
+        let service = fixture.fixture.service();
+        let profile_config = service
+            .get_acp_profile_config(fixture.fixture.profile_id.clone())
+            .unwrap();
+        let env = profile_config
+            .env
+            .iter()
+            .filter_map(|entry| match entry.source {
+                AcpProviderEnvSource::Literal => {
+                    entry.value.clone().map(|value| (entry.key.clone(), value))
+                }
+                AcpProviderEnvSource::ProcessEnvironment
+                | AcpProviderEnvSource::SecretReference => None,
+            })
+            .collect();
+        service
+            .update_agent_config(vibex_core::AgentUpdateConfigRequest {
+                agent_id: agent_id.clone(),
+                added: Some(true),
+                enabled: Some(true),
+                label_override: None,
+                description_override: None,
+                order_index: None,
+                command: Some(AgentCommandConfig {
+                    command: profile_config.command,
+                    args: profile_config.args,
+                }),
+                env: Some(env),
+                params: None,
+            })
+            .unwrap();
+    }
+
+    fn account_model_descriptor(
+        model_id: &str,
+        effort: &str,
+        mode: &str,
+        include_feature: bool,
+    ) -> AgentAuthModelDescriptor {
+        AgentAuthModelDescriptor {
+            model_id: model_id.to_string(),
+            label: format!("{model_id} label"),
+            reasoning_efforts: vec![SessionConfigValue {
+                value: effort.to_string(),
+                label: None,
+            }],
+            modes: vec![SessionConfigValue {
+                value: mode.to_string(),
+                label: None,
+            }],
+            features: include_feature
+                .then(|| vibex_core::SessionRuntimeFeature {
+                    id: "fast_mode".to_string(),
+                    label: "Fast mode".to_string(),
+                    description: None,
+                    kind: vibex_core::SessionRuntimeFeatureKind::Toggle,
+                    current_value: None,
+                    default_value: None,
+                    values: Vec::new(),
+                })
+                .into_iter()
+                .collect(),
+        }
     }
 
     async fn runtime_switch_fixture(label: &str) -> Option<RuntimeSwitchFixture> {
@@ -20012,12 +21324,12 @@ for line in sys.stdin:
             .install_message_submission_coordinator(&message_submission)
             .unwrap();
         let selection = SessionRuntimeSelection {
-            agent_id,
-            provider_profile_id: fixture.profile_id.clone(),
-            model_id: "mock/model-1".to_string(),
-            reasoning_effort: None,
             mode_id: Some("build".to_string()),
-            config_values: Default::default(),
+            ..SessionRuntimeSelection::provider(
+                agent_id,
+                fixture.profile_id.clone(),
+                "mock/model-1",
+            )
         };
         if model_prefix.is_some() {
             fixture.use_verified_opencode_projection();
@@ -20051,10 +21363,7 @@ for line in sys.stdin:
         .unwrap();
         assert_eq!(source_binding.session_id, session.id);
         assert_eq!(source_binding.agent_id, selection.agent_id);
-        assert_eq!(
-            source_binding.provider_profile_id,
-            selection.provider_profile_id
-        );
+        assert_eq!(source_binding.auth_source, selection.auth_source);
         assert_eq!(source_binding.transport_kind, TransportKind::Acp);
         assert_eq!(source_binding.binding_state, BindingState::Current);
         assert_eq!(
@@ -20084,6 +21393,255 @@ for line in sys.stdin:
         })
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runtime_selection_resolver_rejects_provider_agent_default() {
+        let Some(fixture) = runtime_switch_fixture("selection-provider-default").await else {
+            return;
+        };
+        let mut selection = fixture.selection.clone();
+        selection.model = RuntimeModelSelection::AgentDefault;
+
+        let error = fixture
+            .bridge
+            .resolve(&fixture.session.id, &selection, None)
+            .await
+            .unwrap_err();
+        assert_runtime_configuration_cause(&error, "provider_default_model_unsupported");
+
+        drop(fixture.message_submission);
+        drop(fixture.runtime_selection);
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runtime_selection_rejects_an_account_with_active_authentication() {
+        let Some(fixture) = runtime_switch_fixture("selection-account-auth-active").await else {
+            return;
+        };
+        let agent_id = AgentId::parse("codex").unwrap();
+        configure_mock_agent_account_runtime(&fixture, &agent_id);
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        let initial = AgentAuthContextRepository::ensure_default(&conn, &agent_id).unwrap();
+        let authenticated = AgentAuthContextRepository::compare_and_set(
+            &conn,
+            &initial.id,
+            initial.revision,
+            AgentAuthContextStatus::Authenticated,
+            None,
+            Some("browser-login"),
+            Some(unix_timestamp_ms()),
+            false,
+        )
+        .unwrap();
+        AgentAuthenticationOperationRepository::insert(
+            &conn,
+            &AgentAuthenticationOperation {
+                operation_id: AgentAuthenticationOperationId::new(),
+                auth_context_id: authenticated.id.clone(),
+                expected_context_revision: authenticated.revision,
+                method_id: "browser-login".to_string(),
+                state: AgentAuthenticationOperationState::AwaitingUser,
+                error_code: None,
+                created_at_ms: unix_timestamp_ms(),
+                updated_at_ms: unix_timestamp_ms(),
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        let selection = SessionRuntimeSelection::agent_default(agent_id, authenticated.id.clone());
+        let error = fixture
+            .bridge
+            .resolve(&fixture.session.id, &selection, None)
+            .await
+            .unwrap_err();
+        assert_runtime_configuration_cause(&error, "agent_authentication_operation_in_progress");
+
+        drop(fixture.message_submission);
+        drop(fixture.runtime_selection);
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runtime_selection_resolver_fences_account_models_and_per_model_options() {
+        let Some(fixture) = runtime_switch_fixture("selection-account-evidence").await else {
+            return;
+        };
+        let agent_id = AgentId::parse("codex").unwrap();
+        configure_mock_agent_account_runtime(&fixture, &agent_id);
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        let initial = AgentAuthContextRepository::ensure_default(&conn, &agent_id).unwrap();
+        let authenticated = AgentAuthContextRepository::compare_and_set(
+            &conn,
+            &initial.id,
+            initial.revision,
+            AgentAuthContextStatus::Authenticated,
+            None,
+            Some("browser-login"),
+            Some(unix_timestamp_ms()),
+            false,
+        )
+        .unwrap();
+        let mut selection =
+            SessionRuntimeSelection::agent_default(agent_id.clone(), authenticated.id.clone());
+        selection.model = RuntimeModelSelection::explicit("model-a");
+        let old_launch = fixture
+            .bridge
+            .target_context(&fixture.session.id, &selection)
+            .unwrap();
+        let old_snapshot = AgentAuthModelCatalogSnapshot {
+            auth_context_id: authenticated.id.clone(),
+            auth_context_revision: authenticated.revision,
+            runtime_fingerprint: old_launch.spawn_snapshot.process_spawn_fingerprint(),
+            discovery_source: AgentModelDiscoverySource::SessionConfig,
+            status: AgentAuthModelCatalogStatus::Available,
+            models: vec![
+                account_model_descriptor("model-a", "high", "build", true),
+                account_model_descriptor("model-b", "low", "review", false),
+            ],
+            last_success_at_ms: Some(unix_timestamp_ms()),
+            last_attempt_at_ms: unix_timestamp_ms(),
+            last_error_code: None,
+        };
+        let current = AgentAuthContextRepository::compare_and_set(
+            &conn,
+            &authenticated.id,
+            authenticated.revision,
+            AgentAuthContextStatus::Authenticated,
+            None,
+            authenticated.authenticated_via_method.as_deref(),
+            Some(unix_timestamp_ms()),
+            true,
+        )
+        .unwrap();
+        AgentAuthModelCatalogRepository::upsert(&conn, &old_snapshot).unwrap();
+        drop(conn);
+
+        let current_launch = fixture
+            .bridge
+            .target_context(&fixture.session.id, &selection)
+            .unwrap();
+        let current_fingerprint = current_launch.spawn_snapshot.process_spawn_fingerprint();
+        let error = fixture
+            .bridge
+            .resolve(&fixture.session.id, &selection, None)
+            .await
+            .unwrap_err();
+        assert_runtime_configuration_cause(&error, "agent_auth_model_catalog_unavailable");
+
+        let mut wrong_fingerprint = old_snapshot.clone();
+        wrong_fingerprint.auth_context_revision = current.revision;
+        wrong_fingerprint.runtime_fingerprint = "stale-runtime-fingerprint".to_string();
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        AgentAuthModelCatalogRepository::upsert(&conn, &wrong_fingerprint).unwrap();
+        drop(conn);
+        let error = fixture
+            .bridge
+            .resolve(&fixture.session.id, &selection, None)
+            .await
+            .unwrap_err();
+        assert_runtime_configuration_cause(&error, "agent_auth_model_catalog_unavailable");
+
+        let mut current_snapshot = wrong_fingerprint;
+        current_snapshot.runtime_fingerprint = current_fingerprint;
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        AgentAuthModelCatalogRepository::upsert(&conn, &current_snapshot).unwrap();
+        drop(conn);
+
+        selection.reasoning_effort = Some("high".to_string());
+        selection.mode_id = Some("build".to_string());
+        selection
+            .config_values
+            .insert("fast_mode".to_string(), "true".to_string());
+        fixture
+            .bridge
+            .resolve(&fixture.session.id, &selection, None)
+            .await
+            .unwrap();
+
+        let mut wrong_effort = selection.clone();
+        wrong_effort.model = RuntimeModelSelection::explicit("model-b");
+        wrong_effort.reasoning_effort = Some("high".to_string());
+        wrong_effort.mode_id = None;
+        wrong_effort.config_values.clear();
+        let error = fixture
+            .bridge
+            .resolve(&fixture.session.id, &wrong_effort, None)
+            .await
+            .unwrap_err();
+        assert_runtime_configuration_cause(&error, "reasoning_effort_unavailable");
+
+        let mut wrong_mode = wrong_effort;
+        wrong_mode.reasoning_effort = Some("low".to_string());
+        wrong_mode.mode_id = Some("build".to_string());
+        let error = fixture
+            .bridge
+            .resolve(&fixture.session.id, &wrong_mode, None)
+            .await
+            .unwrap_err();
+        assert_runtime_configuration_cause(&error, "mode_unavailable");
+
+        for agent_default in [
+            SessionRuntimeSelection::agent_default(agent_id.clone(), current.id.clone()),
+            SessionRuntimeSelection::agent_default(agent_id.clone(), current.id.clone()),
+            SessionRuntimeSelection::agent_default(agent_id.clone(), current.id.clone()),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut selection)| {
+            match index {
+                0 => selection.reasoning_effort = Some("high".to_string()),
+                1 => selection.mode_id = Some("build".to_string()),
+                _ => {
+                    selection
+                        .config_values
+                        .insert("fast_mode".to_string(), "true".to_string());
+                }
+            }
+            selection
+        }) {
+            let error = fixture
+                .bridge
+                .resolve(&fixture.session.id, &agent_default, None)
+                .await
+                .unwrap_err();
+            assert_runtime_configuration_cause(&error, "agent_default_runtime_options_unavailable");
+        }
+
+        drop(fixture.message_submission);
+        drop(fixture.runtime_selection);
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unsupported_agent_auth_discovery_does_not_create_a_default_context() {
+        let Some(fixture) = MockAcpFixture::create("unsupported-agent-auth-context") else {
+            return;
+        };
+        let client = fixture.client();
+        let agent_id = AgentId::parse(OPENCODE_AGENT_ID).unwrap();
+
+        let error = client.list_auth_methods(&agent_id, None).await.unwrap_err();
+        assert_eq!(error.code, "agent_default_state_home_unsupported");
+        let conn = open_database(&fixture.db_path).unwrap();
+        assert!(
+            AgentAuthContextRepository::get_by_agent(&conn, &agent_id)
+                .unwrap()
+                .is_none()
+        );
+
+        fixture.cleanup();
+    }
+
     fn switch_operation(kind: &str) -> JournaledOperation {
         JournaledOperation {
             operation_id: vibex_core::RuntimeSwitchOperationId::new(),
@@ -20100,7 +21658,7 @@ for line in sys.stdin:
         mode_id: &str,
     ) -> SwitchIntent {
         let mut target = fixture.selection.clone();
-        target.model_id = model_id.to_string();
+        target.model = RuntimeModelSelection::explicit(model_id);
         target.mode_id = Some(mode_id.to_string());
         SwitchIntent {
             switch_id: RuntimeSwitchId::new(),
@@ -20110,6 +21668,7 @@ for line in sys.stdin:
             desired_selection_revision: fixture.source_selection_revision,
             target_binding_id: Some(target_binding_id),
             target_adapter_id: fixture.source_binding.adapter_id.clone(),
+            target_auth_source_revision: fixture.source_binding.auth_source_revision,
             target_selection: target,
             requested_policy: vibex_core::RuntimeSwitchPolicy::Automatic,
             active_work_policy: Default::default(),
@@ -20265,12 +21824,13 @@ for line in sys.stdin:
                 expected_current_binding_id: Some(fixture.source_binding.binding_id.clone()),
                 desired_selection_revision: fixture.source_selection_revision,
                 target_adapter_id: fixture.source_binding.adapter_id.clone(),
+                target_auth_source_revision: fixture.source_binding.auth_source_revision,
                 target_selection: fixture.selection.clone(),
                 requested_policy: RuntimeSwitchPolicy::ForceFreshSession,
                 active_work_policy: Default::default(),
                 requested_session_config: Some(
                     serde_json::to_value(SessionRuntimeConfigPatch {
-                        model_id: Some(fixture.selection.model_id.clone()),
+                        model_id: fixture.selection.model_id().map(str::to_string),
                         reasoning_effort: fixture.selection.reasoning_effort.clone(),
                         mode_id: fixture.selection.mode_id.clone(),
                         ..Default::default()
@@ -20348,7 +21908,7 @@ for line in sys.stdin:
         fixture.fixture.set_restore_mode("provider_failure", false);
 
         let mut target = fixture.selection.clone();
-        target.model_id = "mock/model-2".to_string();
+        target.model = RuntimeModelSelection::explicit("mock/model-2");
         target.mode_id = Some("review".to_string());
         let (switch_id, ready) = switch_runtime_selection_and_wait(
             &fixture,
@@ -20415,8 +21975,8 @@ for line in sys.stdin:
             fixture.selection.agent_id.clone(),
         );
         let mut target = fixture.selection.clone();
-        target.provider_profile_id = target_profile;
-        target.model_id = "mock/model-2".to_string();
+        target.auth_source = RuntimeAuthSource::provider_profile(target_profile);
+        target.model = RuntimeModelSelection::explicit("mock/model-2");
         target.mode_id = Some("review".to_string());
 
         let (switch_id, ready) =
@@ -20486,8 +22046,8 @@ for line in sys.stdin:
             .create_switch_profile("Mock Codex ACP", target_agent.clone());
         let mut target = fixture.selection.clone();
         target.agent_id = target_agent;
-        target.provider_profile_id = target_profile;
-        target.model_id = "mock/model-2".to_string();
+        target.auth_source = RuntimeAuthSource::provider_profile(target_profile);
+        target.model = RuntimeModelSelection::explicit("mock/model-2");
         target.mode_id = Some("review".to_string());
 
         let (switch_id, ready) =
@@ -21260,7 +22820,7 @@ for line in sys.stdin:
         let intent = switch_intent(
             &fixture,
             RuntimeBindingId::new(),
-            &fixture.selection.model_id,
+            fixture.selection.model_id().unwrap_or("mock/model-1"),
             fixture.selection.mode_id.as_deref().unwrap_or("build"),
         );
         let operation = SwitchOperationRecord {
@@ -21389,7 +22949,8 @@ for line in sys.stdin:
                 target_binding_id: intent.target_binding_id.clone(),
                 target_agent_id: intent.target_selection.agent_id.clone(),
                 target_adapter_id: intent.target_adapter_id.clone(),
-                target_profile_id: intent.target_selection.provider_profile_id.clone(),
+                target_auth_source: intent.target_selection.auth_source.clone(),
+                target_auth_source_revision: intent.target_auth_source_revision,
                 requested_policy: Some(
                     serde_json::to_value(RuntimeSwitchPolicy::PreferLiveMutation).unwrap(),
                 ),
@@ -21955,7 +23516,7 @@ for line in sys.stdin:
         )
         .unwrap();
         let requested_config = serde_json::to_value(SessionRuntimeConfigPatch {
-            model_id: Some(target_selection.model_id.clone()),
+            model_id: target_selection.model_id().map(str::to_string),
             reasoning_effort: target_selection.reasoning_effort.clone(),
             mode_id: target_selection.mode_id.clone(),
             ..Default::default()
@@ -21969,6 +23530,7 @@ for line in sys.stdin:
                 expected_current_binding_id: Some(fixture.source_binding.binding_id.clone()),
                 desired_selection_revision: fixture.source_selection_revision,
                 target_adapter_id: fixture.source_binding.adapter_id.clone(),
+                target_auth_source_revision: fixture.source_binding.auth_source_revision,
                 target_selection: target_selection.clone(),
                 requested_policy: RuntimeSwitchPolicy::ForceFreshSession,
                 active_work_policy: Default::default(),
@@ -22109,7 +23671,7 @@ for line in sys.stdin:
             return;
         };
         let mut desired = fixture.selection.clone();
-        desired.model_id = "mock/model-2".to_string();
+        desired.model = RuntimeModelSelection::explicit("mock/model-2");
         desired.mode_id = Some("review".to_string());
         let request = SendAgentMessageRequest {
             session_id: fixture.session.id.clone(),
@@ -22256,7 +23818,7 @@ for line in sys.stdin:
             })
             .unwrap();
         let mut selection_b = fixture.selection.clone();
-        selection_b.provider_profile_id = profile_b.id.clone();
+        selection_b.auth_source = RuntimeAuthSource::provider_profile(profile_b.id.clone());
         let coordinator = RuntimeSwitchCoordinator::new(
             &fixture.fixture.db_path,
             fixture.bridge.clone(),
@@ -22305,12 +23867,13 @@ for line in sys.stdin:
                 expected_current_binding_id: Some(binding_a.binding_id.clone()),
                 desired_selection_revision: selection_revision_b,
                 target_adapter_id: binding_a.adapter_id.clone(),
+                target_auth_source_revision: profile_b.updated_at_ms,
                 target_selection: selection_b.clone(),
                 requested_policy: RuntimeSwitchPolicy::ForceFreshSession,
                 active_work_policy: Default::default(),
                 requested_session_config: Some(
                     serde_json::to_value(SessionRuntimeConfigPatch {
-                        model_id: Some(selection_b.model_id.clone()),
+                        model_id: selection_b.model_id().map(str::to_string),
                         reasoning_effort: selection_b.reasoning_effort.clone(),
                         mode_id: selection_b.mode_id.clone(),
                         ..Default::default()
@@ -22362,12 +23925,13 @@ for line in sys.stdin:
                 expected_current_binding_id: Some(binding_b_id),
                 desired_selection_revision: selection_revision_a,
                 target_adapter_id: binding_a.adapter_id.clone(),
+                target_auth_source_revision: binding_a.auth_source_revision,
                 target_selection: fixture.selection.clone(),
                 requested_policy: RuntimeSwitchPolicy::Automatic,
                 active_work_policy: Default::default(),
                 requested_session_config: Some(
                     serde_json::to_value(SessionRuntimeConfigPatch {
-                        model_id: Some(fixture.selection.model_id.clone()),
+                        model_id: fixture.selection.model_id().map(str::to_string),
                         reasoning_effort: fixture.selection.reasoning_effort.clone(),
                         mode_id: fixture.selection.mode_id.clone(),
                         ..Default::default()
@@ -23335,10 +24899,16 @@ for line in sys.stdin:
         fixture.force_model_config_option_fallback();
         let client = fixture.client();
         let session_id = VibexSessionId::new();
+        let profile = client
+            .config_service
+            .get_profile(&fixture.profile_id)
+            .unwrap()
+            .unwrap();
         let binding = ProviderBinding {
             session_id: session_id.clone(),
             provider_kind: ProviderKind::Acp,
-            provider_profile_id: fixture.profile_id.clone(),
+            auth_source: RuntimeAuthSource::provider_profile(fixture.profile_id.clone()),
+            auth_source_revision: profile.updated_at_ms,
             native: vibex_core::ProviderNativeBinding {
                 native_session_id: Some("mock-import-session".to_string()),
                 native_thread_id: None,
@@ -24981,7 +26551,7 @@ for line in sys.stdin:
             .unwrap();
         assert_eq!(
             status_events.try_recv().unwrap().status,
-            ProcessConfigStatus::Current
+            ProcessConfigStatus::StaleRestartRequired
         );
         runtime.close_session(&binding).await.unwrap();
         fixture.cleanup();
@@ -25092,13 +26662,22 @@ for line in sys.stdin:
         )
         .unwrap();
         let resources = ProviderRuntimeResources::default();
+        let profile = runtime
+            .config_service
+            .get_profile(&fixture.profile_id)
+            .unwrap()
+            .unwrap();
+        let auth_source = RuntimeAuthSource::provider_profile(fixture.profile_id.clone());
+        let env_unsets = Vec::new();
         let replacement = runtime
             .acquire_initialized_process(AcpProcessLaunch {
-                profile_id: &fixture.profile_id,
-                agent_id: None,
+                auth_source: &auth_source,
+                auth_source_revision: profile.updated_at_ms,
+                agent_id: &profile.agent_id,
                 config: &config,
                 cwd: &cwd,
                 runtime_resources: &resources,
+                env_unsets: &env_unsets,
                 purpose: AcpProcessPurpose::Session,
                 process_strategy_effective: AcpProcessStrategy::PerSession,
                 pool_fallback_reason: None,
@@ -25170,14 +26749,23 @@ for line in sys.stdin:
             AcpRuntimeClient::resolve_workspace_cwd(&config, &fixture.workspace.to_string_lossy())
                 .unwrap();
         let resources = ProviderRuntimeResources::default();
+        let profile = client
+            .config_service
+            .get_profile(&fixture.profile_id)
+            .unwrap()
+            .unwrap();
+        let auth_source = RuntimeAuthSource::provider_profile(fixture.profile_id.clone());
+        let env_unsets = Vec::new();
         let ready_lease = tokio::time::timeout(
             Duration::from_millis(400),
             client.acquire_initialized_process(AcpProcessLaunch {
-                profile_id: &fixture.profile_id,
-                agent_id: None,
+                auth_source: &auth_source,
+                auth_source_revision: profile.updated_at_ms,
+                agent_id: &profile.agent_id,
                 config: &config,
                 cwd: &cwd,
                 runtime_resources: &resources,
+                env_unsets: &env_unsets,
                 purpose: AcpProcessPurpose::Session,
                 process_strategy_effective: AcpProcessStrategy::PerProfilePool,
                 pool_fallback_reason: None,
@@ -25417,8 +27005,9 @@ for line in sys.stdin:
                 binding_id: attachment.binding_id().clone(),
                 activation_generation: attachment.fence().activation_generation as i64,
                 agent_id: AgentId::parse(OPENCODE_AGENT_ID).unwrap(),
-                provider_profile_id: fixture.profile_id.clone(),
-                model_id: "mock/model-1".to_string(),
+                auth_source: binding.auth_source.clone(),
+                auth_source_revision: binding.auth_source_revision,
+                model_id: Some("mock/model-1".to_string()),
             },
         };
         let mut undispatched_context = execution_context.clone();
@@ -25518,8 +27107,9 @@ for line in sys.stdin:
                 binding_id: attachment.binding_id().clone(),
                 activation_generation: attachment.fence().activation_generation as i64,
                 agent_id: AgentId::parse(OPENCODE_AGENT_ID).unwrap(),
-                provider_profile_id: fixture.profile_id.clone(),
-                model_id: "mock/model-1".to_string(),
+                auth_source: binding.auth_source.clone(),
+                auth_source_revision: binding.auth_source_revision,
+                model_id: Some("mock/model-1".to_string()),
             },
         };
         payload
@@ -26824,12 +28414,12 @@ for line in sys.stdin:
             .unwrap();
 
         let selection = SessionRuntimeSelection {
-            agent_id,
-            provider_profile_id: fixture.profile_id.clone(),
-            model_id: "mock/model-1".to_string(),
-            reasoning_effort: None,
             mode_id: Some("build".to_string()),
-            config_values: Default::default(),
+            ..SessionRuntimeSelection::provider(
+                agent_id,
+                fixture.profile_id.clone(),
+                "mock/model-1",
+            )
         };
         let session = manager
             .create_session(CreateAgentSessionRequest {

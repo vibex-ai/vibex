@@ -3,6 +3,8 @@
 Vibex records provider-neutral Agent token consumption from online ACP turns.
 This domain is separate from Provider quota and balance records: it contains no
 prices, costs, billing estimates, or Provider-native session identities.
+Each fact is attributed to the exact `RuntimeAuthSource` and source revision
+that executed the turn. AgentAccount facts may have no disclosed concrete model.
 
 ## Scenario: Durable Cumulative Usage Accounting And Typed Queries
 
@@ -31,7 +33,7 @@ AgentUsageTokenValues {
 
 AgentUsageObservation {
   stream: { session_id, binding_id, activation_generation, agent_id,
-            provider_profile_id, model_id },
+            auth_source, auth_source_revision, model_id? },
   execution: AgentUsageExecution?,
   counter_origin: known_zero | resumed | restored_checkpoint | unknown,
   observation_sequence,
@@ -87,9 +89,10 @@ AgentUsageAnnualDay {
 SQLite owns these additive records:
 
 ```text
-agent_usage_checkpoints(
+  agent_usage_checkpoints(
   usage_stream_id PRIMARY KEY, session_id, binding_id,
-  last_activation_generation, agent_id, provider_profile_id, last_model_id,
+  last_activation_generation, agent_id, auth_source_kind, auth_source_id,
+  auth_source_revision, provider_profile_id?, last_model_id?,
   reset_epoch, counter_origin, cumulative_* NULL,
   last_usage_execution_id NULL, last_observation_sequence,
   created_at_ms, updated_at_ms,
@@ -99,7 +102,8 @@ agent_usage_checkpoints(
 agent_turn_usage_facts(
   usage_execution_id PRIMARY KEY, message_submission_id NULL,
   session_id, project_id, workspace_id, binding_id, activation_generation,
-  reset_epoch, agent_id, provider_profile_id, model_id, execution_status,
+  reset_epoch, agent_id, auth_source_kind, auth_source_id,
+  auth_source_revision, provider_profile_id?, model_id?, execution_status,
   *_delta NULL, cumulative_*_after NULL,
   context_window_used_tokens NULL, context_window_size_tokens NULL,
   reported_fields, coverage, last_source NULL, reset_reason NULL,
@@ -298,4 +302,104 @@ if precedes {
     tx.commit()?;
     return Ok(outcome);
 }
+```
+
+## Scenario: Authentication-Source Usage Attribution And Unknown Models
+
+### 1. Scope / Trigger
+
+- Trigger: an ACP turn runs through a Provider Profile or an Agent default
+  account and usage telemetry, checkpoints, statistics filters, or timeline
+  attribution are persisted.
+- The source/revision fence must remain aligned with `RuntimeBinding`; changing
+  the current Composer selection must never rewrite historical usage.
+
+### 2. Signatures
+
+```text
+AgentUsageStreamAttribution {
+  session_id, binding_id, activation_generation, agent_id,
+  auth_source: RuntimeAuthSource, auth_source_revision,
+  model_id: Option<String>
+}
+
+AgentTurnUsageFact {
+  ..., auth_source, auth_source_revision,
+  provider_profile_id: Option<ProviderProfileId>,
+  model_id: Option<String>, ...
+}
+
+AgentUsageStatisticsRequest.provider_profile_ids[]
+  filters only ProviderProfile sources; AgentAccount sources are identified
+  by the source label/id in returned rows and are never merged into a Profile.
+```
+
+### 3. Contracts
+
+- The manager snapshots source kind/id/revision and the concrete model reported
+  by the committed binding before dispatch. A desired `AgentDefault` selection
+  may produce `model_id = NULL`; this means unknown/not disclosed, not zero or
+  a sentinel.
+- Provider sources retain the legacy `provider_profile_id` compatibility column
+  and require a concrete model. AgentAccount rows keep that column null and may
+  keep model null through checkpoints, facts, and aggregate projections.
+- Usage checkpoint identity is `(session_id, binding_id)` plus source/revision
+  validation. A source or revision mismatch is a new stream/conflict, never a
+  subtraction against another account or Provider Profile.
+- Statistics label joins resolve Provider Profile display names or the safe
+  Agent account hint/Agent label. AgentAccount subscription usage is marked
+  agent-managed/unknown where billing data is unavailable and never enters
+  Provider quota or balance tables.
+- Legacy JSON and rows decode Provider source aliases; no code should decode a
+  missing AgentAccount model as `"default"` or another invented id.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Source/revision differs from the prepared binding | reject or ignore telemetry with bounded attribution conflict; do not mutate checkpoint. |
+| Provider source has null model | validation/storage failure; Provider usage remains unchanged. |
+| AgentAccount source has null model | valid unknown-model fact; preserve nullable coverage. |
+| AgentAccount row contains a Provider id | legacy/source mismatch; fail closed. |
+| Query filters Provider profile ids | exclude AgentAccount rows rather than matching by string id. |
+| Late event from an older account revision | stale no-op; never advance current checkpoint. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: a subscription turn records `AgentAccount(context, revision 4)` with
+  input/output deltas and null model; the Usage view labels the account without
+  assigning it to a Provider Profile.
+- Base: the Agent later reports an effective model; only subsequent evidence or
+  the same fact's bounded enrichment fills it, while desired remains
+  `AgentDefault`.
+- Bad: copy the current Provider Profile id into an account fact, turn null into
+  `agent_default`, or re-label historical rows when the user switches sources.
+
+### 6. Tests Required
+
+- Core/DB tests cover source/revision serde, nullable model checks, Provider
+  legacy aliases, and account rows with no Profile id.
+- Telemetry tests cover exact binding/source fences, null model acceptance for
+  AgentAccount, stale revision no-op, and no Provider usage writes.
+- Query tests cover account labels, Provider filters excluding accounts,
+  unknown-model coverage, deterministic sorting, and redacted output.
+- Migration tests assert v45/46/47 conversion of old Provider rows and removal
+  of the internal AgentDefault sentinel.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+fact.provider_profile_id = current_profile_id;
+fact.model_id = model_id.unwrap_or_else(|| "agent_default".into());
+```
+
+#### Correct
+
+```rust
+fact.auth_source = committed_binding.auth_source.clone();
+fact.auth_source_revision = committed_binding.auth_source_revision;
+fact.provider_profile_id = fact.auth_source.provider_profile_id().cloned();
+fact.model_id = effective_model_id; // None is valid for AgentDefault
 ```

@@ -3906,14 +3906,11 @@ mod tests {
     fn runtime_selection_event_without_switch_projection_is_scoped_by_session_id() {
         let selected = VibexSessionId::new();
         let other = VibexSessionId::new();
-        let selection = vibex_core::SessionRuntimeSelection {
-            agent_id: AgentId::parse("claude").unwrap(),
-            provider_profile_id: ProviderProfileId::new(),
-            model_id: "claude-sonnet".into(),
-            reasoning_effort: None,
-            mode_id: None,
-            config_values: Default::default(),
-        };
+        let selection = vibex_core::SessionRuntimeSelection::provider(
+            AgentId::parse("claude").unwrap(),
+            ProviderProfileId::new(),
+            "claude-sonnet",
+        );
         let event = BackendEvent::RuntimeSelection(vibex_core::AgentSessionRuntimeSelectionEvent {
             session_id: selected.clone(),
             state: vibex_core::AgentSessionRuntimeSelectionState {

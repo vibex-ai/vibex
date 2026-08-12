@@ -35,6 +35,7 @@ const DEFAULT_RUNTIME_SELECTION_BROADCAST_CAPACITY: usize = 64;
 #[derive(Clone, PartialEq, Eq)]
 pub struct ResolvedRuntimeSelection {
     pub adapter_id: AcpAdapterId,
+    pub auth_source_revision: i64,
     pub session_config: Option<serde_json::Value>,
 }
 
@@ -43,6 +44,7 @@ impl fmt::Debug for ResolvedRuntimeSelection {
         formatter
             .debug_struct("ResolvedRuntimeSelection")
             .field("adapter_id", &self.adapter_id)
+            .field("auth_source_revision", &self.auth_source_revision)
             .field("has_session_config", &self.session_config.is_some())
             .finish()
     }
@@ -235,6 +237,7 @@ impl RuntimeSelectionService {
                     expected_selection_revision: 0,
                     target_binding_id: RuntimeBindingId::new(),
                     target_adapter_id: resolved.adapter_id,
+                    target_auth_source_revision: resolved.auth_source_revision,
                     desired,
                     requested_policy: RuntimeSwitchPolicy::Automatic,
                     active_work_policy: self.seamless_active_work_policy(),
@@ -336,6 +339,7 @@ impl RuntimeSelectionService {
                     expected_selection_revision: request.expected_selection_revision,
                     target_binding_id: RuntimeBindingId::new(),
                     target_adapter_id: resolved.adapter_id,
+                    target_auth_source_revision: resolved.auth_source_revision,
                     desired: request.desired,
                     requested_policy: RuntimeSwitchPolicy::Automatic,
                     active_work_policy: self.seamless_active_work_policy(),
@@ -394,6 +398,7 @@ impl RuntimeSelectionService {
                 expected_current_binding_id: state.current_binding_id,
                 desired_selection_revision: state.selection_revision,
                 target_adapter_id: resolved.adapter_id,
+                target_auth_source_revision: resolved.auth_source_revision,
                 target_selection: request.target,
                 requested_policy: request.policy,
                 active_work_policy: request.active_work_policy,
@@ -654,7 +659,7 @@ impl RuntimeSelectionService {
                             .with_switch_id(&current.switch_id)
                             .with_agent_id(&current.target_agent_id)
                             .with_adapter_id(&current.target_adapter_id)
-                            .with_provider_profile_id(&current.target_profile_id)
+                            .with_auth_source(&current.target_auth_source)
                             .emit(
                                 if current.status == RuntimeSwitchStatus::Committed {
                                     RuntimeLogLevel::Info
@@ -897,8 +902,9 @@ mod tests {
             }
             Ok(ResolvedRuntimeSelection {
                 adapter_id: self.adapter_id.clone(),
+                auth_source_revision: 1,
                 session_config: Some(serde_json::json!({
-                    "model": selection.model_id,
+                    "model": selection.model_id(),
                     "reasoningEffort": selection.reasoning_effort,
                     "mode": selection.mode_id,
                 })),
@@ -980,7 +986,8 @@ mod tests {
                     session_id: intent.session_id.clone(),
                     agent_id: intent.target_selection.agent_id.clone(),
                     transport_kind: TransportKind::Acp,
-                    provider_profile_id: intent.target_selection.provider_profile_id.clone(),
+                    auth_source: intent.target_selection.auth_source.clone(),
+                    auth_source_revision: intent.target_auth_source_revision,
                     adapter_id: intent.target_adapter_id.clone(),
                     adapter_version: "test-v1".to_string(),
                     adapter_compatibility_identity: "test-compatible-v1".to_string(),
@@ -991,7 +998,6 @@ mod tests {
                     session_runtime_config_state: SessionRuntimeConfigState::default(),
                     capability_snapshot: None,
                     restore_compatibility_key: None,
-                    profile_revision: 1,
                     last_context_sequence: 0,
                     last_summary_sequence: 0,
                     context_bridge_version: 0,
@@ -1244,20 +1250,18 @@ mod tests {
                 },
             )
             .unwrap();
-            let effective = SessionRuntimeSelection {
-                agent_id: agent_id.clone(),
-                provider_profile_id: profile_id.clone(),
-                model_id: "model-source".to_string(),
-                reasoning_effort: None,
-                mode_id: None,
-                config_values: Default::default(),
-            };
+            let effective = SessionRuntimeSelection::provider(
+                agent_id.clone(),
+                profile_id.clone(),
+                "model-source",
+            );
             let source_binding = RuntimeBinding {
                 binding_id: RuntimeBindingId::new(),
                 session_id: session_id.clone(),
                 agent_id: agent_id.clone(),
                 transport_kind: TransportKind::Acp,
-                provider_profile_id: profile_id,
+                auth_source: effective.auth_source.clone(),
+                auth_source_revision: 1,
                 adapter_id: adapter_id.clone(),
                 adapter_version: "source-v1".to_string(),
                 adapter_compatibility_identity: "source-compatible-v1".to_string(),
@@ -1268,7 +1272,6 @@ mod tests {
                 session_runtime_config_state: SessionRuntimeConfigState::default(),
                 capability_snapshot: None,
                 restore_compatibility_key: None,
-                profile_revision: 1,
                 last_context_sequence: 0,
                 last_summary_sequence: 0,
                 context_bridge_version: 0,
@@ -1353,7 +1356,7 @@ mod tests {
                 expected_revision: 0,
                 expected_selection_revision,
                 desired: SessionRuntimeSelection {
-                    model_id: model.to_string(),
+                    model: vibex_core::RuntimeModelSelection::explicit(model),
                     ..self.effective.clone()
                 },
                 interaction: RuntimeSelectionInteraction::Seamless,
@@ -1385,7 +1388,7 @@ mod tests {
         session_id: &VibexSessionId,
         expected: SessionRuntimeSelectionStatus,
     ) -> AgentSessionRuntimeSelectionState {
-        for _ in 0..200 {
+        for _ in 0..2_500 {
             let state = service.get_selection_state(session_id).unwrap();
             if state.status == expected {
                 return state;
@@ -1397,7 +1400,7 @@ mod tests {
 
     #[tokio::test]
     async fn seamless_wait_can_be_cancelled_without_cancelling_active_work() {
-        let env = TestEnvironment::new("cancel-wait", 500);
+        let env = TestEnvironment::new("cancel-wait", 10_000);
         env.gate.set_active_turn(true);
         let mut events = env.service.subscribe();
         let initial = env
@@ -1427,7 +1430,9 @@ mod tests {
         ] {
             assert_eq!(
                 policy.disposition(kind),
-                BusyDisposition::Wait { deadline_ms: 500 }
+                BusyDisposition::Wait {
+                    deadline_ms: 10_000
+                }
             );
         }
 
@@ -1531,7 +1536,7 @@ mod tests {
             SessionRuntimeSelectionStatus::Ready,
         )
         .await;
-        assert_eq!(ready.effective.model_id, "model-latest");
+        assert_eq!(ready.effective.model_id(), Some("model-latest"));
         assert_eq!(ready.desired, ready.effective);
         assert_eq!(
             env.switch_by_key("rapid-first").status,

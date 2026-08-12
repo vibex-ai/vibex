@@ -4009,6 +4009,14 @@ fn gateway_features(state: &GatewayState) -> Vec<String> {
     .map(str::to_string)
     .collect::<Vec<_>>();
     if state
+        .dispatcher
+        .info()
+        .capabilities
+        .supports_agent_account_auth
+    {
+        features.push("agent_account_auth".to_string());
+    }
+    if state
         .pairing_routes
         .lock()
         .map(|routes| !routes.is_empty())

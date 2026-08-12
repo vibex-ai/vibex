@@ -796,17 +796,14 @@ mod tests {
             .send_message(SendAgentMessageRequest {
                 session_id: session.id.clone(),
                 message_idempotency_key: "claude-read-only-import".to_string(),
-                desired_runtime: vibex_core::SessionRuntimeSelection {
-                    agent_id: vibex_core::AgentId::parse("claude").unwrap(),
-                    provider_profile_id: vibex_core::ProviderProfileId::parse(
+                desired_runtime: vibex_core::SessionRuntimeSelection::provider(
+                    vibex_core::AgentId::parse("claude").unwrap(),
+                    vibex_core::ProviderProfileId::parse(
                         ProviderKind::Claude.local_default_profile_id().to_string(),
                     )
                     .unwrap(),
-                    model_id: "legacy-import".to_string(),
-                    reasoning_effort: None,
-                    mode_id: None,
-                    config_values: Default::default(),
-                },
+                    "legacy-import",
+                ),
                 text: "continue".to_string(),
                 attachments: Vec::new(),
                 reasoning_effort: None,

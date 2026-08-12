@@ -2322,7 +2322,9 @@ pub struct ProviderBindingMetadata {
 pub struct ProviderBinding {
     pub session_id: VibexSessionId,
     pub provider_kind: ProviderKind,
-    pub provider_profile_id: ProviderProfileId,
+    pub auth_source: crate::RuntimeAuthSource,
+    #[serde(default)]
+    pub auth_source_revision: i64,
     pub native: ProviderNativeBinding,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,

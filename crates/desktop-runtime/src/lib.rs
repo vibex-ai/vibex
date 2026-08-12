@@ -1,6 +1,7 @@
 //! Shared desktop composition root used by the native GPUI shell.
 
 mod acp_terminal;
+mod agent_auth_context;
 mod agent_install;
 mod auth_catalog;
 mod catalog;
@@ -36,11 +37,15 @@ use vibex_agent_acp::{
 };
 use vibex_config_switch::{ProviderConfigService, ProviderProfileChangeListener};
 use vibex_core::{
-    AgentAuthCatalog, AgentAuthenticateRequest, AgentAuthenticateResult,
+    AgentAuthCatalog, AgentAuthContext, AgentAuthContextAuthenticateRequest,
+    AgentAuthContextAuthenticateResult, AgentAuthContextCancelAuthenticationRequest,
+    AgentAuthContextId, AgentAuthContextLogoutPreview, AgentAuthContextLogoutRequest,
+    AgentAuthContextMutationResult, AgentAuthContextRefreshModelsRequest,
+    AgentAuthContextVerifyRequest, AgentAuthenticateRequest, AgentAuthenticateResult,
     AgentAuthenticationCancelRequest, AgentLogoutRequest, AgentRuntimeKind, AgentSession,
     FetchTimelineRequest, OpenWorkspaceRequest, ProjectId, ProjectRecord, ProviderProfileId,
     TerminalCreateRequest, TerminalId, TerminalSession, TerminalSwitchShellRequest, TimelinePage,
-    VibexError, VibexResult, WorkspaceId, WorkspaceMode, WorkspaceRecord,
+    TimelinePayload, VibexError, VibexResult, WorkspaceId, WorkspaceMode, WorkspaceRecord,
 };
 use vibex_db::{
     TerminalSessionRepository, WorkspaceRepository, apply_migrations, default_database_path,
@@ -57,6 +62,7 @@ use vibex_terminal::TerminalManager;
 
 use acp_terminal::DesktopAcpTerminalHost;
 
+pub use agent_auth_context::AgentAuthContextService;
 pub use agent_install::{AgentInstallService, AgentNodeRuntimeOptions, AgentUvRuntimeOptions};
 pub use auth_catalog::AgentAuthCatalogService;
 pub use catalog::{
@@ -366,6 +372,7 @@ pub struct AgentHandle {
     message_submission: Arc<MessageSubmissionCoordinator>,
     runtime_catalog: Arc<RuntimeOptionCatalogService>,
     auth_catalog: Arc<AgentAuthCatalogService>,
+    auth_contexts: Arc<AgentAuthContextService>,
     install_service: Arc<AgentInstallService>,
 }
 
@@ -388,6 +395,70 @@ impl AgentHandle {
 
     pub fn runtime_catalog(&self) -> Arc<RuntimeOptionCatalogService> {
         self.runtime_catalog.clone()
+    }
+
+    pub fn auth_contexts(&self) -> Arc<AgentAuthContextService> {
+        self.auth_contexts.clone()
+    }
+
+    pub fn ensure_default_auth_context(
+        &self,
+        agent_id: &vibex_core::AgentId,
+    ) -> VibexResult<AgentAuthContext> {
+        self.auth_contexts.ensure_default(agent_id)
+    }
+
+    pub fn list_auth_contexts(&self) -> VibexResult<Vec<AgentAuthContext>> {
+        self.auth_contexts.list()
+    }
+
+    pub async fn authenticate_context(
+        &self,
+        request: AgentAuthContextAuthenticateRequest,
+    ) -> VibexResult<AgentAuthContextAuthenticateResult> {
+        self.auth_contexts.authenticate(request).await
+    }
+
+    pub fn authentication_operation(
+        &self,
+        operation_id: &vibex_core::AgentAuthenticationOperationId,
+    ) -> VibexResult<vibex_core::AgentAuthenticationOperation> {
+        self.auth_contexts.authentication_operation(operation_id)
+    }
+
+    pub async fn cancel_context_authentication(
+        &self,
+        request: AgentAuthContextCancelAuthenticationRequest,
+    ) -> VibexResult<AgentAuthContextMutationResult> {
+        self.auth_contexts.cancel_authentication(request).await
+    }
+
+    pub async fn verify_auth_context(
+        &self,
+        request: AgentAuthContextVerifyRequest,
+    ) -> VibexResult<AgentAuthContextMutationResult> {
+        self.auth_contexts.verify(request).await
+    }
+
+    pub async fn refresh_auth_context_models(
+        &self,
+        request: AgentAuthContextRefreshModelsRequest,
+    ) -> VibexResult<AgentAuthContextMutationResult> {
+        self.auth_contexts.refresh_models(request).await
+    }
+
+    pub fn preview_auth_context_logout(
+        &self,
+        auth_context_id: &AgentAuthContextId,
+    ) -> VibexResult<AgentAuthContextLogoutPreview> {
+        self.auth_contexts.logout_preview(auth_context_id)
+    }
+
+    pub async fn logout_auth_context(
+        &self,
+        request: AgentAuthContextLogoutRequest,
+    ) -> VibexResult<AgentAuthContextMutationResult> {
+        self.auth_contexts.logout(request).await
     }
 
     pub async fn list_auth_methods(
@@ -867,7 +938,7 @@ impl DesktopRuntime {
                     &config,
                     observability.clone(),
                     provider_change_listener,
-                    terminal_host,
+                    terminal_host.clone(),
                 )
             })?;
         let runtime_probe = acp_runtime.runtime_probe_service();
@@ -910,15 +981,25 @@ impl DesktopRuntime {
         )?);
         message_submission.install_runtime_lifecycle(runtime_lifecycle.clone())?;
         manager.install_message_submission_coordinator(&message_submission)?;
-        let runtime_catalog = Arc::new(RuntimeOptionCatalogService::with_live_runtime(
-            manager.clone(),
-            provider_config_service.clone(),
-            acp_runtime.clone(),
-        ));
         let auth_catalog = Arc::new(AgentAuthCatalogService::new(
             manager.clone(),
             provider_config_service.clone(),
         ));
+        let auth_contexts = Arc::new(AgentAuthContextService::new(
+            db_path.clone(),
+            manager.clone(),
+            acp_runtime.clone(),
+            terminal_host,
+            auth_catalog.clone(),
+        )?);
+        let runtime_catalog = Arc::new(
+            RuntimeOptionCatalogService::with_live_runtime(
+                manager.clone(),
+                provider_config_service.clone(),
+                acp_runtime.clone(),
+            )
+            .with_auth_context_service(auth_contexts.clone()),
+        );
         let install_service = Arc::new(AgentInstallService::new_with_runtime_options(
             db_path.clone(),
             config.home_dir.join("acp-agents"),
@@ -947,6 +1028,7 @@ impl DesktopRuntime {
                 .with_worktree_snapshot_source(Arc::new(git.clone())),
         )
         .with_runtime_option_catalog_source(runtime_catalog.clone())
+        .with_agent_auth_context_source(auth_contexts.clone())
         .with_agent_runtime_probe_source(Arc::new(providers.clone()));
         let remote_gateway = RemoteGateway::new(
             config.remote_gateway.clone(),
@@ -990,6 +1072,7 @@ impl DesktopRuntime {
                 message_submission,
                 runtime_catalog,
                 auth_catalog,
+                auth_contexts,
                 install_service,
             },
             providers,
@@ -1043,6 +1126,9 @@ impl DesktopRuntime {
         })?;
         startup_stage("provider_config_consumer_start", || {
             runtime.spawn_provider_config_consumer(provider_change_receiver)
+        })?;
+        startup_stage("agent_auth_context_consumer_start", || {
+            runtime.spawn_agent_auth_context_consumer()
         })?;
         runtime.activate().await?;
         startup_stage("startup_reconciliation_spawn", || {
@@ -1167,6 +1253,8 @@ impl DesktopRuntime {
         let install_managed_adapters = self.config.install_managed_adapters;
         let install_service = self.agent.install_service.clone();
         let runtime_catalog = self.agent.runtime_catalog();
+        let auth_contexts = self.agent.auth_contexts();
+        let provider_config = self.providers.service();
         let runtime_option_events = self.events.clone();
         let runtime_option_gateway = self.remote.gateway.clone();
         tasks.push(tokio::spawn(async move {
@@ -1179,7 +1267,7 @@ impl DesktopRuntime {
                             error_code = %error.code,
                             "managed ACP Agent bootstrap inventory failed"
                         );
-                        return;
+                        Vec::new()
                     }
                 };
                 for agent_id in agent_ids {
@@ -1192,6 +1280,56 @@ impl DesktopRuntime {
                             "managed ACP Agent background preparation failed"
                         );
                     }
+                }
+            }
+            match provider_config.list_agents(vibex_core::AgentListRequest {
+                include_disabled: false,
+            }) {
+                Ok(agents) => {
+                    for agent in agents.agents.into_iter().filter(|agent| {
+                        agent.added
+                            && agent.enabled
+                            && agent.installed
+                            && auth_contexts.supports_agent_account(&agent.id)
+                    }) {
+                        let context = match auth_contexts.ensure_default(&agent.id) {
+                            Ok(context) => context,
+                            Err(error) => {
+                                tracing::warn!(
+                                    target: "vibex_desktop",
+                                    agent_id = %agent.id,
+                                    error_code = %error.code,
+                                    "Agent default authentication context bootstrap failed"
+                                );
+                                continue;
+                            }
+                        };
+                        if context.status != vibex_core::AgentAuthContextStatus::Unverified {
+                            continue;
+                        }
+                        if let Err(error) = auth_contexts
+                            .verify(vibex_core::AgentAuthContextVerifyRequest {
+                                auth_context_id: context.id,
+                                expected_context_revision: context.revision,
+                                operation_id: None,
+                            })
+                            .await
+                        {
+                            tracing::warn!(
+                                target: "vibex_desktop",
+                                agent_id = %agent.id,
+                                error_code = %error.code,
+                                "Agent default authentication context verification failed"
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "vibex_desktop",
+                        error_code = %error.code,
+                        "Agent default authentication context inventory failed"
+                    );
                 }
             }
             let mut runtime_options_changed = false;
@@ -1256,6 +1394,68 @@ impl DesktopRuntime {
         Ok(())
     }
 
+    fn spawn_agent_auth_context_consumer(&self) -> VibexResult<()> {
+        let mut tasks = self.tasks.lock().map_err(|_| {
+            VibexError::process(
+                "desktop_runtime_task_lock_failed",
+                "desktop runtime task ownership is unavailable",
+            )
+        })?;
+        let mut receiver = self.agent.auth_contexts.subscribe_changes();
+        let events = self.events.clone();
+        let gateway = self.remote.gateway.clone();
+        tasks.push(tokio::spawn(async move {
+            loop {
+                let first = match receiver.recv().await {
+                    Ok(change) => change,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let _ = events.send(DesktopEvent::ProviderConfigChanged(
+                            ProviderConfigChangedEvent {
+                                provider_profile_ids: Vec::new(),
+                                phase: ProviderConfigChangePhase::RuntimeOptionsChanged,
+                            },
+                        ));
+                        if let Err(error) = gateway.publish_provider_invalidation() {
+                            tracing::warn!(
+                                target: "vibex_desktop",
+                                error_code = %error.code,
+                                "Remote Agent authentication catalog invalidation failed"
+                            );
+                        }
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                };
+                let mut agent_ids = BTreeSet::from([first.agent_id]);
+                let mut auth_context_ids = BTreeSet::from([first.auth_context_id]);
+                while let Ok(change) = receiver.try_recv() {
+                    agent_ids.insert(change.agent_id);
+                    auth_context_ids.insert(change.auth_context_id);
+                }
+                tracing::debug!(
+                    target: "vibex_desktop",
+                    agent_count = agent_ids.len(),
+                    auth_context_count = auth_context_ids.len(),
+                    "Agent authentication runtime options changed"
+                );
+                let _ = events.send(DesktopEvent::ProviderConfigChanged(
+                    ProviderConfigChangedEvent {
+                        provider_profile_ids: Vec::new(),
+                        phase: ProviderConfigChangePhase::RuntimeOptionsChanged,
+                    },
+                ));
+                if let Err(error) = gateway.publish_provider_invalidation() {
+                    tracing::warn!(
+                        target: "vibex_desktop",
+                        error_code = %error.code,
+                        "Remote Agent authentication catalog invalidation failed"
+                    );
+                }
+            }
+        }));
+        Ok(())
+    }
+
     fn spawn_event_bridges(&self) -> VibexResult<()> {
         let mut tasks = self.tasks.lock().map_err(|_| {
             VibexError::process(
@@ -1265,11 +1465,26 @@ impl DesktopRuntime {
         })?;
         let mut timeline = self.agent.manager.subscribe();
         let timeline_events = self.events.clone();
+        let auth_contexts = self.agent.auth_contexts();
         tasks.push(tokio::spawn(async move {
             loop {
                 match timeline.recv().await {
                     Ok(event) => {
-                        let _ = timeline_events.send(DesktopEvent::Timeline(event));
+                        let _ = timeline_events.send(DesktopEvent::Timeline(event.clone()));
+                        if let TimelinePayload::Error(error) = &event.item.payload
+                            && let Err(failure) = auth_contexts
+                                .handle_timeline_authentication_required(
+                                    &event.session_id,
+                                    &error.code,
+                                )
+                                .await
+                        {
+                            tracing::warn!(
+                                target: "vibex_desktop",
+                                error_code = %failure.code,
+                                "Agent authentication failure invalidation failed"
+                            );
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         let _ = timeline_events.send(DesktopEvent::Lagged {
@@ -1843,8 +2058,16 @@ fn build_agent_manager(
 mod tests {
     use super::*;
     use vibex_core::{
-        ProviderKind, ProviderOptions, ProviderProfileCreateRequest, ProviderProfileDeleteRequest,
-        TerminalStatus, WorkspaceMode,
+        AcpAdapterId, AgentAuthContextStatus, AgentAuthModelCatalogSnapshot,
+        AgentAuthModelCatalogStatus, AgentModelDiscoverySource, AgentSessionSafety,
+        AgentSessionState, BindingState, NativeStateHomeId, ProviderKind, ProviderOptions,
+        ProviderProfileCreateRequest, ProviderProfileDeleteRequest, RuntimeBinding,
+        SessionRuntimeConfigState, SessionRuntimeSelection, TerminalStatus, TransportKind,
+        WorkspaceMode,
+    };
+    use vibex_db::{
+        AgentAuthContextRepository, AgentAuthModelCatalogRepository, AgentSessionRuntimeRepository,
+        SessionRepository,
     };
 
     #[test]
@@ -1887,6 +2110,18 @@ mod tests {
         assert!(bootstrap.contains("install_service.bootstrap_agent_ids()"));
         assert!(bootstrap.contains("install_service.ensure_installed(agent_id)"));
         assert!(!bootstrap.contains("refresh_missing"));
+        assert!(bootstrap.contains("agent.added"));
+        assert!(bootstrap.contains("agent.enabled"));
+        assert!(bootstrap.contains("agent.installed"));
+        assert!(bootstrap.contains("auth_contexts.supports_agent_account(&agent.id)"));
+        assert!(bootstrap.contains("auth_contexts.ensure_default(&agent.id)"));
+        assert!(
+            bootstrap.contains("context.status != vibex_core::AgentAuthContextStatus::Unverified")
+        );
+        assert!(
+            bootstrap.find("auth_contexts.ensure_default(&agent.id)")
+                < bootstrap.find("runtime_catalog.probe_missing_enabled_agents().await")
+        );
         assert!(bootstrap.contains("runtime_catalog.probe_missing_enabled_agents().await"));
         assert!(bootstrap.contains("probe_missing_enabled_profile_models().await"));
         assert!(bootstrap.contains("ProviderConfigChangePhase::RuntimeOptionsChanged"));
@@ -1963,6 +2198,169 @@ mod tests {
         runtime.shutdown().await.unwrap();
         let replacement = DesktopRuntime::start(config).await.unwrap();
         replacement.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_authentication_failure_invalidates_only_the_current_account_revision() {
+        let home = tempfile::tempdir().unwrap();
+        let config = DesktopRuntimeConfig::isolated_test(home.path());
+        let agent_id = vibex_core::AgentId::parse("codex").unwrap();
+        ProviderConfigService::new(&config.database_path)
+            .update_agent_config(vibex_core::AgentUpdateConfigRequest {
+                agent_id: agent_id.clone(),
+                added: Some(false),
+                enabled: Some(false),
+                label_override: None,
+                description_override: None,
+                order_index: None,
+                command: None,
+                env: None,
+                params: None,
+            })
+            .unwrap();
+        let runtime = DesktopRuntime::start(config.clone()).await.unwrap();
+        let service = runtime.agent().auth_contexts();
+        let initial = service.ensure_default(&agent_id).unwrap();
+        let now = vibex_core::unix_timestamp_ms();
+        let mut conn = open_database(&config.database_path).unwrap();
+        let authenticated = AgentAuthContextRepository::compare_and_set(
+            &conn,
+            &initial.id,
+            initial.revision,
+            AgentAuthContextStatus::Authenticated,
+            None,
+            Some("browser-login"),
+            Some(now),
+            false,
+        )
+        .unwrap();
+        let (_project, workspace) = WorkspaceRepository::ensure(
+            &conn,
+            home.path().join("workspace"),
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let session = AgentSession {
+            id: vibex_core::VibexSessionId::new(),
+            title: "Authentication failure".to_string(),
+            project_id: workspace.project_id.clone(),
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path.clone(),
+            workspace_mode: workspace.mode,
+            agent_id: agent_id.clone(),
+            state: AgentSessionState::Idle,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_message_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        SessionRepository::insert(&conn, &session).unwrap();
+        let selection =
+            SessionRuntimeSelection::agent_default(agent_id.clone(), authenticated.id.clone());
+        let binding = RuntimeBinding {
+            binding_id: vibex_core::RuntimeBindingId::new(),
+            session_id: session.id.clone(),
+            agent_id,
+            transport_kind: TransportKind::Acp,
+            auth_source: selection.auth_source.clone(),
+            auth_source_revision: authenticated.revision,
+            adapter_id: AcpAdapterId::parse("codex-acp").unwrap(),
+            adapter_version: "test-v1".to_string(),
+            adapter_compatibility_identity: "codex-acp@test".to_string(),
+            native_session_id: Some("native-test".to_string()),
+            native_state_home_id: NativeStateHomeId::new(),
+            provider_resume_identity: None,
+            process_spawn_fingerprint: "spawn-test".to_string(),
+            session_runtime_config_state: SessionRuntimeConfigState::default(),
+            capability_snapshot: None,
+            restore_compatibility_key: None,
+            last_context_sequence: 0,
+            last_summary_sequence: 0,
+            context_bridge_version: 0,
+            activation_generation: 1,
+            binding_state: BindingState::Current,
+            created_by_switch_id: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        AgentSessionRuntimeRepository::initialize_runtime_selection(
+            &mut conn, &binding, &selection,
+        )
+        .unwrap();
+        AgentAuthModelCatalogRepository::upsert(
+            &conn,
+            &AgentAuthModelCatalogSnapshot {
+                auth_context_id: authenticated.id.clone(),
+                auth_context_revision: authenticated.revision,
+                runtime_fingerprint: "spawn-test".to_string(),
+                discovery_source: AgentModelDiscoverySource::AgentDefault,
+                status: AgentAuthModelCatalogStatus::AgentDefaultOnly,
+                models: Vec::new(),
+                last_success_at_ms: Some(now),
+                last_attempt_at_ms: now,
+                last_error_code: None,
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut changes = service.subscribe_changes();
+        assert!(
+            service
+                .handle_timeline_authentication_required(
+                    &session.id,
+                    "provider_authentication_required",
+                )
+                .await
+                .unwrap()
+        );
+        let changed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match changes.recv().await {
+                    Ok(changed) if changed.auth_context_id == authenticated.id => break changed,
+                    Ok(_) => continue,
+                    Err(error) => panic!("authentication context change stream closed: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(changed.auth_context_id, authenticated.id);
+        let current = service.get(&authenticated.id).unwrap();
+        assert_eq!(
+            current.status,
+            AgentAuthContextStatus::AuthenticationRequired
+        );
+        assert_eq!(current.revision, authenticated.revision + 1);
+        let conn = open_database(&config.database_path).unwrap();
+        assert!(
+            AgentAuthModelCatalogRepository::get(
+                &conn,
+                &authenticated.id,
+                authenticated.revision,
+                "spawn-test",
+            )
+            .unwrap()
+            .is_none()
+        );
+        drop(conn);
+        assert!(
+            !service
+                .handle_timeline_authentication_required(
+                    &session.id,
+                    "provider_authentication_required",
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            service.get(&authenticated.id).unwrap().revision,
+            current.revision
+        );
+
+        runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

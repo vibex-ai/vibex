@@ -1058,6 +1058,7 @@ pub fn remote_permissions_for_level(
     if permission_level == RemoteDevicePermissionLevel::FullControl {
         permissions.extend([
             RemoteActionClass::MutateAgentSession,
+            RemoteActionClass::MutateAgentAuthentication,
             RemoteActionClass::MutateFile,
             RemoteActionClass::MutateGit,
             RemoteActionClass::MutateTerminal,

@@ -11,11 +11,15 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use vibex_core::{
-    AgentConfigStatus, AgentId, AgentReasoningEffort, AgentRuntimeStatus, AgentSnapshotEntry,
-    ProviderKind, ProviderProfileStatus, ProviderProfileSummary, ProviderSessionConfigOption,
-    ProviderSessionConfigOptionKind, ProviderSessionConfigValue, RuntimeOptionAvailability,
-    SessionConfigValue, SessionRuntimeFeature, SessionRuntimeFeatureKind, SessionRuntimeOption,
-    SessionRuntimeOptionCatalog, SessionRuntimeSelection,
+    AgentAuthContext, AgentAuthContextStatus, AgentAuthModelCatalogSnapshot,
+    AgentAuthModelCatalogStatus, AgentConfigStatus, AgentId, AgentReasoningEffort,
+    AgentRuntimeStatus, AgentSnapshotEntry, ProviderKind, ProviderProfileStatus,
+    ProviderProfileSummary, ProviderSessionConfigOption, ProviderSessionConfigOptionKind,
+    ProviderSessionConfigValue, RuntimeAgentSummary, RuntimeAuthSource, RuntimeAuthSourceAction,
+    RuntimeAuthSourceAvailability, RuntimeAuthSourceKind, RuntimeAuthSourceSummary,
+    RuntimeModelSelection, RuntimeOptionAvailability, SessionConfigValue, SessionRuntimeFeature,
+    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
+    SessionRuntimeSelection,
 };
 
 use crate::protocol::{AcpOperation, AcpOperationStability, AcpWireEncoding, CapabilitySource};
@@ -726,17 +730,13 @@ pub fn build_runtime_option_catalog_for_agents(
                     .is_some_and(|model| !model.trim().is_empty()),
         );
         for (model_id, model_label) in model_ids {
+            let mut selection =
+                SessionRuntimeSelection::provider(agent.id.clone(), profile.id.clone(), model_id);
+            selection.config_values = feature_config_values.clone();
             options.push(SessionRuntimeOption {
-                selection: SessionRuntimeSelection {
-                    agent_id: agent.id.clone(),
-                    provider_profile_id: profile.id.clone(),
-                    model_id,
-                    reasoning_effort: None,
-                    mode_id: None,
-                    config_values: feature_config_values.clone(),
-                },
+                selection,
                 agent_label: bounded_catalog_label(&agent.label),
-                provider_profile_label: bounded_catalog_label(&profile.display_name),
+                auth_source_label: bounded_catalog_label(&profile.display_name),
                 model_label,
                 reasoning_efforts: reasoning_efforts.clone(),
                 modes: modes.clone(),
@@ -746,10 +746,14 @@ pub fn build_runtime_option_catalog_for_agents(
         }
     }
 
-    SessionRuntimeOptionCatalog {
-        revision: runtime_option_catalog_revision(&options),
+    let mut catalog = SessionRuntimeOptionCatalog {
+        revision: 1,
+        agents: catalog_agent_summaries(agents),
+        auth_sources: provider_auth_source_summaries(agents, profiles),
         options,
-    }
+    };
+    refresh_runtime_option_catalog_revision(&mut catalog, std::iter::empty::<&[u8]>());
+    catalog
 }
 
 /// Builds the redacted, deterministic Runtime Option Catalog consumed by
@@ -866,17 +870,13 @@ pub fn build_runtime_option_catalog(
                         .map(|value| (feature.id.clone(), value.value.clone()))
                 })
                 .collect::<BTreeMap<_, _>>();
+            let mut selection =
+                SessionRuntimeSelection::provider(agent.id.clone(), profile.id.clone(), model_id);
+            selection.config_values = feature_config_values;
             options.push(SessionRuntimeOption {
-                selection: SessionRuntimeSelection {
-                    agent_id: agent.id.clone(),
-                    provider_profile_id: profile.id.clone(),
-                    model_id,
-                    reasoning_effort: None,
-                    mode_id: None,
-                    config_values: feature_config_values,
-                },
+                selection,
                 agent_label: bounded_catalog_label(&agent.label),
-                provider_profile_label: bounded_catalog_label(&profile.display_name),
+                auth_source_label: bounded_catalog_label(&profile.display_name),
                 model_label,
                 reasoning_efforts: model_evidence
                     .filter(|model| {
@@ -897,10 +897,231 @@ pub fn build_runtime_option_catalog(
         }
     }
 
-    SessionRuntimeOptionCatalog {
-        revision: runtime_option_catalog_revision(&options),
+    let mut catalog = SessionRuntimeOptionCatalog {
+        revision: 1,
+        agents: catalog_agent_summaries(agents),
+        auth_sources: provider_auth_source_summaries(agents, profiles),
         options,
+    };
+    refresh_runtime_option_catalog_revision(&mut catalog, std::iter::empty::<&[u8]>());
+    catalog
+}
+
+/// Adds the one default account owned by an Agent to an existing Provider
+/// catalog. Account sources remain visible while signed out; executable model
+/// options are emitted only from evidence for the current context revision.
+pub fn append_agent_account_runtime_options(
+    catalog: &mut SessionRuntimeOptionCatalog,
+    agent: &AgentSnapshotEntry,
+    context: &AgentAuthContext,
+    snapshot: Option<&AgentAuthModelCatalogSnapshot>,
+    supports_logout: bool,
+) {
+    let model_catalog_status = snapshot
+        .map(|snapshot| snapshot.status)
+        .unwrap_or(AgentAuthModelCatalogStatus::Unknown);
+    let availability = agent_account_availability(agent, context, model_catalog_status);
+    let mut supported_actions = Vec::new();
+    if context.status != AgentAuthContextStatus::Verifying {
+        supported_actions.push(RuntimeAuthSourceAction::Authenticate);
+        supported_actions.push(RuntimeAuthSourceAction::Verify);
     }
+    if context.status == AgentAuthContextStatus::Authenticated {
+        supported_actions.push(RuntimeAuthSourceAction::RefreshModels);
+        if supports_logout {
+            supported_actions.push(RuntimeAuthSourceAction::Logout);
+        }
+    }
+    let source = RuntimeAuthSource::agent_account(context.id.clone());
+    catalog.auth_sources.push(RuntimeAuthSourceSummary {
+        source: source.clone(),
+        auth_source_revision: context.revision,
+        agent_id: agent.id.clone(),
+        label: "Default CLI account".to_string(),
+        kind: RuntimeAuthSourceKind::AgentAccount,
+        availability,
+        account_hint: context.account_hint.as_deref().map(bounded_catalog_label),
+        model_catalog_status,
+        supported_actions,
+    });
+    if availability != RuntimeAuthSourceAvailability::Available {
+        return;
+    }
+
+    match snapshot.map(|snapshot| snapshot.status) {
+        Some(AgentAuthModelCatalogStatus::Available) => {
+            for model in snapshot
+                .into_iter()
+                .flat_map(|snapshot| snapshot.models.iter())
+            {
+                let Ok(model_id) = validate_model_value(&model.model_id) else {
+                    continue;
+                };
+                let reasoning_efforts = model.reasoning_efforts.clone();
+                let modes = model.modes.clone();
+                let features = model.features.clone();
+                let mut selection =
+                    SessionRuntimeSelection::agent_default(agent.id.clone(), context.id.clone());
+                selection.model = RuntimeModelSelection::explicit(model_id);
+                selection.config_values = default_feature_values(&features);
+                catalog.options.push(SessionRuntimeOption {
+                    selection,
+                    agent_label: bounded_catalog_label(&agent.label),
+                    auth_source_label: "Default CLI account".to_string(),
+                    model_label: bounded_catalog_label(&model.label),
+                    reasoning_efforts,
+                    modes,
+                    features,
+                    availability: RuntimeOptionAvailability::Available,
+                });
+            }
+        }
+        Some(AgentAuthModelCatalogStatus::AgentDefaultOnly) => {
+            let selection =
+                SessionRuntimeSelection::agent_default(agent.id.clone(), context.id.clone());
+            catalog.options.push(SessionRuntimeOption {
+                selection,
+                agent_label: bounded_catalog_label(&agent.label),
+                auth_source_label: "Default CLI account".to_string(),
+                model_label: "Selected automatically by Agent".to_string(),
+                reasoning_efforts: Vec::new(),
+                modes: Vec::new(),
+                features: Vec::new(),
+                availability: RuntimeOptionAvailability::Available,
+            });
+        }
+        _ => {}
+    }
+}
+
+fn default_feature_values(features: &[SessionRuntimeFeature]) -> BTreeMap<String, String> {
+    features
+        .iter()
+        .filter_map(|feature| {
+            feature
+                .current_value
+                .as_ref()
+                .or(feature.default_value.as_ref())
+                .map(|value| (feature.id.clone(), value.value.clone()))
+        })
+        .collect()
+}
+
+fn agent_account_availability(
+    agent: &AgentSnapshotEntry,
+    context: &AgentAuthContext,
+    model_catalog_status: AgentAuthModelCatalogStatus,
+) -> RuntimeAuthSourceAvailability {
+    if !agent.installed {
+        return RuntimeAuthSourceAvailability::Unsupported;
+    }
+    if matches!(
+        agent.runtime_status,
+        AgentRuntimeStatus::Unavailable | AgentRuntimeStatus::ProbeFailed
+    ) {
+        return RuntimeAuthSourceAvailability::TemporarilyUnavailable;
+    }
+    match context.status {
+        AgentAuthContextStatus::Unverified | AgentAuthContextStatus::AuthenticationRequired => {
+            RuntimeAuthSourceAvailability::RequiresAuthentication
+        }
+        AgentAuthContextStatus::Verifying => RuntimeAuthSourceAvailability::Verifying,
+        AgentAuthContextStatus::Unavailable => {
+            RuntimeAuthSourceAvailability::TemporarilyUnavailable
+        }
+        AgentAuthContextStatus::Authenticated => match model_catalog_status {
+            AgentAuthModelCatalogStatus::Available
+            | AgentAuthModelCatalogStatus::AgentDefaultOnly => {
+                RuntimeAuthSourceAvailability::Available
+            }
+            AgentAuthModelCatalogStatus::AuthenticationRequired => {
+                RuntimeAuthSourceAvailability::RequiresAuthentication
+            }
+            AgentAuthModelCatalogStatus::Unavailable => {
+                RuntimeAuthSourceAvailability::TemporarilyUnavailable
+            }
+            AgentAuthModelCatalogStatus::Unknown | AgentAuthModelCatalogStatus::Discovering => {
+                RuntimeAuthSourceAvailability::DiscoveringModels
+            }
+        },
+    }
+}
+
+fn catalog_agent_summaries(agents: &[AgentSnapshotEntry]) -> Vec<RuntimeAgentSummary> {
+    let mut enabled = agents
+        .iter()
+        .filter(|agent| agent.added && agent.enabled)
+        .collect::<Vec<_>>();
+    enabled.sort_by(|left, right| {
+        left.order_index
+            .cmp(&right.order_index)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    enabled
+        .into_iter()
+        .map(|agent| RuntimeAgentSummary {
+            agent_id: agent.id.clone(),
+            label: bounded_catalog_label(&agent.label),
+        })
+        .collect()
+}
+
+fn provider_auth_source_summaries(
+    agents: &[AgentSnapshotEntry],
+    profiles: &[ProviderProfileSummary],
+) -> Vec<RuntimeAuthSourceSummary> {
+    let agents_by_id = agents
+        .iter()
+        .filter(|agent| agent.added && agent.enabled)
+        .map(|agent| (agent.id.clone(), agent))
+        .collect::<BTreeMap<_, _>>();
+    let mut summaries = profiles
+        .iter()
+        .filter(|profile| {
+            profile.kind == ProviderKind::Acp && profile.status == ProviderProfileStatus::Enabled
+        })
+        .filter_map(|profile| {
+            let agent = agents_by_id.get(&profile.agent_id)?;
+            Some((
+                agent.order_index,
+                RuntimeAuthSourceSummary {
+                    source: RuntimeAuthSource::provider_profile(profile.id.clone()),
+                    auth_source_revision: profile.updated_at_ms,
+                    agent_id: profile.agent_id.clone(),
+                    label: bounded_catalog_label(&profile.display_name),
+                    kind: RuntimeAuthSourceKind::ProviderProfile,
+                    availability: if matches!(
+                        agent.config_status,
+                        AgentConfigStatus::NeedsConfiguration | AgentConfigStatus::Unknown
+                    ) {
+                        RuntimeAuthSourceAvailability::RequiresConfiguration
+                    } else {
+                        RuntimeAuthSourceAvailability::Available
+                    },
+                    account_hint: None,
+                    model_catalog_status: if profile.configured_models.is_empty()
+                        && profile
+                            .default_model
+                            .as_deref()
+                            .is_none_or(|model| model.trim().is_empty())
+                    {
+                        AgentAuthModelCatalogStatus::Unknown
+                    } else {
+                        AgentAuthModelCatalogStatus::Available
+                    },
+                    supported_actions: vec![RuntimeAuthSourceAction::ConfigureProvider],
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    summaries.sort_by(|(left_order, left), (right_order, right)| {
+        left_order
+            .cmp(right_order)
+            .then_with(|| left.agent_id.cmp(&right.agent_id))
+            .then_with(|| left.label.cmp(&right.label))
+            .then_with(|| left.source.id().cmp(right.source.id()))
+    });
+    summaries.into_iter().map(|(_, summary)| summary).collect()
 }
 
 fn catalog_availability(
@@ -1050,6 +1271,15 @@ fn catalog_features(
     features
 }
 
+pub(crate) fn runtime_features_from_options(
+    options: &[ProviderSessionConfigOption],
+) -> Vec<SessionRuntimeFeature> {
+    catalog_features(Some(&RuntimeOptionCatalogProfileEvidence {
+        options: options.to_vec(),
+        ..Default::default()
+    }))
+}
+
 fn is_structural_catalog_option(option: &ProviderSessionConfigOption, id: &str) -> bool {
     const STRUCTURAL_KEYS: [&str; 6] = [
         CANONICAL_MODEL,
@@ -1103,18 +1333,66 @@ fn bounded_catalog_label(value: &str) -> String {
     value[..end].to_string()
 }
 
-fn runtime_option_catalog_revision(options: &[SessionRuntimeOption]) -> i64 {
+/// Recomputes the deterministic stale-selection revision after callers merge
+/// additional authentication sources into the catalog. Extra components are
+/// reserved for safe internal identities such as a model-catalog fingerprint.
+pub fn refresh_runtime_option_catalog_revision<'a>(
+    catalog: &mut SessionRuntimeOptionCatalog,
+    extra_components: impl IntoIterator<Item = &'a [u8]>,
+) {
     let mut hasher = Sha256::new();
     write_catalog_component(&mut hasher, RUNTIME_OPTION_CATALOG_DOMAIN);
-    for option in options {
+    for agent in &catalog.agents {
+        write_catalog_component(&mut hasher, b"agent");
+        write_catalog_component(&mut hasher, agent.agent_id.as_str().as_bytes());
+        write_catalog_component(&mut hasher, agent.label.as_bytes());
+    }
+    for source in &catalog.auth_sources {
+        write_catalog_component(&mut hasher, b"auth_source");
+        write_catalog_component(&mut hasher, source.agent_id.as_str().as_bytes());
+        write_catalog_component(
+            &mut hasher,
+            match source.kind {
+                RuntimeAuthSourceKind::ProviderProfile => b"provider_profile",
+                RuntimeAuthSourceKind::AgentAccount => b"agent_account",
+            },
+        );
+        write_catalog_component(&mut hasher, source.source.id().as_bytes());
+        write_catalog_component(&mut hasher, &source.auth_source_revision.to_be_bytes());
+        write_catalog_component(&mut hasher, source.label.as_bytes());
+        write_catalog_component(
+            &mut hasher,
+            source
+                .account_hint
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        write_catalog_component(&mut hasher, format!("{:?}", source.availability).as_bytes());
+        write_catalog_component(
+            &mut hasher,
+            format!("{:?}", source.model_catalog_status).as_bytes(),
+        );
+        for action in &source.supported_actions {
+            write_catalog_component(&mut hasher, format!("{action:?}").as_bytes());
+        }
+    }
+    for option in &catalog.options {
         write_catalog_component(&mut hasher, option.selection.agent_id.as_str().as_bytes());
         write_catalog_component(
             &mut hasher,
-            option.selection.provider_profile_id.as_str().as_bytes(),
+            match option.selection.auth_source.kind() {
+                RuntimeAuthSourceKind::ProviderProfile => b"provider_profile",
+                RuntimeAuthSourceKind::AgentAccount => b"agent_account",
+            },
         );
-        write_catalog_component(&mut hasher, option.selection.model_id.as_bytes());
+        write_catalog_component(&mut hasher, option.selection.auth_source.id().as_bytes());
+        write_catalog_component(
+            &mut hasher,
+            option.selection.model_id().unwrap_or_default().as_bytes(),
+        );
         write_catalog_component(&mut hasher, option.agent_label.as_bytes());
-        write_catalog_component(&mut hasher, option.provider_profile_label.as_bytes());
+        write_catalog_component(&mut hasher, option.auth_source_label.as_bytes());
         write_catalog_component(&mut hasher, option.model_label.as_bytes());
         write_catalog_component(
             &mut hasher,
@@ -1183,11 +1461,15 @@ fn runtime_option_catalog_revision(options: &[SessionRuntimeOption]) -> i64 {
             }
         }
     }
+    for component in extra_components {
+        write_catalog_component(&mut hasher, b"extra");
+        write_catalog_component(&mut hasher, component);
+    }
     let digest = hasher.finalize();
     let mut revision = [0_u8; 8];
     revision.copy_from_slice(&digest[..8]);
     let revision = i64::from_be_bytes(revision) & i64::MAX;
-    if revision == 0 { 1 } else { revision }
+    catalog.revision = if revision == 0 { 1 } else { revision };
 }
 
 fn write_catalog_component(hasher: &mut Sha256, value: &[u8]) {
@@ -1305,8 +1587,9 @@ pub fn validate_effort_value(value: &str) -> Result<String, &'static str> {
 mod tests {
     use super::*;
     use vibex_core::{
-        ProviderConfiguredModel, ProviderKind, ProviderProfileStatus, ProviderSecretSetupState,
-        ProviderSessionConfigOptionKind, ProviderSessionConfigValue, builtin_agent_definitions,
+        AgentAuthContextId, AgentModelDiscoverySource, ProviderConfiguredModel, ProviderKind,
+        ProviderProfileStatus, ProviderSecretSetupState, ProviderSessionConfigOptionKind,
+        ProviderSessionConfigValue, builtin_agent_definitions,
     };
 
     fn evidence(
@@ -1369,6 +1652,92 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn agent_account_catalog_exposes_one_source_and_real_agent_default_selection() {
+        let definition = builtin_agent_definitions()
+            .into_iter()
+            .find(|definition| definition.id.as_str() == "codex")
+            .unwrap();
+        let mut agent = AgentSnapshotEntry::from_definition(&definition, None, None);
+        agent.added = true;
+        agent.enabled = true;
+        agent.installed = true;
+        agent.configured = true;
+        agent.config_status = AgentConfigStatus::Configured;
+        agent.runtime_status = AgentRuntimeStatus::Ready;
+        let context = AgentAuthContext {
+            id: AgentAuthContextId::new(),
+            agent_id: agent.id.clone(),
+            status: AgentAuthContextStatus::Authenticated,
+            account_hint: Some("work account".to_string()),
+            authenticated_via_method: Some("browser".to_string()),
+            revision: 4,
+            last_verified_at_ms: Some(10),
+            created_at_ms: 1,
+            updated_at_ms: 10,
+        };
+        let snapshot = AgentAuthModelCatalogSnapshot {
+            auth_context_id: context.id.clone(),
+            auth_context_revision: context.revision,
+            runtime_fingerprint: "codex-runtime-v1".to_string(),
+            discovery_source: AgentModelDiscoverySource::AgentDefault,
+            status: AgentAuthModelCatalogStatus::AgentDefaultOnly,
+            models: Vec::new(),
+            last_success_at_ms: Some(10),
+            last_attempt_at_ms: 10,
+            last_error_code: None,
+        };
+        let mut catalog = build_runtime_option_catalog(&[agent.clone()], &[], &BTreeMap::new());
+
+        append_agent_account_runtime_options(&mut catalog, &agent, &context, Some(&snapshot), true);
+
+        assert_eq!(catalog.auth_sources.len(), 1);
+        let source = &catalog.auth_sources[0];
+        assert_eq!(
+            source.source,
+            RuntimeAuthSource::agent_account(context.id.clone())
+        );
+        assert_eq!(source.auth_source_revision, context.revision);
+        assert_eq!(
+            source.availability,
+            RuntimeAuthSourceAvailability::Available
+        );
+        assert_eq!(source.account_hint.as_deref(), Some("work account"));
+        assert!(
+            source
+                .supported_actions
+                .contains(&RuntimeAuthSourceAction::Logout)
+        );
+        assert_eq!(catalog.options.len(), 1);
+        assert_eq!(catalog.options[0].selection.auth_source, source.source);
+        assert_eq!(
+            catalog.options[0].selection.model,
+            RuntimeModelSelection::AgentDefault
+        );
+        assert_eq!(
+            catalog.options[0].model_label,
+            "Selected automatically by Agent"
+        );
+
+        let mut signed_out = context;
+        signed_out.status = AgentAuthContextStatus::AuthenticationRequired;
+        let mut signed_out_catalog =
+            build_runtime_option_catalog(&[agent.clone()], &[], &BTreeMap::new());
+        append_agent_account_runtime_options(
+            &mut signed_out_catalog,
+            &agent,
+            &signed_out,
+            None,
+            true,
+        );
+        assert_eq!(signed_out_catalog.auth_sources.len(), 1);
+        assert_eq!(
+            signed_out_catalog.auth_sources[0].availability,
+            RuntimeAuthSourceAvailability::RequiresAuthentication
+        );
+        assert!(signed_out_catalog.options.is_empty());
     }
 
     #[test]
@@ -1834,7 +2203,7 @@ mod tests {
         );
         assert_eq!(first, second);
         assert_eq!(first.options.len(), 1);
-        assert_eq!(first.options[0].selection.model_id, "gpt-5");
+        assert_eq!(first.options[0].selection.model_id(), Some("gpt-5"));
         assert_eq!(
             first.options[0].availability,
             RuntimeOptionAvailability::Available
@@ -2009,7 +2378,7 @@ mod tests {
             &evidence,
         );
         assert_eq!(catalog.options.len(), 1);
-        assert_eq!(catalog.options[0].selection.model_id, "sonnet");
+        assert_eq!(catalog.options[0].selection.model_id(), Some("sonnet"));
         assert_eq!(catalog.options[0].reasoning_efforts[0].value, "high");
         assert_eq!(catalog.options[0].modes[0].value, "plan");
         assert_eq!(catalog.options[0].features[0].id, "fast_mode");

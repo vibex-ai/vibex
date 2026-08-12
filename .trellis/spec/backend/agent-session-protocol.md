@@ -19,14 +19,16 @@ Persist three independent layers of identity:
 
 - Logical Session: `AgentSession.id` is the stable id used by UI, remote
   clients, database records, links, and audit logs. `AgentSession.agent_id` is
-  required; Profile/Model state is not duplicated on this DTO.
+  required; auth-source/model state is not duplicated on this DTO.
 - Product selection: durable desired/effective `SessionRuntimeSelection`
-  identifies `agent_id + provider_profile_id + model_id + optional
-  reasoning_effort/mode_id`.
+  identifies `agent_id + RuntimeAuthSource + RuntimeModelSelection + optional
+  reasoning_effort/mode_id`. The source is either a Provider Profile or the
+  Agent's one default authenticated account; an ACP `methodId` is never a
+  selection identity.
 - Execution fence: the current `RuntimeBinding` and activation generation bind
   the selection to an exact
-  `AgentRuntimeRouteKey { agent_id, Acp, adapter_id }`, process instance, and
-  ACP-native session handle.
+  `AgentRuntimeRouteKey { agent_id, Acp, adapter_id }`, process instance, ACP
+  native session handle, and the source revision verified for that process.
 
 `ProviderKind` may describe configuration, import, diagnostics, or provenance;
 it is never a Logical Session identity, online route key, or fallback choice.
@@ -40,14 +42,17 @@ one attachment.
 ### 1. Scope / Trigger
 
 Session creation and in-session selectors need one provider-neutral list of
-enabled Agent/Profile/Model combinations. Runtime controls belong to the Agent
-CLI, while model choices belong to Provider Profiles. The catalog joins those
-inputs with an Agent-level fallback and a model-specific capability cache.
+Agent/authentication-source/model combinations. Provider Profiles retain their
+configured model list; an Agent default account contributes models discovered
+inside its own authenticated state home. Sources remain visible even when
+their model catalog is unavailable, so login and retry actions do not disappear.
 
 ### 2. Signatures
 
 ```text
 agent_list_runtime_options() -> SessionRuntimeOptionCatalog
+AgentAuthContextService::list() -> Vec<AgentAuthContext>
+AgentAuthContextService::refresh_models(request) -> AgentAuthContextMutationResult
 RuntimeOptionCatalogService::probe_agent(agent_id) -> RuntimeOptionProbeResult
 RuntimeOptionCatalogService::probe_profile_models(provider_profile_id)
   -> ProviderModelRuntimeOptionProbeResult
@@ -78,14 +83,29 @@ provider_model_runtime_option_snapshots(
   last_error_code,
   PRIMARY KEY(provider_profile_id, model_id)
 )
+
+agent_auth_model_catalog_snapshots(
+  auth_context_id, auth_context_revision, runtime_fingerprint,
+  discovery_source, status, catalog_json, last_success_at_ms,
+  last_attempt_at_ms, last_error_code,
+  PRIMARY KEY(auth_context_id, auth_context_revision, runtime_fingerprint)
+)
 ```
 
 ### 3. Contracts
 
-- Store at most one successful fallback runtime-option snapshot per `agent_id`.
-  It contains modes, reasoning controls, and generic session options only.
-  Clear `AgentSessionConfigProbe.models` before persistence even if an Adapter
-  reports models from `session/new`.
+- Store at most one successful fallback runtime-option snapshot per `agent_id`
+  for Provider Profile projection. It contains modes, reasoning controls, and
+  generic session options only; it must not be used as an Agent account model
+  catalog. The old Agent fallback probe still clears reported models before
+  persistence.
+- Agent account model snapshots are keyed by context id, positive context
+  revision, and runtime fingerprint. Their model descriptors and per-model
+  reasoning/mode/features are evidence from that exact authenticated launch.
+- A source summary is published independently from `options`. An authenticated
+  Agent account with no enumerated models publishes one `AgentDefault` option,
+  not a guessed model id. The serialized projection key is `agent-default`;
+  it is not sent to ACP as a model override.
 - An Agent-level probe launches the configured Agent command with its Agent
   args and Agent env. It must not list or load a Provider Profile, resolve a
   Provider secret, materialize a Provider projection, or use a Provider model.
@@ -115,10 +135,11 @@ provider_model_runtime_option_snapshots(
   OpenCode return the selected model's complete mode, effort, and generic option
   set only from that response. If the operation is rejected, the probe falls
   back to `session/set_model` and re-registers its bounded config-update waiter.
-- Ordinary catalog reads load the SQLite Agent fallback, persisted model
-  snapshots, and current in-memory Profile evidence; they never start an ACP
-  process. Provider mutations trigger only the asynchronous missing-model
-  bootstrap.
+- Ordinary catalog reads load the SQLite Agent fallback, persisted Provider
+  model snapshots, current in-memory Profile evidence, and current-revision
+  Agent account snapshots; they never start an ACP process. Provider mutations
+  trigger only the asynchronous missing-model bootstrap. An explicit Agent
+  account refresh is the only account-catalog mutation path.
 - A real `session/new`, `session/load`, or `session/resume` response publishes
   its safe session configuration under the exact `provider_profile_id`.
   `ConfigOptionUpdate` replaces that session's complete option set, including
@@ -132,7 +153,9 @@ provider_model_runtime_option_snapshots(
   reuse them before falling back to Agent evidence.
 - Enabled ACP Provider Profiles contribute only enabled configured model ids,
   or their configured default model when the explicit list is empty. Agent
-  discovery, Agent probe, and live session models never populate the selector.
+  discovery and the Provider-only Agent probe never populate a Profile's
+  selector. Agent account snapshots populate only their matching account
+  source.
 - Until live evidence exists, every enabled Profile for one Agent receives the
   same fallback modes, reasoning controls, and Features. Once calibrated, each
   Profile may expose its own current Agent-owned controls.
@@ -178,14 +201,19 @@ provider_model_runtime_option_snapshots(
 - Unknown/needs-configuration Agent -> `requires_configuration`.
 - Catalog revision changes -> clients re-fetch and reject stale desired
   selections.
+- Agent account context revision/fingerprint changes -> discard old account
+  model options and require a fresh catalog read; never carry an old explicit
+  model or reasoning value across a relogin.
+- Catalog has an authenticated Agent account but no model evidence -> expose
+  `AgentDefault`, not `Explicit { model_id: "default" }` or another sentinel.
 
 ### 5. Good/Base/Bad Cases
 
 - Good: one Agent probe succeeds, two Provider Profiles render immediately from
   the fallback, then a real session for one Profile replaces only that Profile's
   controls and subsequent updates remove withdrawn choices.
-- Base: an Agent has no Provider Profile. Its controls can be probed and cached,
-  while the session selector remains empty until a Profile supplies a model.
+- Base: an Agent has no Provider Profile. Its default account can still be
+  selected as `AgentDefault`; the selector does not invent a model.
 - Base: a Profile has models but the Agent exposes no reasoning control; its
   models remain selectable and the reasoning selector is empty.
 - Bad: saving a Provider API key clears the Agent snapshot, blocks on a probe,
@@ -201,8 +229,9 @@ provider_model_runtime_option_snapshots(
   fallback and Provider/model-keyed SQLite round trips and deletion.
 - `cargo test -p vibex-config-switch agent_acp_runtime_config --locked` asserts
   command/args/Agent-env resolution without a Provider Profile.
-- `cargo test -p vibex-agent-acp session_config::tests --locked` asserts Agent
-  evidence is shared and models come only from Provider Profiles.
+- `cargo test -p vibex-agent-acp session_config::tests --locked` asserts the
+  Provider fallback evidence is shared without contributing model ids, while
+  Agent-account model evidence remains scoped to its source and revision.
 - `cargo test -p vibex-agent-acp config_option_update --locked` asserts a full
   replacement, runtime-state calibration, and model stripping.
 - `cargo test -p vibex-desktop-runtime catalog --locked` asserts cached reuse,
@@ -211,6 +240,8 @@ provider_model_runtime_option_snapshots(
 - Desktop management tests assert Agent add/discovery/install detection invokes
   `probe_agent`, ordinary toggles and Profile saves do not, and a successful
   snapshot disables the probe button.
+- Agent account catalog tests assert one source per Agent, revision/fingerprint
+  invalidation, explicit model isolation, and the `AgentDefault` fallback.
 
 ### 7. Wrong vs Correct
 
@@ -1133,8 +1164,8 @@ Agents.
   participation.
 - Bad: Selecting `/review` immediately starts execution before the user presses
   Send.
-- Bad: Multiple ACP profiles share one ProviderKind-based static catalog when
-  their command sets diverge; discovery must remain Agent/Profile-aware.
+- Bad: Multiple ACP sources share one ProviderKind-based static catalog when
+  their command sets diverge; discovery must remain Agent/auth-source-aware.
 
 ### 6. Tests Required
 
@@ -1666,7 +1697,7 @@ and `AdapterDiagnosticsRepository`.
   `bypassAllPermissions = false`. A bypass/all-permissions session must be an
   explicit session setting and visible in durable session/timeline data.
 - `AgentSession.id` is the only primary session id crossing UI/API boundaries.
-  `AgentSession.agentId` is required. Profile/Model, binding/generation,
+  `AgentSession.agentId` is required. Auth-source/model, binding/generation,
   Adapter, process, and ACP-native ids remain outside the session DTO.
 - `AgentSession.updatedAtMs` tracks session state and metadata mutations.
   Sidebar display and ordering use `lastMessageAtMs`, derived from the latest
@@ -2603,7 +2634,7 @@ logout({})
   `initialize` and prevents authentication discovery from completing.
 - Auth discovery and mutation results are fenced by `(agent_id,
   provider_profile_id?)` and a monotonically increasing UI generation. A late
-  result may not replace a newly selected Agent/Profile or reattach a terminal.
+  result may not replace a newly selected Agent/auth scope or reattach a terminal.
 - Every authenticate call carries a product-level
   `AgentAuthenticationOperationId`. The ACP runtime reserves it before process
   initialization, associates it with the dedicated temporary auth process, and
@@ -2680,7 +2711,7 @@ logout({})
   exact key names, blank preservation, explicit clear, keychain rollback, and
   secret-free projections.
 - Desktop Management tests cover method rendering, masked inputs, logout
-  visibility, terminal exit classification, and Agent/Profile generation
+  visibility, terminal exit classification, and Agent/auth-scope generation
   fencing.
 
 ### 7. Wrong vs Correct
@@ -2714,6 +2745,185 @@ agent.cancel_agent_authentication(AgentAuthenticationCancelRequest {
 
 The Agent owns the method contract; Vibex owns the common UI, Profile secret
 reference, `authenticate(method_id)`, and terminal lifecycle.
+
+## Scenario: ACP Default Account Authentication Source And Model Discovery
+
+### 1. Scope / Trigger
+
+- Trigger: an ACP Agent exposes a browser, terminal, or Agent-owned login path
+  whose credentials live in the Agent's normal default state home, and a
+  session must use that account without a Provider Profile.
+- This is the contract for the one `AgentAuthContext` allowed per Agent. It
+  complements the dynamic method contract above; a method describes an action,
+  while the context is the durable runtime identity.
+- Login, verification, model discovery, runtime switching, logout, timeline
+  attribution, and usage facts must all use the same context revision.
+
+### 2. Signatures
+
+```text
+AgentAuthContextService::ensure_default(agent_id)
+  -> AgentAuthContext
+AgentAuthContextService::list()
+  -> Vec<AgentAuthContext>
+AgentAuthContextService::authenticate(
+  AgentAuthContextAuthenticateRequest {
+    operation_id, auth_context_id, expected_context_revision, method_id
+  }
+) -> AgentAuthContextAuthenticateResult
+AgentAuthContextService::verify(
+  AgentAuthContextVerifyRequest {
+    auth_context_id, expected_context_revision, operation_id?
+  }
+) -> AgentAuthContextMutationResult
+AgentAuthContextService::refresh_models(
+  AgentAuthContextRefreshModelsRequest {
+    auth_context_id, expected_context_revision
+  }
+) -> AgentAuthContextMutationResult
+AgentAuthContextService::logout_preview(auth_context_id)
+  -> AgentAuthContextLogoutPreview
+AgentAuthContextService::logout(
+  AgentAuthContextLogoutRequest {
+    auth_context_id, expected_context_revision,
+    confirmed_affected_session_count
+  }
+) -> AgentAuthContextMutationResult
+
+RuntimeAuthSource =
+  ProviderProfile { provider_profile_id }
+  | AgentAccount { auth_context_id }
+
+RuntimeModelSelection = Explicit { model_id } | AgentDefault
+
+AgentAuthModelCatalogSnapshot {
+  auth_context_id, auth_context_revision, runtime_fingerprint,
+  discovery_source, status, models[], last_success_at_ms?,
+  last_attempt_at_ms, last_error_code?
+}
+```
+
+### 3. Contracts
+
+- `ensure_default` is idempotent and the database `UNIQUE(agent_id)` constraint
+  is the final fence. No UI or API may add, copy, name, or select a second
+  account for the same Agent.
+- The context stores only a bounded redacted account hint and the method id
+  used for the latest successful action. It never stores token, cookie,
+  credential-file contents, or the raw state-home path.
+- The compatibility registry must prove `supports_default_state_home` and
+  supplies the exact credential/provider environment keys to unset for an
+  Agent-account launch. The Agent-account path does not apply Provider
+  projection or inject a Provider-specific state home.
+- `authenticate` re-reads the current method catalog, rejects methods whose
+  effect requires a Provider Profile, persists one operation row, and uses the
+  same Agent/account launch context as verification and later sessions.
+  Interactive terminal/browser work returns an execution location and a
+  redacted terminal descriptor; completion is followed by verification in a
+  fresh process.
+- Verification shuts down old account-source processes first, increments the
+  context revision for a credential change, probes models with that exact
+  revision, then commits `Authenticated` and the snapshot. A successful RPC
+  alone, a non-empty `authMethods` list, or a credential file is not proof.
+- Discovery prefers a direct Agent model catalog, then session config evidence,
+  a verified compatibility descriptor, and live-session evidence. If no real
+  model list exists, it stores `AgentDefaultOnly` and publishes
+  `RuntimeModelSelection::AgentDefault`; `session/new` receives no model
+  override. A concrete model is selectable only when the same context revision
+  proved it available.
+- Snapshot cache identity is
+  `(auth_context_id, auth_context_revision, runtime_fingerprint)`. Login,
+  relogin, logout, an authentication-required runtime error, Agent/adapter
+  version change, or state-home identity change invalidates older snapshots.
+- A structured authentication-required error from a live turn invalidates only
+  the binding's exact account revision. The service shuts down processes for
+  that source, marks the context `AuthenticationRequired`, and never silently
+  changes the session to a Provider Profile.
+- Logout first previews affected logical session ids, then stops all account
+  source processes before sending the Agent logout RPC. It increments the
+  context revision, clears model snapshots, and leaves affected sessions with
+  their desired source but a re-authentication/recovery state.
+- Remote and UI projections contain status, labels, action availability,
+  bounded hints, and model descriptors only. Native paths, process ids, ACP
+  payloads, secrets, and OAuth/device-code values are local/short-lived.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Agent has no verified default-home capability | `agent_default_state_home_unsupported`; do not create a selectable account source. |
+| A second context is inserted for one Agent | SQLite uniqueness conflict; preserve the first context. |
+| Context id is missing or belongs to another Agent | `agent_auth_context_not_found` or `agent_auth_context_agent_mismatch`; no process. |
+| Expected revision is non-positive or stale | `agent_auth_context_revision_invalid` or `agent_auth_context_revision_conflict`; no external action. |
+| Method is not in the latest catalog | `agent_auth_method_not_advertised`; do not call authenticate. |
+| Method effect requires Provider Profile | `agent_auth_method_requires_provider_profile`; do not use it as an Agent account login. |
+| Another operation is active for the context | `agent_authentication_operation_in_progress`; no second process. |
+| Verification discovers authentication is absent | `agent_authentication_required`; context revision/status and snapshot are updated consistently. |
+| Explicit model is absent from the current snapshot | `agent_auth_model_no_longer_available`; keep the old effective source. |
+| No model enumeration evidence | `AgentDefaultOnly` catalog; run with `AgentDefault`, never a sentinel model id. |
+| Logout impact count changed after preview | `agent_auth_context_in_use_changed`; require a fresh preview. |
+| Logout is unsupported | `agent_logout_not_advertised`; do not send the ACP call. |
+| Account process shutdown fails before logout | return the shutdown error and do not send logout. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: Codex is logged in outside Vibex; the first catalog read creates one
+  unverified context, verification observes the same default home, and a new
+  session can select `AgentAccount` without a Provider Profile.
+- Good: a relogin changes the account hint and entitlement, keeps the same
+  context id, increments revision, and makes the previous model snapshot
+  ineligible.
+- Base: the Agent reports no models. The source remains selectable as
+  “Agent automatically chooses” and the actual model, if later reported, is
+  recorded only as effective evidence.
+- Base: an Agent exposes browser and environment methods. Browser/Agent-owned
+  login is offered for the default account; the environment method remains a
+  Provider Profile action.
+- Bad: create a synthetic Provider Profile, set `model_id = "default"`, reuse
+  a prior revision's model list, or let a Provider API-key variable leak into
+  the Agent-account process.
+- Bad: call logout while an account process still owns a token, or silently
+  fail over an authentication error to a different billing/organization source.
+
+### 6. Tests Required
+
+- Core serde tests cover both tagged source variants, `AgentDefault`, bounded
+  hints, and legacy Provider selection aliases.
+- DB tests cover `UNIQUE(agent_id)`, CAS revision updates, operation uniqueness,
+  snapshot primary-key isolation, invalidation, and migration 45/46/47 data
+  preservation without synthetic Profiles.
+- ACP tests assert login, model discovery, and real session launches share the
+  same source fingerprint/home and that Registry env-unset keys are applied.
+- Catalog tests cover direct/session/compatibility/live discovery precedence,
+  `AgentDefaultOnly`, revision invalidation, and stale explicit model rejection.
+- Runtime-switch tests cover Provider -> AgentAccount -> Provider, failed
+  account verification retaining the old effective source, and account-revision
+  authentication-required invalidation.
+- Desktop runtime tests cover process shutdown before logout, affected-session
+  preview, and no automatic Provider fallback. Remote tests cover redaction and
+  permission classes.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+authenticate(methodId)
+  -> mark the Agent logged in
+  -> copy methodId into providerProfileId
+  -> reuse the last Provider model list
+```
+
+#### Correct
+
+```text
+ensure one AgentAuthContext
+  -> authenticate(methodId) in the default account context
+  -> close auth process and verify with the same launch context
+  -> snapshot models under (context, revision, fingerprint)
+  -> select RuntimeAuthSource::AgentAccount
+  -> send AgentDefault when no concrete model was proven
+```
 
 ## Scenario: ACP Terminal Tools And Terminal Auth
 
@@ -3405,14 +3615,16 @@ exact key + current evidence
 
 ```text
 AgentProvider::prepare_turn_execution(handle, request)
-  -> Option<ProviderTurnExecutionIdentity { binding_id, activation_generation, model_id }>
+  -> Option<ProviderTurnExecutionIdentity {
+       binding_id, activation_generation, model_id?
+     }>
 
 ProviderTurnRequest.execution_identity: Option<ProviderTurnExecutionIdentity>
 
 TurnExecutionAttribution {
-  agent_id, provider_profile_id, model_id,
+  agent_id, auth_source, model, effective_model_id?,
   binding_id, activation_generation,
-  agent_label, provider_profile_label, model_label
+  agent_label, auth_source_label, model_label
 }
 
 TimelineItem.executionAttribution?: TurnExecutionAttributionView {
@@ -3432,7 +3644,8 @@ agent_timeline_items.execution_attribution_json TEXT NULL
   revalidates binding, generation, and effective Model before `begin_turn` or `session/prompt`. Send must not restore or
   create a replacement attachment from the old request binding.
 - Every online turn is ACP-backed and requires a real committed RuntimeBinding id and activation generation. Do not
-  synthesize generation zero, a legacy binding id, or attribution from ProviderKind.
+  synthesize a Provider Profile for an Agent account, a legacy binding id, or attribution from ProviderKind. An
+  `AgentDefault` desired model may have a null effective model until the Agent reports one.
 - SQLite stores the complete Rust-only audit snapshot. Timeline reads project it to `TurnExecutionAttributionView`;
   generated TypeScript and remote/Desktop payloads never contain binding ids, generations, native ids, adapter ids,
   credentials, commands, endpoints, or raw provider metadata.
@@ -3445,15 +3658,15 @@ agent_timeline_items.execution_attribution_json TEXT NULL
 
 ### 4. Validation & Error Matrix
 
-- Missing/invalid profile or Agent definition while creating a proved attribution -> structured
-  `turn_execution_profile_missing`, `turn_execution_agent_missing`, or `turn_execution_attribution_invalid`; no prompt
-  admission.
+- Missing/invalid auth source or Agent definition while creating a proved attribution -> structured
+  `turn_execution_profile_missing`/`turn_execution_agent_missing` or
+  `turn_execution_attribution_invalid`; no prompt admission.
 - ACP send without a prepared identity -> `turn_execution_identity_missing`; no active turn, prompt, permission, or
   timeline side effect.
 - Binding, generation, or effective Model changed after prepare -> `turn_execution_identity_mismatch`; no active turn,
   prompt, permission, or timeline side effect.
-- Effective ACP Model not provable or changed after prepare -> `turn_execution_identity_mismatch`; no provider turn
-  starts and attribution is never guessed from UI state.
+- Effective ACP Model changed after prepare -> `turn_execution_identity_mismatch`; no provider turn starts and
+  attribution is never guessed from UI state. A missing model is valid only when desired is `AgentDefault`.
 - Coalesced event attribution differs from stored audit JSON, including `Some` versus `None` ->
   `turn_execution_attribution_conflict`; existing row remains unchanged.
 - Old/NULL attribution row -> safe `None` projection and legacy rendering.
@@ -3568,7 +3781,7 @@ agent_message_submission_payloads(
   atomically with `Dispatched`, then advances to `Completed`.
 - After claiming the session `Running`, a durable ACP turn rereads the DB
   runtime state and current `RuntimeBinding`. It must match desired/effective,
-  Ready, no pending switch, Agent/Profile/Model/Effort/Mode, binding state,
+  Ready, no pending switch, Agent/AuthSource/Model/Effort/Mode, binding state,
   activation generation, and applied-generation evidence. The manager builds
   a temporary provider binding from that current row; it must not use the
   session DTO, import provenance, or caller payload as execution authority.

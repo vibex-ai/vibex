@@ -46,6 +46,8 @@ pub struct RuntimeSwitchRequest {
     pub expected_current_binding_id: Option<RuntimeBindingId>,
     pub desired_selection_revision: i64,
     pub target_adapter_id: AcpAdapterId,
+    #[serde(default)]
+    pub target_auth_source_revision: i64,
     pub target_selection: SessionRuntimeSelection,
     pub requested_policy: RuntimeSwitchPolicy,
     pub active_work_policy: RuntimeSwitchActiveWorkPolicy,
@@ -68,6 +70,10 @@ impl fmt::Debug for RuntimeSwitchRequest {
                 &self.desired_selection_revision,
             )
             .field("target_adapter_id", &self.target_adapter_id)
+            .field(
+                "target_auth_source_revision",
+                &self.target_auth_source_revision,
+            )
             .field("target_selection", &self.target_selection)
             .field("requested_policy", &self.requested_policy)
             .field("active_work_policy", &self.active_work_policy)
@@ -88,6 +94,7 @@ pub struct SwitchIntent {
     pub desired_selection_revision: i64,
     pub target_binding_id: Option<RuntimeBindingId>,
     pub target_adapter_id: AcpAdapterId,
+    pub target_auth_source_revision: i64,
     pub target_selection: SessionRuntimeSelection,
     pub requested_policy: RuntimeSwitchPolicy,
     pub active_work_policy: RuntimeSwitchActiveWorkPolicy,
@@ -109,6 +116,10 @@ impl fmt::Debug for SwitchIntent {
             )
             .field("target_binding_id", &self.target_binding_id)
             .field("target_adapter_id", &self.target_adapter_id)
+            .field(
+                "target_auth_source_revision",
+                &self.target_auth_source_revision,
+            )
             .field("target_selection", &self.target_selection)
             .field("requested_policy", &self.requested_policy)
             .field("active_work_policy", &self.active_work_policy)
@@ -148,7 +159,7 @@ impl SwitchIntent {
                 })
             })?;
         if durable.effective_selection.agent_id != record.target_agent_id
-            || durable.effective_selection.provider_profile_id != record.target_profile_id
+            || durable.effective_selection.auth_source != record.target_auth_source
         {
             return Err(VibexError::conflict(
                 "runtime_switch_intent_route_mismatch",
@@ -165,6 +176,7 @@ impl SwitchIntent {
             desired_selection_revision: record.desired_selection_revision,
             target_binding_id: record.target_binding_id.clone(),
             target_adapter_id: record.target_adapter_id.clone(),
+            target_auth_source_revision: record.target_auth_source_revision,
             target_selection: durable.effective_selection,
             requested_policy: record
                 .requested_policy
@@ -796,7 +808,8 @@ impl RuntimeSwitchCoordinator {
             target_binding_id: Some(target_binding_id),
             target_agent_id: request.target_selection.agent_id,
             target_adapter_id: request.target_adapter_id,
-            target_profile_id: request.target_selection.provider_profile_id,
+            target_auth_source: request.target_selection.auth_source,
+            target_auth_source_revision: request.target_auth_source_revision,
             requested_policy: Some(serde_json::to_value(request.requested_policy).map_err(
                 |_| {
                     VibexError::validation(
@@ -1746,7 +1759,8 @@ impl RuntimeSwitchCoordinator {
         if binding.binding_id != *expected_binding_id
             || binding.session_id != intent.session_id
             || binding.agent_id != intent.target_selection.agent_id
-            || binding.provider_profile_id != intent.target_selection.provider_profile_id
+            || binding.auth_source != intent.target_selection.auth_source
+            || binding.auth_source_revision != intent.target_auth_source_revision
             || binding.adapter_id != intent.target_adapter_id
         {
             return Err(VibexError::conflict(
@@ -1757,7 +1771,8 @@ impl RuntimeSwitchCoordinator {
         if let Some(existing) = self.get_binding(expected_binding_id)? {
             if existing.session_id != binding.session_id
                 || existing.agent_id != binding.agent_id
-                || existing.provider_profile_id != binding.provider_profile_id
+                || existing.auth_source != binding.auth_source
+                || existing.auth_source_revision != binding.auth_source_revision
                 || existing.adapter_id != binding.adapter_id
                 || existing.native_session_id != binding.native_session_id
                 || existing.created_by_switch_id.as_ref() != Some(&intent.switch_id)
@@ -1805,7 +1820,8 @@ impl RuntimeSwitchCoordinator {
         if binding.created_by_switch_id.as_ref() != Some(&intent.switch_id)
             || binding.session_id != intent.session_id
             || binding.agent_id != intent.target_selection.agent_id
-            || binding.provider_profile_id != intent.target_selection.provider_profile_id
+            || binding.auth_source != intent.target_selection.auth_source
+            || binding.auth_source_revision != intent.target_auth_source_revision
             || binding.adapter_id != intent.target_adapter_id
         {
             return Err(VibexError::conflict(
@@ -2304,7 +2320,7 @@ fn switch_log_context(intent: &SwitchIntent, operation: &'static str) -> Runtime
         .with_switch_id(&intent.switch_id)
         .with_agent_id(&intent.target_selection.agent_id)
         .with_adapter_id(&intent.target_adapter_id)
-        .with_provider_profile_id(&intent.target_selection.provider_profile_id);
+        .with_auth_source(&intent.target_selection.auth_source);
     if let Some(binding_id) = intent
         .target_binding_id
         .as_ref()
@@ -2334,8 +2350,8 @@ mod tests {
 
     use vibex_core::{
         AgentId, AgentSession, AgentSessionSafety, AgentSessionState, NativeStateHomeId,
-        ProviderKind, ProviderProfileId, RequestId, SessionRuntimeConfigState,
-        SessionRuntimeSelectionStatus, TransportKind, WorkspaceMode,
+        ProviderKind, ProviderProfileId, RequestId, RuntimeAuthSource, RuntimeModelSelection,
+        SessionRuntimeConfigState, SessionRuntimeSelectionStatus, TransportKind, WorkspaceMode,
     };
     use vibex_db::{
         DesiredRuntimeSwitchEnqueueRequest, DesiredRuntimeSwitchEnqueueResult, SessionRepository,
@@ -2457,7 +2473,8 @@ mod tests {
                 session_id: intent.session_id.clone(),
                 agent_id: intent.target_selection.agent_id.clone(),
                 transport_kind: TransportKind::Acp,
-                provider_profile_id: intent.target_selection.provider_profile_id.clone(),
+                auth_source: intent.target_selection.auth_source.clone(),
+                auth_source_revision: intent.target_auth_source_revision,
                 adapter_id: intent.target_adapter_id.clone(),
                 adapter_version: "mock-v1".to_string(),
                 adapter_compatibility_identity: "mock-compatible-v1".to_string(),
@@ -2471,7 +2488,6 @@ mod tests {
                 session_runtime_config_state: SessionRuntimeConfigState::default(),
                 capability_snapshot: None,
                 restore_compatibility_key: None,
-                profile_revision: 1,
                 last_context_sequence: 0,
                 last_summary_sequence: 0,
                 context_bridge_version: 0,
@@ -2770,19 +2786,20 @@ mod tests {
             )
             .unwrap();
             let selection = SessionRuntimeSelection {
-                agent_id: agent_id.clone(),
-                provider_profile_id: profile_id.clone(),
-                model_id: "model-next".to_string(),
                 reasoning_effort: Some("high".to_string()),
-                mode_id: None,
-                config_values: Default::default(),
+                ..SessionRuntimeSelection::provider(
+                    agent_id.clone(),
+                    profile_id.clone(),
+                    "model-next",
+                )
             };
             let source_binding = RuntimeBinding {
                 binding_id: RuntimeBindingId::new(),
                 session_id: session_id.clone(),
                 agent_id: agent_id.clone(),
                 transport_kind: TransportKind::Acp,
-                provider_profile_id: profile_id,
+                auth_source: RuntimeAuthSource::provider_profile(profile_id),
+                auth_source_revision: 1,
                 adapter_id: AcpAdapterId::parse("claude-code-acp").unwrap(),
                 adapter_version: "source-v1".to_string(),
                 adapter_compatibility_identity: "source-compatible-v1".to_string(),
@@ -2793,7 +2810,6 @@ mod tests {
                 session_runtime_config_state: SessionRuntimeConfigState::default(),
                 capability_snapshot: None,
                 restore_compatibility_key: None,
-                profile_revision: 1,
                 last_context_sequence: 0,
                 last_summary_sequence: 0,
                 context_bridge_version: 0,
@@ -2855,6 +2871,7 @@ mod tests {
                 expected_current_binding_id: Some(self.source_binding.binding_id.clone()),
                 desired_selection_revision: 0,
                 target_adapter_id: self.source_binding.adapter_id.clone(),
+                target_auth_source_revision: 1,
                 target_selection: self.selection.clone(),
                 requested_policy: RuntimeSwitchPolicy::ForceFreshSession,
                 active_work_policy: RuntimeSwitchActiveWorkPolicy::default(),
@@ -2901,7 +2918,8 @@ mod tests {
                     target_binding_id: Some(RuntimeBindingId::new()),
                     target_agent_id: self.selection.agent_id.clone(),
                     target_adapter_id: self.source_binding.adapter_id.clone(),
-                    target_profile_id: self.selection.provider_profile_id.clone(),
+                    target_auth_source: self.selection.auth_source.clone(),
+                    target_auth_source_revision: 1,
                     requested_policy: Some(
                         serde_json::to_value(RuntimeSwitchPolicy::ForceFreshSession).unwrap(),
                     ),
@@ -2922,7 +2940,7 @@ mod tests {
         ) -> RuntimeSwitchRecord {
             let requested_session_config = RuntimeSwitchCoordinator::encode_requested_config(
                 &selection,
-                Some(serde_json::json!({"model": selection.model_id})),
+                Some(serde_json::json!({"model": selection.model_id()})),
             )
             .unwrap();
             let result = AgentSessionRuntimeRepository::enqueue_desired_switch(
@@ -2935,6 +2953,7 @@ mod tests {
                     expected_selection_revision,
                     target_binding_id: RuntimeBindingId::new(),
                     target_adapter_id: self.source_binding.adapter_id.clone(),
+                    target_auth_source_revision: 1,
                     desired: selection,
                     requested_policy: RuntimeSwitchPolicy::ForceFreshSession,
                     active_work_policy: RuntimeSwitchActiveWorkPolicy::default(),
@@ -4149,7 +4168,7 @@ mod tests {
     async fn drives_pre_enqueued_requested_switch_through_pending_claim() {
         let env = TestEnvironment::new("drive-requested");
         let mut desired = env.selection.clone();
-        desired.model_id = "model-requested".to_string();
+        desired.model = RuntimeModelSelection::explicit("model-requested");
         let requested = env.seed_requested_switch("drive-requested", 0, desired.clone());
         assert_eq!(requested.status, RuntimeSwitchStatus::Requested);
         assert_eq!(env.runtime_state().pending_switch_id, None);
@@ -4176,7 +4195,7 @@ mod tests {
         let env = TestEnvironment::new("requested-after-cleanup");
         let previous = env.seed_reserved_switch("requested-previous");
         let mut latest_selection = env.selection.clone();
-        latest_selection.model_id = "model-latest".to_string();
+        latest_selection.model = RuntimeModelSelection::explicit("model-latest");
         let latest = env.seed_requested_switch("requested-latest", 0, latest_selection.clone());
         env.executor.set_delay_on("cleanup_target", 25);
 
@@ -4239,7 +4258,7 @@ mod tests {
         let task = tokio::spawn(async move { coordinator.request_switch(request).await });
         wait_for_executor_call(&env.executor, "revalidate_prepared").await;
         let mut newer_selection = env.selection.clone();
-        newer_selection.model_id = "model-newer".to_string();
+        newer_selection.model = RuntimeModelSelection::explicit("model-newer");
         AgentSessionRuntimeRepository::set_desired_selection(
             &env.connection(),
             &env.session_id,

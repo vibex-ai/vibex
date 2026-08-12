@@ -37,6 +37,7 @@ const USAGE_MODEL_CHART_MIN_WIDTH: f32 = 720.0;
 const USAGE_TABLE_MIN_WIDTH: f32 = 1040.0;
 const USAGE_MODEL_LIMIT: usize = 10;
 const USAGE_OTHER_MODEL_ID: &str = "__vibex_other_models__";
+const USAGE_AGENT_DEFAULT_MODEL_ID: &str = "__vibex_agent_default_model__";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UsageFilterKind {
@@ -1758,6 +1759,13 @@ fn model_metric_label(metric: UsageModelMetric) -> &'static str {
     }
 }
 
+fn usage_model_series_id(model: &AgentUsageDailyModelUsage) -> String {
+    model
+        .model_id
+        .clone()
+        .unwrap_or_else(|| USAGE_AGENT_DEFAULT_MODEL_ID.to_string())
+}
+
 fn model_category_color(index: usize, cx: &Context<UsageView>) -> Hsla {
     const TOKENS: [&str; USAGE_MODEL_LIMIT] = [
         "chart-category-1",
@@ -1779,7 +1787,7 @@ fn ranked_model_identities(annual: &AgentUsageAnnualProjection) -> Vec<UsageMode
     for day in &annual.days {
         for model in &day.models {
             let entry = totals
-                .entry(model.model_id.clone())
+                .entry(usage_model_series_id(model))
                 .or_insert_with(|| (model.label.clone(), 0, None));
             entry.1 = entry.1.saturating_add(model.requests);
             if let Some(value) = model.total_tokens.value {
@@ -1851,10 +1859,11 @@ fn model_day_value(
     let mut known = false;
     let mut sum = 0_u64;
     for model in &day.models {
+        let model_id = usage_model_series_id(model);
         let included = if category.other {
-            !visible_model_ids.contains(&model.model_id)
+            !visible_model_ids.contains(&model_id)
         } else {
-            model.model_id == category.id
+            model_id == category.id
         };
         if !included {
             continue;
@@ -2671,7 +2680,7 @@ mod tests {
         };
         let models = (0..11)
             .map(|index| AgentUsageDailyModelUsage {
-                model_id: format!("model-{index:02}"),
+                model_id: Some(format!("model-{index:02}")),
                 label: format!("Model {index:02}"),
                 requests: index + 1,
                 total_tokens: metric((11 - index) * 100),

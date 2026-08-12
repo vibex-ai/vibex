@@ -30,18 +30,19 @@ use vibex_config_switch::{ProviderConfigService, acp_capabilities_from_config};
 use vibex_core::{
     AcpProviderConfig, AcpProviderEnvSource, AcpProviderProfileCreateRequest, AgentAuthCatalog,
     AgentAuthenticateRequest, AgentAuthenticateResult, AgentAuthenticationCancelRequest,
-    AgentCommandDiscoverRequest, AgentCommandDiscoverResponse, AgentCommandEntry,
-    AgentCommandExecuteRequest, AgentCommandExecutionBehavior, AgentCommandSelectionBehavior,
-    AgentCommandSourceKind, AgentCommandTrigger, AgentEventRawExtension, AgentLogoutRequest,
-    AgentMessageDeltaPayload, AgentMessagePayload, AgentMessagePhase, AgentModelCapabilities,
-    AgentModelListResponse, AgentModelListSource, AgentReasoningEffort, AgentSessionConfigProbe,
-    AgentSessionSafety, AgentUsageCounterOrigin, AgentUsageExecutionContext, ElicitationRequest,
-    ExternalSessionImportCandidate, MessageSubmissionId, PermissionActionDetail, PermissionRequest,
-    PermissionRequestStatus, PermissionResponseKind, PermissionResponseOption,
-    PermissionRiskCategory, PlanPayload, PlanStepPayload, ProviderBinding, ProviderBindingMetadata,
-    ProviderCapabilities, ProviderCapabilitySummary, ProviderKind, ProviderNativeBinding,
-    ProviderProfileId, ProviderRunCapabilityProbesRequest, ProviderSessionConfigOption,
-    ProviderSessionConfigValue, ReasoningPayload, RequestId, SessionRuntimeConfigMutationRequest,
+    AgentAuthenticationCompleteRequest, AgentCommandDiscoverRequest, AgentCommandDiscoverResponse,
+    AgentCommandEntry, AgentCommandExecuteRequest, AgentCommandExecutionBehavior,
+    AgentCommandSelectionBehavior, AgentCommandSourceKind, AgentCommandTrigger,
+    AgentEventRawExtension, AgentLogoutRequest, AgentMessageDeltaPayload, AgentMessagePayload,
+    AgentMessagePhase, AgentModelCapabilities, AgentModelListResponse, AgentModelListSource,
+    AgentReasoningEffort, AgentSessionConfigProbe, AgentSessionSafety, AgentUsageCounterOrigin,
+    AgentUsageExecutionContext, ElicitationRequest, ExternalSessionImportCandidate,
+    MessageSubmissionId, PermissionActionDetail, PermissionRequest, PermissionRequestStatus,
+    PermissionResponseKind, PermissionResponseOption, PermissionRiskCategory, PlanPayload,
+    PlanStepPayload, ProviderBinding, ProviderBindingMetadata, ProviderCapabilities,
+    ProviderCapabilitySummary, ProviderKind, ProviderNativeBinding, ProviderProfileId,
+    ProviderRunCapabilityProbesRequest, ProviderSessionConfigOption, ProviderSessionConfigValue,
+    ReasoningPayload, RequestId, SessionRuntimeConfigMutationRequest,
     SessionRuntimeConfigMutationResult, SessionRuntimeSelection, SystemNoticeLevel,
     SystemNoticePayload, TimelineErrorPayload, TimelinePayload, TimelineRedactionState,
     ToolCallPayload, ToolCallStatus, VibexError, VibexResult, VibexSessionId, unix_timestamp_ms,
@@ -130,8 +131,9 @@ pub use session_config::{
     RuntimeOptionCatalogProfileEvidence, SessionConfigExtension, SessionConfigFieldKind,
     SessionConfigFieldRequest, SessionConfigOperationEvidence, SessionConfigPlan,
     SessionConfigPlanner, SessionModelCatalogEntry, SessionModelCatalogSource,
-    build_runtime_option_catalog, build_runtime_option_catalog_for_agents, merge_model_catalog,
-    normalize_identifier, resolve_canonical_option_key, validate_effort_value,
+    append_agent_account_runtime_options, build_runtime_option_catalog,
+    build_runtime_option_catalog_for_agents, merge_model_catalog, normalize_identifier,
+    refresh_runtime_option_catalog_revision, resolve_canonical_option_key, validate_effort_value,
     validate_model_value,
 };
 pub use session_restore::{
@@ -413,6 +415,16 @@ pub trait AcpClient: Send + Sync {
         ))
     }
 
+    async fn complete_agent_authentication(
+        &self,
+        _request: AgentAuthenticationCompleteRequest,
+    ) -> VibexResult<bool> {
+        Err(VibexError::capability(
+            "acp_authentication_complete_unsupported",
+            "completing interactive ACP authentication is not supported by this adapter",
+        ))
+    }
+
     async fn logout_agent(&self, _request: AgentLogoutRequest) -> VibexResult<()> {
         Err(VibexError::capability(
             "acp_logout_unsupported",
@@ -439,7 +451,10 @@ pub trait AcpClient: Send + Sync {
         let binding = ProviderBinding {
             session_id: request.session_id,
             provider_kind: ProviderKind::Acp,
-            provider_profile_id: request.provider_profile_id,
+            auth_source: vibex_core::RuntimeAuthSource::provider_profile(
+                request.provider_profile_id,
+            ),
+            auth_source_revision: 0,
             native: ProviderNativeBinding {
                 native_session_id: request.native_session_id,
                 native_thread_id: None,
@@ -2025,6 +2040,13 @@ impl AgentProvider for AcpAgentProvider {
         self.client.cancel_agent_authentication(request).await
     }
 
+    async fn complete_agent_authentication(
+        &self,
+        request: AgentAuthenticationCompleteRequest,
+    ) -> VibexResult<bool> {
+        self.client.complete_agent_authentication(request).await
+    }
+
     async fn logout_agent(&self, request: AgentLogoutRequest) -> VibexResult<()> {
         self.client.logout_agent(request).await
     }
@@ -2208,6 +2230,18 @@ impl AgentProvider for AcpAgentProvider {
         &self,
         request: ProviderCreateRequest,
     ) -> VibexResult<ProviderSessionHandle> {
+        let profile_revision = match self.config_service.as_ref() {
+            Some(service) => service
+                .get_profile(&request.provider_profile_id)?
+                .map(|profile| profile.updated_at_ms)
+                .ok_or_else(|| {
+                    VibexError::validation(
+                        "provider_profile_not_found",
+                        "Provider Profile was not found while creating the ACP binding",
+                    )
+                })?,
+            None => 0,
+        };
         let acp_session = self
             .client
             .create_session(AcpCreateSessionRequest {
@@ -2223,7 +2257,8 @@ impl AgentProvider for AcpAgentProvider {
         Ok(ProviderSessionHandle {
             binding: provider_binding(
                 request.session_id,
-                request.provider_profile_id,
+                vibex_core::RuntimeAuthSource::provider_profile(request.provider_profile_id),
+                profile_revision,
                 acp_session,
                 request.model,
                 None,
@@ -2233,12 +2268,13 @@ impl AgentProvider for AcpAgentProvider {
     }
 
     async fn resume_session(&self, binding: ProviderBinding) -> VibexResult<ProviderSessionHandle> {
-        let capabilities = self.capabilities_for_profile(Some(&binding.provider_profile_id));
+        let capabilities = self.capabilities_for_profile(binding.auth_source.provider_profile_id());
         let acp_session = self.client.resume_session(binding.clone()).await?;
         Ok(ProviderSessionHandle {
             binding: provider_binding(
                 binding.session_id,
-                binding.provider_profile_id,
+                binding.auth_source,
+                binding.auth_source_revision,
                 acp_session,
                 None,
                 Some(binding.created_at_ms),
@@ -2278,6 +2314,18 @@ impl AgentProvider for AcpAgentProvider {
         request: ProviderCreateRequest,
         candidate: ExternalSessionImportCandidate,
     ) -> VibexResult<ProviderSessionHandle> {
+        let profile_revision = match self.config_service.as_ref() {
+            Some(service) => service
+                .get_profile(&request.provider_profile_id)?
+                .map(|profile| profile.updated_at_ms)
+                .ok_or_else(|| {
+                    VibexError::validation(
+                        "provider_profile_not_found",
+                        "Provider Profile was not found while importing the ACP binding",
+                    )
+                })?,
+            None => 0,
+        };
         let capabilities = self.capabilities_for_profile(Some(&request.provider_profile_id));
         let acp_session = self
             .client
@@ -2292,7 +2340,8 @@ impl AgentProvider for AcpAgentProvider {
         Ok(ProviderSessionHandle {
             binding: provider_binding(
                 request.session_id,
-                request.provider_profile_id,
+                vibex_core::RuntimeAuthSource::provider_profile(request.provider_profile_id),
+                profile_revision,
                 acp_session,
                 None,
                 None,
@@ -2363,7 +2412,8 @@ impl AgentProvider for AcpAgentProvider {
         let binding_update = turn.binding_update.map(|session| {
             provider_binding(
                 request.session_id,
-                request.binding.provider_profile_id,
+                request.binding.auth_source.clone(),
+                request.binding.auth_source_revision,
                 session,
                 None,
                 Some(handle.binding.created_at_ms),
@@ -3064,7 +3114,8 @@ pub(crate) fn redact_summary(value: &str) -> String {
 
 fn provider_binding(
     session_id: vibex_core::VibexSessionId,
-    provider_profile_id: vibex_core::ProviderProfileId,
+    auth_source: vibex_core::RuntimeAuthSource,
+    auth_source_revision: i64,
     mut acp_session: AcpSession,
     selected_model: Option<String>,
     created_at_ms: Option<i64>,
@@ -3083,7 +3134,8 @@ fn provider_binding(
     ProviderBinding {
         session_id,
         provider_kind: ProviderKind::Acp,
-        provider_profile_id,
+        auth_source,
+        auth_source_revision,
         native: ProviderNativeBinding {
             native_session_id: sanitize_optional_native_value(acp_session.native_session_id),
             native_thread_id: sanitize_optional_native_value(acp_session.native_thread_id),
@@ -3362,8 +3414,8 @@ mod tests {
             message_submission_id: Some(submission_id.clone()),
             required_runtime: Some(SessionRuntimeSelection {
                 agent_id: vibex_core::AgentId::parse("opencode").unwrap(),
-                provider_profile_id: binding.provider_profile_id.clone(),
-                model_id: "model-secret-id".to_string(),
+                auth_source: binding.auth_source.clone(),
+                model: vibex_core::RuntimeModelSelection::explicit("model-secret-id"),
                 reasoning_effort: Some("high".to_string()),
                 mode_id: Some("build".to_string()),
                 config_values: Default::default(),
@@ -3381,7 +3433,7 @@ mod tests {
             execution_identity: Some(ProviderTurnExecutionIdentity {
                 binding_id: vibex_core::RuntimeBindingId::new(),
                 activation_generation: 7,
-                model_id: "model-secret-id".to_string(),
+                model_id: Some("model-secret-id".to_string()),
             }),
             event_sender: None,
             usage_execution_context: None,
@@ -4259,8 +4311,10 @@ mod tests {
         ProviderBinding {
             session_id,
             provider_kind: ProviderKind::Acp,
-            provider_profile_id: vibex_core::ProviderProfileId::parse("provider_local_default_acp")
-                .unwrap(),
+            auth_source: vibex_core::RuntimeAuthSource::provider_profile(
+                vibex_core::ProviderProfileId::parse("provider_local_default_acp").unwrap(),
+            ),
+            auth_source_revision: 1,
             native: ProviderNativeBinding::empty(),
             created_at_ms: unix_timestamp_ms(),
             updated_at_ms: unix_timestamp_ms(),

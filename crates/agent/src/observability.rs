@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 use tracing::field;
+use vibex_core::RuntimeAuthSource;
 
 pub const RUNTIME_METRIC_SERIES_LIMIT: usize = 256;
 
@@ -380,6 +381,8 @@ pub struct RuntimeLogContext {
     adapter_id: Option<String>,
     adapter_version: Option<String>,
     provider_profile_id: Option<String>,
+    auth_source_kind: Option<String>,
+    auth_source_id: Option<String>,
     process_spawn_fingerprint_prefix: Option<String>,
     native_session_id_hash: Option<String>,
     operation: &'static str,
@@ -399,6 +402,8 @@ impl fmt::Debug for RuntimeLogContext {
             .field("adapter_id", &self.adapter_id)
             .field("adapter_version", &self.adapter_version)
             .field("provider_profile_id", &self.provider_profile_id)
+            .field("auth_source_kind", &self.auth_source_kind)
+            .field("auth_source_id", &self.auth_source_id)
             .field(
                 "process_spawn_fingerprint_prefix",
                 &self.process_spawn_fingerprint_prefix,
@@ -466,6 +471,15 @@ impl RuntimeLogContext {
 
     pub fn with_provider_profile_id(mut self, value: impl fmt::Display) -> Self {
         self.provider_profile_id = Some(value.to_string());
+        self
+    }
+
+    pub fn with_auth_source(mut self, value: &RuntimeAuthSource) -> Self {
+        self.auth_source_kind = Some(format!("{:?}", value.kind()).to_ascii_lowercase());
+        self.auth_source_id = Some(value.id().to_string());
+        if let Some(provider_profile_id) = value.provider_profile_id() {
+            self.provider_profile_id = Some(provider_profile_id.to_string());
+        }
         self
     }
 

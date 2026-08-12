@@ -9,15 +9,15 @@ use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 use vibex_core::{
     AgentAuthCatalog, AgentAuthenticateRequest, AgentAuthenticateResult,
-    AgentAuthenticationCancelRequest, AgentCommandDiscoverRequest, AgentCommandDiscoverResponse,
-    AgentCommandExecuteRequest, AgentId, AgentLogoutRequest, AgentModelListResponse,
-    AgentModelListSource, AgentSessionConfigProbe, AgentSessionSafety, AgentUsageCounterOrigin,
-    AgentUsageExecution, AgentUsageExecutionContext, AgentUsageExecutionStatusUpdate,
-    AgentUsageObservation, ElicitationResolution, ExternalSessionImportCandidate,
-    MessageAttachment, MessageSubmissionId, PermissionResolution, ProviderBinding,
-    ProviderBindingMetadata, ProviderCapabilities, ProviderKind, ProviderProfileId,
-    RuntimeBindingId, SessionRuntimeSelection, TimelinePayload, TimelineRedactionState,
-    TimelineSource, VibexError, VibexResult, VibexSessionId,
+    AgentAuthenticationCancelRequest, AgentAuthenticationCompleteRequest,
+    AgentCommandDiscoverRequest, AgentCommandDiscoverResponse, AgentCommandExecuteRequest, AgentId,
+    AgentLogoutRequest, AgentModelListResponse, AgentModelListSource, AgentSessionConfigProbe,
+    AgentSessionSafety, AgentUsageCounterOrigin, AgentUsageExecution, AgentUsageExecutionContext,
+    AgentUsageExecutionStatusUpdate, AgentUsageObservation, ElicitationResolution,
+    ExternalSessionImportCandidate, MessageAttachment, MessageSubmissionId, PermissionResolution,
+    ProviderBinding, ProviderBindingMetadata, ProviderCapabilities, ProviderKind,
+    ProviderProfileId, RuntimeBindingId, SessionRuntimeSelection, TimelinePayload,
+    TimelineRedactionState, TimelineSource, VibexError, VibexResult, VibexSessionId,
 };
 
 #[derive(Debug, Clone)]
@@ -147,7 +147,9 @@ pub enum AgentUsageTelemetryEvent {
 pub struct ProviderTurnExecutionIdentity {
     pub binding_id: RuntimeBindingId,
     pub activation_generation: i64,
-    pub model_id: String,
+    /// The concrete model reported by the Agent for this turn. Agent-default
+    /// selections may legitimately leave this unknown.
+    pub model_id: Option<String>,
 }
 
 pub fn legacy_provider_runtime_binding_id(binding: &ProviderBinding) -> RuntimeBindingId {
@@ -155,7 +157,7 @@ pub fn legacy_provider_runtime_binding_id(binding: &ProviderBinding) -> RuntimeB
         "binding_legacy_{}_{}_{}",
         binding.provider_kind,
         binding.session_id.as_str(),
-        binding.provider_profile_id.as_str()
+        binding.auth_source.id()
     ))
     .expect("legacy provider binding identity must use the binding_ prefix")
 }
@@ -458,6 +460,16 @@ pub trait AgentProvider: Send + Sync {
         ))
     }
 
+    async fn complete_agent_authentication(
+        &self,
+        _request: AgentAuthenticationCompleteRequest,
+    ) -> VibexResult<bool> {
+        Err(VibexError::capability(
+            "agent_authentication_complete_unsupported",
+            "completing interactive authentication is not supported by this provider",
+        ))
+    }
+
     async fn logout_agent(&self, _request: AgentLogoutRequest) -> VibexResult<()> {
         Err(VibexError::capability(
             "agent_logout_unsupported",
@@ -636,7 +648,8 @@ mod tests {
             binding: ProviderBinding {
                 session_id,
                 provider_kind: ProviderKind::Acp,
-                provider_profile_id: profile_id,
+                auth_source: vibex_core::RuntimeAuthSource::provider_profile(profile_id),
+                auth_source_revision: 1,
                 native: vibex_core::ProviderNativeBinding {
                     native_session_id: Some("native-secret-id".to_string()),
                     native_thread_id: None,

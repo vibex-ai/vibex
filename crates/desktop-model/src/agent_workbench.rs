@@ -1290,7 +1290,7 @@ fn runtime_attribution(item: &TimelineItem) -> Option<String> {
     item.execution_attribution.as_ref().map(|attribution| {
         format!(
             "{} · {} · {}",
-            attribution.agent_label, attribution.provider_profile_label, attribution.model_label
+            attribution.agent_label, attribution.auth_source_label, attribution.model_label
         )
     })
 }
@@ -1722,7 +1722,7 @@ mod tests {
         );
         first.execution_attribution = Some(TurnExecutionAttributionView {
             agent_label: "Codex".into(),
-            provider_profile_label: "Profile A".into(),
+            auth_source_label: "Profile A".into(),
             model_label: "Model A".into(),
         });
         let mut second = item(
@@ -1736,7 +1736,7 @@ mod tests {
         );
         second.execution_attribution = Some(TurnExecutionAttributionView {
             agent_label: "Codex".into(),
-            provider_profile_label: "Profile B".into(),
+            auth_source_label: "Profile B".into(),
             model_label: "Model B".into(),
         });
         let rows = timeline_rows(&[

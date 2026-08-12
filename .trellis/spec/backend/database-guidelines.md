@@ -43,6 +43,9 @@ Plan migrations around these domain records:
   `provider_model_runtime_option_snapshots` model cache.
 - `agent_configs`, `agent_discovery_records`, and the active Agent-owned
   `agent_runtime_option_snapshots` table.
+- `agent_auth_contexts`, `agent_authentication_operations`, and
+  `agent_auth_model_catalog_snapshots` for each Agent's one default account,
+  its durable operation state, and revision-scoped model evidence.
 - `agent_managed_installations`, the durable lifecycle record for verified ACP
   Registry downloads, side-by-side versions, active commands, and crash
   recovery state.
@@ -136,12 +139,15 @@ state before the side effect to support recovery on restart.
 stores one row per `agent_id` (not per Provider Profile) with a nullable
 `session_config_json`, `last_success_at_ms`, `last_attempt_at_ms`, and
 `last_error_code`. Successful Agent probes persist only modes, reasoning
-controls, and generic session options; model ids must be empty because models
-are owned by Provider Profiles. A successful row is reused without a process
-launch until the Agent is removed. Removing an Agent deletes the row so a later
-re-add can probe again. A failed first attempt records its timestamp and stable
-error code; ordinary reads never retry it, while the desktop startup bootstrap
-may retry enabled, installed Agents without a successful row.
+controls, and generic session options. Model ids must be empty because this
+fallback feeds Provider Profile sources, whose selectable model ids come from
+Provider configuration. Agent-account model evidence belongs only in
+`agent_auth_model_catalog_snapshots` under its context revision and runtime
+fingerprint. A successful row is reused without a process launch until the
+Agent is removed. Removing an Agent deletes the row so a later re-add can probe
+again. A failed first attempt records its timestamp and stable error code;
+ordinary reads never retry it, while the desktop startup bootstrap may retry
+enabled, installed Agents without a successful row.
 
 `provider_model_runtime_option_snapshots` is schema migration 42 and stores
 product-safe ACP session configuration for one `(provider_profile_id, model_id)`
@@ -1066,3 +1072,167 @@ fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
 
 The compatibility transaction begins only after migration transactions finish
 and before a caller starts its own application transaction.
+
+## Scenario: Agent Authentication Context And Runtime Source Persistence
+
+### 1. Scope / Trigger
+
+- Trigger: code creates or changes an Agent default account context, persists
+  its model catalog, binds a runtime to `AgentAccount`, records a switch or
+  usage fact for that source, or upgrades a Provider-only database.
+- Schema versions 45, 46, and 47 are one compatibility chain. Version 45 adds
+  source columns and backfills Provider rows; 46 rebuilds tables so legacy
+  Profile columns can be null; 47 makes usage model ids nullable for semantic
+  `AgentDefault`.
+
+### 2. Signatures
+
+```text
+CURRENT_SCHEMA_VERSION = 47
+
+agent_auth_contexts(
+  auth_context_id PRIMARY KEY,
+  agent_id UNIQUE NOT NULL,
+  status, account_hint_redacted?, authenticated_via_method?,
+  revision CHECK(revision > 0), last_verified_at_ms?,
+  created_at_ms, updated_at_ms
+)
+
+agent_authentication_operations(
+  operation_id PRIMARY KEY,
+  auth_context_id REFERENCES agent_auth_contexts ON DELETE CASCADE,
+  expected_context_revision CHECK(expected_context_revision > 0),
+  method_id, state, error_code?, created_at_ms, updated_at_ms
+)
+
+agent_auth_model_catalog_snapshots(
+  auth_context_id REFERENCES agent_auth_contexts ON DELETE CASCADE,
+  auth_context_revision CHECK(auth_context_revision > 0),
+  runtime_fingerprint, discovery_source, status, catalog_json,
+  last_success_at_ms?, last_attempt_at_ms, last_error_code?,
+  PRIMARY KEY(auth_context_id, auth_context_revision, runtime_fingerprint)
+)
+
+session_runtime_bindings(
+  ..., provider_profile_id?, profile_revision?,
+  auth_source_kind, auth_source_id, auth_source_revision, ...
+)
+
+runtime_switches(
+  ..., target_profile_id?, target_auth_source_kind,
+  target_auth_source_id, target_auth_source_revision, ...
+)
+
+AgentAuthContextRepository::{ensure_default, compare_and_set,
+  referencing_session_ids}
+AgentAuthenticationOperationRepository::{insert, update_state,
+  cancel_incomplete_on_startup}
+AgentAuthModelCatalogRepository::{upsert, get, list_current, delete_context}
+```
+
+### 3. Contracts
+
+- `UNIQUE(agent_id)` is the durable one-account rule. `ensure_default` uses
+  insert-on-conflict plus a read, so concurrent callers converge on one stable
+  context id instead of creating account slots.
+- Context updates are CAS-fenced by a positive revision. Credential identity
+  changes increment revision and delete every snapshot for the context in the
+  same repository operation; a status-only verification completion may retain
+  the just-written current-revision snapshot.
+- The partial unique index on active operation states permits at most one
+  queued/discovering/authenticating/awaiting/verifying/cancelling operation per
+  context. Startup marks every incomplete operation `cancelled` with the safe
+  `application_restarted` code; it never resumes an external login call.
+- Model snapshot JSON contains typed model descriptors only. Its primary key
+  includes context revision and runtime fingerprint, so account and Agent
+  runtime changes cannot reuse stale entitlement evidence.
+- Version 45 backfills every legacy binding, switch, checkpoint, and usage fact
+  as `provider_profile` with the existing Profile id. It does not create a
+  synthetic Profile or rewrite selection/timeline JSON to an account source.
+- Version 46 rebuilds `session_runtime_bindings` and `runtime_switches` with
+  nullable legacy Profile columns and CHECK constraints: Provider source rows
+  must match those columns, while Agent-account rows must keep them null. It
+  also makes usage Profile columns nullable and recreates all required indexes.
+- Version 47 rebuilds usage tables so `last_model_id`/`model_id` may be null
+  only for `agent_account`. Any old internal `agent_default` sentinel is
+  converted to null during copy. Provider facts still require a concrete model.
+- Table rebuilds disable foreign keys only outside the transaction, copy all
+  rows, recreate tables/indexes, run `PRAGMA foreign_key_check`, record the
+  migration, commit, and restore foreign-key enforcement. Failure at any stage
+  must not publish a partially rebuilt schema.
+- Runtime repositories decode new kind/id/revision first and cross-check legacy
+  Profile columns when present. A mismatch is corruption, not a fallback hint.
+  JSON selection compatibility maps old `providerProfileId/modelId` to tagged
+  Provider/Explicit variants; AgentAccount has no lossy legacy encoding.
+- Account hints are already redacted/bounded before persistence. No token,
+  cookie, raw environment value, OAuth state, native state-home path, or raw
+  ACP payload belongs in these tables.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Two context rows target one Agent | SQLite uniqueness conflict; keep the existing context. |
+| Expected context revision is stale | `agent_auth_context_revision_conflict`; no status/snapshot mutation. |
+| A second active operation is inserted | `agent_authentication_operation_in_progress`; no second row/process ownership. |
+| Operation state CAS loses | `agent_authentication_operation_state_conflict`; preserve the winner. |
+| Snapshot context/revision/fingerprint cannot decode | stable `agent_auth_model_catalog_*` storage/decode error; never substitute another snapshot. |
+| Provider source disagrees with legacy Profile id/revision | runtime/usage auth-source legacy mismatch error; fail the read. |
+| AgentAccount row has a non-null legacy Profile column | CHECK/migration failure; do not coerce it into Provider source. |
+| Provider usage row has null model | CHECK failure; only AgentAccount may use unknown model. |
+| Row count, foreign key, or index recreation check fails | roll back the rebuild and leave the prior schema authoritative. |
+| Migration 46/47 is already recorded | skip idempotently; do not rebuild again. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: two concurrent `ensure_default(codex)` calls return the same context;
+  a direct second insert is rejected by `UNIQUE(agent_id)`.
+- Good: a v44 Provider-only database applies 45/46/47, retains every binding,
+  switch, checkpoint, and fact, and all rows decode as Provider sources.
+- Good: an AgentAccount binding persists null legacy Profile fields, positive
+  source revision, and an AgentDefault usage fact with null model id.
+- Base: a relogin increments revision and old snapshot rows are deleted; the
+  same context id remains referenced by historical bindings and sessions.
+- Bad: write an empty/synthetic Profile id to satisfy old NOT NULL columns,
+  store `agent_default` as a model, or ignore mismatched dual-read fields.
+- Bad: turn foreign keys off inside the rebuild transaction, forget to recreate
+  partial indexes, or record the migration before validation/commit.
+
+### 6. Tests Required
+
+- Migration tests apply v45/46/47 from fresh and v44 databases, assert ordered
+  migration records, stable row counts, all indexes, CHECK constraints, and
+  `PRAGMA foreign_key_check` success.
+- Repository tests assert idempotent `ensure_default`, direct second-row
+  rejection, context CAS success/conflict, snapshot invalidation, and startup
+  cancellation of incomplete operations.
+- Runtime repository tests round-trip both source variants, reject legacy/new
+  mismatches, and persist null legacy Profile fields only for AgentAccount.
+- Usage migration/repository tests convert the old `agent_default` sentinel to
+  null, accept null model for AgentAccount, and reject it for Provider source.
+- Backup/restore and smoke tests assert schema version 47 and preserve account,
+  source, switch, timeline attribution, and usage rows without secret material.
+- Run the full `vibex-db`, `vibex-agent`, `vibex-agent-acp`, and
+  `vibex-desktop-runtime` suites after changing this chain.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```sql
+INSERT INTO provider_profiles(provider_profile_id, display_name)
+VALUES ('agent_default', 'Codex subscription');
+
+UPDATE session_runtime_bindings
+SET provider_profile_id = 'agent_default';
+```
+
+#### Correct
+
+```text
+v45 add/backfill tagged source columns
+  -> v46 rebuild legacy Profile columns nullable with cross-field CHECKs
+  -> persist AgentAccount(id, revision) with Profile columns NULL
+  -> v47 store unknown Agent-default model as NULL
+  -> decode tagged source and validate every legacy alias
+```

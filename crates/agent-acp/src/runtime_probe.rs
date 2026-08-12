@@ -452,17 +452,21 @@ impl AcpRuntimeClient {
         let cwd = workspace;
         let (strategy, fallback) = self.pool_decision(&profile_id, &config)?;
         let runtime_resources = vibex_agent::ProviderRuntimeResources::default();
+        let auth_source = vibex_core::RuntimeAuthSource::provider_profile(profile_id.clone());
+        let env_unsets = Vec::new();
         let process = tokio::select! {
             result = timeout(
                 deadline.saturating_duration_since(Instant::now()),
                 self.spawn_process(
                     AcpProcessInstanceId::new(),
                     AcpProcessLaunch {
-                        profile_id: &profile_id,
-                        agent_id: None,
+                        auth_source: &auth_source,
+                        auth_source_revision: profile.updated_at_ms,
+                        agent_id: &profile.agent_id,
                         config: &config,
                         cwd: &cwd,
                         runtime_resources: &runtime_resources,
+                        env_unsets: &env_unsets,
                         purpose: AcpProcessPurpose::Probe,
                         process_strategy_effective: strategy,
                         pool_fallback_reason: fallback,

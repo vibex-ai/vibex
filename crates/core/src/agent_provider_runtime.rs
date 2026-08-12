@@ -1694,12 +1694,11 @@ mod tests {
                 "{agent_id} has a typed model-provider projector"
             );
         }
-        for agent_id in ["cline"] {
-            assert!(
-                !supported.contains(&AgentId::parse(agent_id).unwrap()),
-                "{agent_id} must not expose model-provider configuration"
-            );
-        }
+        let unsupported_agent_id = "cline";
+        assert!(
+            !supported.contains(&AgentId::parse(unsupported_agent_id).unwrap()),
+            "{unsupported_agent_id} must not expose model-provider configuration"
+        );
     }
 
     #[test]

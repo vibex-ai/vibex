@@ -581,7 +581,7 @@ const previewRoot = normalizePreviewRootRecord(persisted.previewRoot, previewTab
 
 ### 1. Scope / Trigger
 
-- Trigger: Desktop or Remote lets a user change Agent/Profile/Model/Effort/Mode
+- Trigger: Desktop or Remote lets a user change Agent/authentication-source/model/Effort/Mode
   while preserving one logical session and accepting ordinary messages during
   runtime preparation.
 - Server selection, lifecycle snapshots, and durable submissions are separate
@@ -659,8 +659,8 @@ Remote history attach role  -> viewer
 - Snapshot binding/generation mismatch -> reject live projection and refetch.
 - Cursor reset/stream id change -> clear cursor/snapshot, refetch selection,
   and reattach.
-- Authentication-required failure -> retain effective runtime and open Config
-  Center/Providers recovery.
+- Authentication-required failure -> retain effective runtime and open the
+  selected source's login or Provider configuration recovery.
 - Final transient failure -> retain effective runtime and offer an explicit
   retry when a target is remembered.
 - Ambiguous message dispatch -> show uncertain delivery and never auto-resend.
@@ -775,7 +775,7 @@ ComposerUiState {
   runtime_selections_by_agent:
     BTreeMap<AgentId, SessionRuntimeSelection>,
   runtime_selections_by_model:
-    Vec<SessionRuntimeSelection> // max 256, identity = Agent/Profile/Model
+    Vec<SessionRuntimeSelection> // max 256, identity = Agent/AuthSource/Model
 }
 
 ComposerGeometry {
@@ -959,11 +959,12 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   remembered desired selection through the durable selector, while Reset
   requests the effective selection. Neither action mutates effective state
   optimistically.
-- Runtime controls derive an Agent → Provider Profile → Model → Reasoning Effort
-  → Mode cascade from `SessionRuntimeOptionCatalog`. Each visible choice maps
-  back to a complete `SessionRuntimeSelection`; unavailable catalog entries are
-  excluded from cascade choices, and the selected request still goes through the
-  durable runtime-selection service.
+- Runtime controls derive an Agent → authentication source → Model → Reasoning
+  Effort → Mode cascade from `SessionRuntimeOptionCatalog`. New-session UI may
+  omit the Agent level, while current-session UI keeps it. Each visible choice
+  maps back to a complete `SessionRuntimeSelection`; source summaries remain
+  visible even when their model options are unavailable, and the selected
+  request still goes through the durable runtime-selection service.
 - Reasoning Effort selector names derive from the catalog value (`low` -> `Low`,
   `medium` -> `Medium`, `xhigh` -> `XHigh`), never from the explanatory
   description. Known levels render from lower to higher depth
@@ -979,7 +980,7 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
 - `DesktopUiStateV1.composer.runtime_selections_by_agent` persists the most recent
   complete selection per Agent so Agent A -> B -> A restores the last route.
   `runtime_selections_by_model` additionally persists at most 256 selections by
-  exact Agent/Profile/Model identity, so choosing a Model restores its own valid
+  exact Agent/AuthSource/Model identity, so choosing a Model restores its own valid
   Effort/Mode/feature values even after selecting another Model. Explicit
   new-session choices and successful in-session runtime changes update both
   projections. Existing per-Agent values seed the per-Model collection during
@@ -991,9 +992,9 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   persists only while its epoch is still current, so an older switch cannot
   overwrite a newer choice; activity for another Agent does not invalidate it.
 - Above the compact breakpoint, the runtime trigger visibly renders
-  `Provider Profile / Model`; compact icon-only triggers keep the same complete
-  value in their tooltip. Rendering only the Model name is ambiguous when two
-  Profiles expose similarly named Models.
+  `authentication source / Model`; compact icon-only triggers keep the same
+  complete value in their tooltip. Rendering only the Model name is ambiguous
+  when two sources expose similarly named Models.
 - Composer terminal controls own only a filtered terminal-id list and selected
   id. Create goes through the typed desktop runtime terminal facade and persists
   metadata; switch changes the Composer selection without auto-selecting a
@@ -1135,10 +1136,10 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   the preference valid again. Only an explicit user choice or a confirmed
   in-session switch replaces it.
 - Persisted runtime preference key does not match `selection.agent_id`, has an
-  empty Model, or exceeds bounded key/value/count limits -> drop that preference
-  during `DesktopUiStateV1::normalize`; do not fail session creation or treat the
-  preference as runtime authority.
-- A per-Model preference has the same Agent/Profile/Model identity as an earlier
+  empty explicit Model, or exceeds bounded key/value/count limits -> drop that
+  preference during `DesktopUiStateV1::normalize`; `AgentDefault` is valid and
+  does not require a model id. Preferences never become runtime authority.
+- A per-Model preference has the same Agent/AuthSource/Model identity as an earlier
   entry -> keep the latest normalized configuration in that slot. An invalid or
   257th distinct entry is dropped/evicted without affecting runtime authority.
 - Catalog exposes no Reasoning Effort values, or only a `default` sentinel ->
@@ -1594,7 +1595,7 @@ non-destructive and must not delete or rewrite stored Workspace references.
   surface must show the current ACP authentication methods.
 - Trigger: discovery, environment save, native Agent login, terminal login,
   logout, and terminal exit can complete out of order while the user changes
-  Agent or Provider Profile.
+  Agent or authentication scope.
 - The Agent detail surface must keep authentication understandable without
   exposing runtime verification, runtime-option, or Provider projection
   implementation panels.
@@ -1629,7 +1630,7 @@ logout_agent() -> BackendFuture<AgentAuthCatalog>
   input treatment; the UI never creates a generic API-key field for an Agent
   that did not advertise one.
 - An auth callback may mutate state only when its generation and exact scope
-  still match. Selecting another Agent/Profile clears inputs, errors, catalog,
+  still match. Selecting another Agent/auth scope clears inputs, errors, catalog,
   terminal surface, and the old temporary terminal.
 - Environment inputs are keyed by an unambiguous `(method_id, env_name)` value,
   masked when `secret`, and show only `configured` for an existing secret.
@@ -1667,7 +1668,7 @@ logout_agent() -> BackendFuture<AgentAuthCatalog>
 | Condition | Required result |
 | --- | --- |
 | No runtime or disabled Agent | disable auth actions and show the unavailable state. |
-| Discovery completes for an old scope/generation | ignore it; keep the current Agent/Profile state. |
+| Discovery completes for an old scope/generation | ignore it; keep the current Agent/auth-scope state. |
 | Environment method has no Profile | keep the action disabled and show the Profile-required state. |
 | Required credential is explicitly cleared | refresh catalog, mark authentication required, and do not invoke ACP authenticate. |
 | Selected method has a Running auth operation | render Stop; keep other methods for that Agent disabled. |
@@ -1679,7 +1680,7 @@ logout_agent() -> BackendFuture<AgentAuthCatalog>
 
 ### 5. Good / Base / Bad Cases
 
-- Good: selecting a new Profile while auth discovery is in flight leaves the
+- Good: selecting a new authentication scope while discovery is in flight leaves the
   new Profile's catalog intact when the old request returns.
 - Good: two methods both contain a variable named `TOKEN`; their input state
   remains independent because the method id is part of the key.
@@ -1751,6 +1752,139 @@ self.agent_auth_operations.insert(
 
 The view owns transient presentation state; `DesktopRuntime` and the ACP
 adapter remain authoritative for authentication and credentials.
+
+## Scenario: GPUI Authentication-Source Cascade And Default Account Login
+
+### 1. Scope / Trigger
+
+- Trigger: the Composer's two-in-one or three-in-one runtime selector must let
+  a user switch between Provider Profiles and the selected Agent's one default
+  logged-in account, then choose a model or the Agent's own default behavior.
+- `DesktopRuntime`/Backend owns catalog and authentication state. GPUI stores
+  only the selected view, pending presentation state, and bounded desired
+  request; Web/mobile consume the same projection through the remote backend.
+
+### 2. Signatures
+
+```text
+RuntimeCascadeProjection {
+  agents[], auth_sources[], models[], reasoning_efforts[], modes[]
+}
+
+ComposerRuntimeMenuView = Agent | AuthSource | Authentication | Model
+
+RuntimeAuthSourceSummary {
+  source, agent_id, label, kind, auth_source_revision,
+  availability, account_hint?, model_catalog_status, supported_actions[]
+}
+
+RuntimeModelSelection = Explicit { model_id } | AgentDefault
+
+New-session selector: AuthSource -> Model -> Effort -> Mode
+Current-session selector: Agent -> AuthSource -> Model -> Effort -> Mode
+```
+
+### 3. Contracts
+
+- The catalog's `auth_sources` list is independent of `options`. A source with
+  no models, a stale catalog, or `RequiresAuthentication` must still render a
+  stable source row and its status/action affordance.
+- New-session menus skip the Agent level because the selected Agent is already
+  implied by the surrounding composer. Current-session menus keep the Agent
+  level and filter sources to that Agent. Both paths use the same
+  `RuntimeCascadeProjection` and complete `SessionRuntimeSelection` values.
+- Source rows show Provider Profile or AgentAccount semantics with distinct
+  icon/label treatment. An AgentAccount row is the sole default account for
+  that Agent, may show a bounded account hint, and must not expose Add account,
+  Duplicate, account list, or account deletion controls.
+- `Available` sources enter the model view. `RequiresAuthentication` opens the
+  authentication view; `Verifying`/`DiscoveringModels` keeps the same row size
+  with a progress state; temporary failure exposes retry; unsupported/config
+  states remain actionable where the backend advertises an action.
+- Browser/Agent-owned methods can complete in the popover. Terminal and
+  Provider-required methods open Config Center, which owns PTY/environment
+  input and the full login lifecycle. A successful login/verify returns to the
+  model view only after the catalog is refreshed.
+- If a source has no concrete model evidence, the model view shows the semantic
+  label “Selected automatically by Agent”. The projection key is
+  `agent-default`, but `RuntimeModelSelection::AgentDefault` is preserved in
+  the request and no model sentinel is sent to ACP.
+- Selecting a new source/model creates a complete desired selection with the
+  catalog revision and stable idempotency key. It never locally changes
+  effective state. Desired/effective differences render “Preparing”, “Waiting
+  for current work”, “Needs sign-in”, or “Still using previous source”.
+- Active turns are not reconfigured in place. The backend waits/rejects per its
+  active-work policy; the UI does not disable unrelated Agents or fabricate a
+  successful switch when the target fails.
+- Context revision/catalog refresh invalidates old explicit model and effort
+  choices. The UI clears an unavailable choice or asks for a fresh selection;
+  it does not silently substitute a Provider or another account.
+- Remote clients receive the same source/model projection and revisions. A
+  read-only client may inspect but cannot authenticate or change the source;
+  all permission checks remain server-side.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Source absent from current catalog | reject click/no mutation; refetch catalog. |
+| Catalog revision changed after menu opened | backend CAS conflict; clear overlay and rebuild choices. |
+| AgentAccount requires authentication | open authentication view; preserve old effective source. |
+| AgentAccount has no model list | expose `AgentDefault`; never use `"default"` as a model id. |
+| Login/verify changes context revision | refresh catalog and discard old model/effort selection. |
+| Browser/terminal auth callback is stale | ignore it by auth generation and exact source/context id. |
+| Runtime switch fails | keep old effective label and show actionable retry/login/configure state. |
+| Read-only remote client attempts source/auth mutation | backend returns permission denial; local disabled state is convenience only. |
+| Long label/account hint exceeds row width | truncate within a stable row; tooltip carries the bounded full label, never raw path. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: new session opens the two-level menu, shows “Codex · default CLI
+  account · Sign in”, completes browser login, refreshes models, and returns to
+  the model list without creating a Provider Profile.
+- Good: current session opens Agent -> AgentAccount -> AgentDefault, then later
+  switches back to a Provider Profile; desired/effective feedback remains tied
+  to the same logical session.
+- Base: a Provider Profile exposes eight models while the Agent account exposes
+  only AgentDefault; both source rows remain visible and independently usable.
+- Base: terminal login routes to Config Center and returning to the composer
+  preserves the selected Agent/source but reloads its status and catalog.
+- Bad: hide an account source because its model list is empty, render a second
+  account row for a relogin, set effective state optimistically, or silently
+  fall back to a Provider after authentication failure.
+
+### 6. Tests Required
+
+- Shared GPUI model tests cover source grouping, AgentDefault projection key,
+  model filtering by exact source, stable ordering, and revision invalidation.
+- Desktop app tests cover two-level new-session and three-level current-session
+  navigation, source status labels/icons, login subview, Config Center routing,
+  and one-account-per-Agent rendering.
+- Async generation tests cover stale catalog/auth callbacks, login completion,
+  model refresh, failed switch feedback, and desired/effective reconciliation.
+- Remote/client tests cover identical DTO projection, legacy capability
+  filtering, read-only rendering, and permission-denied mutation handling.
+- Responsive/dark-mode checks cover fixed menu row dimensions, long account
+  hints, compact layout, and no overflow at desktop and phone widths.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+set_effective(selection);
+let model_id = source.models.first().unwrap_or("default");
+hide_source_when_models_empty();
+```
+
+#### Correct
+
+```rust
+let source = catalog.auth_sources_for(agent_id).find(source_id)?;
+set_desired_runtime(catalog.revision, source, RuntimeModelSelection::AgentDefault);
+render_status(source.availability);
+// Backend commits effective state only after the source-specific switch is ready.
+```
 
 ## Scenario: GPUI Management Section Lifetime
 

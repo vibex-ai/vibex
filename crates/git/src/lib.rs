@@ -29,7 +29,7 @@ const MAX_BLAME_LINES: u32 = 500;
 const VIBEX_GIT_MUTATION_LOCK_FILE: &str = "vibex-mutation.lock";
 
 fn git_command() -> Command {
-    let mut command = Command::new("git");
+    let command = Command::new("git");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;

@@ -449,7 +449,7 @@ fn build_annual_projection(
         .into_iter()
         .zip(facts_by_day)
         .map(|(bucket, day_facts)| {
-            let mut model_groups: BTreeMap<String, Vec<&AgentUsageFactProjection>> =
+            let mut model_groups: BTreeMap<Option<String>, Vec<&AgentUsageFactProjection>> =
                 BTreeMap::new();
             for projection in &day_facts {
                 model_groups
@@ -461,7 +461,9 @@ fn build_annual_projection(
                 .into_iter()
                 .map(|(model_id, model_facts)| {
                     Ok(AgentUsageDailyModelUsage {
-                        label: model_id.clone(),
+                        label: model_id
+                            .clone()
+                            .unwrap_or_else(|| "Agent default".to_string()),
                         model_id,
                         requests: model_facts.len() as u64,
                         total_tokens: total_metric(model_facts.as_slice())?,
@@ -530,10 +532,15 @@ fn matches_filters(
     (request.agent_ids.is_empty() || request.agent_ids.contains(&fact.agent_id))
         && (request.project_ids.is_empty() || request.project_ids.contains(&fact.project_id))
         && (request.provider_profile_ids.is_empty()
-            || request
-                .provider_profile_ids
-                .contains(&fact.provider_profile_id))
-        && (request.model_ids.is_empty() || request.model_ids.contains(&fact.model_id))
+            || fact
+                .auth_source
+                .provider_profile_id()
+                .is_some_and(|profile_id| request.provider_profile_ids.contains(profile_id)))
+        && (request.model_ids.is_empty()
+            || fact
+                .model_id
+                .as_ref()
+                .is_some_and(|model_id| request.model_ids.contains(model_id)))
         && (request.session_ids.is_empty() || request.session_ids.contains(&fact.session_id))
 }
 
@@ -554,10 +561,12 @@ fn build_filter_options(facts: &[AgentUsageFactProjection]) -> AgentUsageFilterO
             projection.project_label.clone(),
         );
         provider_profiles.insert(
-            fact.provider_profile_id.as_str().to_string(),
-            projection.provider_profile_label.clone(),
+            fact.auth_source.id().to_string(),
+            projection.auth_source_label.clone(),
         );
-        models.insert(fact.model_id.clone(), fact.model_id.clone());
+        if let Some(model_id) = fact.model_id.as_ref() {
+            models.insert(model_id.clone(), model_id.clone());
+        }
         sessions.insert(
             fact.session_id.as_str().to_string(),
             projection.session_label.clone(),
@@ -608,10 +617,18 @@ fn build_dimension_rows(
                 projection.project_label.clone(),
             ),
             AgentUsageDimension::ModelProvider => (
-                fact.provider_profile_id.as_str().to_string(),
-                projection.provider_profile_label.clone(),
+                fact.auth_source.id().to_string(),
+                projection.auth_source_label.clone(),
             ),
-            AgentUsageDimension::Model => (fact.model_id.clone(), fact.model_id.clone()),
+            AgentUsageDimension::Model => fact.model_id.as_ref().map_or_else(
+                || {
+                    (
+                        "model-resolution:agent-default".to_string(),
+                        "Agent default".to_string(),
+                    )
+                },
+                |model_id| (model_id.clone(), model_id.clone()),
+            ),
         };
         groups.entry((id, label)).or_default().push(*projection);
     }
@@ -825,12 +842,12 @@ mod tests {
     use tempfile::tempdir;
     use vibex_core::{
         AgentId, AgentSession, AgentSessionSafety, AgentSessionState, AgentUsageCounterOrigin,
-        AgentUsageExecution, AgentUsageExecutionStatus, AgentUsageExecutionStatusUpdate,
-        AgentUsageObservation, AgentUsageObservationSource, AgentUsageStreamAttribution,
-        AgentUsageTokenValues, ProviderProfileId, RuntimeBindingId, UsageExecutionId,
-        VibexSessionId, WorkspaceMode,
+        AgentUsageDimension, AgentUsageExecution, AgentUsageExecutionStatus,
+        AgentUsageExecutionStatusUpdate, AgentUsageObservation, AgentUsageObservationSource,
+        AgentUsageStreamAttribution, AgentUsageTokenValues, ProviderProfileId, RuntimeAuthSource,
+        RuntimeBindingId, UsageExecutionId, VibexSessionId, WorkspaceMode,
     };
-    use vibex_db::{SessionRepository, WorkspaceRepository};
+    use vibex_db::{AgentAuthContextRepository, SessionRepository, WorkspaceRepository};
 
     use super::*;
 
@@ -929,8 +946,11 @@ mod tests {
             binding_id: RuntimeBindingId::new(),
             activation_generation: 1,
             agent_id: AgentId::parse(agent_id).unwrap(),
-            provider_profile_id,
-            model_id: model_id.to_string(),
+            auth_source: vibex_core::RuntimeAuthSource::provider_profile(
+                provider_profile_id.clone(),
+            ),
+            auth_source_revision: 1,
+            model_id: Some(model_id.to_string()),
         };
         let connection = open_database(service.database_path()).unwrap();
         let migration_applied_at_ms = connection
@@ -945,13 +965,15 @@ mod tests {
                 "
                 INSERT INTO session_runtime_bindings (
                     binding_id, session_id, agent_id, transport_kind, adapter_id, adapter_version,
-                    adapter_compatibility_identity, provider_profile_id, native_state_home_id,
+                    adapter_compatibility_identity, provider_profile_id, profile_revision,
+                    auth_source_kind, auth_source_id, auth_source_revision, native_state_home_id,
                     process_spawn_fingerprint, session_runtime_config_state_json, binding_state,
                     activation_generation, created_at_ms, updated_at_ms,
                     usage_zero_baseline_state
                 ) VALUES (
                     ?1, ?2, ?3, 'acp', 'usage-test-adapter', '1.0.0',
-                    'usage-test-compatibility', ?4, 'usage-test-home',
+                    'usage-test-compatibility', ?4, 1, 'provider_profile', ?4, 1,
+                    'usage-test-home',
                     'usage-test-fingerprint', '{}', 'current', 1, ?5, ?5, 'available'
                 )
                 ",
@@ -959,7 +981,60 @@ mod tests {
                     stream.binding_id.as_str(),
                     stream.session_id.as_str(),
                     stream.agent_id.as_str(),
-                    stream.provider_profile_id.as_str(),
+                    provider_profile_id.as_str(),
+                    migration_applied_at_ms.saturating_add(1),
+                ],
+            )
+            .unwrap();
+        stream
+    }
+
+    fn agent_default_stream(
+        service: &AgentUsageService,
+        session: &AgentSession,
+    ) -> AgentUsageStreamAttribution {
+        let connection = open_database(service.database_path()).unwrap();
+        let auth_context =
+            AgentAuthContextRepository::ensure_default(&connection, &session.agent_id).unwrap();
+        let stream = AgentUsageStreamAttribution {
+            session_id: session.id.clone(),
+            binding_id: RuntimeBindingId::new(),
+            activation_generation: 1,
+            agent_id: session.agent_id.clone(),
+            auth_source: RuntimeAuthSource::agent_account(auth_context.id.clone()),
+            auth_source_revision: auth_context.revision,
+            model_id: None,
+        };
+        let migration_applied_at_ms = connection
+            .query_row(
+                "SELECT applied_at_ms FROM schema_migrations WHERE version = 31",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "
+                INSERT INTO session_runtime_bindings (
+                    binding_id, session_id, agent_id, transport_kind, adapter_id, adapter_version,
+                    adapter_compatibility_identity, provider_profile_id, profile_revision,
+                    auth_source_kind, auth_source_id, auth_source_revision, native_state_home_id,
+                    process_spawn_fingerprint, session_runtime_config_state_json, binding_state,
+                    activation_generation, created_at_ms, updated_at_ms,
+                    usage_zero_baseline_state
+                ) VALUES (
+                    ?1, ?2, ?3, 'acp', 'usage-test-adapter', '1.0.0',
+                    'usage-test-compatibility', NULL, NULL, 'agent_account', ?4, ?5,
+                    'usage-test-agent-default-home', 'usage-test-agent-default-fingerprint', '{}',
+                    'current', 1, ?6, ?6, 'available'
+                )
+                ",
+                rusqlite::params![
+                    stream.binding_id.as_str(),
+                    stream.session_id.as_str(),
+                    stream.agent_id.as_str(),
+                    auth_context.id.as_str(),
+                    auth_context.revision,
                     migration_applied_at_ms.saturating_add(1),
                 ],
             )
@@ -1123,6 +1198,76 @@ mod tests {
             3
         );
         assert_eq!(statistics.filter_options.sessions.len(), 1);
+    }
+
+    #[test]
+    fn agent_default_usage_has_no_synthetic_model_but_remains_visible() {
+        let (_directory, service, session) = seeded_service();
+        let stream = agent_default_stream(&service, &session);
+        let execution = execution(&service, &session, &stream, 9);
+        service
+            .apply_telemetry_event(dispatched_event(execution.clone()))
+            .unwrap();
+        service
+            .apply_telemetry_event(AgentUsageTelemetryEvent::Observation(observation(
+                execution.clone(),
+                1,
+                60,
+                40,
+                20,
+                100,
+            )))
+            .unwrap();
+
+        let connection = open_database(service.database_path()).unwrap();
+        let fact = AgentUsageRepository::get_fact(&connection, &execution.usage_execution_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fact.model_id, None);
+        let checkpoint_model: Option<String> = connection
+            .query_row(
+                "SELECT last_model_id FROM agent_usage_checkpoints WHERE binding_id = ?1",
+                rusqlite::params![stream.binding_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(checkpoint_model, None);
+
+        let statistics = service
+            .query_statistics_at(
+                AgentUsageStatisticsRequest {
+                    dimension: AgentUsageDimension::Model,
+                    ..fixed_request(AgentUsageRange::Today)
+                },
+                dispatched_at(12),
+            )
+            .unwrap();
+        assert_eq!(statistics.totals.requests, 1);
+        assert_eq!(statistics.totals.total_tokens.value, Some(100));
+        assert!(statistics.filter_options.models.is_empty());
+        assert_eq!(statistics.dimension_rows.len(), 1);
+        assert_eq!(
+            statistics.dimension_rows[0].id,
+            "model-resolution:agent-default"
+        );
+        assert_eq!(statistics.dimension_rows[0].label, "Agent default");
+        assert_eq!(statistics.dimension_rows[0].aggregate.requests, 1);
+        assert_eq!(
+            statistics.dimension_rows[0].aggregate.total_tokens.value,
+            Some(100)
+        );
+
+        let annual = statistics.annual.unwrap();
+        let day = annual
+            .days
+            .iter()
+            .find(|day| day.label == "2026-07-31")
+            .unwrap();
+        assert_eq!(day.models.len(), 1);
+        assert_eq!(day.models[0].model_id, None);
+        assert_eq!(day.models[0].label, "Agent default");
+        assert_eq!(day.models[0].requests, 1);
+        assert_eq!(day.models[0].total_tokens.value, Some(100));
     }
 
     #[test]
@@ -1355,7 +1500,7 @@ mod tests {
                 .find(|day| day.label == "2025-08-15")
                 .unwrap();
             assert_eq!(used_day.total_tokens.value, Some(100));
-            assert_eq!(used_day.models[0].model_id, "annual-model");
+            assert_eq!(used_day.models[0].model_id.as_deref(), Some("annual-model"));
             assert_eq!(used_day.models[0].requests, 1);
         }
     }
@@ -1436,7 +1581,7 @@ mod tests {
                     agent_ids: vec![first_stream.agent_id.clone()],
                     project_ids: vec![first_session.project_id.clone()],
                     provider_profile_ids: vec![first_profile],
-                    model_ids: vec![first_stream.model_id.clone()],
+                    model_ids: vec![first_stream.model_id.clone().unwrap()],
                     session_ids: vec![first_session.id.clone()],
                     ..fixed_request(AgentUsageRange::Today)
                 },

@@ -5,8 +5,8 @@ use agent_client_protocol_schema::v1::AuthMethod as SchemaAuthMethod;
 use serde::Deserialize;
 use serde_json::Value;
 use vibex_core::{
-    AgentAuthCatalog, AgentAuthEnvironmentVariable, AgentAuthMethod, AgentAuthMethodKind,
-    AgentAuthStatus, AgentId, unix_timestamp_ms,
+    AgentAuthCatalog, AgentAuthEnvironmentVariable, AgentAuthMethod, AgentAuthMethodEffect,
+    AgentAuthMethodKind, AgentAuthStatus, AgentId, unix_timestamp_ms,
 };
 
 const AUTH_METHOD_LIMIT: usize = 32;
@@ -168,6 +168,12 @@ pub(crate) fn parse_initialize_auth_catalog(
             name,
             description,
             kind,
+            effect: match kind {
+                AgentAuthMethodKind::Environment => AgentAuthMethodEffect::RequiresProviderProfile,
+                AgentAuthMethodKind::Agent | AgentAuthMethodKind::Terminal => {
+                    AgentAuthMethodEffect::WritesAgentStateHome
+                }
+            },
             environment,
             credential_link,
         });
@@ -259,6 +265,7 @@ pub(crate) fn append_known_terminal_auth_fallback(
         name: title.to_string(),
         description: Some(description.to_string()),
         kind: AgentAuthMethodKind::Terminal,
+        effect: AgentAuthMethodEffect::WritesAgentStateHome,
         environment: Vec::new(),
         credential_link: None,
     });

@@ -1986,7 +1986,7 @@ Claude Agent -> ProviderProfile.kind = claude -> dispatch a Native SDK runtime
 ```text
 Claude configuration/API profile -> kind = claude (not catalog eligible)
 Claude online runtime profile -> kind = acp + claude-agent-acp preset
-SessionRuntimeSelection -> exact Agent/Profile -> managed ACP route
+Provider-backed SessionRuntimeSelection -> exact Agent/Provider Profile -> managed ACP route
 ```
 
 ## Scenario: Phase 6 ACP Capability Probe And Runtime Gating
@@ -3818,3 +3818,122 @@ if provider_matches && current_model == target_model {
 Only descriptor-owned, redacted projection targets define the expected provider
 identity. Raw endpoint paths, query strings, credentials, and response payloads
 do not enter durable evidence.
+
+## Scenario: Source-Aware ACP Launch Projection
+
+### 1. Scope / Trigger
+
+- Trigger: an ACP process is started for authentication, model discovery, or a
+  real session and the requested runtime source is either a Provider Profile or
+  an Agent default account.
+- Read this contract with the Agent session and runtime-switch source-revision
+  contracts. Provider projection is a source-specific operation, not a generic
+  Agent launch default.
+
+### 2. Signatures
+
+```text
+RuntimeAuthSource = ProviderProfile { provider_profile_id }
+                 | AgentAccount { auth_context_id }
+
+AgentProviderProjectionEngine::plan/resolve_and_materialize(
+  ProviderProfile source, agent/version/workspace
+) -> ResolvedAgentProviderProjection
+
+AcpRuntimeClient::process_spawn_config_snapshot_for_agent_account(
+  agent_id, auth_context_id, context_revision
+) -> redacted spawn snapshot
+
+AgentAuthContextCapabilities {
+  supports_default_state_home,
+  credential_env_keys_to_unset[],
+  supports_logout,
+  supports_direct_model_catalog,
+  auth_verification_strategy
+}
+```
+
+### 3. Contracts
+
+- Provider Profile launches resolve secret references late, apply the
+  versioned projection descriptor, materialize the Provider-scoped runtime
+  home/overlay, and include projection identity in the spawn fingerprint. Secret
+  values never enter the fingerprint, Debug, or persisted preview.
+- AgentAccount launches verify the context/revision, resolve the Agent's normal
+  default state home, do not call the Provider projection engine, and do not
+  create an isolated Vibex account home. They unset exactly the Registry-listed
+  Provider/API-key/selector variables before spawn.
+- The same source-aware launch decision is used by auth, model discovery, and
+  real session creation. A successful login process is closed before a fresh
+  verification/discovery process starts, so an in-memory credential cannot
+  masquerade as persisted login.
+- State-home identity, source kind/id, context/Profile revision, Agent/Adapter
+  compatibility, and redacted environment fingerprint are part of runtime
+  binding/restore identity. Workspace path is a separate compatibility input.
+- AgentAccount process snapshots may expose only bounded command/config facts to
+  diagnostics. They never persist raw default-home paths or environment values.
+- Provider projection compatibility/backfill remains available for legacy
+  Provider rows. It must not synthesize a Profile for an AgentAccount source.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Provider source lacks a valid enabled ACP Profile | existing Provider route/config validation error; no process. |
+| AgentAccount context missing, Agent mismatch, or revision stale | `agent_auth_context_not_found`, `agent_auth_context_agent_mismatch`, or revision conflict; no projection. |
+| Agent lacks default-home capability | `agent_default_state_home_unsupported`; source unavailable. |
+| AgentAccount path sees Provider projection plan | fail closed with source/projection mismatch; do not spawn. |
+| Registry env-unset key is invalid/unbounded | compatibility descriptor validation error; do not guess a global key list. |
+| Secret resolution fails on Provider path | redacted secret/config error; no partial overlay or process. |
+| Auth/model/session fingerprints differ for same source revision | stale/recovery conflict; do not reuse the process or native session. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: Provider source receives its configured API key and projection home;
+  AgentAccount source starts from the normal Agent home with Provider keys
+  explicitly unset, and both fingerprints remain distinct.
+- Good: model discovery and the first real session use the same account source
+  revision and state-home identity, so the discovered entitlement is relevant.
+- Base: an Agent's Registry descriptor does not support direct model listing;
+  the runtime falls back to ACP session evidence or `AgentDefault` without
+  inventing a Provider model.
+- Bad: set `CODEX_HOME`/equivalent to a Provider temp directory on AgentAccount,
+  inherit a parent API key, or copy a token into the Vibex database.
+- Bad: let a Provider projection write into the Agent's default state home or
+  use a broad hard-coded env-unset list shared by every Agent.
+
+### 6. Tests Required
+
+- Projection tests cover Provider plan/materialization, secret-free preview,
+  legacy compatibility, and source-specific fingerprints.
+- ACP tests cover AgentAccount env unsets, default-home preservation, no
+  projection calls, and equal launch identity across auth/probe/session.
+- Registry tests cover descriptor capability validation and bounded env keys.
+- Restore/switch tests reject source/home/revision fingerprint mismatches and
+  never reuse a Provider process for an AgentAccount target.
+- Redaction tests inspect Debug, diagnostics, database rows, and remote DTOs for
+  absence of secrets and raw paths.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+let projection = plan_provider_projection(profile_or_fake_profile)?;
+spawn_with_home(projection.runtime_home);
+```
+
+#### Correct
+
+```rust
+match selection.auth_source {
+    RuntimeAuthSource::ProviderProfile { .. } => {
+        let projection = resolve_provider_projection(...)?;
+        spawn_with_projection(projection)
+    }
+    RuntimeAuthSource::AgentAccount { auth_context_id } => {
+        let descriptor = registry.auth_context_capabilities(agent_id)?;
+        spawn_with_default_home_and_unsets(auth_context_id, descriptor)
+    }
+}
+```

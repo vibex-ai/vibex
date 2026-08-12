@@ -1966,7 +1966,7 @@ Agent/workbench remote APIs while keeping native config writes out of scope.
 ### 1. Scope / Trigger
 
 - Trigger: Desktop and paired Remote clients must read and change the same
-  provider-neutral Agent/Profile/Model selection without adding a second
+  provider-neutral Agent/authentication-source/model selection without adding a second
   switch-then-send protocol.
 - The PC runtime owns Catalog assembly and durable desired/effective state.
   `vibex-remote` owns only authenticated transport and authorization.
@@ -1988,6 +1988,7 @@ trait RemoteRuntimeOptionCatalogSource: Send + Sync {
 }
 
 RemoteCapabilitySummary.supportsSeamlessRuntimeSelection: bool
+RemoteCapabilitySummary.supportsAgentAccountAuth: bool
 ```
 
 ### 3. Contracts
@@ -1998,6 +1999,9 @@ RemoteCapabilitySummary.supportsSeamlessRuntimeSelection: bool
 - The capability is true only when both runtime selection and the Catalog
   source are wired. It uses a serde default of `false`, so older service-info
   payloads fail closed.
+- `ListRuntimeOptions.supportsAgentAccountAuth` is a client capability fence.
+  When false/omitted, the server removes AgentAccount source summaries and
+  options before serialization so old clients never see unknown tagged variants.
 - `list_runtime_options` requires `ReadAgentSession`; `set_desired_runtime` and
   `cancel_runtime_switch` require `MutateAgentSession`. Authentication and
   authorization happen before any service call.
@@ -2065,6 +2069,145 @@ Remote UI -> list_runtime_options (ReadAgentSession)
           -> set_desired_runtime (MutateAgentSession + CAS)
           -> send_message(desiredRuntime, stable idempotency key)
           -> poll authoritative selection/submission state
+```
+
+## Scenario: Remote Agent Default Account Authentication
+
+### 1. Scope / Trigger
+
+- Trigger: a paired Web/mobile client needs the same redacted Agent default
+  account state, login methods, operation progress, verification, model refresh,
+  logout impact, and logout action as GPUI Desktop.
+- `DesktopRuntime` remains the only credential/process authority. Remote and
+  Relay carry typed requests and safe progress only; they never authenticate
+  directly against an Agent or inspect its state home.
+
+### 2. Signatures
+
+```text
+RemoteCapabilitySummary.supportsAgentAccountAuth: bool
+
+RemoteAgentRequest =
+  ListAuthContexts { auth }
+  | ListAuthMethods { auth, agent_id }
+  | AuthenticateContext { auth, request }
+  | GetAuthenticationOperation { auth, operation_id }
+  | CancelContextAuthentication { auth, request }
+  | VerifyAuthContext { auth, request }
+  | RefreshAuthModels { auth, request }
+  | PreviewAuthLogout { auth, auth_context_id }
+  | LogoutAuthContext { auth, request }
+
+trait RemoteAgentAuthContextSource {
+  list_auth_contexts() -> Vec<AgentAuthContext>
+  list_auth_methods(agent_id) -> AgentAuthCatalog
+  authenticate_context(request) -> AgentAuthContextAuthenticateResult
+  get_authentication_operation(operation_id) -> AgentAuthenticationOperation
+  cancel_authentication(request) -> AgentAuthContextMutationResult
+  verify_context(request) -> AgentAuthContextMutationResult
+  refresh_models(request) -> AgentAuthContextMutationResult
+  logout_preview(auth_context_id) -> AgentAuthContextLogoutPreview
+  logout(request) -> AgentAuthContextMutationResult
+}
+```
+
+### 3. Contracts
+
+- The service advertises `supportsAgentAccountAuth` only when an authoritative
+  `RemoteAgentAuthContextSource` is wired. The capability defaults to false for
+  old server payloads and clients must hide/disable account actions when false.
+- Context and method listing require `ReadAgentSession`. Responses contain
+  bounded ids, status, revision, account hint, advertised method metadata,
+  action location, model descriptors, and timestamps only.
+- Authenticate, operation-status query, cancel, verify, refresh models, logout
+  preview, and logout all require `MutateAgentAuthentication`; only
+  `full_control` devices have it. Operation status remains mutation-class
+  because it can reveal a sensitive login workflow and is polled only by the
+  device that controls that workflow.
+- Every mutation reuses the canonical context request, including operation id,
+  expected context revision, and confirmed affected-session count. Remote does
+  not invent an account id, revision, model list, or logout impact.
+- Host browser, device-code, host terminal, and remote-attachable terminal are
+  explicit execution locations. A remote client renders the returned action;
+  it does not assume a PC loopback OAuth callback can run in the phone browser.
+- Authentication operation state is durable and queryable. Disconnecting the
+  client does not cancel the host operation; cancellation is an explicit typed
+  request with the same operation/context/revision fence.
+- Each authentication mutation writes a bounded audit record with target kind
+  `agent_authentication`, target context id, safe operation label, device id,
+  request/correlation ids, and success/failure. Listing and status polling do
+  not copy account payloads into audit details.
+- `safe_remote_agent_auth_error` preserves a stable safe code/category and
+  replaces diagnostic text. Responses/audit/logs must not contain token,
+  cookie, OAuth state, device code, environment values, raw terminal output,
+  native state-home path, command, process/native session id, or ACP payload.
+- Runtime catalog negotiation is separate: a client must set
+  `supportsAgentAccountAuth=true` on `ListRuntimeOptions` before account source
+  variants are included. Older clients receive a Provider-only projection.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Account source is not wired | `remote_agent_account_auth_unavailable`; no partial local fallback. |
+| Service/client capability is false | hide account actions; catalog response is Provider-only. |
+| Unknown/revoked/bad-token device | normal remote authentication error before source call. |
+| Read-only device lists contexts/methods | allowed with redacted DTOs. |
+| Read-only/approve-only device invokes any account mutation/status/preview | `remote_permission_denied` before source call or audit success. |
+| Full-control request has stale context revision | canonical `agent_auth_context_revision_conflict`; client refetches. |
+| Logout confirmed count is stale | `agent_auth_context_in_use_changed`; request a new preview. |
+| Backend error contains sensitive diagnostics | return the safe mapped error and bounded failed audit only. |
+| Remote disconnects during login | host operation continues; client may query by operation id after reconnect. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: a read-only phone lists “Codex default account” and its safe status but
+  cannot start login or switch a session's auth source.
+- Good: a full-control Web client starts a remote-attachable terminal login,
+  reconnects, queries the same operation id, verifies the account, refreshes
+  models, and receives the new context revision.
+- Good: logout preview reports two Vibex session ids; logout succeeds only when
+  the client echoes count two and an audit row records the safe action.
+- Base: an older client omits the capability field and receives the same
+  Provider-only catalog shape it already understands.
+- Bad: return an OAuth URL/device code in durable operation JSON, let Relay
+  launch the Agent, expose a raw terminal transcript, or allow approve-only
+  devices to poll/manage authentication.
+
+### 6. Tests Required
+
+- Core serde tests cover every tagged request/response, capability default,
+  safe Debug output, and absence of auth tokens in serialized operation queries.
+- Remote tests cover read-only context/method listing, full-control mutations,
+  denial before dispatch for lower permissions, and the dedicated audit target.
+- Compatibility tests assert `ListRuntimeOptions` filters both account source
+  summaries and account options when the client capability is false.
+- Error tests inject secret-shaped diagnostics and assert response, tracing,
+  and audit rows contain only safe codes/labels.
+- Reconnect tests start an operation, drop the client transport, query it by id,
+  then cancel or complete it without duplicate host authentication.
+- Run `cargo test -p vibex-core -p vibex-remote -p vibex-remote-client` and the
+  GPUI-WASM typecheck after protocol changes.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+mobile -> Relay -> read ~/.codex/auth.json
+mobile -> call Agent OAuth endpoint directly
+Relay -> cache token and model entitlement
+```
+
+#### Correct
+
+```text
+remote typed request + device proof
+  -> authorize on DesktopRuntime
+  -> execute/query host AgentAuthContextService
+  -> return redacted context/operation/action DTO
+  -> audit bounded mutation outcome
+  -> keep Relay as ciphertext transport only
 ```
 
 ## Scenario: GPUI Web Pairing, Auto Transport, And Bounded Streams

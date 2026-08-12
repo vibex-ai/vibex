@@ -10,10 +10,11 @@ use std::fmt;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use vibex_core::{
-    AcpAdapterId, AgentId, AgentSessionRestoreCompatibilityKey, AgentSessionRestoreResult,
-    BindingState, EventId, MAX_MESSAGE_IDEMPOTENCY_KEY_LEN, MAX_RUNTIME_SELECTION_ERROR_CODE_LEN,
-    MessageSubmissionId, MessageSubmissionState, MessageSubmissionStatus, NativeStateHomeId,
-    ProviderProfileId, RetrySemantics, RuntimeBinding, RuntimeBindingId,
+    AcpAdapterId, AgentAuthContextId, AgentId, AgentSessionRestoreCompatibilityKey,
+    AgentSessionRestoreResult, BindingState, EventId, MAX_MESSAGE_IDEMPOTENCY_KEY_LEN,
+    MAX_RUNTIME_SELECTION_ERROR_CODE_LEN, MessageSubmissionId, MessageSubmissionState,
+    MessageSubmissionStatus, NativeStateHomeId, ProviderProfileId, RetrySemantics,
+    RuntimeAuthSource, RuntimeAuthSourceKind, RuntimeBinding, RuntimeBindingId,
     RuntimeSwitchActiveWorkPolicy, RuntimeSwitchEventKind, RuntimeSwitchEventProjection,
     RuntimeSwitchId, RuntimeSwitchOperationId, RuntimeSwitchPolicy, RuntimeSwitchStatus,
     SendAgentMessageRequest, SessionRuntimeConfigState, SessionRuntimeSelection,
@@ -25,6 +26,47 @@ use crate::{enum_from_db, enum_to_db, json_from_db, json_to_db, parse_id, storag
 
 fn cas_conflict(code: &'static str, message: &'static str) -> VibexError {
     VibexError::conflict(code, message).with_diagnostic("kind", "cas_conflict")
+}
+
+fn decode_runtime_auth_source(
+    kind: String,
+    source_id: String,
+    legacy_provider_profile_id: Option<String>,
+    legacy_profile_revision: Option<i64>,
+    auth_source_revision: i64,
+    validate_legacy_revision: bool,
+) -> VibexResult<RuntimeAuthSource> {
+    match enum_from_db::<RuntimeAuthSourceKind>(kind)? {
+        RuntimeAuthSourceKind::ProviderProfile => {
+            if legacy_provider_profile_id.as_deref() != Some(source_id.as_str())
+                || (validate_legacy_revision
+                    && legacy_profile_revision != Some(auth_source_revision))
+            {
+                return Err(VibexError::storage(
+                    "runtime_auth_source_legacy_mismatch",
+                    "Provider runtime auth source does not match its compatibility column",
+                ));
+            }
+            Ok(RuntimeAuthSource::provider_profile(parse_id(
+                source_id,
+                ProviderProfileId::parse,
+            )?))
+        }
+        RuntimeAuthSourceKind::AgentAccount => {
+            if legacy_provider_profile_id.is_some()
+                || (validate_legacy_revision && legacy_profile_revision.is_some())
+            {
+                return Err(VibexError::storage(
+                    "runtime_auth_source_legacy_mismatch",
+                    "Agent account runtime auth source must not contain a Provider Profile",
+                ));
+            }
+            Ok(RuntimeAuthSource::agent_account(parse_id(
+                source_id,
+                AgentAuthContextId::parse,
+            )?))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -43,7 +85,8 @@ impl RuntimeBindingRepository {
             INSERT INTO session_runtime_bindings (
                 binding_id, session_id, agent_id, transport_kind, adapter_id,
                 adapter_version, adapter_compatibility_identity, provider_profile_id,
-                profile_revision, native_session_id, native_state_home_id,
+                profile_revision, auth_source_kind, auth_source_id, auth_source_revision,
+                native_session_id, native_state_home_id,
                 provider_resume_identity, process_spawn_fingerprint,
                 session_runtime_config_state_json, capability_snapshot_json,
                 restore_compatibility_key_json, last_context_sequence,
@@ -53,7 +96,8 @@ impl RuntimeBindingRepository {
                 usage_zero_baseline_activation_generation
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, 'available', NULL, NULL
+                ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27,
+                'available', NULL, NULL
             )
             ",
             params![
@@ -64,8 +108,17 @@ impl RuntimeBindingRepository {
                 binding.adapter_id.as_str(),
                 binding.adapter_version,
                 binding.adapter_compatibility_identity,
-                binding.provider_profile_id.as_str(),
-                binding.profile_revision,
+                binding
+                    .auth_source
+                    .provider_profile_id()
+                    .map(ProviderProfileId::as_str),
+                binding
+                    .auth_source
+                    .provider_profile_id()
+                    .map(|_| binding.auth_source_revision),
+                enum_to_db(&binding.auth_source.kind())?,
+                binding.auth_source.id(),
+                binding.auth_source_revision,
                 binding.native_session_id,
                 binding.native_state_home_id.as_str(),
                 binding.provider_resume_identity,
@@ -451,7 +504,8 @@ impl RuntimeBindingRepository {
     const COLUMNS: &'static str = "
         binding_id, session_id, agent_id, transport_kind, adapter_id,
         adapter_version, adapter_compatibility_identity, provider_profile_id,
-        profile_revision, native_session_id, native_state_home_id,
+        profile_revision, auth_source_kind, auth_source_id, auth_source_revision,
+        native_session_id, native_state_home_id,
         provider_resume_identity, process_spawn_fingerprint,
         session_runtime_config_state_json, capability_snapshot_json,
         restore_compatibility_key_json, last_context_sequence,
@@ -471,21 +525,24 @@ impl RuntimeBindingRepository {
             adapter_compatibility_identity: row.get(6)?,
             provider_profile_id: row.get(7)?,
             profile_revision: row.get(8)?,
-            native_session_id: row.get(9)?,
-            native_state_home_id: row.get(10)?,
-            provider_resume_identity: row.get(11)?,
-            process_spawn_fingerprint: row.get(12)?,
-            session_runtime_config_state_json: row.get(13)?,
-            capability_snapshot_json: row.get(14)?,
-            restore_compatibility_key_json: row.get(15)?,
-            last_context_sequence: row.get(16)?,
-            last_summary_sequence: row.get(17)?,
-            context_bridge_version: row.get(18)?,
-            activation_generation: row.get(19)?,
-            binding_state: row.get(20)?,
-            created_by_switch_id: row.get(21)?,
-            created_at_ms: row.get(22)?,
-            updated_at_ms: row.get(23)?,
+            auth_source_kind: row.get(9)?,
+            auth_source_id: row.get(10)?,
+            auth_source_revision: row.get(11)?,
+            native_session_id: row.get(12)?,
+            native_state_home_id: row.get(13)?,
+            provider_resume_identity: row.get(14)?,
+            process_spawn_fingerprint: row.get(15)?,
+            session_runtime_config_state_json: row.get(16)?,
+            capability_snapshot_json: row.get(17)?,
+            restore_compatibility_key_json: row.get(18)?,
+            last_context_sequence: row.get(19)?,
+            last_summary_sequence: row.get(20)?,
+            context_bridge_version: row.get(21)?,
+            activation_generation: row.get(22)?,
+            binding_state: row.get(23)?,
+            created_by_switch_id: row.get(24)?,
+            created_at_ms: row.get(25)?,
+            updated_at_ms: row.get(26)?,
         })
     }
 
@@ -498,8 +555,15 @@ impl RuntimeBindingRepository {
             adapter_id: parse_id(raw.adapter_id, AcpAdapterId::parse)?,
             adapter_version: raw.adapter_version,
             adapter_compatibility_identity: raw.adapter_compatibility_identity,
-            provider_profile_id: parse_id(raw.provider_profile_id, ProviderProfileId::parse)?,
-            profile_revision: raw.profile_revision,
+            auth_source: decode_runtime_auth_source(
+                raw.auth_source_kind,
+                raw.auth_source_id,
+                raw.provider_profile_id,
+                raw.profile_revision,
+                raw.auth_source_revision,
+                true,
+            )?,
+            auth_source_revision: raw.auth_source_revision,
             native_session_id: raw.native_session_id,
             native_state_home_id: parse_id(raw.native_state_home_id, NativeStateHomeId::parse)?,
             provider_resume_identity: raw.provider_resume_identity,
@@ -533,8 +597,11 @@ struct RawBindingRow {
     adapter_id: String,
     adapter_version: String,
     adapter_compatibility_identity: String,
-    provider_profile_id: String,
-    profile_revision: i64,
+    provider_profile_id: Option<String>,
+    profile_revision: Option<i64>,
+    auth_source_kind: String,
+    auth_source_id: String,
+    auth_source_revision: i64,
     native_session_id: Option<String>,
     native_state_home_id: String,
     provider_resume_identity: Option<String>,
@@ -1069,7 +1136,8 @@ pub struct RuntimeSwitchReserveRequest {
     pub target_binding_id: Option<RuntimeBindingId>,
     pub target_agent_id: AgentId,
     pub target_adapter_id: AcpAdapterId,
-    pub target_profile_id: ProviderProfileId,
+    pub target_auth_source: RuntimeAuthSource,
+    pub target_auth_source_revision: i64,
     pub requested_policy: Option<serde_json::Value>,
     pub active_work_policy: Option<serde_json::Value>,
     pub requested_session_config: Option<serde_json::Value>,
@@ -1083,6 +1151,7 @@ pub struct DesiredRuntimeSwitchEnqueueRequest {
     pub expected_selection_revision: i64,
     pub target_binding_id: RuntimeBindingId,
     pub target_adapter_id: AcpAdapterId,
+    pub target_auth_source_revision: i64,
     pub desired: SessionRuntimeSelection,
     pub requested_policy: RuntimeSwitchPolicy,
     pub active_work_policy: RuntimeSwitchActiveWorkPolicy,
@@ -1102,6 +1171,10 @@ impl fmt::Debug for DesiredRuntimeSwitchEnqueueRequest {
             )
             .field("target_binding_id", &self.target_binding_id)
             .field("target_adapter_id", &self.target_adapter_id)
+            .field(
+                "target_auth_source_revision",
+                &self.target_auth_source_revision,
+            )
             .field("desired", &self.desired)
             .field("requested_policy", &self.requested_policy)
             .field("active_work_policy", &self.active_work_policy)
@@ -1141,7 +1214,11 @@ impl fmt::Debug for RuntimeSwitchReserveRequest {
             .field("target_binding_id", &self.target_binding_id)
             .field("target_agent_id", &self.target_agent_id)
             .field("target_adapter_id", &self.target_adapter_id)
-            .field("target_profile_id", &self.target_profile_id)
+            .field("target_auth_source", &self.target_auth_source)
+            .field(
+                "target_auth_source_revision",
+                &self.target_auth_source_revision,
+            )
             .field("has_requested_policy", &self.requested_policy.is_some())
             .field("has_active_work_policy", &self.active_work_policy.is_some())
             .field(
@@ -1166,7 +1243,8 @@ pub struct RuntimeSwitchRecord {
     pub target_binding_id: Option<RuntimeBindingId>,
     pub target_agent_id: AgentId,
     pub target_adapter_id: AcpAdapterId,
-    pub target_profile_id: ProviderProfileId,
+    pub target_auth_source: RuntimeAuthSource,
+    pub target_auth_source_revision: i64,
     pub requested_policy: Option<RuntimeSwitchPolicy>,
     pub active_work_policy: Option<RuntimeSwitchActiveWorkPolicy>,
     pub requested_session_config: Option<serde_json::Value>,
@@ -1195,7 +1273,11 @@ impl fmt::Debug for RuntimeSwitchRecord {
             .field("target_binding_id", &self.target_binding_id)
             .field("target_agent_id", &self.target_agent_id)
             .field("target_adapter_id", &self.target_adapter_id)
-            .field("target_profile_id", &self.target_profile_id)
+            .field("target_auth_source", &self.target_auth_source)
+            .field(
+                "target_auth_source_revision",
+                &self.target_auth_source_revision,
+            )
             .field("status", &self.status)
             .field("error_code", &self.error_code)
             .field(
@@ -1345,9 +1427,14 @@ impl RuntimeSwitchRepository {
                 switch_id, session_id, idempotency_key, source_revision,
                 source_binding_id, desired_selection_revision, target_binding_id,
                 target_agent_id, target_adapter_id, target_profile_id,
+                target_auth_source_kind, target_auth_source_id,
+                target_auth_source_revision,
                 requested_policy_json, active_work_policy_json,
                 requested_session_config_json, status, created_at_ms, updated_at_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                ?14, ?15, ?16, ?17, ?18, ?19
+            )
             ",
             params![
                 switch_id.as_str(),
@@ -1362,7 +1449,13 @@ impl RuntimeSwitchRepository {
                 request.target_binding_id.as_ref().map(|id| id.as_str()),
                 request.target_agent_id.as_str(),
                 request.target_adapter_id.as_str(),
-                request.target_profile_id.as_str(),
+                request
+                    .target_auth_source
+                    .provider_profile_id()
+                    .map(ProviderProfileId::as_str),
+                enum_to_db(&request.target_auth_source.kind())?,
+                request.target_auth_source.id(),
+                request.target_auth_source_revision,
                 request
                     .requested_policy
                     .as_ref()
@@ -1445,7 +1538,8 @@ impl RuntimeSwitchRepository {
             target_binding_id: request.target_binding_id.clone(),
             target_agent_id: request.target_agent_id.clone(),
             target_adapter_id: request.target_adapter_id.clone(),
-            target_profile_id: request.target_profile_id.clone(),
+            target_auth_source: request.target_auth_source.clone(),
+            target_auth_source_revision: request.target_auth_source_revision,
             requested_policy,
             active_work_policy,
             requested_session_config: request.requested_session_config.clone(),
@@ -2844,6 +2938,7 @@ impl RuntimeSwitchRepository {
         switch_id, session_id, idempotency_key, source_revision,
         source_binding_id, desired_selection_revision, target_binding_id,
         target_agent_id, target_adapter_id, target_profile_id,
+        target_auth_source_kind, target_auth_source_id, target_auth_source_revision,
         requested_policy_json, active_work_policy_json,
         requested_session_config_json, status, error_code,
         restore_compatibility_result_json, worker_lease_owner,
@@ -2862,17 +2957,20 @@ impl RuntimeSwitchRepository {
             target_agent_id: row.get(7)?,
             target_adapter_id: row.get(8)?,
             target_profile_id: row.get(9)?,
-            requested_policy_json: row.get(10)?,
-            active_work_policy_json: row.get(11)?,
-            requested_session_config_json: row.get(12)?,
-            status: row.get(13)?,
-            error_code: row.get(14)?,
-            restore_compatibility_result_json: row.get(15)?,
-            worker_lease_owner: row.get(16)?,
-            worker_lease_deadline_ms: row.get(17)?,
-            created_at_ms: row.get(18)?,
-            updated_at_ms: row.get(19)?,
-            committed_at_ms: row.get(20)?,
+            target_auth_source_kind: row.get(10)?,
+            target_auth_source_id: row.get(11)?,
+            target_auth_source_revision: row.get(12)?,
+            requested_policy_json: row.get(13)?,
+            active_work_policy_json: row.get(14)?,
+            requested_session_config_json: row.get(15)?,
+            status: row.get(16)?,
+            error_code: row.get(17)?,
+            restore_compatibility_result_json: row.get(18)?,
+            worker_lease_owner: row.get(19)?,
+            worker_lease_deadline_ms: row.get(20)?,
+            created_at_ms: row.get(21)?,
+            updated_at_ms: row.get(22)?,
+            committed_at_ms: row.get(23)?,
         })
     }
 
@@ -2893,7 +2991,15 @@ impl RuntimeSwitchRepository {
                 .transpose()?,
             target_agent_id: parse_id(raw.target_agent_id, AgentId::parse)?,
             target_adapter_id: parse_id(raw.target_adapter_id, AcpAdapterId::parse)?,
-            target_profile_id: parse_id(raw.target_profile_id, ProviderProfileId::parse)?,
+            target_auth_source: decode_runtime_auth_source(
+                raw.target_auth_source_kind,
+                raw.target_auth_source_id,
+                raw.target_profile_id,
+                None,
+                raw.target_auth_source_revision,
+                false,
+            )?,
+            target_auth_source_revision: raw.target_auth_source_revision,
             requested_policy: raw.requested_policy_json.map(json_from_db).transpose()?,
             active_work_policy: raw.active_work_policy_json.map(json_from_db).transpose()?,
             requested_session_config: raw
@@ -2925,7 +3031,10 @@ struct RawSwitchRow {
     target_binding_id: Option<String>,
     target_agent_id: String,
     target_adapter_id: String,
-    target_profile_id: String,
+    target_profile_id: Option<String>,
+    target_auth_source_kind: String,
+    target_auth_source_id: String,
+    target_auth_source_revision: i64,
     requested_policy_json: Option<String>,
     active_work_policy_json: Option<String>,
     requested_session_config_json: Option<String>,
@@ -3144,7 +3253,8 @@ fn runtime_switch_matches_desired_request(
     request: &DesiredRuntimeSwitchEnqueueRequest,
 ) -> bool {
     existing.target_agent_id == request.desired.agent_id
-        && existing.target_profile_id == request.desired.provider_profile_id
+        && existing.target_auth_source == request.desired.auth_source
+        && existing.target_auth_source_revision == request.target_auth_source_revision
         && existing.target_adapter_id == request.target_adapter_id
         && existing.requested_policy == Some(request.requested_policy)
         && existing.active_work_policy == Some(request.active_work_policy)
@@ -4505,9 +4615,7 @@ impl AgentSessionRuntimeRepository {
         binding: &RuntimeBinding,
         selection: &SessionRuntimeSelection,
     ) -> VibexResult<AgentSessionRuntimeState> {
-        if binding.agent_id != selection.agent_id
-            || binding.provider_profile_id != selection.provider_profile_id
-        {
+        if binding.agent_id != selection.agent_id || binding.auth_source != selection.auth_source {
             return Err(VibexError::validation(
                 "runtime_selection_initial_binding_mismatch",
                 "initial runtime binding does not match the effective selection",
@@ -4894,9 +5002,14 @@ impl AgentSessionRuntimeRepository {
                 switch_id, session_id, idempotency_key, source_revision,
                 source_binding_id, desired_selection_revision, target_binding_id,
                 target_agent_id, target_adapter_id, target_profile_id,
+                target_auth_source_kind, target_auth_source_id,
+                target_auth_source_revision,
                 requested_policy_json, active_work_policy_json,
                 requested_session_config_json, status, created_at_ms, updated_at_ms
-             ) VALUES (?1, ?2, ?3, 0, NULL, 1, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+             ) VALUES (
+                ?1, ?2, ?3, 0, NULL, 1, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                ?11, ?12, ?13, ?14, ?15, ?15
+             )",
             params![
                 switch_id.as_str(),
                 request.session_id.as_str(),
@@ -4904,7 +5017,13 @@ impl AgentSessionRuntimeRepository {
                 request.target_binding_id.as_str(),
                 request.desired.agent_id.as_str(),
                 request.target_adapter_id.as_str(),
-                request.desired.provider_profile_id.as_str(),
+                request
+                    .desired
+                    .provider_profile_id()
+                    .map(ProviderProfileId::as_str),
+                enum_to_db(&request.desired.auth_source.kind())?,
+                request.desired.auth_source.id(),
+                request.target_auth_source_revision,
                 json_to_db(&request.requested_policy)?,
                 json_to_db(&request.active_work_policy)?,
                 json_to_db(&request.requested_session_config)?,
@@ -4940,7 +5059,8 @@ impl AgentSessionRuntimeRepository {
             target_binding_id: Some(request.target_binding_id.clone()),
             target_agent_id: request.desired.agent_id.clone(),
             target_adapter_id: request.target_adapter_id.clone(),
-            target_profile_id: request.desired.provider_profile_id.clone(),
+            target_auth_source: request.desired.auth_source.clone(),
+            target_auth_source_revision: request.target_auth_source_revision,
             requested_policy: Some(request.requested_policy),
             active_work_policy: Some(request.active_work_policy),
             requested_session_config: Some(request.requested_session_config.clone()),
@@ -5046,7 +5166,8 @@ impl AgentSessionRuntimeRepository {
         )?;
         if let Some(existing) = current_intent.as_ref()
             && existing.target_agent_id == request.desired.agent_id
-            && existing.target_profile_id == request.desired.provider_profile_id
+            && existing.target_auth_source == request.desired.auth_source
+            && existing.target_auth_source_revision == request.target_auth_source_revision
             && existing.requested_session_config.as_ref() == Some(&request.requested_session_config)
         {
             tx.commit().map_err(storage_err(
@@ -5115,9 +5236,14 @@ impl AgentSessionRuntimeRepository {
                 switch_id, session_id, idempotency_key, source_revision,
                 source_binding_id, desired_selection_revision, target_binding_id,
                 target_agent_id, target_adapter_id, target_profile_id,
+                target_auth_source_kind, target_auth_source_id,
+                target_auth_source_revision,
                 requested_policy_json, active_work_policy_json,
                 requested_session_config_json, status, created_at_ms, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                ?14, ?15, ?16, ?17, ?18, ?19
+             )",
             params![
                 switch_id.as_str(),
                 request.session_id.as_str(),
@@ -5128,7 +5254,13 @@ impl AgentSessionRuntimeRepository {
                 request.target_binding_id.as_str(),
                 request.desired.agent_id.as_str(),
                 request.target_adapter_id.as_str(),
-                request.desired.provider_profile_id.as_str(),
+                request
+                    .desired
+                    .provider_profile_id()
+                    .map(ProviderProfileId::as_str),
+                enum_to_db(&request.desired.auth_source.kind())?,
+                request.desired.auth_source.id(),
+                request.target_auth_source_revision,
                 json_to_db(&request.requested_policy)?,
                 json_to_db(&request.active_work_policy)?,
                 json_to_db(&request.requested_session_config)?,
@@ -5166,7 +5298,8 @@ impl AgentSessionRuntimeRepository {
                 target_binding_id: Some(request.target_binding_id.clone()),
                 target_agent_id: request.desired.agent_id.clone(),
                 target_adapter_id: request.target_adapter_id.clone(),
-                target_profile_id: request.desired.provider_profile_id.clone(),
+                target_auth_source: request.desired.auth_source.clone(),
+                target_auth_source_revision: request.target_auth_source_revision,
                 requested_policy: Some(request.requested_policy),
                 active_work_policy: Some(request.active_work_policy),
                 requested_session_config: Some(request.requested_session_config.clone()),
@@ -5364,10 +5497,11 @@ mod tests {
             session_id: session_id.clone(),
             agent_id: AgentId::parse("claude-code").unwrap(),
             transport_kind: TransportKind::Acp,
-            provider_profile_id: ProviderProfileId::parse(
-                ProviderKind::Acp.local_default_profile_id().to_string(),
-            )
-            .unwrap(),
+            auth_source: RuntimeAuthSource::provider_profile(
+                ProviderProfileId::parse(ProviderKind::Acp.local_default_profile_id().to_string())
+                    .unwrap(),
+            ),
+            auth_source_revision: 1,
             adapter_id: AcpAdapterId::parse("claude-code-acp").unwrap(),
             adapter_version: "1.0.0".to_string(),
             adapter_compatibility_identity: "claude-code-acp@v1".to_string(),
@@ -5378,7 +5512,6 @@ mod tests {
             session_runtime_config_state: SessionRuntimeConfigState::default(),
             capability_snapshot: None,
             restore_compatibility_key: None,
-            profile_revision: 1,
             last_context_sequence: 0,
             last_summary_sequence: 0,
             context_bridge_version: 0,
@@ -5393,6 +5526,8 @@ mod tests {
     fn sample_restore_key(binding: &RuntimeBinding) -> AgentSessionRestoreCompatibilityKey {
         AgentSessionRestoreCompatibilityKey::new(
             binding.agent_id.clone(),
+            binding.auth_source.clone(),
+            binding.auth_source_revision,
             binding.native_session_id.clone().unwrap(),
             binding.native_state_home_id.clone(),
             binding.adapter_compatibility_identity.clone(),
@@ -5424,22 +5559,17 @@ mod tests {
     }
 
     fn sample_selection() -> SessionRuntimeSelection {
-        SessionRuntimeSelection {
-            agent_id: AgentId::parse("claude-code").unwrap(),
-            provider_profile_id: ProviderProfileId::parse(
-                ProviderKind::Acp.local_default_profile_id().to_string(),
-            )
-            .unwrap(),
-            model_id: "claude-sonnet-4-5".to_string(),
-            reasoning_effort: None,
-            mode_id: None,
-            config_values: Default::default(),
-        }
+        SessionRuntimeSelection::provider(
+            AgentId::parse("claude-code").unwrap(),
+            ProviderProfileId::parse(ProviderKind::Acp.local_default_profile_id().to_string())
+                .unwrap(),
+            "claude-sonnet-4-5",
+        )
     }
 
     fn selection_with_model(model_id: &str) -> SessionRuntimeSelection {
         SessionRuntimeSelection {
-            model_id: model_id.to_string(),
+            model: vibex_core::RuntimeModelSelection::explicit(model_id),
             ..sample_selection()
         }
     }
@@ -5500,6 +5630,7 @@ mod tests {
             expected_selection_revision,
             target_binding_id: RuntimeBindingId::new(),
             target_adapter_id: AcpAdapterId::parse("claude-code-acp").unwrap(),
+            target_auth_source_revision: 1,
             requested_session_config: serde_json::json!({
                 "effectiveSelection": desired,
                 "profileRevision": 1,
@@ -5538,10 +5669,11 @@ mod tests {
             target_binding_id: target_binding,
             target_agent_id: AgentId::parse("claude-code").unwrap(),
             target_adapter_id: AcpAdapterId::parse("claude-code-acp").unwrap(),
-            target_profile_id: ProviderProfileId::parse(
-                ProviderKind::Acp.local_default_profile_id().to_string(),
-            )
-            .unwrap(),
+            target_auth_source: RuntimeAuthSource::provider_profile(
+                ProviderProfileId::parse(ProviderKind::Acp.local_default_profile_id().to_string())
+                    .unwrap(),
+            ),
+            target_auth_source_revision: 1,
             requested_policy: None,
             active_work_policy: None,
             requested_session_config: None,
@@ -5662,7 +5794,8 @@ mod tests {
             target_binding_id: Some(target_binding_id.clone()),
             target_agent_id: source.agent_id.clone(),
             target_adapter_id: source.adapter_id.clone(),
-            target_profile_id: source.provider_profile_id.clone(),
+            target_auth_source: source.auth_source.clone(),
+            target_auth_source_revision: source.auth_source_revision,
             requested_policy: None,
             active_work_policy: None,
             requested_session_config: None,
@@ -6393,9 +6526,10 @@ mod tests {
 
         let first = sample_binding(&session_id, BindingState::Current);
         let mut second = sample_binding(&session_id, BindingState::Preparing);
-        // Identical route: same agent/profile/compatibility identity.
+        // Identical route: same agent/auth source/compatibility identity.
         second.agent_id = first.agent_id.clone();
-        second.provider_profile_id = first.provider_profile_id.clone();
+        second.auth_source = first.auth_source.clone();
+        second.auth_source_revision = first.auth_source_revision;
         second.adapter_compatibility_identity = first.adapter_compatibility_identity.clone();
 
         RuntimeBindingRepository::insert(&conn, &first).unwrap();
@@ -7612,7 +7746,11 @@ mod tests {
         assert_eq!(reserved.target_binding_id, Some(target_binding_id));
         assert_eq!(reserved.target_agent_id, request.target_agent_id);
         assert_eq!(reserved.target_adapter_id, request.target_adapter_id);
-        assert_eq!(reserved.target_profile_id, request.target_profile_id);
+        assert_eq!(reserved.target_auth_source, request.target_auth_source);
+        assert_eq!(
+            reserved.target_auth_source_revision,
+            request.target_auth_source_revision
+        );
         assert_eq!(reserved.worker_lease_owner, None);
         assert_eq!(reserved.worker_lease_deadline_ms, None);
         assert!(reserved.created_at_ms > 0);

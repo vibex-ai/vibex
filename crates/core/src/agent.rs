@@ -486,12 +486,12 @@ mod tests {
             session_id: VibexSessionId::new(),
             message_idempotency_key: "message-1".to_string(),
             desired_runtime: SessionRuntimeSelection {
-                agent_id: AgentId::parse("codex").unwrap(),
-                provider_profile_id: ProviderProfileId::parse("provider_openai").unwrap(),
-                model_id: "gpt-5".to_string(),
                 reasoning_effort: Some("high".to_string()),
-                mode_id: None,
-                config_values: Default::default(),
+                ..SessionRuntimeSelection::provider(
+                    AgentId::parse("codex").unwrap(),
+                    ProviderProfileId::parse("provider_openai").unwrap(),
+                    "gpt-5",
+                )
             },
             text: "prompt-secret-SHOULD-NOT-DEBUG".to_string(),
             attachments: vec![MessageAttachment {

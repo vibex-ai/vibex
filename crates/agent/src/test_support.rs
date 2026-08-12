@@ -157,8 +157,8 @@ impl TestSwitchRuntime {
     fn attachment(intent: &SwitchIntent) -> PreparedAttachment {
         let generation = 1;
         let mut config = SessionRuntimeConfigState {
-            preferred_model: Some(intent.target_selection.model_id.clone()),
-            effective_model: Some(intent.target_selection.model_id.clone()),
+            preferred_model: intent.target_selection.model_id().map(str::to_string),
+            effective_model: intent.target_selection.model_id().map(str::to_string),
             preferred_mode: intent.target_selection.mode_id.clone(),
             effective_mode: intent.target_selection.mode_id.clone(),
             preferred_reasoning_effort: intent.target_selection.reasoning_effort.clone(),
@@ -178,7 +178,8 @@ impl TestSwitchRuntime {
                 session_id: intent.session_id.clone(),
                 agent_id: intent.target_selection.agent_id.clone(),
                 transport_kind: TransportKind::Acp,
-                provider_profile_id: intent.target_selection.provider_profile_id.clone(),
+                auth_source: intent.target_selection.auth_source.clone(),
+                auth_source_revision: intent.target_auth_source_revision,
                 adapter_id: intent.target_adapter_id.clone(),
                 adapter_version: "test-adapter-v1".to_string(),
                 adapter_compatibility_identity: "test-adapter-compatible-v1".to_string(),
@@ -189,7 +190,6 @@ impl TestSwitchRuntime {
                 session_runtime_config_state: config,
                 capability_snapshot: None,
                 restore_compatibility_key: None,
-                profile_revision: 1,
                 last_context_sequence: 0,
                 last_summary_sequence: 0,
                 context_bridge_version: 0,
@@ -217,6 +217,7 @@ impl RuntimeSelectionResolver for TestSwitchRuntime {
             adapter_id: preferred_adapter_id
                 .cloned()
                 .unwrap_or_else(|| self.adapter_id.clone()),
+            auth_source_revision: 1,
             session_config: None,
         })
     }

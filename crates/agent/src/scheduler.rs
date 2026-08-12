@@ -723,7 +723,8 @@ mod tests {
         ProviderBinding {
             session_id,
             provider_kind: ProviderKind::Acp,
-            provider_profile_id,
+            auth_source: vibex_core::RuntimeAuthSource::provider_profile(provider_profile_id),
+            auth_source_revision: 1,
             native: vibex_core::ProviderNativeBinding {
                 native_session_id: Some(format!("test-session-{now}")),
                 native_thread_id: None,

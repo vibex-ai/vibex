@@ -873,10 +873,12 @@ fn normalize_set(ids: &mut BTreeSet<String>, limit: usize) {
 }
 
 fn normalize_runtime_selection(selection: &mut SessionRuntimeSelection) -> bool {
-    let Some(model_id) = bounded_runtime_value(&selection.model_id, 512) else {
-        return false;
-    };
-    selection.model_id = model_id;
+    if let vibex_core::RuntimeModelSelection::Explicit { model_id } = &mut selection.model {
+        let Some(normalized) = bounded_runtime_value(model_id, 512) else {
+            return false;
+        };
+        *model_id = normalized;
+    }
     selection.reasoning_effort = match selection.reasoning_effort.take() {
         Some(value) => {
             let Some(value) = bounded_runtime_value(&value, 128) else {
@@ -939,8 +941,8 @@ fn runtime_selection_identity_matches(
     right: &SessionRuntimeSelection,
 ) -> bool {
     left.agent_id == right.agent_id
-        && left.provider_profile_id == right.provider_profile_id
-        && left.model_id == right.model_id
+        && left.auth_source == right.auth_source
+        && left.model == right.model
 }
 
 fn bounded_runtime_value(value: &str, max_chars: usize) -> Option<String> {
@@ -1195,35 +1197,31 @@ mod tests {
         state.composer.runtime_selections_by_agent.insert(
             codex.clone(),
             SessionRuntimeSelection {
-                agent_id: codex.clone(),
-                provider_profile_id: vibex_core::ProviderProfileId::new(),
-                model_id: "  gpt-5  ".into(),
                 reasoning_effort: Some(" high ".into()),
                 mode_id: Some(" agent ".into()),
                 config_values: BTreeMap::from([(" web_search ".into(), " true ".into())]),
+                ..SessionRuntimeSelection::provider(
+                    codex.clone(),
+                    vibex_core::ProviderProfileId::new(),
+                    "  gpt-5  ",
+                )
             },
         );
         state.composer.runtime_selections_by_agent.insert(
             claude,
-            SessionRuntimeSelection {
-                agent_id: AgentId::parse("codex").unwrap(),
-                provider_profile_id: vibex_core::ProviderProfileId::new(),
-                model_id: "stale".into(),
-                reasoning_effort: None,
-                mode_id: None,
-                config_values: BTreeMap::new(),
-            },
+            SessionRuntimeSelection::provider(
+                AgentId::parse("codex").unwrap(),
+                vibex_core::ProviderProfileId::new(),
+                "stale",
+            ),
         );
         state.composer.runtime_selections_by_agent.insert(
             AgentId::parse("opencode").unwrap(),
-            SessionRuntimeSelection {
-                agent_id: AgentId::parse("opencode").unwrap(),
-                provider_profile_id: vibex_core::ProviderProfileId::new(),
-                model_id: "x".repeat(513),
-                reasoning_effort: None,
-                mode_id: None,
-                config_values: BTreeMap::new(),
-            },
+            SessionRuntimeSelection::provider(
+                AgentId::parse("opencode").unwrap(),
+                vibex_core::ProviderProfileId::new(),
+                "x".repeat(513),
+            ),
         );
 
         state.normalize().unwrap();
@@ -1233,7 +1231,7 @@ mod tests {
             .runtime_selections_by_agent
             .get(&codex)
             .unwrap();
-        assert_eq!(selection.model_id, "gpt-5");
+        assert_eq!(selection.model_id(), Some("gpt-5"));
         assert_eq!(selection.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(selection.mode_id.as_deref(), Some("agent"));
         assert_eq!(
@@ -1255,19 +1253,21 @@ mod tests {
         let codex = AgentId::parse("codex").unwrap();
         let mut state = DesktopUiStateV1::default();
         let selection = SessionRuntimeSelection {
-            agent_id: codex.clone(),
-            provider_profile_id: vibex_core::ProviderProfileId::new(),
-            model_id: "gpt-5".into(),
             reasoning_effort: Some("medium".into()),
             mode_id: Some("agent".into()),
             config_values: BTreeMap::from([("web_search".into(), "true".into())]),
+            ..SessionRuntimeSelection::provider(
+                codex.clone(),
+                vibex_core::ProviderProfileId::new(),
+                "gpt-5",
+            )
         };
         state
             .composer
             .runtime_selections_by_agent
             .insert(codex.clone(), selection.clone());
         let mut alternate = selection.clone();
-        alternate.model_id = "gpt-5-mini".into();
+        alternate.model = vibex_core::RuntimeModelSelection::explicit("gpt-5-mini");
         alternate.reasoning_effort = Some("low".into());
         state
             .composer
@@ -1312,12 +1312,12 @@ mod tests {
         let agent_id = AgentId::parse("codex").unwrap();
         let provider_profile_id = vibex_core::ProviderProfileId::new();
         let selection = |model: &str, effort: &str| SessionRuntimeSelection {
-            agent_id: agent_id.clone(),
-            provider_profile_id: provider_profile_id.clone(),
-            model_id: model.into(),
             reasoning_effort: Some(effort.into()),
-            mode_id: None,
-            config_values: BTreeMap::new(),
+            ..SessionRuntimeSelection::provider(
+                agent_id.clone(),
+                provider_profile_id.clone(),
+                model,
+            )
         };
         let mut state = DesktopUiStateV1::default();
         state
@@ -1340,8 +1340,8 @@ mod tests {
             Some("high")
         );
         assert_eq!(
-            state.composer.runtime_selections_by_model[1].model_id,
-            "gpt-5-mini"
+            state.composer.runtime_selections_by_model[1].model_id(),
+            Some("gpt-5-mini")
         );
     }
 

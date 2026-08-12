@@ -1,5 +1,10 @@
 use vibex_core::{
-    AgentSession, AgentSessionRuntimeSelectionEvent, AgentSessionRuntimeSelectionState,
+    AgentAuthCatalog, AgentAuthContext, AgentAuthContextAuthenticateRequest,
+    AgentAuthContextAuthenticateResult, AgentAuthContextCancelAuthenticationRequest,
+    AgentAuthContextId, AgentAuthContextLogoutPreview, AgentAuthContextLogoutRequest,
+    AgentAuthContextMutationResult, AgentAuthContextRefreshModelsRequest,
+    AgentAuthContextVerifyRequest, AgentAuthenticationOperation, AgentAuthenticationOperationId,
+    AgentId, AgentSession, AgentSessionRuntimeSelectionEvent, AgentSessionRuntimeSelectionState,
     AgentUsageStatistics, AgentUsageStatisticsRequest, CancelAgentSessionRuntimeSwitchRequest,
     ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest,
     RemoteDeepLinkResolution, RenameAgentSessionRequest, ResolveElicitationRequest,
@@ -129,6 +134,108 @@ pub trait AgentBackend: BackendBound {
     fn delete_session(&self, request: MutationRequest<VibexSessionId>) -> BackendFuture<'_, ()>;
 
     fn list_runtime_options(&self) -> BackendFuture<'_, SessionRuntimeOptionCatalog>;
+
+    fn list_agent_auth_contexts(&self) -> BackendFuture<'_, Vec<AgentAuthContext>> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_account_auth_unavailable",
+                "Agent account authentication is unavailable on this backend",
+            ))
+        })
+    }
+
+    fn list_agent_auth_methods(&self, _agent_id: AgentId) -> BackendFuture<'_, AgentAuthCatalog> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_account_auth_unavailable",
+                "Agent account authentication is unavailable on this backend",
+            ))
+        })
+    }
+
+    fn authenticate_agent_context(
+        &self,
+        _request: MutationRequest<AgentAuthContextAuthenticateRequest>,
+    ) -> BackendFuture<'_, AgentAuthContextAuthenticateResult> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_account_auth_unavailable",
+                "Agent account authentication is unavailable on this backend",
+            ))
+        })
+    }
+
+    fn get_agent_authentication_operation(
+        &self,
+        _operation_id: AgentAuthenticationOperationId,
+    ) -> BackendFuture<'_, AgentAuthenticationOperation> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_account_auth_unavailable",
+                "Agent account authentication is unavailable on this backend",
+            ))
+        })
+    }
+
+    fn cancel_agent_context_authentication(
+        &self,
+        _request: MutationRequest<AgentAuthContextCancelAuthenticationRequest>,
+    ) -> BackendFuture<'_, AgentAuthContextMutationResult> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_account_auth_unavailable",
+                "Agent account authentication is unavailable on this backend",
+            ))
+        })
+    }
+
+    fn verify_agent_auth_context(
+        &self,
+        _request: MutationRequest<AgentAuthContextVerifyRequest>,
+    ) -> BackendFuture<'_, AgentAuthContextMutationResult> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_account_auth_unavailable",
+                "Agent account authentication is unavailable on this backend",
+            ))
+        })
+    }
+
+    fn refresh_agent_auth_models(
+        &self,
+        _request: MutationRequest<AgentAuthContextRefreshModelsRequest>,
+    ) -> BackendFuture<'_, AgentAuthContextMutationResult> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_account_auth_unavailable",
+                "Agent account authentication is unavailable on this backend",
+            ))
+        })
+    }
+
+    fn preview_agent_auth_logout(
+        &self,
+        _auth_context_id: AgentAuthContextId,
+    ) -> BackendFuture<'_, AgentAuthContextLogoutPreview> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_account_auth_unavailable",
+                "Agent account authentication is unavailable on this backend",
+            ))
+        })
+    }
+
+    fn logout_agent_auth_context(
+        &self,
+        _request: MutationRequest<AgentAuthContextLogoutRequest>,
+    ) -> BackendFuture<'_, AgentAuthContextMutationResult> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_account_auth_unavailable",
+                "Agent account authentication is unavailable on this backend",
+            ))
+        })
+    }
 
     fn runtime_selection(
         &self,
