@@ -7,7 +7,7 @@ use gpui::{
     prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, IconName, Root, Sizable as _,
+    ActiveTheme as _, Disableable as _, IconName, Root, Selectable as _, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -21,14 +21,16 @@ use vibex_backend::{
     BackendProjection, BackendResult, MutationRequest, WorkspaceSummary,
 };
 use vibex_core::{
-    AgentId, DeviceId, ElicitationField, ElicitationFieldKind, ElicitationRequest,
-    ElicitationResolutionAction, FileEntryKind, FileSearchRequest, PermissionResolution,
-    PermissionResponseKind, ProviderProfileId, ProviderRunHealthProbesRequest,
-    RemoteCreatePairingOfferRequest, RemoteDevicePermissionLevel, RemoteDeviceStatus,
-    RemoteRevokeDeviceRequest, RequestId, ResolvePermissionRequest, SendAgentMessageRequest,
-    TerminalCreateRequest, VibexSessionId, WorkspaceId, unix_timestamp_ms,
+    AgentId, AgentSessionState, DeviceId, ElicitationField, ElicitationFieldKind,
+    ElicitationRequest, ElicitationResolutionAction, FileEntryKind, FileSearchRequest,
+    PermissionResolution, PermissionResponseKind, ProviderProfileId,
+    ProviderRunHealthProbesRequest, RemoteCreatePairingOfferRequest, RemoteDevicePermissionLevel,
+    RemoteDeviceStatus, RemoteRevokeDeviceRequest, RequestId, ResolvePermissionRequest,
+    SendAgentMessageRequest, TerminalCreateRequest, VibexSessionId, WorkspaceId, unix_timestamp_ms,
 };
-use vibex_desktop_model::{AgentSidebarRowKind, GitSelectionKey, SidebarState};
+use vibex_desktop_model::{
+    AgentSidebarRowKind, GitSelectionKey, SidebarState, TimelineRowKind, UnifiedDiffLineKind,
+};
 
 use crate::browser_gate::{BrowserHostSnapshot, KeyboardSource};
 use crate::{
@@ -46,6 +48,37 @@ const TEST_AGENT_MESSAGE: &str = "Vibex E2E probe: reply OK";
 const TEST_FILE_CONTENT: &str = "vibex-e2e-probe\n";
 const TEST_COMMIT_MESSAGE: &str = "test: gpui workflow e2e";
 const TEST_TERMINAL_INPUT: &str = "printf vibex-e2e-probe";
+const MOBILE_TOP_BAR_HEIGHT: f32 = 56.0;
+const MOBILE_BOTTOM_NAV_HEIGHT: f32 = 64.0;
+const MOBILE_PAGE_GUTTER: f32 = 16.0;
+const MOBILE_CARD_RADIUS: f32 = 8.0;
+const MOBILE_TOUCH_TARGET: f32 = 44.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactDetailPage {
+    FilePreview,
+    GitDiff,
+    ManagementSection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkbenchSettingsSection {
+    Connection,
+    Appearance,
+    About,
+}
+
+impl WorkbenchSettingsSection {
+    const ALL: [Self; 3] = [Self::Connection, Self::Appearance, Self::About];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Connection => "Connection",
+            Self::Appearance => "Appearance",
+            Self::About => "About",
+        }
+    }
+}
 
 fn fill_fixed_file_test_input(controller: &mut crate::FileWorkflowController) -> BackendResult<()> {
     controller
@@ -97,6 +130,35 @@ pub enum WorkbenchConnectionState {
     Offline,
     Revoked,
     Incompatible,
+}
+
+fn connection_label(state: WorkbenchConnectionState) -> &'static str {
+    match state {
+        WorkbenchConnectionState::Online => "Connected",
+        WorkbenchConnectionState::Degraded => "Degraded",
+        WorkbenchConnectionState::Reconnecting => "Reconnecting",
+        WorkbenchConnectionState::Offline => "Offline",
+        WorkbenchConnectionState::Revoked => "Revoked",
+        WorkbenchConnectionState::Incompatible => "Incompatible",
+    }
+}
+
+fn connection_color(state: WorkbenchConnectionState, cx: &App) -> gpui::Hsla {
+    match state {
+        WorkbenchConnectionState::Online => cx.theme().success,
+        WorkbenchConnectionState::Degraded | WorkbenchConnectionState::Reconnecting => {
+            cx.theme().warning
+        }
+        WorkbenchConnectionState::Offline
+        | WorkbenchConnectionState::Revoked
+        | WorkbenchConnectionState::Incompatible => cx.theme().danger,
+    }
+}
+
+fn path_file_name(path: &str) -> Option<&str> {
+    path.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .find(|component| !component.is_empty())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -238,6 +300,9 @@ pub struct WorkflowWorkbenchView {
     elicitation_inputs: BTreeMap<String, Entity<InputState>>,
     elicitation_drafts: BTreeMap<String, crate::ElicitationFormDraft>,
     selected_git_key: Option<GitSelectionKey>,
+    compact_detail: Option<CompactDetailPage>,
+    settings_section: WorkbenchSettingsSection,
+    expanded_timeline_rows: BTreeSet<String>,
     agent_live_event_count: u64,
     agent_recovery_count: u64,
     file_live_event_count: u64,
@@ -380,6 +445,9 @@ impl WorkflowWorkbenchView {
             elicitation_inputs: BTreeMap::new(),
             elicitation_drafts: BTreeMap::new(),
             selected_git_key: None,
+            compact_detail: None,
+            settings_section: WorkbenchSettingsSection::Connection,
+            expanded_timeline_rows: BTreeSet::new(),
             agent_live_event_count: 0,
             agent_recovery_count: 0,
             file_live_event_count: 0,
@@ -536,6 +604,7 @@ impl WorkflowWorkbenchView {
         destination: GlobalDestination,
         cx: &mut Context<Self>,
     ) {
+        self.compact_detail = None;
         self.navigation.select_global(destination);
         cx.notify();
     }
@@ -545,6 +614,7 @@ impl WorkflowWorkbenchView {
         destination: SessionDestination,
         cx: &mut Context<Self>,
     ) {
+        self.compact_detail = None;
         self.navigation.select_session(destination);
         cx.notify();
     }
@@ -568,6 +638,10 @@ impl WorkflowWorkbenchView {
     }
 
     pub fn platform_back(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.compact_detail.take().is_some() {
+            cx.notify();
+            return true;
+        }
         let handled = self.navigation.back();
         if handled {
             cx.notify();
@@ -775,6 +849,10 @@ impl WorkflowWorkbenchView {
                     self.management_operation_pending = false;
                     self.drain_management_event_refresh(cx);
                 }
+                if self.layout.kind != ShellKind::Wide {
+                    self.compact_detail = (section != ManagementSection::Overview)
+                        .then_some(CompactDetailPage::ManagementSection);
+                }
                 cx.notify();
             }
             WorkflowWorkbenchCommand::RefreshManagement => self.refresh_management(cx),
@@ -790,10 +868,16 @@ impl WorkflowWorkbenchView {
     }
 
     fn active_surface(&self) -> WorkbenchSurface {
-        if self.navigation.level == NavigationLevel::Global
-            && self.navigation.global == GlobalDestination::Management
-        {
-            return WorkbenchSurface::Management;
+        if self.navigation.level == NavigationLevel::Global {
+            match self.navigation.global {
+                GlobalDestination::Management => return WorkbenchSurface::Management,
+                GlobalDestination::Settings => return WorkbenchSurface::Agent,
+                // `select_surface` is also used by the host contract before a
+                // session exists. Preserve that surface in the sanitized
+                // snapshot so the five-surface probe remains deterministic;
+                // the renderer presents the corresponding empty/list state.
+                GlobalDestination::Sessions => {}
+            }
         }
         match self.navigation.session {
             SessionDestination::Agent => WorkbenchSurface::Agent,
@@ -804,6 +888,7 @@ impl WorkflowWorkbenchView {
     }
 
     fn select_surface(&mut self, surface: WorkbenchSurface, cx: &mut Context<Self>) {
+        self.compact_detail = None;
         match surface {
             WorkbenchSurface::Management => {
                 self.navigation.select_global(GlobalDestination::Management)
@@ -905,11 +990,6 @@ impl WorkflowWorkbenchView {
             });
         if let Some(workspace_id) = workspace_id {
             self.select_workspace(workspace_id, cx);
-        }
-        if self.workflow.agent.state.selected_session_id.is_none()
-            && let Some(session) = sessions.first()
-        {
-            let _ = self.open_session(session.id.clone(), cx);
         }
     }
 
@@ -1447,6 +1527,9 @@ impl WorkflowWorkbenchView {
         cx: &mut Context<Self>,
     ) -> BackendResult<()> {
         let ticket = self.workflow.files.begin_open_file(path)?;
+        if self.layout.kind != ShellKind::Wide {
+            self.compact_detail = Some(CompactDetailPage::FilePreview);
+        }
         let future = self.workflow.files.read_file(ticket.clone());
         self.file_task = Some(
             cx.spawn_in(window, async move |entity: WeakEntity<Self>, cx| {
@@ -1575,6 +1658,9 @@ impl WorkflowWorkbenchView {
         };
         let ticket = self.workflow.git.begin_diff_load(change.path, staged)?;
         self.selected_git_key = Some(key);
+        if self.layout.kind != ShellKind::Wide {
+            self.compact_detail = Some(CompactDetailPage::GitDiff);
+        }
         let future = self.workflow.git.load_diff(ticket.clone());
         self.git_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let result = future.await;
@@ -2068,62 +2154,195 @@ impl WorkflowWorkbenchView {
         cx.notify();
     }
 
+    fn toggle_timeline_row(&mut self, row_id: String, cx: &mut Context<Self>) {
+        if !self.expanded_timeline_rows.insert(row_id.clone()) {
+            self.expanded_timeline_rows.remove(&row_id);
+        }
+        cx.notify();
+    }
+
+    fn select_settings_section(
+        &mut self,
+        section: WorkbenchSettingsSection,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings_section = section;
+        cx.notify();
+    }
+
     fn render_top_bar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let connection = format!("{:?}", self.connection);
+        let compact = self.layout.kind == ShellKind::Compact;
+        let shows_back = self.navigation.level == NavigationLevel::Session
+            || self.navigation.global != GlobalDestination::Sessions
+            || self.compact_detail.is_some();
+        let title = self.page_title();
+        let subtitle = self.page_subtitle();
+        let connection = connection_label(self.connection);
+        let connection_color = connection_color(self.connection, cx);
+
         h_flex()
             .id("workflow-top-bar")
-            .h(px(52.0))
+            .h(px(if compact { MOBILE_TOP_BAR_HEIGHT } else { 60.0 }))
             .w_full()
-            .flex_shrink_0()
+            .flex_none()
             .items_center()
             .justify_between()
-            .gap_3()
-            .px_3()
+            .gap_2()
+            .px(px(if compact { 8.0 } else { 16.0 }))
             .border_b_1()
             .border_color(cx.theme().border)
+            .bg(cx.theme().sidebar)
             .child(
                 h_flex()
                     .min_w_0()
+                    .flex_1()
                     .gap_2()
-                    .child(
+                    .children(shows_back.then(|| {
+                        Button::new("workflow-back")
+                            .ghost()
+                            .compact()
+                            .size(px(MOBILE_TOUCH_TARGET))
+                            .icon(IconName::ArrowLeft)
+                            .tooltip("Back")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.platform_back(cx);
+                            }))
+                    }))
+                    .children((!shows_back).then(|| {
                         div()
-                            .id("workflow-brand")
-                            .role(Role::Heading)
-                            .aria_level(1)
+                            .id("workflow-brand-mark")
+                            .size(px(32.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(8.0))
+                            .bg(cx.theme().primary)
+                            .text_color(cx.theme().primary_foreground)
                             .font_weight(gpui::FontWeight::BOLD)
-                            .child("Vibex"),
-                    )
+                            .child("V")
+                    }))
                     .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(self.active_surface().label()),
+                        v_flex()
+                            .min_w_0()
+                            .gap(px(1.0))
+                            .child(
+                                div()
+                                    .id("workflow-page-title")
+                                    .role(Role::Heading)
+                                    .aria_level(1)
+                                    .truncate()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(title),
+                            )
+                            .children(subtitle.map(|subtitle| {
+                                div()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(subtitle)
+                            })),
                     ),
             )
             .child(
                 h_flex()
-                    .flex_shrink_0()
-                    .gap_2()
+                    .flex_none()
+                    .gap_1()
                     .child(
-                        div()
+                        h_flex()
+                            .h(px(28.0))
+                            .gap_1()
                             .px_2()
-                            .py_1()
-                            .rounded(cx.theme().radius)
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .text_xs()
-                            .child(connection),
+                            .rounded(px(6.0))
+                            .bg(cx.theme().muted.opacity(0.55))
+                            .child(div().size(px(7.0)).rounded_full().bg(connection_color))
+                            .children((!compact).then(|| {
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(connection)
+                            })),
                     )
                     .child(
                         Button::new("workflow-refresh-all")
                             .ghost()
                             .compact()
+                            .size(px(MOBILE_TOUCH_TARGET))
                             .icon(IconName::Replace)
-                            .tooltip("Refresh all workflows")
+                            .tooltip("Refresh")
                             .on_click(cx.listener(|this, _, _, cx| this.refresh_all(cx))),
                     ),
             )
             .into_any_element()
+    }
+
+    fn page_title(&self) -> String {
+        if self.compact_detail == Some(CompactDetailPage::FilePreview) {
+            return self
+                .workflow
+                .files
+                .state
+                .view()
+                .selected_path
+                .as_deref()
+                .and_then(path_file_name)
+                .unwrap_or("File")
+                .to_string();
+        }
+        if self.compact_detail == Some(CompactDetailPage::GitDiff) {
+            return self
+                .selected_git_key
+                .as_ref()
+                .and_then(|key| path_file_name(&key.path))
+                .unwrap_or("Diff")
+                .to_string();
+        }
+        if self.compact_detail == Some(CompactDetailPage::ManagementSection) {
+            return self.management.state.navigation.active.label().to_string();
+        }
+        match self.navigation.level {
+            NavigationLevel::Session => match self.navigation.session {
+                SessionDestination::Agent => self
+                    .workflow
+                    .agent
+                    .state
+                    .active_session
+                    .value
+                    .as_ref()
+                    .map(|session| session.title.clone())
+                    .unwrap_or_else(|| "Agent".into()),
+                SessionDestination::Files => "Files".into(),
+                SessionDestination::Changes => "Changes".into(),
+                SessionDestination::Terminal => "Terminal".into(),
+            },
+            NavigationLevel::Global => match self.navigation.global {
+                GlobalDestination::Sessions => "Vibex".into(),
+                GlobalDestination::Management => "Management Center".into(),
+                GlobalDestination::Settings => "Settings".into(),
+            },
+        }
+    }
+
+    fn page_subtitle(&self) -> Option<String> {
+        if self.navigation.level == NavigationLevel::Session {
+            return self.selected_workspace_label();
+        }
+        match self.navigation.global {
+            GlobalDestination::Sessions => Some("Your remote coding sessions".into()),
+            GlobalDestination::Management => Some("Agents, providers and devices".into()),
+            GlobalDestination::Settings => Some(self.settings_section.label().into()),
+        }
+    }
+
+    fn selected_workspace_label(&self) -> Option<String> {
+        let selected = self.selected_workspace_id.as_ref()?;
+        self.workspaces
+            .value
+            .as_ref()?
+            .iter()
+            .find(|item| &item.workspace.id == selected)
+            .map(|item| item.project.name.clone())
     }
 
     fn render_workspace_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -2179,77 +2398,250 @@ impl WorkflowWorkbenchView {
     }
 
     fn render_global_navigation(&self, cx: &mut Context<Self>) -> AnyElement {
-        let management_selected = self.active_surface() == WorkbenchSurface::Management;
-        let mut sessions = Button::new("workflow-global-sessions")
-            .w_full()
-            .justify_start()
-            .icon(IconName::Bot)
-            .label("Sessions")
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.navigation.select_global(GlobalDestination::Sessions);
-                cx.notify();
-            }));
-        sessions = if management_selected {
-            sessions.ghost()
+        let current = self.navigation.global;
+        let level = self.navigation.level;
+        let items = [
+            (GlobalDestination::Sessions, "Sessions", IconName::Bot),
+            (GlobalDestination::Management, "Manage", IconName::Settings2),
+            (GlobalDestination::Settings, "Settings", IconName::Settings),
+        ];
+        let buttons = items
+            .into_iter()
+            .map(|(destination, label, icon)| {
+                let selected = level == NavigationLevel::Global && current == destination;
+                Button::new(format!("workflow-global-{destination:?}"))
+                    .ghost()
+                    .compact()
+                    .flex_1()
+                    .h(px(52.0))
+                    .rounded(px(8.0))
+                    .selected(selected)
+                    .icon(icon)
+                    .label(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_global_destination(destination, cx)
+                    }))
+            })
+            .collect::<Vec<_>>();
+        if self.layout.kind == ShellKind::Wide {
+            v_flex()
+                .id("workflow-global-navigation")
+                .w_full()
+                .gap_1()
+                .p_2()
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .children(buttons)
+                .into_any_element()
         } else {
-            sessions.primary()
-        };
-        let mut management = Button::new("workflow-global-management")
-            .w_full()
-            .justify_start()
-            .icon(IconName::Settings2)
-            .label("Management")
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.navigation.select_global(GlobalDestination::Management);
-                cx.notify();
-            }));
-        management = if management_selected {
-            management.primary()
-        } else {
-            management.ghost()
-        };
-        v_flex()
-            .p_2()
-            .border_t_1()
-            .border_color(cx.theme().border)
-            .gap_1()
-            .child(sessions)
-            .child(management)
-            .into_any_element()
+            Self::render_bottom_navigation("workflow-global-navigation", buttons, cx)
+        }
     }
 
     fn render_surface_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
         let current = self.active_surface();
-        let tabs = [
-            (WorkbenchSurface::Agent, IconName::Bot),
-            (WorkbenchSurface::Files, IconName::FolderOpen),
-            (WorkbenchSurface::Git, IconName::Github),
-            (WorkbenchSurface::Terminal, IconName::SquareTerminal),
-        ]
-        .into_iter()
-        .map(|(surface, icon)| {
-            let mut button = Button::new(format!("workflow-tab-{surface:?}"))
+        let items = [
+            (WorkbenchSurface::Agent, "Agent", IconName::Bot),
+            (WorkbenchSurface::Files, "Files", IconName::FolderOpen),
+            (WorkbenchSurface::Git, "Changes", IconName::Github),
+            (
+                WorkbenchSurface::Terminal,
+                "Terminal",
+                IconName::SquareTerminal,
+            ),
+        ];
+        let buttons = items
+            .into_iter()
+            .map(|(surface, label, icon)| {
+                Button::new(format!("workflow-tab-{surface:?}"))
+                    .ghost()
+                    .compact()
+                    .flex_1()
+                    .h(px(52.0))
+                    .rounded(px(8.0))
+                    .selected(current == surface)
+                    .icon(icon)
+                    .label(label)
+                    .on_click(cx.listener(move |this, _, _, cx| this.select_surface(surface, cx)))
+            })
+            .collect::<Vec<_>>();
+        if self.layout.kind == ShellKind::Wide {
+            h_flex()
+                .id("workflow-surface-tabs")
+                .w_full()
                 .h(px(44.0))
-                .icon(icon)
-                .label(surface.label())
-                .on_click(cx.listener(move |this, _, _, cx| this.select_surface(surface, cx)));
-            button = if current == surface {
-                button.primary()
-            } else {
-                button.ghost()
-            };
-            button
-        });
+                .flex_none()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .children(buttons)
+                .into_any_element()
+        } else {
+            Self::render_bottom_navigation("workflow-session-navigation", buttons, cx)
+        }
+    }
+
+    fn render_bottom_navigation(
+        id: &'static str,
+        items: impl IntoIterator<Item = Button>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         h_flex()
-            .id("workflow-surface-tabs")
+            .id(id)
+            .role(Role::Navigation)
             .w_full()
-            .flex_shrink_0()
+            .h(px(MOBILE_BOTTOM_NAV_HEIGHT))
+            .flex_none()
+            .items_center()
             .gap_1()
             .px_2()
             .py_1()
-            .border_b_1()
+            .border_t_1()
             .border_color(cx.theme().border)
-            .children(tabs)
+            .bg(cx.theme().sidebar)
+            .children(items)
+            .into_any_element()
+    }
+
+    fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let section = self.settings_section;
+        let options =
+            WorkbenchSettingsSection::ALL
+                .into_iter()
+                .enumerate()
+                .map(|(index, option)| {
+                    let mut button = Button::new(("mobile-settings-section", index))
+                        .w_full()
+                        .min_h(px(MOBILE_TOUCH_TARGET))
+                        .justify_start()
+                        .label(option.label())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.select_settings_section(option, cx);
+                        }));
+                    button = if section == option {
+                        button.primary()
+                    } else {
+                        button.ghost()
+                    };
+                    button
+                });
+        let detail = match section {
+            WorkbenchSettingsSection::Connection => v_flex()
+                .gap_3()
+                .child(settings_value_row(
+                    "Connection",
+                    connection_label(self.connection),
+                    connection_color(self.connection, cx),
+                    cx,
+                ))
+                .child(settings_value_row(
+                    "Workspaces",
+                    self.workspaces
+                        .value
+                        .as_ref()
+                        .map_or_else(|| "Loading".into(), |items| items.len().to_string()),
+                    cx.theme().foreground,
+                    cx,
+                ))
+                .child(settings_value_row(
+                    "Transport",
+                    "Authoritative desktop backend",
+                    cx.theme().muted_foreground,
+                    cx,
+                ))
+                .child(
+                    Button::new("settings-refresh")
+                        .primary()
+                        .min_h(px(MOBILE_TOUCH_TARGET))
+                        .label("Refresh connection")
+                        .on_click(cx.listener(|this, _, _, cx| this.refresh_all(cx))),
+                )
+                .into_any_element(),
+            WorkbenchSettingsSection::Appearance => v_flex()
+                .gap_3()
+                .child(settings_value_row(
+                    "Shell",
+                    self.layout.kind.label(),
+                    cx.theme().foreground,
+                    cx,
+                ))
+                .child(settings_value_row(
+                    "Theme",
+                    "System appearance",
+                    cx.theme().foreground,
+                    cx,
+                ))
+                .child(settings_value_row(
+                    "Touch targets",
+                    "44 px minimum",
+                    cx.theme().muted_foreground,
+                    cx,
+                ))
+                .into_any_element(),
+            WorkbenchSettingsSection::About => v_flex()
+                .gap_3()
+                .child(settings_value_row(
+                    "Product",
+                    "Vibex mobile workbench",
+                    cx.theme().foreground,
+                    cx,
+                ))
+                .child(settings_value_row(
+                    "Workflow schema",
+                    WORKFLOW_WORKBENCH_SCHEMA_VERSION,
+                    cx.theme().muted_foreground,
+                    cx,
+                ))
+                .child(settings_value_row(
+                    "Runtime",
+                    "GPUI-WASM + Capacitor",
+                    cx.theme().muted_foreground,
+                    cx,
+                ))
+                .into_any_element(),
+        };
+        v_flex()
+            .id("mobile-settings")
+            .size_full()
+            .min_h_0()
+            .gap_3()
+            .p(px(MOBILE_PAGE_GUTTER))
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child("Settings"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Local display and connection preferences"),
+                    ),
+            )
+            .child(h_flex().w_full().gap_1().children(options))
+            .child(
+                v_flex()
+                    .id("mobile-settings-detail")
+                    .flex_1()
+                    .min_h_0()
+                    .gap_2()
+                    .p_3()
+                    .rounded(px(MOBILE_CARD_RADIUS))
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(section.label()),
+                    )
+                    .child(detail),
+            )
             .into_any_element()
     }
 
@@ -2522,7 +2914,7 @@ impl WorkflowWorkbenchView {
             .into_any_element()
     }
 
-    fn render_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_agent_wide(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let view = self
             .workflow
             .agent
@@ -2741,7 +3133,7 @@ impl WorkflowWorkbenchView {
         }
     }
 
-    fn render_files(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_files_wide(&self, cx: &mut Context<Self>) -> AnyElement {
         let view = self.workflow.files.state.view();
         let rows = view
             .rows
@@ -2957,7 +3349,7 @@ impl WorkflowWorkbenchView {
         }
     }
 
-    fn render_git(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_git_wide(&self, cx: &mut Context<Self>) -> AnyElement {
         let view = self.workflow.git.state.view();
         let changes = view
             .status
@@ -3152,7 +3544,7 @@ impl WorkflowWorkbenchView {
             .into_any_element()
     }
 
-    fn render_terminal(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_terminal_wide(&self, cx: &mut Context<Self>) -> AnyElement {
         let view = self.terminal.state.view(self.layout.kind);
         let sessions = view
             .sessions
@@ -3279,7 +3671,7 @@ impl WorkflowWorkbenchView {
             .into_any_element()
     }
 
-    fn render_management(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_management_wide(&self, cx: &mut Context<Self>) -> AnyElement {
         let view = self.management.state.view(self.layout.kind);
         let pairing_fragment = view
             .pairing_offer
@@ -3569,6 +3961,1461 @@ impl WorkflowWorkbenchView {
             .into_any_element()
     }
 
+    fn render_agent_mobile(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let view = self
+            .workflow
+            .agent
+            .state
+            .view(&self.sidebar, "", self.layout.kind);
+        self.sync_elicitation_forms(&view.elicitations, window, cx);
+        let selected_id = self.workflow.agent.state.selected_session_id.clone();
+
+        if self.navigation.level == NavigationLevel::Global {
+            let rows = view.sessions.into_iter().enumerate().map(|(index, row)| {
+                let is_session = row.kind == AgentSidebarRowKind::Session;
+                let selected = row.session_id.as_ref() == selected_id.as_ref();
+                let session_id = row.session_id.clone();
+                let icon = if is_session {
+                    IconName::Bot
+                } else {
+                    IconName::FolderOpen
+                };
+                let state_label = row.state.map(agent_state_label).unwrap_or("Workspace");
+                let row_label = row.label.clone();
+                let mut button = Button::new(("mobile-agent-session", index))
+                    .w_full()
+                    .min_h(px(MOBILE_TOUCH_TARGET))
+                    .justify_start()
+                    .icon(icon)
+                    .label(row_label)
+                    .disabled(!is_session)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(session_id) = session_id.clone() {
+                            let result = this.open_session(session_id, cx);
+                            this.record_action_result(result, cx);
+                        }
+                    }));
+                button = if selected {
+                    button.primary()
+                } else {
+                    button.ghost()
+                };
+                v_flex()
+                    .id(("mobile-agent-row", index))
+                    .w_full()
+                    .gap_1()
+                    .child(button)
+                    .when(is_session, |this| {
+                        this.child(
+                            div()
+                                .pl_10()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(state_label),
+                        )
+                    })
+                    .into_any_element()
+            });
+            let session_count = self
+                .workflow
+                .agent
+                .state
+                .sessions
+                .value
+                .as_ref()
+                .map_or(0, Vec::len);
+            return v_flex()
+                .id("mobile-agent-session-list")
+                .size_full()
+                .min_h_0()
+                .gap_3()
+                .p(px(MOBILE_PAGE_GUTTER))
+                .child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .child("Sessions"),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(format!("{session_count} remote sessions")),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .rounded(px(6.0))
+                                .bg(cx.theme().muted.opacity(0.45))
+                                .text_xs()
+                                .child(connection_label(self.connection)),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .id("mobile-agent-session-scroll")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.content_scroll)
+                        .vertical_scrollbar(&self.content_scroll)
+                        .gap_2()
+                        .children(rows)
+                        .when(session_count == 0, |this| {
+                            this.child(mobile_empty_state(
+                                "No sessions yet",
+                                "Choose a workspace on the paired desktop to start coding.",
+                                cx,
+                            ))
+                        }),
+                )
+                .into_any_element();
+        }
+
+        let active_title = view
+            .active_session
+            .as_ref()
+            .map(|session| session.title.clone())
+            .unwrap_or_else(|| "Session".into());
+        let timeline_count = view.timeline_rows.len();
+        let elicitations = view
+            .elicitations
+            .clone()
+            .into_iter()
+            .map(|surface| self.render_elicitation_surface(surface, cx))
+            .collect::<Vec<_>>();
+        let timeline = view
+            .timeline_rows
+            .clone()
+            .into_iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let row_id = row.id.clone();
+                let expanded = !row.collapsible || self.expanded_timeline_rows.contains(&row_id);
+                let title = row.title.clone();
+                let kind = timeline_kind_label(row.kind);
+                let body = bounded_text(row.body, MAX_RENDERED_TEXT_BYTES);
+                let tone = if row.failed {
+                    cx.theme().danger
+                } else if row.pending_permission {
+                    cx.theme().warning
+                } else {
+                    cx.theme().border
+                };
+                v_flex()
+                    .id(("mobile-agent-timeline-row", index))
+                    .w_full()
+                    .min_w_0()
+                    .gap_2()
+                    .p_3()
+                    .rounded(px(MOBILE_CARD_RADIUS))
+                    .border_1()
+                    .border_color(tone.opacity(0.7))
+                    .bg(cx.theme().background)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(kind),
+                            )
+                            .when(row.collapsible, |this| {
+                                let row_id = row_id.clone();
+                                this.child(
+                                    Button::new(("mobile-agent-expand", index))
+                                        .ghost()
+                                        .compact()
+                                        .size(px(MOBILE_TOUCH_TARGET))
+                                        .icon(if expanded {
+                                            IconName::ChevronUp
+                                        } else {
+                                            IconName::ChevronDown
+                                        })
+                                        .tooltip(if expanded { "Collapse" } else { "Expand" })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.toggle_timeline_row(row_id.clone(), cx)
+                                        })),
+                                )
+                            }),
+                    )
+                    .when(expanded, |this| {
+                        this.child(div().min_w_0().text_sm().child(body))
+                    })
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let approvals = view
+            .approvals
+            .into_iter()
+            .enumerate()
+            .map(|(index, approval)| {
+                let response_options = if approval.response_options.is_empty() {
+                    approval
+                        .allowed_responses
+                        .iter()
+                        .map(|response| {
+                            (
+                                None,
+                                permission_response_label(*response).to_string(),
+                                *response,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    approval
+                        .response_options
+                        .iter()
+                        .map(|option| {
+                            (
+                                Some(option.option_id.clone()),
+                                option.label.clone(),
+                                option.response,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                };
+                v_flex()
+                    .id(("mobile-agent-approval", index))
+                    .w_full()
+                    .gap_2()
+                    .p_3()
+                    .rounded(px(MOBILE_CARD_RADIUS))
+                    .border_1()
+                    .border_color(cx.theme().warning.opacity(0.7))
+                    .bg(cx.theme().warning.opacity(0.08))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(approval.title),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().warning)
+                                    .child("Needs your decision"),
+                            ),
+                    )
+                    .child(h_flex().w_full().flex_wrap().gap_2().children(
+                        response_options.into_iter().enumerate().map(
+                            |(option_index, (option_id, label, response))| {
+                                let request_id = approval.request_id.clone();
+                                let mut button =
+                                    Button::new(("mobile-agent-approval-response", option_index))
+                                        .min_h(px(MOBILE_TOUCH_TARGET))
+                                        .label(label)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            let result = this.resolve_approval(
+                                                request_id.clone(),
+                                                response,
+                                                option_id.clone(),
+                                                cx,
+                                            );
+                                            this.record_action_result(result, cx);
+                                        }));
+                                button = match response {
+                                    PermissionResponseKind::Approve => button.primary(),
+                                    PermissionResponseKind::Deny => button.danger(),
+                                    PermissionResponseKind::AlwaysAllowForSession => {
+                                        button.outline()
+                                    }
+                                };
+                                button
+                            },
+                        ),
+                    ))
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        v_flex()
+            .id("mobile-agent-session-detail")
+            .size_full()
+            .min_h_0()
+            .gap_2()
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .px(px(MOBILE_PAGE_GUTTER))
+                    .py_2()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(active_title),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("{timeline_count} activity items")),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded(px(6.0))
+                            .bg(cx.theme().muted.opacity(0.45))
+                            .text_xs()
+                            .child(
+                                view.active_session
+                                    .as_ref()
+                                    .map(|session| agent_state_label(session.state))
+                                    .unwrap_or("Unavailable"),
+                            ),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .id("mobile-agent-timeline-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.content_scroll)
+                    .vertical_scrollbar(&self.content_scroll)
+                    .gap_2()
+                    .px(px(MOBILE_PAGE_GUTTER))
+                    .py_2()
+                    .children(timeline)
+                    .children(approvals)
+                    .children(elicitations),
+            )
+            .child(
+                h_flex()
+                    .id("agent-mobile-composer")
+                    .w_full()
+                    .min_h(px(84.0))
+                    .gap_2()
+                    .p_2()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().sidebar)
+                    .child(Input::new(&self.composer).w_full())
+                    .child(
+                        Button::new("agent-send")
+                            .primary()
+                            .min_h(px(MOBILE_TOUCH_TARGET))
+                            .icon(IconName::ArrowUp)
+                            .tooltip("Send message")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.send_agent_message(window, cx)
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.layout.kind == ShellKind::Wide {
+            self.render_agent_wide(window, cx)
+        } else {
+            self.render_agent_mobile(window, cx)
+        }
+    }
+
+    fn render_files_mobile(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let view = self.workflow.files.state.view();
+        if self.compact_detail == Some(CompactDetailPage::FilePreview) {
+            return self.render_file_preview_mobile(view, cx);
+        }
+        let rows = view
+            .rows
+            .clone()
+            .into_iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let is_directory = row.kind == FileEntryKind::Directory;
+                let icon = if is_directory {
+                    IconName::Folder
+                } else {
+                    IconName::File
+                };
+                let label = row.name.clone();
+                let path = row.path.clone();
+                let mut button = Button::new(("mobile-file-row", index))
+                    .w_full()
+                    .min_h(px(MOBILE_TOUCH_TARGET))
+                    .justify_start()
+                    .icon(icon)
+                    .label(label)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let result = this.open_file_row(index, window, cx);
+                        this.record_action_result(result, cx);
+                    }));
+                if view.selected_path.as_deref() == Some(path.as_str()) {
+                    button = button.primary();
+                } else {
+                    button = button.ghost();
+                }
+                v_flex()
+                    .id(("mobile-file-row-wrap", index))
+                    .w_full()
+                    .pl(px((row.depth as f32 * 16.0).min(64.0)))
+                    .child(button)
+                    .into_any_element()
+            });
+        let search_rows = view
+            .search
+            .clone()
+            .into_iter()
+            .enumerate()
+            .map(|(index, result)| {
+                let path = result.path.clone();
+                Button::new(("mobile-file-search-result", index))
+                    .w_full()
+                    .min_h(px(MOBILE_TOUCH_TARGET))
+                    .justify_start()
+                    .ghost()
+                    .icon(IconName::Search)
+                    .label(result.name)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let result = this.open_file(path.clone(), window, cx);
+                        this.record_action_result(result, cx);
+                    }))
+            });
+        v_flex()
+            .id("mobile-files-list")
+            .size_full()
+            .min_h_0()
+            .gap_2()
+            .p(px(MOBILE_PAGE_GUTTER))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(Input::new(&self.file_search).w_full())
+                    .child(
+                        Button::new("file-search")
+                            .outline()
+                            .size(px(MOBILE_TOUCH_TARGET))
+                            .icon(IconName::Search)
+                            .tooltip("Search files")
+                            .on_click(cx.listener(|this, _, _, cx| this.search_files(cx))),
+                    )
+                    .child(
+                        Button::new("file-tree-refresh")
+                            .ghost()
+                            .size(px(MOBILE_TOUCH_TARGET))
+                            .icon(IconName::Replace)
+                            .tooltip("Refresh file tree")
+                            .on_click(cx.listener(|this, _, _, cx| this.refresh_file_tree(cx))),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .id("mobile-file-tree-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.sidebar_scroll)
+                    .vertical_scrollbar(&self.sidebar_scroll)
+                    .gap_1()
+                    .children(search_rows)
+                    .children(rows)
+                    .when(view.rows.is_empty() && view.search.is_empty(), |this| {
+                        this.child(mobile_empty_state(
+                            "Workspace is empty",
+                            "Files from the selected remote workspace will appear here.",
+                            cx,
+                        ))
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_file_preview_mobile(
+        &mut self,
+        view: crate::FileWorkflowView,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let path = view
+            .selected_path
+            .clone()
+            .unwrap_or_else(|| "No file selected".into());
+        let status = file_status_label(view.status);
+        let conflict = view.conflict.map(|conflict| {
+            v_flex()
+                .gap_2()
+                .p_3()
+                .rounded(px(MOBILE_CARD_RADIUS))
+                .border_1()
+                .border_color(cx.theme().danger.opacity(0.6))
+                .bg(cx.theme().danger.opacity(0.06))
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .child("Revision conflict"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("The remote file changed while you were editing."),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .child(div().text_xs().child("Local"))
+                                .child(
+                                    div()
+                                        .font_family(cx.theme().mono_font_family.clone())
+                                        .text_xs()
+                                        .child(bounded_text(
+                                            conflict.local_content,
+                                            MAX_RENDERED_TEXT_BYTES / 4,
+                                        )),
+                                ),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .child(div().text_xs().child("Server"))
+                                .child(
+                                    div()
+                                        .font_family(cx.theme().mono_font_family.clone())
+                                        .text_xs()
+                                        .child(bounded_text(
+                                            conflict.server_content,
+                                            MAX_RENDERED_TEXT_BYTES / 4,
+                                        )),
+                                ),
+                        ),
+                )
+                .child(
+                    Button::new("file-conflict-reload")
+                        .outline()
+                        .min_h(px(MOBILE_TOUCH_TARGET))
+                        .label("Reload server version")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            let result = this.apply_test_command(
+                                WorkflowWorkbenchCommand::ReloadFileConflict,
+                                window,
+                                cx,
+                            );
+                            this.record_action_result(result, cx);
+                        })),
+                )
+        });
+        v_flex()
+            .id("mobile-file-preview")
+            .size_full()
+            .min_h_0()
+            .gap_2()
+            .p(px(MOBILE_PAGE_GUTTER))
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(path),
+                    )
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded(px(6.0))
+                            .bg(cx.theme().muted.opacity(0.45))
+                            .text_xs()
+                            .child(status),
+                    )
+                    .child(
+                        Button::new("file-save")
+                            .primary()
+                            .min_h(px(MOBILE_TOUCH_TARGET))
+                            .icon(IconName::Check)
+                            .tooltip("Save file")
+                            .disabled(!matches!(
+                                view.status,
+                                FileEditorStatus::Dirty | FileEditorStatus::Saved
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let result = this.save_file(cx);
+                                this.record_action_result(result, cx);
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .id("mobile-file-editor")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .p_1()
+                    .rounded(px(MOBILE_CARD_RADIUS))
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(Input::new(&self.file_editor).size_full()),
+            )
+            .children(conflict)
+            .into_any_element()
+    }
+
+    fn render_files(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.layout.kind == ShellKind::Wide {
+            self.render_files_wide(cx)
+        } else {
+            self.render_files_mobile(window, cx)
+        }
+    }
+
+    fn render_git(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if self.layout.kind == ShellKind::Wide {
+            self.render_git_wide(cx)
+        } else {
+            self.render_git_mobile(cx)
+        }
+    }
+
+    fn render_git_mobile(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let view = self.workflow.git.state.view();
+        if self.compact_detail == Some(CompactDetailPage::GitDiff) {
+            return self.render_git_diff_mobile(view, cx);
+        }
+        let changes = view
+            .status
+            .as_ref()
+            .map(|status| status.changes.clone())
+            .unwrap_or_default();
+        let changes_empty = changes.is_empty();
+        let rows = changes.into_iter().enumerate().map(|(index, change)| {
+            let path = change.path.clone();
+            let stage = !change.staged || change.unstaged;
+            v_flex()
+                .id(("mobile-git-change", index))
+                .w_full()
+                .gap_2()
+                .p_3()
+                .rounded(px(MOBILE_CARD_RADIUS))
+                .border_1()
+                .border_color(cx.theme().border)
+                .child(
+                    Button::new(("mobile-git-open-diff", index))
+                        .w_full()
+                        .min_h(px(MOBILE_TOUCH_TARGET))
+                        .justify_start()
+                        .ghost()
+                        .icon(IconName::Github)
+                        .label(path)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let result = this.load_git_diff(index, cx);
+                            this.record_action_result(result, cx);
+                        })),
+                )
+                .child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!("{:?}", change.kind)),
+                        )
+                        .child(
+                            Button::new(("mobile-git-stage", index))
+                                .outline()
+                                .min_h(px(MOBILE_TOUCH_TARGET))
+                                .label(if stage { "Stage" } else { "Unstage" })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let result = this.mutate_git_change(index, stage, cx);
+                                    this.record_action_result(result, cx);
+                                })),
+                        ),
+                )
+                .into_any_element()
+        });
+        v_flex()
+            .id("mobile-git-list")
+            .size_full()
+            .min_h_0()
+            .gap_2()
+            .p(px(MOBILE_PAGE_GUTTER))
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child("Changes"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!(
+                                        "{} files changed",
+                                        view.status
+                                            .as_ref()
+                                            .map_or(0, |status| status.changes.len())
+                                    )),
+                            ),
+                    )
+                    .child(
+                        Button::new("git-refresh")
+                            .ghost()
+                            .size(px(MOBILE_TOUCH_TARGET))
+                            .icon(IconName::Replace)
+                            .tooltip("Refresh Git status")
+                            .on_click(cx.listener(|this, _, _, cx| this.refresh_git_status(cx))),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .id("mobile-git-change-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.content_scroll)
+                    .vertical_scrollbar(&self.content_scroll)
+                    .gap_2()
+                    .children(rows)
+                    .when(changes_empty, |this| {
+                        this.child(mobile_empty_state(
+                            "Working tree is clean",
+                            "Remote changes will appear here for review and staging.",
+                            cx,
+                        ))
+                    }),
+            )
+            .child(self.render_commit_bar(view, cx))
+            .into_any_element()
+    }
+
+    fn render_git_diff_mobile(
+        &mut self,
+        view: crate::GitWorkflowView,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let diff_rows = self
+            .selected_git_key
+            .as_ref()
+            .and_then(|key| self.workflow.git.state.model.diffs.get(key))
+            .map(|document| {
+                document
+                    .files
+                    .iter()
+                    .flat_map(|file| file.lines.iter())
+                    .take(500)
+                    .enumerate()
+                    .map(|(index, line)| {
+                        let (background, foreground, prefix) = match line.kind {
+                            UnifiedDiffLineKind::Add => {
+                                (cx.theme().success.opacity(0.12), cx.theme().success, "+")
+                            }
+                            UnifiedDiffLineKind::Delete => {
+                                (cx.theme().danger.opacity(0.12), cx.theme().danger, "-")
+                            }
+                            UnifiedDiffLineKind::Hunk => {
+                                (cx.theme().primary.opacity(0.12), cx.theme().primary, "@")
+                            }
+                            UnifiedDiffLineKind::Meta => (
+                                cx.theme().muted.opacity(0.35),
+                                cx.theme().muted_foreground,
+                                "·",
+                            ),
+                            UnifiedDiffLineKind::Context => {
+                                (cx.theme().background, cx.theme().foreground, " ")
+                            }
+                        };
+                        div()
+                            .id(("mobile-git-diff-line", index))
+                            .w_full()
+                            .px_2()
+                            .py_1()
+                            .bg(background)
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_xs()
+                            .text_color(foreground)
+                            .child(format!(
+                                "{prefix} {}",
+                                bounded_text(line.content.clone(), 2_048)
+                            ))
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        v_flex()
+            .id("mobile-git-diff")
+            .size_full()
+            .min_h_0()
+            .gap_2()
+            .p(px(MOBILE_PAGE_GUTTER))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Review the selected change, then return to stage or commit."),
+            )
+            .child(
+                v_flex()
+                    .id("mobile-git-diff-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.content_scroll)
+                    .vertical_scrollbar(&self.content_scroll)
+                    .rounded(px(MOBILE_CARD_RADIUS))
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .children(diff_rows)
+                    .when(self.selected_git_key.is_none(), |this| {
+                        this.child(mobile_empty_state(
+                            "No diff selected",
+                            "Choose a changed file to inspect it.",
+                            cx,
+                        ))
+                    }),
+            )
+            .child(self.render_commit_bar(view, cx))
+            .into_any_element()
+    }
+
+    fn render_commit_bar(
+        &self,
+        view: crate::GitWorkflowView,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let confirmation = view.commit_confirmation.map(|confirmation| {
+            v_flex()
+                .gap_2()
+                .p_2()
+                .rounded(px(MOBILE_CARD_RADIUS))
+                .border_1()
+                .border_color(cx.theme().warning.opacity(0.65))
+                .bg(cx.theme().warning.opacity(0.08))
+                .child(div().text_sm().child(format!(
+                    "Commit {} staged path(s)?",
+                    confirmation.paths.len()
+                )))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("git-commit-cancel")
+                                .outline()
+                                .min_h(px(MOBILE_TOUCH_TARGET))
+                                .label("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.workflow.git.cancel_commit();
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("git-commit-confirm")
+                                .primary()
+                                .min_h(px(MOBILE_TOUCH_TARGET))
+                                .label("Confirm commit")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let result = this.confirm_commit(cx);
+                                    this.record_action_result(result, cx);
+                                })),
+                        ),
+                )
+        });
+        v_flex()
+            .w_full()
+            .gap_2()
+            .p_2()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .children(confirmation)
+            .child(Input::new(&self.commit_message).w_full().h(px(56.0)))
+            .child(
+                Button::new("git-commit-prepare")
+                    .primary()
+                    .min_h(px(MOBILE_TOUCH_TARGET))
+                    .label("Review commit")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let result = this.prepare_commit(cx);
+                        this.record_action_result(result, cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn render_terminal(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if self.layout.kind == ShellKind::Wide {
+            self.render_terminal_wide(cx)
+        } else {
+            self.render_terminal_mobile(cx)
+        }
+    }
+
+    fn render_terminal_mobile(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let view = self.terminal.state.view(self.layout.kind);
+        let output = view
+            .frame
+            .as_ref()
+            .map(terminal_frame_text)
+            .unwrap_or_else(|| "Attach or create a terminal".into());
+        let sessions = view
+            .sessions
+            .clone()
+            .into_iter()
+            .enumerate()
+            .map(|(index, session)| {
+                let mut button = Button::new(("mobile-terminal-session", index))
+                    .min_h(px(MOBILE_TOUCH_TARGET))
+                    .label(session.title)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let result = this.attach_terminal(index, cx);
+                        this.record_action_result(result, cx);
+                    }));
+                button = if session.selected {
+                    button.primary()
+                } else {
+                    button.ghost()
+                };
+                button
+            });
+        let keys = view.key_bar.into_iter().enumerate().map(|(index, action)| {
+            let key = action.key;
+            Button::new(("mobile-terminal-key", index))
+                .outline()
+                .min_h(px(MOBILE_TOUCH_TARGET))
+                .label(action.label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let result = this.send_terminal_key(key, cx);
+                    this.record_action_result(result, cx);
+                }))
+        });
+        v_flex()
+            .id("mobile-terminal")
+            .size_full()
+            .min_h_0()
+            .gap_2()
+            .p_2()
+            .child(
+                h_flex()
+                    .id("mobile-terminal-session-scroll")
+                    .w_full()
+                    .min_h(px(MOBILE_TOUCH_TARGET))
+                    .items_center()
+                    .gap_1()
+                    .overflow_x_scroll()
+                    .children(sessions)
+                    .child(
+                        Button::new("terminal-create")
+                            .ghost()
+                            .size(px(MOBILE_TOUCH_TARGET))
+                            .icon(IconName::Plus)
+                            .tooltip("Create terminal")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let result = this.create_terminal(cx);
+                                this.record_action_result(result, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("terminal-close")
+                            .ghost()
+                            .size(px(MOBILE_TOUCH_TARGET))
+                            .icon(IconName::Close)
+                            .tooltip("Close terminal")
+                            .disabled(view.active_session_id.is_none())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let result = this.close_terminal(cx);
+                                this.record_action_result(result, cx);
+                            })),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .id("terminal-output-scroll")
+                    .flex_1()
+                    .min_h(px(160.0))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.content_scroll)
+                    .vertical_scrollbar(&self.content_scroll)
+                    .p_3()
+                    .rounded(px(MOBILE_CARD_RADIUS))
+                    .bg(cx.theme().popover)
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .text_sm()
+                    .child(output),
+            )
+            .child(h_flex().w_full().flex_wrap().gap_1().children(keys))
+            .child(
+                v_flex()
+                    .w_full()
+                    .gap_2()
+                    .p_2()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .rounded(px(MOBILE_CARD_RADIUS))
+                    .child(Input::new(&self.terminal_input).w_full().h(px(52.0)))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("terminal-send")
+                                    .primary()
+                                    .min_h(px(MOBILE_TOUCH_TARGET))
+                                    .label("Send")
+                                    .disabled(view.access != TerminalAccessMode::ReadWrite)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.send_terminal_input(window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("terminal-resize")
+                                    .outline()
+                                    .min_h(px(MOBILE_TOUCH_TARGET))
+                                    .label("100 x 30")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let result = this.resize_terminal(30, 100, cx);
+                                        this.record_action_result(result, cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!(
+                                        "{} · seq {}",
+                                        terminal_connection_label(view.connection),
+                                        view.raw_next_sequence
+                                    )),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_management(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if self.layout.kind == ShellKind::Wide {
+            self.render_management_wide(cx)
+        } else {
+            self.render_management_mobile(cx)
+        }
+    }
+
+    fn render_management_mobile(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let view = self.management.state.view(self.layout.kind);
+        if self.compact_detail == Some(CompactDetailPage::ManagementSection) {
+            return self.render_management_section_mobile(view, cx);
+        }
+        let summaries = [
+            (
+                ManagementSection::Overview,
+                "Workspace overview",
+                "Agents, profiles, devices and audit",
+            ),
+            (
+                ManagementSection::Providers,
+                "Provider profiles",
+                "Choose the active remote provider",
+            ),
+            (
+                ManagementSection::Health,
+                "Health checks",
+                "Run provider connectivity probes",
+            ),
+            (
+                ManagementSection::Relay,
+                "Relay connection",
+                "Inspect self-hosted relay status",
+            ),
+            (
+                ManagementSection::Devices,
+                "Paired devices",
+                "Manage pairing and access permissions",
+            ),
+        ];
+        let rows = summaries
+            .into_iter()
+            .enumerate()
+            .map(|(index, (section, title, subtitle))| {
+                Button::new(("mobile-management-section", index))
+                    .w_full()
+                    .min_h(px(64.0))
+                    .justify_start()
+                    .icon(match section {
+                        ManagementSection::Overview => IconName::LayoutDashboard,
+                        ManagementSection::Providers => IconName::Settings2,
+                        ManagementSection::Health => IconName::TriangleAlert,
+                        ManagementSection::Relay => IconName::SquareTerminal,
+                        ManagementSection::Devices => IconName::Settings,
+                    })
+                    .label(title)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.management.switch_section(section, true) {
+                            this.management_operation_pending = false;
+                            this.drain_management_event_refresh(cx);
+                        }
+                        if section != ManagementSection::Overview {
+                            this.compact_detail = Some(CompactDetailPage::ManagementSection);
+                        }
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(subtitle),
+                    )
+            });
+        v_flex()
+            .id("mobile-management-list")
+            .size_full()
+            .min_h_0()
+            .gap_3()
+            .p(px(MOBILE_PAGE_GUTTER))
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child("Management"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Remote runtime and device controls"),
+                            ),
+                    )
+                    .child(
+                        Button::new("management-refresh")
+                            .ghost()
+                            .size(px(MOBILE_TOUCH_TARGET))
+                            .icon(IconName::Replace)
+                            .tooltip("Refresh management")
+                            .on_click(cx.listener(|this, _, _, cx| this.refresh_management(cx))),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .id("mobile-management-section-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.content_scroll)
+                    .vertical_scrollbar(&self.content_scroll)
+                    .gap_2()
+                    .children(rows)
+                    .child(
+                        v_flex()
+                            .gap_2()
+                            .p_3()
+                            .rounded(px(MOBILE_CARD_RADIUS))
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .child(summary_row("Agents", view.agents.len(), cx))
+                            .child(summary_row("Provider profiles", view.profiles.len(), cx))
+                            .child(summary_row("Paired devices", view.devices.len(), cx)),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_management_section_mobile(
+        &self,
+        view: crate::ManagementWorkflowView,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let can_select_profile = self
+            .management
+            .capabilities
+            .supports(BackendOperation::ManagementProfileSelect);
+        let can_pair = self
+            .management
+            .capabilities
+            .supports(BackendOperation::DevicePairing);
+        let can_run_health = self
+            .management
+            .capabilities
+            .supports(BackendOperation::ManagementHealth);
+        let can_revoke = self
+            .management
+            .capabilities
+            .supports(BackendOperation::DeviceRevoke);
+        let pairing_fragment = view
+            .pairing_offer
+            .as_ref()
+            .filter(|offer| !offer.canceled)
+            .and_then(|offer| offer.launch_fragment.clone());
+        let content = match view.active_section {
+            ManagementSection::Overview => v_flex()
+                .gap_2()
+                .child(summary_row("Agents", view.agents.len(), cx))
+                .child(summary_row("Provider profiles", view.profiles.len(), cx))
+                .child(summary_row("Health summaries", view.health.len(), cx))
+                .child(summary_row("Paired devices", view.devices.len(), cx))
+                .child(summary_row("Audit records", view.audit_count, cx))
+                .into_any_element(),
+            ManagementSection::Providers => v_flex()
+                .gap_2()
+                .children(
+                    view.profiles
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, profile)| {
+                            h_flex()
+                                .w_full()
+                                .min_h(px(64.0))
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .p_2()
+                                .rounded(px(MOBILE_CARD_RADIUS))
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(profile.display_name)
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(format!("{:?}", profile.status)),
+                                        ),
+                                )
+                                .child(
+                                    Button::new(("mobile-management-select-profile", index))
+                                        .outline()
+                                        .min_h(px(MOBILE_TOUCH_TARGET))
+                                        .label("Select")
+                                        .disabled(!can_select_profile)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            let result = this.select_provider_profile(index, cx);
+                                            this.record_action_result(result, cx);
+                                        })),
+                                )
+                        }),
+                )
+                .into_any_element(),
+            ManagementSection::Health => v_flex()
+                .gap_2()
+                .child(
+                    Button::new("management-health-run")
+                        .primary()
+                        .min_h(px(MOBILE_TOUCH_TARGET))
+                        .label("Run health probes")
+                        .disabled(!can_run_health)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let result = this.run_health_probes(cx);
+                            this.record_action_result(result, cx);
+                        })),
+                )
+                .children(view.health.into_iter().enumerate().map(|(index, health)| {
+                    h_flex()
+                        .id(("mobile-management-health", index))
+                        .min_h(px(56.0))
+                        .items_center()
+                        .justify_between()
+                        .p_2()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .child(health.display_name)
+                        .child(format!("{:?}", health.status))
+                }))
+                .into_any_element(),
+            ManagementSection::Relay => v_flex()
+                .gap_2()
+                .p_3()
+                .rounded(px(MOBILE_CARD_RADIUS))
+                .border_1()
+                .border_color(cx.theme().border)
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .child("Self-hosted Relay"),
+                )
+                .child(
+                    view.relay
+                        .map(|relay| {
+                            format!("{:?}, retry {}", relay.state, relay.reconnect_attempt)
+                        })
+                        .unwrap_or_else(|| "Relay status unavailable".into()),
+                )
+                .into_any_element(),
+            ManagementSection::Devices => v_flex()
+                .gap_2()
+                .child(
+                    Button::new("management-pair-device")
+                        .primary()
+                        .min_h(px(MOBILE_TOUCH_TARGET))
+                        .label(if pairing_fragment.is_some() {
+                            "Pairing offer ready"
+                        } else {
+                            "Create pairing offer"
+                        })
+                        .disabled(!can_pair)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let result = this.create_pairing_offer(cx);
+                            this.record_action_result(result, cx);
+                        })),
+                )
+                .children(pairing_fragment.map(|fragment| {
+                    let clipboard_value = fragment.clone();
+                    v_flex()
+                        .gap_2()
+                        .p_2()
+                        .rounded(px(MOBILE_CARD_RADIUS))
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            div()
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .text_xs()
+                                .child(bounded_text(fragment, 2048)),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(
+                                    Button::new("management-pairing-copy")
+                                        .outline()
+                                        .size(px(MOBILE_TOUCH_TARGET))
+                                        .icon(IconName::Copy)
+                                        .tooltip("Copy pairing link")
+                                        .on_click(cx.listener(move |_, _, _, cx| {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                clipboard_value.clone(),
+                                            ));
+                                        })),
+                                )
+                                .child(
+                                    Button::new("management-pairing-cancel")
+                                        .outline()
+                                        .min_h(px(MOBILE_TOUCH_TARGET))
+                                        .label("Cancel")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            let result = this.cancel_pairing_offer(cx);
+                                            this.record_action_result(result, cx);
+                                        })),
+                                ),
+                        )
+                }))
+                .children(view.devices.into_iter().enumerate().map(|(index, device)| {
+                    let can_revoke_device =
+                        can_revoke && device.status == RemoteDeviceStatus::Active;
+                    h_flex()
+                        .w_full()
+                        .min_h(px(64.0))
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .p_2()
+                        .rounded(px(MOBILE_CARD_RADIUS))
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .child(device.display_name)
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(format!(
+                                            "{:?} / {:?}",
+                                            device.permission_level, device.status
+                                        )),
+                                ),
+                        )
+                        .child(
+                            Button::new(("mobile-management-revoke", index))
+                                .danger()
+                                .min_h(px(MOBILE_TOUCH_TARGET))
+                                .label("Revoke")
+                                .disabled(!can_revoke_device)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let result = this.revoke_device(index, cx);
+                                    this.record_action_result(result, cx);
+                                })),
+                        )
+                }))
+                .into_any_element(),
+        };
+        v_flex()
+            .id("mobile-management-detail")
+            .size_full()
+            .min_h_0()
+            .gap_3()
+            .p(px(MOBILE_PAGE_GUTTER))
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(view.active_section.label()),
+                    )
+                    .child(
+                        Button::new("management-refresh")
+                            .ghost()
+                            .size(px(MOBILE_TOUCH_TARGET))
+                            .icon(IconName::Replace)
+                            .tooltip("Refresh management")
+                            .on_click(cx.listener(|this, _, _, cx| this.refresh_management(cx))),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .id("mobile-management-detail-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.content_scroll)
+                    .vertical_scrollbar(&self.content_scroll)
+                    .child(content),
+            )
+            .into_any_element()
+    }
+
     fn render_error_bar(&self, cx: &App) -> Option<AnyElement> {
         let codes = self.error_codes();
         (!codes.is_empty()).then(|| {
@@ -3594,19 +5441,29 @@ impl Render for WorkflowWorkbenchView {
         let height = f32::from(window.viewport_size().height);
         self.layout =
             ShellLayout::resolve_mobile(normalized_dimension(width), normalized_dimension(height));
-        let surface = match self.active_surface() {
-            WorkbenchSurface::Agent => self.render_agent(window, cx),
-            WorkbenchSurface::Files => self.render_files(cx),
-            WorkbenchSurface::Git => self.render_git(cx),
-            WorkbenchSurface::Terminal => self.render_terminal(cx),
-            WorkbenchSurface::Management => self.render_management(cx),
+        let is_settings = self.navigation.level == NavigationLevel::Global
+            && self.navigation.global == GlobalDestination::Settings;
+        let surface = if is_settings {
+            self.render_settings(cx)
+        } else {
+            match self.active_surface() {
+                WorkbenchSurface::Agent => self.render_agent(window, cx),
+                WorkbenchSurface::Files => self.render_files(window, cx),
+                WorkbenchSurface::Git => self.render_git(cx),
+                WorkbenchSurface::Terminal => self.render_terminal(cx),
+                WorkbenchSurface::Management => self.render_management(cx),
+            }
         };
+        let session_navigation = self.navigation.level == NavigationLevel::Session && !is_settings;
+        let navigation = session_navigation.then(|| self.render_surface_tabs(cx));
+        let global_navigation = (!session_navigation && self.layout.kind != ShellKind::Wide)
+            .then(|| self.render_global_navigation(cx));
         let core = v_flex()
             .flex_1()
             .h_full()
             .min_h_0()
             .min_w_0()
-            .child(self.render_surface_tabs(cx))
+            .children(navigation)
             .child(div().flex_1().min_h_0().min_w_0().child(surface));
         let body = if self.layout.kind == ShellKind::Wide {
             h_flex()
@@ -3641,6 +5498,7 @@ impl Render for WorkflowWorkbenchView {
             .text_color(cx.theme().foreground)
             .child(self.render_top_bar(cx))
             .child(body)
+            .children(global_navigation)
             .children(self.render_error_bar(cx))
             .children(Root::render_sheet_layer(window, cx))
             .children(Root::render_dialog_layer(window, cx))
@@ -3682,6 +5540,118 @@ fn terminal_frame_text(frame: &vibex_terminal_ui::TerminalFrameSnapshot) -> Shar
         row.push_str(&cell.text);
     }
     bounded_text(rows.join("\n"), MAX_RENDERED_TEXT_BYTES)
+}
+
+fn agent_state_label(state: AgentSessionState) -> &'static str {
+    match state {
+        AgentSessionState::Initializing => "Starting",
+        AgentSessionState::Idle => "Ready",
+        AgentSessionState::Running => "Working",
+        AgentSessionState::NeedsInput => "Needs input",
+        AgentSessionState::Error => "Error",
+        AgentSessionState::Closed => "Closed",
+        AgentSessionState::Archived => "Archived",
+    }
+}
+
+fn timeline_kind_label(kind: TimelineRowKind) -> &'static str {
+    match kind {
+        TimelineRowKind::UserMessage => "You",
+        TimelineRowKind::AgentMessage => "Agent",
+        TimelineRowKind::Reasoning => "Thinking",
+        TimelineRowKind::Plan => "Plan",
+        TimelineRowKind::ToolCall => "Tool",
+        TimelineRowKind::Command => "Command",
+        TimelineRowKind::FileOperation => "File",
+        TimelineRowKind::WebSearch => "Search",
+        TimelineRowKind::TodoUpdate => "Todo",
+        TimelineRowKind::Collaboration => "Team",
+        TimelineRowKind::ImageGeneration => "Image",
+        TimelineRowKind::GitNotice => "Git",
+        TimelineRowKind::SystemNotice => "System",
+        TimelineRowKind::PermissionRequest => "Approval",
+        TimelineRowKind::PermissionResolution => "Approval result",
+        TimelineRowKind::ElicitationRequest => "Question",
+        TimelineRowKind::ElicitationResolution => "Answer",
+        TimelineRowKind::Error => "Error",
+    }
+}
+
+fn permission_response_label(response: PermissionResponseKind) -> &'static str {
+    match response {
+        PermissionResponseKind::Approve => "Allow",
+        PermissionResponseKind::AlwaysAllowForSession => "Always allow",
+        PermissionResponseKind::Deny => "Deny",
+    }
+}
+
+fn file_status_label(status: FileEditorStatus) -> &'static str {
+    match status {
+        FileEditorStatus::Loading => "Loading",
+        FileEditorStatus::Clean => "Clean",
+        FileEditorStatus::Dirty => "Unsaved",
+        FileEditorStatus::Saving => "Saving",
+        FileEditorStatus::Saved => "Saved",
+        FileEditorStatus::Conflict => "Conflict",
+        FileEditorStatus::Disconnected => "Offline",
+        FileEditorStatus::Unsupported => "Unsupported",
+        FileEditorStatus::TooLarge => "Too large",
+    }
+}
+
+fn terminal_connection_label(state: TerminalConnectionState) -> &'static str {
+    match state {
+        TerminalConnectionState::Idle => "Idle",
+        TerminalConnectionState::Connecting => "Connecting",
+        TerminalConnectionState::Connected => "Connected",
+        TerminalConnectionState::Reconnecting => "Reconnecting",
+        TerminalConnectionState::Rebuilding => "Restoring",
+        TerminalConnectionState::Closed => "Closed",
+        TerminalConnectionState::Offline => "Offline",
+        TerminalConnectionState::Error => "Error",
+    }
+}
+
+fn mobile_empty_state(title: &'static str, description: &'static str, cx: &App) -> AnyElement {
+    v_flex()
+        .w_full()
+        .min_w_0()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .p_6()
+        .rounded(px(MOBILE_CARD_RADIUS))
+        .border_1()
+        .border_color(cx.theme().border)
+        .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child(title))
+        .child(
+            div()
+                .max_w(px(300.0))
+                .text_center()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(description),
+        )
+        .into_any_element()
+}
+
+fn settings_value_row(
+    label: &'static str,
+    value: impl Into<SharedString>,
+    color: gpui::Hsla,
+    cx: &App,
+) -> AnyElement {
+    h_flex()
+        .w_full()
+        .min_h(px(44.0))
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .border_b_1()
+        .border_color(cx.theme().border)
+        .child(div().text_sm().child(label))
+        .child(div().text_sm().text_color(color).child(value.into()))
+        .into_any_element()
 }
 
 fn summary_row(label: &'static str, count: usize, cx: &App) -> AnyElement {

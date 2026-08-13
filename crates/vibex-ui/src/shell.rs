@@ -318,6 +318,7 @@ impl CompactNavigation {
     pub fn select_global(&mut self, destination: GlobalDestination) {
         self.level = NavigationLevel::Global;
         self.global = destination;
+        self.session = SessionDestination::Agent;
         self.session_id = None;
         self.overlay = None;
     }
@@ -366,6 +367,11 @@ impl CompactNavigation {
             self.level = NavigationLevel::Global;
             self.global = GlobalDestination::Sessions;
             self.session_id = None;
+            return true;
+        }
+        if self.global != GlobalDestination::Sessions {
+            self.global = GlobalDestination::Sessions;
+            self.focus_target = Some("global-sessions".into());
             return true;
         }
         false
@@ -484,6 +490,35 @@ mod tests {
         assert!(navigation.back());
         assert_eq!(navigation.level, NavigationLevel::Global);
         assert!(!navigation.back());
+    }
+
+    #[test]
+    fn global_secondary_destinations_back_to_sessions_before_host_exit() {
+        let mut navigation = CompactNavigation::default();
+        navigation.select_global(GlobalDestination::Management);
+
+        assert!(navigation.back());
+        assert_eq!(navigation.level, NavigationLevel::Global);
+        assert_eq!(navigation.global, GlobalDestination::Sessions);
+        assert_eq!(navigation.focus_target.as_deref(), Some("global-sessions"));
+        assert!(!navigation.back());
+
+        navigation.select_global(GlobalDestination::Settings);
+        assert!(navigation.back());
+        assert_eq!(navigation.global, GlobalDestination::Sessions);
+    }
+
+    #[test]
+    fn selecting_global_destination_resets_stale_session_surface() {
+        let mut navigation = CompactNavigation::default();
+        navigation.enter_session("session_test");
+        navigation.select_session(SessionDestination::Terminal);
+        navigation.select_global(GlobalDestination::Settings);
+
+        assert_eq!(navigation.level, NavigationLevel::Global);
+        assert_eq!(navigation.global, GlobalDestination::Settings);
+        assert_eq!(navigation.session, SessionDestination::Agent);
+        assert!(navigation.session_id.is_none());
     }
 
     #[test]
