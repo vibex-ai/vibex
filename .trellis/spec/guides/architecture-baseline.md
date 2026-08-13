@@ -205,7 +205,6 @@ checks. Hiding a button is not enforcement.
 | IME | Candidate-window placement incomplete | CJK input, soft keyboard, and composition need real-device acceptance |
 | Accessibility | Canvas accessibility adapter incomplete | Separate accessibility plan and release standard |
 | Fetch body | Body is fully buffered | Terminal and large files must not use plain buffered fetch |
-| DOM embedding | Canvas cannot host an iframe | Web Preview needs an overlay bridge or external open |
 
 The default dispatcher is single-threaded: it lowers COOP/COEP and Capacitor
 WebView compatibility cost. Enabling the multi-threaded dispatcher requires
@@ -596,7 +595,7 @@ Open engineering questions that data — not this document — must settle: the
 minimum supported browser, Android WebView, and iOS versions; the final
 breakpoints and the Terminal performance budget on low-end devices; when the
 in-memory Relay needs persistence or horizontal scaling; the priority of PDF,
-Office, and embedded Web Preview; and whether the 1 MiB mobile text-edit limit
+Office; and whether the 1 MiB mobile text-edit limit
 needs to adapt per device.
 
 ## Evidence Map

@@ -684,7 +684,6 @@ pub struct CodeWorkbench {
     git_surface_visible: bool,
     pub(crate) editors: EditorBufferRegistry,
     editor_bindings: BTreeMap<String, EditorBinding>,
-    web_address_inputs: BTreeMap<String, Entity<InputState>>,
     next_editor_binding_id: u64,
     editor_subscriptions: Vec<Subscription>,
     markdown_edit_paths: BTreeSet<String>,
@@ -820,7 +819,6 @@ impl CodeWorkbench {
             git_surface_visible: false,
             editors,
             editor_bindings: BTreeMap::new(),
-            web_address_inputs: BTreeMap::new(),
             next_editor_binding_id: 0,
             editor_subscriptions: Vec::new(),
             markdown_edit_paths: BTreeSet::new(),
@@ -1316,15 +1314,6 @@ impl CodeWorkbench {
         self.commit_message.update(cx, |input, cx| {
             input.set_placeholder(commit_placeholder, window, cx)
         });
-        for input in self.web_address_inputs.values() {
-            input.update(cx, |input, cx| {
-                input.set_placeholder(
-                    locale::text("Enter a URL", "输入 URL", "輸入 URL"),
-                    window,
-                    cx,
-                )
-            });
-        }
         for binding in self.editor_bindings.values() {
             binding.input.update(cx, |input, cx| {
                 input.set_placeholder(
@@ -1365,7 +1354,6 @@ impl CodeWorkbench {
         self.git_preview_errors.clear();
         self.editors = editors;
         self.editor_bindings.clear();
-        self.web_address_inputs.clear();
         self.editor_subscriptions.clear();
         self.recovery_persist_generation = self.recovery_persist_generation.wrapping_add(1);
         self.recovery_persist_task = None;
@@ -1451,7 +1439,6 @@ impl CodeWorkbench {
             self.set_preview_panel_fullscreen(false, cx);
             self.editors = EditorBufferRegistry::default();
             self.editor_bindings.clear();
-            self.web_address_inputs.clear();
             self.editor_subscriptions.clear();
             self.selected_file_path = None;
             self.selected_git_path = None;
@@ -3001,25 +2988,6 @@ impl CodeWorkbench {
         cx.notify();
     }
 
-    pub fn open_web(&mut self, url: String, cx: &mut Context<Self>) {
-        self.open_web_in_pane(url, None, cx);
-    }
-
-    fn open_web_in_pane(&mut self, url: String, pane_id: Option<String>, cx: &mut Context<Self>) {
-        let web_id = RequestId::new().as_str().to_string();
-        let Some(tab_id) = self.preview.open(
-            PreviewTarget::Web { web_id, url },
-            pane_id.as_deref(),
-            unix_timestamp_ms(),
-        ) else {
-            return;
-        };
-        self.activate_tab(&tab_id, cx);
-        self.persist(cx);
-        self.request_preview_panel(cx);
-        cx.notify();
-    }
-
     pub fn sync_terminals(
         &mut self,
         terminals: Vec<TerminalSession>,
@@ -3227,82 +3195,11 @@ impl CodeWorkbench {
         input
     }
 
-    fn ensure_web_address_input(
-        &mut self,
-        tab_id: &str,
-        url: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<InputState> {
-        if let Some(input) = self.web_address_inputs.get(tab_id) {
-            return input.clone();
-        }
-        let input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(locale::text(
-                "Enter a URL",
-                "输入 URL",
-                "輸入 URL",
-            ))
-        });
-        input.update(cx, |input, cx| input.set_value(url, window, cx));
-        let target_tab_id = tab_id.to_string();
-        let subscription =
-            cx.subscribe_in(&input, window, move |this, input, event, window, cx| {
-                if !matches!(event, InputEvent::PressEnter { shift: false, .. }) {
-                    return;
-                }
-                let value = input.read(cx).value().to_string();
-                this.navigate_web_tab(target_tab_id.clone(), value, window, cx);
-            });
-        self.editor_subscriptions.push(subscription);
-        self.web_address_inputs
-            .insert(tab_id.to_string(), input.clone());
-        input
-    }
-
-    fn navigate_web_tab(
-        &mut self,
-        tab_id: String,
-        value: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let normalized = normalize_preview_web_url(&value);
-        let url = if normalized.is_empty() {
-            String::new()
-        } else {
-            match validate_external_open_url(&normalized) {
-                Ok(validated) => validated.url,
-                Err(error) => {
-                    self.error = Some(format!("{}: {}", error.code, error.message));
-                    cx.notify();
-                    return;
-                }
-            }
-        };
-        let Some(tab) = self.preview.tabs.get_mut(&tab_id) else {
-            return;
-        };
-        let PreviewTarget::Web {
-            url: current_url, ..
-        } = &mut tab.target
-        else {
-            return;
-        };
-        *current_url = url.clone();
-        if let Some(input) = self.web_address_inputs.get(&tab_id) {
-            input.update(cx, |input, cx| input.set_value(url, window, cx));
-        }
-        self.error = None;
-        self.persist(cx);
-        cx.notify();
-    }
-
     fn open_web_external(&mut self, url: String, cx: &mut Context<Self>) {
         let outcome = validate_external_open_url(&url)
             .and_then(|validated| open_external_url(&validated.url));
         match outcome {
-            Ok(()) => self.note = Some("Opened Web Preview in the system browser".into()),
+            Ok(()) => self.note = Some("Opened link in the system browser".into()),
             Err(error) => self.error = Some(format!("{}: {}", error.code, error.message)),
         }
         cx.notify();
@@ -3734,9 +3631,6 @@ impl CodeWorkbench {
         self.preview_commit_lists.remove(tab_id);
         self.preview_commit_focus_requests.remove(tab_id);
         self.git_preview_errors.remove(tab_id);
-        if tab_id.starts_with("web:") {
-            self.web_address_inputs.remove(tab_id);
-        }
         if let Some(terminal_id) = tab_id.strip_prefix("terminal:")
             && let Ok(terminal_id) = TerminalId::parse(terminal_id)
         {
@@ -4838,12 +4732,8 @@ impl CodeWorkbench {
         let drop_pane_id = pane_id.clone();
         let tab_strip_pane_id = pane_id.clone();
         let drag_pane_id = pane_id.clone();
-        let new_web_entity = cx.weak_entity();
-        let new_web_pane_id = pane_id.clone();
         let new_terminal_entity = cx.weak_entity();
         let new_terminal_pane_id = pane_id.clone();
-        let empty_web_entity = cx.weak_entity();
-        let empty_web_pane_id = pane_id.clone();
         let empty_terminal_entity = cx.weak_entity();
         let empty_terminal_pane_id = pane_id.clone();
         let terminal_available = self.workspace.is_some() && self.runtime.is_some();
@@ -5006,36 +4896,11 @@ impl CodeWorkbench {
                             .flex_none()
                             .icon(IconName::Plus)
                             .text_color(cx.theme().muted_foreground)
-                            .tooltip(locale::text(
-                                "New web tab",
-                                "新建网页标签",
-                                "新增網頁標籤",
-                            ))
+                            .tooltip(locale::text("New preview tab", "新建预览标签", "新增預覽標籤"))
                             .dropdown_menu(move |menu, _, _| {
-                                let web_entity = new_web_entity.clone();
-                                let web_pane_id = new_web_pane_id.clone();
                                 let terminal_entity = new_terminal_entity.clone();
                                 let terminal_pane_id = new_terminal_pane_id.clone();
                                 menu.min_w(px(176.0)).max_w(px(176.0)).item(
-                                    PopupMenuItem::new(locale::text(
-                                        "New web tab",
-                                        "新建网页标签",
-                                        "新增網頁標籤",
-                                    ))
-                                    .icon(IconName::Globe)
-                                    .on_click(
-                                        move |_, _, cx| {
-                                            let _ = web_entity.update(cx, |this, cx| {
-                                                this.open_web_in_pane(
-                                                    String::new(),
-                                                    Some(web_pane_id.clone()),
-                                                    cx,
-                                                )
-                                            });
-                                        },
-                                    ),
-                                )
-                                .item(
                                     PopupMenuItem::new(locale::text(
                                         "New terminal",
                                         "新建终端",
@@ -5107,39 +4972,15 @@ impl CodeWorkbench {
                                             )),
                                     )
                                     .child(div().line_height(gpui::relative(1.5)).child(locale::text(
-                                        "Open a file, terminal, or webpage here while keeping the Agent visible.",
-                                        "在这里打开文件、终端或网页，同时保留 Agent 对话。",
-                                        "在這裡開啟檔案、終端或網頁，同時保留 Agent 對話。",
+                                        "Open a file or terminal here while keeping the Agent visible.",
+                                        "在这里打开文件或终端，同时保留 Agent 对话。",
+                                        "在這裡開啟檔案或終端機，同時保留 Agent 對話。",
                                     )))
                                     .child(
                                         h_flex()
                                             .flex_wrap()
                                             .justify_center()
                                             .gap_2()
-                                            .child(
-                                                Button::new(format!(
-                                                    "preview-empty-new-web:{pane_id}"
-                                                ))
-                                                .secondary()
-                                                .icon(IconName::Globe)
-                                                .label(locale::text(
-                                                    "New web tab",
-                                                    "新建网页标签",
-                                                    "新增網頁標籤",
-                                                ))
-                                                .on_click(move |_, _, cx| {
-                                                    let _ = empty_web_entity.update(
-                                                        cx,
-                                                        |this, cx| {
-                                                            this.open_web_in_pane(
-                                                                String::new(),
-                                                                Some(empty_web_pane_id.clone()),
-                                                                cx,
-                                                            )
-                                                        },
-                                                    );
-                                                }),
-                                            )
                                             .child(
                                                 Button::new(format!(
                                                     "preview-empty-new-terminal:{pane_id}"
@@ -5237,10 +5078,6 @@ impl CodeWorkbench {
         };
         let reveal_path = match &tab.target {
             PreviewTarget::File { path } => Some(path.clone()),
-            _ => None,
-        };
-        let web_url = match &tab.target {
-            PreviewTarget::Web { url, .. } if !url.is_empty() => Some(url.clone()),
             _ => None,
         };
         let open_in_editor = matches!(tab.target, PreviewTarget::GitDiff { .. });
@@ -5589,8 +5426,7 @@ impl CodeWorkbench {
                     );
                 }
                 let file_open_path = file_path.clone();
-                let web_open_url = web_url.clone();
-                if file_open_path.is_some() || web_open_url.is_some() {
+                if file_open_path.is_some() {
                     let submenu_entity = context_entity.clone();
                     let submenu_pane_id = context_pane_id.clone();
                     let can_open_in_file_system = file_open_path.is_some() && workspace_available;
@@ -5722,23 +5558,6 @@ impl CodeWorkbench {
                                         );
                                     }
                                 }
-                                if let Some(url) = web_open_url.clone() {
-                                    let web_entity = submenu_entity.clone();
-                                    submenu =
-                                        submenu.item(
-                                            PopupMenuItem::new(locale::text(
-                                                "Open in browser",
-                                                "在浏览器打开",
-                                                "在瀏覽器開啟",
-                                            ))
-                                            .icon(IconName::Globe)
-                                            .on_click(move |_, _, cx| {
-                                                let _ = web_entity.update(cx, |this, cx| {
-                                                    this.open_web_external(url.clone(), cx)
-                                                });
-                                            }),
-                                        );
-                                }
                                 submenu
                             },
                         );
@@ -5809,7 +5628,6 @@ impl CodeWorkbench {
                         cx,
                     )
                 }),
-            PreviewTarget::Web { url, .. } => self.render_web_content(tab_id, url, window, cx),
         };
         let entity = cx.entity().clone();
         let lifecycle_tab_id = tab_id.to_string();
@@ -5834,114 +5652,6 @@ impl CodeWorkbench {
                 )
                 .absolute()
                 .size_full(),
-            )
-            .into_any_element()
-    }
-
-    fn render_web_content(
-        &mut self,
-        tab_id: &str,
-        url: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let input = self.ensure_web_address_input(tab_id, &url, window, cx);
-        let go_tab_id = tab_id.to_string();
-        let go_input = input.clone();
-        let external_url = url.clone();
-        let body_url = url.clone();
-
-        v_flex()
-            .size_full()
-            .min_h_0()
-            .child(
-                h_flex()
-                    .min_h(px(48.0))
-                    .flex_none()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(Icon::new(IconName::Globe).small())
-                    .child(div().min_w_0().flex_1().child(Input::new(&input).small()))
-                    .child(
-                        Button::new(format!("web-go:{tab_id}"))
-                            .small()
-                            .label(locale::text("Go", "前往", "前往"))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                let value = go_input.read(cx).value().to_string();
-                                this.navigate_web_tab(go_tab_id.clone(), value, window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new(format!("web-open-external:{tab_id}"))
-                            .small()
-                            .ghost()
-                            .compact()
-                            .icon(IconName::ExternalLink)
-                            .tooltip(locale::text(
-                                "Open in browser",
-                                "在浏览器中打开",
-                                "在瀏覽器中開啟",
-                            ))
-                            .disabled(url.is_empty())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.open_web_external(external_url.clone(), cx)
-                            })),
-                    ),
-            )
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .items_center()
-                    .justify_center()
-                    .gap_3()
-                    .p_5()
-                    .text_center()
-                    .bg(cx.theme().muted.opacity(0.18))
-                    .child(Icon::new(IconName::Globe))
-                    .child(div().text_sm().font_medium().child(if body_url.is_empty() {
-                        locale::text(
-                            "Enter a URL to start a Web Preview",
-                            "输入 URL 以开始网页预览",
-                            "輸入 URL 以開始網頁預覽",
-                        )
-                        .to_string()
-                    } else {
-                        locale::text(
-                            "Embedded Web Preview is unavailable in this GPUI build",
-                            "此 GPUI 版本不支持嵌入式网页预览",
-                            "此 GPUI 版本不支援嵌入式網頁預覽",
-                        )
-                        .to_string()
-                    }))
-                    .when(!body_url.is_empty(), |this| {
-                        let open_url = body_url.clone();
-                        this.child(
-                            div()
-                                .max_w(px(460.0))
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(body_url.clone()),
-                        )
-                        .child(
-                            Button::new(format!("web-open-body:{tab_id}"))
-                                .small()
-                                .outline()
-                                .icon(IconName::ExternalLink)
-                                .label(locale::text(
-                                    "Open in browser",
-                                    "在浏览器中打开",
-                                    "在瀏覽器中開啟",
-                                ))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_web_external(open_url.clone(), cx)
-                                })),
-                        )
-                    }),
             )
             .into_any_element()
     }
@@ -6693,22 +6403,6 @@ impl Render for CodeWorkbench {
                     .child(
                         h_flex()
                             .gap_1()
-                            .child(
-                                Button::new("preview-new-web")
-                                    .small()
-                                    .ghost()
-                                    .compact()
-                                    .size(px(28.0))
-                                    .icon(IconName::Globe)
-                                    .tooltip(locale::text(
-                                        "New web tab",
-                                        "新建网页标签",
-                                        "新增網頁標籤",
-                                    ))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.open_web(String::new(), cx)
-                                    })),
-                            )
                             .child(
                                 Button::new("preview-new-terminal")
                                     .small()
@@ -11478,17 +11172,6 @@ fn tab_label(target: &PreviewTarget) -> String {
         PreviewTarget::Terminal { terminal_id } => {
             format!("{} {terminal_id}", locale::text("Terminal", "终端", "終端"))
         }
-        PreviewTarget::Web { url, .. } => url::Url::parse(url)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_string))
-            .filter(|host| !host.is_empty())
-            .unwrap_or_else(|| {
-                if url.is_empty() {
-                    locale::text("Web", "网页", "網頁").to_string()
-                } else {
-                    url.clone()
-                }
-            }),
         PreviewTarget::GitCommit {
             commit_hash,
             subject,
@@ -11532,7 +11215,6 @@ fn preview_target_icon(target: &PreviewTarget, cx: &Context<CodeWorkbench>) -> A
         PreviewTarget::Terminal { .. } => Icon::new(IconName::SquareTerminal)
             .size(px(14.0))
             .into_any_element(),
-        PreviewTarget::Web { .. } => Icon::new(IconName::Globe).size(px(14.0)).into_any_element(),
     }
 }
 
@@ -11572,9 +11254,7 @@ fn preview_tab_visual_status(
                     }
             })
             .map(git_preview_visual_status),
-        PreviewTarget::GitCommit { .. }
-        | PreviewTarget::Terminal { .. }
-        | PreviewTarget::Web { .. } => None,
+        PreviewTarget::GitCommit { .. } | PreviewTarget::Terminal { .. } => None,
     }
 }
 
@@ -11712,7 +11392,6 @@ fn surface_kind(target: &PreviewTarget) -> ContentSurfaceKind {
             ContentPreviewKind::UnsupportedBinary => ContentSurfaceKind::Text,
         },
         PreviewTarget::Terminal { .. } => ContentSurfaceKind::Terminal,
-        PreviewTarget::Web { .. } => ContentSurfaceKind::Web,
         PreviewTarget::GitDiff { .. } => ContentSurfaceKind::GitDiff,
         PreviewTarget::GitCommit { .. } => ContentSurfaceKind::GitCommit,
     }
@@ -12193,17 +11872,6 @@ fn unique_copy_destination(parent: &str, name: &str, exists: impl Fn(&str) -> bo
     join_relative_path(parent, &format!("{stem} copy 1000{extension}"))
 }
 
-fn normalize_preview_web_url(value: &str) -> String {
-    let value = value.trim();
-    if value.is_empty() {
-        String::new()
-    } else if value.contains("://") {
-        value.to_string()
-    } else {
-        format!("https://{value}")
-    }
-}
-
 fn path_is_equal_or_descendant(candidate: &str, ancestor: &str) -> bool {
     candidate == ancestor
         || candidate
@@ -12242,7 +11910,7 @@ fn preview_target_references_path(target: &PreviewTarget, path: &str) -> bool {
         PreviewTarget::GitCommit { focus_path, .. } => focus_path
             .as_deref()
             .is_some_and(|target| path_is_equal_or_descendant(target, path)),
-        PreviewTarget::Terminal { .. } | PreviewTarget::Web { .. } => false,
+        PreviewTarget::Terminal { .. } => false,
     }
 }
 
@@ -12824,19 +12492,6 @@ mod tests {
         );
         assert_eq!(normalize_git_commit_message("docs", "   "), "");
         assert_eq!(git_commit_placeholder("test"), "test: commit message");
-    }
-
-    #[test]
-    fn preview_web_urls_match_tauri_navigation_normalization() {
-        assert_eq!(normalize_preview_web_url(""), "");
-        assert_eq!(
-            normalize_preview_web_url(" example.com/path "),
-            "https://example.com/path"
-        );
-        assert_eq!(
-            normalize_preview_web_url("http://localhost:3000"),
-            "http://localhost:3000"
-        );
     }
 
     #[test]

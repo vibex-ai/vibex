@@ -25,8 +25,6 @@ mod pdf_spike;
 mod pdf_surface;
 mod pdf_worker;
 mod terminal_surface;
-#[cfg(feature = "web-preview-spike")]
-mod web_preview_spike;
 
 #[derive(Clone)]
 enum LaunchMode {
@@ -46,8 +44,6 @@ enum LaunchMode {
         document: std::path::PathBuf,
         output: Option<std::path::PathBuf>,
     },
-    #[cfg(feature = "web-preview-spike")]
-    WebPreview(std::path::PathBuf),
 }
 
 fn main() {
@@ -267,14 +263,10 @@ fn main() {
                 output: Some(std::path::PathBuf::from(output)),
             }
         }
-        #[cfg(feature = "web-preview-spike")]
-        [flag, output] if flag == "--spike-web-preview" => {
-            LaunchMode::WebPreview(std::path::PathBuf::from(output))
-        }
         [] => LaunchMode::Workbench,
         _ => {
             eprintln!(
-                "usage: vibex-desktop [--probe|--code-workbench-fixture <files|diff|markdown>|--native-content-contract <output.json>|--native-content-switch-contract <output.json>|--native-content-document-interaction <pdfium-library> <fixture.pdf> <fixture.docx> <output.json>|--native-content-pdf-controller <pdfium-library> <fixture.pdf> <encrypted-fixture.pdf> <too-many-pages.pdf> <extreme-page.pdf> <oversized-source.pdf> <output.json>|--native-content-pdf-worker-once <pdfium-library> <fixture.pdf> <generation> <page-index> <target-width> <output-directory> <report.json> <none|crash|hang>|--native-content-pdf-worker-supervisor <pdfium-library> <fixture.pdf> <output.json>|--native-content-pdf-worker-soak <pdfium-library> <fixture.pdf> <output.json>|--native-content-pdf-workbench <pdfium-library> <fixture.pdf> [output.json]|--native-content-workbench [output.json]|--spike-acp-lifecycle <output.json>|--spike-composer <output.json>|--spike-terminal <output.json>|--spike-pdf <pdfium-library> <fixture.pdf> <output.json> <preview.rgba>|--spike-web-preview <output.json>]"
+                "usage: vibex-desktop [--probe|--code-workbench-fixture <files|diff|markdown>|--native-content-contract <output.json>|--native-content-switch-contract <output.json>|--native-content-document-interaction <pdfium-library> <fixture.pdf> <fixture.docx> <output.json>|--native-content-pdf-controller <pdfium-library> <fixture.pdf> <encrypted-fixture.pdf> <too-many-pages.pdf> <extreme-page.pdf> <oversized-source.pdf> <output.json>|--native-content-pdf-worker-once <pdfium-library> <fixture.pdf> <generation> <page-index> <target-width> <output-directory> <report.json> <none|crash|hang>|--native-content-pdf-worker-supervisor <pdfium-library> <fixture.pdf> <output.json>|--native-content-pdf-worker-soak <pdfium-library> <fixture.pdf> <output.json>|--native-content-pdf-workbench <pdfium-library> <fixture.pdf> [output.json]|--native-content-workbench [output.json]|--spike-acp-lifecycle <output.json>|--spike-composer <output.json>|--spike-terminal <output.json>|--spike-pdf <pdfium-library> <fixture.pdf> <output.json> <preview.rgba>]"
             );
             std::process::exit(2);
         }
@@ -297,14 +289,6 @@ fn main() {
     } else {
         None
     };
-
-    #[cfg(feature = "web-preview-spike")]
-    if matches!(launch_mode, LaunchMode::WebPreview(_)) {
-        web_preview_spike::init_platform().unwrap_or_else(|error| {
-            eprintln!("Web Preview platform initialization failed: {error}");
-            std::process::exit(1);
-        });
-    }
 
     gpui_platform::application()
         .with_assets(assets::VibexAssets)
@@ -389,10 +373,6 @@ fn main() {
                                 cx,
                             )
                         })
-                        .into(),
-                    #[cfg(feature = "web-preview-spike")]
-                    LaunchMode::WebPreview(output) => cx
-                        .new(|cx| web_preview_spike::WebPreviewSpikeView::new(output, window, cx))
                         .into(),
                     LaunchMode::Workbench => {
                         unreachable!("workbench launches through its app root")

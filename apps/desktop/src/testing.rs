@@ -9,10 +9,10 @@ use crate::{
     code_workbench::{CODE_WORKBENCH_INITIAL_DIFF_ROWS, CODE_WORKBENCH_MAX_EAGER_ROWS},
     primitives, theme,
 };
-use vibex_core::{ProviderKind, RightRailPlugin, RightRailPluginKind, RightRailPluginStatus};
+use vibex_core::ProviderKind;
 use vibex_desktop_model::{
     AutomationGraphDraft, ManagementNavigation, ManagementSection, PairingContextProjection,
-    ProviderProfileDraft, RightRailActivation, RightRailModel,
+    ProviderProfileDraft,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -26,7 +26,6 @@ pub struct FoundationContractProbe {
     pub bundled_font_family: &'static str,
     pub bundled_font_count: usize,
     pub raw_terminal_capacity_bytes: usize,
-    pub ordinary_web_preview_supported: bool,
     pub standard_viewports_resolve: bool,
     pub primitive_count: usize,
     pub primitive_contracts_valid: bool,
@@ -97,7 +96,6 @@ pub struct ManagementContractProbe {
     pub section_generation_fenced: bool,
     pub dirty_draft_preserved: bool,
     pub graph_cas_versioned: bool,
-    pub no_native_webview_allocated: bool,
     pub static_pairing_urls_removed: bool,
     pub pairing_context_secret_free: bool,
     pub provider_secret_redacted: bool,
@@ -134,43 +132,12 @@ pub fn management_contract_probe() -> ManagementContractProbe {
         .unwrap_or_default()
         .to_lowercase();
 
-    let mut right_rail = RightRailModel::default();
-    right_rail.apply_plugins(vec![RightRailPlugin {
-        id: vibex_core::RightRailPluginId::new(),
-        kind: RightRailPluginKind::Web,
-        system_key: None,
-        builtin_key: None,
-        display_name: "Probe".to_string(),
-        url: Some("https://example.invalid/".to_string()),
-        logo: None,
-        desktop_user_agent: None,
-        mobile_user_agent: None,
-        ua_mode: None,
-        status: RightRailPluginStatus::Enabled,
-        order_index: 0,
-        data_directory: None,
-        created_at_ms: 0,
-        updated_at_ms: 0,
-        deleted_at_ms: None,
-    }]);
-    let plugin_id = right_rail
-        .plugins
-        .first()
-        .map(|plugin| plugin.id.as_str().to_string());
-    let no_native_webview_allocated = matches!(
-        plugin_id
-            .as_deref()
-            .map(|plugin_id| right_rail.activate(plugin_id)),
-        Some(RightRailActivation::UnsupportedEmbedding { .. })
-    );
-
     ManagementContractProbe {
         schema_version: "management-contract.v1",
         section_count: ManagementSection::ALL.len(),
         section_generation_fenced: generation_fenced,
         dirty_draft_preserved: dirty_preserved_before_discard && !graph.dirty,
         graph_cas_versioned,
-        no_native_webview_allocated,
         static_pairing_urls_removed: !pairing_json.contains("127.0.0.1:1421")
             && !pairing_json.contains("fixture"),
         pairing_context_secret_free: !pairing_json.contains("qr")
@@ -258,7 +225,6 @@ pub fn foundation_contract_probe() -> FoundationContractProbe {
         bundled_font_family: assets::asset_report().family,
         bundled_font_count: assets::asset_report().font_count,
         raw_terminal_capacity_bytes: NATIVE_TERMINAL_RAW_CAPACITY_BYTES,
-        ordinary_web_preview_supported: false,
         standard_viewports_resolve,
         primitive_count: primitives::FOUNDATION_PRIMITIVE_CONTRACTS.len(),
         primitive_contracts_valid: primitives::foundation_primitive_contracts_valid(),
@@ -280,7 +246,6 @@ mod tests {
         let probe = foundation_contract_probe();
         assert_eq!(probe.application_id, "dev.vibex.desktop.preview");
         assert!(probe.standard_viewports_resolve);
-        assert!(!probe.ordinary_web_preview_supported);
         assert_eq!(probe.primitive_count, 11);
         assert!(probe.primitive_contracts_valid);
         assert!(probe.system_appearance_observed);
@@ -349,7 +314,6 @@ mod tests {
         assert_eq!(probe.section_count, 10);
         assert!(probe.section_generation_fenced);
         assert!(probe.graph_cas_versioned);
-        assert!(probe.no_native_webview_allocated);
         assert!(probe.static_pairing_urls_removed);
         assert!(probe.pairing_context_secret_free);
         assert!(probe.provider_secret_redacted);

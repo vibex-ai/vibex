@@ -114,7 +114,6 @@ vibex_id!(RequestId, "request");
 vibex_id!(CorrelationId, "correlation");
 vibex_id!(TimelineItemId, "timeline");
 vibex_id!(TerminalId, "terminal");
-vibex_id!(RightRailPluginId, "rail_plugin");
 vibex_id!(EventId, "event");
 vibex_id!(ChannelId, "channel");
 vibex_id!(RelayRoomId, "relayroom");

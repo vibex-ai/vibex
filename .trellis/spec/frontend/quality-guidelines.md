@@ -891,8 +891,7 @@ target -> {
 - Bad: report `vibex-desktop` parent RSS as total desktop RSS.
 - Bad: reuse `pnpm baseline:performance` and label its service fixture a Tauri
   timeline/file/diff measurement.
-- Bad: treat a browser mock, a blank app, or an unopened Web Preview as a measured
-  native scenario.
+- Bad: treat a browser mock or a blank app as a measured native scenario.
 
 ### 6. Tests Required
 
@@ -1066,11 +1065,11 @@ cx.on_app_quit(|app, cx| {
 
 One app-level owner completes persistence and runtime cleanup before exit.
 
-## Scenario: GPUI Native Content Zero-Allocation And Physical Linux Capture
+## Scenario: GPUI Native Content And Physical Linux Capture
 
 ### 1. Scope / Trigger
 
-- Trigger: GPUI adds or changes Terminal, ordinary Web Preview, PDF, Office, or the
+- Trigger: GPUI adds or changes Terminal, PDF, Office, or the
   Native Content evidence workbench.
 - Linux is the first physical target. A source check, headless compositor, or old
   screenshot cannot replace a current physical input/window run.
@@ -1089,9 +1088,6 @@ native-content-run.v1 -> {
   terminal { ptyCreated, rawByteSnapshots, imeCapableInput,
              commandSubmitted, commandMarkerObserved, frameRows,
              frameColumns, ingestedBytes, terminalOutputStored },
-  web { typedUnsupportedState, ordinaryNativeSurfaceAllocated,
-        rightRailNativeSurfaceAllocated, profileOrCacheAllocated,
-        networkTaskAllocated },
   privacy,
   limitations[]
 }
@@ -1101,10 +1097,6 @@ native-content-run.v1 -> {
 
 - `vibex-terminal::TerminalManager` remains the PTY owner. GPUI consumes bounded raw
   snapshots and must not create a second terminal/session persistence domain.
-- Ordinary and right-rail Web activation return typed unsupported states in the
-  default GPUI graph. They allocate no native browser surface, networking task,
-  profile, or cache. External open is a separate validated action, never embedded
-  parity.
 - The physical capture runner requires an active native Wayland monitor and a
   non-XWayland window. Monitor `-1`, an empty monitor list, or a created headless
   output is a blocker, not a physical pass.

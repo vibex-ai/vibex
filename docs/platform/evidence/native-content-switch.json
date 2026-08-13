@@ -1,32 +1,32 @@
 {
   "schemaVersion": "native-content-switch-evidence.v1",
   "status": "passed",
-  "capturedAt": "2026-07-25T10:46:08.469Z",
+  "capturedAt": "2026-08-13T09:06:43.645Z",
   "sourceInputs": [
     {
       "path": "Cargo.lock",
-      "bytes": 299235,
-      "sha256": "4d7403b1d03a19381c6c30f7527bbbca9883518b8d562ac559c1582d33da367c"
+      "bytes": 282904,
+      "sha256": "6a0deb409f2e43c799b072c9f39c9e7305951565ad9e5fcdabf7a55d028437f0"
     },
     {
       "path": "Cargo.toml",
-      "bytes": 2928,
-      "sha256": "c250765f302b52767f12383e7d035181175602c53cc58c3066d884108a3051bf"
+      "bytes": 3309,
+      "sha256": "6e7ca15eea7119607e8c9ebaa683194e5fc0e01969fdbad8b9cf331d059df8b4"
     },
     {
       "path": "apps/desktop/Cargo.toml",
-      "bytes": 1776,
-      "sha256": "1ae05510cdabe3573d8633db6488236ce1ef160ac4226d7610c1f2d8e6b2568c"
+      "bytes": 2000,
+      "sha256": "295f893f08a20772d29dc771b3d8a3d788e7acd34856214a732e2af8c2ea63a8"
     },
     {
       "path": "apps/desktop/src/main.rs",
-      "bytes": 15218,
-      "sha256": "87a7fab7d4803a904f374efe548f28c816fdd2e713bdbeaf6661eaa32765489b"
+      "bytes": 15716,
+      "sha256": "0c46c5e9458b08ea6fd036fa0f9561512f51c3320c2df8ea3095f0cf54fb70c3"
     },
     {
       "path": "apps/desktop/src/native_content.rs",
-      "bytes": 31599,
-      "sha256": "d5c9efee278b4a72f042056c39b8b3d5d8f1a157565af62799a512ca6fa196dd"
+      "bytes": 26197,
+      "sha256": "50c8b0d8102c80963803427b7867234de5609748006f3d17e16816800e6e1163"
     },
     {
       "path": "crates/content/Cargo.toml",
@@ -35,24 +35,19 @@
     },
     {
       "path": "crates/content/src/lifecycle.rs",
-      "bytes": 19869,
-      "sha256": "f22146f3ba6f308578baffc6f9d97d81f01e6b86b06e94d2ef577ceffd03f2b4"
-    },
-    {
-      "path": "crates/content/src/web.rs",
-      "bytes": 23640,
-      "sha256": "0b5df06aaad87a0ea2ae547767e4fe8563a9ae73d2b12efa61a09f5cce236c00"
+      "bytes": 18764,
+      "sha256": "1837e1beeb7d2e64d69b1e60c80b3af4fd0c6e937627cec59e1eac67ef592489"
     },
     {
       "path": "scripts/capture-native-content-switch.mjs",
-      "bytes": 6146,
-      "sha256": "ed54b99859475c6058942001a63bcd5f7fbb8886c2221ba3325f0ba547dac3cf"
+      "bytes": 6304,
+      "sha256": "bdd361a3c71e97e31eb9d994929f8166ca5d274e410001e5db45b7afd9c56ebe"
     }
   ],
   "run": {
     "schemaVersion": "native-content-switch-contract.v1",
     "status": "passed",
-    "targetsActivated": 5,
+    "targetsActivated": 3,
     "rapidSwitches": 100,
     "staleCallbacksIgnored": 3,
     "closeCallbacksIgnored": 3,
@@ -65,12 +60,9 @@
     "visibleSurfaceCount": 1,
     "focusedSurfaceCount": 1,
     "finalActiveKind": "office",
-    "webZeroAllocation": true,
-    "rightRailWebZeroAllocation": true,
     "privacy": {
       "targetIdentityStored": false,
       "terminalOutputStored": false,
-      "urlStored": false,
       "pdfContentStored": false,
       "officeContentStored": false
     },

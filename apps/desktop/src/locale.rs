@@ -977,9 +977,9 @@ const ERROR_MESSAGES: &[MessageTranslation] = &[
         zh_tw: "正在載入工作區檔案和 Git 狀態",
     },
     MessageTranslation {
-        en: "Opened Web Preview in the system browser",
-        zh_cn: "已在系统浏览器中打开网页预览",
-        zh_tw: "已在系統瀏覽器中開啟網頁預覽",
+        en: "Opened link in the system browser",
+        zh_cn: "已在系统浏览器中打开链接",
+        zh_tw: "已在系統瀏覽器中開啟連結",
     },
     MessageTranslation {
         en: "File operation completed",

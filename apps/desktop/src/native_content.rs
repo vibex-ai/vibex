@@ -14,7 +14,7 @@ use serde::Serialize;
 use vibex_content::{
     ContentSurfaceKind, ContentSurfaceLifecycle, ContentSurfaceOrigin, GenerationDisposition,
     LogicalSurfaceBounds, OfficeDocumentController, PdfDocumentController, TerminalSurfaceBackend,
-    WebPreviewController, new_ui_terminal_manager,
+    new_ui_terminal_manager,
 };
 
 use crate::office_surface::OfficeSurface;
@@ -29,8 +29,6 @@ pub struct NativeContentContractReport {
     platform: &'static str,
     architecture: &'static str,
     terminal: NativeContentSurfaceReport,
-    web: NativeContentSurfaceReport,
-    right_rail_web_plugin: NativeContentSurfaceReport,
     pdf: NativeContentSurfaceReport,
     office: NativeContentSurfaceReport,
     privacy: NativeContentPrivacyReport,
@@ -54,7 +52,6 @@ struct NativeContentSurfaceReport {
 #[serde(rename_all = "camelCase")]
 struct NativeContentPrivacyReport {
     terminal_output_stored_in_diagnostics: bool,
-    url_stored_in_web_diagnostics: bool,
     pdf_content_stored_in_diagnostics: bool,
     office_content_stored_in_diagnostics: bool,
 }
@@ -65,7 +62,6 @@ struct NativeContentRunReport {
     schema_version: &'static str,
     status: &'static str,
     terminal: NativeContentTerminalObservation,
-    web: NativeContentWebObservation,
     privacy: NativeContentRunPrivacy,
     limitations: Vec<&'static str>,
 }
@@ -91,19 +87,8 @@ struct NativeContentTerminalObservation {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct NativeContentWebObservation {
-    typed_unsupported_state: bool,
-    ordinary_native_surface_allocated: bool,
-    right_rail_native_surface_allocated: bool,
-    profile_or_cache_allocated: bool,
-    network_task_allocated: bool,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct NativeContentRunPrivacy {
     terminal_output_stored: bool,
-    url_stored: bool,
     pdf_content_stored: bool,
     office_content_stored: bool,
 }
@@ -126,8 +111,6 @@ pub struct NativeContentSwitchContractReport {
     visible_surface_count: usize,
     focused_surface_count: usize,
     final_active_kind: &'static str,
-    web_zero_allocation: bool,
-    right_rail_web_zero_allocation: bool,
     privacy: NativeContentSwitchPrivacy,
     limitations: Vec<&'static str>,
 }
@@ -137,7 +120,6 @@ pub struct NativeContentSwitchContractReport {
 struct NativeContentSwitchPrivacy {
     target_identity_stored: bool,
     terminal_output_stored: bool,
-    url_stored: bool,
     pdf_content_stored: bool,
     office_content_stored: bool,
 }
@@ -151,24 +133,6 @@ pub fn native_content_contract_report() -> NativeContentContractReport {
         .expect("terminal lifecycle activates");
     let terminal_diagnostics =
         serde_json::to_string(&terminal.diagnostics()).expect("terminal diagnostics serialize");
-
-    let mut web =
-        WebPreviewController::restored(Some("https://example.com"), ContentSurfaceOrigin::Preview)
-            .expect("web controller restores URL");
-    let web_error = web
-        .activate(1)
-        .expect_err("Web Preview remains explicitly unsupported");
-    let web_diagnostics =
-        serde_json::to_string(&web.diagnostics("unsupported-no-allocation", "gpui-stage-1"))
-            .expect("web diagnostics serialize");
-    let mut right_rail = WebPreviewController::restored(
-        Some("https://example.com"),
-        ContentSurfaceOrigin::RightRailWebPlugin,
-    )
-    .expect("right rail controller restores URL");
-    let right_rail_error = right_rail
-        .activate(1)
-        .expect_err("right rail native allocation is unsupported");
 
     let pdf = PdfDocumentController::new();
     let pdf_diagnostics =
@@ -194,42 +158,6 @@ pub fn native_content_contract_report() -> NativeContentContractReport {
             supported: true,
             notes: vec![
                 "uses existing vibex-terminal ids, PTY lifecycle, and raw byte observations",
-            ],
-        },
-        web: NativeContentSurfaceReport {
-            kind: "web",
-            lifecycle_phase: format!("{:?}", web.lifecycle().phase()),
-            backend: "unsupported-no-allocation",
-            explicit_load_required: !web.has_allocated_surface(),
-            native_surface_allocated: web.has_allocated_surface(),
-            resource_budgeted: true,
-            diagnostics_redacted: !web_diagnostics.contains("example.com"),
-            supported: false,
-            notes: vec![
-                "restored URL metadata remains inert; no network, profile, cache, or native surface is allocated",
-                if web_error.code == "web_preview_temporarily_unsupported" {
-                    "typed unsupported state verified"
-                } else {
-                    "unexpected unsupported code"
-                },
-            ],
-        },
-        right_rail_web_plugin: NativeContentSurfaceReport {
-            kind: "right_rail_web_plugin",
-            lifecycle_phase: format!("{:?}", right_rail.lifecycle().phase()),
-            backend: "dom-iframe-external-open-boundary",
-            explicit_load_required: true,
-            native_surface_allocated: right_rail.has_allocated_surface(),
-            resource_budgeted: true,
-            diagnostics_redacted: true,
-            supported: false,
-            notes: vec![
-                "GPUI v1 rejects native right-rail Web plugin allocation",
-                if right_rail_error.code == "right_rail_native_web_surface_unsupported" {
-                    "typed unsupported state verified"
-                } else {
-                    "unexpected unsupported code"
-                },
             ],
         },
         pdf: NativeContentSurfaceReport {
@@ -260,7 +188,6 @@ pub fn native_content_contract_report() -> NativeContentContractReport {
         },
         privacy: NativeContentPrivacyReport {
             terminal_output_stored_in_diagnostics: terminal_diagnostics.contains("vibex-secret"),
-            url_stored_in_web_diagnostics: web_diagnostics.contains("example.com"),
             pdf_content_stored_in_diagnostics: pdf_diagnostics.contains("documentText"),
             office_content_stored_in_diagnostics: office_diagnostics.contains("paragraphs"),
         },
@@ -291,17 +218,6 @@ pub fn native_content_switch_contract_report() -> NativeContentSwitchContractRep
         ContentSurfaceKind::Office,
         ContentSurfaceOrigin::Preview,
     );
-    let mut web = WebPreviewController::restored(
-        Some("https://vibex-switch-sentinel.invalid"),
-        ContentSurfaceOrigin::Preview,
-    )
-    .expect("switch contract Web metadata is valid");
-    let mut right_rail = WebPreviewController::restored(
-        Some("https://vibex-right-rail-sentinel.invalid"),
-        ContentSurfaceOrigin::RightRailWebPlugin,
-    )
-    .expect("switch contract right-rail metadata is valid");
-
     ready_lifecycle(&mut terminal, 1, initial_bounds);
     terminal
         .focus_entered(1)
@@ -319,9 +235,6 @@ pub fn native_content_switch_contract_report() -> NativeContentSwitchContractRep
         terminal.visible() && terminal.focused() && !terminal.focus_return_pending();
 
     terminal.deactivate(1).expect("terminal deactivates");
-    let web_error = web
-        .activate(2)
-        .expect_err("ordinary Web remains explicitly unsupported");
     ready_lifecycle(&mut pdf, 3, initial_bounds);
     pdf.focus_entered(3).expect("PDF accepts focus");
     pdf.deactivate(3).expect("PDF deactivates");
@@ -331,10 +244,6 @@ pub fn native_content_switch_contract_report() -> NativeContentSwitchContractRep
     ready_lifecycle(&mut terminal, 5, initial_bounds);
     terminal.focus_entered(5).expect("terminal accepts focus");
     terminal.deactivate(5).expect("terminal deactivates");
-    let right_rail_error = right_rail
-        .activate(6)
-        .expect_err("right-rail Web remains explicitly unsupported");
-
     ready_lifecycle(&mut terminal, 7, latest_bounds);
     terminal.focus_entered(7).expect("terminal accepts focus");
     let stale_results = [
@@ -404,13 +313,7 @@ pub fn native_content_switch_contract_report() -> NativeContentSwitchContractRep
         }
     }
 
-    let lifecycles = [
-        &terminal,
-        web.lifecycle(),
-        right_rail.lifecycle(),
-        &pdf,
-        &office,
-    ];
+    let lifecycles = [&terminal, &pdf, &office];
     let visible_surface_count = lifecycles
         .iter()
         .filter(|lifecycle| lifecycle.visible())
@@ -419,11 +322,6 @@ pub fn native_content_switch_contract_report() -> NativeContentSwitchContractRep
         .iter()
         .filter(|lifecycle| lifecycle.focused())
         .count();
-    let web_zero_allocation =
-        web_error.code == "web_preview_temporarily_unsupported" && !web.has_allocated_surface();
-    let right_rail_web_zero_allocation = right_rail_error.code
-        == "right_rail_native_web_surface_unsupported"
-        && !right_rail.has_allocated_surface();
     let passed = stale_callbacks_ignored == 3
         && close_callbacks_ignored == 3
         && overlay_hidden
@@ -434,14 +332,12 @@ pub fn native_content_switch_contract_report() -> NativeContentSwitchContractRep
         && crash_recovery_passed
         && visible_surface_count == 1
         && focused_surface_count == 1
-        && web_zero_allocation
-        && right_rail_web_zero_allocation
         && repeated_cycles == 100;
 
     NativeContentSwitchContractReport {
         schema_version: "native-content-switch-contract.v1",
         status: if passed { "passed" } else { "failed" },
-        targets_activated: 5,
+        targets_activated: 3,
         rapid_switches: repeated_cycles,
         stale_callbacks_ignored,
         close_callbacks_ignored,
@@ -454,12 +350,9 @@ pub fn native_content_switch_contract_report() -> NativeContentSwitchContractRep
         visible_surface_count,
         focused_surface_count,
         final_active_kind: "office",
-        web_zero_allocation,
-        right_rail_web_zero_allocation,
         privacy: NativeContentSwitchPrivacy {
             target_identity_stored: false,
             terminal_output_stored: false,
-            url_stored: false,
             pdf_content_stored: false,
             office_content_stored: false,
         },
@@ -614,20 +507,8 @@ impl NativeContentWorkbench {
                 partial_repaints: observation.partial_repaints,
                 terminal_output_stored: false,
             },
-            web: NativeContentWebObservation {
-                typed_unsupported_state: !self.report.web.supported
-                    && !self.report.right_rail_web_plugin.supported,
-                ordinary_native_surface_allocated: self.report.web.native_surface_allocated,
-                right_rail_native_surface_allocated: self
-                    .report
-                    .right_rail_web_plugin
-                    .native_surface_allocated,
-                profile_or_cache_allocated: false,
-                network_task_allocated: false,
-            },
             privacy: NativeContentRunPrivacy {
                 terminal_output_stored: false,
-                url_stored: false,
                 pdf_content_stored: false,
                 office_content_stored: false,
             },
@@ -688,8 +569,6 @@ impl Render for NativeContentWorkbench {
                             .overflow_hidden()
                             .child(self.terminal_surface.clone()),
                     )
-                    .child(surface_row(&self.report.web, cx))
-                    .child(surface_row(&self.report.right_rail_web_plugin, cx))
                     .child(surface_row(&self.report.pdf, cx))
                     .child(
                         div()
@@ -723,7 +602,7 @@ impl Render for NativeContentWorkbench {
                     .border_color(cx.theme().border)
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("Diagnostics redact terminal output, URLs, PDF text, and Office content")
+                    .child("Diagnostics redact terminal output, PDF text, and Office content")
                     .child(format!(
                         "{} / {}",
                         self.report.platform, self.report.architecture
@@ -813,7 +692,7 @@ mod tests {
     fn switch_contract_fences_stale_close_and_focus_transitions() {
         let report = native_content_switch_contract_report();
         assert_eq!(report.status, "passed");
-        assert_eq!(report.targets_activated, 5);
+        assert_eq!(report.targets_activated, 3);
         assert_eq!(report.stale_callbacks_ignored, 3);
         assert_eq!(report.close_callbacks_ignored, 3);
         assert!(report.overlay_hidden);
@@ -824,15 +703,11 @@ mod tests {
         assert!(report.crash_recovery_passed);
         assert_eq!(report.visible_surface_count, 1);
         assert_eq!(report.focused_surface_count, 1);
-        assert!(report.web_zero_allocation);
-        assert!(report.right_rail_web_zero_allocation);
     }
 
     #[test]
     fn switch_contract_report_is_content_free() {
         let json = serde_json::to_string(&native_content_switch_contract_report()).unwrap();
-        assert!(!json.contains("vibex-switch-sentinel"));
-        assert!(!json.contains("vibex-right-rail-sentinel"));
         assert!(!json.contains("terminal_id"));
         assert!(!json.contains("document_path"));
     }

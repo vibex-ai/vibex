@@ -93,40 +93,6 @@ external action when possible. Examples:
 - Do not ignore native provider unknown fields. Preserve them for diagnostics
   when possible.
 
-## Scenario: Right Rail Iframe Embed Check
-
-### 1. Scope / Trigger
-
-- Trigger: The desktop right rail opens a web plugin in a DOM iframe.
-- The command layer checks target response headers before the frontend mounts a
-  new iframe.
-
-### 2. Signatures
-
-```text
-right_rail_iframe_embed_check({ url }) -> RightRailIframeEmbedCheckResponse
-RightRailIframeEmbedStatus = supported | blocked | unknown
-RightRailIframeEmbedCheckResponse {
-  status,
-  blockingHeader,
-  blockingValue,
-  finalUrl
-}
-```
-
-### 3. Contracts
-
-- Validate `url` as `http` or `https`; invalid URLs return a structured
-  validation error.
-- Check `X-Frame-Options` and `Content-Security-Policy: frame-ancestors`.
-- `DENY`, `SAMEORIGIN`, obsolete `ALLOW-FROM`, and `frame-ancestors` values
-  that do not allow the app origin return `status=blocked` with the blocking
-  header/value.
-- Network failures while probing headers return `status=unknown`, not a command
-  error, so the frontend can still attempt iframe loading.
-- The frontend should show a browser-open prompt only for `blocked` or runtime
-  blank/timeout cases, not for every opaque cross-origin iframe.
-
 ## Scenario: Workspace File Create And Copy Mutations
 
 ### 1. Scope / Trigger

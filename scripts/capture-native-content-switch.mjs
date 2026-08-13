@@ -19,7 +19,6 @@ const SOURCE_INPUTS = [
   "apps/desktop/src/native_content.rs",
   "crates/content/Cargo.toml",
   "crates/content/src/lifecycle.rs",
-  "crates/content/src/web.rs",
   "scripts/capture-native-content-switch.mjs"
 ];
 
@@ -73,7 +72,7 @@ function validateRun(report) {
     "Native Content switch schema drifted"
   );
   assert(report.status === "passed", "Native Content switch contract did not pass");
-  assert(report.targetsActivated === 5, "Native Content target coverage drifted");
+  assert(report.targetsActivated === 3, "Native Content target coverage drifted");
   assert(report.rapidSwitches === 100, "Native Content rapid-switch count drifted");
   assert(report.staleCallbacksIgnored === 3, "stale callbacks were not fenced");
   assert(report.closeCallbacksIgnored === 3, "close callbacks were not fenced");
@@ -94,10 +93,6 @@ function validateRun(report) {
       report.focusedSurfaceCount === 1 &&
       report.finalActiveKind === "office",
     "final active/focus ownership drifted"
-  );
-  assert(
-    report.webZeroAllocation === true && report.rightRailWebZeroAllocation === true,
-    "Web switching allocated an unsupported native surface"
   );
   assert(
     Object.values(report.privacy ?? {}).every((value) => value === false),
@@ -157,7 +152,7 @@ function selfTest(evidence) {
     (copy) => (copy.run.closeCallbacksIgnored = 2),
     (copy) => (copy.run.focusRestored = false),
     (copy) => (copy.run.visibleSurfaceCount = 2),
-    (copy) => (copy.run.webZeroAllocation = false),
+    (copy) => (copy.run.targetsActivated = 2),
     (copy) => (copy.run.privacy.urlStored = true)
   ];
   for (const mutate of mutations) {

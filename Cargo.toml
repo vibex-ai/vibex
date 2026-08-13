@@ -59,7 +59,6 @@ web-sys = { version = "0.3", features = [
   "WebSocket",
   "Window",
 ] }
-wry = "=0.55.1"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 bzip2 = "0.6"

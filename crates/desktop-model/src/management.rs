@@ -8,14 +8,12 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use url::Url;
 use vibex_core::{
     AgentCatalogListResponse, AgentId, AgentSnapshotEntry, AutomationEdgeCondition,
     AutomationEdgeCreateRequest, AutomationGraph, AutomationGraphDefinitionUpdateRequest,
     AutomationNodeConfig, AutomationNodeCreateRequest, AutomationNodeId, AutomationNodePosition,
-    McpServer, Prompt, ProviderKind, ProviderProfile, ProviderProfileStatus, RightRailPlugin,
-    RightRailPluginStatus, ScheduledTask, ScheduledTaskAttentionSummary, ScheduledTaskAuditRecord,
-    ScheduledTaskRun, Skill,
+    McpServer, Prompt, ProviderKind, ProviderProfile, ProviderProfileStatus, ScheduledTask,
+    ScheduledTaskAttentionSummary, ScheduledTaskAuditRecord, ScheduledTaskRun, Skill,
 };
 
 use crate::{AsyncGeneration, MutationState, QueryError, QueryState};
@@ -784,111 +782,6 @@ impl AutomationGraphDraft {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RightRailActivation {
-    System { key: String },
-    UnsupportedEmbedding { plugin_id: String, url: String },
-    InvalidUrl { plugin_id: String, code: String },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct RightRailModel {
-    pub plugins: Vec<RightRailPlugin>,
-    pub active_plugin_id: Option<String>,
-    pub activation: Option<RightRailActivation>,
-    pub panel_visible: bool,
-    pub width: u16,
-}
-
-impl RightRailModel {
-    pub fn apply_plugins(&mut self, plugins: Vec<RightRailPlugin>) {
-        self.plugins = plugins
-            .into_iter()
-            .filter(|plugin| plugin.status != RightRailPluginStatus::Deleted)
-            .collect();
-        self.plugins
-            .sort_by_key(|plugin| (plugin.order_index, plugin.id.as_str().to_string()));
-        if self
-            .active_plugin_id
-            .as_ref()
-            .is_some_and(|id| !self.plugins.iter().any(|plugin| plugin.id.as_str() == id))
-        {
-            self.active_plugin_id = self
-                .plugins
-                .first()
-                .map(|plugin| plugin.id.as_str().to_string());
-        }
-    }
-
-    pub fn activate(&mut self, plugin_id: &str) -> RightRailActivation {
-        let Some(plugin) = self
-            .plugins
-            .iter()
-            .find(|plugin| plugin.id.as_str() == plugin_id)
-        else {
-            let state = RightRailActivation::InvalidUrl {
-                plugin_id: plugin_id.to_string(),
-                code: "right_rail_plugin_not_found".to_string(),
-            };
-            self.activation = Some(state.clone());
-            return state;
-        };
-        if plugin.status != RightRailPluginStatus::Enabled {
-            let state = RightRailActivation::InvalidUrl {
-                plugin_id: plugin.id.as_str().to_string(),
-                code: "right_rail_plugin_disabled".to_string(),
-            };
-            self.activation = Some(state.clone());
-            return state;
-        }
-        self.active_plugin_id = Some(plugin.id.as_str().to_string());
-        self.panel_visible = true;
-        let state = match plugin.kind {
-            vibex_core::RightRailPluginKind::System => RightRailActivation::System {
-                key: plugin
-                    .system_key
-                    .map(|key| format!("{key:?}").to_lowercase())
-                    .unwrap_or_else(|| "system".to_string()),
-            },
-            vibex_core::RightRailPluginKind::Web => {
-                match plugin.url.as_deref().and_then(valid_http_url) {
-                    Some(url) => RightRailActivation::UnsupportedEmbedding {
-                        plugin_id: plugin.id.as_str().to_string(),
-                        url,
-                    },
-                    None => RightRailActivation::InvalidUrl {
-                        plugin_id: plugin.id.as_str().to_string(),
-                        code: "right_rail_external_url_invalid".to_string(),
-                    },
-                }
-            }
-        };
-        self.activation = Some(state.clone());
-        state
-    }
-
-    pub fn enabled_plugins(&self) -> impl Iterator<Item = &RightRailPlugin> {
-        self.plugins
-            .iter()
-            .filter(|plugin| plugin.status == RightRailPluginStatus::Enabled)
-    }
-
-    pub fn is_system_plugin_immutable(plugin: &RightRailPlugin) -> bool {
-        plugin.kind == vibex_core::RightRailPluginKind::System
-    }
-}
-
-fn valid_http_url(value: &str) -> Option<String> {
-    let url = Url::parse(value).ok()?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        return None;
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return None;
-    }
-    Some(url.to_string())
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PairingContextProjection {
@@ -939,14 +832,12 @@ pub struct ManagementStateSummary {
     pub section: ManagementSection,
     pub generation: u64,
     pub dirty_section_count: usize,
-    pub active_plugin_id: Option<String>,
     pub graph_dirty: bool,
     pub diagnostic_status: String,
 }
 
 pub fn management_state_summary(
     navigation: &ManagementNavigation,
-    right_rail: &RightRailModel,
     graph: &AutomationGraphDraft,
     diagnostics: &RedactedDiagnosticProjection,
 ) -> ManagementStateSummary {
@@ -957,7 +848,6 @@ pub fn management_state_summary(
             .into_iter()
             .filter(|section| navigation.is_dirty(*section))
             .count(),
-        active_plugin_id: right_rail.active_plugin_id.clone(),
         graph_dirty: graph.dirty,
         diagnostic_status: diagnostics.status.clone(),
     }
@@ -1073,72 +963,6 @@ mod tests {
         assert!(!json.contains("fixture"));
         assert!(!json.to_lowercase().contains("qr"));
     }
-
-    #[test]
-    fn right_rail_web_activation_never_reports_embedded_surface() {
-        let mut model = RightRailModel::default();
-        let plugin = RightRailPlugin {
-            id: vibex_core::RightRailPluginId::new(),
-            kind: vibex_core::RightRailPluginKind::Web,
-            system_key: None,
-            builtin_key: None,
-            display_name: "Docs".to_string(),
-            url: Some("https://example.invalid/docs".to_string()),
-            logo: None,
-            desktop_user_agent: Some("desktop".to_string()),
-            mobile_user_agent: Some("mobile".to_string()),
-            ua_mode: Some(vibex_core::RightRailWebPluginUaMode::Desktop),
-            status: RightRailPluginStatus::Enabled,
-            order_index: 1,
-            data_directory: None,
-            created_at_ms: 1,
-            updated_at_ms: 1,
-            deleted_at_ms: None,
-        };
-        let id = plugin.id.as_str().to_string();
-        model.apply_plugins(vec![plugin]);
-        assert!(matches!(
-            model.activate(&id),
-            RightRailActivation::UnsupportedEmbedding { .. }
-        ));
-    }
-
-    #[test]
-    fn right_rail_disabled_plugins_cannot_be_activated_and_order_is_stable() {
-        let disabled = vibex_core::RightRailPlugin {
-            id: vibex_core::RightRailPluginId::new(),
-            kind: vibex_core::RightRailPluginKind::Web,
-            system_key: None,
-            builtin_key: None,
-            display_name: "Disabled".to_string(),
-            url: Some("https://example.invalid/disabled".to_string()),
-            logo: None,
-            desktop_user_agent: None,
-            mobile_user_agent: None,
-            ua_mode: None,
-            status: RightRailPluginStatus::Disabled,
-            order_index: 20,
-            data_directory: None,
-            created_at_ms: 0,
-            updated_at_ms: 0,
-            deleted_at_ms: None,
-        };
-        let enabled = vibex_core::RightRailPlugin {
-            id: vibex_core::RightRailPluginId::new(),
-            order_index: 1,
-            status: RightRailPluginStatus::Enabled,
-            ..disabled.clone()
-        };
-        let disabled_id = disabled.id.as_str().to_string();
-        let mut model = RightRailModel::default();
-        model.apply_plugins(vec![disabled, enabled]);
-        assert_eq!(model.plugins[0].order_index, 1);
-        assert!(matches!(
-            model.activate(&disabled_id),
-            RightRailActivation::InvalidUrl { code, .. } if code == "right_rail_plugin_disabled"
-        ));
-    }
-
     #[test]
     fn provider_draft_debug_and_serialized_summary_never_contain_secret() {
         let mut draft = ProviderProfileDraft::empty(ProviderKind::Acp);

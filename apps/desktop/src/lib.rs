@@ -129,7 +129,6 @@ mod tests {
         assert_eq!(probe.management_contract.section_count, 10);
         assert!(probe.management_contract.section_generation_fenced);
         assert!(probe.management_contract.graph_cas_versioned);
-        assert!(probe.management_contract.no_native_webview_allocated);
     }
 
     #[test]

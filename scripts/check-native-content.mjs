@@ -73,8 +73,6 @@ function validate(report) {
       "platform",
       "architecture",
       "terminal",
-      "web",
-      "rightRailWebPlugin",
       "pdf",
       "office",
       "privacy"
@@ -92,21 +90,6 @@ function validate(report) {
     nativeSurfaceAllocated: true,
     supported: true
   });
-  validateSurface(report.web, {
-    kind: "web",
-    backend: "unsupported-no-allocation",
-    explicitLoadRequired: true,
-    nativeSurfaceAllocated: false,
-    supported: false
-  });
-  validateSurface(report.rightRailWebPlugin, {
-    kind: "right_rail_web_plugin",
-    backend: "dom-iframe-external-open-boundary",
-    explicitLoadRequired: true,
-    nativeSurfaceAllocated: false,
-    supported: false
-  });
-  assert(report.rightRailWebPlugin.lifecyclePhase === "Unsupported", "right-rail Web plugin must stay unsupported");
   validateSurface(report.pdf, {
     kind: "pdf",
     backend: "pdfium-render",
@@ -125,7 +108,6 @@ function validate(report) {
     report.privacy,
     [
       "terminalOutputStoredInDiagnostics",
-      "urlStoredInWebDiagnostics",
       "pdfContentStoredInDiagnostics",
       "officeContentStoredInDiagnostics"
     ],

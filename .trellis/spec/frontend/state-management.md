@@ -449,7 +449,6 @@ document.documentElement.style.setProperty("--vibex-code-font-family", codeFontF
 PreviewTabTarget =
   file(path)
   terminal(terminalId)
-  web(webId, url)
   git_diff(path, staged)
 
 localStorage["vibex-workbench"].state.previewTabs -> Record<string, PreviewTab>
@@ -463,7 +462,6 @@ localStorage["vibex-workbench"].state.previewFocusedPaneId -> string | null
   authoritative file, terminal, Git, or browser state.
 - Stable resources use deterministic tab ids: `file:<path>`,
   `terminal:<terminalId>`, and `git:<staged|unstaged>:<path>`.
-- Web tabs use generated ids so multiple tabs may point to the same URL.
 - Terminal tabs opened in the compound preview are separate UI-owned shell
   surfaces from the Agent composer terminal mode. Do not let a shared terminal
   create mutation auto-select a global terminal id for both surfaces. Track

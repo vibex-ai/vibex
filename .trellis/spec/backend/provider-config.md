@@ -3053,8 +3053,6 @@ AutomationGraphRepository::replace_definition(
   the local draft unchanged. `None` is reserved for legacy trusted callers.
 - Provider projections contain presence/reference metadata only; secret values
   never enter GPUI entities, redacted summaries, logs, or fixtures.
-- GPUI v1 Web plugins expose unsupported embedding plus validated HTTP(S)
-  external open; no WebView or iframe probe is allocated.
 
 ### 4. Validation & Error Matrix
 
@@ -3063,9 +3061,6 @@ AutomationGraphRepository::replace_definition(
   `automation_graph_version_conflict` with bounded expected/actual revisions.
 - Self, missing, or duplicate graph edge -> typed graph validation issue before
   the repository call.
-- External plugin URL is non-HTTP(S), lacks a host, or contains credentials ->
-  `right_rail_external_url_invalid` or
-  `right_rail_external_url_credentials_rejected`.
 - Redaction sentinel appears in a diagnostic bundle -> export fails before the
   temporary file is published.
 

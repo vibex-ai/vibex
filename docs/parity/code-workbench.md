@@ -8,7 +8,7 @@ those features.
 
 - Workspace-scoped file trees, search, selection, mutations, drag/drop, retry,
   and generation fencing.
-- File, Git diff, commit, Terminal, and Web Preview targets with tab, split,
+- File, Git diff, commit, and Terminal targets with tab, split,
   resize, focus, close, and persistence behavior.
 - Independent editor buffers, revision-checked saves, encoding and line-ending
   handling, large-file guards, search/replace, undo/redo, and IME input.

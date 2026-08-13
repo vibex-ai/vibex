@@ -9,7 +9,6 @@ repository.workspace = true
 [features]
 default = []
 e2e-test-support = []
-web-preview-spike = ["dep:webkit2gtk", "dep:wry"]
 
 [dependencies]
 gpui.workspace = true
@@ -43,12 +42,10 @@ vibex-backend = { path = "../../crates/vibex-backend", features = ["native"] }
 vibex-ui = { path = "../../crates/vibex-ui" }
 vibex-markdown = { path = "../../crates/vibex-markdown" }
 vibex-terminal = { path = "../../crates/terminal" }
-wry = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = { version = "0.18" }
 tray-icon = { workspace = true, features = ["gtk"] }
-webkit2gtk = { version = "=2.0.2", features = ["v2_38"], optional = true }
 
 [dev-dependencies]
 axum.workspace = true

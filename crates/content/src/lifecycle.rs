@@ -13,7 +13,6 @@ pub enum ContentSurfaceKind {
     GitDiff,
     GitCommit,
     Terminal,
-    Web,
     Pdf,
     Office,
 }
@@ -22,13 +21,6 @@ pub enum ContentSurfaceKind {
 #[serde(rename_all = "snake_case")]
 pub enum ContentSurfaceOrigin {
     Preview,
-    RightRailWebPlugin,
-}
-
-impl ContentSurfaceOrigin {
-    pub fn allows_native_surface(self, kind: ContentSurfaceKind) -> bool {
-        !(self == Self::RightRailWebPlugin && kind == ContentSurfaceKind::Web)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -202,14 +194,6 @@ impl ContentSurfaceLifecycle {
                 "content_surface_generation_zero",
                 "content surface activation generation must be non-zero",
             ));
-        }
-        if !self.origin.allows_native_surface(self.kind) {
-            self.phase = ContentSurfacePhase::Unsupported;
-            return Err(VibexError::capability(
-                "right_rail_native_web_surface_unsupported",
-                "right-rail Web plugins do not allocate native browser surfaces in GPUI v1",
-            )
-            .with_recovery_hint("Open the validated URL in the system browser"));
         }
         if generation < self.activation_generation {
             return Ok(GenerationDisposition::IgnoredStale);
@@ -476,7 +460,7 @@ mod tests {
     #[test]
     fn stale_generation_cannot_show_or_move_a_surface() {
         let mut lifecycle = ContentSurfaceLifecycle::restored(
-            ContentSurfaceKind::Web,
+            ContentSurfaceKind::Pdf,
             ContentSurfaceOrigin::Preview,
         );
         lifecycle.activate(4).unwrap();
@@ -499,7 +483,7 @@ mod tests {
     #[test]
     fn overlay_hides_and_restores_only_the_current_surface() {
         let mut lifecycle = ContentSurfaceLifecycle::restored(
-            ContentSurfaceKind::Web,
+            ContentSurfaceKind::Pdf,
             ContentSurfaceOrigin::Preview,
         );
         lifecycle.activate(1).unwrap();
@@ -562,17 +546,6 @@ mod tests {
         lifecycle.focus_entered(5).unwrap();
         assert_eq!(lifecycle.phase(), ContentSurfacePhase::Active);
         assert!(lifecycle.focused());
-    }
-
-    #[test]
-    fn right_rail_web_origin_never_allocates_a_native_surface() {
-        let mut lifecycle = ContentSurfaceLifecycle::restored(
-            ContentSurfaceKind::Web,
-            ContentSurfaceOrigin::RightRailWebPlugin,
-        );
-        let error = lifecycle.activate(1).unwrap_err();
-        assert_eq!(error.code, "right_rail_native_web_surface_unsupported");
-        assert_eq!(lifecycle.phase(), ContentSurfacePhase::Unsupported);
     }
 
     #[test]

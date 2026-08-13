@@ -76,7 +76,7 @@ pub use events::{
 pub use fixture::FixtureDesktopRuntime;
 pub use home_lock::{DESKTOP_RUNTIME_LOCK_FILE, DesktopHomeLock};
 pub use management::{
-    BackupProgress, ManagementMutationGuard, ProviderManagementFacade, RightRailExternalOpen,
+    BackupProgress, ExternalOpenUrl, ManagementMutationGuard, ProviderManagementFacade,
     validate_external_open_url,
 };
 pub use relay::{
@@ -712,18 +712,6 @@ impl AutomationHandle {
 }
 
 #[derive(Clone)]
-pub struct RightRailHandle {
-    db_path: PathBuf,
-    mutation_guard: ManagementMutationGuard,
-}
-
-impl RightRailHandle {
-    pub fn database_path(&self) -> &Path {
-        &self.db_path
-    }
-}
-
-#[derive(Clone)]
 pub struct DiagnosticsHandle {
     service: DiagnosticBundleService,
     mutation_guard: ManagementMutationGuard,
@@ -770,7 +758,6 @@ pub struct ManagementHandle {
     providers: ProviderHandle,
     scheduled: ScheduledHandle,
     automation: AutomationHandle,
-    right_rail: RightRailHandle,
     diagnostics: DiagnosticsHandle,
     backup: BackupHandle,
     remote: RemoteHandle,
@@ -807,10 +794,6 @@ impl ManagementHandle {
 
     pub fn automation(&self) -> AutomationHandle {
         self.automation.clone()
-    }
-
-    pub fn right_rail(&self) -> RightRailHandle {
-        self.right_rail.clone()
     }
 
     pub fn diagnostics(&self) -> DiagnosticsHandle {
@@ -877,7 +860,6 @@ pub struct DesktopRuntime {
     terminals: TerminalHandle,
     scheduled: ScheduledHandle,
     automation: AutomationHandle,
-    right_rail: RightRailHandle,
     diagnostics: DiagnosticsHandle,
     backup: BackupHandle,
     remote: RemoteHandle,
@@ -1095,10 +1077,6 @@ impl DesktopRuntime {
             automation: AutomationHandle {
                 db_path: db_path.clone(),
                 manager: manager.clone(),
-                mutation_guard: ManagementMutationGuard::default(),
-            },
-            right_rail: RightRailHandle {
-                db_path: db_path.clone(),
                 mutation_guard: ManagementMutationGuard::default(),
             },
             diagnostics: DiagnosticsHandle {
@@ -1841,10 +1819,6 @@ impl DesktopRuntime {
         self.automation.clone()
     }
 
-    pub fn right_rail(&self) -> RightRailHandle {
-        self.right_rail.clone()
-    }
-
     pub fn diagnostics(&self) -> DiagnosticsHandle {
         self.diagnostics.clone()
     }
@@ -1872,7 +1846,6 @@ impl DesktopRuntime {
             providers: self.providers.clone(),
             scheduled: self.scheduled.clone(),
             automation: self.automation.clone(),
-            right_rail: self.right_rail.clone(),
             diagnostics: self.diagnostics.clone(),
             backup: self.backup.clone(),
             remote: self.remote.clone(),

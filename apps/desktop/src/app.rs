@@ -76,19 +76,16 @@ use vibex_core::{
     MessageAttachment, MessageSubmissionState, MessageSubmissionStatus, OpenWorkspaceRequest,
     PermissionResolution, PermissionResponseKind, PlanStepStatus, ProjectId, ProjectRecord,
     PromptId, ProviderBindingMetadata, ProviderKind, ProviderProfileSummary,
-    RenameAgentSessionRequest, RequestId, ResolvePermissionRequest, RightRailPlugin,
-    RightRailPluginCreateRequest, RightRailPluginDeleteRequest, RightRailPluginId,
-    RightRailPluginKind, RightRailPluginReorderRequest, RightRailPluginStatus,
-    RightRailPluginUpdateRequest, RightRailSystemPluginKey, RightRailWebPluginUaMode,
-    RuntimeAuthSource, RuntimeAuthSourceAvailability, RuntimeAuthSourceKind,
-    RuntimeAuthSourceSummary, RuntimeClientId, RuntimeLeaseRole, RuntimeModelSelection,
-    RuntimeSelectionInteraction, SendAgentMessageRequest, SessionRuntimeFeature,
-    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
-    SessionRuntimeSelection, SessionRuntimeSelectionStatus, SetDesiredAgentSessionRuntimeRequest,
-    TerminalCreateRequest, TerminalId, TerminalSession, TerminalStatus, TerminalSwitchShellRequest,
-    TimelineItem, TimelineItemId, TimelineLiveEvent, TimelinePage, TimelinePayload,
-    TimelineRedactionState, TimelineSource, UserMessagePayload, VibexSessionId, WorkspaceMode,
-    WorkspaceRecord, agent_session_turn_requires_continuation, latest_timeline_turn_ended_normally,
+    RenameAgentSessionRequest, RequestId, ResolvePermissionRequest, RuntimeAuthSource,
+    RuntimeAuthSourceAvailability, RuntimeAuthSourceKind, RuntimeAuthSourceSummary,
+    RuntimeClientId, RuntimeLeaseRole, RuntimeModelSelection, RuntimeSelectionInteraction,
+    SendAgentMessageRequest, SessionRuntimeFeature, SessionRuntimeFeatureKind,
+    SessionRuntimeOption, SessionRuntimeOptionCatalog, SessionRuntimeSelection,
+    SessionRuntimeSelectionStatus, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
+    TerminalId, TerminalSession, TerminalStatus, TerminalSwitchShellRequest, TimelineItem,
+    TimelineItemId, TimelineLiveEvent, TimelinePage, TimelinePayload, TimelineRedactionState,
+    TimelineSource, UserMessagePayload, VibexSessionId, WorkspaceMode, WorkspaceRecord,
+    agent_session_turn_requires_continuation, latest_timeline_turn_ended_normally,
     unix_timestamp_ms,
 };
 use vibex_desktop_model::{
@@ -184,7 +181,6 @@ const RIGHT_ACTIVITY_BAR_WIDTH: f32 = 40.0;
 const RIGHT_ACTIVITY_BUTTON_SIZE: f32 = 32.0;
 const RIGHT_ACTIVITY_ITEM_GAP: f32 = 4.0;
 const RIGHT_ACTIVITY_BAR_VERTICAL_PADDING: f32 = 8.0;
-const UNSUPPORTED_RIGHT_RAIL_WEB_BUILTINS: &[&str] = &["doubao", "kimi", "yuanbao"];
 const SIDEBAR_INLINE_TRANSITION_DURATION: Duration = Duration::from_millis(200);
 const SIDEBAR_FLOATING_TRANSITION_DURATION: Duration = Duration::from_millis(200);
 const SIDEBAR_REORDER_TRANSITION_DURATION: Duration = Duration::from_millis(160);
@@ -1359,31 +1355,10 @@ fn route_right_rail_activity_id(value: &str) -> Option<String> {
     }
 }
 
-fn right_rail_web_builtin_is_visible(builtin_key: Option<&str>) -> bool {
-    !builtin_key
-        .is_some_and(|builtin_key| UNSUPPORTED_RIGHT_RAIL_WEB_BUILTINS.contains(&builtin_key))
-}
-
-fn right_rail_plugin_is_visible(plugin: &RightRailPlugin) -> bool {
-    plugin.kind != RightRailPluginKind::Web
-        || right_rail_web_builtin_is_visible(plugin.builtin_key.as_deref())
-}
-
-fn normalized_enabled_right_rail_plugins(
-    mut plugins: Vec<RightRailPlugin>,
-) -> Vec<RightRailPlugin> {
-    plugins.retain(|plugin| {
-        plugin.deleted_at_ms.is_none() && plugin.status == RightRailPluginStatus::Enabled
-    });
-    plugins.sort_by_key(|plugin| (plugin.order_index, plugin.id.as_str().to_string()));
-    plugins
-}
-
-fn right_rail_system_plugin_icon(key: RightRailSystemPluginKey) -> Icon {
-    match key {
-        RightRailSystemPluginKey::Files => Icon::new(IconName::Folder),
-        RightRailSystemPluginKey::Git => Icon::default().path("icons/vibex/git-branch.svg"),
-        RightRailSystemPluginKey::Terminal => Icon::new(IconName::SquareTerminal),
+fn right_rail_mode_icon(mode: RightRailMode) -> Icon {
+    match mode {
+        RightRailMode::Files => Icon::new(IconName::Folder),
+        RightRailMode::Git => Icon::default().path("icons/vibex/git-branch.svg"),
     }
 }
 
@@ -1392,28 +1367,6 @@ fn right_rail_activity_button(id: impl Into<ElementId>, icon: Icon) -> Button {
         .ghost()
         .size(px(RIGHT_ACTIVITY_BUTTON_SIZE))
         .icon(icon)
-}
-
-fn reordered_right_rail_plugin_ids(
-    plugin_ids: &[RightRailPluginId],
-    moving_id: &str,
-    target_id: &str,
-    after: bool,
-) -> Vec<RightRailPluginId> {
-    let mut ids = plugin_ids.to_vec();
-    if moving_id == target_id {
-        return ids;
-    }
-    let Some(moving_index) = ids.iter().position(|id| id.as_str() == moving_id) else {
-        return ids;
-    };
-    let moving = ids.remove(moving_index);
-    let Some(target_index) = ids.iter().position(|id| id.as_str() == target_id) else {
-        ids.insert(moving_index.min(ids.len()), moving);
-        return ids;
-    };
-    ids.insert(target_index + usize::from(after), moving);
-    ids
 }
 
 fn toggled_sidebar_display(
@@ -3155,35 +3108,6 @@ struct NewSessionAgentDropTarget {
 }
 
 #[derive(Clone)]
-struct RightRailPluginDrag {
-    plugin_id: String,
-    label: SharedString,
-}
-
-impl Render for RightRailPluginDrag {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
-            .gap_2()
-            .px_3()
-            .py_1()
-            .rounded_sm()
-            .border_1()
-            .border_color(cx.theme().drag_border)
-            .bg(cx.theme().popover)
-            .text_color(cx.theme().popover_foreground)
-            .shadow_md()
-            .child(Icon::new(IconName::ChevronsUpDown).small())
-            .child(self.label.clone())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RightRailPluginDropTarget {
-    plugin_id: String,
-    after: bool,
-}
-
-#[derive(Clone)]
 struct ComposerTerminalDrag {
     terminal_id: String,
     label: SharedString,
@@ -3349,18 +3273,14 @@ pub struct VibexWorkbench {
     sidebar_hover_preview_close_task: Option<Task<()>>,
     sidebar_resize_drag: Option<SidebarResizeDragState>,
     right_panel_resize_drag: Option<RightPanelResizeDragState>,
-    right_rail_plugins: Vec<RightRailPlugin>,
     pair_button_hovered: bool,
     timeline_command_expansion: BTreeMap<String, bool>,
     elicitation_inputs: BTreeMap<String, Entity<InputState>>,
     elicitation_drafts: BTreeMap<String, ElicitationFormDraft>,
-    plugin_manager_view: Option<Entity<RightRailPluginManager>>,
     external_import_view: Option<Entity<ExternalImportDialog>>,
     composer_submission_locators: Vec<ComposerSubmissionLocator>,
     composer_submission_states: Vec<MessageSubmissionState>,
     submission_poll_task: Option<Task<()>>,
-    right_rail_plugin_drop_target: Option<RightRailPluginDropTarget>,
-    right_rail_error: Option<String>,
     preview_overlay_open: bool,
     right_rail_overlay_open: bool,
     settings_open: bool,
@@ -3554,8 +3474,6 @@ pub struct VibexWorkbench {
     runtime_heartbeat_task: Option<Task<()>>,
     agent_poll_task: Option<Task<()>>,
     composer_attachment_task: Option<Task<()>>,
-    right_rail_plugin_task: Option<Task<()>>,
-    right_rail_plugin_mutation_task: Option<Task<()>>,
     startup_loading_indicator_task: Option<Task<()>>,
     startup_loading_release_task: Option<Task<()>>,
     appearance_subscription: Option<Subscription>,
@@ -3905,18 +3823,14 @@ impl VibexWorkbench {
             sidebar_hover_preview_close_task: None,
             sidebar_resize_drag: None,
             right_panel_resize_drag: None,
-            right_rail_plugins: Vec::new(),
             pair_button_hovered: false,
             timeline_command_expansion: BTreeMap::new(),
             elicitation_inputs: BTreeMap::new(),
             elicitation_drafts: BTreeMap::new(),
-            plugin_manager_view: None,
             external_import_view: None,
             composer_submission_locators: Vec::new(),
             composer_submission_states: Vec::new(),
             submission_poll_task: None,
-            right_rail_plugin_drop_target: None,
-            right_rail_error: None,
             preview_overlay_open: false,
             right_rail_overlay_open: false,
             settings_open: false,
@@ -4110,8 +4024,6 @@ impl VibexWorkbench {
             runtime_heartbeat_task: None,
             agent_poll_task: None,
             composer_attachment_task: None,
-            right_rail_plugin_task: None,
-            right_rail_plugin_mutation_task: None,
             startup_loading_indicator_task: None,
             startup_loading_release_task: None,
             appearance_subscription: None,
@@ -4313,7 +4225,6 @@ impl VibexWorkbench {
                             });
                             this.attach_event_stream(runtime, cx);
                             this.load_agent_overview(cx);
-                            this.load_right_rail_plugins(cx);
                         }
                         Ok(Err(error)) => {
                             eprintln!("vibex-foundation: runtime-failed code={}", error.code);
@@ -5025,171 +4936,6 @@ impl VibexWorkbench {
         if changed {
             self.queue_ui_state();
         }
-    }
-
-    fn load_right_rail_plugins(&mut self, cx: &mut Context<Self>) {
-        let Some(runtime) = self.runtime.clone() else {
-            return;
-        };
-        let runner =
-            gpui_tokio::Tokio::spawn(cx, async move { runtime.management().right_rail().list() });
-        self.right_rail_plugin_task = Some(cx.spawn(
-            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let outcome = runner.await;
-                let _ = entity.update(cx, |this, cx| {
-                    match outcome {
-                        Ok(Ok(plugins)) => {
-                            this.right_rail_plugins =
-                                normalized_enabled_right_rail_plugins(plugins);
-                            this.reconcile_active_right_rail_plugin(cx);
-                            this.right_rail_error = None;
-                        }
-                        Ok(Err(error)) => {
-                            this.right_rail_error =
-                                Some(format!("{}: {}", error.code, error.message));
-                        }
-                        Err(error) => {
-                            this.right_rail_error =
-                                Some(format!("right-rail plugin load failed: {error}"));
-                        }
-                    }
-                    cx.notify();
-                });
-            },
-        ));
-    }
-
-    fn reorder_right_rail_plugin(
-        &mut self,
-        moving_id: &str,
-        target_id: &str,
-        after: bool,
-        cx: &mut Context<Self>,
-    ) {
-        if self.right_rail_plugin_mutation_task.is_some() {
-            return;
-        }
-        let current_plugin_ids = self
-            .right_rail_plugins
-            .iter()
-            .map(|plugin| plugin.id.clone())
-            .collect::<Vec<_>>();
-        let ordered_plugin_ids =
-            reordered_right_rail_plugin_ids(&current_plugin_ids, moving_id, target_id, after);
-        if ordered_plugin_ids
-            .iter()
-            .map(RightRailPluginId::as_str)
-            .eq(self
-                .right_rail_plugins
-                .iter()
-                .map(|plugin| plugin.id.as_str()))
-        {
-            return;
-        }
-        let Some(runtime) = self.runtime.clone() else {
-            return;
-        };
-        let previous_plugins = self.right_rail_plugins.clone();
-        let positions = ordered_plugin_ids
-            .iter()
-            .enumerate()
-            .map(|(index, id)| (id.as_str().to_string(), index))
-            .collect::<BTreeMap<_, _>>();
-        self.right_rail_plugins.sort_by_key(|plugin| {
-            positions
-                .get(plugin.id.as_str())
-                .copied()
-                .unwrap_or(usize::MAX)
-        });
-        for (index, plugin) in self.right_rail_plugins.iter_mut().enumerate() {
-            plugin.order_index = index as i64;
-        }
-        self.ui_state.right_rail.activity_order = ordered_plugin_ids
-            .iter()
-            .map(|id| id.as_str().to_string())
-            .collect();
-        self.queue_ui_state();
-        let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
-                .management()
-                .right_rail()
-                .reorder(RightRailPluginReorderRequest { ordered_plugin_ids })
-        });
-        self.right_rail_plugin_mutation_task = Some(cx.spawn(
-            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let outcome = runner.await;
-                let _ = entity.update(cx, |this, cx| {
-                    this.right_rail_plugin_mutation_task = None;
-                    match outcome {
-                        Ok(Ok(plugins)) => {
-                            this.right_rail_plugins =
-                                normalized_enabled_right_rail_plugins(plugins);
-                            this.reconcile_active_right_rail_plugin(cx);
-                            this.right_rail_error = None;
-                        }
-                        Ok(Err(error)) => {
-                            this.right_rail_plugins = previous_plugins;
-                            this.right_rail_error =
-                                Some(format!("{}: {}", error.code, error.message));
-                        }
-                        Err(error) => {
-                            this.right_rail_plugins = previous_plugins;
-                            this.right_rail_error =
-                                Some(format!("right-rail reorder failed: {error}"));
-                        }
-                    }
-                    cx.notify();
-                });
-            },
-        ));
-        cx.notify();
-    }
-
-    fn reconcile_active_right_rail_plugin(&mut self, cx: &mut Context<Self>) {
-        if !self
-            .right_rail_plugins
-            .iter()
-            .any(right_rail_plugin_is_visible)
-        {
-            return;
-        }
-        let selected = self.ui_state.right_rail.selected_activity_id.as_deref();
-        let selected_is_valid = selected.is_some_and(|selected| {
-            self.right_rail_plugins.iter().any(|plugin| {
-                plugin.id.as_str() == selected
-                    && right_rail_plugin_is_visible(plugin)
-                    && !matches!(plugin.system_key, Some(RightRailSystemPluginKey::Terminal))
-            })
-        });
-        if !selected_is_valid {
-            self.ui_state.right_rail.selected_activity_id = self
-                .right_rail_plugins
-                .iter()
-                .find(|plugin| {
-                    right_rail_plugin_is_visible(plugin)
-                        && plugin.system_key == Some(RightRailSystemPluginKey::Files)
-                })
-                .or_else(|| {
-                    self.right_rail_plugins.iter().find(|plugin| {
-                        right_rail_plugin_is_visible(plugin)
-                            && plugin.system_key != Some(RightRailSystemPluginKey::Terminal)
-                    })
-                })
-                .map(|plugin| plugin.id.as_str().to_string());
-            self.queue_ui_state();
-        }
-        let mode = right_rail_mode_from_activity_id(
-            self.ui_state.right_rail.selected_activity_id.as_deref(),
-        );
-        self.right_rail_mode = mode;
-        self.code_workbench.update(cx, |workbench, cx| {
-            if workbench.right_rail_mode != mode {
-                workbench.right_rail_mode = mode;
-                cx.notify();
-            }
-        });
-        self.code_right_rail
-            .update(cx, |right_rail, cx| right_rail.set_mode(mode, cx));
     }
 
     fn reconcile_sidebar_state(&mut self) {
@@ -14223,8 +13969,6 @@ impl VibexWorkbench {
             let session_filter = self.usage_session_filter.clone();
             self.usage_view
                 .update(cx, |usage, cx| usage.activate(session_filter, cx));
-        } else {
-            self.load_right_rail_plugins(cx);
         }
         self.queue_ui_state();
         cx.notify();
@@ -14767,195 +14511,6 @@ impl VibexWorkbench {
         }
     }
 
-    fn selected_right_rail_web_plugin(&self) -> Option<RightRailPlugin> {
-        let selected_id = self.ui_state.right_rail.selected_activity_id.as_deref()?;
-        self.right_rail_plugins
-            .iter()
-            .find(|plugin| {
-                plugin.id.as_str() == selected_id
-                    && plugin.kind == RightRailPluginKind::Web
-                    && right_rail_plugin_is_visible(plugin)
-            })
-            .cloned()
-    }
-
-    fn open_right_rail_web_plugin(&mut self, plugin_id: String, cx: &mut Context<Self>) {
-        let selection_changed =
-            self.ui_state.right_rail.selected_activity_id.as_deref() != Some(&plugin_id);
-        self.ui_state.right_rail.selected_activity_id = Some(plugin_id);
-        let visibility_changed = !self.ui_state.workbench.right_rail_visible;
-        self.ui_state.workbench.right_rail_visible = true;
-        if !self.right_rail_docks_when_open(cx) {
-            self.right_rail_overlay_open = true;
-            self.preview_overlay_open = false;
-        } else {
-            self.right_rail_overlay_open = false;
-        }
-        if selection_changed || visibility_changed {
-            self.queue_ui_state();
-        }
-        cx.notify();
-    }
-
-    fn activate_right_rail_plugin(
-        &mut self,
-        plugin_id: String,
-        window_handle: AnyWindowHandle,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(plugin) = self
-            .right_rail_plugins
-            .iter()
-            .find(|plugin| plugin.id.as_str() == plugin_id && right_rail_plugin_is_visible(plugin))
-            .cloned()
-        else {
-            return;
-        };
-        match plugin.system_key {
-            Some(RightRailSystemPluginKey::Files) => {
-                self.toggle_right_rail_mode(RightRailMode::Files, cx)
-            }
-            Some(RightRailSystemPluginKey::Git) => {
-                self.toggle_right_rail_mode(RightRailMode::Git, cx)
-            }
-            Some(RightRailSystemPluginKey::Terminal) => {
-                self.create_preview_terminal(window_handle, None, None, cx)
-            }
-            None if plugin.kind == RightRailPluginKind::Web => {
-                let already_active = self.ui_state.right_rail.selected_activity_id.as_deref()
-                    == Some(plugin.id.as_str())
-                    && self.right_rail_panel_open();
-                if already_active {
-                    self.close_right_rail(cx);
-                } else {
-                    self.open_right_rail_web_plugin(plugin.id.as_str().to_string(), cx);
-                }
-            }
-            None => {}
-        }
-    }
-
-    fn open_right_rail_plugin_external(&mut self, url: String, cx: &mut Context<Self>) {
-        let outcome = validate_external_open_url(&url)
-            .and_then(|validated| crate::platform::open_external_url(&validated.url));
-        match outcome {
-            Ok(()) => self.right_rail_error = None,
-            Err(error) => {
-                self.right_rail_error = Some(format!("{}: {}", error.code, error.message))
-            }
-        }
-        cx.notify();
-    }
-
-    fn render_right_rail_web_plugin(
-        &mut self,
-        plugin: RightRailPlugin,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let url = plugin.url.clone().unwrap_or_default();
-        let open_url = url.clone();
-        let body_url = url.clone();
-        v_flex()
-            .size_full()
-            .min_w_0()
-            .min_h_0()
-            .bg(cx.theme().background)
-            .child(
-                h_flex()
-                    .h(px(48.0))
-                    .flex_none()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .px_3()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(
-                        h_flex()
-                            .min_w_0()
-                            .gap_2()
-                            .child(Icon::new(IconName::Globe).small())
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_sm()
-                                    .font_medium()
-                                    .child(plugin.display_name),
-                            ),
-                    )
-                    .child(
-                        Button::new("close-right-rail-web-plugin")
-                            .small()
-                            .ghost()
-                            .compact()
-                            .icon(IconName::PanelRight)
-                            .tooltip(locale::text("Close panel", "关闭面板", "關閉面板"))
-                            .on_click(cx.listener(|this, _, _, cx| this.close_right_rail(cx))),
-                    ),
-            )
-            .when_some(self.right_rail_error.clone(), |this, error| {
-                this.child(
-                    div()
-                        .flex_none()
-                        .px_3()
-                        .py_2()
-                        .text_xs()
-                        .text_color(cx.theme().danger)
-                        .child(locale::localize_error_message(&error)),
-                )
-            })
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .items_center()
-                    .justify_center()
-                    .gap_3()
-                    .p_5()
-                    .text_center()
-                    .child(Icon::new(IconName::Globe))
-                    .child(div().text_sm().font_medium().child(locale::text(
-                        "Embedded Web plugin unavailable",
-                        "嵌入式网页插件不可用",
-                        "嵌入式網頁外掛無法使用",
-                    )))
-                    .child(
-                        div()
-                            .max_w_full()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(body_url),
-                    )
-                    .child(
-                        Button::new("open-right-rail-web-plugin-external")
-                            .small()
-                            .outline()
-                            .icon(IconName::ExternalLink)
-                            .label(locale::text(
-                                "Open in browser",
-                                "在浏览器中打开",
-                                "在瀏覽器中開啟",
-                            ))
-                            .disabled(url.is_empty())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.open_right_rail_plugin_external(open_url.clone(), cx)
-                            })),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn render_right_rail_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        if let Some(plugin) = self.selected_right_rail_web_plugin() {
-            self.render_right_rail_web_plugin(plugin, cx)
-        } else {
-            self.code_right_rail
-                .clone()
-                .cached(StyleRefinement::default().size_full())
-                .into_any_element()
-        }
-    }
-
     fn render_preview_activity_button(
         &mut self,
         preview_open: bool,
@@ -14972,190 +14527,48 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
-    fn render_new_web_activity_button(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        right_rail_activity_button("activity-new-web", Icon::new(IconName::Globe))
-            .tooltip(locale::text(
-                "New web tab",
-                "新建网页标签页",
-                "新增網頁分頁",
-            ))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.code_workbench
-                    .update(cx, |workbench, cx| workbench.open_web(String::new(), cx));
-            }))
-            .into_any_element()
-    }
-
-    fn render_right_rail_plugin_activity_button(
-        &mut self,
-        plugin: RightRailPlugin,
-        panel_open: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let plugin_id = plugin.id.as_str().to_string();
-        let display_name = plugin.display_name.clone();
-        let selected = panel_open
-            && plugin.system_key != Some(RightRailSystemPluginKey::Terminal)
-            && self.ui_state.right_rail.selected_activity_id.as_deref() == Some(plugin.id.as_str());
-        let icon = plugin
-            .system_key
-            .map(right_rail_system_plugin_icon)
-            .unwrap_or_else(|| Icon::new(IconName::Globe));
-        let button = right_rail_activity_button(format!("activity-plugin:{plugin_id}"), icon)
-            .tooltip(display_name.clone())
-            .selected(selected)
-            .disabled(self.right_rail_plugin_mutation_task.is_some())
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.activate_right_rail_plugin(plugin_id.clone(), window.window_handle(), cx)
-            }));
-        let plugin_id = plugin.id.as_str().to_string();
-        let active_drop_after = self
-            .right_rail_plugin_drop_target
-            .as_ref()
-            .and_then(|target| {
-                (cx.has_active_drag() && target.plugin_id == plugin_id).then_some(target.after)
-            });
-        let drag_payload = RightRailPluginDrag {
-            plugin_id: plugin_id.clone(),
-            label: display_name.into(),
-        };
-        let drag_entity = cx.weak_entity();
-        let drag_target_plugin_id = plugin_id.clone();
-        let drop_target_plugin_id = plugin_id;
-        div()
-            .id(format!("activity-plugin-drag:{drop_target_plugin_id}"))
-            .relative()
-            .flex_none()
-            .when_some(active_drop_after, |this, after| {
-                this.child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .right_0()
-                        .h(px(2.0))
-                        .bg(cx.theme().drag_border)
-                        .map(|line| if after { line.bottom_0() } else { line.top_0() }),
-                )
-            })
-            .on_drag(drag_payload, move |drag, _, _, cx| {
-                cx.stop_propagation();
-                let _ = drag_entity.update(cx, |this, cx| {
-                    this.right_rail_plugin_drop_target = None;
-                    cx.notify();
-                });
-                cx.new(|_| drag.clone())
-            })
-            .on_drag_move(cx.listener(
-                move |this, event: &DragMoveEvent<RightRailPluginDrag>, _, cx| {
-                    let drag = event.drag(cx);
-                    let next = (event.bounds.contains(&event.event.position)
-                        && drag.plugin_id != drag_target_plugin_id)
-                        .then_some(RightRailPluginDropTarget {
-                            plugin_id: drag_target_plugin_id.clone(),
-                            after: event.event.position.y >= event.bounds.center().y,
-                        });
-                    if this.right_rail_plugin_drop_target != next {
-                        this.right_rail_plugin_drop_target = next;
-                        cx.notify();
-                    }
-                },
-            ))
-            .on_drop(cx.listener(move |this, drag: &RightRailPluginDrag, _, cx| {
-                let target = this.right_rail_plugin_drop_target.take();
-                if let Some(target) =
-                    target.filter(|target| target.plugin_id == drop_target_plugin_id)
-                {
-                    this.reorder_right_rail_plugin(
-                        &drag.plugin_id,
-                        &target.plugin_id,
-                        target.after,
-                        cx,
-                    );
-                } else {
-                    cx.notify();
-                }
-            }))
-            .child(button)
+    fn render_right_rail_panel(&self) -> AnyElement {
+        self.code_right_rail
+            .clone()
+            .cached(StyleRefinement::default().size_full())
             .into_any_element()
     }
 
     fn render_right_rail_activity_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let active_mode = self.right_rail_mode;
         let panel_open = self.right_rail_panel_open();
         let preview_open = if self.last_visibility.preview_docked {
             self.ui_state.workbench.preview_visible
         } else {
             self.preview_overlay_open
         };
-        let plugins = self
-            .right_rail_plugins
-            .iter()
-            .filter(|plugin| right_rail_plugin_is_visible(plugin))
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut activities = Vec::new();
-        if plugins.is_empty() {
-            activities.push(
-                right_rail_activity_button(
-                    "activity-files",
-                    right_rail_system_plugin_icon(RightRailSystemPluginKey::Files),
-                )
-                .tooltip(locale::text("Files", "文件", "檔案"))
-                .selected(panel_open && active_mode == RightRailMode::Files)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.toggle_right_rail_mode(RightRailMode::Files, cx)
-                }))
-                .into_any_element(),
-            );
-            activities.push(
-                right_rail_activity_button(
-                    "activity-git",
-                    right_rail_system_plugin_icon(RightRailSystemPluginKey::Git),
-                )
+        let activities = vec![
+            right_rail_activity_button(
+                "activity-files",
+                right_rail_mode_icon(RightRailMode::Files),
+            )
+            .tooltip(locale::text("Files", "文件", "檔案"))
+            .selected(panel_open && self.right_rail_mode == RightRailMode::Files)
+            .on_click(
+                cx.listener(|this, _, _, cx| this.toggle_right_rail_mode(RightRailMode::Files, cx)),
+            )
+            .into_any_element(),
+            right_rail_activity_button("activity-git", right_rail_mode_icon(RightRailMode::Git))
                 .tooltip("Git")
-                .selected(panel_open && active_mode == RightRailMode::Git)
+                .selected(panel_open && self.right_rail_mode == RightRailMode::Git)
                 .on_click(
                     cx.listener(|this, _, _, cx| {
                         this.toggle_right_rail_mode(RightRailMode::Git, cx)
                     }),
                 )
                 .into_any_element(),
-            );
-            activities.push(self.render_preview_activity_button(preview_open, cx));
-            activities.push(self.render_new_web_activity_button(cx));
-            activities.push(
-                right_rail_activity_button(
-                    "activity-terminal",
-                    right_rail_system_plugin_icon(RightRailSystemPluginKey::Terminal),
-                )
+            self.render_preview_activity_button(preview_open, cx),
+            right_rail_activity_button("activity-terminal", Icon::new(IconName::SquareTerminal))
                 .tooltip(locale::text("New terminal", "新建终端", "新增終端機"))
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.create_preview_terminal(window.window_handle(), None, None, cx)
                 }))
                 .into_any_element(),
-            );
-        } else {
-            let mut preview_actions_inserted = false;
-            if !plugins
-                .iter()
-                .any(|plugin| plugin.system_key == Some(RightRailSystemPluginKey::Git))
-            {
-                activities.push(self.render_preview_activity_button(preview_open, cx));
-                activities.push(self.render_new_web_activity_button(cx));
-                preview_actions_inserted = true;
-            }
-            for plugin in plugins {
-                let insert_preview_actions =
-                    plugin.system_key == Some(RightRailSystemPluginKey::Git);
-                activities
-                    .push(self.render_right_rail_plugin_activity_button(plugin, panel_open, cx));
-                if insert_preview_actions && !preview_actions_inserted {
-                    activities.push(self.render_preview_activity_button(preview_open, cx));
-                    activities.push(self.render_new_web_activity_button(cx));
-                    preview_actions_inserted = true;
-                }
-            }
-        }
+        ];
 
         v_flex()
             .id("right-rail-activity-bar")
@@ -15170,20 +14583,6 @@ impl VibexWorkbench {
             .py(px(RIGHT_ACTIVITY_BAR_VERTICAL_PADDING))
             .children(activities)
             .child(div().flex_1())
-            .child(
-                right_rail_activity_button(
-                    "activity-manage",
-                    Icon::default().path("icons/vibex/puzzle.svg"),
-                )
-                .tooltip(locale::text(
-                    "Manage rail plugins",
-                    "管理右侧栏插件",
-                    "管理右側欄外掛",
-                ))
-                .on_click(
-                    cx.listener(|this, _, window, cx| this.open_right_rail_management(window, cx)),
-                ),
-            )
             .into_any_element()
     }
 
@@ -15234,49 +14633,6 @@ impl VibexWorkbench {
         self.usage_view
             .update(cx, |usage, cx| usage.activate(session_filter, cx));
         self.push_current_navigation_entry();
-        cx.notify();
-    }
-
-    fn open_right_rail_management(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Tauri parity: the puzzle button opens the "Right rail plugins" manager dialog.
-        if window.has_active_dialog(cx) {
-            return;
-        }
-        let workbench = cx.weak_entity();
-        let manager = cx.new(|cx| {
-            RightRailPluginManager::new(self.runtime.clone(), workbench.clone(), window, cx)
-        });
-        self.plugin_manager_view = Some(manager.clone());
-        let manager_title = locale::text("Right rail plugins", "右侧栏插件", "右側欄外掛");
-        let viewport = window.viewport_size();
-        let dialog_width = (f32::from(viewport.width) - 32.0).clamp(280.0, 768.0);
-        let dialog_max_height = (f32::from(viewport.height) - 32.0).clamp(240.0, 672.0);
-        let on_close_workbench = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _, cx| {
-            let on_close = on_close_workbench.clone();
-            let is_dark = cx.theme().is_dark();
-            let popover = theme::semantic_color("popover", is_dark);
-            let popover_foreground = theme::semantic_color("popover-foreground", is_dark);
-            dialog
-                .title(manager_title)
-                .w(px(dialog_width))
-                .max_w(px(dialog_width))
-                .max_h(px(dialog_max_height))
-                .rounded(px(14.0))
-                .bg(popover)
-                .text_color(popover_foreground)
-                .border_color(popover_foreground.opacity(0.10))
-                .overlay(true)
-                .overlay_closable(true)
-                .on_close(move |_, _, cx| {
-                    let _ = on_close.update(cx, |this, cx| {
-                        this.plugin_manager_view = None;
-                        this.load_right_rail_plugins(cx);
-                        cx.notify();
-                    });
-                })
-                .child(manager.clone())
-        });
         cx.notify();
     }
 
@@ -27624,7 +26980,7 @@ impl VibexWorkbench {
                 right_rail_width,
                 cx,
             );
-            let panel = self.render_right_rail_panel(cx);
+            let panel = self.render_right_rail_panel();
             shell = shell.child(
                 div()
                     .relative()
@@ -27652,7 +27008,7 @@ impl VibexWorkbench {
                     right_rail_width,
                     cx,
                 );
-                let panel = self.render_right_rail_panel(cx);
+                let panel = self.render_right_rail_panel();
                 div()
                     .absolute()
                     .top_0()
@@ -30957,908 +30313,6 @@ fn mobile_pair_icon(hovered: bool, cx: &App) -> AnyElement {
 }
 
 // ---------------------------------------------------------------------------
-// Right-rail plugin manager (Tauri parity: `RightRailPluginManagerDialog`)
-// ---------------------------------------------------------------------------
-
-fn plugin_manager_text(locale: locale::ResolvedLocale) -> PluginManagerText {
-    match locale {
-        locale::ResolvedLocale::En => PluginManagerText {
-            description: "Files, Git, and Terminal are built-in plugins. Add web plugins for sites you use often.",
-            add_web_plugin: "Add web plugin",
-            edit_web_plugin: "Edit web plugin",
-            system_plugin: "Built-in",
-            web_plugin: "Web",
-            plugin_name: "Name",
-            plugin_url: "URL",
-            plugin_logo: "Logo",
-            logo_placeholder: "https://example.com/logo.svg, openai, or logos:claude-icon",
-            desktop_ua: "Desktop UA",
-            mobile_ua: "Mobile UA",
-            ua_mode: "User agent",
-            ua_desktop: "Desktop",
-            ua_mobile: "Mobile",
-            save: "Save",
-            create: "Create",
-            cancel: "Cancel",
-            edit: "Edit",
-            delete: "Delete",
-            disable: "Disable",
-            enable: "Enable",
-            locked_description: "System plugins can be reordered but not edited, disabled, or deleted.",
-            no_web_plugins: "No custom web plugins yet.",
-            name_required: "Plugin name is required.",
-            url_required: "Plugin URL is required.",
-            url_invalid: "Plugin URL must be a valid http(s) URL.",
-            cookie_note: "Loaded iframe pages stay in a hidden pool after the panel closes so reopening does not reload them.",
-            error_label: "Error",
-        },
-        locale::ResolvedLocale::ZhCn => PluginManagerText {
-            description: "文件、Git、终端是内置插件。你可以添加常用网站作为网页插件。",
-            add_web_plugin: "添加网页插件",
-            edit_web_plugin: "编辑网页插件",
-            system_plugin: "内置",
-            web_plugin: "网页",
-            plugin_name: "名称",
-            plugin_url: "URL",
-            plugin_logo: "Logo",
-            logo_placeholder: "https://example.com/logo.svg、openai 或 logos:claude-icon",
-            desktop_ua: "桌面端 UA",
-            mobile_ua: "移动端 UA",
-            ua_mode: "User Agent",
-            ua_desktop: "桌面端",
-            ua_mobile: "移动端",
-            save: "保存",
-            create: "创建",
-            cancel: "取消",
-            edit: "编辑",
-            delete: "删除",
-            disable: "停用",
-            enable: "启用",
-            locked_description: "系统插件可以拖拽排序，但不能编辑、停用或删除。",
-            no_web_plugins: "还没有自定义网页插件。",
-            name_required: "插件名称必填。",
-            url_required: "插件 URL 必填。",
-            url_invalid: "插件 URL 必须是有效的 http(s) 地址。",
-            cookie_note: "已加载的 iframe 页面会在关闭面板后保留在隐藏池中，下次打开无需重新加载。",
-            error_label: "错误",
-        },
-        locale::ResolvedLocale::ZhTw => PluginManagerText {
-            description: "檔案、Git、終端是內建外掛。你可以新增常用網站作為網頁外掛。",
-            add_web_plugin: "新增網頁外掛",
-            edit_web_plugin: "編輯網頁外掛",
-            system_plugin: "內建",
-            web_plugin: "網頁",
-            plugin_name: "名稱",
-            plugin_url: "URL",
-            plugin_logo: "Logo",
-            logo_placeholder: "https://example.com/logo.svg、openai 或 logos:claude-icon",
-            desktop_ua: "桌面端 UA",
-            mobile_ua: "行動端 UA",
-            ua_mode: "User Agent",
-            ua_desktop: "桌面端",
-            ua_mobile: "行動端",
-            save: "儲存",
-            create: "建立",
-            cancel: "取消",
-            edit: "編輯",
-            delete: "刪除",
-            disable: "停用",
-            enable: "啟用",
-            locked_description: "系統外掛可以拖曳排序，但不能編輯、停用或刪除。",
-            no_web_plugins: "尚無自訂網頁外掛。",
-            name_required: "外掛名稱必填。",
-            url_required: "外掛 URL 必填。",
-            url_invalid: "外掛 URL 必須是有效的 http(s) 位址。",
-            cookie_note: "已載入的 iframe 頁面會在關閉面板後保留在隱藏池中，下次開啟無需重新載入。",
-            error_label: "錯誤",
-        },
-    }
-}
-
-#[derive(Clone, Copy)]
-struct PluginManagerText {
-    description: &'static str,
-    add_web_plugin: &'static str,
-    edit_web_plugin: &'static str,
-    system_plugin: &'static str,
-    web_plugin: &'static str,
-    plugin_name: &'static str,
-    plugin_url: &'static str,
-    plugin_logo: &'static str,
-    logo_placeholder: &'static str,
-    desktop_ua: &'static str,
-    mobile_ua: &'static str,
-    ua_mode: &'static str,
-    ua_desktop: &'static str,
-    ua_mobile: &'static str,
-    save: &'static str,
-    create: &'static str,
-    cancel: &'static str,
-    edit: &'static str,
-    delete: &'static str,
-    disable: &'static str,
-    enable: &'static str,
-    locked_description: &'static str,
-    no_web_plugins: &'static str,
-    name_required: &'static str,
-    url_required: &'static str,
-    url_invalid: &'static str,
-    cookie_note: &'static str,
-    error_label: &'static str,
-}
-
-fn plugin_manager_confirm_delete(locale: locale::ResolvedLocale, name: &str) -> String {
-    match locale {
-        locale::ResolvedLocale::En => format!("Delete web plugin \"{name}\"?"),
-        locale::ResolvedLocale::ZhCn => format!("删除网页插件“{name}”？"),
-        locale::ResolvedLocale::ZhTw => format!("刪除網頁外掛「{name}」？"),
-    }
-}
-
-fn validate_plugin_form(name: &str, url: &str, text: &PluginManagerText) -> Option<&'static str> {
-    if name.trim().is_empty() {
-        return Some(text.name_required);
-    }
-    let raw_url = url.trim();
-    if raw_url.is_empty() {
-        return Some(text.url_required);
-    }
-    match url::Url::parse(raw_url) {
-        Ok(parsed) if parsed.scheme() == "http" || parsed.scheme() == "https" => None,
-        _ => Some(text.url_invalid),
-    }
-}
-
-fn trim_optional_field(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
-}
-
-pub struct RightRailPluginManager {
-    runtime: Option<Arc<DesktopRuntime>>,
-    workbench: WeakEntity<VibexWorkbench>,
-    plugins: Vec<RightRailPlugin>,
-    editing_plugin_id: Option<RightRailPluginId>,
-    name_input: Entity<InputState>,
-    url_input: Entity<InputState>,
-    logo_input: Entity<InputState>,
-    desktop_ua_input: Entity<InputState>,
-    mobile_ua_input: Entity<InputState>,
-    ua_mode: RightRailWebPluginUaMode,
-    form_error: Option<String>,
-    submitting: bool,
-    pending_form_reset: bool,
-    _load_task: Option<Task<()>>,
-    mutation_task: Option<Task<()>>,
-}
-
-impl RightRailPluginManager {
-    fn new(
-        runtime: Option<Arc<DesktopRuntime>>,
-        workbench: WeakEntity<VibexWorkbench>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let text = plugin_manager_text(locale::resolve_locale(
-            LocaleMode::System,
-            locale::system_locale().as_deref(),
-        ));
-        let logo_placeholder = text.logo_placeholder;
-        let mut this = Self {
-            runtime,
-            workbench,
-            plugins: Vec::new(),
-            editing_plugin_id: None,
-            name_input: cx.new(|cx| InputState::new(window, cx)),
-            url_input: cx.new(|cx| InputState::new(window, cx)),
-            logo_input: cx.new(|cx| InputState::new(window, cx).placeholder(logo_placeholder)),
-            desktop_ua_input: cx.new(|cx| InputState::new(window, cx).auto_grow(2, 4)),
-            mobile_ua_input: cx.new(|cx| InputState::new(window, cx).auto_grow(2, 4)),
-            ua_mode: RightRailWebPluginUaMode::Desktop,
-            form_error: None,
-            submitting: false,
-            pending_form_reset: false,
-            _load_task: None,
-            mutation_task: None,
-        };
-        this.load_plugins(cx);
-        this
-    }
-
-    fn resolved_locale(&self, cx: &App) -> locale::ResolvedLocale {
-        let locale_mode = self
-            .workbench
-            .read_with(cx, |workbench, _| workbench.ui_state.appearance.locale)
-            .ok()
-            .unwrap_or_default();
-        locale::resolve_locale(locale_mode, locale::system_locale().as_deref())
-    }
-
-    fn load_plugins(&mut self, cx: &mut Context<Self>) {
-        let Some(runtime) = self.runtime.clone() else {
-            return;
-        };
-        let runner =
-            gpui_tokio::Tokio::spawn(cx, async move { runtime.management().right_rail().list() });
-        self._load_task = Some(cx.spawn(
-            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let outcome = runner.await;
-                let _ = entity.update(cx, |this, cx| {
-                    if let Ok(Ok(mut plugins)) = outcome {
-                        plugins.retain(|plugin| plugin.status != RightRailPluginStatus::Deleted);
-                        plugins.sort_by_key(|plugin| plugin.order_index);
-                        this.plugins = plugins;
-                    }
-                    cx.notify();
-                });
-            },
-        ));
-    }
-
-    fn begin_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.editing_plugin_id = None;
-        self.form_error = None;
-        self.ua_mode = RightRailWebPluginUaMode::Desktop;
-        for input in [
-            &self.name_input,
-            &self.url_input,
-            &self.logo_input,
-            &self.desktop_ua_input,
-            &self.mobile_ua_input,
-        ] {
-            input.update(cx, |input, cx| input.set_value("", window, cx));
-        }
-        cx.notify();
-    }
-
-    fn begin_edit(
-        &mut self,
-        plugin: &RightRailPlugin,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if plugin.kind != RightRailPluginKind::Web {
-            return;
-        }
-        self.editing_plugin_id = Some(plugin.id.clone());
-        self.form_error = None;
-        self.ua_mode = plugin.ua_mode.unwrap_or(RightRailWebPluginUaMode::Desktop);
-        let values = [
-            (&self.name_input, plugin.display_name.clone()),
-            (&self.url_input, plugin.url.clone().unwrap_or_default()),
-            (&self.logo_input, plugin.logo.clone().unwrap_or_default()),
-            (
-                &self.desktop_ua_input,
-                plugin.desktop_user_agent.clone().unwrap_or_default(),
-            ),
-            (
-                &self.mobile_ua_input,
-                plugin.mobile_user_agent.clone().unwrap_or_default(),
-            ),
-        ];
-        for (input, value) in values {
-            input.update(cx, |input, cx| input.set_value(value, window, cx));
-        }
-        cx.notify();
-    }
-
-    fn submit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.submitting {
-            return;
-        }
-        let Some(runtime) = self.runtime.clone() else {
-            return;
-        };
-        let text = plugin_manager_text(self.resolved_locale(cx));
-        let name = self.name_input.read(cx).value().to_string();
-        let url = self.url_input.read(cx).value().to_string();
-        if let Some(error) = validate_plugin_form(&name, &url, &text) {
-            self.form_error = Some(error.to_string());
-            cx.notify();
-            return;
-        }
-        let logo = self.logo_input.read(cx).value().to_string();
-        let desktop_ua = self.desktop_ua_input.read(cx).value().to_string();
-        let mobile_ua = self.mobile_ua_input.read(cx).value().to_string();
-        let ua_mode = self.ua_mode;
-        let editing = self.editing_plugin_id.clone().filter(|id| {
-            self.plugins
-                .iter()
-                .any(|plugin| &plugin.id == id && plugin.kind == RightRailPluginKind::Web)
-        });
-        self.submitting = true;
-        self.form_error = None;
-        let reset_form = true;
-        let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let rail = runtime.management().right_rail();
-            if let Some(id) = editing {
-                rail.update(RightRailPluginUpdateRequest {
-                    id,
-                    display_name: Some(name.trim().to_string()),
-                    url: Some(url.trim().to_string()),
-                    logo: trim_optional_field(&logo),
-                    clear_logo: logo.trim().is_empty(),
-                    desktop_user_agent: trim_optional_field(&desktop_ua),
-                    clear_desktop_user_agent: desktop_ua.trim().is_empty(),
-                    mobile_user_agent: trim_optional_field(&mobile_ua),
-                    clear_mobile_user_agent: mobile_ua.trim().is_empty(),
-                    ua_mode: Some(ua_mode),
-                    status: None,
-                })
-                .map(|_| ())
-            } else {
-                rail.create(RightRailPluginCreateRequest {
-                    display_name: name.trim().to_string(),
-                    url: url.trim().to_string(),
-                    logo: trim_optional_field(&logo),
-                    desktop_user_agent: trim_optional_field(&desktop_ua),
-                    mobile_user_agent: trim_optional_field(&mobile_ua),
-                    ua_mode,
-                })
-                .map(|_| ())
-            }
-        });
-        self.finish_mutation(runner, reset_form, cx);
-    }
-
-    fn toggle_plugin_status(&mut self, plugin: &RightRailPlugin, cx: &mut Context<Self>) {
-        if self.submitting || plugin.kind != RightRailPluginKind::Web {
-            return;
-        }
-        let Some(runtime) = self.runtime.clone() else {
-            return;
-        };
-        let id = plugin.id.clone();
-        let next_status = if plugin.status == RightRailPluginStatus::Enabled {
-            RightRailPluginStatus::Disabled
-        } else {
-            RightRailPluginStatus::Enabled
-        };
-        self.submitting = true;
-        let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
-                .management()
-                .right_rail()
-                .update(RightRailPluginUpdateRequest {
-                    id,
-                    display_name: None,
-                    url: None,
-                    logo: None,
-                    clear_logo: false,
-                    desktop_user_agent: None,
-                    clear_desktop_user_agent: false,
-                    mobile_user_agent: None,
-                    clear_mobile_user_agent: false,
-                    ua_mode: None,
-                    status: Some(next_status),
-                })
-                .map(|_| ())
-        });
-        self.finish_mutation(runner, false, cx);
-    }
-
-    fn request_delete(
-        &mut self,
-        plugin: &RightRailPlugin,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if plugin.kind != RightRailPluginKind::Web {
-            return;
-        }
-        let locale = self.resolved_locale(cx);
-        let text = plugin_manager_text(locale);
-        let title = plugin_manager_confirm_delete(locale, &plugin.display_name);
-        let plugin_id = plugin.id.clone();
-        let entity = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _, _| {
-            let entity = entity.clone();
-            let plugin_id = plugin_id.clone();
-            dialog
-                .title(title.clone())
-                .footer(
-                    DialogFooter::new()
-                        .child(
-                            DialogClose::new().child(
-                                Button::new("cancel-delete-plugin")
-                                    .outline()
-                                    .label(text.cancel),
-                            ),
-                        )
-                        .child(
-                            DialogAction::new().child(
-                                Button::new("confirm-delete-plugin")
-                                    .danger()
-                                    .label(text.delete),
-                            ),
-                        ),
-                )
-                .on_ok(move |_, _, cx| {
-                    let _ = entity.update(cx, |this, cx| this.delete_plugin(plugin_id.clone(), cx));
-                    true
-                })
-        });
-    }
-
-    fn delete_plugin(&mut self, plugin_id: RightRailPluginId, cx: &mut Context<Self>) {
-        if self.submitting {
-            return;
-        }
-        let Some(runtime) = self.runtime.clone() else {
-            return;
-        };
-        if self.editing_plugin_id.as_ref() == Some(&plugin_id) {
-            self.editing_plugin_id = None;
-        }
-        self.submitting = true;
-        let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
-                .management()
-                .right_rail()
-                .delete(RightRailPluginDeleteRequest { id: plugin_id })
-                .map(|_| ())
-        });
-        self.finish_mutation(runner, false, cx);
-    }
-
-    fn finish_mutation(
-        &mut self,
-        runner: impl std::future::Future<
-            Output = Result<vibex_core::VibexResult<()>, gpui_tokio::JoinError>,
-        > + 'static,
-        reset_form: bool,
-        cx: &mut Context<Self>,
-    ) {
-        self.mutation_task = Some(cx.spawn(
-            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let outcome = runner.await;
-                let _ = entity.update(cx, |this, cx| {
-                    this.submitting = false;
-                    this.mutation_task = None;
-                    match outcome {
-                        Ok(Ok(())) => {
-                            if reset_form {
-                                this.editing_plugin_id = None;
-                                this.form_error = None;
-                                this.pending_form_reset = true;
-                            }
-                            this.load_plugins(cx);
-                            let _ = this.workbench.update(cx, |workbench, cx| {
-                                workbench.load_right_rail_plugins(cx);
-                            });
-                        }
-                        Ok(Err(error)) => {
-                            this.form_error = Some(format!("{}: {}", error.code, error.message));
-                        }
-                        Err(error) => {
-                            this.form_error = Some(format!("plugin mutation failed: {error}"));
-                        }
-                    }
-                    cx.notify();
-                });
-            },
-        ));
-        cx.notify();
-    }
-
-    fn render_plugin_row(
-        &self,
-        plugin: &RightRailPlugin,
-        text: &PluginManagerText,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let is_system = plugin.kind == RightRailPluginKind::System;
-        let icon = plugin
-            .system_key
-            .map(right_rail_system_plugin_icon)
-            .unwrap_or_else(|| Icon::new(IconName::Globe));
-        let row_id = plugin.id.as_str().to_string();
-        let row = h_flex()
-            .w_full()
-            .min_w_0()
-            .items_center()
-            .gap_2()
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(cx.theme().border)
-            .p_2()
-            .mb_1()
-            .child(icon.size(px(16.0)).text_color(cx.theme().foreground));
-        if is_system {
-            row.child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .child(
-                        div()
-                            .truncate()
-                            .text_xs()
-                            .font_medium()
-                            .child(plugin.display_name.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(text.locked_description),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .rounded(px(6.0))
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .px_2()
-                    .py(px(1.0))
-                    .text_xs()
-                    .child(text.system_plugin),
-            )
-            .into_any_element()
-        } else {
-            let edit_plugin = plugin.clone();
-            let toggle_plugin = plugin.clone();
-            let delete_plugin = plugin.clone();
-            let enabled = plugin.status == RightRailPluginStatus::Enabled;
-            row.child(
-                div()
-                    .id(SharedString::from(format!("plugin-edit-target-{row_id}")))
-                    .min_w_0()
-                    .flex_1()
-                    .cursor_pointer()
-                    .on_click(cx.listener({
-                        let edit_plugin = edit_plugin.clone();
-                        move |this, _, window, cx| this.begin_edit(&edit_plugin, window, cx)
-                    }))
-                    .child(
-                        div()
-                            .truncate()
-                            .text_xs()
-                            .font_medium()
-                            .child(plugin.display_name.clone()),
-                    )
-                    .child(
-                        div()
-                            .truncate()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(plugin.url.clone().unwrap_or_default()),
-                    ),
-            )
-            .child(
-                Switch::new(SharedString::from(format!("plugin-status-{row_id}")))
-                    .small()
-                    .checked(enabled)
-                    .disabled(self.submitting)
-                    .tooltip(if enabled { text.disable } else { text.enable })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.toggle_plugin_status(&toggle_plugin, cx)
-                    })),
-            )
-            .child(
-                Button::new(SharedString::from(format!("plugin-edit-{row_id}")))
-                    .xsmall()
-                    .ghost()
-                    .compact()
-                    .size(px(24.0))
-                    .icon(IconName::Settings)
-                    .tooltip(text.edit)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.begin_edit(&edit_plugin, window, cx)
-                    })),
-            )
-            .child(
-                Button::new(SharedString::from(format!("plugin-delete-{row_id}")))
-                    .xsmall()
-                    .ghost()
-                    .compact()
-                    .size(px(24.0))
-                    .icon(Icon::default().path("icons/vibex/trash-2.svg"))
-                    .tooltip(text.delete)
-                    .disabled(self.submitting)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.request_delete(&delete_plugin, window, cx)
-                    })),
-            )
-            .into_any_element()
-        }
-    }
-
-    fn render_form_field(
-        &self,
-        label: &'static str,
-        input: &Entity<InputState>,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        v_flex()
-            .w_full()
-            .min_w_0()
-            .gap(px(6.0))
-            .child(div().text_xs().font_medium().child(label))
-            .child(
-                Input::new(input)
-                    .small()
-                    .rounded(px(8.0))
-                    .border_color(cx.theme().input)
-                    .bg(cx.theme().background),
-            )
-            .into_any_element()
-    }
-}
-
-impl Render for RightRailPluginManager {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.pending_form_reset {
-            self.pending_form_reset = false;
-            self.begin_create(window, cx);
-        }
-        let locale = self.resolved_locale(cx);
-        let text = plugin_manager_text(locale);
-        let viewport = window.viewport_size();
-        let body_height = (f32::from(viewport.height) - 32.0).clamp(240.0, 672.0) - 96.0;
-        let two_columns = f32::from(viewport.width) >= 700.0;
-        let editing = self.editing_plugin_id.is_some();
-        let system_plugins = self
-            .plugins
-            .iter()
-            .filter(|plugin| plugin.kind == RightRailPluginKind::System)
-            .cloned()
-            .collect::<Vec<_>>();
-        let web_plugins = self
-            .plugins
-            .iter()
-            .filter(|plugin| plugin.kind == RightRailPluginKind::Web)
-            .cloned()
-            .collect::<Vec<_>>();
-
-        let list_column = v_flex()
-            .id("plugin-manager-list")
-            .min_h_0()
-            .when(two_columns, |this| this.w(px(300.0)).flex_none().h_full())
-            .when(!two_columns, |this| this.w_full().max_h(px(160.0)))
-            .overflow_y_scrollbar()
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(cx.theme().border)
-            .p_2()
-            .child(
-                div()
-                    .mb_2()
-                    .px_1()
-                    .text_xs()
-                    .font_medium()
-                    .child(text.system_plugin),
-            )
-            .children(
-                system_plugins
-                    .iter()
-                    .map(|plugin| self.render_plugin_row(plugin, &text, cx)),
-            )
-            .child(
-                div()
-                    .mt_3()
-                    .mb_2()
-                    .px_1()
-                    .text_xs()
-                    .font_medium()
-                    .child(text.web_plugin),
-            )
-            .when(web_plugins.is_empty(), |this| {
-                this.child(
-                    div()
-                        .rounded(px(6.0))
-                        .border_1()
-                        .border_dashed()
-                        .border_color(cx.theme().border)
-                        .p_3()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(text.no_web_plugins),
-                )
-            })
-            .children(
-                web_plugins
-                    .iter()
-                    .map(|plugin| self.render_plugin_row(plugin, &text, cx)),
-            );
-
-        let form_column = v_flex()
-            .min_w_0()
-            .min_h_0()
-            .flex_1()
-            .gap_3()
-            .child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .child(div().text_sm().font_medium().child(if editing {
-                                text.edit_web_plugin
-                            } else {
-                                text.add_web_plugin
-                            }))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(text.cookie_note),
-                            ),
-                    )
-                    .when(editing, |this| {
-                        this.child(
-                            Button::new("plugin-begin-create")
-                                .small()
-                                .outline()
-                                .icon(IconName::Plus)
-                                .label(text.add_web_plugin)
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| {
-                                        this.begin_create(window, cx)
-                                    }),
-                                ),
-                        )
-                    }),
-            )
-            .when_some(self.form_error.clone(), |this, error| {
-                this.child(
-                    v_flex()
-                        .w_full()
-                        .rounded(px(8.0))
-                        .border_1()
-                        .border_color(cx.theme().danger.opacity(0.45))
-                        .bg(cx.theme().danger.opacity(0.06))
-                        .px_3()
-                        .py_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_medium()
-                                .text_color(cx.theme().danger)
-                                .child(text.error_label),
-                        )
-                        .child(div().text_xs().child(error)),
-                )
-            })
-            .child(
-                v_flex()
-                    .id("plugin-manager-form")
-                    .min_h_0()
-                    .flex_1()
-                    .gap_3()
-                    .overflow_y_scrollbar()
-                    .pr_1()
-                    .child(self.render_form_field(text.plugin_name, &self.name_input.clone(), cx))
-                    .child(self.render_form_field(text.plugin_url, &self.url_input.clone(), cx))
-                    .child(self.render_form_field(text.plugin_logo, &self.logo_input.clone(), cx))
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .min_w_0()
-                            .gap_3()
-                            .items_start()
-                            .child(self.render_form_field(
-                                text.desktop_ua,
-                                &self.desktop_ua_input.clone(),
-                                cx,
-                            ))
-                            .child(self.render_form_field(
-                                text.mobile_ua,
-                                &self.mobile_ua_input.clone(),
-                                cx,
-                            )),
-                    )
-                    .child(
-                        v_flex()
-                            .w_full()
-                            .gap(px(6.0))
-                            .child(div().text_xs().font_medium().child(text.ua_mode))
-                            .child(
-                                Button::new("plugin-ua-mode")
-                                    .small()
-                                    .outline()
-                                    .w(px(160.0))
-                                    .label(match self.ua_mode {
-                                        RightRailWebPluginUaMode::Desktop => text.ua_desktop,
-                                        RightRailWebPluginUaMode::Mobile => text.ua_mobile,
-                                    })
-                                    .dropdown_menu({
-                                        let entity = cx.weak_entity();
-                                        move |menu, _, _| {
-                                            let desktop_entity = entity.clone();
-                                            let mobile_entity = entity.clone();
-                                            menu.item(PopupMenuItem::new(text.ua_desktop).on_click(
-                                                move |_, _, cx| {
-                                                    let _ =
-                                                        desktop_entity.update(cx, |this, cx| {
-                                                            this.ua_mode =
-                                                                RightRailWebPluginUaMode::Desktop;
-                                                            cx.notify();
-                                                        });
-                                                },
-                                            ))
-                                            .item(
-                                                PopupMenuItem::new(text.ua_mobile).on_click(
-                                                    move |_, _, cx| {
-                                                        let _ =
-                                                            mobile_entity.update(cx, |this, cx| {
-                                                                this.ua_mode =
-                                                                RightRailWebPluginUaMode::Mobile;
-                                                                cx.notify();
-                                                            });
-                                                    },
-                                                ),
-                                            )
-                                        }
-                                    }),
-                            ),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .flex_none()
-                    .justify_end()
-                    .gap_2()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .pt_3()
-                    .child(
-                        Button::new("plugin-form-cancel")
-                            .outline()
-                            .label(text.cancel)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.begin_create(window, cx)),
-                            ),
-                    )
-                    .child(
-                        Button::new("plugin-form-submit")
-                            .primary()
-                            .label(if editing { text.save } else { text.create })
-                            .loading(self.submitting)
-                            .disabled(self.submitting)
-                            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
-                    ),
-            );
-
-        v_flex()
-            .w_full()
-            .h(px(body_height))
-            .min_h_0()
-            .gap_3()
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(text.description),
-            )
-            .child(if two_columns {
-                h_flex()
-                    .w_full()
-                    .min_h_0()
-                    .flex_1()
-                    .items_start()
-                    .gap_4()
-                    .child(list_column)
-                    .child(form_column)
-                    .into_any_element()
-            } else {
-                v_flex()
-                    .w_full()
-                    .min_h_0()
-                    .flex_1()
-                    .gap_3()
-                    .child(list_column)
-                    .child(form_column)
-                    .into_any_element()
-            })
-    }
-}
-
-// ---------------------------------------------------------------------------
 // External session import dialog (Tauri parity: `ExternalSessionImportDialog`)
 // ---------------------------------------------------------------------------
 
@@ -33582,9 +32036,7 @@ impl Render for VibexWorkbench {
                 || (visibility.preview_docked && self.ui_state.workbench.preview_visible)
                 || (!visibility.preview_docked && self.preview_overlay_open));
         self.set_code_preview_visible(preview_visible, cx);
-        let right_rail_visible = !right_rail_suppressed
-            && self.right_rail_panel_open()
-            && self.selected_right_rail_web_plugin().is_none();
+        let right_rail_visible = !right_rail_suppressed && self.right_rail_panel_open();
         self.set_code_workspace_surface_visibility(
             right_rail_visible && self.right_rail_mode == RightRailMode::Files,
             right_rail_visible && self.right_rail_mode == RightRailMode::Git,
@@ -35998,69 +34450,6 @@ mod tests {
         assert_eq!(
             route_right_rail_activity_id("git").as_deref(),
             Some("rail_plugin_system_git")
-        );
-        assert_eq!(
-            route_right_rail_activity_id("rail_plugin_custom_web").as_deref(),
-            Some("rail_plugin_custom_web")
-        );
-    }
-
-    #[test]
-    fn ui_hides_only_the_unsupported_builtin_web_plugins() {
-        for builtin_key in ["doubao", "kimi", "yuanbao"] {
-            assert!(!right_rail_web_builtin_is_visible(Some(builtin_key)));
-        }
-        assert!(right_rail_web_builtin_is_visible(Some("custom")));
-        assert!(right_rail_web_builtin_is_visible(None));
-    }
-
-    #[test]
-    fn right_rail_plugin_reorder_matches_tauri_before_and_after_placement() {
-        let ids = ["files", "git", "terminal", "web"]
-            .map(|id| RightRailPluginId::parse(format!("rail_plugin_{id}")).unwrap());
-
-        assert_eq!(
-            reordered_right_rail_plugin_ids(&ids, ids[3].as_str(), ids[1].as_str(), false)
-                .iter()
-                .map(RightRailPluginId::as_str)
-                .collect::<Vec<_>>(),
-            [
-                ids[0].as_str(),
-                ids[3].as_str(),
-                ids[1].as_str(),
-                ids[2].as_str(),
-            ]
-        );
-        assert_eq!(
-            reordered_right_rail_plugin_ids(&ids, ids[0].as_str(), ids[2].as_str(), true)
-                .iter()
-                .map(RightRailPluginId::as_str)
-                .collect::<Vec<_>>(),
-            [
-                ids[1].as_str(),
-                ids[2].as_str(),
-                ids[0].as_str(),
-                ids[3].as_str(),
-            ]
-        );
-    }
-
-    #[test]
-    fn right_rail_plugin_reorder_keeps_hidden_plugins_in_the_persisted_order() {
-        let ids = ["files", "doubao", "git", "terminal"]
-            .map(|id| RightRailPluginId::parse(format!("rail_plugin_{id}")).unwrap());
-
-        assert_eq!(
-            reordered_right_rail_plugin_ids(&ids, ids[3].as_str(), ids[0].as_str(), false)
-                .iter()
-                .map(RightRailPluginId::as_str)
-                .collect::<Vec<_>>(),
-            [
-                ids[3].as_str(),
-                ids[0].as_str(),
-                ids[1].as_str(),
-                ids[2].as_str(),
-            ]
         );
     }
 

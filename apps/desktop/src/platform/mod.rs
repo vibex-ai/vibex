@@ -10,14 +10,12 @@ pub const DESKTOP_UI_STATE_FILE: &str = "desktop-ui-state.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeSurfaceCapabilities {
-    pub ordinary_web_preview: bool,
     pub pdf_preview: bool,
     pub office_preview: bool,
 }
 
 impl NativeSurfaceCapabilities {
     pub const FOUNDATION: Self = Self {
-        ordinary_web_preview: false,
         pdf_preview: false,
         office_preview: false,
     };
@@ -25,12 +23,6 @@ impl NativeSurfaceCapabilities {
 
 pub trait NativeSurfaceHost: Send + Sync {
     fn capabilities(&self) -> NativeSurfaceCapabilities;
-    fn open_ordinary_web_preview(&self, _url: &str) -> VibexResult<()> {
-        Err(VibexError::capability(
-            "web_preview_not_supported",
-            "ordinary Web Preview is not supported by the GPUI Foundation build",
-        ))
-    }
 }
 
 #[derive(Debug, Default)]
@@ -589,10 +581,6 @@ mod tests {
     fn foundation_native_surfaces_fail_truthfully() {
         let host = FoundationNativeSurfaceHost;
         assert_eq!(host.capabilities(), NativeSurfaceCapabilities::FOUNDATION);
-        let error = host
-            .open_ordinary_web_preview("https://example.com")
-            .unwrap_err();
-        assert_eq!(error.code, "web_preview_not_supported");
     }
 
     #[test]

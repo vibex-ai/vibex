@@ -30,6 +30,7 @@ use vibex_core::{
     TerminalCreateRequest, TerminalId, TerminalSession, TerminalStatus, TerminalSwitchShellRequest,
     WorkspaceId,
 };
+use vibex_desktop_runtime::validate_external_open_url;
 use vibex_markdown::code_font_weight;
 use vibex_terminal::{
     TerminalCellColor, TerminalCellSnapshot, TerminalCursorShape, TerminalFrameSnapshot,
@@ -1298,21 +1299,14 @@ impl TerminalSurface {
         let Some(url) = self.active_hyperlink.clone() else {
             return;
         };
-        let validated = vibex_content::WebPreviewController::restored(
-            None,
-            vibex_content::ContentSurfaceOrigin::Preview,
-        )
-        .and_then(|controller| controller.open_external(&url));
-        let vibex_content::WebHostAction::OpenExternal(url) = (match validated {
-            Ok(action) => action,
+        let url = match validate_external_open_url(&url) {
+            Ok(validated) => validated.url,
             Err(error) => {
                 self.note = format!("Link rejected: {}", error.message);
                 self.last_error_code = Some("terminal_hyperlink_invalid");
                 cx.notify();
                 return;
             }
-        }) else {
-            return;
         };
         match spawn_external_url(&url) {
             Ok(mut child) => {

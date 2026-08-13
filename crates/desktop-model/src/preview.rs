@@ -14,11 +14,6 @@ pub enum PreviewTarget {
         #[serde(alias = "terminalId")]
         terminal_id: String,
     },
-    Web {
-        #[serde(alias = "webId")]
-        web_id: String,
-        url: String,
-    },
     GitDiff {
         path: String,
         staged: bool,
@@ -43,10 +38,6 @@ impl PreviewTarget {
             Self::Terminal { terminal_id } => {
                 *terminal_id = normalized_text(terminal_id)?;
             }
-            Self::Web { web_id, url } => {
-                *web_id = normalized_text(web_id)?;
-                *url = url.trim().to_string();
-            }
             Self::GitCommit {
                 commit_hash,
                 subject,
@@ -65,7 +56,6 @@ impl PreviewTarget {
         match self {
             Self::File { path } => format!("file:{path}"),
             Self::Terminal { terminal_id } => format!("terminal:{terminal_id}"),
-            Self::Web { web_id, .. } => format!("web:{web_id}"),
             Self::GitDiff { path, staged } => {
                 format!("git:{}:{path}", if *staged { "staged" } else { "unstaged" })
             }

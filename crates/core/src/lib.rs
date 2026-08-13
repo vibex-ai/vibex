@@ -23,7 +23,6 @@ pub mod provider_projection;
 pub mod relay;
 pub mod remote;
 pub mod remote_v2;
-pub mod right_rail;
 pub mod runtime;
 pub mod scheduled_task;
 pub mod session_import;
@@ -143,8 +142,8 @@ pub use ids::{
     AutomationRunStepId, ChannelId, CorrelationId, DeviceId, EventId, HookId, McpServerId,
     MessageSubmissionId, ModelProviderProfileId, NativeStateHomeId, ProjectId, PromptId,
     ProviderProfileId, RelayConnectionId, RelayFrameId, RelayPeerId, RelayRoomId, RelaySessionId,
-    RequestId, RightRailPluginId, RuntimeBindingId, RuntimeClientId, RuntimeLeaseId,
-    RuntimeProcessId, RuntimeStreamId, RuntimeSwitchId, RuntimeSwitchOperationId, ScheduledTaskId,
+    RequestId, RuntimeBindingId, RuntimeClientId, RuntimeLeaseId, RuntimeProcessId,
+    RuntimeStreamId, RuntimeSwitchId, RuntimeSwitchOperationId, ScheduledTaskId,
     ScheduledTaskRunId, SkillId, TerminalId, TimelineItemId, UsageExecutionId, VibexSessionId,
     WorkspaceId,
 };
@@ -301,15 +300,6 @@ pub use remote::{
     RemoteWorkbenchOperationKind, RemoteWorkbenchRequest,
 };
 pub use remote_v2::*;
-pub use right_rail::{
-    RightRailIframeEmbedCheckRequest, RightRailIframeEmbedCheckResponse,
-    RightRailIframeEmbedStatus, RightRailPlugin, RightRailPluginCreateRequest,
-    RightRailPluginDeleteRequest, RightRailPluginKind, RightRailPluginReorderRequest,
-    RightRailPluginStatus, RightRailPluginUpdateRequest, RightRailSystemPluginKey,
-    RightRailWebPluginUaMode, RightRailWebviewBounds, RightRailWebviewCloseRequest,
-    RightRailWebviewHideRequest, RightRailWebviewNavigateRequest, RightRailWebviewOpenRequest,
-    RightRailWebviewSetBoundsRequest, RightRailWebviewShowRequest,
-};
 pub use runtime::{
     AcpAdapterId, ActiveWorkKind, AgentRuntimeRouteKey, AgentSessionRestoreAttempt,
     AgentSessionRestoreCompatibility, AgentSessionRestoreCompatibilityKey,

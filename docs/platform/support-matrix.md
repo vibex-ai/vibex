@@ -29,7 +29,6 @@ filesystem services. The shared UI and Wide/Medium/Compact shell rules live in
 | Terminal | Native PTY plus shared terminal UI | Remote binary stream and input; no local shell |
 | PDF | Native PDFium worker on supported packaged targets | Remote or browser-safe presentation only; no native PDFium in the client |
 | Office documents | Bounded native projection where supported | Remote/browser-safe presentation only |
-| Ordinary Web Preview | External open; no embedded browser surface in the default product graph | The client itself is Web-based, but arbitrary iframe embedding is not a supported workbench surface |
 | Secure credentials | OS/native storage owned by the desktop runtime | Browser storage is not a secret store; Capacitor secure storage requires device validation |
 
 ## Evidence Rules

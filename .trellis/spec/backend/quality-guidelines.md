@@ -1942,8 +1942,6 @@ linux-release-evidence.v1 -> {
 }
 
 approved deviation ids, in order -> [
-  ordinary_web_preview_v1,
-  right_rail_web_external_open_v1,
   macos_windows_release_deferred
 ]
 ```
@@ -2073,8 +2071,8 @@ approved deviation ids, in order -> [
   reloads the canonical state.
 - Good: the exact Stable `.deb` and AppImage pass compiled probes and PDFium resource
   checks, then Wayland/XWayland each finish 300 seconds with the final RSS below budget.
-- Good: parity audit and release candidate both list ordinary Web Preview, right-rail
-  Web, and macOS/Windows deviation ids exactly once in the approved order.
+- Good: parity audit and release candidate list the macOS/Windows deviation id
+  exactly once in the approved order.
 - Base: an older request omits optional keys and receives defaults while current
   schema exports all 25 entries.
 - Base: macOS/Windows remain explicit accepted deviations with no inferred build,
@@ -2091,8 +2089,8 @@ approved deviation ids, in order -> [
   let `VIBEX_CHANNEL=stable` override an already built Preview/RC binary.
 - Bad: approve an AppImage because it launches without checking its transformed
   PDFium identity, or use the observation peak in place of the frozen end-RSS metric.
-- Bad: mark ordinary Web Preview `accepted_deviation` in the workflow audit but omit it
-  from the release candidate's approved-deviation ledger.
+- Bad: mark a platform capability `accepted_deviation` in the workflow audit but
+  omit it from the release candidate's approved-deviation ledger.
 
 ### 6. Tests Required
 
@@ -2175,7 +2173,6 @@ idle RSS gate = endRssKiB <= frozen process_tree_idle_end_rss_kib budget
 ```json
 {
   "approvedDeviations": [
-    { "id": "right_rail_web_external_open_v1" },
     { "id": "macos_windows_release_deferred" }
   ]
 }
@@ -2271,8 +2268,6 @@ artifact `{ path, bytes, sha256, applicationId }`.
 ```json
 {
   "approvedDeviations": [
-    { "id": "ordinary_web_preview_v1" },
-    { "id": "right_rail_web_external_open_v1" },
     { "id": "macos_windows_release_deferred" }
   ]
 }

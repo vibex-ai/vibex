@@ -28,24 +28,19 @@ use vibex_core::{
     RemoteCancelPairingOfferRequest, RemoteCreatePairingCodeRequest,
     RemoteCreatePairingCodeResponse, RemoteCreatePairingOfferRequest,
     RemoteCreatePairingOfferResponse, RemoteDeviceDetail, RemotePairingOfferSummary,
-    RemoteRevokeDeviceRequest, RightRailPlugin, RightRailPluginCreateRequest,
-    RightRailPluginDeleteRequest, RightRailPluginReorderRequest, RightRailPluginUpdateRequest,
-    ScheduledTask, ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
-    ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord, ScheduledTaskCreateRequest,
-    ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun, ScheduledTaskRunListRequest,
-    ScheduledTaskUpdateRequest, VibexError, VibexResult,
+    RemoteRevokeDeviceRequest, ScheduledTask, ScheduledTaskAttentionListRequest,
+    ScheduledTaskAttentionSummary, ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord,
+    ScheduledTaskCreateRequest, ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun,
+    ScheduledTaskRunListRequest, ScheduledTaskUpdateRequest, VibexError, VibexResult,
 };
 use vibex_db::{
     AutomationGraphRepository, RemoteAuditRepository, RemoteDeviceRepository,
-    RightRailPluginRepository, ScheduledTaskRepository, apply_migrations, open_database,
+    ScheduledTaskRepository, apply_migrations, open_database,
 };
 use vibex_diagnostics::assert_no_sensitive_sentinels;
 use vibex_remote::RemoteTrustService;
 
-use crate::{
-    AutomationHandle, BackupHandle, DiagnosticsHandle, ProviderHandle, RightRailHandle,
-    ScheduledHandle,
-};
+use crate::{AutomationHandle, BackupHandle, DiagnosticsHandle, ProviderHandle, ScheduledHandle};
 
 /// Provider/config-switch operations exposed as a typed desktop boundary.
 /// The GPUI layer can use this facade without depending on the config-switch
@@ -1057,39 +1052,6 @@ impl AutomationHandle {
     }
 }
 
-impl RightRailHandle {
-    pub fn list(&self) -> VibexResult<Vec<RightRailPlugin>> {
-        RightRailPluginRepository::list(&migrated(&self.db_path)?)
-    }
-
-    pub fn create(&self, request: RightRailPluginCreateRequest) -> VibexResult<RightRailPlugin> {
-        let _claim = self.mutation_guard.claim("right-rail:create")?;
-        RightRailPluginRepository::create(&migrated(&self.db_path)?, request)
-    }
-
-    pub fn update(&self, request: RightRailPluginUpdateRequest) -> VibexResult<RightRailPlugin> {
-        let _claim = self
-            .mutation_guard
-            .claim(format!("right-rail:update:{}", request.id))?;
-        RightRailPluginRepository::update(&migrated(&self.db_path)?, request)
-    }
-
-    pub fn delete(&self, request: RightRailPluginDeleteRequest) -> VibexResult<RightRailPlugin> {
-        let _claim = self
-            .mutation_guard
-            .claim(format!("right-rail:delete:{}", request.id))?;
-        RightRailPluginRepository::soft_delete(&migrated(&self.db_path)?, request)
-    }
-
-    pub fn reorder(
-        &self,
-        request: RightRailPluginReorderRequest,
-    ) -> VibexResult<Vec<RightRailPlugin>> {
-        let _claim = self.mutation_guard.claim("right-rail:reorder")?;
-        RightRailPluginRepository::reorder(&migrated(&self.db_path)?, request)
-    }
-}
-
 impl DiagnosticsHandle {
     pub fn export(&self, request: DiagnosticBundleRequest) -> VibexResult<DiagnosticBundle> {
         self.service.export_bundle(request)
@@ -1254,32 +1216,32 @@ impl crate::RemoteHandle {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RightRailExternalOpen {
+pub struct ExternalOpenUrl {
     pub url: String,
 }
 
 /// Validates the v1 GPUI external-open boundary. No network probe or embedded
 /// surface is allocated here; the caller may pass the validated URL to the OS.
-pub fn validate_external_open_url(value: &str) -> VibexResult<RightRailExternalOpen> {
+pub fn validate_external_open_url(value: &str) -> VibexResult<ExternalOpenUrl> {
     let url = Url::parse(value.trim()).map_err(|_| {
         VibexError::validation(
-            "right_rail_external_url_invalid",
-            "Web plugin URL must be a valid HTTP or HTTPS URL",
+            "external_url_invalid",
+            "URL must be a valid HTTP or HTTPS URL",
         )
     })?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         return Err(VibexError::validation(
-            "right_rail_external_url_invalid",
-            "Web plugin URL must use HTTP or HTTPS and include a host",
+            "external_url_invalid",
+            "URL must use HTTP or HTTPS and include a host",
         ));
     }
     if !url.username().is_empty() || url.password().is_some() {
         return Err(VibexError::validation(
-            "right_rail_external_url_credentials_rejected",
-            "Web plugin URLs must not contain embedded credentials",
+            "external_url_credentials_rejected",
+            "URLs must not contain embedded credentials",
         ));
     }
-    Ok(RightRailExternalOpen {
+    Ok(ExternalOpenUrl {
         url: url.to_string(),
     })
 }
@@ -1311,13 +1273,13 @@ mod tests {
             validate_external_open_url("file:///tmp/secret")
                 .unwrap_err()
                 .code,
-            "right_rail_external_url_invalid"
+            "external_url_invalid"
         );
         assert_eq!(
             validate_external_open_url("https://user:pass@example.invalid/")
                 .unwrap_err()
                 .code,
-            "right_rail_external_url_credentials_rejected"
+            "external_url_credentials_rejected"
         );
     }
 
