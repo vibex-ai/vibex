@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -7,6 +9,27 @@ use gpui::App;
 use vibex_core::{VibexError, VibexResult};
 
 pub const DESKTOP_UI_STATE_FILE: &str = "desktop-ui-state.json";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StorageUsage {
+    pub database_bytes: u64,
+    pub session_bytes: u64,
+    pub terminal_bytes: u64,
+    pub attachment_bytes: u64,
+    pub diagnostic_bytes: u64,
+    pub other_bytes: u64,
+}
+
+impl StorageUsage {
+    pub const fn total_bytes(self) -> u64 {
+        self.database_bytes
+            .saturating_add(self.session_bytes)
+            .saturating_add(self.terminal_bytes)
+            .saturating_add(self.attachment_bytes)
+            .saturating_add(self.diagnostic_bytes)
+            .saturating_add(self.other_bytes)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeSurfaceCapabilities {
@@ -36,6 +59,298 @@ impl NativeSurfaceHost for FoundationNativeSurfaceHost {
 
 pub fn ui_state_path(home: &Path) -> PathBuf {
     home.join(DESKTOP_UI_STATE_FILE)
+}
+
+pub fn storage_usage(home: &Path) -> VibexResult<StorageUsage> {
+    ensure_existing_absolute_path(home)?;
+    let mut usage = StorageUsage::default();
+    collect_storage_usage(home, home, &mut usage).map_err(|error| {
+        VibexError::storage(
+            "desktop_storage_usage_failed",
+            "failed to inspect desktop storage usage",
+        )
+        .with_diagnostic("errorKind", format!("{:?}", error.kind()))
+    })?;
+    Ok(usage)
+}
+
+fn collect_storage_usage(root: &Path, path: &Path, usage: &mut StorageUsage) -> io::Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            collect_storage_usage(root, &path, usage)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let bytes = entry.metadata()?.len();
+        let relative = path.strip_prefix(root).unwrap_or(&path);
+        let folded = relative.to_string_lossy().to_ascii_lowercase();
+        match storage_bucket(&folded) {
+            StorageBucket::Database => {
+                usage.database_bytes = usage.database_bytes.saturating_add(bytes)
+            }
+            StorageBucket::Attachment => {
+                usage.attachment_bytes = usage.attachment_bytes.saturating_add(bytes)
+            }
+            StorageBucket::Diagnostic => {
+                usage.diagnostic_bytes = usage.diagnostic_bytes.saturating_add(bytes)
+            }
+            StorageBucket::Terminal => {
+                usage.terminal_bytes = usage.terminal_bytes.saturating_add(bytes)
+            }
+            StorageBucket::Session => {
+                usage.session_bytes = usage.session_bytes.saturating_add(bytes)
+            }
+            StorageBucket::Other => usage.other_bytes = usage.other_bytes.saturating_add(bytes),
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageBucket {
+    Database,
+    Session,
+    Terminal,
+    Attachment,
+    Diagnostic,
+    Other,
+}
+
+fn storage_bucket(relative_path: &str) -> StorageBucket {
+    if relative_path.ends_with("vibex.db")
+        || relative_path.ends_with("vibex.db-wal")
+        || relative_path.ends_with("vibex.db-shm")
+    {
+        StorageBucket::Database
+    } else if relative_path.contains("attachment") || relative_path.contains("upload") {
+        StorageBucket::Attachment
+    } else if relative_path.contains("diagnostic")
+        || relative_path.contains("backup")
+        || relative_path.contains("log")
+    {
+        StorageBucket::Diagnostic
+    } else if relative_path.contains("terminal") || relative_path.contains("pty") {
+        StorageBucket::Terminal
+    } else if relative_path.contains("session") || relative_path.contains("transcript") {
+        StorageBucket::Session
+    } else {
+        StorageBucket::Other
+    }
+}
+
+pub fn set_launch_at_login(enabled: bool, application_id: &str) -> VibexResult<()> {
+    let target = launch_at_login_path(application_id)?;
+    if !enabled {
+        match fs::remove_file(&target) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(VibexError::storage(
+                    "desktop_launch_at_login_remove_failed",
+                    "failed to disable launch at login",
+                )
+                .with_diagnostic("errorKind", format!("{:?}", error.kind())));
+            }
+        }
+    }
+    let executable = env::current_exe().map_err(|error| {
+        VibexError::process(
+            "desktop_launch_at_login_executable_failed",
+            "failed to resolve the Vibex executable",
+        )
+        .with_diagnostic("errorKind", format!("{:?}", error.kind()))
+    })?;
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            VibexError::storage(
+                "desktop_launch_at_login_directory_failed",
+                "failed to prepare the launch-at-login directory",
+            )
+            .with_diagnostic("errorKind", format!("{:?}", error.kind()))
+        })?;
+    }
+    fs::write(
+        &target,
+        launch_at_login_contents(&executable, application_id),
+    )
+    .map_err(|error| {
+        VibexError::storage(
+            "desktop_launch_at_login_write_failed",
+            "failed to enable launch at login",
+        )
+        .with_diagnostic("errorKind", format!("{:?}", error.kind()))
+    })
+}
+
+pub fn launch_at_login_enabled(application_id: &str) -> bool {
+    launch_at_login_path(application_id).is_ok_and(|path| path.is_file())
+}
+
+fn launch_at_login_path(application_id: &str) -> VibexResult<PathBuf> {
+    if application_id.is_empty()
+        || !application_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-'))
+    {
+        return Err(VibexError::validation(
+            "desktop_launch_at_login_application_id_invalid",
+            "application id is invalid",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let config = env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+            .ok_or_else(|| {
+                VibexError::storage(
+                    "desktop_launch_at_login_home_missing",
+                    "desktop configuration directory is unavailable",
+                )
+            })?;
+        return Ok(config
+            .join("autostart")
+            .join(format!("{application_id}.desktop")));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+            VibexError::storage(
+                "desktop_launch_at_login_home_missing",
+                "home directory is unavailable",
+            )
+        })?;
+        return Ok(home
+            .join("Library/LaunchAgents")
+            .join(format!("{application_id}.plist")));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let app_data = env::var_os("APPDATA").map(PathBuf::from).ok_or_else(|| {
+            VibexError::storage(
+                "desktop_launch_at_login_home_missing",
+                "application data directory is unavailable",
+            )
+        })?;
+        return Ok(app_data
+            .join("Microsoft/Windows/Start Menu/Programs/Startup")
+            .join(format!("{application_id}.cmd")));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn launch_at_login_contents(executable: &Path, _: &str) -> Vec<u8> {
+    format!(
+        "[Desktop Entry]\nType=Application\nName=Vibex\nExec=\"{}\"\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
+        desktop_exec_escape(&executable.to_string_lossy())
+    )
+    .into_bytes()
+}
+
+#[cfg(target_os = "linux")]
+fn desktop_exec_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('`', "\\`")
+        .replace('$', "\\$")
+        .replace('%', "%%")
+}
+
+#[cfg(target_os = "macos")]
+fn launch_at_login_contents(executable: &Path, application_id: &str) -> Vec<u8> {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict><key>Label</key><string>{application_id}</string><key>ProgramArguments</key><array><string>{}</string></array><key>RunAtLoad</key><true/></dict></plist>\n",
+        xml_escape(&executable.to_string_lossy())
+    )
+    .into_bytes()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+#[cfg(target_os = "windows")]
+fn launch_at_login_contents(executable: &Path, _: &str) -> Vec<u8> {
+    format!(
+        "@echo off\r\nstart \"\" \"{}\"\r\n",
+        windows_batch_escape(&executable.to_string_lossy())
+    )
+    .into_bytes()
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_batch_escape(value: &str) -> String {
+    value.replace('%', "%%")
+}
+
+pub fn send_system_notification(title: &str, body: &str) -> VibexResult<()> {
+    let title = bounded_notification_text(title, 80)?;
+    let body = bounded_notification_text(body, 240)?;
+    #[cfg(target_os = "linux")]
+    {
+        return spawn_open_command(
+            Command::new("notify-send").args(["--app-name=Vibex", &title, &body]),
+            "desktop_notification_failed",
+            "failed to show a system notification",
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "display notification {} with title {}",
+            apple_script_string(&body),
+            apple_script_string(&title)
+        );
+        return spawn_open_command(
+            Command::new("osascript").args(["-e", &script]),
+            "desktop_notification_failed",
+            "failed to show a system notification",
+        );
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let script = format!(
+            "$w=New-Object -ComObject WScript.Shell;$w.Popup('{}',8,'{}',64)",
+            body.replace('\'', "''"),
+            title.replace('\'', "''")
+        );
+        return spawn_open_command(
+            Command::new("powershell.exe").args(["-NoProfile", "-Command", &script]),
+            "desktop_notification_failed",
+            "failed to show a system notification",
+        );
+    }
+}
+
+fn bounded_notification_text(value: &str, limit: usize) -> VibexResult<String> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err(VibexError::validation(
+            "desktop_notification_text_invalid",
+            "notification text is invalid",
+        ));
+    }
+    Ok(value.chars().take(limit).collect())
+}
+
+#[cfg(target_os = "macos")]
+fn apple_script_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 pub fn platform_font_fallbacks() -> &'static [&'static str] {
@@ -594,6 +909,52 @@ mod tests {
                 "bad\nfont".to_string(),
             ]),
             vec!["inter variable".to_string(), "Noto Sans".to_string()]
+        );
+    }
+
+    #[test]
+    fn storage_bucket_prefers_specific_runtime_artifacts() {
+        assert_eq!(storage_bucket("vibex.db-wal"), StorageBucket::Database);
+        assert_eq!(
+            storage_bucket("clipboard-attachments/image.bin"),
+            StorageBucket::Attachment
+        );
+        assert_eq!(
+            storage_bucket("terminal-output.log"),
+            StorageBucket::Diagnostic
+        );
+        assert_eq!(
+            storage_bucket("sessions/transcript.json"),
+            StorageBucket::Session
+        );
+        assert_eq!(storage_bucket("sessions/item.json"), StorageBucket::Session);
+        assert_eq!(storage_bucket("misc.bin"), StorageBucket::Other);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_autostart_contents_escape_exec_path() {
+        let content = String::from_utf8(launch_at_login_contents(
+            Path::new("/tmp/Vibex \\\"preview\\\"/vibex"),
+            "dev.vibex.preview",
+        ))
+        .unwrap();
+        assert!(content.contains("Exec=\"/tmp/Vibex \\\\\\\"preview\\\\\\\"/vibex\""));
+    }
+
+    #[test]
+    fn macos_autostart_xml_escapes_executable_path() {
+        assert_eq!(
+            xml_escape("/Applications/Vibex & Preview <1>/vibex"),
+            "/Applications/Vibex &amp; Preview &lt;1&gt;/vibex"
+        );
+    }
+
+    #[test]
+    fn windows_autostart_batch_escapes_percent_expansion() {
+        assert_eq!(
+            windows_batch_escape(r"C:\\Apps\\Vibex %preview%\\vibex.exe"),
+            r"C:\\Apps\\Vibex %%preview%%\\vibex.exe"
         );
     }
 }

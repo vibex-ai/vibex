@@ -16,6 +16,7 @@ pub const MIN_UI_STATE_WRITE_DELAY_MS: u64 = 100;
 pub const MAX_UI_STATE_WRITE_DELAY_MS: u64 = 300;
 pub const DEFAULT_CORRUPT_BACKUP_LIMIT: usize = 3;
 pub const RUNTIME_SELECTION_PREFERENCE_LIMIT: usize = 256;
+pub const KEYBOARD_SHORTCUT_OVERRIDE_LIMIT: usize = 64;
 
 #[derive(Debug, Error)]
 pub enum UiStateError {
@@ -60,6 +61,39 @@ pub enum LocaleMode {
     ZhTw,
     #[default]
     System,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupDestination {
+    #[default]
+    RestoreWorkbench,
+    NewSession,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerQueueSendMode {
+    #[default]
+    Automatic,
+    Manual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageSendKey {
+    #[default]
+    Enter,
+    CommandEnter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalWorkingDirectory {
+    #[default]
+    CurrentWorktree,
+    ProjectRoot,
+    CurrentFile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +172,10 @@ pub struct WorkbenchUiState {
     pub sidebar_width: f32,
     pub preview_width: f32,
     pub right_rail_width: f32,
+    #[serde(default = "default_remember_layout")]
+    pub remember_layout: bool,
+    #[serde(default)]
+    pub default_new_session_location: NewSessionLocation,
 }
 
 impl Default for WorkbenchUiState {
@@ -154,8 +192,14 @@ impl Default for WorkbenchUiState {
             sidebar_width: 320.0,
             preview_width: 520.0,
             right_rail_width: 336.0,
+            remember_layout: default_remember_layout(),
+            default_new_session_location: NewSessionLocation::CurrentCheckout,
         }
     }
+}
+
+const fn default_remember_layout() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -228,6 +272,12 @@ pub struct ComposerUiState {
     pub runtime_selections_by_agent: BTreeMap<AgentId, SessionRuntimeSelection>,
     #[serde(default)]
     pub runtime_selections_by_model: Vec<SessionRuntimeSelection>,
+    #[serde(default)]
+    pub default_runtime_selection: Option<SessionRuntimeSelection>,
+    #[serde(default)]
+    pub queue_send_mode: ComposerQueueSendMode,
+    #[serde(default)]
+    pub message_send_key: MessageSendKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,18 +314,56 @@ const fn default_enhanced_command_execution_display() -> bool {
 pub struct DesktopBehaviorUiState {
     #[serde(default = "default_close_to_tray")]
     pub close_to_tray: bool,
+    #[serde(default)]
+    pub startup_destination: StartupDestination,
+    #[serde(default)]
+    pub launch_at_login: bool,
+    #[serde(default = "default_notifications_enabled")]
+    pub notifications_enabled: bool,
+    #[serde(default = "default_notifications_enabled")]
+    pub notify_agent_completed: bool,
+    #[serde(default = "default_notifications_enabled")]
+    pub notify_agent_needs_input: bool,
+    #[serde(default = "default_notifications_enabled")]
+    pub notify_agent_failed: bool,
 }
 
 impl Default for DesktopBehaviorUiState {
     fn default() -> Self {
         Self {
             close_to_tray: default_close_to_tray(),
+            startup_destination: StartupDestination::RestoreWorkbench,
+            launch_at_login: false,
+            notifications_enabled: default_notifications_enabled(),
+            notify_agent_completed: default_notifications_enabled(),
+            notify_agent_needs_input: default_notifications_enabled(),
+            notify_agent_failed: default_notifications_enabled(),
         }
     }
 }
 
 const fn default_close_to_tray() -> bool {
     true
+}
+
+const fn default_notifications_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalPreferencesUiState {
+    #[serde(default)]
+    pub shell: Option<String>,
+    #[serde(default)]
+    pub working_directory: TerminalWorkingDirectory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyboardUiState {
+    #[serde(default)]
+    pub shortcuts: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -296,11 +384,15 @@ pub struct DesktopUiStateV1 {
     pub sidebar: SidebarUiState,
     pub preview: PreviewUiState,
     pub terminal: TerminalUiState,
+    #[serde(default)]
+    pub terminal_preferences: TerminalPreferencesUiState,
     pub right_rail: RightRailUiState,
     #[serde(default)]
     pub session: SessionUiState,
     #[serde(default)]
     pub desktop_behavior: DesktopBehaviorUiState,
+    #[serde(default)]
+    pub keyboard: KeyboardUiState,
     #[serde(default)]
     pub composer: ComposerUiState,
     #[serde(default)]
@@ -322,9 +414,11 @@ impl Default for DesktopUiStateV1 {
             sidebar: SidebarUiState::default(),
             preview: PreviewUiState::default(),
             terminal: TerminalUiState::default(),
+            terminal_preferences: TerminalPreferencesUiState::default(),
             right_rail: RightRailUiState::default(),
             session: SessionUiState::default(),
             desktop_behavior: DesktopBehaviorUiState::default(),
+            keyboard: KeyboardUiState::default(),
             composer: ComposerUiState::default(),
             terminal_tab_titles: BTreeMap::new(),
             agent_tab_order: Vec::new(),
@@ -388,6 +482,8 @@ impl DesktopUiStateV1 {
         self.right_rail.selected_activity_id =
             bounded_optional(self.right_rail.selected_activity_id.take(), 256);
         normalize_ids(&mut self.composer.terminal_ids, 64);
+        self.terminal_preferences.shell =
+            bounded_optional(self.terminal_preferences.shell.take(), 4_096);
         self.composer.runtime_selections_by_agent =
             std::mem::take(&mut self.composer.runtime_selections_by_agent)
                 .into_iter()
@@ -423,6 +519,22 @@ impl DesktopUiStateV1 {
             runtime_selections_by_model.push(selection);
         }
         self.composer.runtime_selections_by_model = runtime_selections_by_model;
+        self.composer.default_runtime_selection = self
+            .composer
+            .default_runtime_selection
+            .take()
+            .and_then(|mut selection| {
+                normalize_runtime_selection(&mut selection).then_some(selection)
+            });
+        self.keyboard.shortcuts = std::mem::take(&mut self.keyboard.shortcuts)
+            .into_iter()
+            .filter_map(|(action, keystroke)| {
+                let action = bounded_required(&action, 80)?;
+                let keystroke = bounded_required(&keystroke, 80)?;
+                Some((action, keystroke))
+            })
+            .take(KEYBOARD_SHORTCUT_OVERRIDE_LIMIT)
+            .collect();
         normalize_set(&mut self.session.auto_continue_project_ids, 1_000);
         self.session.auto_continue_session_overrides =
             std::mem::take(&mut self.session.auto_continue_session_overrides)
@@ -1123,6 +1235,102 @@ mod tests {
         let decoded = decode_and_migrate(&serde_json::to_vec(&state).unwrap()).unwrap();
 
         assert!(!decoded.desktop_behavior.close_to_tray);
+    }
+
+    #[test]
+    fn new_settings_preferences_are_backward_compatible_and_round_trip() {
+        let mut legacy = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("terminalPreferences");
+        legacy.as_object_mut().unwrap().remove("keyboard");
+        let workbench = legacy
+            .get_mut("workbench")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        workbench.remove("rememberLayout");
+        workbench.remove("defaultNewSessionLocation");
+        let composer = legacy
+            .get_mut("composer")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        composer.remove("defaultRuntimeSelection");
+        composer.remove("queueSendMode");
+        composer.remove("messageSendKey");
+        let behavior = legacy
+            .get_mut("desktopBehavior")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        behavior.remove("startupDestination");
+        behavior.remove("launchAtLogin");
+        behavior.remove("notificationsEnabled");
+        behavior.remove("notifyAgentCompleted");
+        behavior.remove("notifyAgentNeedsInput");
+        behavior.remove("notifyAgentFailed");
+
+        let decoded = decode_and_migrate(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(decoded.workbench.remember_layout);
+        assert_eq!(
+            decoded.workbench.default_new_session_location,
+            NewSessionLocation::CurrentCheckout
+        );
+        assert_eq!(
+            decoded.composer.queue_send_mode,
+            ComposerQueueSendMode::Automatic
+        );
+        assert_eq!(decoded.composer.message_send_key, MessageSendKey::Enter);
+        assert!(decoded.desktop_behavior.notifications_enabled);
+        assert_eq!(
+            decoded.terminal_preferences,
+            TerminalPreferencesUiState::default()
+        );
+        assert!(decoded.keyboard.shortcuts.is_empty());
+
+        let mut state = decoded;
+        state.workbench.remember_layout = false;
+        state.workbench.default_new_session_location = NewSessionLocation::NewWorktree;
+        state.desktop_behavior.startup_destination = StartupDestination::NewSession;
+        state.desktop_behavior.launch_at_login = true;
+        state.desktop_behavior.notify_agent_failed = false;
+        state.composer.queue_send_mode = ComposerQueueSendMode::Manual;
+        state.composer.message_send_key = MessageSendKey::CommandEnter;
+        state.terminal_preferences.shell = Some(" /bin/zsh ".into());
+        state.terminal_preferences.working_directory = TerminalWorkingDirectory::ProjectRoot;
+        state
+            .keyboard
+            .shortcuts
+            .insert(" open_settings ".into(), " cmd-shift-, ".into());
+
+        state.normalize().unwrap();
+        let round_trip = decode_and_migrate(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert!(!round_trip.workbench.remember_layout);
+        assert_eq!(
+            round_trip.workbench.default_new_session_location,
+            NewSessionLocation::NewWorktree
+        );
+        assert_eq!(
+            round_trip.desktop_behavior.startup_destination,
+            StartupDestination::NewSession
+        );
+        assert!(round_trip.desktop_behavior.launch_at_login);
+        assert!(!round_trip.desktop_behavior.notify_agent_failed);
+        assert_eq!(
+            round_trip.composer.queue_send_mode,
+            ComposerQueueSendMode::Manual
+        );
+        assert_eq!(
+            round_trip.composer.message_send_key,
+            MessageSendKey::CommandEnter
+        );
+        assert_eq!(
+            round_trip.terminal_preferences.shell.as_deref(),
+            Some("/bin/zsh")
+        );
+        assert_eq!(
+            round_trip.keyboard.shortcuts.get("open_settings"),
+            Some(&"cmd-shift-,".to_string())
+        );
     }
 
     #[test]

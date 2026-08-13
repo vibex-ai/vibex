@@ -14,11 +14,11 @@ use gpui::{
     AccessibleAction, Anchor, Animation, AnimationExt as _, AnyElement, AnyWindowHandle, App,
     Bounds, ClipboardEntry, ClipboardItem, Context, Decorations, DragMoveEvent, ElementId, Empty,
     Entity, EntityInputHandler, ExternalPaths, FocusHandle, Focusable as _, FontWeight,
-    HighlightStyle, Hsla, Image, IntoElement, KeyBinding, KeyDownEvent, MouseButton,
+    HighlightStyle, Hsla, Image, IntoElement, KeyBinding, KeyDownEvent, Keystroke, MouseButton,
     MouseDownEvent, MouseMoveEvent, ObjectFit, Orientation, ParentElement as _, PathBuilder,
     Pixels, Render, Rgba, Role, ScrollDelta, ScrollStrategy, ScrollWheelEvent, SharedString, Size,
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, StyledText,
-    Subscription, Task, WeakEntity, Window, WindowBackgroundAppearance, WindowBounds,
+    Subscription, Task, Unbind, WeakEntity, Window, WindowBackgroundAppearance, WindowBounds,
     WindowControlArea, WindowDecorations, WindowOptions, canvas, div, img, linear_color_stop,
     linear_gradient, point, prelude::*, px, relative, rgb, size,
 };
@@ -89,16 +89,17 @@ use vibex_core::{
     unix_timestamp_ms,
 };
 use vibex_desktop_model::{
-    AgentPlanProjection, AppearanceUiState, ComposerAttachment, ComposerSuggestionSelection,
-    ComposerTrigger, DesktopBehaviorUiState, DesktopUiStateV1, LocaleMode, NavigationHistory,
-    NewSessionLocation, NewSessionProjectTicket, NewSessionSubmissionStage,
-    NewSessionWorkspaceState, RUNTIME_SELECTION_PREFERENCE_LIMIT, RuntimeCascadeChoice,
-    RuntimeCascadeProjection, SessionContentWidthMode, SessionUiState, SidebarHierarchyMode,
-    SidebarProjectProjection, SidebarState, SidebarWorkspaceProjection,
-    ThemeMode as ModelThemeMode, ThrottledUiStateWriter, TimelineConversationTurn,
-    TimelineFollowState, TimelineModel, TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
-    UiStateStore, WorkbenchRoute, WorkspaceAgentSummary, WorkspaceContextProjection,
-    WorktreeLifecycleDisplayState, active_collaborations, composer_trigger_at, current_agent_plan,
+    AgentPlanProjection, AppearanceUiState, ComposerAttachment, ComposerQueueSendMode,
+    ComposerSuggestionSelection, ComposerTrigger, DesktopBehaviorUiState, DesktopUiStateV1,
+    LocaleMode, MessageSendKey, NavigationHistory, NewSessionLocation, NewSessionProjectTicket,
+    NewSessionSubmissionStage, NewSessionWorkspaceState, RUNTIME_SELECTION_PREFERENCE_LIMIT,
+    RuntimeCascadeChoice, RuntimeCascadeProjection, SessionContentWidthMode, SessionUiState,
+    SidebarHierarchyMode, SidebarProjectProjection, SidebarState, SidebarWorkspaceProjection,
+    StartupDestination, TerminalWorkingDirectory, ThemeMode as ModelThemeMode,
+    ThrottledUiStateWriter, TimelineConversationTurn, TimelineFollowState, TimelineModel,
+    TimelineProcessActivityGroup, TimelineRow, TimelineRowKind, UiStateStore, WorkbenchRoute,
+    WorkspaceAgentSummary, WorkspaceContextProjection, WorktreeLifecycleDisplayState,
+    active_collaborations, composer_trigger_at, current_agent_plan,
     custom_worktree_path_is_absolute, sidebar_project_projections,
     timeline_agent_message_count_after_sequence, timeline_conversation_turns,
 };
@@ -129,7 +130,10 @@ use crate::code_workbench::{
 use crate::gpui_ext::button_with_aria_label;
 use crate::locale::{self, Strings};
 use crate::management::{ManagementCenter, ManagementEvent};
-use crate::platform::ui_state_path;
+use crate::platform::{
+    launch_at_login_enabled, open_external_url, reveal_path_in_file_manager,
+    send_system_notification, set_launch_at_login, storage_usage, ui_state_path,
+};
 use crate::remote_access_pairing::open_remote_access_pairing;
 use crate::responsive::WorkbenchVisibility;
 use crate::terminal_surface::{TerminalSurface, available_shells};
@@ -797,6 +801,34 @@ async fn fetch_authoritative_timeline(
 fn normalize_empty_preview_visibility(state: &mut DesktopUiStateV1) {
     if state.preview.layout.tabs.is_empty() {
         state.workbench.preview_visible = false;
+    }
+}
+
+fn clear_remembered_workbench_layout(state: &mut DesktopUiStateV1) {
+    let defaults = vibex_desktop_model::WorkbenchUiState::default();
+    let editor_recovery = std::mem::take(&mut state.preview.editor_recovery);
+    state.workbench.selected_file_path = None;
+    state.workbench.selected_git_path = None;
+    state.workbench.sidebar_visible = defaults.sidebar_visible;
+    state.workbench.preview_visible = defaults.preview_visible;
+    state.workbench.right_rail_visible = defaults.right_rail_visible;
+    state.workbench.sidebar_width = defaults.sidebar_width;
+    state.workbench.preview_width = defaults.preview_width;
+    state.workbench.right_rail_width = defaults.right_rail_width;
+    state.preview = vibex_desktop_model::PreviewUiState {
+        editor_recovery,
+        ..vibex_desktop_model::PreviewUiState::default()
+    };
+    state.terminal = vibex_desktop_model::TerminalUiState::default();
+    state.right_rail = vibex_desktop_model::RightRailUiState::default();
+    state.composer.terminal_ids.clear();
+    state.terminal_tab_titles.clear();
+    state.agent_tab_order.clear();
+}
+
+fn apply_layout_memory_preference(state: &mut DesktopUiStateV1) {
+    if !state.workbench.remember_layout {
+        clear_remembered_workbench_layout(state);
     }
 }
 
@@ -3519,7 +3551,12 @@ impl VibexWorkbench {
                 Some(format!("Preview configuration failed: {}", error.code)),
             ),
         };
+        apply_layout_memory_preference(&mut ui_state);
         normalize_empty_preview_visibility(&mut ui_state);
+        if let Some(config) = config.as_ref() {
+            ui_state.desktop_behavior.launch_at_login =
+                launch_at_login_enabled(&config.application_id);
+        }
         let auto_continue_default_project_ids = ui_state.session.auto_continue_project_ids.clone();
         let auto_continue_session_ids = restored_auto_continue_session_ids(&ui_state.session);
         let initial_locale = locale::apply_locale(ui_state.appearance.locale);
@@ -3662,21 +3699,38 @@ impl VibexWorkbench {
                         this.sync_composer_command_entry(ComposerTarget::Session, cx);
                         this.refresh_suggestions(ComposerTarget::Session, window, cx);
                     }
-                    InputEvent::PressEnter { shift: false, .. } => {
-                        this.handle_composer_enter(window, cx)
+                    InputEvent::PressEnter { secondary, shift } if !shift => {
+                        let command_enter =
+                            this.ui_state.composer.message_send_key == MessageSendKey::CommandEnter;
+                        if command_enter && !*secondary {
+                            this.composer_input
+                                .update(cx, |input, cx| input.replace("\n", window, cx));
+                            this.sync_inline_composer_attachments(false, cx);
+                        } else if !command_enter || *secondary {
+                            this.handle_composer_enter(window, cx)
+                        }
                     }
                     InputEvent::Focus => {
                         this.refresh_suggestions(ComposerTarget::Session, window, cx)
                     }
                     InputEvent::PressEnter { shift: true, .. } | InputEvent::Blur => {}
+                    InputEvent::PressEnter { shift: false, .. } => {}
                 },
             ),
             cx.subscribe_in(
                 &new_session_input,
                 window,
                 |this, _, event, window, cx| match event {
-                    InputEvent::PressEnter { shift: false, .. } => {
-                        this.submit_new_session(window, cx)
+                    InputEvent::PressEnter { secondary, shift } if !shift => {
+                        let command_enter =
+                            this.ui_state.composer.message_send_key == MessageSendKey::CommandEnter;
+                        if command_enter && !*secondary {
+                            this.new_session_input
+                                .update(cx, |input, cx| input.replace("\n", window, cx));
+                            this.sync_inline_composer_attachments(true, cx);
+                        } else if !command_enter || *secondary {
+                            this.submit_new_session(window, cx)
+                        }
                     }
                     InputEvent::Change => {
                         this.sync_inline_composer_attachments(true, cx);
@@ -3688,6 +3742,7 @@ impl VibexWorkbench {
                         this.refresh_suggestions(ComposerTarget::NewSession, window, cx)
                     }
                     InputEvent::PressEnter { shift: true, .. } | InputEvent::Blur => cx.notify(),
+                    InputEvent::PressEnter { shift: false, .. } => {}
                 },
             ),
             cx.subscribe(
@@ -4313,6 +4368,7 @@ impl VibexWorkbench {
     }
 
     fn apply_loaded_ui_state(&mut self, mut state: DesktopUiStateV1, cx: &mut Context<Self>) {
+        apply_layout_memory_preference(&mut state);
         normalize_empty_preview_visibility(&mut state);
         let auto_continue_default_project_ids = state.session.auto_continue_project_ids.clone();
         let auto_continue_session_ids = restored_auto_continue_session_ids(&state.session);
@@ -4329,6 +4385,10 @@ impl VibexWorkbench {
             .unwrap_or_else(|| crate::platform::default_code_font_family().to_string());
         let code_font_size = state.appearance.code_font.size;
         self.ui_state = state;
+        if let Some(config) = self.config.as_ref() {
+            self.ui_state.desktop_behavior.launch_at_login =
+                launch_at_login_enabled(&config.application_id);
+        }
         self.auto_continue_default_project_ids = auto_continue_default_project_ids;
         self.auto_continue_session_ids = auto_continue_session_ids;
         self.sidebar_state.row_order = self.ui_state.sidebar.session_order.clone();
@@ -4666,6 +4726,17 @@ impl VibexWorkbench {
                             for session_id in auto_continue_sessions {
                                 this.sync_auto_continue_for_session(&session_id, cx);
                             }
+                            if this.ui_state.composer.queue_send_mode
+                                == ComposerQueueSendMode::Manual
+                            {
+                                this.composer_queue_manual_session_ids = this
+                                    .sessions
+                                    .iter()
+                                    .map(|session| session.id.as_str().to_string())
+                                    .collect();
+                            } else {
+                                this.composer_queue_manual_session_ids.clear();
+                            }
                             this.reconcile_sidebar_state();
                             this.refresh_workspace_contexts(cx);
                             if this.reconcile_new_session_runtime_selection()
@@ -4675,9 +4746,11 @@ impl VibexWorkbench {
                             }
                             if !this.initial_new_session_panel_handled {
                                 this.initial_new_session_panel_handled = true;
-                                this.new_session_open = sessions_empty;
+                                this.new_session_open = sessions_empty
+                                    || this.ui_state.desktop_behavior.startup_destination
+                                        == StartupDestination::NewSession;
                                 this.initial_new_session_setup_pending =
-                                    sessions_empty && !this.new_session_draft_initialized;
+                                    this.new_session_open && !this.new_session_draft_initialized;
                             }
                             if let Some(session_id) = preferred {
                                 this.select_session_with_history(session_id, false, cx);
@@ -4872,6 +4945,15 @@ impl VibexWorkbench {
         &self,
         agent_id: &AgentId,
     ) -> Option<SessionRuntimeSelection> {
+        if let Some(default) = self
+            .ui_state
+            .composer
+            .default_runtime_selection
+            .as_ref()
+            .filter(|selection| &selection.agent_id == agent_id)
+        {
+            return Some(default.clone());
+        }
         let selected_runtime = self.selected_runtime_selection();
         new_session_runtime_preference_for_agent(
             agent_id,
@@ -4893,6 +4975,7 @@ impl VibexWorkbench {
     fn remember_runtime_selection(&mut self, selection: &SessionRuntimeSelection) {
         self.runtime_preference_write_fence
             .begin(&selection.agent_id);
+        self.ui_state.composer.default_runtime_selection = Some(selection.clone());
         self.persist_runtime_selection(selection);
     }
 
@@ -7263,6 +7346,7 @@ impl VibexWorkbench {
         events: Vec<TimelineLiveEvent>,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.notify_for_timeline_events(&events);
         let unread_changed = update_unread_agent_completions(
             &mut self.unread_agent_completion_session_ids,
             self.selected_session_id.as_ref(),
@@ -7364,6 +7448,36 @@ impl VibexWorkbench {
             changed > 0,
             needs_refetch,
         )
+    }
+
+    fn notify_for_timeline_events(&self, events: &[TimelineLiveEvent]) {
+        if !self.ui_state.desktop_behavior.notifications_enabled {
+            return;
+        }
+        let title = "Vibex";
+        let body = match timeline_notification_kind(events, &self.ui_state.desktop_behavior) {
+            Some(NotificationKind::Failed) => Some(locale::text(
+                "Agent turn failed",
+                "Agent 回合失败",
+                "Agent 回合失敗",
+            )),
+            Some(NotificationKind::NeedsInput) => Some(locale::text(
+                "Agent needs your input",
+                "Agent 需要你的输入",
+                "Agent 需要你的輸入",
+            )),
+            Some(NotificationKind::Completed) => Some(locale::text(
+                "Agent turn completed",
+                "Agent 回合已完成",
+                "Agent 回合已完成",
+            )),
+            None => None,
+        };
+        if let Some(body) = body
+            && let Err(error) = send_system_notification(title, body)
+        {
+            eprintln!("system notification failed: {}", error.code);
+        }
     }
 
     fn apply_desktop_event(&mut self, event: DesktopEvent, cx: &mut Context<Self>) -> bool {
@@ -9920,19 +10034,34 @@ impl VibexWorkbench {
         self.agent_error = None;
         let generation = self.session_generation;
         let terminal_number = self.composer_terminals.len().saturating_add(1);
+        let project_root = (session.workspace_mode == WorkspaceMode::CurrentCheckout)
+            .then(|| {
+                self.workspaces
+                    .iter()
+                    .find(|(project, _)| project.id == session.project_id)
+                    .map(|(project, _)| project.root_path.as_str())
+            })
+            .flatten();
+        let selected_file_path = self.ui_state.workbench.selected_file_path.clone();
+        let (terminal_root, cwd) = terminal_preference_target(
+            &session.workspace_root,
+            project_root,
+            selected_file_path.as_deref(),
+            &self.ui_state.terminal_preferences.working_directory,
+        );
         let request = TerminalCreateRequest {
             workspace_id: session.workspace_id,
             title: Some(format!(
                 "{} {terminal_number}",
                 locale::text("Terminals", "终端", "終端")
             )),
-            shell: None,
-            cwd: None,
+            shell: this_terminal_shell(&self.ui_state.terminal_preferences.shell),
+            cwd,
             rows: 18,
             cols: 100,
         };
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime.create_terminal(session.workspace_root, request)
+            runtime.create_terminal(terminal_root, request)
         });
         let entity = cx.weak_entity();
         self.agent_action_task = Some(cx.spawn(async move |_, cx| {
@@ -10007,19 +10136,35 @@ impl VibexWorkbench {
         self.agent_action_pending = true;
         self.agent_error = None;
         let generation = self.session_generation;
-        let cwd = cwd_source
+        let project_root = (session.workspace_mode == WorkspaceMode::CurrentCheckout)
+            .then(|| {
+                self.workspaces
+                    .iter()
+                    .find(|(project, _)| project.id == session.project_id)
+                    .map(|(project, _)| project.root_path.as_str())
+            })
+            .flatten();
+        let selected_file_path = self.ui_state.workbench.selected_file_path.clone();
+        let explicit_cwd = cwd_source
             .as_ref()
             .and_then(|(path, kind)| terminal_cwd_for_workspace_target(path, *kind));
+        let (terminal_root, preferred_cwd) = terminal_preference_target(
+            &session.workspace_root,
+            project_root,
+            selected_file_path.as_deref(),
+            &self.ui_state.terminal_preferences.working_directory,
+        );
+        let cwd = explicit_cwd.or(preferred_cwd);
         let request = TerminalCreateRequest {
             workspace_id: session.workspace_id,
             title: Some(PREVIEW_TERMINAL_TITLE.into()),
-            shell: None,
+            shell: this_terminal_shell(&self.ui_state.terminal_preferences.shell),
             cwd,
             rows: 28,
             cols: 100,
         };
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime.create_terminal(session.workspace_root, request)
+            runtime.create_terminal(terminal_root, request)
         });
         let entity = cx.weak_entity();
         self.agent_action_task = Some(cx.spawn(async move |_, cx| {
@@ -11487,6 +11632,8 @@ impl VibexWorkbench {
                 RequestId::new().to_string(),
                 self.new_session_managed_root(),
             );
+            self.new_session_workspace.preference =
+                self.ui_state.workbench.default_new_session_location;
             self.new_session_draft_initialized = true;
         }
         let target = target.or_else(|| {
@@ -11764,7 +11911,7 @@ impl VibexWorkbench {
                     .project_location_preferences
                     .get(project.id.as_str())
                     .copied()
-                    .unwrap_or_default();
+                    .unwrap_or(self.ui_state.workbench.default_new_session_location);
                 self.new_session_workspace.select_project(
                     &project,
                     &origin_workspace,
@@ -13868,6 +14015,9 @@ impl VibexWorkbench {
     }
 
     fn apply_code_workbench_state(&mut self, state: CodeWorkbenchPersistedState) {
+        if !self.ui_state.workbench.remember_layout {
+            return;
+        }
         self.ui_state.preview.layout = state.preview;
         if let Some(recovery) = state.recovery {
             self.ui_state.preview.editor_recovery = recovery;
@@ -14920,10 +15070,120 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    fn set_terminal_shell(&mut self, shell: String, cx: &mut Context<Self>) {
+        self.ui_state.terminal_preferences.shell = (!shell.is_empty()).then_some(shell);
+        self.queue_ui_state();
+        cx.notify();
+    }
+
+    fn set_reduced_motion(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.ui_state.appearance.reduced_motion = enabled;
+        self.queue_ui_state();
+        cx.notify();
+    }
+
+    fn set_high_contrast(&mut self, enabled: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.ui_state.appearance.high_contrast = enabled;
+        theme::apply_appearance(&self.ui_state.appearance, Some(window), cx);
+        self.queue_ui_state();
+        cx.notify();
+    }
+
+    fn set_sidebar_hierarchy_mode(&mut self, mode: SidebarHierarchyMode, cx: &mut Context<Self>) {
+        self.ui_state.sidebar.hierarchy_mode = mode;
+        self.queue_ui_state();
+        cx.notify();
+    }
+
+    fn clear_auto_continue_preference_state(&mut self) {
+        self.auto_continue_default_project_ids.clear();
+        self.auto_continue_session_ids.clear();
+        self.auto_continue_paused_turn_session_ids.clear();
+        self.auto_continue_handled_turns.clear();
+        self.auto_continue_turn_statuses.clear();
+        self.auto_continue_probe_tasks.clear();
+        self.auto_continue_countdowns.clear();
+        self.auto_continue_countdown_tasks.clear();
+        self.ui_state.session.auto_continue_project_ids.clear();
+        self.ui_state
+            .session
+            .auto_continue_session_overrides
+            .clear();
+    }
+
+    fn clear_runtime_selection_preferences(&mut self, cx: &mut Context<Self>) {
+        let mut agent_ids = self
+            .ui_state
+            .composer
+            .runtime_selections_by_agent
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        agent_ids.extend(
+            self.ui_state
+                .composer
+                .runtime_selections_by_model
+                .iter()
+                .map(|selection| selection.agent_id.clone()),
+        );
+        if let Some(selection) = &self.ui_state.composer.default_runtime_selection {
+            agent_ids.insert(selection.agent_id.clone());
+        }
+        for agent_id in agent_ids {
+            self.runtime_preference_write_fence.begin(&agent_id);
+        }
+        self.ui_state.composer.default_runtime_selection = None;
+        self.ui_state.composer.runtime_selections_by_agent.clear();
+        self.ui_state.composer.runtime_selections_by_model.clear();
+        if self.reconcile_new_session_runtime_selection() && self.new_session_open {
+            self.refresh_active_suggestions(ComposerTarget::NewSession, cx);
+        }
+    }
+
     fn restore_settings_defaults(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let application_id = self
+            .config
+            .as_ref()
+            .map(|config| config.application_id.as_str())
+            .unwrap_or("com.vibex.desktop");
+        let launch_at_login = match set_launch_at_login(false, application_id) {
+            Ok(()) => {
+                self.persistence_note = None;
+                false
+            }
+            Err(error) => {
+                self.persistence_note = Some(format!("{}: {}", error.code, error.message));
+                launch_at_login_enabled(application_id)
+            }
+        };
         self.ui_state.appearance = AppearanceUiState::default();
         self.ui_state.session = SessionUiState::default();
         self.ui_state.desktop_behavior = DesktopBehaviorUiState::default();
+        self.ui_state.desktop_behavior.launch_at_login = launch_at_login;
+        clear_remembered_workbench_layout(&mut self.ui_state);
+        self.ui_state.workbench.remember_layout = true;
+        self.ui_state.workbench.default_new_session_location = NewSessionLocation::CurrentCheckout;
+        self.ui_state.sidebar.hierarchy_mode = SidebarHierarchyMode::Compact;
+        self.ui_state.sidebar.project_location_preferences.clear();
+        self.ui_state.terminal_preferences =
+            vibex_desktop_model::TerminalPreferencesUiState::default();
+        clear_shortcut_overrides(&mut self.ui_state.keyboard.shortcuts, cx);
+        self.ui_state.composer.queue_send_mode = ComposerQueueSendMode::Automatic;
+        self.ui_state.composer.message_send_key = MessageSendKey::Enter;
+        self.clear_runtime_selection_preferences(cx);
+        self.composer_queue_manual_session_ids.clear();
+        self.clear_auto_continue_preference_state();
+        self.sidebar_overlay_open = false;
+        self.preview_overlay_open = false;
+        self.right_rail_overlay_open = false;
+        self.sidebar_hover_preview_open = false;
+        self.code_preview_visible = false;
+        self.code_files_surface_visible = false;
+        self.code_git_surface_visible = false;
+        self.code_workbench.update(cx, |workbench, cx| {
+            workbench.set_preview_visible(false, cx);
+            workbench.set_workspace_surface_visibility(false, false, cx);
+        });
         theme::apply_appearance(&self.ui_state.appearance, Some(window), cx);
         locale::apply_locale(self.ui_state.appearance.locale);
         self.sync_locale_dependents(window, cx);
@@ -28104,6 +28364,9 @@ fn estimated_detail_block_height(value: &str) -> f32 {
 }
 
 fn terminal_cwd_for_workspace_target(path: &str, kind: FileEntryKind) -> Option<String> {
+    if std::path::Path::new(path).is_absolute() {
+        return None;
+    }
     let normalized = path.replace('\\', "/");
     let normalized = normalized.trim_matches('/');
     if normalized.is_empty() {
@@ -28116,6 +28379,43 @@ fn terminal_cwd_for_workspace_target(path: &str, kind: FileEntryKind) -> Option<
         .rsplit_once('/')
         .map(|(parent, _)| parent.to_string())
         .filter(|parent| !parent.is_empty())
+}
+
+fn this_terminal_shell(shell: &Option<String>) -> Option<String> {
+    shell
+        .as_ref()
+        .map(|shell| shell.trim().to_string())
+        .filter(|shell| !shell.is_empty())
+}
+
+fn terminal_preference_cwd(
+    worktree_root: &str,
+    project_root: Option<&str>,
+    current_file: Option<&str>,
+    preference: &TerminalWorkingDirectory,
+) -> Option<String> {
+    match preference {
+        TerminalWorkingDirectory::CurrentWorktree => Some(worktree_root.to_string()),
+        TerminalWorkingDirectory::ProjectRoot => project_root
+            .filter(|project_root| {
+                std::path::Path::new(project_root).starts_with(std::path::Path::new(worktree_root))
+            })
+            .map(str::to_string)
+            .or_else(|| Some(worktree_root.to_string())),
+        TerminalWorkingDirectory::CurrentFile => current_file
+            .and_then(|path| terminal_cwd_for_workspace_target(path, FileEntryKind::File))
+            .or_else(|| Some(worktree_root.to_string())),
+    }
+}
+
+fn terminal_preference_target(
+    worktree_root: &str,
+    project_root: Option<&str>,
+    current_file: Option<&str>,
+    preference: &TerminalWorkingDirectory,
+) -> (String, Option<String>) {
+    let cwd = terminal_preference_cwd(worktree_root, project_root, current_file, preference);
+    (worktree_root.to_string(), cwd)
 }
 
 fn workbench_route(
@@ -30898,16 +31198,13 @@ impl SettingsDialogTitle {
 impl Render for SettingsDialogTitle {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let appearance = self.settings.read(cx).appearance(cx);
-        let session = self.settings.read(cx).session(cx);
-        let desktop_behavior = self.settings.read(cx).desktop_behavior(cx);
         let strings = locale::strings(locale::resolve_locale(
             appearance.locale,
             locale::system_locale().as_deref(),
         ));
         let header_inline =
             f32::from(window.viewport_size().width) >= SETTINGS_ROW_INLINE_MIN_WIDTH;
-        let defaults_restored =
-            settings_defaults_restored(&appearance, &session, &desktop_behavior);
+        let defaults_restored = self.settings.read(cx).all_defaults_restored(cx);
         let settings = self.settings.clone();
 
         div()
@@ -30974,7 +31271,234 @@ impl Render for SettingsDialogTitle {
 enum SettingsSection {
     General,
     Appearance,
+    Workbench,
     Session,
+    Terminal,
+    Shortcuts,
+    Data,
+    About,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotificationKind {
+    Completed,
+    NeedsInput,
+    Failed,
+}
+
+fn timeline_notification_kind(
+    events: &[TimelineLiveEvent],
+    preferences: &DesktopBehaviorUiState,
+) -> Option<NotificationKind> {
+    if preferences.notify_agent_failed
+        && events
+            .iter()
+            .any(|event| matches!(event.item.payload, TimelinePayload::Error(_)))
+    {
+        return Some(NotificationKind::Failed);
+    }
+    if preferences.notify_agent_needs_input
+        && events.iter().any(|event| {
+            matches!(
+                event.item.payload,
+                TimelinePayload::PermissionRequest(_) | TimelinePayload::ElicitationRequest(_)
+            )
+        })
+    {
+        return Some(NotificationKind::NeedsInput);
+    }
+    (preferences.notify_agent_completed
+        && events.iter().any(|event| {
+            matches!(
+                &event.item.payload,
+                TimelinePayload::AgentMessage(message) if message.is_final
+            )
+        }))
+    .then_some(NotificationKind::Completed)
+}
+
+const FOUNDATION_SHORTCUTS: &[(&str, &str)] = &[
+    ("toggle_sidebar", "cmd-b"),
+    ("toggle_preview", "cmd-shift-p"),
+    ("toggle_right_rail", "cmd-shift-r"),
+    ("open_settings", "cmd-,"),
+    ("retry_runtime", "cmd-r"),
+    ("save_active_file", "cmd-s"),
+    ("navigate_back", "alt-left"),
+    ("navigate_forward", "alt-right"),
+];
+
+fn shortcut_action_label(action: &str) -> &'static str {
+    match action {
+        "toggle_sidebar" => "Toggle sidebar",
+        "toggle_preview" => "Toggle preview",
+        "toggle_right_rail" => "Toggle right rail",
+        "open_settings" => "Open settings",
+        "retry_runtime" => "Retry runtime",
+        "save_active_file" => "Save active file",
+        "navigate_back" => "Navigate back",
+        "navigate_forward" => "Navigate forward",
+        _ => "Shortcut",
+    }
+}
+
+fn shortcut_action_group(action: &str) -> &'static str {
+    match action {
+        "toggle_sidebar" | "toggle_preview" | "toggle_right_rail" => "Workbench",
+        "open_settings" => "Navigation",
+        "retry_runtime" => "Runtime",
+        "save_active_file" => "Editor",
+        "navigate_back" | "navigate_forward" => "Navigation",
+        _ => "Vibex",
+    }
+}
+
+fn effective_shortcut<'a>(
+    overrides: &'a BTreeMap<String, String>,
+    action: &str,
+) -> Option<&'a str> {
+    overrides.get(action).map(String::as_str).or_else(|| {
+        FOUNDATION_SHORTCUTS
+            .iter()
+            .find(|(name, _)| *name == action)
+            .map(|(_, key)| *key)
+    })
+}
+
+fn rebind_foundation_action(
+    cx: &mut App,
+    action: &str,
+    previous: Option<&str>,
+    current: Option<&str>,
+) {
+    if previous == current {
+        return;
+    }
+    let mut bindings = Vec::new();
+    if let Some(previous) = previous {
+        bindings.push(KeyBinding::new(
+            previous,
+            Unbind(action_name(action).into()),
+            None,
+        ));
+    }
+    if let Some(current) = current {
+        bind_action(&mut bindings, current, action, false);
+    }
+    cx.bind_keys(bindings);
+}
+
+fn clear_shortcut_overrides(overrides: &mut BTreeMap<String, String>, cx: &mut App) {
+    let previous = std::mem::take(overrides);
+    for (action, default) in FOUNDATION_SHORTCUTS {
+        let old_effective = effective_shortcut(&previous, action);
+        rebind_foundation_action(cx, action, old_effective, Some(default));
+    }
+}
+
+fn settings_section_for_query(query: &str) -> Option<SettingsSection> {
+    if query.is_empty() {
+        return None;
+    }
+    let matches = |terms: &[&str]| {
+        terms
+            .iter()
+            .any(|term| term.contains(query) || query.contains(term))
+    };
+    if matches(&[
+        "general",
+        "startup",
+        "notification",
+        "language",
+        "常规",
+        "启动",
+        "通知",
+        "一般",
+        "啟動",
+    ]) {
+        Some(SettingsSection::General)
+    } else if matches(&[
+        "appearance",
+        "theme",
+        "font",
+        "contrast",
+        "motion",
+        "外观",
+        "主题",
+        "字体",
+        "對比",
+        "動效",
+    ]) {
+        Some(SettingsSection::Appearance)
+    } else if matches(&[
+        "workbench",
+        "layout",
+        "sidebar",
+        "worktree",
+        "工作台",
+        "布局",
+        "侧栏",
+        "版面",
+        "側欄",
+    ]) {
+        Some(SettingsSection::Workbench)
+    } else if matches(&[
+        "session", "agent", "queue", "send", "会话", "消息", "队列", "會話", "訊息", "佇列",
+    ]) {
+        Some(SettingsSection::Session)
+    } else if matches(&[
+        "terminal",
+        "shell",
+        "cwd",
+        "终端",
+        "終端機",
+        "工作目录",
+        "工作目錄",
+    ]) {
+        Some(SettingsSection::Terminal)
+    } else if matches(&["shortcut", "key", "快捷键", "快速鍵"]) {
+        Some(SettingsSection::Shortcuts)
+    } else if matches(&[
+        "data",
+        "diagnostic",
+        "storage",
+        "backup",
+        "数据",
+        "诊断",
+        "資料",
+        "診斷",
+    ]) {
+        Some(SettingsSection::Data)
+    } else if matches(&[
+        "about",
+        "version",
+        "license",
+        "release",
+        "关于",
+        "版本",
+        "许可证",
+        "關於",
+        "授權",
+    ]) {
+        Some(SettingsSection::About)
+    } else {
+        None
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 #[derive(Clone)]
@@ -31019,6 +31543,24 @@ struct FontChoice {
     family: Option<String>,
 }
 
+#[derive(Clone)]
+struct ShellChoice {
+    label: SharedString,
+    path: String,
+}
+
+impl SearchableListItem for ShellChoice {
+    type Value = String;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.path
+    }
+}
+
 impl SearchableListItem for FontChoice {
     type Value = Option<String>;
 
@@ -31038,6 +31580,8 @@ struct FoundationSettings {
     interface_fonts: Entity<SelectState<Vec<FontChoice>>>,
     code_fonts: Entity<SelectState<Vec<FontChoice>>>,
     session_content_widths: Entity<SelectState<Vec<SessionContentWidthChoice>>>,
+    terminal_shells: Entity<SelectState<Vec<ShellChoice>>>,
+    search: Entity<InputState>,
     active_section: SettingsSection,
 }
 
@@ -31057,6 +31601,7 @@ impl FoundationSettings {
         let interface_choices = font_choices(&families, strings.system_ui);
         let code_choices = font_choices(&families, strings.system_monospace);
         let session_content_width_choices = session_content_width_choices(strings);
+        let shell_choices = shell_choices();
         let language_selected =
             selected_locale_index(&language_choices, ui_state.appearance.locale);
         let interface_selected = selected_font_index(
@@ -31069,6 +31614,8 @@ impl FoundationSettings {
             &session_content_width_choices,
             ui_state.session.content_width,
         );
+        let terminal_shell_selected =
+            selected_shell_index(&shell_choices, &ui_state.terminal_preferences.shell);
         let language_modes =
             cx.new(|cx| SelectState::new(language_choices, language_selected, window, cx));
         let interface_fonts = cx.new(|cx| {
@@ -31084,7 +31631,30 @@ impl FoundationSettings {
                 cx,
             )
         });
+        let terminal_shells = cx.new(|cx| {
+            SelectState::new(shell_choices, terminal_shell_selected, window, cx).searchable(true)
+        });
+        let search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(locale::text(
+                "Search settings",
+                "搜索设置",
+                "搜尋設定",
+            ))
+        });
         cx.new(|cx| {
+            cx.subscribe(
+                &search,
+                |this: &mut FoundationSettings, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        let query = this.search.read(cx).value().trim().to_ascii_lowercase();
+                        if let Some(section) = settings_section_for_query(&query) {
+                            this.active_section = section;
+                        }
+                        cx.notify();
+                    }
+                },
+            )
+            .detach();
             let interface_workbench = workbench.clone();
             cx.subscribe_in(
                 &interface_fonts,
@@ -31135,6 +31705,20 @@ impl FoundationSettings {
                 },
             )
             .detach();
+            let terminal_workbench = workbench.clone();
+            cx.subscribe(
+                &terminal_shells,
+                move |_: &mut FoundationSettings, _, event: &SelectEvent<Vec<ShellChoice>>, cx| {
+                    let SelectEvent::Confirm(path) = event;
+                    if let Some(path) = path.clone() {
+                        let _ = terminal_workbench.update(cx, |this, cx| {
+                            this.set_terminal_shell(path, cx);
+                        });
+                    }
+                    cx.notify();
+                },
+            )
+            .detach();
             Self {
                 workbench,
                 font_families: families,
@@ -31142,6 +31726,8 @@ impl FoundationSettings {
                 interface_fonts,
                 code_fonts,
                 session_content_widths,
+                terminal_shells,
+                search,
                 active_section: SettingsSection::General,
             }
         })
@@ -31163,6 +31749,34 @@ impl FoundationSettings {
         self.workbench
             .read_with(cx, |this, _| this.ui_state.desktop_behavior.clone())
             .unwrap_or_default()
+    }
+
+    fn workbench_state(&self, cx: &App) -> vibex_desktop_model::WorkbenchUiState {
+        self.workbench
+            .read_with(cx, |this, _| this.ui_state.workbench.clone())
+            .unwrap_or_default()
+    }
+
+    fn terminal_preferences(&self, cx: &App) -> vibex_desktop_model::TerminalPreferencesUiState {
+        self.workbench
+            .read_with(cx, |this, _| this.ui_state.terminal_preferences.clone())
+            .unwrap_or_default()
+    }
+
+    fn keyboard_shortcuts(&self, cx: &App) -> BTreeMap<String, String> {
+        self.workbench
+            .read_with(cx, |this, _| this.ui_state.keyboard.shortcuts.clone())
+            .unwrap_or_default()
+    }
+
+    fn ui_state(&self, cx: &App) -> DesktopUiStateV1 {
+        self.workbench
+            .read_with(cx, |this, _| this.ui_state.clone())
+            .unwrap_or_default()
+    }
+
+    fn all_defaults_restored(&self, cx: &App) -> bool {
+        all_settings_defaults_restored(&self.ui_state(cx))
     }
 
     fn sync_controls(
@@ -31191,6 +31805,11 @@ impl FoundationSettings {
         self.code_fonts.update(cx, |select, cx| {
             select.set_items(code_choices, window, cx);
             select.set_selected_value(&appearance.code_font.family, window, cx)
+        });
+        self.terminal_shells.update(cx, |select, cx| {
+            select.set_items(shell_choices(), window, cx);
+            let shell = self.terminal_preferences(&*cx).shell.unwrap_or_default();
+            select.set_selected_value(&shell, window, cx);
         });
         self.session_content_widths.update(cx, |select, cx| {
             select.set_items(session_content_width_choices, window, cx);
@@ -31259,6 +31878,408 @@ impl FoundationSettings {
             .workbench
             .update(cx, |this, cx| this.set_close_to_tray(enabled, cx));
         cx.notify();
+    }
+
+    fn set_reduced_motion(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let _ = self
+            .workbench
+            .update(cx, |this, cx| this.set_reduced_motion(enabled, cx));
+        cx.notify();
+    }
+
+    fn set_high_contrast(&mut self, enabled: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self
+            .workbench
+            .update(cx, |this, cx| this.set_high_contrast(enabled, window, cx));
+        cx.notify();
+    }
+
+    fn set_sidebar_hierarchy(&mut self, mode: SidebarHierarchyMode, cx: &mut Context<Self>) {
+        let _ = self
+            .workbench
+            .update(cx, |this, cx| this.set_sidebar_hierarchy_mode(mode, cx));
+        cx.notify();
+    }
+
+    fn set_workbench_remember_layout(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            if !enabled {
+                this.ui_state.workbench.remember_layout = false;
+                clear_remembered_workbench_layout(&mut this.ui_state);
+                this.code_preview_visible = false;
+                this.preview_fullscreen_active = false;
+                this.code_workbench.update(cx, |workbench, cx| {
+                    workbench.set_preview_visible(false, cx);
+                });
+            } else {
+                this.ui_state.workbench.remember_layout = true;
+            }
+            this.queue_ui_state();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn set_default_new_session_location(
+        &mut self,
+        location: NewSessionLocation,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.ui_state.workbench.default_new_session_location = location;
+            this.queue_ui_state();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn set_startup_destination(&mut self, destination: StartupDestination, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.ui_state.desktop_behavior.startup_destination = destination;
+            this.queue_ui_state();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn set_launch_at_login(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            let application_id = this
+                .config
+                .as_ref()
+                .map(|config| config.application_id.as_str())
+                .unwrap_or("com.vibex.desktop");
+            match set_launch_at_login(enabled, application_id) {
+                Ok(()) => {
+                    this.ui_state.desktop_behavior.launch_at_login = enabled;
+                    this.queue_ui_state();
+                    this.persistence_note = None;
+                }
+                Err(error) => {
+                    this.persistence_note = Some(format!("{}: {}", error.code, error.message));
+                }
+            }
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn set_notifications_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.ui_state.desktop_behavior.notifications_enabled = enabled;
+            this.queue_ui_state();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn set_notification_kind(
+        &mut self,
+        kind: NotificationKind,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            match kind {
+                NotificationKind::Completed => {
+                    this.ui_state.desktop_behavior.notify_agent_completed = enabled
+                }
+                NotificationKind::NeedsInput => {
+                    this.ui_state.desktop_behavior.notify_agent_needs_input = enabled
+                }
+                NotificationKind::Failed => {
+                    this.ui_state.desktop_behavior.notify_agent_failed = enabled
+                }
+            }
+            this.queue_ui_state();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn set_queue_send_mode(&mut self, mode: ComposerQueueSendMode, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.ui_state.composer.queue_send_mode = mode;
+            if mode == ComposerQueueSendMode::Manual {
+                this.composer_queue_manual_session_ids = this
+                    .sessions
+                    .iter()
+                    .map(|session| session.id.as_str().to_string())
+                    .collect();
+            } else {
+                this.composer_queue_manual_session_ids.clear();
+            }
+            this.queue_ui_state();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn set_message_send_key(
+        &mut self,
+        key: MessageSendKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.ui_state.composer.message_send_key = key;
+            this.composer_input.update(cx, |input, cx| {
+                input.set_placeholder(this.strings().message_agent, window, cx);
+            });
+            this.queue_ui_state();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn set_terminal_shell(&mut self, shell: String, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.ui_state.terminal_preferences.shell = (!shell.is_empty()).then_some(shell);
+            this.queue_ui_state();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn set_terminal_working_directory(
+        &mut self,
+        directory: TerminalWorkingDirectory,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.ui_state.terminal_preferences.working_directory = directory;
+            this.queue_ui_state();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn set_shortcut(&mut self, action: String, keystroke: String, cx: &mut Context<Self>) -> bool {
+        let applied = self
+            .workbench
+            .update(cx, |this, cx| {
+                let keystroke = keystroke.trim().to_ascii_lowercase();
+                let old_effective = effective_shortcut(&this.ui_state.keyboard.shortcuts, &action)
+                    .map(str::to_string);
+                let default = FOUNDATION_SHORTCUTS
+                    .iter()
+                    .find(|(known_action, _)| *known_action == action)
+                    .map(|(_, default)| *default);
+                let desired = if keystroke.is_empty() {
+                    default
+                } else {
+                    Some(keystroke.as_str())
+                };
+                let conflicts = desired.is_some_and(|desired| {
+                    FOUNDATION_SHORTCUTS
+                        .iter()
+                        .filter(|(other_action, _)| *other_action != action)
+                        .any(|(other_action, _)| {
+                            effective_shortcut(&this.ui_state.keyboard.shortcuts, other_action)
+                                == Some(desired)
+                        })
+                });
+                let valid = default.is_some()
+                    && (keystroke.is_empty() || shortcut_is_valid(&keystroke))
+                    && !conflicts;
+                if !valid {
+                    this.persistence_note =
+                        Some("Shortcut is invalid or already in use".to_string());
+                } else {
+                    if keystroke.is_empty() {
+                        this.ui_state.keyboard.shortcuts.remove(&action);
+                    } else {
+                        this.ui_state
+                            .keyboard
+                            .shortcuts
+                            .insert(action.clone(), keystroke);
+                    }
+                    let new_effective =
+                        effective_shortcut(&this.ui_state.keyboard.shortcuts, &action);
+                    rebind_foundation_action(cx, &action, old_effective.as_deref(), new_effective);
+                    this.queue_ui_state();
+                    this.persistence_note = None;
+                }
+                cx.notify();
+                valid
+            })
+            .unwrap_or(false);
+        cx.notify();
+        applied
+    }
+
+    fn reset_layout(&mut self, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            clear_remembered_workbench_layout(&mut this.ui_state);
+            this.ui_state.sidebar.hierarchy_mode = SidebarHierarchyMode::Compact;
+            this.sidebar_overlay_open = false;
+            this.preview_overlay_open = false;
+            this.right_rail_overlay_open = false;
+            this.sidebar_hover_preview_open = false;
+            this.code_preview_visible = false;
+            this.code_files_surface_visible = false;
+            this.code_git_surface_visible = false;
+            this.code_workbench.update(cx, |workbench, cx| {
+                workbench.set_preview_visible(false, cx);
+                workbench.set_workspace_surface_visibility(false, false, cx);
+            });
+            this.queue_ui_state();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn clear_runtime_preferences(&mut self, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.clear_runtime_selection_preferences(cx);
+            this.queue_ui_state();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn clear_auto_continue_preferences(&mut self, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.clear_auto_continue_preference_state();
+            this.queue_ui_state();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn toggle_current_auto_continue(&mut self, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            if let Some(session) = this.selected_session().cloned() {
+                let enabled = this.auto_continue_enabled(&session.id);
+                this.set_auto_continue_enabled(session.id, !enabled, cx);
+            } else if let Some(project_id) = this
+                .ui_state
+                .workbench
+                .selected_workspace_id
+                .as_deref()
+                .and_then(|workspace_id| {
+                    this.workspaces
+                        .iter()
+                        .find(|(_, workspace)| workspace.id.as_str() == workspace_id)
+                        .map(|(project, _)| project.id.clone())
+                })
+            {
+                let enabled = this.project_auto_continue_enabled(&project_id);
+                this.set_project_auto_continue_enabled(project_id, !enabled, cx);
+            }
+        });
+        cx.notify();
+    }
+
+    fn open_custom_shell_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entity = cx.weak_entity();
+        let initial = self.terminal_preferences(cx).shell.unwrap_or_default();
+        window.open_dialog(cx, move |dialog, window, cx| {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value(initial.clone())
+                    .placeholder(locale::text("Shell path", "Shell 路径", "Shell 路徑"))
+            });
+            let apply = entity.clone();
+            dialog
+                .title(locale::text("Custom shell", "自定义 Shell", "自訂 Shell"))
+                .w(px(420.0))
+                .child(Input::new(&input).w_full())
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("cancel-shell")
+                                    .outline()
+                                    .label(locale::text("Cancel", "取消", "取消")),
+                            ),
+                        )
+                        .child(
+                            DialogAction::new().child(
+                                Button::new("apply-shell")
+                                    .primary()
+                                    .label(locale::text("Apply", "应用", "套用")),
+                            ),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    let value = input.read(cx).value().trim().to_string();
+                    if value.is_empty() || std::path::Path::new(&value).is_file() {
+                        let _ =
+                            apply.update(cx, |settings, cx| settings.set_terminal_shell(value, cx));
+                        true
+                    } else {
+                        let _ = apply.update(cx, |settings, cx| {
+                            let _ = settings.workbench.update(cx, |this, cx| {
+                                this.persistence_note = Some(
+                                    locale::text(
+                                        "Shell path does not exist",
+                                        "Shell 路径不存在",
+                                        "Shell 路徑不存在",
+                                    )
+                                    .to_string(),
+                                );
+                                cx.notify();
+                            });
+                            cx.notify();
+                        });
+                        false
+                    }
+                })
+        });
+    }
+
+    fn open_shortcut_dialog(
+        &mut self,
+        action: String,
+        current: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entity = cx.weak_entity();
+        let action_label = shortcut_action_label(&action);
+        window.open_dialog(cx, move |dialog, window, cx| {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value(current.clone())
+                    .placeholder("cmd-shift-p")
+            });
+            let apply = entity.clone();
+            let action_for_apply = action.clone();
+            dialog
+                .title(format!(
+                    "{}: {}",
+                    locale::text("Shortcut", "快捷键", "快速鍵"),
+                    action_label
+                ))
+                .w(px(420.0))
+                .child(Input::new(&input).w_full())
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("cancel-shortcut")
+                                    .outline()
+                                    .label(locale::text("Cancel", "取消", "取消")),
+                            ),
+                        )
+                        .child(
+                            DialogAction::new().child(
+                                Button::new("apply-shortcut")
+                                    .primary()
+                                    .label(locale::text("Apply", "应用", "套用")),
+                            ),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    let value = input.read(cx).value().to_string();
+                    apply
+                        .update(cx, |settings, cx| {
+                            settings.set_shortcut(action_for_apply.clone(), value, cx)
+                        })
+                        .unwrap_or(false)
+                })
+        });
     }
 
     fn request_restore_defaults(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -31330,125 +32351,85 @@ impl FoundationSettings {
         } else {
             background
         };
-        let general_active = self.active_section == SettingsSection::General;
-        let appearance_active = self.active_section == SettingsSection::Appearance;
-        let session_active = self.active_section == SettingsSection::Session;
-
-        div()
-            .flex()
-            .when(wide, |this| this.w(px(160.0)).flex_none().flex_col())
-            .when(!wide, |this| this.w_full().flex_row())
-            .p(px(3.0))
-            .rounded(px(10.0))
-            .bg(muted)
+        let sections = [
+            (SettingsSection::General, strings.general),
+            (SettingsSection::Appearance, strings.appearance),
+            (
+                SettingsSection::Workbench,
+                locale::text("Workbench", "工作台", "工作台"),
+            ),
+            (SettingsSection::Session, strings.session_settings),
+            (
+                SettingsSection::Terminal,
+                locale::text("Terminal", "终端", "終端機"),
+            ),
+            (
+                SettingsSection::Shortcuts,
+                locale::text("Shortcuts", "快捷键", "快速鍵"),
+            ),
+            (
+                SettingsSection::Data,
+                locale::text("Data & Diagnostics", "数据与诊断", "資料與診斷"),
+            ),
+            (
+                SettingsSection::About,
+                locale::text("About", "关于", "關於"),
+            ),
+        ];
+        let section_button = |(section, label): (SettingsSection, &'static str)| {
+            let active = self.active_section == section;
+            Button::new(SharedString::from(format!("settings-{section:?}")))
+                .small()
+                .ghost()
+                .h(px(26.0))
+                .px(px(6.0))
+                .rounded(px(8.0))
+                .selected(active)
+                .border_1()
+                .border_color(if active && is_dark {
+                    input
+                } else {
+                    cx.theme().transparent
+                })
+                .text_color(if active {
+                    foreground
+                } else {
+                    inactive_foreground
+                })
+                .when(active, |this| this.bg(active_background))
+                .when(wide, |this| this.w_full())
+                .when(!wide, |this| this.flex_1())
+                .tooltip(label)
+                .child(
+                    div()
+                        .w_full()
+                        .text_left()
+                        .text_xs()
+                        .font_medium()
+                        .child(label),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.active_section = section;
+                    cx.notify();
+                }))
+                .into_any_element()
+        };
+        let children = sections.into_iter().map(section_button);
+        v_flex()
+            .when(wide, |this| this.w(px(160.0)).flex_none())
+            .when(!wide, |this| this.w_full())
+            .gap_1()
             .child(
-                Button::new("settings-general")
-                    .small()
-                    .ghost()
-                    .h(px(26.0))
-                    .px(px(6.0))
-                    .rounded(px(8.0))
-                    .selected(general_active)
-                    .border_1()
-                    .border_color(if general_active && is_dark {
-                        input
-                    } else {
-                        cx.theme().transparent
-                    })
-                    .text_color(if general_active {
-                        foreground
-                    } else {
-                        inactive_foreground
-                    })
-                    .when(general_active, |this| this.bg(active_background))
-                    .when(wide, |this| this.w_full())
-                    .when(!wide, |this| this.flex_1())
-                    .tooltip(strings.general)
-                    .child(
-                        div()
-                            .w_full()
-                            .text_left()
-                            .text_xs()
-                            .font_medium()
-                            .child(strings.general),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.active_section = SettingsSection::General;
-                        cx.notify();
-                    })),
+                div()
+                    .flex()
+                    .when(wide, |this| this.flex_col())
+                    .when(!wide, |this| this.flex_row())
+                    .p(px(3.0))
+                    .rounded(px(10.0))
+                    .bg(muted)
+                    .children(children),
             )
-            .child(
-                Button::new("settings-appearance")
-                    .small()
-                    .ghost()
-                    .h(px(26.0))
-                    .px(px(6.0))
-                    .rounded(px(8.0))
-                    .selected(appearance_active)
-                    .border_1()
-                    .border_color(if appearance_active && is_dark {
-                        input
-                    } else {
-                        cx.theme().transparent
-                    })
-                    .text_color(if appearance_active {
-                        foreground
-                    } else {
-                        inactive_foreground
-                    })
-                    .when(appearance_active, |this| this.bg(active_background))
-                    .when(wide, |this| this.w_full())
-                    .when(!wide, |this| this.flex_1())
-                    .tooltip(strings.appearance)
-                    .child(
-                        div()
-                            .w_full()
-                            .text_left()
-                            .text_xs()
-                            .font_medium()
-                            .child(strings.appearance),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.active_section = SettingsSection::Appearance;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                Button::new("settings-session")
-                    .small()
-                    .ghost()
-                    .h(px(26.0))
-                    .px(px(6.0))
-                    .rounded(px(8.0))
-                    .selected(session_active)
-                    .border_1()
-                    .border_color(if session_active && is_dark {
-                        input
-                    } else {
-                        cx.theme().transparent
-                    })
-                    .text_color(if session_active {
-                        foreground
-                    } else {
-                        inactive_foreground
-                    })
-                    .when(session_active, |this| this.bg(active_background))
-                    .when(wide, |this| this.w_full())
-                    .when(!wide, |this| this.flex_1())
-                    .tooltip(strings.session_settings)
-                    .child(
-                        div()
-                            .w_full()
-                            .text_left()
-                            .text_xs()
-                            .font_medium()
-                            .child(strings.session_settings),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.active_section = SettingsSection::Session;
-                        cx.notify();
-                    })),
-            )
+            .child(Input::new(&self.search).small().h(px(28.0)).w_full())
             .into_any_element()
     }
 
@@ -31477,6 +32458,61 @@ impl FoundationSettings {
             .checked(desktop_behavior.close_to_tray)
             .tooltip(strings.close_to_tray)
             .on_click(cx.listener(|this, enabled, _, cx| this.set_close_to_tray(*enabled, cx)));
+        let startup_new_session =
+            desktop_behavior.startup_destination == StartupDestination::NewSession;
+        let startup_control = h_flex()
+            .gap_1()
+            .child(
+                Button::new("startup-restore")
+                    .small()
+                    .outline()
+                    .selected(!startup_new_session)
+                    .label(locale::text("Restore", "恢复工作台", "還原工作台"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_startup_destination(StartupDestination::RestoreWorkbench, cx)
+                    })),
+            )
+            .child(
+                Button::new("startup-new-session")
+                    .small()
+                    .outline()
+                    .selected(startup_new_session)
+                    .label(locale::text("New session", "新会话", "新會話"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_startup_destination(StartupDestination::NewSession, cx)
+                    })),
+            );
+        let launch_at_login = Switch::new("launch-at-login")
+            .small()
+            .checked(desktop_behavior.launch_at_login)
+            .on_click(cx.listener(|this, enabled, _, cx| this.set_launch_at_login(*enabled, cx)));
+        let notifications = Switch::new("notifications-enabled")
+            .small()
+            .checked(desktop_behavior.notifications_enabled)
+            .on_click(
+                cx.listener(|this, enabled, _, cx| this.set_notifications_enabled(*enabled, cx)),
+            );
+        let completed_notifications = Switch::new("notify-completed")
+            .small()
+            .checked(desktop_behavior.notify_agent_completed)
+            .disabled(!desktop_behavior.notifications_enabled)
+            .on_click(cx.listener(|this, enabled, _, cx| {
+                this.set_notification_kind(NotificationKind::Completed, *enabled, cx)
+            }));
+        let needs_input_notifications = Switch::new("notify-needs-input")
+            .small()
+            .checked(desktop_behavior.notify_agent_needs_input)
+            .disabled(!desktop_behavior.notifications_enabled)
+            .on_click(cx.listener(|this, enabled, _, cx| {
+                this.set_notification_kind(NotificationKind::NeedsInput, *enabled, cx)
+            }));
+        let failed_notifications = Switch::new("notify-failed")
+            .small()
+            .checked(desktop_behavior.notify_agent_failed)
+            .disabled(!desktop_behavior.notifications_enabled)
+            .on_click(cx.listener(|this, enabled, _, cx| {
+                this.set_notification_kind(NotificationKind::Failed, *enabled, cx)
+            }));
         settings_page(
             strings.general,
             strings.general_description,
@@ -31492,6 +32528,72 @@ impl FoundationSettings {
                     strings.close_to_tray,
                     strings.close_to_tray_description,
                     close_to_tray_switch,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Startup", "启动行为", "啟動行為"),
+                    locale::text(
+                        "Choose what opens after the local runtime is ready.",
+                        "选择本地运行时就绪后的打开内容。",
+                        "選擇本機執行階段就緒後要開啟的內容。",
+                    ),
+                    startup_control,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Launch at login", "开机启动", "登入時啟動"),
+                    locale::text(
+                        "Start Vibex when you sign in.",
+                        "登录系统时启动 Vibex。",
+                        "登入系統時啟動 Vibex。",
+                    ),
+                    launch_at_login,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("System notifications", "系统通知", "系統通知"),
+                    locale::text(
+                        "Show desktop notifications for Agent activity.",
+                        "显示 Agent 活动的桌面通知。",
+                        "顯示 Agent 活動的桌面通知。",
+                    ),
+                    notifications,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Agent completed", "Agent 完成", "Agent 完成"),
+                    locale::text(
+                        "Notify when an Agent turn completes.",
+                        "Agent 回合完成时通知。",
+                        "Agent 回合完成時通知。",
+                    ),
+                    completed_notifications,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Agent needs input", "Agent 需要输入", "Agent 需要輸入"),
+                    locale::text(
+                        "Notify when an Agent is waiting for input.",
+                        "Agent 等待输入时通知。",
+                        "Agent 等待輸入時通知。",
+                    ),
+                    needs_input_notifications,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Agent failed", "Agent 失败", "Agent 失敗"),
+                    locale::text(
+                        "Notify when an Agent turn fails.",
+                        "Agent 回合失败时通知。",
+                        "Agent 回合失敗時通知。",
+                    ),
+                    failed_notifications,
                     stacked,
                     cx,
                 ),
@@ -31714,6 +32816,38 @@ impl FoundationSettings {
                     stacked,
                     cx,
                 ),
+                setting_row(
+                    locale::text("Reduced motion", "减少动效", "減少動效"),
+                    locale::text(
+                        "Reduce non-essential interface animation.",
+                        "减少非必要界面动画。",
+                        "減少非必要介面動畫。",
+                    ),
+                    Switch::new("reduced-motion")
+                        .small()
+                        .checked(appearance.reduced_motion)
+                        .on_click(cx.listener(|this, enabled, _, cx| {
+                            this.set_reduced_motion(*enabled, cx)
+                        })),
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("High contrast", "高对比度", "高對比度"),
+                    locale::text(
+                        "Increase borders and focus contrast.",
+                        "提高边框和焦点对比度。",
+                        "提高邊框與焦點對比度。",
+                    ),
+                    Switch::new("high-contrast")
+                        .small()
+                        .checked(appearance.high_contrast)
+                        .on_click(cx.listener(|this, enabled, window, cx| {
+                            this.set_high_contrast(*enabled, window, cx)
+                        })),
+                    stacked,
+                    cx,
+                ),
             ],
             cx,
         )
@@ -31754,6 +32888,110 @@ impl FoundationSettings {
             .on_click(cx.listener(|this, enabled, _, cx| {
                 this.set_enhanced_command_execution_display(*enabled, cx)
             }));
+        let queue_manual = self
+            .workbench
+            .read_with(cx, |this, _| {
+                this.ui_state.composer.queue_send_mode == ComposerQueueSendMode::Manual
+            })
+            .unwrap_or(false);
+        let send_command = self
+            .workbench
+            .read_with(cx, |this, _| {
+                this.ui_state.composer.message_send_key == MessageSendKey::CommandEnter
+            })
+            .unwrap_or(false);
+        let queue_control = h_flex()
+            .gap_1()
+            .child(
+                Button::new("queue-automatic")
+                    .small()
+                    .outline()
+                    .selected(!queue_manual)
+                    .label(locale::text("Automatic", "自动", "自動"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_queue_send_mode(ComposerQueueSendMode::Automatic, cx)
+                    })),
+            )
+            .child(
+                Button::new("queue-manual")
+                    .small()
+                    .outline()
+                    .selected(queue_manual)
+                    .label(locale::text("Manual", "手动", "手動"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_queue_send_mode(ComposerQueueSendMode::Manual, cx)
+                    })),
+            );
+        let send_key_control = h_flex()
+            .gap_1()
+            .child(
+                Button::new("send-enter")
+                    .small()
+                    .outline()
+                    .selected(!send_command)
+                    .label("Enter")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.set_message_send_key(MessageSendKey::Enter, window, cx)
+                    })),
+            )
+            .child(
+                Button::new("send-command-enter")
+                    .small()
+                    .outline()
+                    .selected(send_command)
+                    .label(locale::text(
+                        "Cmd/Ctrl+Enter",
+                        "Cmd/Ctrl+Enter",
+                        "Cmd/Ctrl+Enter",
+                    ))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.set_message_send_key(MessageSendKey::CommandEnter, window, cx)
+                    })),
+            );
+        let auto_continue = self
+            .workbench
+            .read_with(cx, |this, _| {
+                this.selected_session()
+                    .is_some_and(|session| this.auto_continue_enabled(&session.id))
+            })
+            .unwrap_or(false);
+        let (runtime_preferences, auto_continue_preferences) = self
+            .workbench
+            .read_with(cx, |this, _| {
+                (
+                    !this
+                        .ui_state
+                        .composer
+                        .runtime_selections_by_agent
+                        .is_empty()
+                        || !this
+                            .ui_state
+                            .composer
+                            .runtime_selections_by_model
+                            .is_empty()
+                        || this.ui_state.composer.default_runtime_selection.is_some(),
+                    !this.ui_state.session.auto_continue_project_ids.is_empty()
+                        || !this
+                            .ui_state
+                            .session
+                            .auto_continue_session_overrides
+                            .is_empty(),
+                )
+            })
+            .unwrap_or((false, false));
+        let agent_jump = Button::new("open-agent-management")
+            .small()
+            .outline()
+            .label(locale::text(
+                "Open Management Center",
+                "打开管理中心",
+                "開啟管理中心",
+            ))
+            .on_click(cx.listener(|this, _, _, cx| {
+                let _ = this
+                    .workbench
+                    .update(cx, |workbench, cx| workbench.open_management(cx));
+            }));
 
         settings_page(
             strings.session_settings,
@@ -31780,6 +33018,704 @@ impl FoundationSettings {
                     stacked,
                     cx,
                 ),
+                setting_row(
+                    locale::text("Queue sending", "队列发送", "佇列傳送"),
+                    locale::text(
+                        "Choose the default behavior while an Agent is running.",
+                        "选择 Agent 运行时的默认队列行为。",
+                        "選擇 Agent 執行時的預設佇列行為。",
+                    ),
+                    queue_control,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Message send key", "消息发送按键", "訊息傳送按鍵"),
+                    locale::text(
+                        "Choose whether Enter or Cmd/Ctrl+Enter sends a message.",
+                        "选择 Enter 或 Cmd/Ctrl+Enter 发送消息。",
+                        "選擇 Enter 或 Cmd/Ctrl+Enter 傳送訊息。",
+                    ),
+                    send_key_control,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Auto-continue", "自动继续", "自動繼續"),
+                    locale::text(
+                        "Apply auto-continue to the selected session.",
+                        "为当前选中的会话启用自动继续。",
+                        "為目前選取的會話啟用自動繼續。",
+                    ),
+                    Switch::new("auto-continue")
+                        .small()
+                        .checked(auto_continue)
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.toggle_current_auto_continue(cx)),
+                        ),
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Remembered runtime", "已记住的运行时", "已記住的執行階段"),
+                    locale::text(
+                        "Clear the default and per-agent runtime selections used by new sessions.",
+                        "清除新会话使用的默认和按 Agent 记忆的运行时选择。",
+                        "清除新會話使用的預設與按 Agent 記住的執行階段選擇。",
+                    ),
+                    Button::new("clear-runtime-preferences")
+                        .small()
+                        .outline()
+                        .disabled(!runtime_preferences)
+                        .label(locale::text("Clear", "清除", "清除"))
+                        .on_click(cx.listener(|this, _, _, cx| this.clear_runtime_preferences(cx))),
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Auto-continue defaults", "自动继续默认项", "自動繼續預設項"),
+                    locale::text(
+                        "Clear project and session auto-continue overrides.",
+                        "清除项目和会话的自动继续覆盖项。",
+                        "清除專案與會話的自動繼續覆寫項。",
+                    ),
+                    Button::new("clear-auto-continue-preferences")
+                        .small()
+                        .outline()
+                        .disabled(!auto_continue_preferences)
+                        .label(locale::text("Clear", "清除", "清除"))
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.clear_auto_continue_preferences(cx)),
+                        ),
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Agent configuration", "Agent 配置", "Agent 設定"),
+                    locale::text(
+                        "Credentials, providers, MCP, Skills and hooks stay in the Management Center.",
+                        "凭据、供应商、MCP、Skills 和 Hooks 仍由管理中心负责。",
+                        "憑證、供應商、MCP、Skills 與 Hooks 仍由管理中心負責。",
+                    ),
+                    agent_jump,
+                    stacked,
+                    cx,
+                ),
+            ],
+            cx,
+        )
+    }
+
+    fn render_workbench_page(
+        &self,
+        workbench: &vibex_desktop_model::WorkbenchUiState,
+        stacked: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let hierarchy = self
+            .workbench
+            .read_with(cx, |this, _| this.ui_state.sidebar.hierarchy_mode)
+            .unwrap_or_default();
+        let overrides = self
+            .workbench
+            .read_with(cx, |this, _| {
+                this.ui_state.sidebar.project_location_preferences.len()
+            })
+            .unwrap_or(0);
+        let location_control = h_flex()
+            .gap_1()
+            .child(
+                Button::new("default-current-checkout")
+                    .small()
+                    .outline()
+                    .selected(
+                        workbench.default_new_session_location
+                            == NewSessionLocation::CurrentCheckout,
+                    )
+                    .label(locale::text("Current checkout", "当前检出", "目前簽出"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_default_new_session_location(
+                            NewSessionLocation::CurrentCheckout,
+                            cx,
+                        )
+                    })),
+            )
+            .child(
+                Button::new("default-new-worktree")
+                    .small()
+                    .outline()
+                    .selected(
+                        workbench.default_new_session_location == NewSessionLocation::NewWorktree,
+                    )
+                    .label("Worktree")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_default_new_session_location(NewSessionLocation::NewWorktree, cx)
+                    })),
+            );
+        let hierarchy_control = h_flex()
+            .gap_1()
+            .child(
+                Button::new("sidebar-compact")
+                    .small()
+                    .outline()
+                    .selected(hierarchy == SidebarHierarchyMode::Compact)
+                    .label(locale::text("Compact", "紧凑", "精簡"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_sidebar_hierarchy(SidebarHierarchyMode::Compact, cx)
+                    })),
+            )
+            .child(
+                Button::new("sidebar-detailed")
+                    .small()
+                    .outline()
+                    .selected(hierarchy == SidebarHierarchyMode::Detailed)
+                    .label(locale::text("Detailed", "详细", "詳細"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_sidebar_hierarchy(SidebarHierarchyMode::Detailed, cx)
+                    })),
+            );
+        let clear_overrides = Button::new("clear-project-location-overrides")
+            .small()
+            .outline()
+            .disabled(overrides == 0)
+            .label(format!(
+                "{} ({overrides})",
+                locale::text("Clear overrides", "清除覆盖项", "清除覆寫項")
+            ))
+            .on_click(cx.listener(|this, _, _, cx| {
+                let _ = this.workbench.update(cx, |workbench, cx| {
+                    workbench
+                        .ui_state
+                        .sidebar
+                        .project_location_preferences
+                        .clear();
+                    workbench.queue_ui_state();
+                    cx.notify();
+                });
+                cx.notify();
+            }));
+        settings_page(
+            locale::text("Workbench", "工作台", "工作台"),
+            locale::text(
+                "Configure layout and new-session defaults.",
+                "配置布局和新会话默认值。",
+                "設定版面與新會話預設值。",
+            ),
+            vec![
+                setting_row(
+                    locale::text("Sidebar hierarchy", "侧栏层级", "側欄層級"),
+                    locale::text(
+                        "Choose compact project groups or detailed workspace nesting.",
+                        "选择紧凑项目分组或详细工作区嵌套。",
+                        "選擇精簡專案分組或詳細工作區巢狀結構。",
+                    ),
+                    hierarchy_control,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text(
+                        "Default new-session location",
+                        "新会话默认位置",
+                        "新會話預設位置",
+                    ),
+                    locale::text(
+                        "Used when a project has no explicit override.",
+                        "项目没有覆盖项时使用。",
+                        "專案沒有覆寫項時使用。",
+                    ),
+                    location_control,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Remember layout", "记住工作台布局", "記住工作台版面"),
+                    locale::text(
+                        "Restore panel visibility, sizes and open editor state.",
+                        "恢复面板可见性、尺寸和打开的编辑器状态。",
+                        "還原面板可見性、尺寸與開啟的編輯器狀態。",
+                    ),
+                    Switch::new("remember-layout")
+                        .small()
+                        .checked(workbench.remember_layout)
+                        .on_click(cx.listener(|this, enabled, _, cx| {
+                            this.set_workbench_remember_layout(*enabled, cx)
+                        })),
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Project overrides", "项目覆盖项", "專案覆寫項"),
+                    locale::text(
+                        "Review and clear saved new-session location overrides.",
+                        "查看并清除已保存的新会话位置覆盖项。",
+                        "檢視並清除已儲存的新會話位置覆寫項。",
+                    ),
+                    clear_overrides,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Reset workbench layout", "重置工作台布局", "重設工作台版面"),
+                    locale::text(
+                        "Restore default panel visibility and sizes without deleting sessions.",
+                        "恢复默认面板可见性和尺寸，不删除会话。",
+                        "還原預設面板可見性與尺寸，不刪除會話。",
+                    ),
+                    Button::new("reset-layout")
+                        .small()
+                        .outline()
+                        .label(locale::text("Reset layout", "重置布局", "重設版面"))
+                        .on_click(cx.listener(|this, _, _, cx| this.reset_layout(cx))),
+                    stacked,
+                    cx,
+                ),
+            ],
+            cx,
+        )
+    }
+
+    fn render_terminal_page(
+        &self,
+        preferences: &vibex_desktop_model::TerminalPreferencesUiState,
+        stacked: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let input = theme::semantic_color("input", cx.theme().is_dark());
+        let shell_select = div()
+            .h(px(28.0))
+            .when(stacked, |this| this.w_full())
+            .when(!stacked, |this| this.w(px(240.0)))
+            .child(
+                Select::new(&self.terminal_shells)
+                    .small()
+                    .h(px(28.0))
+                    .rounded(px(8.0))
+                    .border_color(input)
+                    .text_xs(),
+            );
+        let cwd = preferences.working_directory;
+        let cwd_control = h_flex()
+            .gap_1()
+            .child(
+                Button::new("terminal-cwd-worktree")
+                    .small()
+                    .outline()
+                    .selected(cwd == TerminalWorkingDirectory::CurrentWorktree)
+                    .label(locale::text("Worktree", "工作树", "工作樹"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_terminal_working_directory(
+                            TerminalWorkingDirectory::CurrentWorktree,
+                            cx,
+                        )
+                    })),
+            )
+            .child(
+                Button::new("terminal-cwd-project")
+                    .small()
+                    .outline()
+                    .selected(cwd == TerminalWorkingDirectory::ProjectRoot)
+                    .label(locale::text("Project", "项目", "專案"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_terminal_working_directory(
+                            TerminalWorkingDirectory::ProjectRoot,
+                            cx,
+                        )
+                    })),
+            )
+            .child(
+                Button::new("terminal-cwd-file")
+                    .small()
+                    .outline()
+                    .selected(cwd == TerminalWorkingDirectory::CurrentFile)
+                    .label(locale::text("Current file", "当前文件", "目前檔案"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_terminal_working_directory(
+                            TerminalWorkingDirectory::CurrentFile,
+                            cx,
+                        )
+                    })),
+            );
+        settings_page(
+            locale::text("Terminal", "终端", "終端機"),
+            locale::text(
+                "Configure defaults for newly created terminals.",
+                "配置新建终端的默认值。",
+                "設定新建終端機的預設值。",
+            ),
+            vec![
+                setting_row(
+                    locale::text("Default shell", "默认 Shell", "預設 Shell"),
+                    locale::text(
+                        "Applied to both composer and preview terminals.",
+                        "同时应用到对话和预览终端。",
+                        "同時套用到對話與預覽終端機。",
+                    ),
+                    shell_select,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Custom shell", "自定义 Shell", "自訂 Shell"),
+                    locale::text(
+                        "Use an executable not listed by the system.",
+                        "使用系统列表中没有的可执行文件。",
+                        "使用系統清單中沒有的可執行檔。",
+                    ),
+                    Button::new("custom-shell")
+                        .small()
+                        .outline()
+                        .label(locale::text("Choose path", "选择路径", "選擇路徑"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_custom_shell_dialog(window, cx)
+                        })),
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Working directory", "工作目录", "工作目錄"),
+                    locale::text(
+                        "Choose the initial directory for new terminals.",
+                        "选择新终端的初始目录。",
+                        "選擇新終端機的初始目錄。",
+                    ),
+                    cwd_control,
+                    stacked,
+                    cx,
+                ),
+            ],
+            cx,
+        )
+    }
+
+    fn render_shortcuts_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
+        let overrides = self.keyboard_shortcuts(cx);
+        let mut rows = Vec::new();
+        for (action, default) in FOUNDATION_SHORTCUTS {
+            let current = overrides
+                .get(*action)
+                .cloned()
+                .unwrap_or_else(|| (*default).to_string());
+            let edit_action = (*action).to_string();
+            let edit_current = current.clone();
+            let reset_action = (*action).to_string();
+            let control = h_flex()
+                .gap_1()
+                .child(
+                    Button::new(SharedString::from(format!("edit-shortcut-{action}")))
+                        .small()
+                        .outline()
+                        .label(current)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_shortcut_dialog(
+                                edit_action.clone(),
+                                edit_current.clone(),
+                                window,
+                                cx,
+                            )
+                        })),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("reset-shortcut-{action}")))
+                        .small()
+                        .ghost()
+                        .icon(IconName::Undo)
+                        .tooltip(locale::text("Reset", "重置", "重設"))
+                        .disabled(!overrides.contains_key(*action))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let _ = this.set_shortcut(reset_action.clone(), String::new(), cx);
+                        })),
+                );
+            rows.push(setting_row(
+                shortcut_action_label(action),
+                shortcut_action_group(action),
+                control,
+                stacked,
+                cx,
+            ));
+        }
+        rows.push(setting_row(
+            locale::text("All shortcuts", "全部快捷键", "全部快速鍵"),
+            locale::text(
+                "Remove all custom mappings.",
+                "移除全部自定义映射。",
+                "移除全部自訂對應。",
+            ),
+            Button::new("reset-all-shortcuts")
+                .small()
+                .outline()
+                .disabled(overrides.is_empty())
+                .label(locale::text("Reset all", "全部重置", "全部重設"))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    let _ = this.workbench.update(cx, |workbench, cx| {
+                        clear_shortcut_overrides(&mut workbench.ui_state.keyboard.shortcuts, cx);
+                        workbench.queue_ui_state();
+                        cx.notify();
+                    });
+                    cx.notify();
+                })),
+            stacked,
+            cx,
+        ));
+        settings_page(
+            locale::text("Shortcuts", "快捷键", "快速鍵"),
+            locale::text(
+                "Review and customize keyboard shortcuts. Changes apply immediately.",
+                "查看和自定义快捷键，修改立即生效。",
+                "檢視與自訂快速鍵，變更會立即生效。",
+            ),
+            rows,
+            cx,
+        )
+    }
+
+    fn render_data_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
+        let home = self
+            .workbench
+            .read_with(cx, |this, _| {
+                this.config.as_ref().map(|config| config.home_dir.clone())
+            })
+            .ok()
+            .flatten();
+        let usage = home.as_deref().and_then(|home| storage_usage(home).ok());
+        let storage_label = usage
+            .map(|usage| {
+                format!(
+                    "{} {} · DB {} · {} {} · {} {} · {} {} · {} {}",
+                    locale::text("Total", "总计", "總計"),
+                    format_bytes(usage.total_bytes()),
+                    format_bytes(usage.database_bytes),
+                    locale::text("Sessions", "会话", "會話"),
+                    format_bytes(usage.session_bytes),
+                    locale::text("Terminals", "终端", "終端機"),
+                    format_bytes(usage.terminal_bytes),
+                    locale::text("Attachments", "附件", "附件"),
+                    format_bytes(usage.attachment_bytes),
+                    locale::text("Diagnostics", "诊断", "診斷"),
+                    format_bytes(usage.diagnostic_bytes),
+                )
+            })
+            .unwrap_or_else(|| locale::text("Unavailable", "不可用", "無法使用").to_string());
+        let open_home = home.clone();
+        settings_page(
+            locale::text("Data & Diagnostics", "数据与诊断", "資料與診斷"),
+            locale::text(
+                "Inspect local storage and open existing diagnostic workflows.",
+                "检查本地存储并打开现有诊断流程。",
+                "檢查本機儲存並開啟現有診斷流程。",
+            ),
+            vec![
+                setting_row(
+                    locale::text("Local storage", "本地存储", "本機儲存"),
+                    locale::text(
+                        "Database, sessions, terminal records, attachments and diagnostics.",
+                        "数据库、会话、终端记录、附件和诊断文件。",
+                        "資料庫、會話、終端機記錄、附件與診斷檔案。",
+                    ),
+                    div().text_xs().font_medium().child(storage_label),
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Data directory", "数据目录", "資料目錄"),
+                    locale::text(
+                        "Reveal the authoritative local runtime home.",
+                        "打开权威本地运行时目录。",
+                        "開啟權威本機執行階段目錄。",
+                    ),
+                    Button::new("open-data-directory")
+                        .small()
+                        .outline()
+                        .disabled(open_home.is_none())
+                        .label(locale::text("Open", "打开", "開啟"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(path) = open_home.clone() {
+                                let _ = reveal_path_in_file_manager(&path);
+                            }
+                            let _ = &this;
+                            cx.notify();
+                        })),
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Usage statistics", "用量统计", "用量統計"),
+                    locale::text(
+                        "Open the complete Usage page.",
+                        "打开完整的用量统计页面。",
+                        "開啟完整的用量統計頁面。",
+                    ),
+                    Button::new("open-usage-settings")
+                        .small()
+                        .outline()
+                        .label(locale::text("Open Usage", "打开用量统计", "開啟用量統計"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let _ = this
+                                .workbench
+                                .update(cx, |workbench, cx| workbench.open_usage(None, cx));
+                        })),
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Diagnostics & recovery", "诊断与恢复", "診斷與復原"),
+                    locale::text(
+                        "Export diagnostics, create backups and recover data in Management Center.",
+                        "在管理中心导出诊断、创建备份和恢复数据。",
+                        "在管理中心匯出診斷、建立備份與復原資料。",
+                    ),
+                    Button::new("open-recovery-settings")
+                        .small()
+                        .outline()
+                        .label(locale::text(
+                            "Open Management Center",
+                            "打开管理中心",
+                            "開啟管理中心",
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let _ = this
+                                .workbench
+                                .update(cx, |workbench, cx| workbench.open_management(cx));
+                        })),
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Reset workbench layout", "重置工作台布局", "重設工作台版面"),
+                    locale::text(
+                        "Does not remove projects, sessions or local data.",
+                        "不会删除项目、会话或本地数据。",
+                        "不會刪除專案、會話或本機資料。",
+                    ),
+                    Button::new("data-reset-layout")
+                        .small()
+                        .outline()
+                        .label(locale::text("Reset", "重置", "重設"))
+                        .on_click(cx.listener(|this, _, _, cx| this.reset_layout(cx))),
+                    stacked,
+                    cx,
+                ),
+            ],
+            cx,
+        )
+    }
+
+    fn render_about_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
+        let channel = release_channel()
+            .map(|channel| format!("{channel:?}"))
+            .unwrap_or_else(|_| "Preview".into());
+        let summary = format!(
+            "Vibex {}\nChannel: {}\nPlatform: {} {}\nRust: {}",
+            env!("CARGO_PKG_VERSION"),
+            channel,
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            option_env!("RUSTC_VERSION").unwrap_or("1.97.0")
+        );
+        let copy_summary = summary.clone();
+        settings_page(
+            locale::text("About", "关于", "關於"),
+            locale::text(
+                "Version, build and project information.",
+                "版本、构建和项目信息。",
+                "版本、建置與專案資訊。",
+            ),
+            vec![
+                setting_row(
+                    locale::text("Version", "版本", "版本"),
+                    locale::text(
+                        "Installed Vibex desktop version and release channel.",
+                        "已安装的 Vibex 桌面版本和发布通道。",
+                        "已安裝的 Vibex 桌面版本與發行通道。",
+                    ),
+                    div().text_xs().font_medium().child(format!(
+                        "{} · {}",
+                        env!("CARGO_PKG_VERSION"),
+                        channel
+                    )),
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Platform", "平台", "平台"),
+                    locale::text(
+                        "Current operating system and architecture.",
+                        "当前操作系统和架构。",
+                        "目前作業系統與架構。",
+                    ),
+                    div().text_xs().font_medium().child(format!(
+                        "{} · {}",
+                        std::env::consts::OS,
+                        std::env::consts::ARCH
+                    )),
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Environment summary", "环境摘要", "環境摘要"),
+                    locale::text(
+                        "Copy a non-secret summary for support.",
+                        "复制不包含密钥的支持摘要。",
+                        "複製不包含密鑰的支援摘要。",
+                    ),
+                    Button::new("copy-environment-summary")
+                        .small()
+                        .outline()
+                        .icon(IconName::Copy)
+                        .label(locale::text("Copy", "复制", "複製"))
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(copy_summary.clone()))
+                        }),
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("License", "许可证", "授權條款"),
+                    "AGPL-3.0-or-later",
+                    Button::new("open-license")
+                        .small()
+                        .outline()
+                        .label(locale::text("Open", "打开", "開啟"))
+                        .on_click(|_, _, _| {
+                            let _ = open_external_url("https://www.gnu.org/licenses/agpl-3.0.html");
+                        }),
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Source code", "源代码", "原始碼"),
+                    locale::text(
+                        "Vibex is open source.",
+                        "Vibex 是开源软件。",
+                        "Vibex 是開源軟體。",
+                    ),
+                    Button::new("open-source")
+                        .small()
+                        .outline()
+                        .label("GitHub")
+                        .on_click(|_, _, _| {
+                            let _ = open_external_url("https://github.com/vibex-ai/vibex");
+                        }),
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Release notes", "发行说明", "發行說明"),
+                    locale::text(
+                        "Review changes for published releases.",
+                        "查看已发布版本的变更。",
+                        "檢視已發行版本的變更。",
+                    ),
+                    Button::new("open-releases")
+                        .small()
+                        .outline()
+                        .label(locale::text("Open", "打开", "開啟"))
+                        .on_click(|_, _, _| {
+                            let _ = open_external_url("https://github.com/vibex-ai/vibex/releases");
+                        }),
+                    stacked,
+                    cx,
+                ),
             ],
             cx,
         )
@@ -31791,6 +33727,8 @@ impl Render for FoundationSettings {
         let appearance = self.appearance(cx);
         let session = self.session(cx);
         let desktop_behavior = self.desktop_behavior(cx);
+        let workbench = self.workbench_state(cx);
+        let terminal = self.terminal_preferences(cx);
         let strings = locale::strings(locale::resolve_locale(
             appearance.locale,
             locale::system_locale().as_deref(),
@@ -31809,6 +33747,11 @@ impl Render for FoundationSettings {
             SettingsSection::Session => {
                 self.render_session_page(&session, stacked_rows, strings, cx)
             }
+            SettingsSection::Workbench => self.render_workbench_page(&workbench, stacked_rows, cx),
+            SettingsSection::Terminal => self.render_terminal_page(&terminal, stacked_rows, cx),
+            SettingsSection::Shortcuts => self.render_shortcuts_page(stacked_rows, cx),
+            SettingsSection::Data => self.render_data_page(stacked_rows, cx),
+            SettingsSection::About => self.render_about_page(stacked_rows, cx),
         };
 
         div()
@@ -31908,6 +33851,37 @@ fn selected_font_index(choices: &[FontChoice], selected: Option<&String>) -> Opt
         .iter()
         .position(|choice| choice.family.as_ref() == selected)
         .map(|row| IndexPath::default().row(row))
+}
+
+fn shell_choices() -> Vec<ShellChoice> {
+    std::iter::once(ShellChoice {
+        label: locale::text("System default", "系统默认", "系統預設").into(),
+        path: String::new(),
+    })
+    .chain(
+        available_shells()
+            .into_iter()
+            .map(|(label, path)| ShellChoice {
+                label: label.into(),
+                path,
+            }),
+    )
+    .collect()
+}
+
+fn selected_shell_index(choices: &[ShellChoice], selected: &Option<String>) -> Option<IndexPath> {
+    choices
+        .iter()
+        .position(|choice| &choice.path == selected.as_ref().unwrap_or(&String::new()))
+        .map(|row| IndexPath::default().row(row))
+}
+
+fn shortcut_is_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 80
+        && !value.chars().any(char::is_whitespace)
+        && !value.chars().any(char::is_control)
+        && Keystroke::parse(value).is_ok()
 }
 
 fn vibex_wordmark(
@@ -32158,16 +34132,70 @@ impl Render for VibexWorkbench {
 }
 
 pub fn bind_foundation_keys(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("cmd-b", ToggleSidebar, None),
-        KeyBinding::new("cmd-shift-p", TogglePreview, None),
-        KeyBinding::new("cmd-shift-r", ToggleRightRail, None),
-        KeyBinding::new("cmd-,", OpenSettings, None),
-        KeyBinding::new("cmd-r", RetryRuntime, Some("RuntimeFailed")),
-        KeyBinding::new("cmd-s", SaveActiveFile, None),
-        KeyBinding::new("alt-left", NavigateBack, None),
-        KeyBinding::new("alt-right", NavigateForward, None),
-    ]);
+    let overrides = release_runtime_config()
+        .ok()
+        .and_then(|config| {
+            UiStateStore::new(ui_state_path(&config.home_dir))
+                .load_read_only()
+                .ok()
+        })
+        .map(|load| load.state.keyboard.shortcuts)
+        .unwrap_or_default();
+    let mut bindings: Vec<KeyBinding> = Vec::new();
+    for (action, default) in FOUNDATION_SHORTCUTS {
+        let effective = overrides
+            .get(*action)
+            .map(String::as_str)
+            .unwrap_or(*default);
+        if overrides.contains_key(*action) {
+            bind_action(&mut bindings, default, action_name(action), true);
+        }
+        bind_action(&mut bindings, effective, action, false);
+    }
+    cx.bind_keys(bindings);
+}
+
+fn bind_action(bindings: &mut Vec<KeyBinding>, keystroke: &str, action: &str, unbind: bool) {
+    macro_rules! push {
+        ($value:expr, $name:expr) => {
+            if unbind {
+                bindings.push(KeyBinding::new(keystroke, Unbind($name.into()), None));
+            } else {
+                bindings.push(KeyBinding::new(keystroke, $value, None));
+            }
+        };
+    }
+    match action {
+        "toggle_sidebar" | "vibex::ToggleSidebar" => push!(ToggleSidebar, "vibex::ToggleSidebar"),
+        "toggle_preview" | "vibex::TogglePreview" => push!(TogglePreview, "vibex::TogglePreview"),
+        "toggle_right_rail" | "vibex::ToggleRightRail" => {
+            push!(ToggleRightRail, "vibex::ToggleRightRail")
+        }
+        "open_settings" | "vibex::OpenSettings" => push!(OpenSettings, "vibex::OpenSettings"),
+        "retry_runtime" | "vibex::RetryRuntime" => push!(RetryRuntime, "vibex::RetryRuntime"),
+        "save_active_file" | "vibex::SaveActiveFile" => {
+            push!(SaveActiveFile, "vibex::SaveActiveFile")
+        }
+        "navigate_back" | "vibex::NavigateBack" => push!(NavigateBack, "vibex::NavigateBack"),
+        "navigate_forward" | "vibex::NavigateForward" => {
+            push!(NavigateForward, "vibex::NavigateForward")
+        }
+        _ => {}
+    }
+}
+
+fn action_name(action: &str) -> &'static str {
+    match action {
+        "toggle_sidebar" => "vibex::ToggleSidebar",
+        "toggle_preview" => "vibex::TogglePreview",
+        "toggle_right_rail" => "vibex::ToggleRightRail",
+        "open_settings" => "vibex::OpenSettings",
+        "retry_runtime" => "vibex::RetryRuntime",
+        "save_active_file" => "vibex::SaveActiveFile",
+        "navigate_back" => "vibex::NavigateBack",
+        "navigate_forward" => "vibex::NavigateForward",
+        _ => "vibex::NoAction",
+    }
 }
 
 pub fn open_workbench_window(cx: &mut App) -> Result<(), String> {
@@ -32439,6 +34467,49 @@ fn settings_defaults_restored(
     appearance == &AppearanceUiState::default()
         && session == &SessionUiState::default()
         && desktop_behavior == &DesktopBehaviorUiState::default()
+}
+
+fn remembered_workbench_layout_defaults(state: &DesktopUiStateV1) -> bool {
+    let defaults = vibex_desktop_model::WorkbenchUiState::default();
+    state.workbench.selected_file_path == defaults.selected_file_path
+        && state.workbench.selected_git_path == defaults.selected_git_path
+        && state.workbench.sidebar_visible == defaults.sidebar_visible
+        && state.workbench.preview_visible == defaults.preview_visible
+        && state.workbench.right_rail_visible == defaults.right_rail_visible
+        && state.workbench.sidebar_width == defaults.sidebar_width
+        && state.workbench.preview_width == defaults.preview_width
+        && state.workbench.right_rail_width == defaults.right_rail_width
+        && state.preview.focused_pane_id == defaults_preview_focused_pane_id()
+        && state.preview.pinned_tab_ids.is_empty()
+        && state.preview.split_sizes == vec![1.0]
+        && state.preview.layout == vibex_desktop_model::PreviewState::default()
+        && state.terminal == vibex_desktop_model::TerminalUiState::default()
+        && state.right_rail == vibex_desktop_model::RightRailUiState::default()
+        && state.composer.terminal_ids.is_empty()
+        && state.terminal_tab_titles.is_empty()
+        && state.agent_tab_order.is_empty()
+}
+
+fn defaults_preview_focused_pane_id() -> Option<String> {
+    vibex_desktop_model::PreviewUiState::default().focused_pane_id
+}
+
+fn all_settings_defaults_restored(state: &DesktopUiStateV1) -> bool {
+    settings_defaults_restored(&state.appearance, &state.session, &state.desktop_behavior)
+        && remembered_workbench_layout_defaults(state)
+        && state.workbench.remember_layout
+        && state.workbench.default_new_session_location == NewSessionLocation::CurrentCheckout
+        && state.sidebar.hierarchy_mode == SidebarHierarchyMode::Compact
+        && state.sidebar.project_location_preferences.is_empty()
+        && state.terminal_preferences == vibex_desktop_model::TerminalPreferencesUiState::default()
+        && state.keyboard.shortcuts.is_empty()
+        && state.composer.queue_send_mode == ComposerQueueSendMode::Automatic
+        && state.composer.message_send_key == MessageSendKey::Enter
+        && state.composer.default_runtime_selection.is_none()
+        && state.composer.runtime_selections_by_agent.is_empty()
+        && state.composer.runtime_selections_by_model.is_empty()
+        && state.session.auto_continue_project_ids.is_empty()
+        && state.session.auto_continue_session_overrides.is_empty()
 }
 
 fn adjust_u16(value: u16, delta: i16, minimum: u16, maximum: u16) -> u16 {
@@ -32792,6 +34863,178 @@ mod tests {
             execution_attribution: None,
             payload,
         }
+    }
+
+    #[test]
+    fn disabled_layout_memory_clears_only_remembered_layout_state() {
+        let mut state = DesktopUiStateV1::default();
+        state.workbench.remember_layout = false;
+        state.workbench.selected_file_path = Some("src/app.rs".into());
+        state.workbench.preview_visible = true;
+        state.preview.layout.tabs.insert(
+            "file:src/app.rs".into(),
+            vibex_desktop_model::PreviewTab {
+                id: "file:src/app.rs".into(),
+                target: vibex_desktop_model::PreviewTarget::File {
+                    path: "src/app.rs".into(),
+                },
+                created_at_ms: 1,
+                pinned: true,
+                temporary: false,
+            },
+        );
+        state.composer.terminal_ids.push("terminal-1".into());
+        state.workbench.default_new_session_location = NewSessionLocation::NewWorktree;
+        state.appearance.reduced_motion = true;
+        state.terminal_preferences.shell = Some("/bin/zsh".into());
+
+        apply_layout_memory_preference(&mut state);
+
+        assert!(!state.workbench.remember_layout);
+        assert_eq!(state.workbench.selected_file_path, None);
+        assert!(!state.workbench.preview_visible);
+        assert!(state.preview.layout.tabs.is_empty());
+        assert!(state.composer.terminal_ids.is_empty());
+        assert_eq!(
+            state.workbench.default_new_session_location,
+            NewSessionLocation::NewWorktree
+        );
+        assert!(state.appearance.reduced_motion);
+        assert_eq!(
+            state.terminal_preferences.shell.as_deref(),
+            Some("/bin/zsh")
+        );
+    }
+
+    #[test]
+    fn terminal_preferences_resolve_worktree_project_and_current_file_directories() {
+        assert_eq!(
+            terminal_preference_target(
+                "/repo/worktree",
+                Some("/repo"),
+                Some("src/app.rs"),
+                &TerminalWorkingDirectory::CurrentWorktree,
+            ),
+            ("/repo/worktree".into(), Some("/repo/worktree".into()))
+        );
+        assert_eq!(
+            terminal_preference_target(
+                "/repo",
+                Some("/repo"),
+                Some("src/app.rs"),
+                &TerminalWorkingDirectory::ProjectRoot,
+            ),
+            ("/repo".into(), Some("/repo".into()))
+        );
+        assert_eq!(
+            terminal_preference_target(
+                "/repo/worktree",
+                None,
+                Some("src/app.rs"),
+                &TerminalWorkingDirectory::CurrentFile,
+            ),
+            ("/repo/worktree".into(), Some("src".into()))
+        );
+        assert_eq!(
+            terminal_preference_target(
+                "/repo/worktree",
+                None,
+                Some("README.md"),
+                &TerminalWorkingDirectory::CurrentFile,
+            ),
+            ("/repo/worktree".into(), Some("/repo/worktree".into()))
+        );
+    }
+
+    #[test]
+    fn completion_notification_requires_an_authoritative_final_message() {
+        let session_id = VibexSessionId::new();
+        let streaming_item = timeline_item_with_payload(
+            &session_id,
+            1,
+            TimelineSource::Agent,
+            TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                text_delta: "final answer chunk".into(),
+                chunk_index: 0,
+                phase: Some(AgentMessagePhase::FinalAnswer),
+            }),
+        );
+        let streaming_event = TimelineLiveEvent {
+            session_id: session_id.clone(),
+            sequence: 1,
+            item: streaming_item,
+        };
+        let preferences = DesktopBehaviorUiState::default();
+        assert_eq!(
+            timeline_notification_kind(&[streaming_event], &preferences),
+            None
+        );
+
+        let final_item = indexed_timeline_item(&session_id, 2, "done");
+        let final_event = TimelineLiveEvent {
+            session_id,
+            sequence: 2,
+            item: final_item,
+        };
+        assert_eq!(
+            timeline_notification_kind(&[final_event], &preferences),
+            Some(NotificationKind::Completed)
+        );
+    }
+
+    #[test]
+    fn settings_default_detection_covers_every_new_preference_family() {
+        let state = DesktopUiStateV1::default();
+        assert!(all_settings_defaults_restored(&state));
+
+        let mut changed = state.clone();
+        changed.workbench.remember_layout = false;
+        assert!(!all_settings_defaults_restored(&changed));
+
+        let mut changed = state.clone();
+        changed.terminal_preferences.shell = Some("/bin/zsh".into());
+        assert!(!all_settings_defaults_restored(&changed));
+
+        let mut changed = state.clone();
+        changed
+            .keyboard
+            .shortcuts
+            .insert("open_settings".into(), "cmd-shift-,".into());
+        assert!(!all_settings_defaults_restored(&changed));
+
+        let mut changed = state.clone();
+        changed.composer.default_runtime_selection = Some(SessionRuntimeSelection::provider(
+            AgentId::parse("codex").unwrap(),
+            ProviderProfileId::parse("provider_codex_default").unwrap(),
+            "gpt-5",
+        ));
+        assert!(!all_settings_defaults_restored(&changed));
+
+        let mut changed = state;
+        changed
+            .session
+            .auto_continue_project_ids
+            .insert("project-1".into());
+        assert!(!all_settings_defaults_restored(&changed));
+    }
+
+    #[test]
+    fn shortcut_validation_uses_gpui_native_keystroke_parsing() {
+        assert!(shortcut_is_valid("cmd-shift-p"));
+        assert!(shortcut_is_valid("ctrl-alt-left"));
+        assert!(!shortcut_is_valid(""));
+        assert!(!shortcut_is_valid("not a shortcut"));
+
+        let mut overrides = BTreeMap::new();
+        assert_eq!(
+            effective_shortcut(&overrides, "open_settings"),
+            Some("cmd-,")
+        );
+        overrides.insert("open_settings".into(), "cmd-shift-,".into());
+        assert_eq!(
+            effective_shortcut(&overrides, "open_settings"),
+            Some("cmd-shift-,")
+        );
     }
 
     fn streaming_timeline_fixture() -> (TimelineModel, Rc<Vec<Rc<TimelineConversationTurn>>>) {
@@ -37023,7 +39266,7 @@ mod tests {
             })
             .map(|(body, _)| body)
             .expect("agent overview should remain inspectable");
-        assert!(overview.contains("sessions_empty && !this.new_session_draft_initialized"));
+        assert!(overview.contains("this.new_session_open && !this.new_session_draft_initialized"));
         assert!(overview.contains("this.initial_new_session_setup_pending ="));
 
         let render = source
