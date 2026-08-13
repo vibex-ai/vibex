@@ -998,16 +998,18 @@ pub fn append_agent_account_runtime_options(
             }
         }
         Some(AgentAuthModelCatalogStatus::AgentDefaultOnly) => {
-            let selection =
+            let snapshot = snapshot.expect("Agent-default status requires a snapshot");
+            let mut selection =
                 SessionRuntimeSelection::agent_default(agent.id.clone(), context.id.clone());
+            selection.config_values = default_feature_values(&snapshot.default_features);
             catalog.options.push(SessionRuntimeOption {
                 selection,
                 agent_label: bounded_catalog_label(&agent.label),
                 auth_source_label: "Default CLI account".to_string(),
                 model_label: "Selected automatically by Agent".to_string(),
-                reasoning_efforts: Vec::new(),
-                modes: Vec::new(),
-                features: Vec::new(),
+                reasoning_efforts: snapshot.default_reasoning_efforts.clone(),
+                modes: snapshot.default_modes.clone(),
+                features: snapshot.default_features.clone(),
                 availability: RuntimeOptionAvailability::Available,
             });
         }
@@ -1706,6 +1708,30 @@ mod tests {
             discovery_source: AgentModelDiscoverySource::AgentDefault,
             status: AgentAuthModelCatalogStatus::AgentDefaultOnly,
             models: Vec::new(),
+            runtime_options_complete: true,
+            default_reasoning_efforts: vec![SessionConfigValue {
+                value: "high".to_string(),
+                label: Some("High".to_string()),
+            }],
+            default_modes: vec![SessionConfigValue {
+                value: "build".to_string(),
+                label: Some("Build".to_string()),
+            }],
+            default_features: vec![SessionRuntimeFeature {
+                id: "auto_apply".to_string(),
+                label: "Auto apply".to_string(),
+                description: None,
+                kind: SessionRuntimeFeatureKind::Toggle,
+                current_value: Some(SessionConfigValue {
+                    value: "true".to_string(),
+                    label: None,
+                }),
+                default_value: Some(SessionConfigValue {
+                    value: "false".to_string(),
+                    label: None,
+                }),
+                values: Vec::new(),
+            }],
             last_success_at_ms: Some(10),
             last_attempt_at_ms: 10,
             last_error_code: None,
@@ -1740,6 +1766,17 @@ mod tests {
         assert_eq!(
             catalog.options[0].model_label,
             "Selected automatically by Agent"
+        );
+        assert_eq!(catalog.options[0].reasoning_efforts[0].value, "high");
+        assert_eq!(catalog.options[0].modes[0].value, "build");
+        assert_eq!(catalog.options[0].features[0].id, "auto_apply");
+        assert_eq!(
+            catalog.options[0]
+                .selection
+                .config_values
+                .get("auto_apply")
+                .map(String::as_str),
+            Some("true")
         );
 
         let mut signed_out = context;

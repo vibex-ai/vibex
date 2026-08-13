@@ -1,9 +1,10 @@
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use vibex_core::{
     AgentAuthContext, AgentAuthContextId, AgentAuthContextStatus, AgentAuthModelCatalogSnapshot,
-    AgentAuthenticationOperation, AgentAuthenticationOperationId,
-    AgentAuthenticationOperationState, AgentId, VibexError, VibexResult, VibexSessionId,
-    unix_timestamp_ms,
+    AgentAuthModelDescriptor, AgentAuthenticationOperation, AgentAuthenticationOperationId,
+    AgentAuthenticationOperationState, AgentId, SessionConfigValue, SessionRuntimeFeature,
+    VibexError, VibexResult, VibexSessionId, unix_timestamp_ms,
 };
 
 use crate::{enum_from_db, enum_to_db, json_from_db, json_to_db, parse_id, storage_err};
@@ -423,6 +424,20 @@ impl AgentAuthenticationOperationRepository {
 
 pub struct AgentAuthModelCatalogRepository;
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentAuthModelCatalogPayload {
+    models: Vec<AgentAuthModelDescriptor>,
+    #[serde(default)]
+    runtime_options_complete: bool,
+    #[serde(default)]
+    default_reasoning_efforts: Vec<SessionConfigValue>,
+    #[serde(default)]
+    default_modes: Vec<SessionConfigValue>,
+    #[serde(default)]
+    default_features: Vec<SessionRuntimeFeature>,
+}
+
 impl AgentAuthModelCatalogRepository {
     pub fn upsert(conn: &Connection, snapshot: &AgentAuthModelCatalogSnapshot) -> VibexResult<()> {
         conn.execute(
@@ -445,7 +460,13 @@ impl AgentAuthModelCatalogRepository {
                 snapshot.runtime_fingerprint,
                 enum_to_db(&snapshot.discovery_source)?,
                 enum_to_db(&snapshot.status)?,
-                json_to_db(&snapshot.models)?,
+                json_to_db(&AgentAuthModelCatalogPayload {
+                    models: snapshot.models.clone(),
+                    runtime_options_complete: snapshot.runtime_options_complete,
+                    default_reasoning_efforts: snapshot.default_reasoning_efforts.clone(),
+                    default_modes: snapshot.default_modes.clone(),
+                    default_features: snapshot.default_features.clone(),
+                })?,
                 snapshot.last_success_at_ms,
                 snapshot.last_attempt_at_ms,
                 snapshot.last_error_code,
@@ -492,17 +513,24 @@ impl AgentAuthModelCatalogRepository {
             "failed to read the Agent account model catalog",
         ))?
         .map(|raw| {
-            Ok(AgentAuthModelCatalogSnapshot {
-                auth_context_id: auth_context_id.clone(),
-                auth_context_revision,
-                runtime_fingerprint: runtime_fingerprint.to_string(),
-                discovery_source: enum_from_db(raw.0)?,
-                status: enum_from_db(raw.1)?,
-                models: json_from_db(raw.2)?,
-                last_success_at_ms: raw.3,
-                last_attempt_at_ms: raw.4,
-                last_error_code: raw.5,
-            })
+            decode_catalog_snapshot_json(
+                &raw.2,
+                AgentAuthModelCatalogSnapshot {
+                    auth_context_id: auth_context_id.clone(),
+                    auth_context_revision,
+                    runtime_fingerprint: runtime_fingerprint.to_string(),
+                    discovery_source: enum_from_db(raw.0)?,
+                    status: enum_from_db(raw.1)?,
+                    models: Vec::new(),
+                    runtime_options_complete: false,
+                    default_reasoning_efforts: Vec::new(),
+                    default_modes: Vec::new(),
+                    default_features: Vec::new(),
+                    last_success_at_ms: raw.3,
+                    last_attempt_at_ms: raw.4,
+                    last_error_code: raw.5,
+                },
+            )
         })
         .transpose()
     }
@@ -546,17 +574,24 @@ impl AgentAuthModelCatalogRepository {
                     "agent_auth_model_catalog_list_failed",
                     "failed to read an Agent account model catalog",
                 ))?;
-                snapshots.push(AgentAuthModelCatalogSnapshot {
-                    auth_context_id: context.id.clone(),
-                    auth_context_revision: context.revision,
-                    runtime_fingerprint: raw.0,
-                    discovery_source: enum_from_db(raw.1)?,
-                    status: enum_from_db(raw.2)?,
-                    models: json_from_db(raw.3)?,
-                    last_success_at_ms: raw.4,
-                    last_attempt_at_ms: raw.5,
-                    last_error_code: raw.6,
-                });
+                snapshots.push(decode_catalog_snapshot_json(
+                    &raw.3,
+                    AgentAuthModelCatalogSnapshot {
+                        auth_context_id: context.id.clone(),
+                        auth_context_revision: context.revision,
+                        runtime_fingerprint: raw.0,
+                        discovery_source: enum_from_db(raw.1)?,
+                        status: enum_from_db(raw.2)?,
+                        models: Vec::new(),
+                        runtime_options_complete: false,
+                        default_reasoning_efforts: Vec::new(),
+                        default_modes: Vec::new(),
+                        default_features: Vec::new(),
+                        last_success_at_ms: raw.4,
+                        last_attempt_at_ms: raw.5,
+                        last_error_code: raw.6,
+                    },
+                )?);
             }
         }
         Ok(snapshots)
@@ -578,10 +613,29 @@ impl AgentAuthModelCatalogRepository {
     }
 }
 
+fn decode_catalog_snapshot_json(
+    raw: &str,
+    mut metadata: AgentAuthModelCatalogSnapshot,
+) -> VibexResult<AgentAuthModelCatalogSnapshot> {
+    if raw.trim_start().starts_with('[') {
+        metadata.models = json_from_db(raw.to_string())?;
+        return Ok(metadata);
+    }
+    let payload: AgentAuthModelCatalogPayload = json_from_db(raw.to_string())?;
+    metadata.models = payload.models;
+    metadata.runtime_options_complete = payload.runtime_options_complete;
+    metadata.default_reasoning_efforts = payload.default_reasoning_efforts;
+    metadata.default_modes = payload.default_modes;
+    metadata.default_features = payload.default_features;
+    Ok(metadata)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vibex_core::{AgentAuthModelCatalogStatus, AgentModelDiscoverySource};
+    use vibex_core::{
+        AgentAuthModelCatalogStatus, AgentModelDiscoverySource, SessionRuntimeFeatureKind,
+    };
 
     fn migrated_connection() -> Connection {
         let mut connection = Connection::open_in_memory().unwrap();
@@ -631,6 +685,10 @@ mod tests {
                 discovery_source: AgentModelDiscoverySource::AgentDefault,
                 status: AgentAuthModelCatalogStatus::AgentDefaultOnly,
                 models: Vec::new(),
+                runtime_options_complete: false,
+                default_reasoning_efforts: Vec::new(),
+                default_modes: Vec::new(),
+                default_features: Vec::new(),
                 last_success_at_ms: Some(1),
                 last_attempt_at_ms: 1,
                 last_error_code: None,
@@ -673,6 +731,81 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(stale.code, "agent_auth_context_revision_conflict");
+    }
+
+    #[test]
+    fn model_catalog_round_trips_default_runtime_controls_and_reads_legacy_rows() {
+        let connection = migrated_connection();
+        let context = AgentAuthContextRepository::ensure_default(
+            &connection,
+            &AgentId::parse("opencode").unwrap(),
+        )
+        .unwrap();
+        let snapshot = AgentAuthModelCatalogSnapshot {
+            auth_context_id: context.id.clone(),
+            auth_context_revision: context.revision,
+            runtime_fingerprint: "runtime-controls".to_string(),
+            discovery_source: AgentModelDiscoverySource::AgentDefault,
+            status: AgentAuthModelCatalogStatus::AgentDefaultOnly,
+            models: Vec::new(),
+            runtime_options_complete: true,
+            default_reasoning_efforts: vec![SessionConfigValue {
+                value: "high".to_string(),
+                label: Some("High".to_string()),
+            }],
+            default_modes: vec![SessionConfigValue {
+                value: "build".to_string(),
+                label: Some("Build".to_string()),
+            }],
+            default_features: vec![SessionRuntimeFeature {
+                id: "auto_apply".to_string(),
+                label: "Auto apply".to_string(),
+                description: None,
+                kind: SessionRuntimeFeatureKind::Toggle,
+                current_value: None,
+                default_value: None,
+                values: Vec::new(),
+            }],
+            last_success_at_ms: Some(10),
+            last_attempt_at_ms: 10,
+            last_error_code: None,
+        };
+        AgentAuthModelCatalogRepository::upsert(&connection, &snapshot).unwrap();
+
+        assert_eq!(
+            AgentAuthModelCatalogRepository::get(
+                &connection,
+                &context.id,
+                context.revision,
+                "runtime-controls",
+            )
+            .unwrap(),
+            Some(snapshot)
+        );
+
+        connection
+            .execute(
+                "INSERT INTO agent_auth_model_catalog_snapshots (
+                    auth_context_id, auth_context_revision, runtime_fingerprint,
+                    discovery_source, status, catalog_json, last_success_at_ms,
+                    last_attempt_at_ms, last_error_code
+                 ) VALUES (?1, ?2, 'legacy-runtime', 'agent_default',
+                    'agent_default_only', '[]', 11, 11, NULL)",
+                params![context.id.as_str(), context.revision],
+            )
+            .unwrap();
+        let legacy = AgentAuthModelCatalogRepository::get(
+            &connection,
+            &context.id,
+            context.revision,
+            "legacy-runtime",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(legacy.models.is_empty());
+        assert!(legacy.default_reasoning_efforts.is_empty());
+        assert!(legacy.default_modes.is_empty());
+        assert!(legacy.default_features.is_empty());
     }
 
     #[test]

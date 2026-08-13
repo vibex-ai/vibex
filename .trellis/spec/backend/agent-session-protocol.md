@@ -102,10 +102,23 @@ agent_auth_model_catalog_snapshots(
 - Agent account model snapshots are keyed by context id, positive context
   revision, and runtime fingerprint. Their model descriptors and per-model
   reasoning/mode/features are evidence from that exact authenticated launch.
+- Account discovery switches each enumerated model inside the same short-lived
+  authenticated ACP session and captures the resulting reasoning, mode, and
+  generic options. A direct catalog such as Codex `model/list` remains
+  authoritative for model ids and reasoning levels, while model-scoped ACP
+  responses supply modes and generic options. One model's current controls
+  must never be copied across every model.
 - A source summary is published independently from `options`. An authenticated
   Agent account with no enumerated models publishes one `AgentDefault` option,
   not a guessed model id. The serialized projection key is `agent-default`;
-  it is not sent to ACP as a model override.
+  it is not sent to ACP as a model override. Reasoning, mode, and generic
+  controls advertised by that default session remain selectable and are fenced
+  against the same snapshot as explicit-model controls.
+- Persist whether an account snapshot contains complete model-scoped runtime
+  options. Older snapshot JSON remains readable but defaults to incomplete;
+  desktop startup refreshes an authenticated incomplete snapshot once and
+  publishes the normal runtime-option invalidation. Complete current snapshots
+  never launch an Agent process during ordinary startup catalog reads.
 - An Agent-level probe launches the configured Agent command with its Agent
   args and Agent env. It must not list or load a Provider Profile, resolve a
   Provider secret, materialize a Provider projection, or use a Provider model.
@@ -204,6 +217,11 @@ agent_auth_model_catalog_snapshots(
 - Agent account context revision/fingerprint changes -> discard old account
   model options and require a fresh catalog read; never carry an old explicit
   model or reasoning value across a relogin.
+- An account model-scoped probe fails -> keep the snapshot marked incomplete so
+  startup or an explicit refresh retries; never claim missing controls are a
+  complete empty set. When a direct catalog already proved model ids and
+  reasoning levels, retain that usable evidence and record the supplemental
+  option failure instead of failing account verification.
 - Catalog has an authenticated Agent account but no model evidence -> expose
   `AgentDefault`, not `Explicit { model_id: "default" }` or another sentinel.
 

@@ -159,6 +159,18 @@ pub struct AgentAuthModelCatalogSnapshot {
     pub discovery_source: AgentModelDiscoverySource,
     pub status: AgentAuthModelCatalogStatus,
     pub models: Vec<AgentAuthModelDescriptor>,
+    /// Whether every published model/default entry has model-scoped runtime
+    /// controls. Older snapshots deserialize as incomplete and are refreshed.
+    #[serde(default)]
+    pub runtime_options_complete: bool,
+    /// Runtime controls advertised for the semantic Agent-default model when
+    /// the Agent does not enumerate concrete model ids.
+    #[serde(default)]
+    pub default_reasoning_efforts: Vec<SessionConfigValue>,
+    #[serde(default)]
+    pub default_modes: Vec<SessionConfigValue>,
+    #[serde(default)]
+    pub default_features: Vec<SessionRuntimeFeature>,
     pub last_success_at_ms: Option<i64>,
     pub last_attempt_at_ms: i64,
     pub last_error_code: Option<String>,

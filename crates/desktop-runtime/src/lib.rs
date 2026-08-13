@@ -1333,6 +1333,18 @@ impl DesktopRuntime {
                 }
             }
             let mut runtime_options_changed = false;
+            match auth_contexts.refresh_incomplete_model_catalogs().await {
+                Ok(refreshed) => {
+                    runtime_options_changed |= refreshed > 0;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "vibex_desktop",
+                        error_code = %error.code,
+                        "Agent account runtime option refresh failed"
+                    );
+                }
+            }
             match runtime_catalog.probe_missing_enabled_agents().await {
                 Ok(result) => {
                     if !result.probed_agent_ids.is_empty() {
@@ -2120,8 +2132,13 @@ mod tests {
         );
         assert!(
             bootstrap.find("auth_contexts.ensure_default(&agent.id)")
+                < bootstrap.find("auth_contexts.refresh_incomplete_model_catalogs().await")
+        );
+        assert!(
+            bootstrap.find("auth_contexts.refresh_incomplete_model_catalogs().await")
                 < bootstrap.find("runtime_catalog.probe_missing_enabled_agents().await")
         );
+        assert!(bootstrap.contains("refresh_incomplete_model_catalogs().await"));
         assert!(bootstrap.contains("runtime_catalog.probe_missing_enabled_agents().await"));
         assert!(bootstrap.contains("probe_missing_enabled_profile_models().await"));
         assert!(bootstrap.contains("ProviderConfigChangePhase::RuntimeOptionsChanged"));
@@ -2298,6 +2315,10 @@ mod tests {
                 discovery_source: AgentModelDiscoverySource::AgentDefault,
                 status: AgentAuthModelCatalogStatus::AgentDefaultOnly,
                 models: Vec::new(),
+                runtime_options_complete: true,
+                default_reasoning_efforts: Vec::new(),
+                default_modes: Vec::new(),
+                default_features: Vec::new(),
                 last_success_at_ms: Some(now),
                 last_attempt_at_ms: now,
                 last_error_code: None,

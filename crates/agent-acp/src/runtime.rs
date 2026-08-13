@@ -6234,16 +6234,6 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
                 return Err(runtime_configuration_unavailable("model_unavailable"));
             }
         }
-        if selection.auth_context_id().is_some()
-            && matches!(selection.model, RuntimeModelSelection::AgentDefault)
-            && (selection.reasoning_effort.is_some()
-                || selection.mode_id.is_some()
-                || !selection.config_values.is_empty())
-        {
-            return Err(runtime_configuration_unavailable(
-                "agent_default_runtime_options_unavailable",
-            ));
-        }
         let session_probe = if (selection.reasoning_effort.is_some() || selection.mode_id.is_some())
             && let Some(provider_profile_id) = selection.provider_profile_id()
         {
@@ -6261,12 +6251,24 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
             // selections working when no probe evidence reached this response
             // (the pinned adapter, not this gate, stays the final authority).
             let supported = if selection.auth_context_id().is_some() {
-                selected_account_model.is_some_and(|model| {
-                    model
-                        .reasoning_efforts
-                        .iter()
-                        .any(|candidate| candidate.value == effort)
-                })
+                match selection.model {
+                    RuntimeModelSelection::Explicit { .. } => {
+                        selected_account_model.is_some_and(|model| {
+                            model
+                                .reasoning_efforts
+                                .iter()
+                                .any(|candidate| candidate.value == effort)
+                        })
+                    }
+                    RuntimeModelSelection::AgentDefault => {
+                        account_snapshot.as_ref().is_some_and(|snapshot| {
+                            snapshot
+                                .default_reasoning_efforts
+                                .iter()
+                                .any(|candidate| candidate.value == effort)
+                        })
+                    }
+                }
             } else {
                 models.as_ref().is_some_and(|models| {
                     models
@@ -6295,9 +6297,21 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
         if let Some(mode) = selection.mode_id.as_deref() {
             let mode = validate_effort_value(mode).map_err(runtime_configuration_unavailable)?;
             let supported = if selection.auth_context_id().is_some() {
-                selected_account_model.is_some_and(|model| {
-                    model.modes.iter().any(|candidate| candidate.value == mode)
-                })
+                match selection.model {
+                    RuntimeModelSelection::Explicit { .. } => {
+                        selected_account_model.is_some_and(|model| {
+                            model.modes.iter().any(|candidate| candidate.value == mode)
+                        })
+                    }
+                    RuntimeModelSelection::AgentDefault => {
+                        account_snapshot.as_ref().is_some_and(|snapshot| {
+                            snapshot
+                                .default_modes
+                                .iter()
+                                .any(|candidate| candidate.value == mode)
+                        })
+                    }
+                }
             } else {
                 context
                     .config
@@ -6315,9 +6329,16 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
         }
         if selection.auth_context_id().is_some()
             && selection.config_values.iter().any(|(id, value)| {
-                selected_account_model.is_none_or(|model| {
-                    !model
-                        .features
+                let features = match selection.model {
+                    RuntimeModelSelection::Explicit { .. } => {
+                        selected_account_model.map(|model| model.features.as_slice())
+                    }
+                    RuntimeModelSelection::AgentDefault => account_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.default_features.as_slice()),
+                };
+                features.is_none_or(|features| {
+                    !features
                         .iter()
                         .any(|feature| feature.id == *id && feature.accepts_value(value))
                 })
@@ -7979,57 +8000,29 @@ impl AcpRuntimeClient {
         let runtime_fingerprint = spawn_snapshot.process_spawn_fingerprint();
         let attempted_at_ms = unix_timestamp_ms();
 
-        if self
+        let direct_capabilities = if self
             .compatibility_registry
             .for_agent(&context.agent_id)
             .is_some_and(|descriptor| descriptor.auth_context.supports_direct_model_catalog)
             && context.agent_id.as_str() == "codex"
-            && let Ok(capabilities) = self
-                .list_runtime_model_capabilities_for_source(
-                    &context.agent_id,
-                    &auth_source,
-                    context.revision,
-                    &config,
-                    &env_unsets,
-                )
-                .await
-            && !capabilities.is_empty()
         {
-            let models = capabilities
-                .into_iter()
-                .map(|capability| AgentAuthModelDescriptor {
-                    label: capability.model.clone(),
-                    model_id: capability.model,
-                    reasoning_efforts: capability
-                        .reasoning_efforts
-                        .into_iter()
-                        .filter_map(|effort| {
-                            validate_effort_value(&effort.value).ok().map(|value| {
-                                SessionConfigValue {
-                                    value,
-                                    label: effort.description,
-                                }
-                            })
-                        })
-                        .collect(),
-                    modes: Vec::new(),
-                    features: Vec::new(),
-                })
-                .collect();
-            return Ok(AgentAuthModelCatalogSnapshot {
-                auth_context_id: context.id.clone(),
-                auth_context_revision: context.revision,
-                runtime_fingerprint,
-                discovery_source: AgentModelDiscoverySource::DirectCatalog,
-                status: AgentAuthModelCatalogStatus::Available,
-                models,
-                last_success_at_ms: Some(attempted_at_ms),
-                last_attempt_at_ms: attempted_at_ms,
-                last_error_code: None,
-            });
-        }
-
-        let probe = probe_runtime_session_config_with_config(
+            self.list_runtime_model_capabilities_for_source(
+                &context.agent_id,
+                &auth_source,
+                context.revision,
+                &config,
+                &env_unsets,
+            )
+            .await
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let target_models = direct_capabilities
+            .iter()
+            .map(|capability| capability.model.clone())
+            .collect::<Vec<_>>();
+        let probe_batch = probe_runtime_session_configs_with_config(
             self,
             AcpAuthSourceLaunchContext {
                 auth_source: &auth_source,
@@ -8039,61 +8032,101 @@ impl AcpRuntimeClient {
                 env_unsets: &env_unsets,
             },
             None,
-            None,
+            if target_models.is_empty() {
+                RuntimeSessionProbeTargets::Discovered
+            } else {
+                RuntimeSessionProbeTargets::Explicit(&target_models)
+            },
         )
-        .await?;
-        let one_model = probe.models.len() == 1;
-        let shared_efforts = if one_model {
-            probe
-                .reasoning_efforts
-                .iter()
-                .filter_map(|effort| {
-                    validate_effort_value(&effort.value)
-                        .ok()
-                        .map(|value| SessionConfigValue {
-                            value,
-                            label: effort.description.clone(),
-                        })
-                })
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
+        .await;
+        let supplemental_probe_failed = probe_batch.is_err();
+        let probe_batch = match probe_batch {
+            Ok(batch) => batch,
+            Err(error) if !target_models.is_empty() => AcpRuntimeSessionProbeBatch {
+                initial: AcpRuntimeSessionProbe::default(),
+                model_results: target_models
+                    .iter()
+                    .cloned()
+                    .map(|model_id| (model_id, Err(error.clone())))
+                    .collect(),
+            },
+            Err(error) => return Err(error),
         };
-        let shared_modes = if one_model {
-            probe
-                .modes
-                .iter()
-                .map(|mode| SessionConfigValue {
-                    value: mode.value.clone(),
-                    label: mode.label.clone(),
-                })
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        let shared_features = if one_model {
-            crate::session_config::runtime_features_from_options(&probe.options)
-        } else {
-            Vec::new()
-        };
-        let models = probe
-            .models
+        let mut capabilities_by_model = direct_capabilities
             .into_iter()
-            .filter_map(|model_id| validate_model_value(&model_id).ok())
-            .map(|model_id| AgentAuthModelDescriptor {
-                label: model_id.clone(),
-                model_id,
-                reasoning_efforts: shared_efforts.clone(),
-                modes: shared_modes.clone(),
-                features: shared_features.clone(),
+            .map(|capability| (capability.model.clone(), capability))
+            .collect::<BTreeMap<_, _>>();
+        let runtime_options_complete = !supplemental_probe_failed
+            && probe_batch
+                .model_results
+                .iter()
+                .all(|(_, result)| result.is_ok());
+        let models = probe_batch
+            .model_results
+            .into_iter()
+            .filter_map(|(model_id, result)| {
+                let model_id = validate_model_value(&model_id).ok()?;
+                let capability = capabilities_by_model.remove(&model_id);
+                let probe = result.ok();
+                let reasoning_efforts = capability
+                    .map(|capability| capability.reasoning_efforts)
+                    .unwrap_or_else(|| {
+                        probe
+                            .as_ref()
+                            .map(|probe| probe.reasoning_efforts.clone())
+                            .unwrap_or_default()
+                    })
+                    .into_iter()
+                    .filter_map(|effort| {
+                        validate_effort_value(&effort.value)
+                            .ok()
+                            .map(|value| SessionConfigValue {
+                                value,
+                                label: effort.description,
+                            })
+                    })
+                    .collect();
+                Some(AgentAuthModelDescriptor {
+                    label: model_id.clone(),
+                    model_id,
+                    reasoning_efforts,
+                    modes: probe
+                        .as_ref()
+                        .map(|probe| session_config_values(&probe.modes))
+                        .unwrap_or_default(),
+                    features: probe
+                        .as_ref()
+                        .map(|probe| {
+                            crate::session_config::runtime_features_from_options(&probe.options)
+                        })
+                        .unwrap_or_default(),
+                })
             })
             .collect::<Vec<_>>();
+        let has_direct_catalog = !target_models.is_empty();
+        let default_reasoning_efforts = if models.is_empty() {
+            reasoning_config_values(&probe_batch.initial.reasoning_efforts)
+        } else {
+            Vec::new()
+        };
+        let default_modes = if models.is_empty() {
+            session_config_values(&probe_batch.initial.modes)
+        } else {
+            Vec::new()
+        };
+        let default_features = if models.is_empty() {
+            crate::session_config::runtime_features_from_options(&probe_batch.initial.options)
+        } else {
+            Vec::new()
+        };
         Ok(AgentAuthModelCatalogSnapshot {
             auth_context_id: context.id.clone(),
             auth_context_revision: context.revision,
             runtime_fingerprint,
             discovery_source: if models.is_empty() {
                 AgentModelDiscoverySource::AgentDefault
+            } else if has_direct_catalog {
+                AgentModelDiscoverySource::DirectCatalog
             } else {
                 AgentModelDiscoverySource::SessionConfig
             },
@@ -8103,9 +8136,14 @@ impl AcpRuntimeClient {
                 AgentAuthModelCatalogStatus::Available
             },
             models,
+            runtime_options_complete,
+            default_reasoning_efforts,
+            default_modes,
+            default_features,
             last_success_at_ms: Some(attempted_at_ms),
             last_attempt_at_ms: attempted_at_ms,
-            last_error_code: None,
+            last_error_code: supplemental_probe_failed
+                .then(|| "agent_auth_runtime_options_incomplete".to_string()),
         })
     }
 
@@ -13842,6 +13880,42 @@ async fn probe_runtime_session_config_with_config(
     materialized_env: Option<Vec<(String, String)>>,
     target_model: Option<&str>,
 ) -> VibexResult<AcpRuntimeSessionProbe> {
+    let targets = target_model
+        .map(|model| vec![model.to_string()])
+        .unwrap_or_default();
+    let mut batch = probe_runtime_session_configs_with_config(
+        client,
+        source,
+        materialized_env,
+        RuntimeSessionProbeTargets::Explicit(&targets),
+    )
+    .await?;
+    if target_model.is_some() {
+        return batch
+            .model_results
+            .pop()
+            .expect("one explicit model probe result")
+            .1;
+    }
+    Ok(batch.initial)
+}
+
+enum RuntimeSessionProbeTargets<'a> {
+    Explicit(&'a [String]),
+    Discovered,
+}
+
+struct AcpRuntimeSessionProbeBatch {
+    initial: AcpRuntimeSessionProbe,
+    model_results: Vec<(String, VibexResult<AcpRuntimeSessionProbe>)>,
+}
+
+async fn probe_runtime_session_configs_with_config(
+    client: &AcpRuntimeClient,
+    source: AcpAuthSourceLaunchContext<'_>,
+    materialized_env: Option<Vec<(String, String)>>,
+    targets: RuntimeSessionProbeTargets<'_>,
+) -> VibexResult<AcpRuntimeSessionProbeBatch> {
     let AcpAuthSourceLaunchContext {
         auth_source,
         auth_source_revision,
@@ -13892,118 +13966,161 @@ async fn probe_runtime_session_config_with_config(
                 ACP_PROBE_TIMEOUT,
             )
             .await?;
-        let (model_response, model_config_update) = if let Some(model_id) = target_model {
-            let native_session_id = session
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    VibexError::provider(
-                        "agent_runtime_probe_session_id_missing",
-                        "ACP session/new did not return a session identity",
-                    )
-                })?;
-            let model_config_id = model_config_options(&session)
-                .into_iter()
-                .find_map(|option| {
-                    option
-                        .get("id")
-                        .or_else(|| option.get("configId"))
-                        .and_then(Value::as_str)
-                        .map(ToString::to_string)
-                });
-            let initial_config_update = process.register_probe_config_update(native_session_id);
-            let (response, config_update) = if let Some(config_id) = model_config_id {
-                match process
-                    .request(
-                        AcpOperation::SessionSetConfigOption.method(),
-                        protocol::build_session_set_config_option_raw_params(
-                            native_session_id,
-                            &config_id,
-                            json!(model_id),
-                        ),
-                        ACP_PROBE_TIMEOUT,
-                    )
-                    .await
-                {
-                    Ok(response) => (response, initial_config_update),
-                    Err(_) => {
-                        process.cancel_probe_config_update(native_session_id);
-                        let fallback_config_update =
-                            process.register_probe_config_update(native_session_id);
-                        let response = process
-                            .request(
-                                AcpOperation::SessionSetModel.method(),
-                                protocol::build_session_set_model_params(
-                                    native_session_id,
-                                    model_id,
-                                ),
-                                ACP_PROBE_TIMEOUT,
-                            )
-                            .await?;
-                        (response, fallback_config_update)
-                    }
-                }
-            } else {
-                let response = process
-                    .request(
-                        AcpOperation::SessionSetModel.method(),
-                        protocol::build_session_set_model_params(native_session_id, model_id),
-                        ACP_PROBE_TIMEOUT,
-                    )
-                    .await?;
-                (response, initial_config_update)
-            };
-            let config_update = if response_has_config_options(&response) {
-                process.cancel_probe_config_update(native_session_id);
-                None
-            } else {
-                match timeout(ACP_PROBE_CONFIG_UPDATE_TIMEOUT, config_update).await {
-                    Ok(Ok(update)) => Some(update),
-                    Ok(Err(_)) | Err(_) => {
-                        process.cancel_probe_config_update(native_session_id);
-                        None
-                    }
-                }
-            };
-            (Some(response), config_update)
-        } else {
-            (None, None)
+        let initial = runtime_session_probe_from_response(&process, &session, None).await?;
+        let target_models = match targets {
+            RuntimeSessionProbeTargets::Explicit(models) => models.to_vec(),
+            RuntimeSessionProbeTargets::Discovered => initial.models.clone(),
         };
-        let model_response_ref = model_response.as_ref();
-        let modes = model_response_ref
-            .filter(|response| response_has_mode_evidence(response))
-            .or_else(|| {
-                model_config_update
-                    .as_ref()
-                    .filter(|update| response_has_mode_evidence(update))
-            })
-            .map(|response| extract_config_values(mode_candidates(response)))
-            .unwrap_or_else(|| extract_config_values(mode_candidates(&session)));
-        let reasoning_efforts = model_response_ref
-            .filter(|response| response_has_config_options(response))
-            .or(model_config_update.as_ref())
-            .map(extract_probe_reasoning_efforts)
-            .unwrap_or_else(|| extract_probe_reasoning_efforts(&session));
-        let options = model_response_ref
-            .filter(|response| response_has_config_options(response))
-            .or(model_config_update.as_ref())
-            .map(extract_config_options)
-            .unwrap_or_else(|| extract_config_options(&session));
-        Ok::<AcpRuntimeSessionProbe, VibexError>(AcpRuntimeSessionProbe {
-            models: target_model
-                .map(|model| vec![model.to_string()])
-                .unwrap_or_else(|| extract_model_ids(&session)),
-            modes,
-            reasoning_efforts,
-            options,
+        let mut model_results = Vec::with_capacity(target_models.len());
+        for model_id in target_models {
+            let result =
+                runtime_session_probe_from_response(&process, &session, Some(&model_id)).await;
+            model_results.push((model_id, result));
+        }
+        Ok::<AcpRuntimeSessionProbeBatch, VibexError>(AcpRuntimeSessionProbeBatch {
+            initial,
+            model_results,
         })
     };
 
     let probed = probe.await;
     process.shutdown().await;
     probed
+}
+
+async fn runtime_session_probe_from_response(
+    process: &Arc<AcpProcess>,
+    session: &Value,
+    target_model: Option<&str>,
+) -> VibexResult<AcpRuntimeSessionProbe> {
+    let (model_response, model_config_update) = if let Some(model_id) = target_model {
+        let native_session_id = session
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                VibexError::provider(
+                    "agent_runtime_probe_session_id_missing",
+                    "ACP session/new did not return a session identity",
+                )
+            })?;
+        let model_config_id = model_config_options(session)
+            .into_iter()
+            .find_map(|option| {
+                option
+                    .get("id")
+                    .or_else(|| option.get("configId"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            });
+        let initial_config_update = process.register_probe_config_update(native_session_id);
+        let (response, config_update) = if let Some(config_id) = model_config_id {
+            match process
+                .request(
+                    AcpOperation::SessionSetConfigOption.method(),
+                    protocol::build_session_set_config_option_raw_params(
+                        native_session_id,
+                        &config_id,
+                        json!(model_id),
+                    ),
+                    ACP_PROBE_TIMEOUT,
+                )
+                .await
+            {
+                Ok(response) => (response, initial_config_update),
+                Err(_) => {
+                    process.cancel_probe_config_update(native_session_id);
+                    let fallback_config_update =
+                        process.register_probe_config_update(native_session_id);
+                    let response = process
+                        .request(
+                            AcpOperation::SessionSetModel.method(),
+                            protocol::build_session_set_model_params(native_session_id, model_id),
+                            ACP_PROBE_TIMEOUT,
+                        )
+                        .await?;
+                    (response, fallback_config_update)
+                }
+            }
+        } else {
+            let response = process
+                .request(
+                    AcpOperation::SessionSetModel.method(),
+                    protocol::build_session_set_model_params(native_session_id, model_id),
+                    ACP_PROBE_TIMEOUT,
+                )
+                .await?;
+            (response, initial_config_update)
+        };
+        let config_update = if response_has_config_options(&response) {
+            process.cancel_probe_config_update(native_session_id);
+            None
+        } else {
+            match timeout(ACP_PROBE_CONFIG_UPDATE_TIMEOUT, config_update).await {
+                Ok(Ok(update)) => Some(update),
+                Ok(Err(_)) | Err(_) => {
+                    process.cancel_probe_config_update(native_session_id);
+                    None
+                }
+            }
+        };
+        (Some(response), config_update)
+    } else {
+        (None, None)
+    };
+    let model_response_ref = model_response.as_ref();
+    let modes = model_response_ref
+        .filter(|response| response_has_mode_evidence(response))
+        .or_else(|| {
+            model_config_update
+                .as_ref()
+                .filter(|update| response_has_mode_evidence(update))
+        })
+        .map(|response| extract_config_values(mode_candidates(response)))
+        .unwrap_or_else(|| extract_config_values(mode_candidates(session)));
+    let reasoning_efforts = model_response_ref
+        .filter(|response| response_has_config_options(response))
+        .or(model_config_update.as_ref())
+        .map(extract_probe_reasoning_efforts)
+        .unwrap_or_else(|| extract_probe_reasoning_efforts(session));
+    let options = model_response_ref
+        .filter(|response| response_has_config_options(response))
+        .or(model_config_update.as_ref())
+        .map(extract_config_options)
+        .unwrap_or_else(|| extract_config_options(session));
+    Ok(AcpRuntimeSessionProbe {
+        models: target_model
+            .map(|model| vec![model.to_string()])
+            .unwrap_or_else(|| extract_model_ids(session)),
+        modes,
+        reasoning_efforts,
+        options,
+    })
+}
+
+fn reasoning_config_values(efforts: &[AgentReasoningEffort]) -> Vec<SessionConfigValue> {
+    efforts
+        .iter()
+        .filter_map(|effort| {
+            validate_effort_value(&effort.value)
+                .ok()
+                .map(|value| SessionConfigValue {
+                    value,
+                    label: effort.description.clone(),
+                })
+        })
+        .collect()
+}
+
+fn session_config_values(values: &[ProviderSessionConfigValue]) -> Vec<SessionConfigValue> {
+    values
+        .iter()
+        .map(|value| SessionConfigValue {
+            value: value.value.clone(),
+            label: value.label.clone(),
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -19774,6 +19891,7 @@ for line in sys.stdin:
         options = [option]
         if config_id == "model" and model_config_updates:
             thought_levels = ["none", "on"] if value == model_2 else ["none", "high", "max"]
+            auto_apply = value == model_1
             options.extend([
                 {
                     "id": "effort",
@@ -19796,6 +19914,13 @@ for line in sys.stdin:
                         {"value": "build", "label": "Build"},
                         {"value": "review", "label": "Review"},
                     ],
+                },
+                {
+                    "id": "autoApply",
+                    "label": "Auto apply",
+                    "type": "boolean",
+                    "currentValue": auto_apply,
+                    "defaultValue": False,
                 },
             ])
         send({
@@ -21506,6 +21631,10 @@ for line in sys.stdin:
                 account_model_descriptor("model-a", "high", "build", true),
                 account_model_descriptor("model-b", "low", "review", false),
             ],
+            runtime_options_complete: true,
+            default_reasoning_efforts: Vec::new(),
+            default_modes: Vec::new(),
+            default_features: Vec::new(),
             last_success_at_ms: Some(unix_timestamp_ms()),
             last_attempt_at_ms: unix_timestamp_ms(),
             last_error_code: None,
@@ -21551,6 +21680,16 @@ for line in sys.stdin:
 
         let mut current_snapshot = wrong_fingerprint;
         current_snapshot.runtime_fingerprint = current_fingerprint;
+        current_snapshot.default_reasoning_efforts = vec![SessionConfigValue {
+            value: "high".to_string(),
+            label: None,
+        }];
+        current_snapshot.default_modes = vec![SessionConfigValue {
+            value: "build".to_string(),
+            label: None,
+        }];
+        current_snapshot.default_features =
+            account_model_descriptor("default", "high", "build", true).features;
         let conn = open_database(&fixture.fixture.db_path).unwrap();
         AgentAuthModelCatalogRepository::upsert(&conn, &current_snapshot).unwrap();
         drop(conn);
@@ -21588,31 +21727,44 @@ for line in sys.stdin:
             .unwrap_err();
         assert_runtime_configuration_cause(&error, "mode_unavailable");
 
-        for agent_default in [
-            SessionRuntimeSelection::agent_default(agent_id.clone(), current.id.clone()),
-            SessionRuntimeSelection::agent_default(agent_id.clone(), current.id.clone()),
-            SessionRuntimeSelection::agent_default(agent_id.clone(), current.id.clone()),
+        let mut agent_default =
+            SessionRuntimeSelection::agent_default(agent_id.clone(), current.id.clone());
+        agent_default.reasoning_effort = Some("high".to_string());
+        agent_default.mode_id = Some("build".to_string());
+        agent_default
+            .config_values
+            .insert("fast_mode".to_string(), "true".to_string());
+        fixture
+            .bridge
+            .resolve(&fixture.session.id, &agent_default, None)
+            .await
+            .unwrap();
+
+        for (invalid, cause) in [
+            (agent_default.clone(), "reasoning_effort_unavailable"),
+            (agent_default.clone(), "mode_unavailable"),
+            (agent_default.clone(), "session_feature_unavailable"),
         ]
         .into_iter()
         .enumerate()
-        .map(|(index, mut selection)| {
+        .map(|(index, (mut selection, cause))| {
             match index {
-                0 => selection.reasoning_effort = Some("high".to_string()),
-                1 => selection.mode_id = Some("build".to_string()),
+                0 => selection.reasoning_effort = Some("unknown".to_string()),
+                1 => selection.mode_id = Some("unknown".to_string()),
                 _ => {
                     selection
                         .config_values
-                        .insert("fast_mode".to_string(), "true".to_string());
+                        .insert("fast_mode".to_string(), "maybe".to_string());
                 }
             }
-            selection
+            (selection, cause)
         }) {
             let error = fixture
                 .bridge
-                .resolve(&fixture.session.id, &agent_default, None)
+                .resolve(&fixture.session.id, &invalid, None)
                 .await
                 .unwrap_err();
-            assert_runtime_configuration_cause(&error, "agent_default_runtime_options_unavailable");
+            assert_runtime_configuration_cause(&error, cause);
         }
 
         drop(fixture.message_submission);
@@ -21647,6 +21799,161 @@ for line in sys.stdin:
             .expect("catalog Agent discovery should create its default account context");
         assert_eq!(context.status, AgentAuthContextStatus::Unverified);
 
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_account_model_discovery_keeps_per_model_runtime_controls() {
+        let Some(fixture) = MockAcpFixture::create("agent-account-model-controls") else {
+            return;
+        };
+        let agent_id = AgentId::parse(OPENCODE_AGENT_ID).unwrap();
+        fixture.enable_model_config_updates();
+        configure_mock_default_agent_runtime(&fixture, &agent_id);
+        let client = fixture.client();
+        let conn = open_database(&fixture.db_path).unwrap();
+        let context = AgentAuthContextRepository::ensure_default(&conn, &agent_id).unwrap();
+        drop(conn);
+
+        let snapshot = client
+            .discover_agent_auth_model_catalog(&context)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            snapshot.discovery_source,
+            AgentModelDiscoverySource::SessionConfig
+        );
+        assert_eq!(snapshot.status, AgentAuthModelCatalogStatus::Available);
+        assert_eq!(snapshot.models.len(), 2);
+        assert_eq!(
+            snapshot.models[0]
+                .reasoning_efforts
+                .iter()
+                .map(|effort| effort.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["none", "high", "max"]
+        );
+        assert_eq!(
+            snapshot.models[1]
+                .reasoning_efforts
+                .iter()
+                .map(|effort| effort.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["none", "on"]
+        );
+        for model in &snapshot.models {
+            assert_eq!(
+                model
+                    .modes
+                    .iter()
+                    .map(|mode| mode.value.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["build", "review"]
+            );
+            assert!(
+                model
+                    .features
+                    .iter()
+                    .any(|feature| feature.id == "autoapply")
+            );
+        }
+        assert_eq!(
+            logged_request_count(&fixture.request_log(), "session/set_config_option"),
+            2
+        );
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn codex_account_discovery_merges_direct_reasoning_with_acp_controls() {
+        let agent_id = AgentId::parse("codex").unwrap();
+        let Some(fixture) =
+            MockAcpFixture::create_for_agent("codex-account-controls", Some(agent_id.clone()))
+        else {
+            return;
+        };
+        fixture.enable_model_config_updates();
+        configure_mock_default_agent_runtime(&fixture, &agent_id);
+        let client = fixture.client();
+        let conn = open_database(&fixture.db_path).unwrap();
+        let context = AgentAuthContextRepository::ensure_default(&conn, &agent_id).unwrap();
+        drop(conn);
+
+        let snapshot = client
+            .discover_agent_auth_model_catalog(&context)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            snapshot.discovery_source,
+            AgentModelDiscoverySource::DirectCatalog
+        );
+        assert_eq!(snapshot.models.len(), 2);
+        assert_eq!(
+            snapshot.models[0]
+                .reasoning_efforts
+                .iter()
+                .map(|effort| effort.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high"]
+        );
+        assert_eq!(
+            snapshot.models[1]
+                .reasoning_efforts
+                .iter()
+                .map(|effort| effort.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["high"]
+        );
+        for model in &snapshot.models {
+            assert_eq!(model.modes.len(), 2);
+            assert!(
+                model
+                    .features
+                    .iter()
+                    .any(|feature| feature.id == "autoapply")
+            );
+        }
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn codex_account_keeps_direct_catalog_when_runtime_option_probe_fails() {
+        let agent_id = AgentId::parse("codex").unwrap();
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "codex-account-option-failure",
+            Some(agent_id.clone()),
+        ) else {
+            return;
+        };
+        fixture.fail_first_session_new();
+        configure_mock_default_agent_runtime(&fixture, &agent_id);
+        let client = fixture.client();
+        let conn = open_database(&fixture.db_path).unwrap();
+        let context = AgentAuthContextRepository::ensure_default(&conn, &agent_id).unwrap();
+        drop(conn);
+
+        let snapshot = client
+            .discover_agent_auth_model_catalog(&context)
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.status, AgentAuthModelCatalogStatus::Available);
+        assert_eq!(snapshot.models.len(), 2);
+        assert!(!snapshot.runtime_options_complete);
+        assert_eq!(
+            snapshot.last_error_code.as_deref(),
+            Some("agent_auth_runtime_options_incomplete")
+        );
+        assert_eq!(snapshot.models[0].reasoning_efforts.len(), 3);
+        assert!(snapshot.models.iter().all(|model| model.modes.is_empty()));
+        assert!(
+            snapshot
+                .models
+                .iter()
+                .all(|model| model.features.is_empty())
+        );
         fixture.cleanup();
     }
 

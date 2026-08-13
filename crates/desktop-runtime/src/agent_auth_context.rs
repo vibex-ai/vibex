@@ -102,6 +102,49 @@ impl AgentAuthContextService {
         AgentAuthContextRepository::list(&conn)
     }
 
+    /// Refreshes authenticated account catalogs created before model-scoped
+    /// runtime controls were persisted. Current snapshots remain process-free.
+    pub(crate) async fn refresh_incomplete_model_catalogs(&self) -> VibexResult<usize> {
+        let contexts = self.list()?;
+        let conn = open_database(&self.db_path)?;
+        let snapshots = AgentAuthModelCatalogRepository::list_current(&conn, &contexts)?;
+        drop(conn);
+        let mut current_by_context = BTreeMap::new();
+        for snapshot in snapshots {
+            let replace = current_by_context
+                .get(&snapshot.auth_context_id)
+                .is_none_or(|current: &AgentAuthModelCatalogSnapshot| {
+                    snapshot.last_attempt_at_ms > current.last_attempt_at_ms
+                });
+            if replace {
+                current_by_context.insert(snapshot.auth_context_id.clone(), snapshot);
+            }
+        }
+        let mut refreshed = 0;
+        for context in contexts.into_iter().filter(|context| {
+            context.status == AgentAuthContextStatus::Authenticated
+                && current_by_context
+                    .get(&context.id)
+                    .is_none_or(|snapshot| !snapshot.runtime_options_complete)
+        }) {
+            let operation_lock = self.operation_lock(&context.id)?;
+            let _guard = operation_lock.lock().await;
+            let current = self.require_revision(&context.id, context.revision)?;
+            if current.status != AgentAuthContextStatus::Authenticated {
+                continue;
+            }
+            let snapshot = self
+                .acp_runtime
+                .discover_agent_auth_model_catalog(&current)
+                .await?;
+            let conn = open_database(&self.db_path)?;
+            AgentAuthModelCatalogRepository::upsert(&conn, &snapshot)?;
+            self.notify_changed(&current);
+            refreshed += 1;
+        }
+        Ok(refreshed)
+    }
+
     pub fn authentication_operation(
         &self,
         operation_id: &vibex_core::AgentAuthenticationOperationId,
