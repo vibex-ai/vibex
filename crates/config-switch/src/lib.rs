@@ -456,13 +456,13 @@ impl ProviderConfigService {
             return Ok(());
         }
 
-        self.create_acp_profile(AcpProviderProfileCreateRequest {
-            agent_id: Some(definition.id.clone()),
-            display_name: format!("{} ACP", definition.label),
-            account_alias: None,
-            preset_id: None,
-            config: Some(acp_config),
-        })?;
+        self.create_acp_profile_from_config(
+            Some(definition.id.clone()),
+            format!("{} ACP", definition.label),
+            None,
+            acp_config,
+            true,
+        )?;
         Ok(())
     }
 
@@ -523,7 +523,7 @@ impl ProviderConfigService {
 
     pub fn list_profiles(&self) -> VibexResult<Vec<ProviderProfile>> {
         let conn = self.open_connection()?;
-        ProviderProfileRepository::list(&conn)
+        visible_model_provider_profiles(&conn, ProviderProfileRepository::list(&conn)?)
     }
 
     /// Returns all ACP-compatible profiles needed by runtime option catalog
@@ -548,10 +548,13 @@ impl ProviderConfigService {
     ) -> VibexResult<AgentModelProviderProfileListResponse> {
         let conn = self.open_connection()?;
         let definition = require_agent_definition(&request.agent_id)?;
-        let profiles = ProviderProfileRepository::list_by_agent(
+        let profiles = visible_model_provider_profiles(
             &conn,
-            &request.agent_id,
-            request.include_disabled,
+            ProviderProfileRepository::list_by_agent(
+                &conn,
+                &request.agent_id,
+                request.include_disabled,
+            )?,
         )?;
         let default = AgentDefaultModelProviderProfileRepository::get(
             &conn,
@@ -579,7 +582,10 @@ impl ProviderConfigService {
         require_agent_definition(&request.agent_id)?;
         let mut seen = HashSet::new();
         let mut conn = self.open_connection()?;
-        let profiles = ProviderProfileRepository::list_by_agent(&conn, &request.agent_id, true)?;
+        let profiles = visible_model_provider_profiles(
+            &conn,
+            ProviderProfileRepository::list_by_agent(&conn, &request.agent_id, true)?,
+        )?;
         let profile_ids = profiles
             .iter()
             .map(|profile| profile.id.clone())
@@ -649,15 +655,17 @@ impl ProviderConfigService {
         let conn = self.open_connection()?;
         let configured_acp_models =
             configured_acp_model_ids(&request.configured_models, request.default_model.as_deref());
+        let requested_provider_options =
+            request.provider_options.map(without_internal_profile_role);
         let provider_options = if provider_kind == ProviderKind::Acp {
             let options = inherit_agent_acp_runtime_options(
                 &conn,
                 &request.agent_id,
-                request.provider_options,
+                requested_provider_options,
             )?;
             Some(with_acp_configured_models(options, configured_acp_models)?)
         } else {
-            request.provider_options
+            requested_provider_options
         };
         let profile =
             ProviderProfileRepository::from_create_request(ProviderProfileCreateRequest {
@@ -707,9 +715,13 @@ impl ProviderConfigService {
                 .as_deref()
                 .or(profile.default_model.as_deref()),
         );
-        let provider_options = match (profile.kind, request.provider_options) {
+        let requested_provider_options =
+            request.provider_options.map(without_internal_profile_role);
+        let provider_options = match (profile.kind, requested_provider_options) {
             (ProviderKind::Acp, options) if options.is_some() || models_changed => {
-                let options = options.unwrap_or_else(|| profile.provider_options.clone());
+                let options = options.unwrap_or_else(|| {
+                    without_internal_profile_role(profile.provider_options.clone())
+                });
                 let mut runtime_config = acp_config_from_options(&profile.provider_options)?
                     .ok_or_else(|| {
                         VibexError::validation(
@@ -1177,12 +1189,35 @@ impl ProviderConfigService {
     ) -> VibexResult<ProviderProfile> {
         validate_display_name(&request.display_name)?;
         let config = resolve_acp_create_config(request.preset_id.as_deref(), request.config)?;
-        let provider_options = acp_config_to_options(&config)?;
+        self.create_acp_profile_from_config(
+            request.agent_id,
+            request.display_name,
+            request.account_alias,
+            config,
+            false,
+        )
+    }
+
+    fn create_acp_profile_from_config(
+        &self,
+        agent_id: Option<AgentId>,
+        display_name: String,
+        account_alias: Option<String>,
+        config: AcpProviderConfig,
+        internal_runtime: bool,
+    ) -> VibexResult<ProviderProfile> {
+        let mut provider_options = acp_config_to_options(&config)?;
+        if internal_runtime {
+            provider_options.entries.push(option_entry(
+                INTERNAL_PROFILE_ROLE_OPTION_KEY,
+                INTERNAL_AGENT_RUNTIME_PROFILE_ROLE,
+            ));
+        }
         self.create_profile(ProviderProfileCreateRequest {
-            agent_id: request.agent_id,
+            agent_id,
             kind: ProviderKind::Acp,
-            display_name: request.display_name,
-            account_alias: request.account_alias,
+            display_name,
+            account_alias,
             base_url: None,
             default_model: config.models.first().cloned(),
             small_model: None,
@@ -2428,7 +2463,8 @@ impl ProviderConfigService {
 
     pub fn list_health_summaries(&self) -> VibexResult<Vec<ProviderHealthSummary>> {
         let conn = self.open_connection()?;
-        let profiles = ProviderProfileRepository::list(&conn)?;
+        let profiles =
+            visible_model_provider_profiles(&conn, ProviderProfileRepository::list(&conn)?)?;
         let records = ProviderHealthRepository::list_latest(&conn)?;
         Ok(build_health_summaries(&profiles, &records))
     }
@@ -2438,7 +2474,8 @@ impl ProviderConfigService {
         request: ProviderRunHealthProbesRequest,
     ) -> VibexResult<ProviderRunHealthProbesResult> {
         let conn = self.open_connection()?;
-        let profiles = ProviderProfileRepository::list(&conn)?;
+        let profiles =
+            visible_model_provider_profiles(&conn, ProviderProfileRepository::list(&conn)?)?;
         let selected_profiles = filter_profiles(&profiles, request.provider_profile_ids.as_ref());
         let probe_kinds = request
             .probe_kinds
@@ -2465,7 +2502,8 @@ impl ProviderConfigService {
 
     pub fn list_capability_summaries(&self) -> VibexResult<Vec<ProviderCapabilitySummary>> {
         let conn = self.open_connection()?;
-        let profiles = ProviderProfileRepository::list(&conn)?;
+        let profiles =
+            visible_model_provider_profiles(&conn, ProviderProfileRepository::list(&conn)?)?;
         let records = ProviderCapabilityRepository::list_latest(&conn)?;
         Ok(build_capability_summaries(
             &profiles,
@@ -2479,7 +2517,8 @@ impl ProviderConfigService {
         request: ProviderRunCapabilityProbesRequest,
     ) -> VibexResult<ProviderRunCapabilityProbesResult> {
         let conn = self.open_connection()?;
-        let profiles = ProviderProfileRepository::list(&conn)?;
+        let profiles =
+            visible_model_provider_profiles(&conn, ProviderProfileRepository::list(&conn)?)?;
         let selected_profiles = filter_profiles(&profiles, request.provider_profile_ids.as_ref());
         let now = unix_timestamp_ms();
         let mut results = Vec::new();
@@ -2504,7 +2543,8 @@ impl ProviderConfigService {
         request: ProviderUsageListRequest,
     ) -> VibexResult<Vec<ProviderUsageSummary>> {
         let conn = self.open_connection()?;
-        let profiles = ProviderProfileRepository::list(&conn)?;
+        let profiles =
+            visible_model_provider_profiles(&conn, ProviderProfileRepository::list(&conn)?)?;
         let selected_profiles = filter_profiles(&profiles, request.provider_profile_ids.as_ref());
         let records = ProviderUsageRepository::list_latest(&conn)?;
         Ok(build_usage_summaries(
@@ -2519,7 +2559,8 @@ impl ProviderConfigService {
         request: ProviderFailoverRecommendationRequest,
     ) -> VibexResult<Vec<ProviderFailoverRecommendation>> {
         let conn = self.open_connection()?;
-        let profiles = ProviderProfileRepository::list(&conn)?;
+        let profiles =
+            visible_model_provider_profiles(&conn, ProviderProfileRepository::list(&conn)?)?;
         let selected_profiles = filter_profiles(&profiles, request.provider_profile_ids.as_ref());
         let health_records = ProviderHealthRepository::list_latest(&conn)?;
         let usage_records = ProviderUsageRepository::list_latest(&conn)?;
@@ -2542,6 +2583,8 @@ impl ProviderConfigService {
 }
 
 const ACP_CONFIG_OPTION_KEY: &str = "acp.config.v1";
+const INTERNAL_PROFILE_ROLE_OPTION_KEY: &str = "vibex.internal.profileRole";
+const INTERNAL_AGENT_RUNTIME_PROFILE_ROLE: &str = "agent_runtime";
 const OPENCODE_PRESET_ID: &str = "opencode";
 const DEFAULT_AGENT_CWD_SCOPE: &str = "home";
 
@@ -4584,6 +4627,13 @@ fn inherit_agent_acp_runtime_options(
         None => default_acp_runtime_config_for_agent(conn, agent_id)?,
     };
     merge_acp_runtime_options(options, runtime_config)
+}
+
+fn without_internal_profile_role(mut options: ProviderOptions) -> ProviderOptions {
+    options
+        .entries
+        .retain(|entry| entry.key.trim() != INTERNAL_PROFILE_ROLE_OPTION_KEY);
+    options
 }
 
 fn default_acp_runtime_config_for_agent(
@@ -7626,6 +7676,57 @@ fn require_failover_agent_profile(
     Ok(profile)
 }
 
+fn visible_model_provider_profiles(
+    conn: &vibex_db::DbConnection,
+    profiles: Vec<ProviderProfile>,
+) -> VibexResult<Vec<ProviderProfile>> {
+    Ok(profiles
+        .into_iter()
+        .filter(|profile| !is_internal_provider_profile(conn, profile))
+        .collect())
+}
+
+fn is_internal_provider_profile(conn: &vibex_db::DbConnection, profile: &ProviderProfile) -> bool {
+    is_local_default_profile(&profile.id)
+        || provider_option_value(&profile.provider_options, INTERNAL_PROFILE_ROLE_OPTION_KEY)
+            .as_deref()
+            == Some(INTERNAL_AGENT_RUNTIME_PROFILE_ROLE)
+        || is_legacy_seeded_agent_runtime_profile(conn, profile)
+}
+
+fn is_legacy_seeded_agent_runtime_profile(
+    conn: &vibex_db::DbConnection,
+    profile: &ProviderProfile,
+) -> bool {
+    if profile.kind != ProviderKind::Acp
+        || profile.status != ProviderProfileStatus::Enabled
+        || profile.account_alias.is_some()
+        || profile.base_url.is_some()
+        || profile.default_model.is_some()
+        || !profile.configured_models.is_empty()
+        || !profile.secrets.is_empty()
+        || profile.provider_options.entries.len() != 1
+        || profile.provider_options.entries[0].key.trim() != ACP_CONFIG_OPTION_KEY
+    {
+        return false;
+    }
+    let Ok(definition) = require_agent_definition(&profile.agent_id) else {
+        return false;
+    };
+    profile.display_name == format!("{} ACP", definition.label)
+        && acp_config_from_options(&profile.provider_options)
+            .ok()
+            .flatten()
+            .is_some_and(|config| {
+                default_acp_runtime_config_for_agent(conn, &profile.agent_id)
+                    .is_ok_and(|default| same_acp_runtime_command(&config, &default))
+            })
+}
+
+fn same_acp_runtime_command(left: &AcpProviderConfig, right: &AcpProviderConfig) -> bool {
+    left.command == right.command && left.args == right.args
+}
+
 fn build_agent_model_provider_profiles(
     agent_id: AgentId,
     profiles: Vec<ProviderProfile>,
@@ -7776,7 +7877,7 @@ mod tests {
     }
 
     #[test]
-    fn enabling_acp_catalog_agents_seeds_default_profiles() {
+    fn enabling_acp_catalog_agents_seeds_hidden_runtime_profiles() {
         let dir = tempdir().unwrap();
         let service = ProviderConfigService::new(dir.path().join("vibex.db"));
         for agent_id in [
@@ -7802,7 +7903,7 @@ mod tests {
                 .unwrap_or_else(|err| panic!("enable {agent_id} failed: {err:?}"));
             assert!(snapshot.enabled, "{agent_id} should be enabled");
 
-            let profiles = service
+            let visible_profiles = service
                 .list_agent_model_provider_profiles(AgentModelProviderProfileListRequest {
                     agent_id: AgentId::parse(agent_id).unwrap(),
                     include_disabled: true,
@@ -7823,17 +7924,40 @@ mod tests {
                 "{agent_id} must be listed as enabled after the toggle"
             );
 
-            let seeded: Vec<_> = profiles
-                .profiles
-                .iter()
-                .filter(|row| {
-                    row.profile.id.as_str() != row.profile.kind.local_default_profile_id()
+            assert!(
+                visible_profiles.profiles.is_empty(),
+                "{agent_id} runtime bootstrap must not appear as a model provider"
+            );
+            let seeded = service
+                .list_runtime_profiles()
+                .unwrap()
+                .into_iter()
+                .filter(|profile| {
+                    profile.agent_id.as_str() == agent_id
+                        && provider_option_value(
+                            &profile.provider_options,
+                            INTERNAL_PROFILE_ROLE_OPTION_KEY,
+                        )
+                        .as_deref()
+                            == Some(INTERNAL_AGENT_RUNTIME_PROFILE_ROLE)
                 })
-                .collect();
-            assert_eq!(seeded.len(), 1, "{agent_id} should have one seeded profile");
-            let profile = &seeded[0].profile;
+                .collect::<Vec<_>>();
+            assert_eq!(
+                seeded.len(),
+                1,
+                "{agent_id} should have one internal runtime profile"
+            );
+            let profile = &seeded[0];
             assert_eq!(profile.kind, ProviderKind::Acp);
             assert_eq!(profile.status, ProviderProfileStatus::Enabled);
+            assert!(
+                service
+                    .list_profiles()
+                    .unwrap()
+                    .iter()
+                    .all(|visible| visible.id != profile.id),
+                "{agent_id} runtime profile must stay out of the global model-provider list"
+            );
             let config = service.get_acp_profile_config(profile.id.clone()).unwrap();
             assert!(
                 !config.command.trim().is_empty(),
@@ -11209,13 +11333,190 @@ Authorization = "Bearer should-not-be-stored"
     }
 
     #[test]
-    fn seeds_local_defaults() {
+    fn seeds_local_defaults_for_runtime_compatibility_only() {
         let dir = tempdir().unwrap();
         let service = ProviderConfigService::new(dir.path().join("vibex.db"));
-        let profiles = service.list_profiles().unwrap();
-        assert!(profiles.iter().any(|profile| {
-            profile.id.as_str() == ProviderKind::Codex.local_default_profile_id()
-        }));
+        let runtime_profiles = service.list_runtime_profiles().unwrap();
+        let visible_profiles = service.list_profiles().unwrap();
+
+        for kind in [ProviderKind::Codex, ProviderKind::Claude, ProviderKind::Acp] {
+            assert!(
+                runtime_profiles
+                    .iter()
+                    .any(|profile| { profile.id.as_str() == kind.local_default_profile_id() })
+            );
+            assert!(
+                visible_profiles
+                    .iter()
+                    .all(|profile| { profile.id.as_str() != kind.local_default_profile_id() })
+            );
+        }
+    }
+
+    #[test]
+    fn model_provider_views_hide_internal_profiles_and_keep_user_profiles() {
+        let dir = tempdir().unwrap();
+        let service = ProviderConfigService::new(dir.path().join("vibex.db"));
+        let agent_id = AgentId::parse("opencode").unwrap();
+        service
+            .update_agent_config(AgentUpdateConfigRequest {
+                agent_id: agent_id.clone(),
+                added: Some(true),
+                enabled: Some(true),
+                label_override: None,
+                description_override: None,
+                order_index: None,
+                command: None,
+                env: None,
+                params: None,
+            })
+            .unwrap();
+
+        let runtime_profile = service
+            .list_runtime_profiles()
+            .unwrap()
+            .into_iter()
+            .find(|profile| {
+                profile.agent_id == agent_id
+                    && provider_option_value(
+                        &profile.provider_options,
+                        INTERNAL_PROFILE_ROLE_OPTION_KEY,
+                    )
+                    .as_deref()
+                        == Some(INTERNAL_AGENT_RUNTIME_PROFILE_ROLE)
+            })
+            .expect("enabling OpenCode should seed an internal runtime profile");
+        let user_model_profile = service
+            .create_agent_model_provider_profile(AgentModelProviderProfileCreateRequest {
+                agent_id: agent_id.clone(),
+                display_name: "OpenCode ACP".to_string(),
+                account_alias: None,
+                base_url: Some("https://relay.example.invalid/v1".to_string()),
+                default_model: Some("user-model".to_string()),
+                small_model: None,
+                large_model: None,
+                configured_models: Vec::new(),
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: None,
+                secret_references: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(
+            provider_option_value(
+                &user_model_profile.provider_options,
+                INTERNAL_PROFILE_ROLE_OPTION_KEY,
+            ),
+            None,
+            "a user model-provider profile must not inherit the runtime-only role marker"
+        );
+
+        let legacy_config = service.get_agent_acp_runtime_config(&agent_id).unwrap();
+        let legacy_runtime_profile = service
+            .create_acp_profile(AcpProviderProfileCreateRequest {
+                agent_id: Some(agent_id.clone()),
+                display_name: "OpenCode ACP".to_string(),
+                account_alias: None,
+                preset_id: None,
+                config: Some(legacy_config),
+            })
+            .unwrap();
+        assert_eq!(
+            provider_option_value(
+                &legacy_runtime_profile.provider_options,
+                INTERNAL_PROFILE_ROLE_OPTION_KEY,
+            ),
+            None,
+            "legacy seeded profiles predate the explicit role marker"
+        );
+
+        let user_acp_profile = service
+            .create_acp_profile(AcpProviderProfileCreateRequest {
+                agent_id: Some(agent_id.clone()),
+                display_name: "My OpenCode runtime".to_string(),
+                account_alias: None,
+                preset_id: Some("opencode".to_string()),
+                config: None,
+            })
+            .unwrap();
+        let visible_ids = service
+            .list_agent_model_provider_profiles(AgentModelProviderProfileListRequest {
+                agent_id: agent_id.clone(),
+                include_disabled: true,
+            })
+            .unwrap()
+            .profiles
+            .into_iter()
+            .map(|entry| entry.profile.id)
+            .collect::<HashSet<_>>();
+        assert!(!visible_ids.contains(&runtime_profile.id));
+        assert!(!visible_ids.contains(&legacy_runtime_profile.id));
+        assert!(visible_ids.contains(&user_acp_profile.id));
+        assert!(visible_ids.contains(&user_model_profile.id));
+        assert_eq!(
+            visible_ids,
+            HashSet::from([user_acp_profile.id.clone(), user_model_profile.id.clone()])
+        );
+
+        let global_visible_ids = service
+            .list_profiles()
+            .unwrap()
+            .into_iter()
+            .map(|profile| profile.id)
+            .collect::<HashSet<_>>();
+        assert_eq!(global_visible_ids, visible_ids);
+
+        let hidden_ids = HashSet::from([
+            runtime_profile.id.clone(),
+            legacy_runtime_profile.id.clone(),
+        ]);
+        assert!(
+            service
+                .list_health_summaries()
+                .unwrap()
+                .iter()
+                .all(|summary| !hidden_ids.contains(&summary.profile.id))
+        );
+        assert!(
+            service
+                .list_capability_summaries()
+                .unwrap()
+                .iter()
+                .all(|summary| !hidden_ids.contains(&summary.profile.id))
+        );
+        assert!(
+            service
+                .list_usage_summaries(ProviderUsageListRequest {
+                    provider_profile_ids: None,
+                    include_empty: true,
+                })
+                .unwrap()
+                .iter()
+                .all(|summary| !hidden_ids.contains(&summary.profile.id))
+        );
+
+        assert!(
+            service
+                .run_health_probes(ProviderRunHealthProbesRequest {
+                    provider_profile_ids: Some(vec![runtime_profile.id.clone()]),
+                    probe_kinds: Some(vec![ProviderHealthProbeKind::AuthStatus]),
+                })
+                .unwrap()
+                .results
+                .is_empty()
+        );
+        assert!(
+            service
+                .run_capability_probes(ProviderRunCapabilityProbesRequest {
+                    provider_profile_ids: Some(vec![legacy_runtime_profile.id]),
+                    force_refresh: true,
+                })
+                .unwrap()
+                .results
+                .is_empty()
+        );
     }
 
     #[test]
@@ -11273,10 +11574,23 @@ Authorization = "Bearer should-not-be-stored"
         let dir = tempdir().unwrap();
         let service = ProviderConfigService::new(dir.path().join("vibex.db"));
         let codex_profile = service
-            .list_profiles()
-            .unwrap()
-            .into_iter()
-            .find(|profile| profile.kind == ProviderKind::Codex)
+            .create_profile(ProviderProfileCreateRequest {
+                agent_id: None,
+                kind: ProviderKind::Codex,
+                display_name: "Codex usage profile".to_string(),
+                account_alias: None,
+                base_url: None,
+                default_model: Some("gpt-5-codex".to_string()),
+                small_model: None,
+                large_model: None,
+                configured_models: Vec::new(),
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: None,
+                secret_references: Vec::new(),
+            })
             .unwrap();
         let conn = service.open_connection().unwrap();
         let now = unix_timestamp_ms();
@@ -11309,8 +11623,12 @@ Authorization = "Bearer should-not-be-stored"
                 include_empty: true,
             })
             .unwrap();
-        assert_eq!(summaries[0].balances[0].label, "Codex quota");
-        assert_eq!(summaries[0].balances[0].remaining, Some(75.0));
+        let summary = summaries
+            .iter()
+            .find(|summary| summary.profile.id == codex_profile.id)
+            .expect("the user-created profile should remain visible in usage summaries");
+        assert_eq!(summary.balances[0].label, "Codex quota");
+        assert_eq!(summary.balances[0].remaining, Some(75.0));
     }
 
     #[test]

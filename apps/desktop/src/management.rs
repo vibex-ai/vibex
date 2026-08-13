@@ -1296,7 +1296,6 @@ impl ManagementCenter {
         self.acp_config_draft = None;
         self.native_export_preview = None;
         self.sync_projection_editor();
-        self.load_agent_auth(false, cx);
         cx.notify();
     }
 
@@ -1308,7 +1307,7 @@ impl ManagementCenter {
                 && agent.enabled
                 && !management_agent_installation_pending(agent.added, &agent.managed_install)
         })?;
-        Some((agent_id.clone(), self.selected_provider_profile_id.clone()))
+        Some((agent_id.clone(), None))
     }
 
     fn load_agent_auth(&mut self, force: bool, cx: &mut Context<Self>) {
@@ -1344,17 +1343,6 @@ impl ManagementCenter {
         let Ok(agent_id) = AgentId::parse(scope.0.clone()) else {
             return;
         };
-        let provider_profile_id = match scope.1.as_ref() {
-            Some(profile_id) => match vibex_core::ProviderProfileId::parse(profile_id.clone()) {
-                Ok(profile_id) => Some(profile_id),
-                Err(error) => {
-                    self.agent_auth_error = Some(format!("{}: {}", error.code, error.message));
-                    cx.notify();
-                    return;
-                }
-            },
-            None => None,
-        };
         let scope_changed = self.agent_auth_scope.as_ref() != Some(&scope);
         self.agent_auth_generation = self.agent_auth_generation.saturating_add(1);
         let generation = self.agent_auth_generation;
@@ -1372,21 +1360,11 @@ impl ManagementCenter {
         }
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let context = if provider_profile_id.is_none() {
-                Some(runtime.agent().ensure_default_auth_context(&agent_id)?)
-            } else {
-                None
-            };
+            let context = Some(runtime.agent().ensure_default_auth_context(&agent_id)?);
             let catalog = if force {
-                runtime
-                    .agent()
-                    .refresh_auth_methods(agent_id, provider_profile_id)
-                    .await?
+                runtime.agent().refresh_auth_methods(agent_id, None).await?
             } else {
-                runtime
-                    .agent()
-                    .list_auth_methods(agent_id, provider_profile_id)
-                    .await?
+                runtime.agent().list_auth_methods(agent_id, None).await?
             };
             Ok::<_, VibexError>((catalog, context))
         });
@@ -8287,7 +8265,6 @@ impl ManagementCenter {
     fn render_agent_authentication(
         &mut self,
         window: &mut Window,
-        provider_configuration: Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.ensure_agent_auth_inputs(window, cx);
@@ -8303,10 +8280,6 @@ impl ManagementCenter {
         let pending = self.mutation.is_some()
             || selected_agent_pending
             || self.agent_auth_terminal_state == Some(AgentAuthTerminalState::Running);
-        let selected_profile_label = self
-            .selected_management_provider_profile()
-            .map(|profile| profile.display_name.clone());
-        let is_agent_account = self.selected_provider_profile_id.is_none();
         let auth_available = self.runtime.is_some() && self.current_agent_auth_scope().is_some();
         let catalog = self.agent_auth_catalog.clone();
         let context = self.agent_auth_context.clone();
@@ -8319,7 +8292,7 @@ impl ManagementCenter {
             management_locale_text("Stopping sign-in", "正在终止登录", "正在終止登入")
         } else if active_auth_operation.is_some() {
             management_locale_text("Signing in", "正在登录", "正在登入")
-        } else if is_agent_account {
+        } else {
             match context.as_ref().map(|context| context.status) {
                 Some(AgentAuthContextStatus::Authenticated) => {
                     management_locale_text("Signed in", "已登录", "已登入")
@@ -8341,30 +8314,17 @@ impl ManagementCenter {
                 }
                 None => management_locale_text("Unavailable", "暂不可用", "暫不可用"),
             }
-        } else if let Some(catalog) = catalog.as_ref() {
-            match catalog.status {
-                AgentAuthStatus::Authenticated => {
-                    management_locale_text("Signed in", "已登录", "已登入")
-                }
-                AgentAuthStatus::AuthenticationRequired => {
-                    management_locale_text("Sign-in required", "需要登录", "需要登入")
-                }
-                AgentAuthStatus::Unknown => {
-                    management_locale_text("Not verified", "尚未验证", "尚未驗證")
-                }
-            }
-        } else if !self.agent_auth_loading {
-            management_locale_text("Unavailable", "暂不可用", "暫不可用")
-        } else {
-            management_locale_text("Discovering", "正在发现", "正在探索")
         };
+        let native_authenticated = context
+            .as_ref()
+            .is_some_and(|context| context.status == AgentAuthContextStatus::Authenticated);
+        let authenticated_method_id = context
+            .as_ref()
+            .and_then(|context| context.authenticated_via_method.clone());
         let supports_logout = catalog
             .as_ref()
             .is_some_and(|catalog| catalog.supports_logout)
-            && (!is_agent_account
-                || context.as_ref().is_some_and(|context| {
-                    context.status == AgentAuthContextStatus::Authenticated
-                }));
+            && native_authenticated;
         let logout_loading = selected_agent_id.as_deref().is_some_and(|agent_id| {
             matches!(
                 self.agent_mutations.get(agent_id),
@@ -8398,19 +8358,17 @@ impl ManagementCenter {
                         .flex_1()
                         .gap_1()
                         .child(management_status_badge(status.to_string(), cx))
-                        .when(is_agent_account, |header| {
-                            header.child(
-                                div()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(management_locale_text(
-                                        "Default CLI account · shared with the external Agent CLI",
-                                        "默认 CLI 账号 · 与外部 Agent CLI 共用",
-                                        "預設 CLI 帳號 · 與外部 Agent CLI 共用",
-                                    )),
-                            )
-                        })
+                        .child(
+                            div()
+                                .truncate()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(management_locale_text(
+                                    "Agent-native account · shared with the external Agent CLI",
+                                    "Agent 原生账号 · 与外部 Agent CLI 共用",
+                                    "Agent 原生帳號 · 與外部 Agent CLI 共用",
+                                )),
+                        )
                         .when_some(
                             context
                                 .as_ref()
@@ -8424,23 +8382,7 @@ impl ManagementCenter {
                                         .child(hint),
                                 )
                             },
-                        )
-                        .when_some(selected_profile_label, |header, label| {
-                            header.child(
-                                div()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(format!(
-                                        "{}: {label}",
-                                        management_locale_text(
-                                            "Credential profile",
-                                            "凭据配置",
-                                            "憑證設定",
-                                        )
-                                    )),
-                            )
-                        }),
+                        ),
                 )
                 .child(
                     h_flex()
@@ -8462,7 +8404,7 @@ impl ManagementCenter {
                                 "重新整理驗證方式",
                             ),
                         ))
-                        .when(is_agent_account && context.is_some(), |actions| {
+                        .when(context.is_some() && !native_authenticated, |actions| {
                             actions.child(management_detail_icon_action(
                                 Button::new("agent-auth-verify")
                                     .small()
@@ -8476,30 +8418,24 @@ impl ManagementCenter {
                                 management_locale_text("Verify account", "验证账号", "驗證帳號"),
                             ))
                         })
-                        .when(
-                            is_agent_account
-                                && context.as_ref().is_some_and(|context| {
-                                    context.status == AgentAuthContextStatus::Authenticated
-                                }),
-                            |actions| {
-                                actions.child(management_detail_icon_action(
-                                    Button::new("agent-auth-refresh-models")
-                                        .small()
-                                        .outline()
-                                        .icon(Icon::default().path("icons/vibex/rotate-ccw.svg"))
-                                        .loading(models_loading)
-                                        .disabled(pending)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.refresh_agent_auth_models(cx)
-                                        })),
-                                    management_locale_text(
-                                        "Refresh models",
-                                        "刷新模型",
-                                        "重新整理模型",
-                                    ),
-                                ))
-                            },
-                        )
+                        .when(native_authenticated, |actions| {
+                            actions.child(management_detail_icon_action(
+                                Button::new("agent-auth-refresh-models")
+                                    .small()
+                                    .outline()
+                                    .icon(Icon::default().path("icons/vibex/rotate-ccw.svg"))
+                                    .loading(models_loading)
+                                    .disabled(pending)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.refresh_agent_auth_models(cx)
+                                    })),
+                                management_locale_text(
+                                    "Refresh models",
+                                    "刷新模型",
+                                    "重新整理模型",
+                                ),
+                            ))
+                        })
                         .when(supports_logout, |actions| {
                             actions.child(management_detail_icon_action(
                                 Button::new("agent-auth-logout")
@@ -8514,10 +8450,6 @@ impl ManagementCenter {
                         }),
                 ),
         );
-        content = content.when_some(provider_configuration, |content, configuration| {
-            content.child(configuration)
-        });
-
         if let Some(preview) = self.agent_auth_logout_preview.clone() {
             let affected_count = preview.affected_session_ids.len();
             content = content.child(
@@ -8570,7 +8502,7 @@ impl ManagementCenter {
             );
         }
 
-        if is_agent_account && let Some(model_catalog) = self.agent_auth_model_catalog.as_ref() {
+        if let Some(model_catalog) = self.agent_auth_model_catalog.as_ref() {
             content = content.child(status_line(
                 format!(
                     "{}: {}",
@@ -8581,7 +8513,7 @@ impl ManagementCenter {
                     ),
                     model_catalog.models.len()
                 ),
-                true,
+                false,
                 cx,
             ));
         }
@@ -8609,29 +8541,53 @@ impl ManagementCenter {
                 cx,
             ));
         }
+        let authenticated_method_is_visible =
+            authenticated_method_id.as_deref().is_some_and(|id| {
+                catalog.as_ref().is_some_and(|catalog| {
+                    catalog.methods.iter().any(|method| {
+                        method.id == id
+                            && method.effect != AgentAuthMethodEffect::RequiresProviderProfile
+                            && method.kind != AgentAuthMethodKind::Environment
+                    })
+                })
+            });
+        if native_authenticated && !authenticated_method_is_visible {
+            content = content.child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(cx.theme().success.opacity(0.55))
+                    .bg(cx.theme().success.opacity(0.08))
+                    .px_3()
+                    .py_2()
+                    .child(
+                        Icon::new(IconName::CircleCheck)
+                            .size(px(16.0))
+                            .text_color(cx.theme().success),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_medium()
+                            .text_color(cx.theme().success)
+                            .child(management_locale_text(
+                                "Native credentials are signed in; sign out before changing methods",
+                                "原生凭证已登录；如需切换方式，请先退出登录",
+                                "原生憑證已登入；如需切換方式，請先登出",
+                            )),
+                    ),
+            );
+        }
         if let Some(catalog) = catalog {
-            if catalog.methods.is_empty() && !is_agent_account {
-                content = content.child(compact_empty_state(
-                    management_locale_text(
-                        "No sign-in method reported",
-                        "Agent 未上报认证方式",
-                        "Agent 未回報驗證方式",
-                    ),
-                    management_locale_text(
-                        "This Agent may use credentials already configured by its own CLI.",
-                        "此 Agent 可能使用其 CLI 中已有的登录状态。",
-                        "此 Agent 可能使用其 CLI 中既有的登入狀態。",
-                    ),
-                    cx,
-                ));
-            }
             let methods = catalog
                 .methods
                 .into_iter()
                 .filter(|method| {
-                    !is_agent_account
-                        || (method.effect != AgentAuthMethodEffect::RequiresProviderProfile
-                            && method.kind != AgentAuthMethodKind::Environment)
+                    method.effect != AgentAuthMethodEffect::RequiresProviderProfile
+                        && method.kind != AgentAuthMethodKind::Environment
                 })
                 .collect::<Vec<_>>();
             if methods.is_empty() {
@@ -8650,6 +8606,9 @@ impl ManagementCenter {
                 ));
             }
             for method in methods {
+                let method_authenticated = native_authenticated
+                    && authenticated_method_id.as_deref() == Some(method.id.as_str());
+                let method_locked = native_authenticated && !method_authenticated;
                 let method_operation = active_auth_operation
                     .as_ref()
                     .filter(|operation| operation.method_id == method.id)
@@ -8660,9 +8619,7 @@ impl ManagementCenter {
                         .agent_auth_terminal
                         .as_ref()
                         .is_some_and(|terminal| terminal.id == method.id);
-                let submit_disabled = pending
-                    || (method.kind == AgentAuthMethodKind::Environment
-                        && self.selected_provider_profile_id.is_none());
+                let submit_disabled = pending || native_authenticated;
                 let submit_method_id = method.id.clone();
                 let action_button_id =
                     SharedString::from(format!("agent-auth-submit-{}", method.id));
@@ -8705,6 +8662,19 @@ impl ManagementCenter {
                             ),
                         management_locale_text("Stop sign-in", "终止登录", "終止登入"),
                     )
+                } else if method_authenticated {
+                    (
+                        Button::new(action_button_id)
+                            .small()
+                            .secondary()
+                            .icon(IconName::CircleCheck)
+                            .disabled(true),
+                        management_locale_text(
+                            "Signed in with this method",
+                            "已通过此方式登录",
+                            "已透過此方式登入",
+                        ),
+                    )
                 } else {
                     let action_label = match method.kind {
                         AgentAuthMethodKind::Agent => {
@@ -8741,8 +8711,14 @@ impl ManagementCenter {
                     .min_w_0()
                     .gap_3()
                     .border_t_1()
-                    .border_color(cx.theme().border.opacity(0.75))
+                    .border_color(if method_authenticated {
+                        cx.theme().success.opacity(0.55)
+                    } else {
+                        cx.theme().border.opacity(0.75)
+                    })
                     .pt_3()
+                    .pb_1()
+                    .when(method_locked, |method| method.opacity(0.55))
                     .child(
                         h_flex()
                             .w_full()
@@ -8755,7 +8731,27 @@ impl ManagementCenter {
                                     .min_w_0()
                                     .flex_1()
                                     .gap_1()
-                                    .child(div().text_sm().font_semibold().child(method.name))
+                                    .child(
+                                        h_flex()
+                                            .min_w_0()
+                                            .gap_2()
+                                            .when(method_authenticated, |row| {
+                                                row.child(
+                                                    Icon::new(IconName::CircleCheck)
+                                                        .size(px(16.0))
+                                                        .text_color(cx.theme().success),
+                                                )
+                                            })
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_semibold()
+                                                    .when(method_authenticated, |name| {
+                                                        name.text_color(cx.theme().success)
+                                                    })
+                                                    .child(method.name),
+                                            ),
+                                    )
                                     .when_some(method.description, |title, description| {
                                         title.child(
                                             div()
@@ -8767,6 +8763,35 @@ impl ManagementCenter {
                             )
                             .child(management_detail_icon_action(action_button, action_label)),
                     );
+
+                if method_authenticated {
+                    method_content = method_content.child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .gap_2()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(cx.theme().success)
+                            .child(Icon::new(IconName::CircleCheck).size(px(14.0)))
+                            .child(management_locale_text(
+                                "Authenticated through this native credential method",
+                                "已通过此原生凭证方式完成登录",
+                                "已透過此原生憑證方式完成登入",
+                            )),
+                    );
+                } else if method_locked {
+                    method_content = method_content.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text(
+                                "Sign out before switching to this method",
+                                "请先退出当前登录，再切换到此方式",
+                                "請先登出目前帳號，再切換到此方式",
+                            )),
+                    );
+                }
 
                 for variable in method.environment {
                     let key = agent_auth_input_key(&method.id, &variable.name);
@@ -8951,11 +8976,11 @@ impl ManagementCenter {
         }
 
         management_card_with_icon(
-            management_locale_text("Authentication", "登录与认证", "登入與驗證"),
+            management_locale_text("Native credentials", "原生凭证", "原生憑證"),
             management_locale_text(
-                "Agent sign-in and model provider credentials",
-                "Agent 登录与模型供应商凭据",
-                "Agent 登入與模型供應商憑證",
+                "Sign in with authentication methods reported by this Agent",
+                "使用此 Agent 探测并上报的认证方式登录",
+                "使用此 Agent 探測並回報的驗證方式登入",
             ),
             "icons/vibex/shield-alert.svg",
             content.into_any_element(),
@@ -9285,7 +9310,7 @@ impl ManagementCenter {
                 .gap_4()
                 .child(agent_header)
                 .child(self.render_agent_installation_card(&selected_agent, window, cx))
-                .child(self.render_agent_authentication(window, None, cx))
+                .child(self.render_agent_authentication(window, cx))
                 .into_any_element();
         }
         let mut profiles = self
@@ -9332,10 +9357,6 @@ impl ManagementCenter {
             &self.mutation,
             Some(ManagementMutation::ProviderPreview(action)) if action == "native-import"
         );
-        let cc_switch_import_candidate_count = self.native_import_preview.as_ref().map(|preview| {
-            pending_cc_switch_import_item_ids(preview, &self.provider_profiles, &selected_agent.id)
-                .len()
-        });
         let mut profile_rows = v_flex().id("provider-profile-rows").w_full().gap_2();
         for profile in profiles.clone() {
             let id = profile.id.clone();
@@ -9734,94 +9755,121 @@ impl ManagementCenter {
         }
 
         let installation = self.render_agent_installation_card(&selected_agent, window, cx);
-        let provider_configuration = v_flex()
-            .w_full()
-            .min_w_0()
-            .gap_3()
-            .border_t_1()
-            .border_color(cx.theme().border.opacity(0.75))
-            .pt_4()
-            .child(
-                v_flex()
-                    .min_w_0()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_semibold()
-                            .child(copy.provider_configuration),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(management_locale_text(
-                                "Credentials used to connect this Agent to model services",
-                                "用于连接此 Agent 与模型服务的凭据配置",
-                                "用於連接此 Agent 與模型服務的憑證設定",
-                            )),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(management_profile_count(profiles.len())),
-                    )
-                    .child(
-                        h_flex()
-                            .flex_none()
-                            .flex_wrap()
-                            .justify_end()
-                            .gap_2()
-                            .child(management_detail_icon_action(
-                                Button::new("provider-import-existing")
-                                    .small()
-                                    .secondary()
-                                    .icon(Icon::default().path("icons/vibex/import.svg"))
-                                    .loading(native_importing)
-                                    .disabled(
-                                        pending
-                                            || cc_switch_import_candidate_count.is_none()
-                                            || cc_switch_import_candidate_count == Some(0),
-                                    )
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        let agent_id = this.selected_agent_id.clone();
-                                        this.preview_native_import(true, agent_id, cx)
-                                    })),
-                                copy.import_configuration,
-                            ))
-                            .child(management_detail_icon_action(
-                                Button::new("provider-add-configuration")
-                                    .small()
-                                    .primary()
-                                    .icon(IconName::Plus)
-                                    .disabled(pending)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_profile_creator(window, cx);
-                                    })),
-                                copy.add_configuration,
-                            )),
-                    ),
-            )
-            .child(if profiles.is_empty() {
-                compact_empty_state(copy.no_profiles, copy.no_profiles_description, cx)
-            } else {
-                profile_rows.into_any_element()
-            });
-        let authentication = self.render_agent_authentication(
-            window,
-            Some(provider_configuration.into_any_element()),
+        let provider_configuration = if profiles.is_empty() {
+            v_flex()
+                .w_full()
+                .min_h(px(180.0))
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .py_4()
+                .child(div().text_sm().font_medium().child(copy.no_profiles))
+                .child(
+                    div()
+                        .max_w(px(420.0))
+                        .text_xs()
+                        .text_center()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(copy.no_profiles_description),
+                )
+                .child(
+                    h_flex()
+                        .flex_wrap()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .child(
+                            Button::new("provider-empty-add-configuration")
+                                .small()
+                                .primary()
+                                .icon(IconName::Plus)
+                                .label(copy.add_configuration)
+                                .disabled(pending)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_profile_creator(window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("provider-empty-import-existing")
+                                .small()
+                                .secondary()
+                                .icon(Icon::default().path("icons/vibex/import.svg"))
+                                .label(copy.import_configuration)
+                                .loading(native_importing)
+                                .disabled(pending)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let agent_id = this.selected_agent_id.clone();
+                                    this.preview_native_import(true, agent_id, cx)
+                                })),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            v_flex()
+                .w_full()
+                .min_w_0()
+                .gap_3()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .flex_wrap()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(management_profile_count(profiles.len())),
+                        )
+                        .child(
+                            h_flex()
+                                .flex_none()
+                                .flex_wrap()
+                                .justify_end()
+                                .gap_2()
+                                .child(management_detail_icon_action(
+                                    Button::new("provider-import-existing")
+                                        .small()
+                                        .secondary()
+                                        .icon(Icon::default().path("icons/vibex/import.svg"))
+                                        .loading(native_importing)
+                                        .disabled(pending)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            let agent_id = this.selected_agent_id.clone();
+                                            this.preview_native_import(true, agent_id, cx)
+                                        })),
+                                    copy.import_configuration,
+                                ))
+                                .child(management_detail_icon_action(
+                                    Button::new("provider-add-configuration")
+                                        .small()
+                                        .primary()
+                                        .icon(IconName::Plus)
+                                        .disabled(pending)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.open_profile_creator(window, cx);
+                                        })),
+                                    copy.add_configuration,
+                                )),
+                        ),
+                )
+                .child(profile_rows)
+                .into_any_element()
+        };
+        let provider_configuration = management_card_with_icon(
+            copy.provider_configuration,
+            management_locale_text(
+                "Configure credentials and models for external model services",
+                "配置外部模型服务所需的凭证与模型",
+                "設定外部模型服務所需的憑證與模型",
+            ),
+            "icons/vibex/database.svg",
+            provider_configuration,
             cx,
         );
+        let authentication = self.render_agent_authentication(window, cx);
 
         v_flex()
             .w_full()
@@ -9830,6 +9878,7 @@ impl ManagementCenter {
             .child(agent_header)
             .child(installation)
             .child(authentication)
+            .child(provider_configuration)
             .into_any_element()
     }
 
@@ -16554,7 +16603,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("Provider renderer should remain inspectable");
 
-        assert!(render.contains("render_agent_authentication(window, None, cx)"));
+        assert!(render.contains("render_agent_authentication(window, cx)"));
         assert!(!render.contains("render_runtime_verification_card"));
         assert!(!render.contains("runtime_options_card"));
         assert!(!render.contains("render_projection_contract"));
@@ -16577,7 +16626,7 @@ mod tests {
 
         assert!(capability_gate < profile_projection);
         assert!(render.contains("render_agent_installation_card(&selected_agent, window, cx)"));
-        assert!(render.contains("render_agent_authentication(window, None, cx)"));
+        assert!(render.contains("render_agent_authentication(window, cx)"));
 
         let sidebar = source
             .split_once("    fn render_agents(")
@@ -16657,7 +16706,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_details_merge_provider_credentials_into_authentication() {
+    fn agent_details_render_native_credentials_before_peer_provider_configuration() {
         let source = include_str!("management.rs");
         let render = source
             .split_once("    fn render_providers(")
@@ -16670,12 +16719,47 @@ mod tests {
             .map(|(body, _)| body)
             .expect("Authentication renderer should remain inspectable");
 
-        assert!(render.contains("let provider_configuration = v_flex()"));
-        assert!(!render.contains("icons/vibex/database.svg"));
-        assert!(render.contains("Some(provider_configuration.into_any_element())"));
-        assert!(authentication.contains("provider_configuration: Option<AnyElement>"));
-        assert!(authentication.contains("content.when_some(provider_configuration"));
+        assert!(authentication.contains("Native credentials"));
         assert!(authentication.contains("icons/vibex/shield-alert.svg"));
+        assert!(!authentication.contains("provider_configuration: Option<AnyElement>"));
+        assert!(!authentication.contains("content.when_some(provider_configuration"));
+        assert!(render.contains("let provider_configuration = management_card_with_icon("));
+        assert!(render.contains("icons/vibex/database.svg"));
+        let authentication_position = render
+            .find(".child(authentication)")
+            .expect("native credentials should render in the Agent detail stack");
+        let provider_position = render
+            .find(".child(provider_configuration)")
+            .expect("provider configuration should render in the Agent detail stack");
+        assert!(
+            authentication_position < provider_position,
+            "native credentials must precede the peer model-provider card"
+        );
+    }
+
+    #[test]
+    fn model_provider_empty_state_centers_labeled_add_and_import_actions() {
+        let source = include_str!("management.rs");
+        let render = source
+            .split_once("    fn render_providers(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_mcp("))
+            .map(|(body, _)| body)
+            .expect("Provider renderer should remain inspectable");
+        let empty = render
+            .split_once("let provider_configuration = if profiles.is_empty()")
+            .and_then(|(_, tail)| tail.split_once("} else {"))
+            .map(|(body, _)| body)
+            .expect("Provider empty state should remain inspectable");
+
+        assert!(empty.contains(".items_center()"));
+        assert!(empty.contains(".justify_center()"));
+        assert!(empty.contains("provider-empty-add-configuration"));
+        assert!(empty.contains("provider-empty-import-existing"));
+        assert!(empty.contains(".label(copy.add_configuration)"));
+        assert!(empty.contains(".label(copy.import_configuration)"));
+        assert!(empty.contains("this.open_profile_creator(window, cx)"));
+        assert!(empty.contains("this.preview_native_import(true, agent_id, cx)"));
+        assert!(!empty.contains("compact_empty_state("));
     }
 
     #[test]
@@ -16874,10 +16958,7 @@ mod tests {
         );
         assert!(authentication.contains("agent-auth-logout-cancel"));
         assert!(authentication.contains("agent-auth-logout-confirm"));
-        for (name, body, minimum_actions) in [
-            ("installation", install, 4),
-            ("Provider configuration", render, 2),
-        ] {
+        for (name, body, minimum_actions) in [("installation", install, 4)] {
             assert!(
                 !body.contains(".label("),
                 "{name} actions must remain icon-only"
@@ -16887,6 +16968,17 @@ mod tests {
                 "{name} actions must use the accessible icon helper"
             );
         }
+        assert_eq!(
+            render.matches(".label(").count(),
+            2,
+            "only empty-state Add and Import use text labels"
+        );
+        assert!(render.contains(".label(copy.add_configuration)"));
+        assert!(render.contains(".label(copy.import_configuration)"));
+        assert!(
+            render.matches("management_detail_icon_action(").count() >= 2,
+            "populated Provider toolbar actions must use the accessible icon helper"
+        );
         assert!(
             authentication
                 .matches("management_detail_icon_action(")
@@ -16919,9 +17011,44 @@ mod tests {
             "agent_auth_terminal_surface",
             ".mask_toggle()",
             "Clear saved value",
+            "native_authenticated",
+            "authenticated_method_id",
+            "method_authenticated",
+            "method_locked",
+            "let submit_disabled = pending || native_authenticated",
+            "Authenticated through this native credential method",
+            "Sign out before switching to this method",
+            "Native credentials are signed in; sign out before changing methods",
         ] {
             assert!(render.contains(expected), "missing auth flow: {expected}");
         }
+    }
+
+    #[test]
+    fn native_authentication_stays_agent_scoped_and_excludes_provider_credentials() {
+        let source = include_str!("management.rs");
+        let scope = source
+            .split_once("    fn current_agent_auth_scope(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn load_agent_auth("))
+            .map(|(body, _)| body)
+            .expect("Agent authentication scope should remain inspectable");
+        let load = source
+            .split_once("    fn load_agent_auth(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn ensure_agent_auth_inputs("))
+            .map(|(body, _)| body)
+            .expect("Agent authentication loader should remain inspectable");
+        let render = source
+            .split_once("    fn render_agent_authentication(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_agent_install_loading("))
+            .map(|(body, _)| body)
+            .expect("Agent authentication renderer should remain inspectable");
+
+        assert!(scope.contains("Some((agent_id.clone(), None))"));
+        assert!(!scope.contains("selected_provider_profile_id"));
+        assert!(load.contains("refresh_auth_methods(agent_id, None)"));
+        assert!(load.contains("list_auth_methods(agent_id, None)"));
+        assert!(render.contains("method.effect != AgentAuthMethodEffect::RequiresProviderProfile"));
+        assert!(render.contains("method.kind != AgentAuthMethodKind::Environment"));
     }
 
     #[test]
