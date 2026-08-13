@@ -26022,6 +26022,7 @@ impl VibexWorkbench {
                                                         },
                                                     )),
                                             )
+                                            .child(self.render_composer_terminal_menu(cx))
                                             .children(runtime_controls),
                                     )
                                     .child(
@@ -26049,7 +26050,6 @@ impl VibexWorkbench {
                                                     "開啟用量統計",
                                                 ),
                                             ))
-                                            .child(self.render_composer_terminal_menu(cx))
                                             .child(primary_action),
                                     ),
                             ),
@@ -34596,7 +34596,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_terminal_toggle_sits_between_usage_and_primary_action() {
+    fn composer_terminal_toggle_sits_in_left_controls() {
         let source = include_str!("app.rs");
         let composer = source
             .split_once("    fn render_composer(&mut self, cx: &mut Context<Self>)")
@@ -34606,6 +34606,9 @@ mod tests {
         let usage = composer
             .find("Button::new(\"open-session-usage\")")
             .expect("token usage action should exist");
+        let runtime_controls = composer
+            .find(".children(runtime_controls)")
+            .expect("runtime controls should exist");
         let terminal = composer
             .find("self.render_composer_terminal_menu(cx)")
             .expect("terminal mode action should exist");
@@ -34613,8 +34616,9 @@ mod tests {
             .find(".child(primary_action)")
             .expect("send or stop action should exist");
 
-        assert!(usage < terminal);
-        assert!(terminal < primary_action);
+        assert!(terminal < runtime_controls);
+        assert!(runtime_controls < usage);
+        assert!(usage < primary_action);
     }
 
     #[test]
