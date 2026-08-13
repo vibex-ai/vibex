@@ -34596,6 +34596,28 @@ mod tests {
     }
 
     #[test]
+    fn composer_terminal_toggle_sits_between_usage_and_primary_action() {
+        let source = include_str!("app.rs");
+        let composer = source
+            .split_once("    fn render_composer(&mut self, cx: &mut Context<Self>)")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
+            .map(|(body, _)| body)
+            .expect("composer renderer should remain inspectable");
+        let usage = composer
+            .find("Button::new(\"open-session-usage\")")
+            .expect("token usage action should exist");
+        let terminal = composer
+            .find("self.render_composer_terminal_menu(cx)")
+            .expect("terminal mode action should exist");
+        let primary_action = composer
+            .find(".child(primary_action)")
+            .expect("send or stop action should exist");
+
+        assert!(usage < terminal);
+        assert!(terminal < primary_action);
+    }
+
+    #[test]
     fn sidebar_project_highlight_yields_to_the_selected_session() {
         assert!(sidebar_project_is_active(
             Some("workspace_a"),
