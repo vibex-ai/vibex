@@ -10,11 +10,10 @@
     <meta name="theme-color" content="#0f766e" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; connect-src 'self' https: ws: wss:; img-src 'self' data:; manifest-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; worker-src 'self'"
+      content="default-src 'self'; connect-src 'self' https: ws: wss:; img-src 'self' data:; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'"
     />
     <title>Vibex</title>
     <link rel="icon" href="./icon.svg" type="image/svg+xml" />
-    <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body data-gate-state="loading">
@@ -22,7 +21,7 @@
       <div class="status-copy">
         <p class="status-kicker">Vibex</p>
         <h1 id="gate-status-title">Starting WebGPU</h1>
-        <p id="gate-status-detail">Checking the browser before the GPUI canvas starts.</p>
+        <p id="gate-status-detail">Checking the mobile runtime before the GPUI canvas starts.</p>
         <code id="gate-status-code">GATE_BOOT</code>
       </div>
     </main>

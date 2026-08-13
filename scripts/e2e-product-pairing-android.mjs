@@ -300,7 +300,13 @@ function productDeepLink(link) {
     fail("product_pairing_android_link_invalid");
   }
   assert(url.hash.startsWith("#/pair/"), "product_pairing_android_link_invalid");
-  return `vibex://open/${url.hash}`;
+  assert(
+    url.protocol === "vibex:" &&
+      url.hostname === "open" &&
+      ["/tailnet", "/self_hosted_relay"].includes(url.pathname),
+    "product_pairing_android_transport_invalid"
+  );
+  return url.toString();
 }
 
 async function clearRevokedDevice(page) {

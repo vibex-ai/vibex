@@ -1,7 +1,7 @@
-// Verbose replica of the scripts/e2e-workflows.mjs browser flow against
-// the local harness. Prints every stage and the relevant state snapshots so
-// failures pinpoint the exact workflow step, which the sealed runner reports
-// only as an opaque code.
+// Verbose replica of the Mobile WASM development-host workflow against the
+// local harness. Prints every stage and relevant state snapshots so failures
+// pinpoint the exact step, which the sealed runner reports only as an opaque
+// code.
 import { readFileSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import process from "node:process";
@@ -13,12 +13,12 @@ for (const key of Object.keys(process.env)) {
   if (/^(https?_proxy|all_proxy|no_proxy)$/i.test(key)) delete process.env[key];
 }
 const origin = process.argv[2] ?? "https://dev-home.tail525c5d.ts.net:8443";
-const bundlePath = process.argv[3] ?? join(ROOT, ".e2e-local-env/web-direct/credentials.json");
+const bundlePath = process.argv[3] ?? join(ROOT, ".e2e-local-env/mobile-wasm-direct/credentials.json");
 const controlPort = process.env.VIBEX_E2E_CONTROL_PORT ?? "14321";
 const REMOTE_CREDENTIAL_STORAGE_KEY = "vibex.remote-client.credentials.v1";
 const credentials = JSON.parse(readFileSync(bundlePath, "utf8"));
 
-const { startWasmServer } = await import(join(ROOT, "scripts/wasm-test-server.mjs"));
+const { startWasmServer } = await import(join(ROOT, "scripts/mobile-wasm-test-server.mjs"));
 const server = await startWasmServer({ port: 14322 });
 
 const fixtureResponse = await fetch(`http://127.0.0.1:${controlPort}/fixture/setup`, {
@@ -252,7 +252,7 @@ try {
   const recoveryHook = join(ROOT, "scripts/e2e-local-env/recovery-hook.sh");
   const transport = process.env.VIBEX_E2E_TRANSPORT ?? "direct";
   const runHook = (hookAction) =>
-    execFileSync(recoveryHook, [hookAction, "web_browser", transport], {
+    execFileSync(recoveryHook, [hookAction, "mobile_wasm_host", transport], {
       env: { ...process.env, VIBEX_E2E_CONTROL_PORT: controlPort }
     });
   const baseline = await snapshot();

@@ -20,19 +20,16 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 use url::{Host, Url};
-pub use vibex_core::WebBuildDescriptor;
 use vibex_core::{
     ErrorCategory, RelayPeerId, RelayProtocolVersion, RelayRoomId, RemoteCancelPairingOfferRequest,
     RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDevicePermissionLevel,
     RemotePairingCandidate, RemotePairingOfferSummary, RemotePairingTransport,
-    RemoteProtocolVersionRange, RequestId, VibexError, VibexResult, WEB_REQUIRED_ASSETS,
-    WEB_STATIC_IDENTITY_ASSETS,
+    RemoteProtocolVersionRange, RequestId, VibexError, VibexResult,
 };
 use vibex_remote::{
     RemoteGateway, RemoteGatewayConfig, RemoteGatewayDeploymentMode, RemoteGatewayPairingRoutes,
@@ -54,7 +51,6 @@ const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const DIRECT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const DIRECT_PROBE_MAX_BYTES: usize = 128 * 1024;
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const DESKTOP_BINARY_NAME: &str = "vibex-desktop";
 const CAPACITOR_CLIENT_ORIGINS: [&str; 2] = ["https://localhost", "capacitor://localhost"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -102,7 +98,6 @@ pub enum RemoteRecoveryAction {
     ConfirmPort,
     RepairRoute,
     Configure,
-    UpdateWebBuild,
     ManualCommand,
     RePair,
 }
@@ -535,202 +530,6 @@ impl RemoteConnectivityStore {
     }
 }
 
-fn load_web_build_descriptor(
-    root: impl AsRef<Path>,
-    allow_debug: bool,
-) -> VibexResult<WebBuildDescriptor> {
-    let root = canonical_contained_root(root.as_ref())?;
-    for relative in WEB_REQUIRED_ASSETS {
-        let path = root.join(relative);
-        let metadata = fs::symlink_metadata(&path).map_err(|_| {
-            VibexError::capability(
-                "web_assets_missing",
-                "the packaged WebUI is missing a required asset",
-            )
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(VibexError::capability(
-                "web_assets_invalid",
-                "the packaged WebUI contains an invalid asset",
-            ));
-        }
-        let canonical = fs::canonicalize(&path).map_err(|_| {
-            VibexError::capability(
-                "web_assets_invalid",
-                "the packaged WebUI asset could not be resolved",
-            )
-        })?;
-        if !canonical.starts_with(&root) {
-            return Err(VibexError::capability(
-                "web_assets_containment_failed",
-                "the packaged WebUI asset escapes its source root",
-            ));
-        }
-    }
-    let bytes = fs::read(root.join("build.json")).map_err(|_| {
-        VibexError::capability(
-            "web_assets_missing",
-            "the packaged WebUI build identity is missing",
-        )
-    })?;
-    let descriptor: WebBuildDescriptor = serde_json::from_slice(&bytes).map_err(|_| {
-        VibexError::capability(
-            "web_assets_invalid",
-            "the packaged WebUI build identity is invalid",
-        )
-    })?;
-    if !descriptor.has_valid_identity(allow_debug) {
-        return Err(VibexError::capability(
-            "web_assets_incompatible",
-            "the packaged WebUI build identity is incomplete",
-        ));
-    }
-    if descriptor.package_version != env!("CARGO_PKG_VERSION") {
-        return Err(VibexError::capability(
-            "web_assets_incompatible",
-            "the WebUI build is not compatible with this Desktop",
-        ));
-    }
-    verify_web_asset_hashes(&root, &descriptor)?;
-    Ok(descriptor)
-}
-
-#[derive(Debug, Clone)]
-pub struct WebAssetResolver {
-    packaged_roots: Vec<PathBuf>,
-    debug_root: Option<PathBuf>,
-    allow_debug: bool,
-    require_source_identity: bool,
-    expected_build_id: Option<String>,
-    expected_git_commit: Option<String>,
-}
-
-impl WebAssetResolver {
-    pub fn debug(root: impl Into<PathBuf>) -> Self {
-        Self {
-            packaged_roots: Vec::new(),
-            debug_root: Some(root.into()),
-            allow_debug: true,
-            require_source_identity: false,
-            expected_build_id: None,
-            expected_git_commit: None,
-        }
-    }
-
-    pub fn packaged(root: impl Into<PathBuf>) -> Self {
-        Self {
-            packaged_roots: vec![root.into()],
-            debug_root: None,
-            allow_debug: false,
-            require_source_identity: true,
-            expected_build_id: option_env!("VIBEX_WEB_BUILD_ID").map(str::to_string),
-            expected_git_commit: option_env!("VIBEX_WEB_GIT_COMMIT").map(str::to_string),
-        }
-    }
-
-    pub fn packaged_for_current_exe() -> Self {
-        let executable = std::env::current_exe().unwrap_or_default();
-        let binary_dir = executable.parent().unwrap_or_else(|| Path::new(""));
-        let install_root = binary_dir.parent().unwrap_or(binary_dir);
-        let roots = vec![
-            install_root
-                .join("lib")
-                .join(DESKTOP_BINARY_NAME)
-                .join("web"),
-            install_root.join("Resources").join("web"),
-            binary_dir.join("web"),
-        ];
-        let mut resolver = Self::packaged(roots[0].clone());
-        resolver.packaged_roots = roots;
-        resolver
-    }
-
-    pub fn with_debug_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.debug_root = Some(root.into());
-        self
-    }
-
-    pub fn allow_debug(mut self, allow: bool) -> Self {
-        self.allow_debug = allow;
-        self
-    }
-
-    pub fn resolve(&self) -> VibexResult<(PathBuf, WebBuildDescriptor)> {
-        if !self.packaged_roots.is_empty() {
-            let Some(root) = self.packaged_roots.iter().find(|root| root.exists()) else {
-                return Err(VibexError::capability(
-                    "web_assets_missing",
-                    "the packaged WebUI resource is unavailable",
-                ));
-            };
-            let canonical = canonical_contained_root(root)?;
-            let descriptor = load_web_build_descriptor(&canonical, self.allow_debug)?;
-            if self.require_source_identity
-                && (self.expected_build_id.as_deref() != Some(descriptor.build_id.as_str())
-                    || self.expected_git_commit.as_deref() != Some(descriptor.git_commit.as_str()))
-            {
-                return Err(VibexError::capability(
-                    "web_assets_incompatible",
-                    "the packaged WebUI was not built from this Desktop source",
-                ));
-            }
-            return Ok((canonical, descriptor));
-        }
-        if self.allow_debug
-            && let Some(root) = &self.debug_root
-        {
-            let canonical = canonical_contained_root(root)?;
-            let descriptor = load_web_build_descriptor(&canonical, true)?;
-            return Ok((canonical, descriptor));
-        }
-        Err(VibexError::capability(
-            "web_assets_missing",
-            "no source-bound WebUI build is configured",
-        ))
-    }
-}
-
-fn verify_web_asset_hashes(root: &Path, descriptor: &WebBuildDescriptor) -> VibexResult<()> {
-    let wasm =
-        fs::read(root.join("pkg/vibex_web_bg.wasm")).map_err(|_| web_asset_integrity_error())?;
-    let glue = fs::read(root.join("pkg/vibex_web.js")).map_err(|_| web_asset_integrity_error())?;
-    let mut static_hash = Sha256::new();
-    for relative in WEB_STATIC_IDENTITY_ASSETS {
-        let mut bytes = fs::read(root.join(relative)).map_err(|_| web_asset_integrity_error())?;
-        if *relative == "service-worker.js" {
-            let source = String::from_utf8(bytes).map_err(|_| web_asset_integrity_error())?;
-            if descriptor.profile == "release" && !source.contains(&descriptor.build_id) {
-                return Err(web_asset_integrity_error());
-            }
-            bytes = source
-                .replace(&descriptor.build_id, "__VIBEX_BUILD_ID__")
-                .into_bytes();
-        }
-        static_hash.update(relative.as_bytes());
-        static_hash.update(b"\0");
-        static_hash.update(bytes);
-        static_hash.update(b"\0");
-    }
-    if sha256_hex(&wasm) != descriptor.wasm_sha256
-        || sha256_hex(&glue) != descriptor.glue_sha256
-        || format!("{:x}", static_hash.finalize()) != descriptor.static_sha256
-    {
-        return Err(web_asset_integrity_error());
-    }
-    Ok(())
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
-
-fn web_asset_integrity_error() -> VibexError {
-    VibexError::capability(
-        "web_assets_incompatible",
-        "the packaged WebUI asset identity does not match its build descriptor",
-    )
-}
-
 pub fn normalize_https_origin(value: &str) -> VibexResult<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.len() > 2_048 {
@@ -787,8 +586,6 @@ pub struct DirectProbeInfo {
     pub deployment_mode: String,
     #[serde(default)]
     pub tls_policy: String,
-    #[serde(default)]
-    pub web_build: Option<WebBuildDescriptor>,
 }
 
 #[async_trait]
@@ -951,8 +748,6 @@ fn gateway_authority_allowlists(network_origins: Vec<String>) -> (Vec<String>, V
 pub struct RelayPublicationInfo {
     pub protocol_version: RelayProtocolVersion,
     pub features: RelayPublicationFeatures,
-    #[serde(default)]
-    pub web_build: Option<WebBuildDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -962,11 +757,10 @@ pub struct RelayPublicationFeatures {
     pub device_websocket: bool,
     pub websocket_frames: bool,
     pub http_pair_bridge: bool,
-    pub static_room_assets: bool,
 }
 
 impl RelayPublicationInfo {
-    fn validate_browser_bootstrap(&self, expected: &WebBuildDescriptor) -> VibexResult<()> {
+    fn validate_transport_capabilities(&self) -> VibexResult<()> {
         if self.protocol_version != RelayProtocolVersion::foundation() {
             return Err(VibexError::capability(
                 "relay_protocol_incompatible",
@@ -977,23 +771,10 @@ impl RelayPublicationInfo {
             || !self.features.device_websocket
             || !self.features.websocket_frames
             || !self.features.http_pair_bridge
-            || !self.features.static_room_assets
         {
             return Err(VibexError::capability(
-                "relay_browser_bootstrap_unavailable",
-                "the self-hosted Relay does not expose the required browser pairing surface",
-            ));
-        }
-        let Some(actual) = self.web_build.as_ref() else {
-            return Err(VibexError::capability(
-                "relay_web_build_missing",
-                "the self-hosted Relay does not advertise a WebUI build",
-            ));
-        };
-        if actual != expected || actual.profile != "release" {
-            return Err(VibexError::capability(
-                "relay_web_build_incompatible",
-                "the self-hosted Relay WebUI does not match this Desktop",
+                "relay_transport_unavailable",
+                "the self-hosted Relay does not expose the required mobile transport surface",
             ));
         }
         Ok(())
@@ -1742,7 +1523,6 @@ struct ControllerInner {
     tailscale: Arc<dyn TailscalePublication>,
     direct_probe: Arc<dyn DirectPublicationProbe>,
     relay_probe: Arc<dyn RelayPublicationProbe>,
-    web_assets: Mutex<Option<WebAssetResolver>>,
     operation: Mutex<()>,
     state: Mutex<ControllerState>,
 }
@@ -1842,7 +1622,6 @@ impl RemoteConnectivityController {
                 tailscale,
                 direct_probe,
                 relay_probe,
-                web_assets: Mutex::new(None),
                 operation: Mutex::new(()),
                 state: Mutex::new(ControllerState {
                     settings: loaded.settings,
@@ -1863,11 +1642,6 @@ impl RemoteConnectivityController {
 
     pub fn relay(&self) -> RelayClientRuntime {
         self.inner.relay.clone()
-    }
-
-    pub async fn set_web_asset_resolver(&self, resolver: Option<WebAssetResolver>) {
-        let _operation = self.inner.operation.lock().await;
-        *self.inner.web_assets.lock().await = resolver;
     }
 
     pub async fn snapshot(&self) -> RemoteConnectivitySnapshot {
@@ -2076,24 +1850,13 @@ impl RemoteConnectivityController {
                 .unwrap()
                 .state = RemoteMethodState::Enabling;
         }
-        let expected_build = match self.prepare_gateway_for_origin(&origin).await {
-            Ok(descriptor) => descriptor,
-            Err(error) => {
-                self.record_method_error(
-                    RemoteConnectivityMethod::Direct,
-                    &error,
-                    RemoteRecoveryAction::UpdateWebBuild,
-                )
-                .await;
-                return Err(error);
-            }
-        };
+        self.prepare_gateway_for_origin(&origin).await?;
         let result = self
             .inner
             .direct_probe
             .probe(&origin, direct_probe_proxy_policy(&origin))
             .await
-            .and_then(|info| self.validate_direct_info(&info, &expected_build));
+            .and_then(|info| self.validate_direct_info(&info));
         match result {
             Ok(()) => {
                 let persisted = {
@@ -2170,22 +1933,8 @@ impl RemoteConnectivityController {
                 .unwrap()
                 .state = RemoteMethodState::Enabling;
         }
-        let expected_build = match self.resolve_web_assets().await {
-            Ok((_, descriptor)) => descriptor,
-            Err(error) => {
-                self.record_method_error(
-                    RemoteConnectivityMethod::SelfHostedRelay,
-                    &error,
-                    RemoteRecoveryAction::UpdateWebBuild,
-                )
-                .await;
-                return Err(error);
-            }
-        };
         let publication = self.inner.relay_probe.probe(&origin).await;
-        if let Err(error) =
-            publication.and_then(|info| info.validate_browser_bootstrap(&expected_build))
-        {
+        if let Err(error) = publication.and_then(|info| info.validate_transport_capabilities()) {
             self.record_method_error(
                 RemoteConnectivityMethod::SelfHostedRelay,
                 &error,
@@ -2407,19 +2156,16 @@ impl RemoteConnectivityController {
             };
             (origin, port, None)
         };
-        let expected_build = match self.prepare_gateway_for_origin(&origin).await {
-            Ok(descriptor) => descriptor,
-            Err(error) => {
-                self.record_method_error(
-                    RemoteConnectivityMethod::TailscaleServe,
-                    &error,
-                    RemoteRecoveryAction::UpdateWebBuild,
-                )
-                .await;
-                self.apply_routes().await?;
-                return Err(error);
-            }
-        };
+        if let Err(error) = self.prepare_gateway_for_origin(&origin).await {
+            self.record_method_error(
+                RemoteConnectivityMethod::TailscaleServe,
+                &error,
+                RemoteRecoveryAction::RepairRoute,
+            )
+            .await;
+            self.apply_routes().await?;
+            return Err(error);
+        }
         let (route, ownership, created) = if let Some(route) = existing_route {
             let ownership = if recorded_ownership == RemoteRouteOwnership::DesktopCreated
                 && recorded_port == Some(route.https_port)
@@ -2456,7 +2202,7 @@ impl RemoteConnectivityController {
             .direct_probe
             .probe(&origin, DirectProbeProxyPolicy::Bypass)
             .await
-            .and_then(|info| self.validate_direct_info(&info, &expected_build));
+            .and_then(|info| self.validate_direct_info(&info));
         if let Err(error) = publication {
             if created {
                 let mut owned = route.clone();
@@ -2650,19 +2396,8 @@ impl RemoteConnectivityController {
         Ok(self.snapshot().await)
     }
 
-    async fn resolve_web_assets(&self) -> VibexResult<(PathBuf, WebBuildDescriptor)> {
-        let resolver = self.inner.web_assets.lock().await.clone().ok_or_else(|| {
-            VibexError::capability(
-                "web_assets_missing",
-                "no source-bound WebUI build is configured",
-            )
-        })?;
-        resolver.resolve()
-    }
-
-    async fn prepare_gateway_for_origin(&self, origin: &str) -> VibexResult<WebBuildDescriptor> {
+    async fn prepare_gateway_for_origin(&self, origin: &str) -> VibexResult<()> {
         let origin = normalize_https_origin(origin)?;
-        let (root, descriptor) = self.resolve_web_assets().await?;
         let routes = self.aggregate_routes().await;
         let mut origins = routes
             .direct_candidates
@@ -2670,14 +2405,8 @@ impl RemoteConnectivityController {
             .map(|candidate| candidate.url.clone())
             .collect::<BTreeSet<_>>();
         origins.insert(origin);
-        self.configure_gateway(
-            routes,
-            origins.into_iter().collect(),
-            Some((root, descriptor.clone())),
-            true,
-        )
-        .await?;
-        Ok(descriptor)
+        self.configure_gateway(routes, origins.into_iter().collect(), true)
+            .await
     }
 
     async fn aggregate_routes(&self) -> RemoteGatewayPairingRoutes {
@@ -2711,7 +2440,6 @@ impl RemoteConnectivityController {
         &self,
         routes: RemoteGatewayPairingRoutes,
         network_origins: Vec<String>,
-        web_assets: Option<(PathBuf, WebBuildDescriptor)>,
         listener_enabled: bool,
     ) -> VibexResult<()> {
         let previous = self.inner.gateway.current_config();
@@ -2741,10 +2469,6 @@ impl RemoteConnectivityController {
                 "the remote Gateway requires at least one validated origin",
             ));
         }
-        config.static_dir = web_assets.as_ref().map(|(root, _)| root.clone());
-        config.web_build = web_assets
-            .as_ref()
-            .map(|(_, descriptor)| descriptor.clone());
         let was_running = self.inner.gateway.status().running;
         if was_running {
             let mut route_only_update = previous.clone();
@@ -2809,11 +2533,7 @@ impl RemoteConnectivityController {
         Ok(self.snapshot().await)
     }
 
-    fn validate_direct_info(
-        &self,
-        info: &DirectProbeInfo,
-        expected_build: &WebBuildDescriptor,
-    ) -> VibexResult<()> {
+    fn validate_direct_info(&self, info: &DirectProbeInfo) -> VibexResult<()> {
         let identity = self.inner.gateway.identity()?;
         if info.server_id != identity.server_id()
             || info.server_identity_public_key != identity.public_key_base64()
@@ -2849,21 +2569,6 @@ impl RemoteConnectivityController {
                 "remote_direct_security_policy_invalid",
                 "the Direct origin does not expose the trusted HTTPS proxy policy",
             ));
-        }
-        match info.web_build.as_ref() {
-            Some(actual) if actual == expected_build => {}
-            Some(_) => {
-                return Err(VibexError::capability(
-                    "remote_direct_web_build_incompatible",
-                    "the Direct origin WebUI does not match this Desktop",
-                ));
-            }
-            None => {
-                return Err(VibexError::capability(
-                    "remote_direct_web_build_missing",
-                    "the Direct origin does not advertise a WebUI build",
-                ));
-            }
         }
         Ok(())
     }
@@ -2913,24 +2618,21 @@ impl RemoteConnectivityController {
                 return;
             }
         };
-        let expected_build = match self.prepare_gateway_for_origin(&origin).await {
-            Ok(descriptor) => descriptor,
-            Err(error) => {
-                self.record_method_error(
-                    RemoteConnectivityMethod::TailscaleServe,
-                    &error,
-                    RemoteRecoveryAction::UpdateWebBuild,
-                )
-                .await;
-                return;
-            }
-        };
+        if let Err(error) = self.prepare_gateway_for_origin(&origin).await {
+            self.record_method_error(
+                RemoteConnectivityMethod::TailscaleServe,
+                &error,
+                RemoteRecoveryAction::RepairRoute,
+            )
+            .await;
+            return;
+        }
         let validation = self
             .inner
             .direct_probe
             .probe(&origin, DirectProbeProxyPolicy::Bypass)
             .await
-            .and_then(|info| self.validate_direct_info(&info, &expected_build));
+            .and_then(|info| self.validate_direct_info(&info));
         if let Err(error) = validation {
             self.record_method_error(
                 RemoteConnectivityMethod::TailscaleServe,
@@ -2977,24 +2679,21 @@ impl RemoteConnectivityController {
             .await;
             return;
         };
-        let expected_build = match self.prepare_gateway_for_origin(&origin).await {
-            Ok(descriptor) => descriptor,
-            Err(error) => {
-                self.record_method_error(
-                    RemoteConnectivityMethod::Direct,
-                    &error,
-                    RemoteRecoveryAction::UpdateWebBuild,
-                )
-                .await;
-                return;
-            }
-        };
+        if let Err(error) = self.prepare_gateway_for_origin(&origin).await {
+            self.record_method_error(
+                RemoteConnectivityMethod::Direct,
+                &error,
+                RemoteRecoveryAction::RepairRoute,
+            )
+            .await;
+            return;
+        }
         let result = self
             .inner
             .direct_probe
             .probe(&origin, direct_probe_proxy_policy(&origin))
             .await
-            .and_then(|info| self.validate_direct_info(&info, &expected_build));
+            .and_then(|info| self.validate_direct_info(&info));
         if let Err(error) = result {
             self.record_method_error(
                 RemoteConnectivityMethod::Direct,
@@ -3039,22 +2738,8 @@ impl RemoteConnectivityController {
             .await;
             return;
         };
-        let expected_build = match self.resolve_web_assets().await {
-            Ok((_, descriptor)) => descriptor,
-            Err(error) => {
-                self.record_method_error(
-                    RemoteConnectivityMethod::SelfHostedRelay,
-                    &error,
-                    RemoteRecoveryAction::UpdateWebBuild,
-                )
-                .await;
-                return;
-            }
-        };
         let publication = self.inner.relay_probe.probe(&origin).await;
-        if let Err(error) =
-            publication.and_then(|info| info.validate_browser_bootstrap(&expected_build))
-        {
+        if let Err(error) = publication.and_then(|info| info.validate_transport_capabilities()) {
             self.record_method_error(
                 RemoteConnectivityMethod::SelfHostedRelay,
                 &error,
@@ -3165,10 +2850,7 @@ impl RemoteConnectivityController {
         if let Some(runtime) = state.methods.get_mut(&method) {
             runtime.state = if error.category == vibex_core::ErrorCategory::Conflict {
                 RemoteMethodState::Conflict
-            } else if matches!(
-                recovery,
-                RemoteRecoveryAction::RepairRoute | RemoteRecoveryAction::UpdateWebBuild
-            ) {
+            } else if recovery == RemoteRecoveryAction::RepairRoute {
                 RemoteMethodState::RepairRequired
             } else {
                 RemoteMethodState::Error
@@ -3192,49 +2874,16 @@ impl RemoteConnectivityController {
     }
 
     async fn apply_routes(&self) -> VibexResult<()> {
-        let mut routes = self.aggregate_routes().await;
+        let routes = self.aggregate_routes().await;
         if routes.direct_candidates.is_empty() {
-            return self
-                .configure_gateway(routes, Vec::new(), None, false)
-                .await;
+            return self.configure_gateway(routes, Vec::new(), false).await;
         }
-        let web_assets = match self.resolve_web_assets().await {
-            Ok(web_assets) => web_assets,
-            Err(error) => {
-                for method in [
-                    RemoteConnectivityMethod::Direct,
-                    RemoteConnectivityMethod::TailscaleServe,
-                ] {
-                    if self
-                        .inner
-                        .state
-                        .lock()
-                        .await
-                        .methods
-                        .get(&method)
-                        .is_some_and(|runtime| runtime.candidate.is_some())
-                    {
-                        self.record_method_error(
-                            method,
-                            &error,
-                            RemoteRecoveryAction::UpdateWebBuild,
-                        )
-                        .await;
-                    }
-                }
-                routes = self.aggregate_routes().await;
-                return self
-                    .configure_gateway(routes, Vec::new(), None, false)
-                    .await;
-            }
-        };
         let origins = routes
             .direct_candidates
             .iter()
             .map(|candidate| candidate.url.clone())
             .collect();
-        self.configure_gateway(routes, origins, Some(web_assets), true)
-            .await
+        self.configure_gateway(routes, origins, true).await
     }
 }
 
@@ -3317,19 +2966,6 @@ fn first_free_port(inspection: &TailscaleInspection, ports: &RangeInclusive<u16>
             .iter()
             .any(|route| route.https_port == *port)
     })
-}
-
-fn canonical_contained_root(root: &Path) -> VibexResult<PathBuf> {
-    let canonical = fs::canonicalize(root).map_err(|_| {
-        VibexError::capability("web_assets_missing", "the WebUI asset root is unavailable")
-    })?;
-    if !canonical.is_dir() {
-        return Err(VibexError::capability(
-            "web_assets_invalid",
-            "the WebUI asset root is not a directory",
-        ));
-    }
-    Ok(canonical)
 }
 
 fn store_io_error(code: &'static str, error: std::io::Error) -> VibexError {
@@ -3630,11 +3266,7 @@ mod tests {
         tailscale: Arc<FakeTailscale>,
         direct_probe: Arc<FakeDirectProbe>,
         relay_probe: Arc<FakeRelayProbe>,
-    ) -> (
-        RemoteConnectivityController,
-        RemoteGateway,
-        WebBuildDescriptor,
-    ) {
+    ) -> (RemoteConnectivityController, RemoteGateway) {
         let dispatcher = vibex_remote::RemoteDispatcher::new(
             vibex_remote::RemoteServiceConfig::loopback_disabled(),
         );
@@ -3654,69 +3286,11 @@ mod tests {
             relay_probe,
         )
         .unwrap();
-        let web_root = directory.join("web");
-        let descriptor = write_test_web_build(&web_root);
-        controller
-            .set_web_asset_resolver(Some(WebAssetResolver::debug(web_root)))
-            .await;
         *direct_probe.gateway.lock().unwrap() = Some(gateway.clone());
-        (controller, gateway, descriptor)
+        (controller, gateway)
     }
 
-    fn write_test_web_build(root: &Path) -> WebBuildDescriptor {
-        write_test_web_build_with_profile(root, "debug")
-    }
-
-    fn write_test_web_build_with_profile(root: &Path, profile: &str) -> WebBuildDescriptor {
-        let build_id = "bbbbbbbbbbbbbbbbbbbbbbbb";
-        fs::create_dir_all(root.join("pkg")).unwrap();
-        for relative in WEB_STATIC_IDENTITY_ASSETS {
-            let path = root.join(relative);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).unwrap();
-            }
-            let contents = if *relative == "service-worker.js" && profile == "release" {
-                format!("const BUILD_ID = \"{build_id}\";\n")
-            } else {
-                format!("test asset {relative}\n")
-            };
-            fs::write(path, contents).unwrap();
-        }
-        fs::write(root.join("pkg/vibex_web.js"), "test glue\n").unwrap();
-        fs::write(root.join("pkg/vibex_web_bg.wasm"), b"\0asmtest").unwrap();
-        let mut static_hash = Sha256::new();
-        for relative in WEB_STATIC_IDENTITY_ASSETS {
-            let mut bytes = fs::read(root.join(relative)).unwrap();
-            if *relative == "service-worker.js" && profile == "release" {
-                bytes = String::from_utf8(bytes)
-                    .unwrap()
-                    .replace(build_id, "__VIBEX_BUILD_ID__")
-                    .into_bytes();
-            }
-            static_hash.update(relative.as_bytes());
-            static_hash.update(b"\0");
-            static_hash.update(bytes);
-            static_hash.update(b"\0");
-        }
-        let descriptor = WebBuildDescriptor {
-            schema_version: "vibex-web-build.v1".to_string(),
-            build_id: build_id.to_string(),
-            package_version: env!("CARGO_PKG_VERSION").to_string(),
-            profile: profile.to_string(),
-            git_commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            wasm_sha256: sha256_hex(b"\0asmtest"),
-            glue_sha256: sha256_hex(b"test glue\n"),
-            static_sha256: format!("{:x}", static_hash.finalize()),
-        };
-        fs::write(
-            root.join("build.json"),
-            serde_json::to_vec_pretty(&descriptor).unwrap(),
-        )
-        .unwrap();
-        load_web_build_descriptor(root, profile == "debug").unwrap()
-    }
-
-    fn direct_info(gateway: &RemoteGateway, web_build: &WebBuildDescriptor) -> DirectProbeInfo {
+    fn direct_info(gateway: &RemoteGateway) -> DirectProbeInfo {
         let identity = gateway.identity().unwrap();
         DirectProbeInfo {
             server_id: identity.server_id().to_string(),
@@ -3727,7 +3301,6 @@ mod tests {
             ws_ticket_path: "/api/v2/ws-ticket".to_string(),
             deployment_mode: "lan".to_string(),
             tls_policy: "trusted_https_proxy".to_string(),
-            web_build: Some(web_build.clone()),
         }
     }
 
@@ -3879,7 +3452,7 @@ mod tests {
         let tailscale = Arc::new(FakeTailscale::default());
         let direct = Arc::new(FakeDirectProbe::default());
         let relay = Arc::new(FakeRelayProbe::default());
-        let (controller, gateway, _) = test_controller(
+        let (controller, gateway) = test_controller(
             directory.path(),
             tailscale.clone(),
             direct.clone(),
@@ -3923,9 +3496,9 @@ mod tests {
         let tailscale = Arc::new(FakeTailscale::default());
         let direct = Arc::new(FakeDirectProbe::default());
         let relay = Arc::new(FakeRelayProbe::default());
-        let (controller, gateway, descriptor) =
+        let (controller, gateway) =
             test_controller(directory.path(), tailscale, direct.clone(), relay).await;
-        *direct.info.lock().unwrap() = Some(direct_info(&gateway, &descriptor));
+        *direct.info.lock().unwrap() = Some(direct_info(&gateway));
 
         let first = controller.clone();
         let second = controller.clone();
@@ -3964,9 +3537,9 @@ mod tests {
         let tailscale = Arc::new(FakeTailscale::default());
         let direct = Arc::new(FakeDirectProbe::default());
         let relay = Arc::new(FakeRelayProbe::default());
-        let (controller, gateway, descriptor) =
+        let (controller, gateway) =
             test_controller(directory.path(), tailscale, direct.clone(), relay).await;
-        *direct.info.lock().unwrap() = Some(direct_info(&gateway, &descriptor));
+        *direct.info.lock().unwrap() = Some(direct_info(&gateway));
         controller
             .enable_direct("https://direct.example.test")
             .await
@@ -4049,9 +3622,9 @@ mod tests {
         let tailscale = Arc::new(FakeTailscale::default());
         let direct = Arc::new(FakeDirectProbe::default());
         let relay = Arc::new(FakeRelayProbe::default());
-        let (controller, gateway, descriptor) =
+        let (controller, gateway) =
             test_controller(directory.path(), tailscale, direct.clone(), relay).await;
-        *direct.info.lock().unwrap() = Some(direct_info(&gateway, &descriptor));
+        *direct.info.lock().unwrap() = Some(direct_info(&gateway));
         controller
             .enable_direct("https://direct.example.test")
             .await
@@ -4070,7 +3643,6 @@ mod tests {
             .configure_gateway(
                 routes,
                 vec!["https://direct.example.test".to_string()],
-                Some(controller.resolve_web_assets().await.unwrap()),
                 true,
             )
             .await
@@ -4123,9 +3695,9 @@ mod tests {
         });
         let direct = Arc::new(FakeDirectProbe::default());
         let relay = Arc::new(FakeRelayProbe::default());
-        let (controller, gateway, descriptor) =
+        let (controller, gateway) =
             test_controller(directory.path(), tailscale.clone(), direct.clone(), relay).await;
-        *direct.info.lock().unwrap() = Some(direct_info(&gateway, &descriptor));
+        *direct.info.lock().unwrap() = Some(direct_info(&gateway));
         controller
             .enable_direct("https://direct.example.test")
             .await
@@ -4193,9 +3765,9 @@ mod tests {
         });
         let direct = Arc::new(FakeDirectProbe::default());
         let relay = Arc::new(FakeRelayProbe::default());
-        let (controller, gateway, descriptor) =
+        let (controller, gateway) =
             test_controller(directory.path(), tailscale.clone(), direct.clone(), relay).await;
-        *direct.info.lock().unwrap() = Some(direct_info(&gateway, &descriptor));
+        *direct.info.lock().unwrap() = Some(direct_info(&gateway));
 
         let snapshot = controller.enable_tailscale(None).await.unwrap();
         assert_eq!(
@@ -4235,9 +3807,9 @@ mod tests {
             let tailscale = Arc::new(FakeTailscale::default());
             let direct = Arc::new(FakeDirectProbe::default());
             let relay = Arc::new(FakeRelayProbe::default());
-            let (controller, gateway, descriptor) =
+            let (controller, gateway) =
                 test_controller(directory.path(), tailscale, direct.clone(), relay).await;
-            *direct.info.lock().unwrap() = Some(direct_info(&gateway, &descriptor));
+            *direct.info.lock().unwrap() = Some(direct_info(&gateway));
 
             controller.enable_direct(origin).await.unwrap();
 
@@ -4284,7 +3856,7 @@ mod tests {
         });
         let direct = Arc::new(FakeDirectProbe::default());
         let relay = Arc::new(FakeRelayProbe::default());
-        let (controller, _, _) =
+        let (controller, _) =
             test_controller(directory.path(), tailscale.clone(), direct, relay).await;
 
         let snapshot = controller
@@ -4325,9 +3897,9 @@ mod tests {
         let tailscale = Arc::new(FakeTailscale::default());
         let direct = Arc::new(FakeDirectProbe::default());
         let relay = Arc::new(FakeRelayProbe::default());
-        let (controller, gateway, descriptor) =
+        let (controller, gateway) =
             test_controller(directory.path(), tailscale, direct.clone(), relay).await;
-        *direct.info.lock().unwrap() = Some(direct_info(&gateway, &descriptor));
+        *direct.info.lock().unwrap() = Some(direct_info(&gateway));
 
         let snapshot = controller.reconcile_on_startup().await.unwrap();
         assert_eq!(
@@ -4367,9 +3939,9 @@ mod tests {
         let tailscale = Arc::new(FakeTailscale::default());
         let direct = Arc::new(FakeDirectProbe::default());
         let relay = Arc::new(FakeRelayProbe::default());
-        let (controller, gateway, descriptor) =
+        let (controller, gateway) =
             test_controller(directory.path(), tailscale, direct.clone(), relay).await;
-        *direct.info.lock().unwrap() = Some(direct_info(&gateway, &descriptor));
+        *direct.info.lock().unwrap() = Some(direct_info(&gateway));
         fs::remove_file(store.path()).unwrap();
         fs::create_dir(store.path()).unwrap();
 
@@ -4394,9 +3966,9 @@ mod tests {
         let tailscale = Arc::new(FakeTailscale::default());
         let direct = Arc::new(FakeDirectProbe::default());
         let relay = Arc::new(FakeRelayProbe::default());
-        let (controller, gateway, descriptor) =
+        let (controller, gateway) =
             test_controller(directory.path(), tailscale, direct.clone(), relay).await;
-        *direct.info.lock().unwrap() = Some(direct_info(&gateway, &descriptor));
+        *direct.info.lock().unwrap() = Some(direct_info(&gateway));
 
         let store_path = store.path().to_path_buf();
         *direct.on_probe.lock().unwrap() = Some(Box::new(move || {
@@ -4417,17 +3989,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_publication_requires_transport_pairing_assets_and_exact_release_build() {
-        let expected = WebBuildDescriptor {
-            schema_version: "vibex-web-build.v1".to_string(),
-            build_id: "bbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
-            package_version: env!("CARGO_PKG_VERSION").to_string(),
-            profile: "release".to_string(),
-            git_commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            wasm_sha256: "1".repeat(64),
-            glue_sha256: "2".repeat(64),
-            static_sha256: "3".repeat(64),
-        };
+    fn relay_publication_requires_transport_capabilities() {
         let mut info = RelayPublicationInfo {
             protocol_version: RelayProtocolVersion::foundation(),
             features: RelayPublicationFeatures {
@@ -4435,59 +3997,13 @@ mod tests {
                 device_websocket: true,
                 websocket_frames: true,
                 http_pair_bridge: true,
-                static_room_assets: true,
             },
-            web_build: Some(expected.clone()),
         };
-        info.validate_browser_bootstrap(&expected).unwrap();
-        info.features.static_room_assets = false;
+        info.validate_transport_capabilities().unwrap();
+        info.features.websocket_frames = false;
         assert_eq!(
-            info.validate_browser_bootstrap(&expected).unwrap_err().code,
-            "relay_browser_bootstrap_unavailable"
-        );
-        info.features.static_room_assets = true;
-        info.web_build.as_mut().unwrap().build_id = "other".to_string();
-        assert_eq!(
-            info.validate_browser_bootstrap(&expected).unwrap_err().code,
-            "relay_web_build_incompatible"
-        );
-    }
-
-    #[test]
-    fn web_asset_resolver_rejects_tampered_build_contents() {
-        let directory = tempdir().unwrap();
-        write_test_web_build(directory.path());
-        fs::write(directory.path().join("pkg/vibex_web.js"), "tampered").unwrap();
-        assert_eq!(
-            load_web_build_descriptor(directory.path(), true)
-                .unwrap_err()
-                .code,
-            "web_assets_incompatible"
-        );
-    }
-
-    #[test]
-    fn web_asset_resolver_rejects_tampered_service_worker() {
-        let directory = tempdir().unwrap();
-        write_test_web_build(directory.path());
-        fs::write(directory.path().join("service-worker.js"), "tampered").unwrap();
-        assert_eq!(
-            load_web_build_descriptor(directory.path(), true)
-                .unwrap_err()
-                .code,
-            "web_assets_incompatible"
-        );
-    }
-
-    #[test]
-    fn web_asset_resolver_accepts_a_source_bound_release_service_worker() {
-        let directory = tempdir().unwrap();
-        let descriptor = write_test_web_build_with_profile(directory.path(), "release");
-
-        assert_eq!(descriptor.profile, "release");
-        assert_eq!(
-            load_web_build_descriptor(directory.path(), false).unwrap(),
-            descriptor
+            info.validate_transport_capabilities().unwrap_err().code,
+            "relay_transport_unavailable"
         );
     }
 

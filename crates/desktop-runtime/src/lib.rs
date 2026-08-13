@@ -93,8 +93,8 @@ pub use remote_connectivity::{
     RemoteConnectivityStore, RemoteMethodSnapshot, RemoteMethodState, RemoteRecoveryAction,
     RemoteRouteOwnership, RemoteTransitionKind, RemoteTransitionRecord, TAILSCALE_DEFAULT_PORT,
     TAILSCALE_FALLBACK_PORTS, TailscaleCli, TailscaleInspection, TailscalePublication,
-    TailscaleRoute, TailscaleSettings, TokioProcessRunner, WebAssetResolver, WebBuildDescriptor,
-    normalize_https_origin, parse_tailscale_inspection,
+    TailscaleRoute, TailscaleSettings, TokioProcessRunner, normalize_https_origin,
+    parse_tailscale_inspection,
 };
 pub use usage::AgentUsageService;
 pub use worktree::{WorktreeCoordinator, WorktreeCreateContext};
@@ -1027,14 +1027,6 @@ impl DesktopRuntime {
             remote_gateway.clone(),
             relay.clone(),
         )?;
-        let web_assets = if cfg!(debug_assertions) {
-            WebAssetResolver::debug(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../apps/web/dist"),
-            )
-        } else {
-            WebAssetResolver::packaged_for_current_exe()
-        };
-        connectivity.set_web_asset_resolver(Some(web_assets)).await;
         let remote = RemoteHandle {
             db_path: db_path.clone(),
             config: remote_config,

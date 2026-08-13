@@ -1,6 +1,6 @@
 // Local controlled-environment orchestrator for one GPUI workflow E2E target.
 //
-//   node scripts/e2e-local-env/run-target.mjs --target web|android --transport direct|relay [--device <serial>] [--reuse-installed]
+//   node scripts/e2e-local-env/run-target.mjs --target mobile-wasm-host|android --transport direct|relay [--device <serial>] [--reuse-installed]
 //
 // Starts the headless desktop harness (crates/vibex-remote-client/tests/
 // e2e_gateway_harness.rs), fronts it with Tailscale Serve so the release WASM
@@ -18,9 +18,9 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-const PORTS = { gateway: 14320, control: 14321, web: 14322, relay: 14323 };
-const TAILSCALE_SERVE_HTTPS = { gateway: 443, web: 8443, relay: 9443 };
-const TLS_FORWARD_HTTPS = { gateway: 10443, web: 10444, relay: 10445 };
+const PORTS = { gateway: 14320, control: 14321, host: 14322, relay: 14323 };
+const TAILSCALE_SERVE_HTTPS = { gateway: 443, host: 8443, relay: 9443 };
+const TLS_FORWARD_HTTPS = { gateway: 10443, host: 10444, relay: 10445 };
 
 // The tailnet HTTPS endpoints must be reached directly; a local forward proxy
 // (e.g. 127.0.0.1:7890) cannot dial tailscale addresses. Strip proxy settings
@@ -38,9 +38,9 @@ const target = option("target");
 const transport = option("transport");
 const device = option("device");
 const reuseInstalled = process.argv.includes("--reuse-installed");
-if (!["web", "android"].includes(target) || !["direct", "relay"].includes(transport)) {
+if (!["mobile-wasm-host", "android"].includes(target) || !["direct", "relay"].includes(transport)) {
   console.error(
-    "usage: run-target.mjs --target web|android --transport direct|relay [--device serial] [--reuse-installed]"
+    "usage: run-target.mjs --target mobile-wasm-host|android --transport direct|relay [--device serial] [--reuse-installed]"
   );
   process.exit(2);
 }
@@ -78,7 +78,7 @@ function publicHttpsUrl(port) {
 }
 
 const publicGatewayUrl = publicHttpsUrl(httpsPorts.gateway);
-const publicWebUrl = publicHttpsUrl(httpsPorts.web);
+const publicHostUrl = publicHttpsUrl(httpsPorts.host);
 const publicRelayUrl = publicHttpsUrl(httpsPorts.relay);
 
 function ensureServe(httpsPort, localPort) {
@@ -151,7 +151,7 @@ function spawnChild(command, args, env, logPrefix, stdio = "inherit") {
 
 try {
   ensureFront(httpsPorts.gateway, PORTS.gateway, "gateway");
-  if (target === "web") ensureFront(httpsPorts.web, PORTS.web, "web");
+  if (target === "mobile-wasm-host") ensureFront(httpsPorts.host, PORTS.host, "mobile-wasm-host");
   if (transport === "relay") ensureFront(httpsPorts.relay, PORTS.relay, "relay");
 
   if (transport === "relay") {
@@ -201,11 +201,11 @@ try {
       VIBEX_E2E_CONTROL_PORT: String(PORTS.control),
       VIBEX_E2E_BUNDLE_FILE: bundleFile,
       VIBEX_E2E_TRANSPORT: transport,
-      VIBEX_E2E_CLIENT_TYPE: target === "android" ? "mobile" : "browser",
+      VIBEX_E2E_CLIENT_TYPE: "mobile",
       VIBEX_E2E_PUBLIC_URL: publicGatewayUrl,
       VIBEX_E2E_RELAY_URL: transport === "relay" ? `http://127.0.0.1:${PORTS.relay}` : "",
       VIBEX_E2E_PUBLIC_RELAY_URL: transport === "relay" ? publicRelayUrl : "",
-      VIBEX_E2E_EXTRA_ORIGINS: target === "web" ? publicWebUrl : ""
+      VIBEX_E2E_EXTRA_ORIGINS: target === "mobile-wasm-host" ? publicHostUrl : ""
     },
     "harness"
   );
@@ -215,10 +215,10 @@ try {
   }, "harness control API");
   await waitFor(async () => existsSync(bundleFile), "credential bundle");
 
-  let webServer = null;
-  if (target === "web") {
-    const { startWasmServer } = await import(join(ROOT, "scripts/wasm-test-server.mjs"));
-    webServer = await startWasmServer({ port: PORTS.web });
+  let developmentServer = null;
+  if (target === "mobile-wasm-host") {
+    const { startWasmServer } = await import(join(ROOT, "scripts/mobile-wasm-test-server.mjs"));
+    developmentServer = await startWasmServer({ port: PORTS.host });
   }
 
   const runnerArgs = [
@@ -229,7 +229,7 @@ try {
     transport,
     "--write"
   ];
-  if (target === "web") runnerArgs.push("--origin", publicWebUrl);
+  if (target === "mobile-wasm-host") runnerArgs.push("--origin", publicHostUrl);
   if (target === "android" && device) runnerArgs.push("--device", device);
   if (reuseInstalled) runnerArgs.push("--reuse-installed");
 
@@ -255,7 +255,7 @@ try {
     stdio: "inherit"
   });
   const exitCode = await new Promise((resolvePromise) => runner.on("exit", resolvePromise));
-  await webServer?.close();
+  await developmentServer?.close();
   if (exitCode !== 0) {
     const bundle = existsSync(bundleFile) ? JSON.parse(readFileSync(bundleFile, "utf8")) : null;
     console.error(`runner failed (${exitCode}); serverUrl=${bundle?.record?.serverUrl ?? "unknown"}`);

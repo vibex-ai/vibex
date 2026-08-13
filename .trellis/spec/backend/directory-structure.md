@@ -1,7 +1,7 @@
 # Backend Directory Structure
 
 Vibex uses a Rust-first workspace. GPUI Desktop is the local product shell,
-GPUI-WASM Web/mobile are remote clients, Axum owns RemoteGateway/Relay network
+GPUI-WASM/Capacitor mobile is the remote client, Axum owns RemoteGateway/Relay network
 adapters, SQLite owns durable local state, and typed services own Agent/File/Git/PTY
 behavior.
 
@@ -12,8 +12,8 @@ Primary architecture: [Architecture Baseline](../guides/architecture-baseline.md
 ```text
 apps/
   desktop/   Complete native GPUI workbench and NativeBackend composition
-  web/       GPUI-WASM bootstrap, browser host bridge, and static assets
-  mobile/    Capacitor host for the source-bound web artifact
+  mobile-wasm/   GPUI-WASM mobile bootstrap and Capacitor host assets
+  mobile/    Capacitor host for the source-bound mobile runtime
   relay-server/   User-self-hosted zero-knowledge Relay service
 crates/
   core/           Domain ids, shared DTOs, errors, event/capability contracts
@@ -27,7 +27,7 @@ crates/
                   Existing typed domain and transport services
 ```
 
-The current `apps/desktop`, `apps/web`, and `apps/mobile` paths reuse locations
+The current `apps/desktop`, `apps/mobile-wasm`, and `apps/mobile` paths reuse locations
 that previously held the retired React/Tauri clients. Those former contents and
 the deleted `packages/ui` tree are historical evidence, not implementation
 templates. Release rollback restores a verified published artifact and compatible
@@ -54,7 +54,7 @@ data backup; it does not restore a legacy source tree on the active branch.
 
 ```text
 apps/* -> GPUI UI/Backend adapters -> typed domain services -> crates/core
-web/mobile GPUI -> WebRemoteBackend -> versioned RemoteGateway -> DesktopRuntime
+mobile GPUI -> WebRemoteBackend -> versioned RemoteGateway -> DesktopRuntime
 Relay transport -> encrypted envelopes only; business authorization -> DesktopRuntime
 ```
 

@@ -226,7 +226,6 @@ pub use relay::{
     RelayHeartbeatAck, RelayNotificationProviderKind, RelayOpaqueNotification, RelayPeerMessage,
     RelayPeerRole, RelayPlaintextEnvelope, RelayProtocolVersion, RelayPushDispatchResult,
     RelayPushRegistration, RelayRemoteHandshakeContext, RelayTransportMode,
-    WEB_BUILD_SCHEMA_VERSION, WEB_REQUIRED_ASSETS, WEB_STATIC_IDENTITY_ASSETS, WebBuildDescriptor,
 };
 pub use remote::{
     RemoteActionClass, RemoteAgentAttachRuntimeRequest, RemoteAgentAttachRuntimeResponse,

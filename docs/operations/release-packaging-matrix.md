@@ -32,8 +32,8 @@ pnpm --filter @vibex/mobile validate
 cargo check -p vibex-relay-server --bin vibex-relay-server --locked
 ```
 
-The mobile validation command builds the stable GPUI-WASM Web/PWA assets through
-`pnpm --filter @vibex/web build`, then type-checks the Capacitor shell.
+The mobile validation command builds the Capacitor-ready GPUI-WASM runtime through
+`pnpm --filter @vibex/mobile-wasm build`, then type-checks the Capacitor shell.
 
 This smoke is explicit release evidence and is intentionally not part of
 `pnpm check`.
@@ -46,8 +46,8 @@ This smoke is explicit release evidence and is intentionally not part of
 | Desktop packages | Linux `.deb` and AppImage | `pnpm package:stable` | `explicit_manual` | Record exact package hashes, install/upgrade/uninstall, native launch, and rollback to the prior published artifact. | Requires cargo-packager, PDFium preparation, Linux package tools, X11/Wayland, and the prior published artifact. |
 | Desktop app/package | macOS | No stable package command is approved yet. | `blocked_follow_up` | Native macOS build/install/sign/notarize/rollback evidence is required before claiming support. | Requires a macOS host and a reviewed desktop package configuration. |
 | Desktop app/package | Windows | No stable package command is approved yet. | `blocked_follow_up` | Native Windows build/install/sign/rollback evidence is required before claiming support. | Requires a Windows host and a reviewed desktop package configuration. |
-| Web/PWA | Static assets | `pnpm --filter @vibex/web build:release` | `deterministic` | Covered by `pnpm release:build-smoke` through mobile validation, or by `pnpm check:wasm-web`. | Hosted deployment, CDN invalidation, and public URL checks are separate release operations. |
-| Mobile shell | Capacitor config and bundled GPUI-WASM assets | `pnpm --filter @vibex/mobile validate` | `deterministic` | `pnpm check:wasm-integration` plus the source-bound mobile evidence. | Does not generate or commit Android/iOS native projects. |
+| Mobile WASM runtime | Capacitor-ready bundled assets | `pnpm --filter @vibex/mobile-wasm build:release` | `deterministic` | `pnpm check:mobile-wasm-host` and `pnpm check:wasm-integration`. | Browser execution is development/automation evidence only; no hosted release exists. |
+| Mobile shell | Capacitor config and bundled GPUI-WASM runtime | `pnpm --filter @vibex/mobile validate` | `deterministic` | `pnpm check:wasm-integration` plus the source-bound mobile evidence. | Does not generate or commit Android/iOS native projects. |
 | Mobile native package | Android | `pnpm --filter @vibex/mobile android:debug` | `explicit_manual` | Android host summary with JDK 21, SDK/API level, emulator/device, APK install, launch, and screenshot status when claimed. | Requires JDK 21, Android SDK, and an emulator or device; the stable application id is `dev.vibex.remote`. |
 | Mobile native package | iOS | `pnpm --filter @vibex/mobile ios:debug` or `ios:release` on macOS | `explicit_manual` | iOS host summary with Xcode version, simulator/device, install, launch, and screenshot status when claimed. | Requires macOS, Xcode, and Apple signing for device/TestFlight/App Store distribution. |
 | Relay server | Binary target | `cargo check -p vibex-relay-server --bin vibex-relay-server` | `deterministic` | Covered by `pnpm release:build-smoke`. | Compile check only; container smoke is separate. |
@@ -77,12 +77,12 @@ Required deterministic evidence before tagging:
 | Recovery matrix | `docs/operations/recovery-matrix.md` and focused tests | Defines restart and recovery semantics. |
 | Performance baseline | `pnpm baseline:performance` | Records the current deterministic performance baseline. |
 | E2E regression | `pnpm e2e:regression` | Runs the provider-free regression harness. |
-| Release build smoke | `pnpm release:build-smoke` | GPUI desktop, Web/mobile, and Relay local build evidence. |
+| Release build smoke | `pnpm release:build-smoke` | GPUI desktop, mobile runtime/shell, and Relay local build evidence. |
 
 Explicit manual evidence is required only for release claims that depend on it:
 
 - real Codex, Claude Code, OpenCode, ACP, or scheduled-provider smokes;
-- LAN browser proof or public Relay/NAT/mobile proof;
+- public Relay/NAT/mobile proof;
 - physical Android/iOS build, install, launch, and screenshot proof;
 - signed, notarized, store, or hosted auto-update distribution proof.
 

@@ -15,6 +15,7 @@ pub const PAIRING_ENTRY_HINT_SCHEMA_VERSION: &str = "vibex-pairing-entry.v1";
 #[serde(rename_all = "snake_case")]
 pub enum PairingEntryHintKind {
     Origin,
+    MobileApp,
     UntrustedCustomScheme,
 }
 
@@ -25,6 +26,8 @@ pub struct PairingEntryHint {
     pub kind: PairingEntryHintKind,
     #[serde(default)]
     pub origin: Option<String>,
+    #[serde(default)]
+    pub transport: Option<RemotePairingTransport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,8 +165,9 @@ fn pairing_claim_base_url_for_candidate(candidate: &str) -> BackendResult<String
 }
 
 /// Select exactly one claim route from the server-owned offer candidates.
-/// The entry hint can only identify an existing candidate origin; it can never
-/// inject a URL used for the claim request.
+/// The entry hint can only identify an existing candidate by development-host
+/// origin or mobile transport class; it can never inject a URL used for the
+/// claim request.
 pub fn select_pairing_claim_route(
     offer: &RemotePairingOffer,
     entry_hint: &PairingEntryHint,
@@ -174,21 +178,48 @@ pub fn select_pairing_claim_route(
             "pairing entry hint schema is incompatible",
         ));
     }
-    if entry_hint.kind == PairingEntryHintKind::UntrustedCustomScheme {
-        return Err(BackendError::permission(
-            "remote_pairing_entry_untrusted",
-            "custom-scheme pairing entry cannot select a network claim route",
-        ));
-    }
-    let entry_origin = entry_hint.origin.as_deref().ok_or_else(|| {
-        BackendError::failed(
-            "remote_pairing_entry_hint_invalid",
-            "pairing entry hint omitted its origin",
-        )
-    })?;
-    let entry_origin = normalized_entry_origin(entry_origin)?;
-
     let mut matches = Vec::new();
+    let entry_origin = match entry_hint.kind {
+        PairingEntryHintKind::Origin => {
+            if entry_hint.transport.is_some() {
+                return Err(invalid_entry_hint(
+                    "development-host pairing entry cannot include a transport",
+                ));
+            }
+            let origin = entry_hint.origin.as_deref().ok_or_else(|| {
+                invalid_entry_hint("development-host pairing entry omitted its origin")
+            })?;
+            Some(normalized_entry_origin(origin)?)
+        }
+        PairingEntryHintKind::MobileApp => {
+            if entry_hint.origin.is_some() {
+                return Err(invalid_entry_hint(
+                    "mobile pairing entry cannot include a network origin",
+                ));
+            }
+            let transport = entry_hint
+                .transport
+                .ok_or_else(|| invalid_entry_hint("mobile pairing entry omitted its transport"))?;
+            if !matches!(
+                transport,
+                RemotePairingTransport::Direct
+                    | RemotePairingTransport::Tailnet
+                    | RemotePairingTransport::SelfHostedRelay
+            ) {
+                return Err(invalid_entry_hint(
+                    "mobile pairing entry transport is unsupported",
+                ));
+            }
+            None
+        }
+        PairingEntryHintKind::UntrustedCustomScheme => {
+            return Err(BackendError::permission(
+                "remote_pairing_entry_untrusted",
+                "unrecognized custom-scheme pairing entry cannot select a network claim route",
+            ));
+        }
+    };
+
     for candidate in &offer.summary.direct_candidates {
         if !matches!(
             candidate.transport,
@@ -197,17 +228,42 @@ pub fn select_pairing_claim_route(
         {
             continue;
         }
-        if normalized_candidate_origin(&candidate.url).as_deref() == Some(entry_origin.as_str()) {
+        let selected = match entry_hint.kind {
+            PairingEntryHintKind::Origin => {
+                normalized_candidate_origin(&candidate.url).as_deref() == entry_origin.as_deref()
+            }
+            PairingEntryHintKind::MobileApp => entry_hint.transport == Some(candidate.transport),
+            PairingEntryHintKind::UntrustedCustomScheme => false,
+        };
+        if selected {
             matches.push(PairingClaimRoute::Direct {
                 claim_base_url: pairing_claim_base_url_for_candidate(&candidate.url)?,
                 transport: candidate.transport,
             });
         }
     }
-    if let Ok(candidate) = relay_pairing_candidate(offer)
-        && normalized_candidate_origin(&candidate.url).as_deref() == Some(entry_origin.as_str())
-    {
-        matches.push(PairingClaimRoute::Relay(candidate.clone()));
+    if let Ok(candidate) = relay_pairing_candidate(offer) {
+        let selected = match entry_hint.kind {
+            PairingEntryHintKind::Origin => {
+                normalized_candidate_origin(&candidate.url).as_deref() == entry_origin.as_deref()
+            }
+            PairingEntryHintKind::MobileApp => {
+                entry_hint.transport == Some(RemotePairingTransport::SelfHostedRelay)
+            }
+            PairingEntryHintKind::UntrustedCustomScheme => false,
+        };
+        if selected {
+            matches.push(PairingClaimRoute::Relay(candidate.clone()));
+        }
+    }
+
+    if entry_hint.kind == PairingEntryHintKind::MobileApp {
+        return matches.into_iter().next().ok_or_else(|| {
+            BackendError::permission(
+                "remote_pairing_entry_route_mismatch",
+                "mobile pairing entry transport does not match an offered claim route",
+            )
+        });
     }
 
     match matches.len() {
@@ -221,6 +277,10 @@ pub fn select_pairing_claim_route(
             "pairing entry origin matches more than one offered claim route",
         )),
     }
+}
+
+fn invalid_entry_hint(message: &'static str) -> BackendError {
+    BackendError::failed("remote_pairing_entry_hint_invalid", message)
 }
 
 fn normalized_entry_origin(value: &str) -> BackendResult<String> {
@@ -496,6 +556,7 @@ mod tests {
             schema_version: PAIRING_ENTRY_HINT_SCHEMA_VERSION.into(),
             kind: PairingEntryHintKind::Origin,
             origin: Some(origin.into()),
+            transport: None,
         };
         assert_eq!(
             select_pairing_claim_route(&offer, &hint("https://desktop.example.test")).unwrap(),
@@ -515,6 +576,59 @@ mod tests {
             select_pairing_claim_route(&offer, &hint("https://relay.example.test")).unwrap(),
             PairingClaimRoute::Relay(_)
         ));
+
+        let mobile_hint = |transport| PairingEntryHint {
+            schema_version: PAIRING_ENTRY_HINT_SCHEMA_VERSION.into(),
+            kind: PairingEntryHintKind::MobileApp,
+            origin: None,
+            transport: Some(transport),
+        };
+        assert_eq!(
+            select_pairing_claim_route(&offer, &mobile_hint(RemotePairingTransport::Tailnet))
+                .unwrap(),
+            PairingClaimRoute::Direct {
+                claim_base_url: "https://desktop.tailnet.test/v2".into(),
+                transport: RemotePairingTransport::Tailnet,
+            }
+        );
+        assert!(matches!(
+            select_pairing_claim_route(
+                &offer,
+                &mobile_hint(RemotePairingTransport::SelfHostedRelay)
+            )
+            .unwrap(),
+            PairingClaimRoute::Relay(_)
+        ));
+    }
+
+    #[test]
+    fn mobile_entry_selects_first_matching_candidate_in_offer_order() {
+        let mut offer = offer(10_000);
+        offer
+            .summary
+            .direct_candidates
+            .push(RemotePairingCandidate {
+                transport: RemotePairingTransport::Direct,
+                url: "wss://desktop-secondary.example.test/v2".into(),
+                relay_room_id: None,
+                relay_pc_peer_id: None,
+                relay_pc_public_key: None,
+            });
+        let hint = PairingEntryHint {
+            schema_version: PAIRING_ENTRY_HINT_SCHEMA_VERSION.into(),
+            kind: PairingEntryHintKind::MobileApp,
+            origin: None,
+            transport: Some(RemotePairingTransport::Direct),
+        };
+
+        assert_eq!(
+            select_pairing_claim_route(&offer, &hint).unwrap(),
+            PairingClaimRoute::Direct {
+                claim_base_url: "https://desktop.example.test".into(),
+                transport: RemotePairingTransport::Direct,
+            }
+        );
+        assert_eq!(offer.summary.direct_candidates.len(), 2);
     }
 
     #[test]
@@ -524,6 +638,7 @@ mod tests {
             schema_version: PAIRING_ENTRY_HINT_SCHEMA_VERSION.into(),
             kind: PairingEntryHintKind::Origin,
             origin: Some("https://other.example.test".into()),
+            transport: None,
         };
         assert_eq!(
             select_pairing_claim_route(&offer, &hint).unwrap_err().code,
@@ -534,6 +649,7 @@ mod tests {
             schema_version: PAIRING_ENTRY_HINT_SCHEMA_VERSION.into(),
             kind: PairingEntryHintKind::UntrustedCustomScheme,
             origin: None,
+            transport: None,
         };
         assert_eq!(
             select_pairing_claim_route(&offer, &untrusted)
@@ -553,6 +669,7 @@ mod tests {
             schema_version: PAIRING_ENTRY_HINT_SCHEMA_VERSION.into(),
             kind: PairingEntryHintKind::Origin,
             origin: Some("https://desktop.example.test".into()),
+            transport: None,
         };
         assert_eq!(
             select_pairing_claim_route(&offer, &same_origin)
@@ -560,5 +677,31 @@ mod tests {
                 .code,
             "remote_pairing_entry_route_ambiguous"
         );
+
+        for hint in [
+            PairingEntryHint {
+                schema_version: PAIRING_ENTRY_HINT_SCHEMA_VERSION.into(),
+                kind: PairingEntryHintKind::MobileApp,
+                origin: Some("https://injected.example.test".into()),
+                transport: Some(RemotePairingTransport::Direct),
+            },
+            PairingEntryHint {
+                schema_version: PAIRING_ENTRY_HINT_SCHEMA_VERSION.into(),
+                kind: PairingEntryHintKind::MobileApp,
+                origin: None,
+                transport: Some(RemotePairingTransport::Unknown),
+            },
+            PairingEntryHint {
+                schema_version: PAIRING_ENTRY_HINT_SCHEMA_VERSION.into(),
+                kind: PairingEntryHintKind::Origin,
+                origin: Some("https://desktop.example.test".into()),
+                transport: Some(RemotePairingTransport::Direct),
+            },
+        ] {
+            assert_eq!(
+                select_pairing_claim_route(&offer, &hint).unwrap_err().code,
+                "remote_pairing_entry_hint_invalid"
+            );
+        }
     }
 }

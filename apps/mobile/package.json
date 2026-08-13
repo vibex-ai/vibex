@@ -9,13 +9,13 @@
     "android:release": "node scripts/build-android-debug.mjs --release",
     "build": "pnpm run validate",
     "cap": "cap",
-    "copy": "pnpm run web:build && cap copy",
+    "copy": "pnpm run runtime:build && cap copy",
     "ios:debug": "node scripts/build-ios.mjs",
     "ios:release": "node scripts/build-ios.mjs --release",
-    "sync": "pnpm run web:build && cap sync",
+    "sync": "pnpm run runtime:build && cap sync",
     "typecheck": "tsc --noEmit",
-    "validate": "pnpm run typecheck && pnpm run web:build",
-    "web:build": "pnpm --filter @vibex/web build"
+    "validate": "pnpm run typecheck && pnpm run runtime:build",
+    "runtime:build": "pnpm --filter @vibex/mobile-wasm build"
   },
   "dependencies": {
     "@capacitor/app": "^8.1.1",

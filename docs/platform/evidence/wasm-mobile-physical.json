@@ -1,6 +1,6 @@
 {
   "schemaVersion": "vibex-mobile-physical-evidence.v1",
-  "updatedAt": "2026-07-30T00:00:00.000Z",
+  "updatedAt": "2026-08-13T11:19:48.980Z",
   "requiredTargets": [
     "android_physical",
     "ios_physical"
@@ -35,8 +35,8 @@
         "status": "not_tested",
         "apk": {
           "path": "apps/mobile/artifacts/vibex-gate-debug.apk",
-          "bytes": 48361164,
-          "sha256": "46af4b0fdfcb9ef94f20fc5c812df50b62e22050e1a3cf48ca476045e6f1ffc6",
+          "bytes": 48690199,
+          "sha256": "b7c804c6a82f596605578add168b65e42fe62eb8a14d5643805cd3f2e3a8f55c",
           "applicationId": "dev.vibex.remote",
           "minSdk": 26,
           "targetSdk": 36

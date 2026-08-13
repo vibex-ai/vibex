@@ -8,11 +8,15 @@ architecture source.
 
 ## Product Boundary
 
-- Desktop uses GPUI with an in-process NativeBackend.
-- Web uses GPUI-WASM with WebRemoteBackend; the source is `apps/web`.
-- Mobile packages the same Web GPUI-WASM artifact in Capacitor; the source is
-  `apps/mobile`, which packages only `apps/web/dist` under the `dev.vibex.remote`
-  application identity.
+- Desktop uses GPUI with an in-process `NativeBackend` and is the complete local
+  product.
+- `apps/mobile-wasm` uses GPUI-WASM with `WebRemoteBackend` and exposes only
+  Compact/Medium mobile shells.
+- `apps/mobile` packages only `apps/mobile-wasm/dist` under the
+  `dev.vibex.remote` application identity.
+- There is no WebUI/PWA product. A fixed browser host may load the mobile
+  runtime for local development and automation only. Desktop, Relay, and public
+  hosting must not serve the runtime assets.
 - DesktopRuntime is authoritative for Agent, files, Git, PTY, Provider config,
   device permission, sequence/revision, and mutation results.
 - Wide, Medium, and Compact are shells over one component and state model.

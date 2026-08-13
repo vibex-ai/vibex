@@ -32,7 +32,7 @@ const ASSET_EXTENSIONS = new Set([
   ".woff",
   ".woff2"
 ]);
-const GENERATED_ASSET_ROOTS = [resolve(ROOT, "apps/web/dist")];
+const GENERATED_ASSET_ROOTS = [resolve(ROOT, "apps/mobile-wasm/dist")];
 
 function fail(message) {
   console.error(message);
@@ -406,7 +406,7 @@ function auditInputs(policyState, runtime) {
     auditExpression(input.licenseExpression, input.id, policyState);
   }
 
-  const scanRoots = [resolve(ROOT, "apps/desktop"), resolve(ROOT, "apps/web")];
+  const scanRoots = [resolve(ROOT, "apps/desktop"), resolve(ROOT, "apps/mobile-wasm")];
   const unregistered = scanRoots
     .filter(existsSync)
     .flatMap(walkFiles)

@@ -107,7 +107,6 @@ const SOURCE_INPUT_PATHS = [
   "apps/desktop/src/lib.rs",
   "apps/desktop/src/main.rs",
   "apps/desktop/src/pdf_spike.rs",
-  "apps/desktop/src/web_preview_spike.rs",
   "crates/terminal/Cargo.toml",
   "crates/terminal/src/bin/vibex-terminal-feasibility.rs",
   "crates/terminal/src/emulator.rs",

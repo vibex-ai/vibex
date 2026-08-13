@@ -1,6 +1,6 @@
-// Diagnostic probe for the web workflow E2E path. Mirrors the first steps of
-// scripts/e2e-workflows.mjs but surfaces the underlying errors, console
-// output, and state snapshots that the sealed runner does not print.
+// Diagnostic probe for the Mobile WASM development-host workflow. It mirrors the
+// first steps of scripts/e2e-workflows.mjs but surfaces underlying errors and
+// state snapshots that the sealed runner does not print.
 import { readFileSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import process from "node:process";
@@ -12,11 +12,11 @@ for (const key of Object.keys(process.env)) {
   if (/^(https?_proxy|all_proxy|no_proxy)$/i.test(key)) delete process.env[key];
 }
 const origin = process.argv[2] ?? "https://dev-home.tail525c5d.ts.net:8443";
-const bundlePath = process.argv[3] ?? join(ROOT, ".e2e-local-env/web-direct/credentials.json");
+const bundlePath = process.argv[3] ?? join(ROOT, ".e2e-local-env/mobile-wasm-direct/credentials.json");
 const REMOTE_CREDENTIAL_STORAGE_KEY = "vibex.remote-client.credentials.v1";
 const credentials = JSON.parse(readFileSync(bundlePath, "utf8"));
 
-const { startWasmServer } = await import(join(ROOT, "scripts/wasm-test-server.mjs"));
+const { startWasmServer } = await import(join(ROOT, "scripts/mobile-wasm-test-server.mjs"));
 const server = await startWasmServer({ port: 14322 });
 
 const browser = await chromium.launch({

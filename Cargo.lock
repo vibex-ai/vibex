@@ -9775,6 +9775,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibex-mobile-wasm"
+version = "0.1.0-rc.1"
+dependencies = [
+ "gpui",
+ "gpui-component",
+ "gpui_platform",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "vibex-backend",
+ "vibex-core",
+ "vibex-remote-client",
+ "vibex-ui",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+]
+
+[[package]]
 name = "vibex-relay"
 version = "0.1.0-rc.1"
 dependencies = [
@@ -9910,24 +9928,6 @@ dependencies = [
  "vibex-desktop-model",
  "vibex-git",
  "vibex-terminal-ui",
-]
-
-[[package]]
-name = "vibex-web"
-version = "0.1.0-rc.1"
-dependencies = [
- "gpui",
- "gpui-component",
- "gpui_platform",
- "js-sys",
- "serde",
- "serde_json",
- "vibex-backend",
- "vibex-core",
- "vibex-remote-client",
- "vibex-ui",
- "wasm-bindgen",
- "wasm-bindgen-futures",
 ]
 
 [[package]]

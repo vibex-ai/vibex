@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 #[cfg(target_family = "wasm")]
-mod web {
+mod mobile {
     use std::borrow::Cow;
     use std::cell::RefCell;
     use std::sync::Arc;
@@ -25,8 +25,8 @@ mod web {
     };
     use vibex_ui::browser_gate::{
         ApplyHostEvent, BROWSER_GATE_SCHEMA_VERSION, BrowserGateView, BrowserHostEvent,
-        BrowserHostEventEnvelope, BrowserHostSnapshot, MEDIUM_MIN_WIDTH, WIDE_MIN_WIDTH,
-        apply_browser_gate_theme, apply_browser_gate_theme_mode,
+        BrowserHostEventEnvelope, BrowserHostSnapshot, MEDIUM_MIN_WIDTH, apply_browser_gate_theme,
+        apply_browser_gate_theme_mode,
     };
     use vibex_ui::{
         AGENT_FILE_GIT_WORKFLOW_SCHEMA_VERSION, AgentFileGitCapabilities, CompactNavigation,
@@ -43,7 +43,7 @@ mod web {
     const MAX_REMOTE_CREDENTIAL_BYTES: usize = 64 * 1024;
     const MAX_REMOTE_COMMAND_BYTES: usize = 8 * 1024;
     const MAX_WORKFLOW_COMMAND_BYTES: usize = 1024;
-    const REMOTE_RUNTIME_SCHEMA_VERSION: &str = "vibex-web-runtime.v1";
+    const REMOTE_RUNTIME_SCHEMA_VERSION: &str = "vibex-mobile-runtime.v1";
     const REMOTE_CREDENTIAL_SCHEMA_VERSION: &str = "vibex-remote-client-credentials.v1";
     const PAIRING_PREVIEW_SCHEMA_VERSION: &str = "vibex-pairing-preview.v1";
     const PAIRING_CLAIM_SCHEMA_VERSION: &str = "vibex-pairing-claim.v1";
@@ -63,7 +63,7 @@ mod web {
     thread_local! {
         static APPLICATION: RefCell<Option<ApplicationHandle>> = const { RefCell::new(None) };
         static WINDOW_HANDLE: RefCell<Option<AnyWindowHandle>> = const { RefCell::new(None) };
-        static ROOT_VIEW: RefCell<Option<Entity<WebRootView>>> = const { RefCell::new(None) };
+        static ROOT_VIEW: RefCell<Option<Entity<MobileRootView>>> = const { RefCell::new(None) };
         static GATE_VIEW: RefCell<Option<Entity<BrowserGateView>>> = const { RefCell::new(None) };
         static WORKBENCH_VIEW: RefCell<Option<Entity<WorkflowWorkbenchView>>> = const { RefCell::new(None) };
         static HOST_SNAPSHOT: RefCell<BrowserHostSnapshot> = RefCell::new(BrowserHostSnapshot::default());
@@ -87,18 +87,18 @@ mod web {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
     #[serde(rename_all = "snake_case")]
-    enum WebRootMode {
+    enum MobileRootMode {
         Workbench,
         GateDiagnostics,
     }
 
-    struct WebRootView {
+    struct MobileRootView {
         gate: Entity<BrowserGateView>,
         workbench: Entity<WorkflowWorkbenchView>,
-        mode: WebRootMode,
+        mode: MobileRootMode,
     }
 
-    impl WebRootView {
+    impl MobileRootView {
         fn new(
             gate: Entity<BrowserGateView>,
             workbench: Entity<WorkflowWorkbenchView>,
@@ -108,9 +108,9 @@ mod web {
                 gate,
                 workbench,
                 mode: if gate_diagnostics {
-                    WebRootMode::GateDiagnostics
+                    MobileRootMode::GateDiagnostics
                 } else {
-                    WebRootMode::Workbench
+                    MobileRootMode::Workbench
                 },
             }
         }
@@ -121,24 +121,24 @@ mod web {
             cx: &mut gpui::Context<Self>,
         ) {
             self.workbench = workbench;
-            self.mode = WebRootMode::Workbench;
+            self.mode = MobileRootMode::Workbench;
             cx.notify();
         }
 
-        fn mode(&self) -> WebRootMode {
+        fn mode(&self) -> MobileRootMode {
             self.mode
         }
     }
 
-    impl Render for WebRootView {
+    impl Render for MobileRootView {
         fn render(
             &mut self,
             _window: &mut Window,
             _cx: &mut gpui::Context<Self>,
         ) -> impl IntoElement {
             let content: AnyElement = match self.mode {
-                WebRootMode::Workbench => self.workbench.clone().into_any_element(),
-                WebRootMode::GateDiagnostics => self.gate.clone().into_any_element(),
+                MobileRootMode::Workbench => self.workbench.clone().into_any_element(),
+                MobileRootMode::GateDiagnostics => self.gate.clone().into_any_element(),
             };
             div().size_full().child(content)
         }
@@ -148,7 +148,7 @@ mod web {
         fn new(
             config: RemoteClientConfig,
             expected_server_id: String,
-            route: Option<&WebRemoteRouteBundle>,
+            route: Option<&MobileRemoteRouteBundle>,
         ) -> BackendResult<Self> {
             let client_type = config.client_type;
             let (backend, route) = if let Some(route) = route {
@@ -205,7 +205,7 @@ mod web {
 
     #[derive(Clone, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
-    struct WebRemoteCredentialBundle {
+    struct MobileRemoteCredentialBundle {
         schema_version: String,
         record: RemoteCredentialRecord,
         identity_private_key: String,
@@ -214,20 +214,20 @@ mod web {
         #[serde(default)]
         allow_insecure_local_dev: bool,
         #[serde(default)]
-        route: Option<WebRemoteRouteBundle>,
+        route: Option<MobileRemoteRouteBundle>,
     }
 
     #[derive(Clone, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
-    struct WebRemoteRouteBundle {
+    struct MobileRemoteRouteBundle {
         #[serde(default)]
         direct_candidates: Vec<String>,
-        relay: Option<WebRelayCandidate>,
+        relay: Option<MobileRelayCandidate>,
     }
 
     #[derive(Clone, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
-    struct WebRelayCandidate {
+    struct MobileRelayCandidate {
         url: String,
         room_id: vibex_core::RelayRoomId,
         local_peer_id: vibex_core::RelayPeerId,
@@ -239,7 +239,7 @@ mod web {
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
     struct PairingClaimOptions {
         display_name: String,
-        #[serde(default = "default_browser_client_type")]
+        #[serde(default = "default_mobile_client_type")]
         client_type: RemoteClientType,
         #[serde(default)]
         allow_insecure_local_dev: bool,
@@ -255,8 +255,8 @@ mod web {
         opaque_locator: String,
     }
 
-    fn default_browser_client_type() -> RemoteClientType {
-        RemoteClientType::Browser
+    fn default_mobile_client_type() -> RemoteClientType {
+        RemoteClientType::Mobile
     }
 
     #[derive(Deserialize)]
@@ -369,7 +369,7 @@ mod web {
                     view
                 });
                 WORKBENCH_VIEW.with(|slot| *slot.borrow_mut() = Some(workbench.clone()));
-                let root_view = cx.new(|_| WebRootView::new(gate, workbench, gate_diagnostics));
+                let root_view = cx.new(|_| MobileRootView::new(gate, workbench, gate_diagnostics));
                 ROOT_VIEW.with(|slot| *slot.borrow_mut() = Some(root_view.clone()));
                 cx.new(|cx| Root::new(root_view, window, cx).bordered(false))
             });
@@ -381,7 +381,7 @@ mod web {
                     let _ = runtime_booted();
                 }
                 Err(error) => {
-                    let message = format!("failed to open the Web window: {error:#}");
+                    let message = format!("failed to open the mobile runtime window: {error:#}");
                     let _ = runtime_failed(&message);
                 }
             }
@@ -431,9 +431,9 @@ mod web {
                 "sharedArrayBufferRequired": false
             },
             "breakpoints": {
-                "wideMinWidth": WIDE_MIN_WIDTH,
                 "mediumMinWidth": MEDIUM_MIN_WIDTH,
-                "compactMinWidth": 0
+                "compactMinWidth": 0,
+                "maximumShell": "medium"
             },
             "network": {
                 "maxProbeResponseBytes": 4096,
@@ -452,7 +452,7 @@ mod web {
             },
             "compatibility": {
                 "schemaVersion": "vibex-platform-compat.v1",
-                "owner": "apps/web",
+                "owner": "apps/mobile-wasm",
                 "behaviorGated": true,
                 "inputEventFallbackRequired": true,
                 "touchScrollFallbackRequired": true,
@@ -467,7 +467,7 @@ mod web {
     }
 
     /// Public host contract for the shared remote client.  The actual
-    /// credential-bearing backend is created by the Web/Capacitor host bridge;
+    /// credential-bearing backend is created by the Capacitor host bridge;
     /// exposing the state vocabulary here keeps lifecycle/error pages on the
     /// same Rust contract without persisting a socket or session key in UI
     /// state.
@@ -506,7 +506,7 @@ mod web {
                 "schemaVersion": AGENT_FILE_GIT_WORKFLOW_SCHEMA_VERSION,
                 "workbenchSchemaVersion": WORKFLOW_WORKBENCH_SCHEMA_VERSION,
                 "domains": ["agent", "files", "git"],
-                "backend": "native_or_web_remote_facade",
+                "backend": "web_remote_facade",
                 "fileEditing": {
                     "maxUtf8Bytes": 1048576,
                     "revisionCas": true,
@@ -548,10 +548,9 @@ mod web {
                 "backOrder": ["dialog", "sheet", "compact_navigation", "unhandled"]
             },
             "deployment": {
-                "pwaManifest": "manifest.webmanifest",
-                "serviceWorker": "versioned_static_cache",
-                "offlineFallback": "offline.html",
-                "capacitorWebDir": "../web/dist"
+                "runtimeRole": "capacitor_mobile_runtime",
+                "browserHost": "development_and_test_only",
+                "capacitorWebDir": "../mobile-wasm/dist"
             },
             "authority": "desktop_runtime"
         }))
@@ -560,7 +559,7 @@ mod web {
 
     /// Configure the one direct remote runtime.  The payload is a validated,
     /// redacted-at-rest bundle supplied by the host bridge; private material is
-    /// never returned by `remote_state` or written to the browser gate event
+    /// never returned by `remote_state` or written to the host diagnostic event
     /// stream.
     #[wasm_bindgen]
     pub fn configure_remote(payload: &str) -> Result<String, JsValue> {
@@ -670,7 +669,7 @@ mod web {
     }
 
     /// Ask the authenticated PC to resolve an opaque push/deep-link locator.
-    /// The browser never interprets the locator or invents a session id.
+    /// The mobile host never interprets the locator or invents a session id.
     #[wasm_bindgen]
     pub fn resolve_deep_link(payload: &str) -> js_sys::Promise {
         if payload.len() > MAX_REMOTE_COMMAND_BYTES {
@@ -757,10 +756,10 @@ mod web {
             Ok(offer) => offer,
             Err(error) => return rejected_promise(&error),
         };
-        if parsed_options.client_type == RemoteClientType::Unknown {
+        if parsed_options.client_type != RemoteClientType::Mobile {
             return rejected_promise(&BackendError::unsupported(
-                "remote_client_type_unknown",
-                "pairing claim requires a supported Web or mobile client type",
+                "remote_client_type_unsupported",
+                "the mobile runtime only accepts the mobile client type",
             ));
         }
 
@@ -853,7 +852,7 @@ mod web {
                 device_identity_public_key: identity.public_key_base64(),
                 server_identity_public_key: Some(offer.summary.server_identity_public_key.clone()),
             };
-            let bundle = WebRemoteCredentialBundle {
+            let bundle = MobileRemoteCredentialBundle {
                 schema_version: REMOTE_CREDENTIAL_SCHEMA_VERSION.to_string(),
                 record,
                 identity_private_key: identity.private_key_base64(),
@@ -945,14 +944,14 @@ mod web {
         navigation_state_json()
     }
 
-    fn parse_credential_bundle(payload: &str) -> BackendResult<WebRemoteCredentialBundle> {
+    fn parse_credential_bundle(payload: &str) -> BackendResult<MobileRemoteCredentialBundle> {
         if payload.is_empty() || payload.len() > MAX_REMOTE_CREDENTIAL_BYTES {
             return Err(BackendError::failed(
                 "remote_credentials_invalid",
                 "remote credential bundle is empty or exceeds the bounded size",
             ));
         }
-        let bundle: WebRemoteCredentialBundle = serde_json::from_str(payload).map_err(|_| {
+        let bundle: MobileRemoteCredentialBundle = serde_json::from_str(payload).map_err(|_| {
             BackendError::failed(
                 "remote_credentials_invalid",
                 "remote credential bundle is not valid JSON",
@@ -966,7 +965,7 @@ mod web {
             || bundle.record.auth.auth_token.trim().is_empty()
             || bundle.record.auth.auth_token.chars().count() > 4096
             || bundle.record.device_identity_public_key.trim().is_empty()
-            || bundle.client_type == RemoteClientType::Unknown
+            || bundle.client_type != RemoteClientType::Mobile
         {
             return Err(BackendError::failed(
                 "remote_credentials_invalid",
@@ -1004,7 +1003,7 @@ mod web {
     }
 
     fn client_config_from_bundle(
-        bundle: &WebRemoteCredentialBundle,
+        bundle: &MobileRemoteCredentialBundle,
     ) -> BackendResult<RemoteClientConfig> {
         let identity = ClientDeviceIdentity::from_private_key_base64(
             bundle.record.auth.device_id.clone(),
@@ -1019,22 +1018,13 @@ mod web {
         let mut config = RemoteClientConfig::from_credentials(bundle.record.clone(), identity)?;
         config.expected_server_id = Some(bundle.expected_server_id.clone());
         config.client_type = bundle.client_type;
-        config.client_id = match bundle.client_type {
-            RemoteClientType::Mobile => "vibex-mobile".to_string(),
-            RemoteClientType::Browser | RemoteClientType::DesktopWeb => "vibex-web".to_string(),
-            RemoteClientType::Native | RemoteClientType::Unknown => {
-                return Err(BackendError::unsupported(
-                    "remote_client_type_unsupported",
-                    "this Web runtime only supports browser and mobile clients",
-                ));
-            }
-        };
+        config.client_id = "vibex-mobile".to_string();
         config.allow_insecure_local_dev = bundle.allow_insecure_local_dev && cfg!(debug_assertions);
         config.validate()?;
         Ok(config)
     }
 
-    fn route_bundle_from_offer(offer: &vibex_core::RemotePairingOffer) -> WebRemoteRouteBundle {
+    fn route_bundle_from_offer(offer: &vibex_core::RemotePairingOffer) -> MobileRemoteRouteBundle {
         let direct_candidates = offer
             .summary
             .direct_candidates
@@ -1053,7 +1043,7 @@ mod web {
             .relay_candidate
             .as_ref()
             .and_then(|candidate| {
-                Some(WebRelayCandidate {
+                Some(MobileRelayCandidate {
                     url: candidate.url.clone(),
                     room_id: candidate.relay_room_id.clone()?,
                     local_peer_id: vibex_core::RelayPeerId::new(),
@@ -1061,7 +1051,7 @@ mod web {
                     pc_public_key: candidate.relay_pc_public_key.clone()?,
                 })
             });
-        WebRemoteRouteBundle {
+        MobileRemoteRouteBundle {
             direct_candidates,
             relay,
         }
@@ -1165,7 +1155,7 @@ mod web {
             .ok_or_else(|| js_error("GPUI root view is not ready"))?;
         serde_json::to_string(&json!({
             "mode": mode,
-            "defaultMode": WebRootMode::Workbench,
+            "defaultMode": MobileRootMode::Workbench,
             "gateFixtureIsProductSource": false,
         }))
         .map_err(|error| js_error(format!("failed to serialize root state: {error}")))
@@ -1480,4 +1470,4 @@ mod web {
 }
 
 #[cfg(target_family = "wasm")]
-pub use web::*;
+pub use mobile::*;

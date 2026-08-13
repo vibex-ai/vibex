@@ -2,16 +2,16 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { WEB_SOURCE_INPUTS } from "./wasm-source-tree.mjs";
+import { MOBILE_RUNTIME_SOURCE_INPUTS } from "./wasm-source-tree.mjs";
 import {
   createHostServices,
   extractOpaqueDeepLink,
   extractPairingFragment,
   validateCredentialBundle
-} from "../apps/web/web/host-services.js";
+} from "../apps/mobile-wasm/host/host-services.js";
 
 const ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
-const WEB = join(ROOT, "apps/web");
+const MOBILE_RUNTIME = join(ROOT, "apps/mobile-wasm");
 const MOBILE = join(ROOT, "apps/mobile");
 const selfTest = process.argv.includes("--self-test");
 
@@ -29,14 +29,12 @@ function text(path) {
 
 function checkForbiddenUi() {
   const files = [
-    "apps/web/src/lib.rs",
-    "apps/web/web/index.html",
-    "apps/web/web/host.js",
-    "apps/web/web/host-services.js",
-    "apps/web/web/platform-compat.js",
-    "apps/web/web/styles.css",
-    "apps/web/web/service-worker.js",
-    "apps/web/web/manifest.webmanifest"
+    "apps/mobile-wasm/src/lib.rs",
+    "apps/mobile-wasm/host/index.html",
+    "apps/mobile-wasm/host/host.js",
+    "apps/mobile-wasm/host/host-services.js",
+    "apps/mobile-wasm/host/platform-compat.js",
+    "apps/mobile-wasm/host/styles.css"
   ];
   const forbidden = [
     /from\s+["'](?:react|react-dom|@?tanstack|tailwind|@radix-ui)/i,
@@ -52,9 +50,9 @@ function checkForbiddenUi() {
 
 function checkPackaging() {
   const config = text("apps/mobile/capacitor.config.ts");
-  assert(/webDir:\s*["']\.\.\/web\/dist["']/.test(config), "Capacitor webDir must be ../web/dist");
+  assert(/webDir:\s*["']\.\.\/mobile-wasm\/dist["']/.test(config), "Capacitor webDir must be ../mobile-wasm/dist");
   const packageJson = JSON.parse(text("apps/mobile/package.json"));
-  for (const script of ["validate", "web:build", "android:debug", "android:release", "ios:debug", "ios:release"]) {
+  for (const script of ["validate", "runtime:build", "android:debug", "android:release", "ios:debug", "ios:release"]) {
     assert(typeof packageJson.scripts?.[script] === "string", `mobile package script ${script} is missing`);
   }
   const contract = JSON.parse(text("apps/mobile/native-shell-contract.json"));
@@ -77,8 +75,8 @@ function checkPackaging() {
 }
 
 function checkHostContracts() {
-  const services = text("apps/web/web/host-services.js");
-  const host = text("apps/web/web/host.js");
+  const services = text("apps/mobile-wasm/host/host-services.js");
+  const host = text("apps/mobile-wasm/host/host.js");
   assert(services.includes("history.replaceState"), "pairing deep links are not scrubbed from history");
   assert(services.indexOf("clearPairingFragment(windowLike") < services.indexOf("onPairingFragment?.({"), "pairing payload is dispatched before URL cleanup");
   assert(services.indexOf("clearOpaqueDeepLink(windowLike") < services.indexOf("onOpaqueDeepLink?.(item)"), "opaque deep link is dispatched before URL cleanup");
@@ -108,37 +106,36 @@ function checkHostContracts() {
     host.includes('!["idle", "unpaired"].includes(runtime.remote.pairing.state)'),
     "initial pairing recovery can be overwritten by the no-credential state"
   );
-  assert(text("apps/web/web/index.html").includes('id="pairing-confirm"'), "pairing confirmation sheet is missing");
+  assert(text("apps/mobile-wasm/host/index.html").includes('id="pairing-confirm"'), "pairing confirmation sheet is missing");
   assert(host.includes("remote_lifecycle") && host.includes("network_lost"), "lifecycle/network bridge is incomplete");
-  assert(host.includes("REMOTE_STATE_STEADY_POLL_MS") && host.includes("snapshot?.configured"), "configured Web runtime does not keep observing authoritative reconnect state");
+  assert(host.includes("REMOTE_STATE_STEADY_POLL_MS") && host.includes("snapshot?.configured"), "configured mobile runtime does not keep observing authoritative reconnect state");
   assert(host.includes('const diagnosticsGate = parameters.get("diagnostics") === "gate"'), "Gate fixture does not require explicit diagnostics mode");
   assert(/if \(!stored\) \{[\s\S]{0,160}if \(!diagnosticsGate\) setPairingState\("unpaired"/.test(host), "default product entry does not require pairing while the diagnostics Gate stays unobstructed");
   assert(host.includes("wasm.start(diagnosticsGate)"), "diagnostics mode is not shared with the GPUI start boundary");
   assert(!/runtime\.gpuiBooted\s*&&\s*runtime\.remote\.page[\s\S]{0,240}setState\(/.test(host), "remote failures can still cover the product workbench with the Gate status layer");
   assert(host.indexOf("wasmRuntime.configure_remote") < host.indexOf("scheduleRemoteStateSync();", host.indexOf("function configureRemote")), "remote state synchronization does not start with configuration");
-  const rust = text("apps/web/src/lib.rs");
+  const rust = text("apps/mobile-wasm/src/lib.rs");
   for (const symbol of ["configure_remote", "connect_remote", "forget_remote", "resolve_deep_link", "pairing_preview", "claim_pairing_fragment", "navigation_action", "closed_compact_navigation"]) {
-    assert(rust.includes(symbol), `Rust Web runtime contract is missing ${symbol}`);
+    assert(rust.includes(symbol), `Rust mobile runtime contract is missing ${symbol}`);
   }
   for (const symbol of ["AutoRemoteTransport", "RelayClientConfig", "claim_pairing_offer_via_relay"]) {
-    assert(rust.includes(symbol), `Rust Web Relay fallback contract is missing ${symbol}`);
+    assert(rust.includes(symbol), `Rust mobile Relay fallback contract is missing ${symbol}`);
   }
   assert(rust.includes("select_pairing_claim_route") && rust.includes("PairingClaimRoute"), "entry-bound single-route claim selection is missing");
   assert(rust.includes('"activeRoute": runtime.active_route()'), "safe remote state omits the active route");
   assert(rust.includes("DisconnectedBackend::facade()"), "default product entry does not construct the real workflow shell while unpaired");
-  assert(rust.includes("WebRootMode::Workbench"), "Web root has no explicit product workbench mode");
+  assert(rust.includes("MobileRootMode::Workbench"), "mobile root has no explicit product workbench mode");
   assert(!/configure_remote[\s\S]{0,1200}show_gate\(\)/.test(rust), "remote configuration still falls back to the Gate fixture");
 }
 
-function checkPwaContracts() {
-  const manifest = JSON.parse(text("apps/web/web/manifest.webmanifest"));
-  assert(manifest.start_url === "./" && manifest.scope === "./", "PWA manifest scope/start URL is not relative");
-  assert(manifest.display === "standalone" && manifest.icons?.length > 0, "PWA manifest is incomplete");
-  const worker = text("apps/web/web/service-worker.js");
-  assert(worker.includes("CACHE_PREFIX") && worker.includes("__VIBEX_BUILD_ID__"), "service worker version contract is missing");
-  const build = text("apps/web/scripts/build.mjs");
-  assert(build.includes("staticSha256") && build.includes("cacheAssets") && build.includes("service-worker.js"), "build script does not produce a stable cache identity");
-  assert(existsSync(join(WEB, "web/offline.html")), "offline page is missing");
+function checkMobileRuntimeBuildContract() {
+  const host = text("apps/mobile-wasm/host/index.html");
+  const build = text("apps/mobile-wasm/scripts/build.mjs");
+  assert(!host.includes("manifest.webmanifest"), "mobile runtime must not expose a PWA manifest");
+  assert(!text("apps/mobile-wasm/host/host.js").includes("serviceWorker"), "mobile host must not register a service worker");
+  assert(!build.includes("service-worker"), "mobile runtime must not build a service worker");
+  assert(build.includes('runtimeRole: "capacitor_mobile_runtime"'), "mobile runtime role is missing");
+  assert(build.includes('schemaVersion: "vibex-mobile-wasm-build.v1"'), "mobile build schema is missing");
 }
 
 function checkSourceIdentityCoverage() {
@@ -147,7 +144,7 @@ function checkSourceIdentityCoverage() {
     [
       "tree",
       "-p",
-      "vibex-web",
+      "vibex-mobile-wasm",
       "--target",
       "wasm32-unknown-unknown",
       "--edges",
@@ -167,15 +164,15 @@ function checkSourceIdentityCoverage() {
     if (!match[1].startsWith(prefix)) continue;
     localCrates.add(match[1].slice(prefix.length).replaceAll("\\", "/"));
   }
-  assert(localCrates.size > 0, "Cargo did not report local Web WASM crates");
+  assert(localCrates.size > 0, "Cargo did not report local mobile WASM crates");
   for (const root of localCrates) {
     assert(
-      WEB_SOURCE_INPUTS.includes(`${root}/Cargo.toml`),
-      `Web source identity omits ${root}/Cargo.toml`
+      MOBILE_RUNTIME_SOURCE_INPUTS.includes(`${root}/Cargo.toml`),
+      `Mobile runtime source identity omits ${root}/Cargo.toml`
     );
     assert(
-      WEB_SOURCE_INPUTS.includes(`${root}/src`),
-      `Web source identity omits ${root}/src`
+      MOBILE_RUNTIME_SOURCE_INPUTS.includes(`${root}/src`),
+      `Mobile runtime source identity omits ${root}/src`
     );
   }
 }
@@ -196,8 +193,23 @@ function checkNegativePaths() {
   }
   assert(rejected, "an executable URL scheme was accepted for pairing");
   const receipt = extractPairingFragment("https://desktop.example/#/pair/abc");
-  assert(receipt.accepted === true && receipt.entryType === "web_origin", "safe pairing receipt is invalid");
+  assert(
+    receipt.accepted === true && receipt.entryType === "development_host",
+    "development-host pairing receipt is invalid"
+  );
   assert(!("fragment" in receipt) && !("entryHint" in receipt) && !("origin" in receipt), "safe pairing receipt exposes intake secrets");
+  const mobileReceipt = extractPairingFragment("vibex://open/direct#/pair/abc");
+  assert(
+    mobileReceipt.accepted === true && mobileReceipt.entryType === "mobile_app",
+    "mobile app pairing receipt is invalid"
+  );
+  rejected = false;
+  try {
+    extractPairingFragment("vibex://open/unknown#/pair/abc");
+  } catch {
+    rejected = true;
+  }
+  assert(rejected, "an unknown mobile pairing transport was accepted");
   const deepLink = extractOpaqueDeepLink("https://vibex.invalid/#/notify/notification-a/opaque-ref");
   assert(deepLink.notificationId === "notification-a" && deepLink.opaqueLocator === "opaque-ref", "opaque deep link did not parse");
   rejected = false;
@@ -264,6 +276,28 @@ async function checkHostServiceRoundTrip() {
   assert(windowLike.history.value === "/open", "pairing cleanup retained query state");
   assert(events.length === 1 && events[0].fragment === "#/pair/abc", "private pairing callback contract is unstable");
   assert(events[0].entryHint?.origin === "https://vibex.invalid", "pairing entry origin was not normalized");
+  const mobilePairing = await services.dispatchPairing(
+    "vibex://open/self_hosted_relay#/pair/def",
+    "app_link"
+  );
+  assert(mobilePairing.accepted === true, "mobile app pairing intake was rejected");
+  assert(
+    events.at(-1)?.entryHint?.kind === "mobile_app" &&
+      events.at(-1)?.entryHint?.transport === "self_hosted_relay" &&
+      !("origin" in events.at(-1).entryHint),
+    "mobile app pairing intake did not preserve the restricted transport hint"
+  );
+  const universalLink = await services.dispatchPairing(
+    "https://mobile.vibex.example/open/tailnet#/pair/ghi",
+    "app_link"
+  );
+  assert(universalLink.accepted === true, "Universal Link pairing intake was rejected");
+  assert(
+    events.at(-1)?.entryHint?.kind === "mobile_app" &&
+      events.at(-1)?.entryHint?.transport === "tailnet" &&
+      !("origin" in events.at(-1).entryHint),
+    "Universal Link intake was treated as a development-host origin"
+  );
   const rejectedPairing = await services.dispatchPairing(
     "javascript:alert(1)#/pair/abc",
     "app_link"
@@ -273,10 +307,10 @@ async function checkHostServiceRoundTrip() {
     "runtime pairing rejection receipt is not typed"
   );
   assert(
-    events.at(-1)?.errorCode === "pairing_link_invalid" && events.at(-1)?.entryType === "custom_scheme",
+    events.at(-1)?.errorCode === "pairing_link_invalid" && events.at(-1)?.entryType === "mobile_app",
     "runtime pairing rejection did not reach the recovery controller"
   );
-  await services.dispatchOpaqueDeepLink("https://vibex.invalid/dashboard?secret=drop#/notify/notification-a/opaque-ref", "browser_url");
+  await services.dispatchOpaqueDeepLink("https://vibex.invalid/dashboard?secret=drop#/notify/notification-a/opaque-ref", "development_host");
   assert(windowLike.history.value === "/dashboard", "opaque deep-link cleanup retained query state");
   assert(deepLinks.length === 1 && deepLinks[0].opaqueLocator === "opaque-ref", "opaque deep-link callback contract is unstable");
   const bundle = {
@@ -289,7 +323,7 @@ async function checkHostServiceRoundTrip() {
     },
     identityPrivateKey: "c".repeat(43),
     expectedServerId: "desktop",
-    clientType: "browser"
+    clientType: "mobile"
   };
   await services.writeCredentialBundle(bundle);
   assert((await services.readCredentialBundle()).expectedServerId === "desktop", "browser storage round-trip failed");
@@ -332,7 +366,7 @@ async function checkHostServiceRoundTrip() {
   });
   const scanner = scannerWith(async (options) => {
     assert(options.hint === 0 && options.cameraDirection === 1, "QR-only scanner options changed");
-    return { ScanResult: "https://desktop.example/#/pair/abc", format: 0 };
+    return { ScanResult: "vibex://open/direct#/pair/abc", format: 0 };
   });
   const scan = await scanner.scanQr();
   assert(scan.status === "scanned" && scan.format === "qr_code", "native QR result was not normalized");
@@ -365,7 +399,7 @@ async function main() {
   checkForbiddenUi();
   checkPackaging();
   checkHostContracts();
-  checkPwaContracts();
+  checkMobileRuntimeBuildContract();
   checkSourceIdentityCoverage();
   if (selfTest) {
     checkNegativePaths();
@@ -375,7 +409,7 @@ async function main() {
     schemaVersion: "vibex-wasm-integration-check.v1",
     status: "passed",
     selfTest,
-    webSource: WEB,
+    mobileRuntimeSource: MOBILE_RUNTIME,
     mobileSource: MOBILE,
     sameBusinessBundle: true,
     legacyReactUi: false,

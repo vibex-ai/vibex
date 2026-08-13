@@ -1,50 +1,37 @@
 {
   "schemaVersion": "vibex-android-build.v1",
-  "capturedAt": "2026-07-30T13:51:54.497Z",
+  "capturedAt": "2026-08-13T11:19:46.567Z",
   "status": "packaged_not_device_validated",
   "source": {
     "dependencySourcePolicy": "upstream_git_root_cargo_lock",
     "zedRevision": "c9e8e611dbc279afa0914d28c4d37ad07f38c03b",
     "gpuiComponentRevision": "031555662e99a1b5a549990b47f246d475b8288a",
-    "webSourceTreeSha256": "039e01ff3b1ac4a815b28c469622c47572684a7238f73892a89313787bb749d3",
-    "mobileShellTreeSha256": "0f3521bfc8ce2e0bab083de876f9f039fdaf8f21e4db0156dd97f946b2fe943c",
-    "cargoLockfileSha256": "9f369bb4fef16ff737c1ac6951740e4f37b56e75bcbbb1b195e41221762e043a",
-    "pnpmLockfileSha256": "ae6aa0f7a317118a33b9affbd66c26b550bf3bf4de1acea1d0643665a5787e17"
+    "mobileRuntimeSourceTreeSha256": "bc9ae99fb918c4463148c4f0abc70da154a6cb0712a282ce891bd9506a9fc4aa",
+    "mobileShellTreeSha256": "d78ae2b5394f4b6390543eb5e0852a9bc13a2188f7c3d4188136421a83031b24",
+    "cargoLockfileSha256": "6a0deb409f2e43c799b072c9f39c9e7305951565ad9e5fcdabf7a55d028437f0",
+    "pnpmLockfileSha256": "0df8e230152545ca1378c26708f020fe60b107310894b2d6e19dbd24bcaff23a"
   },
   "artifact": {
     "path": "apps/mobile/artifacts/vibex-gate-debug.apk",
-    "bytes": 48361164,
-    "sha256": "46af4b0fdfcb9ef94f20fc5c812df50b62e22050e1a3cf48ca476045e6f1ffc6",
+    "bytes": 48690199,
+    "sha256": "b7c804c6a82f596605578add168b65e42fe62eb8a14d5643805cd3f2e3a8f55c",
     "applicationId": "dev.vibex.remote",
     "minSdk": 26,
     "targetSdk": 36
   },
-  "webBuild": {
-    "schemaVersion": "vibex-web-build.v1",
-    "buildId": "10386de3655e9b1843ed8b2a",
+  "runtimeBuild": {
+    "schemaVersion": "vibex-mobile-wasm-build.v1",
+    "runtimeRole": "capacitor_mobile_runtime",
+    "browserHost": "development_and_test_only",
+    "buildId": "e849987cbbf5d359874386c9",
     "packageVersion": "0.1.0-rc.1",
     "profile": "release",
-    "gitCommit": "uncommitted-worktree",
+    "gitCommit": "7d8a22836722cdb47794891aada45288824d6c16",
     "wasmBindgenVersion": "0.2.125",
-    "wasmBytes": 23818142,
-    "wasmSha256": "5b3759a3f808deeb0e54811df2087d6bd6d6884b895687b404ebfd41c328b6f3",
-    "glueSha256": "41ca01158be66de60f8f5bd41f3bede0d5de5128b6aa2cd68177c8f2edaa87c9",
-    "staticSha256": "1e605c527621ec75eb359e97276fe4dd90b7f35e1eef9db69918c6783cece0e9",
-    "cacheName": "vibex-static-10386de3655e9b1843ed8b2a",
-    "cacheAssets": [
-      "./",
-      "./index.html",
-      "./offline.html",
-      "./styles.css",
-      "./host.js",
-      "./host-services.js",
-      "./platform-compat.js",
-      "./manifest.webmanifest",
-      "./icon.svg",
-      "./build.json",
-      "./pkg/vibex_web.js",
-      "./pkg/vibex_web_bg.wasm"
-    ]
+    "wasmBytes": 24862521,
+    "wasmSha256": "cb044e39f25d96205d911c812c87f066bb72746841a72e8d3fa44ec1d103af04",
+    "glueSha256": "14021eae0958616f15046e0dc474ee8a683c4059d303f4089e45f1f4ee15c792",
+    "staticSha256": "575104c26dfe2828a840ec2df9e19c1011ff3ce03c753dc374c906158c0ec23b"
   },
   "toolchain": {
     "java": "openjdk version \"21.0.11\" 2026-04-21 LTS",
@@ -56,7 +43,7 @@
     "capacitor": "8.4.1"
   },
   "packageContract": {
-    "webDir": "../web/dist",
+    "webDir": "../mobile-wasm/dist",
     "containsGpuiHost": true,
     "containsPlatformCompatibilityAdapter": true,
     "containsGpuiWasm": true,
@@ -128,8 +115,8 @@
         "sha256": "05b19f23f054c1360458b17fc871dc7ef6a135d93d02a8a25f34009a2c7764cc"
       },
       "android/app/src/main/AndroidManifest.xml": {
-        "bytes": 2103,
-        "sha256": "3c708a3a609197d2a8d9bd9769997fec4f59a0183bb063836585b0f7dc809898"
+        "bytes": 2105,
+        "sha256": "edaf4f6eeacdde7a20d7dbcec076deec2d2ef26e4a375a3b9dfb6db8eb67e905"
       },
       "android/app/src/main/res/values/strings.xml": {
         "bytes": 296,

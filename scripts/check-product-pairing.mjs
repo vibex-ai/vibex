@@ -30,9 +30,9 @@ function candidate() {
     productSourceTreeSha256: hash("1"),
     cargoLockSha256: hash("2"),
     pnpmLockSha256: hash("3"),
-    webBuildId: "4".repeat(24),
-    webGitCommit: "b".repeat(40),
-    webBuildSha256: hash("5"),
+    mobileRuntimeBuildId: "4".repeat(24),
+    mobileRuntimeGitCommit: "b".repeat(40),
+    mobileRuntimeBuildSha256: hash("5"),
     candidateDigest: ""
   };
 }
@@ -48,9 +48,9 @@ function syntheticEvidence() {
     productSourceTreeSha256: value.productSourceTreeSha256,
     cargoLockSha256: value.cargoLockSha256,
     pnpmLockSha256: value.pnpmLockSha256,
-    webBuildId: value.webBuildId,
-    webGitCommit: value.webGitCommit,
-    webBuildSha256: value.webBuildSha256
+    mobileRuntimeBuildId: value.mobileRuntimeBuildId,
+    mobileRuntimeGitCommit: value.mobileRuntimeGitCommit,
+    mobileRuntimeBuildSha256: value.mobileRuntimeBuildSha256
   });
   value.candidateDigest = createHash("sha256").update(digestSource).digest("hex");
   base.candidate = value;
@@ -77,7 +77,7 @@ function syntheticEvidence() {
       permissions: Object.fromEntries(
         PRODUCT_PAIRING_PERMISSIONS.map((permission) => [permission, hash("a")])
       ),
-      entries: passedMap(["browser_url", "app_link", "in_app_scanner"]),
+      entries: passedMap(["development_host", "app_link", "in_app_scanner"]),
       checks: passedMap(PRODUCT_PAIRING_CHECKS),
       workflows: passedMap(PRODUCT_PAIRING_WORKFLOWS),
       redactionScan: "passed"

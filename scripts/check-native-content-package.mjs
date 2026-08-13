@@ -21,22 +21,6 @@ const APPIMAGE = resolve(
 );
 const PREPARED = resolve(ROOT, "target/native/pdfium/linux-x86_64");
 const PACKAGE_RESOURCE = "usr/lib/vibex-desktop/pdfium";
-const WEB_SOURCE = resolve(ROOT, "apps/web/dist");
-const WEB_PACKAGE_RESOURCE = "usr/lib/vibex-desktop/web";
-const REQUIRED_WEB_ASSETS = [
-  "index.html",
-  "offline.html",
-  "styles.css",
-  "host.js",
-  "host-services.js",
-  "platform-compat.js",
-  "manifest.webmanifest",
-  "icon.svg",
-  "service-worker.js",
-  "build.json",
-  "pkg/vibex_web.js",
-  "pkg/vibex_web_bg.wasm"
-];
 
 function fail(message) {
   throw new Error(message);
@@ -93,35 +77,6 @@ function verifyLicenseBundle(root, label) {
   assert(existsSync(join(root, "manifest.json")), `${label} PDFium manifest is missing`);
 }
 
-function verifyWebBuild(root, label) {
-  const assets = {};
-  for (const relativePath of REQUIRED_WEB_ASSETS) {
-    assets[relativePath] = fileIdentity(join(root, relativePath));
-  }
-  const build = JSON.parse(readFileSync(join(root, "build.json"), "utf8"));
-  assert(build.schemaVersion === "vibex-web-build.v1", `${label} Web build schema drifted`);
-  assert(build.profile === "release", `${label} Web build is not release`);
-  assert(/^[0-9a-f]{24}$/.test(build.buildId ?? ""), `${label} Web build id is invalid`);
-  assert(/^[0-9a-f]{40}$/.test(build.gitCommit ?? ""), `${label} Web source revision is invalid`);
-  return { build, assets };
-}
-
-function assertWebBuildMatches(source, packaged, label) {
-  assert(JSON.stringify(packaged.build) === JSON.stringify(source.build), `${label} Web build identity drifted`);
-  for (const relativePath of REQUIRED_WEB_ASSETS) {
-    assert(
-      JSON.stringify(packaged.assets[relativePath]) === JSON.stringify(source.assets[relativePath]),
-      `${label} Web asset drifted: ${relativePath}`
-    );
-  }
-}
-
-function verifyNativeWebBinding(binary, build, label) {
-  const bytes = readFileSync(binary);
-  assert(bytes.includes(build.buildId), `${label} binary is not bound to the packaged Web build id`);
-  assert(bytes.includes(build.gitCommit), `${label} binary is not bound to the packaged Web source revision`);
-}
-
 function probe(binary, args = []) {
   return JSON.parse(run(binary, [...args, "--probe"]));
 }
@@ -136,7 +91,6 @@ function validate() {
 
   assert(existsSync(DEB), "native-content .deb is missing");
   assert(existsSync(APPIMAGE), "native-content AppImage is missing");
-  const sourceWebBuild = verifyWebBuild(WEB_SOURCE, "source");
   const temporary = mkdtempSync(join(tmpdir(), "vibex-native-content-package-"));
   try {
     const debRoot = join(temporary, "deb");
@@ -145,20 +99,6 @@ function validate() {
     const appImageRoot = join(temporary, "squashfs-root");
     const debPdfium = join(debRoot, PACKAGE_RESOURCE);
     const appImagePdfium = join(appImageRoot, PACKAGE_RESOURCE);
-    const debWeb = verifyWebBuild(join(debRoot, WEB_PACKAGE_RESOURCE), ".deb");
-    const appImageWeb = verifyWebBuild(join(appImageRoot, WEB_PACKAGE_RESOURCE), "AppImage");
-    assertWebBuildMatches(sourceWebBuild, debWeb, ".deb");
-    assertWebBuildMatches(sourceWebBuild, appImageWeb, "AppImage");
-    verifyNativeWebBinding(
-      join(debRoot, "usr/bin/vibex-desktop"),
-      sourceWebBuild.build,
-      ".deb"
-    );
-    verifyNativeWebBinding(
-      join(appImageRoot, "usr/bin/vibex-desktop"),
-      sourceWebBuild.build,
-      "AppImage"
-    );
     const debLibrary = join(debPdfium, archive.libraryPath);
     const appImageLibrary = join(appImagePdfium, archive.libraryPath);
 
@@ -191,11 +131,6 @@ function validate() {
         needed: sourceElf.needed,
         appImageRunpath: appImageElf.runpath,
         licenseFiles: REVIEW.licenseFiles.length
-      },
-      webBuild: {
-        buildId: sourceWebBuild.build.buildId,
-        gitCommit: sourceWebBuild.build.gitCommit,
-        assetCount: REQUIRED_WEB_ASSETS.length
       }
     }, null, 2));
   } finally {

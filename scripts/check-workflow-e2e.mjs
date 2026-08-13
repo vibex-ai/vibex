@@ -31,7 +31,7 @@ function syntheticIdentity() {
       zedRevision: "b".repeat(40),
       gpuiComponentRevision: "c".repeat(40)
     },
-    webBuild: {
+    mobileRuntimeBuild: {
       buildId: "d".repeat(24),
       profile: "release",
       wasmBytes: 1024,
@@ -81,7 +81,7 @@ function passedTarget(identity, target, transport) {
           apkSha256: identity.androidApk.sha256
         }
       : {
-          kind: "browser",
+          kind: "development_host",
           browserName: "chromium",
           browserVersion: "149.0.0.0",
           platformSha256: "d".repeat(64)
@@ -128,11 +128,11 @@ function runSelfTest() {
   rejects(missing, identity, "a partial target matrix");
 
   const stale = structuredClone(evidence);
-  stale.targets.web_browser.direct.candidateDigest = "0".repeat(64);
+  stale.targets.mobile_wasm_host.direct.candidateDigest = "0".repeat(64);
   rejects(stale, identity, "stale target evidence");
 
   const forgedDigest = structuredClone(evidence);
-  forgedDigest.candidate.webBuild.wasmBytes += 1;
+  forgedDigest.candidate.mobileRuntimeBuild.wasmBytes += 1;
   rejects(forgedDigest, identity, "a forged candidate digest");
 
   const forgedCommit = structuredClone(evidence);
@@ -148,11 +148,11 @@ function runSelfTest() {
   );
 
   const inconsistentPermissions = structuredClone(evidence);
-  inconsistentPermissions.targets.web_browser.relay.permissionContractSha256 = "0".repeat(64);
+  inconsistentPermissions.targets.mobile_wasm_host.relay.permissionContractSha256 = "0".repeat(64);
   rejects(inconsistentPermissions, identity, "Direct/Relay permission drift");
 
   const leaked = structuredClone(evidence);
-  leaked.targets.web_browser.direct.topology.endpointSha256 = "wss://relay.example/room";
+  leaked.targets.mobile_wasm_host.direct.topology.endpointSha256 = "wss://relay.example/room";
   rejects(leaked, identity, "a raw Relay endpoint");
 
   const virtualDevice = structuredClone(evidence);

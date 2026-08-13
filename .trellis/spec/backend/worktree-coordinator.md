@@ -209,7 +209,7 @@ IntentRecorded -> LocksAcquired -> GitAddStarted -> GitAdded
   lock/lease/queue keys and preflight revisions. Readiness check commands become
   `recorded-check`; outcome and timestamp remain available.
 - `WebRemoteBackend::git_worktree_create` always fails with
-  `remote_worktree_mutation_unsupported`; Web/mobile never execute local Git
+  `remote_worktree_mutation_unsupported`; mobile never executes local Git
   mutation.
 - No environment keys configure these contracts.
 

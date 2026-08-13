@@ -12,6 +12,7 @@ const PRODUCT_VISUAL_SOURCE = "apps/desktop";
 const DEPENDENCY_SOURCE_POLICY = "upstream_git_root_cargo_lock";
 const FORBIDDEN_SOURCE_REFERENCES = [
   "apps/web",
+  "apps/mobile-wasm",
   "@vibex/ui",
   "react",
   "tailwind",

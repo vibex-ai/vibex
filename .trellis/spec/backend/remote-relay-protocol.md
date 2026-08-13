@@ -1,6 +1,6 @@
 # Remote and Relay Protocol
 
-Vibex remote access must let Web and mobile clients control the PC runtime
+Vibex remote access must let the mobile client control the PC runtime
 without moving trust to the Relay server. The PC remains authoritative for local
 files, Git, terminal, Agent sessions, Provider profiles, and timeline history.
 
@@ -59,7 +59,7 @@ SQLite migration v29 = pairing-offer fields + remote_devices.grant_revision
   Relay route exists; `device_management` alone must not enable pairing UI.
 - RemoteGateway is disabled and loopback by default. LAN requires explicit opt-in
   plus trusted HTTPS/WSS proxy policy. Validate Host, exact/same-authority Origin,
-  CORS/PNA, URL secret keys, WebSocket subprotocol, and static-path containment.
+  CORS/PNA, URL secret keys, and WebSocket subprotocol.
 - RPC timeout is request-local and per-connection RPC concurrency is bounded.
   Mutation retries require an idempotency key.
   Revision/generation/cursor gaps surface structured resync contracts.
@@ -84,7 +84,6 @@ SQLite migration v29 = pairing-offer fields + remote_devices.grant_revision
 | Pairing routes are empty, use the wrong transport kind, exceed eight Direct candidates, or advertise Direct while the listener is disabled | Reject with `remote_pairing_routes_unavailable`, `remote_pairing_*_candidate_invalid`, `remote_pairing_candidates_too_many`, or `remote_pairing_direct_gateway_disabled`; create no offer. |
 | Mutation omits a required idempotency key or exceeds the per-connection RPC limit | Return `remote_idempotency_key_required` or `remote_rpc_concurrency_limit`; keep the socket alive. |
 | Live Terminal scope differs from its workspace or binary generation is stale | Return `remote_terminal_scope_mismatch` or `remote_binary_generation_stale`; write zero bytes. |
-| Static path traverses or resolves through a symlink outside the root | Reject or return not found without reading the target. |
 
 ### 5. Good / Base / Bad Cases
 
@@ -105,7 +104,7 @@ SQLite migration v29 = pairing-offer fields + remote_devices.grant_revision
 - Core golden JSON and binary round-trip, including unknown enum/message safety.
 - Offer success, cancel, expiry, wrong desktop identity, challenge tamper, replay,
   and concurrent claim; plaintext secrets must be absent from SQLite/debug/audit.
-- Host/Origin/PNA/secret-query/static traversal negative tests.
+- Host/Origin/PNA/secret-query negative tests.
 - Real WebSocket single-use ticket, hello identity proof, server_info, RPC error,
   revoke close, and listener start/stop/restart tests.
 - Device-management tests must prove that route-less servers omit
@@ -142,8 +141,7 @@ create_pairing_offer request -> Gateway injects RemoteGatewayPairingRoutes
 ### 1. Scope / Trigger
 
 - Trigger: changing `RemoteConnectivityController`, Direct/Tailnet publication,
-  self-hosted Relay publication validation, `RemoteGateway` reconfiguration, or
-  the GPUI Desktop package's source-bound WebUI resources.
+  self-hosted Relay publication validation, or `RemoteGateway` reconfiguration.
 - The GPUI Desktop runtime is the only product consumer. Frozen Tauri/React
   clients do not receive a parallel command layer.
 
@@ -162,9 +160,7 @@ RemoteGateway::{current_config,apply_config_while_stopped,set_pairing_routes,
   create_pairing_offer,pairing_offer_status,cancel_pairing_offer}
 TailscalePublication::{inspect,create,remove_owned}
 GET <direct-origin>/api/v2/info -> DirectProbeInfo
-GET <relay-origin>/api/info -> RelayPublicationInfo { webBuild }
-VIBEX_WEB_BUILD_ID
-VIBEX_WEB_GIT_COMMIT
+GET <relay-origin>/api/info -> RelayPublicationInfo
 ```
 
 ### 3. Contracts
@@ -200,8 +196,8 @@ VIBEX_WEB_GIT_COMMIT
   repair retries disable when desired state is false instead of re-enabling.
 - Direct and Relay probes accept an exact HTTPS origin without credentials,
   query, fragment, or path. They disable redirects, bound timeout/body size, and
-  validate Desktop identity, protocol, fixed paths, transport features, and an
-  exact release Web build before publishing a pairing candidate. Persistence
+  validate Desktop identity where applicable, protocol, fixed paths, and
+  transport features before publishing a pairing candidate. Persistence
   failure after validation withdraws the candidate and exposes the stable
   storage error.
 - Tailscale Serve validation always uses a proxy-bypassing HTTP client. A
@@ -235,15 +231,9 @@ VIBEX_WEB_GIT_COMMIT
   claimed device and the selected method is verified as one of that offer's
   routes; enabling, validating, selecting, copying, canceling, or expiring a
   route must not update it.
-- Every GPUI Desktop package builds `apps/web/dist` before the native
-  binary, embeds `web`, and compiles the build id and Git revision into the
-  binary through `VIBEX_WEB_BUILD_ID` and
-  `VIBEX_WEB_GIT_COMMIT`. Runtime validation requires schema v1, a
-  24-character lowercase hexadecimal build id, a 40-character lowercase Git
-  revision, release profile, matching package version, required files, canonical
-  containment, and exact WASM/glue/static hashes. The Service Worker participates
-  in `staticSha256`; verification normalizes the injected build id back to
-  `__VIBEX_BUILD_ID__` before hashing to avoid a circular identity.
+- Desktop packages and RemoteGateway do not contain or serve
+  `apps/mobile-wasm/dist`. Mobile runtime construction and source identity are
+  owned by the mobile package pipeline.
 
 ### 4. Validation & Error Matrix
 
@@ -253,12 +243,11 @@ VIBEX_WEB_GIT_COMMIT
 | Validated method state cannot persist | `remote_connectivity_settings_*`; remove its candidate and expose `retry`. |
 | Direct identity/protocol/path/security mismatch | `remote_direct_identity_mismatch`, `remote_direct_protocol_incompatible`, `remote_direct_paths_invalid`, or `remote_direct_security_policy_invalid`; publish no candidate. |
 | A proxy-bypassing probe client cannot initialize, or a private/Tailnet origin cannot be reached directly | `remote_direct_probe_client_unavailable` or `remote_direct_probe_direct_failed`; publish no candidate and show actionable recovery. |
-| Web resources are missing, stale, tampered, debug-only, or source-mismatched | `web_assets_missing`, `web_assets_invalid`, or `web_assets_incompatible`; keep normal local Desktop capabilities available. |
 | Tailscale daemon/DNS/CLI is unavailable | Stable `tailscale_daemon_offline`, `tailscale_dns_unavailable`, `tailscale_binary_missing`, or `tailscale_cli_unsupported`; never mutate Serve. |
 | HTTPS 443 is occupied | `tailscale_https_port_confirmation_required` with one free 8443-8450 proposal; no create before confirmation. |
 | An owned fallback route was disabled and Tailscale is re-enabled while 443 remains occupied | Return `tailscale_https_port_confirmation_required` again; do not reuse the earlier confirmation or run `serve --bg` before the new confirmation. |
 | Owned port has a sibling or mismatched handler | `tailscale_route_ownership_mismatch`; do not run `off`. |
-| Relay lacks browser transports, pair bridge, static assets, or exact build | `relay_browser_bootstrap_unavailable`, `relay_web_build_missing`, or `relay_web_build_incompatible`; Direct remains online. |
+| Relay lacks required device WebSocket/frame or pairing-bridge features | Reject the Relay publication as incompatible; Direct remains online. |
 | Offer status references an unknown id | `remote_pairing_offer_unknown`; retain no secret error detail. |
 | Entry preference is requested before claim or for a method absent from the offer | `remote_pairing_offer_not_claimed` or `remote_pairing_entry_not_offered`; persist nothing. |
 
@@ -279,8 +268,8 @@ VIBEX_WEB_GIT_COMMIT
 - Bad: follow a probe redirect, publish before durable commit, run `serve reset`,
   infer ownership from target alone, remove a whole port containing sibling
   handlers, restart Direct for a Relay-only route change, store an entry merely
-  because it was enabled or selected, retain a terminal offer's QR material, or
-  serve an unhashed Service Worker. Do not clear proxy environment variables or
+  because it was enabled or selected, or retain a terminal offer's QR material.
+  Do not clear proxy environment variables or
   silently retry a requested proxy bypass through the system proxy.
 
 ### 6. Tests Required
@@ -308,15 +297,11 @@ VIBEX_WEB_GIT_COMMIT
   cancel/expiry/regenerate/close cleanup, narrow layout, clipboard failure, and
   safe snapshots whose Debug output contains no fragment, challenge, URL, or QR
   payload.
-- Web build tests tamper WASM, glue, static assets, and Service Worker; package
-  checks compare every required source/package asset and search the native
-  binary for the exact build id and Git revision.
 - Run `cargo test -p vibex-core remote --locked`, `cargo test -p vibex-db remote
   --locked`, `cargo test -p vibex-remote --locked`, `cargo test -p
   vibex-desktop-runtime remote --locked`, `cargo test -p vibex-desktop-runtime
-  relay --locked`, `cargo test -p vibex-remote-client --locked`, `pnpm --filter
-  @vibex/web build:release`, `pnpm package:native-content:linux`, and
-  `pnpm check:native-content-package`.
+  relay --locked`, `cargo test -p vibex-remote-client --locked`, and
+  `pnpm smoke:relay:local`.
 
 ### 7. Wrong vs Correct
 
@@ -390,7 +375,7 @@ it must still be scoped to an authorized terminal session.
 
 ## Direct WebSocket Attach and Reconnect
 
-Direct LAN/Web/PWA WebSocket mode must support the same attach semantics as the
+Direct LAN/mobile WebSocket mode must support the same attach semantics as the
 Agent timeline service:
 
 - The client authenticates during handshake using the current remote auth proof,
@@ -411,7 +396,7 @@ owns reconnect, replay, auth refresh, and queue draining.
 ## Optional Chat and IM Channels
 
 Chat/IM integrations such as Telegram, Lark/Feishu, Weixin/WeCom, or DingTalk
-are weaker-trust control surfaces than paired Web/mobile clients. They belong
+are weaker-trust control surfaces than paired installed mobile clients. They belong
 behind a channel plugin/gateway boundary and must dispatch into the same
 `RemoteRequestEnvelope`/timeline/permission path as direct remote clients.
 
@@ -944,11 +929,15 @@ Relay transport handles encrypted delivery only. `RemoteDispatcher` remains the
 single business execution boundary for direct HTTP, direct WebSocket, and Relay
 commands.
 
-## Scenario: Phase 5 Web/PWA Relay Transport Mode
+## Retired Historical Scenario: Phase 5 Web/PWA Relay Transport Mode
+
+> Retired with the WebUI/PWA product. Current mobile Relay transport uses the
+> shared Rust `WebRemoteBackend` and the installed-app contracts below; this
+> section remains only as protocol-evolution history.
 
 ### 1. Scope / Trigger
 
-- Trigger: Phase 5 fourth child adds Relay transport mode to `apps/web`.
+- Trigger: Phase 5 fourth child adds Relay transport mode to `apps/mobile-wasm`.
 - This scenario covers browser-side Relay pairing, browser-compatible E2EE,
   encrypted remote handshake, encrypted command transport, auth-state mode
   selection, and direct/Relay cache separation. Native mobile shell packaging,
@@ -1005,7 +994,7 @@ RelayBrowserSession::open_json(RelayEncryptedFrame)
 
 ### 3. Contracts
 
-- `apps/web` consumes Relay and Remote DTOs through shared Rust contracts and
+- `apps/mobile-wasm` consumes Relay and Remote DTOs through shared Rust contracts and
   `WebRemoteBackend`. It must not redefine wire variants for Relay control messages,
   encrypted frames, or remote business envelopes.
 - Direct, Relay, and fixture modes are explicit in auth state. Old direct-mode
@@ -1079,7 +1068,7 @@ RelayBrowserSession::open_json(RelayEncryptedFrame)
 
 ### 6. Tests Required
 
-- `@vibex/web` typecheck and build.
+- `@vibex/mobile-wasm` typecheck and build.
 - Browser Relay helper checks, when test tooling exists, for associated-data
   parity, encrypt/decrypt happy path, tamper rejection, replay rejection,
   out-of-order rejection, and plaintext-leak checks.
@@ -1122,12 +1111,12 @@ business capability, auth, permission, audit, and state.
 ### 1. Scope / Trigger
 
 - Trigger: Phase 5 final child adds self-hosted Relay deployment assets,
-  local Relay smoke automation, and a NAT-style browser/mobile verification
+  local Relay smoke automation, and a NAT-style mobile verification
   checklist.
 - This scenario defines the transport-only local smoke baseline, Caddy reverse
   proxy, Relay health/info validation, NAT evidence, and deployment redaction
-  rules. The source-bound GPUI WebUI release image is defined by the following
-  hosting scenario; neither mode permits Relay-side payload decryption.
+  rules. Relay is always transport-only and never permits Relay-side payload
+  decryption or product-asset hosting.
 
 ### 2. Signatures
 
@@ -1152,8 +1141,8 @@ GET /api/info -> RelayServerInfo
 RelayServerInfo.features.pcWebsocket = true
 RelayServerInfo.features.httpPairBridge = true
 RelayServerInfo.features.httpCommandBridge = true
-RelayServerInfo.features.staticRoomAssets = false  # no web_static_dir
-RelayServerInfo.webBuild = omitted                 # no web_static_dir
+RelayServerInfo.features has no staticRoomAssets field
+RelayServerInfo has no webBuild field
 ```
 
 Transport-only local smoke env vars:
@@ -1165,12 +1154,12 @@ RELAY_PORT
 
 ### 3. Contracts
 
-- `pnpm smoke:relay:local` builds and runs only `vibex-relay-server`, without a
-  static root. It must keep reporting `staticRoomAssets=false` and omitting
-  `webBuild`, so transport-only library and development use remains supported.
-- Release containers may package the source-bound GPUI WebUI described below,
-  but must never package generated mobile native projects, provider home
-  configs, local databases, auth tokens, pairing codes, or private keys.
+- `pnpm smoke:relay:local` builds and runs only `vibex-relay-server`. Root,
+  asset-like, and extensionless navigation paths return 404; `/api/info`
+  exposes no static-asset or Web-build capability.
+- Release containers must not package the mobile runtime, generated mobile
+  projects, provider home configs, local databases, auth tokens, pairing codes,
+  or private keys.
 - `apps/relay-server` source must compile with the Docker builder Rust version
   and the workspace `rust-version`; do not use newer Rust syntax there unless
   both the workspace and Dockerfile are updated together.
@@ -1179,8 +1168,8 @@ RELAY_PORT
   that binds to `127.0.0.1:{port}` when `VIBEX_RELAY_BIND_ADDR` is unset.
 - Compose publishes `127.0.0.1:9700` by default for local testing; operators
   must opt into broader host binding or HTTPS reverse proxy exposure.
-- Caddy proxies the same origin for Web assets, `/api/*`, and `/ws`. The PC
-  Relay client uses `/ws`; Web/PWA and mobile clients use `/api/info`,
+- Caddy proxies `/health`, `/api/*`, and `/ws`. The PC Relay client uses `/ws`;
+  mobile clients use `/api/info`,
   `/api/rooms/:room_id/pair`, and `/api/rooms/:room_id/command`.
 - `/api/info` is the source for Relay bridge feature/limit checks. It is not PC
   business capability info and must not enable Agent/Git/terminal/Provider UI
@@ -1205,13 +1194,13 @@ RELAY_PORT
 - `/health` unreachable -> local smoke failure or deployment health failure.
 - `/api/info` missing pair/command/WebSocket bridge features -> Relay mode is
   unsupported for NAT smoke.
-- Transport-only local smoke reports `staticRoomAssets=true` or a `webBuild` ->
-  configuration leakage; the no-assets baseline must remain explicit.
+- Relay `/api/info` reports a static-asset or Web-build field, or `/` returns
+  HTML -> product-boundary regression.
 - Public URL serves `/api/info` but not `/ws` -> Caddy/reverse-proxy
   misconfiguration; PC cannot maintain the outbound room connection.
 - `activeRooms` stays `0` after PC Relay start -> PC settings, public URL, room
   id, firewall, TLS, or WebSocket proxy problem.
-- Browser/mobile connects to Relay but not PC capabilities -> encrypted pair,
+- Mobile connects to Relay but not PC capabilities -> encrypted pair,
   remote handshake, device auth proof, revocation, or permission problem; do
   not treat Relay `/api/info` as PC service info.
 - Relay logs contain the disposable business marker or sensitive payload fields
@@ -1220,7 +1209,7 @@ RELAY_PORT
 ### 5. Good/Base/Bad Cases
 
 - Good: an operator deploys `vibex-relay-server` behind Caddy, the PC connects
-  outbound to `/ws`, a mobile browser pairs through `/api/rooms/:room_id/pair`,
+  outbound to `/ws`, the installed mobile app pairs through `/api/rooms/:room_id/pair`,
   sends encrypted commands through `/api/rooms/:room_id/command`, and reconnect
   catch-up restores missed PC timeline state without Relay plaintext logs.
 - Base: `pnpm smoke:relay:local` starts a local Relay, validates `/health`,
@@ -1260,14 +1249,19 @@ material into deployment artifacts.
 Relay deployment guide
   -> expose HTTPS reverse proxy for /api/* and /ws
   -> prefill only Relay URL and room id where needed
-  -> keep RemoteAuthProof in the Web/PWA auth flow
+  -> keep device proof in the installed mobile app
   -> collect only health/info/status counts and redacted structured errors
 ```
 
 The Relay remains an opaque transport bridge. The PC remains authoritative for
 business auth, permission, audit, and state.
 
-## Scenario: Self-Hosted Relay GPUI WebUI Hosting
+## Retired Historical Scenario: Self-Hosted Relay GPUI WebUI Hosting
+
+> Retired. Relay static hosting, `WebBuildDescriptor`,
+> `VIBEX_RELAY_WEB_STATIC_DIR`, SPA fallback, and Relay image Web identity no
+> longer exist. The current invariant is transport-only Relay: `/health`,
+> `/api/*`, and `/ws`; all product/static paths return 404.
 
 ### 1. Scope / Trigger
 
@@ -1286,7 +1280,7 @@ WebBuildDescriptor {
 }
 
 RelayServerConfig.web_static_dir: Option<PathBuf>
-VIBEX_RELAY_WEB_STATIC_DIR=/app/web
+VIBEX_RELAY_WEB_STATIC_DIR=/app/mobile-wasm
 VIBEX_RELAY_WEB_BUILD_ID=<24 lowercase hex>       # compile-time image binding
 VIBEX_RELAY_WEB_GIT_COMMIT=<40 lowercase hex>     # compile-time image binding
 
@@ -1383,7 +1377,7 @@ GET|HEAD /<asset-or-extensionless-navigation> -> static file or index.html
 #### Wrong
 
 ```text
-COPY apps/web/dist /app/web
+COPY apps/mobile-wasm/dist /app/mobile-wasm
 Relay starts -> staticRoomAssets=true
 GET /api/missing -> index.html
 ```
@@ -2100,7 +2094,7 @@ Remote UI -> list_runtime_options (ReadAgentSession)
 
 ### 1. Scope / Trigger
 
-- Trigger: a paired Web/mobile client needs the same redacted Agent default
+- Trigger: a paired mobile client needs the same redacted Agent default
   account state, login methods, operation progress, verification, model refresh,
   logout impact, and logout action as GPUI Desktop.
 - `DesktopRuntime` remains the only credential/process authority. Remote and
@@ -2235,12 +2229,13 @@ remote typed request + device proof
   -> keep Relay as ciphertext transport only
 ```
 
-## Scenario: GPUI Web Pairing, Auto Transport, And Bounded Streams
+## Scenario: Mobile GPUI-WASM Pairing, Auto Transport, And Bounded Streams
 
 ### 1. Scope / Trigger
 
 - Trigger: `crates/vibex-remote-client` pairing/transport code is changed, or
-  Web/Capacitor wires the shared GPUI Backend facade to v2 Direct/Relay routes.
+  the GPUI-WASM/Capacitor mobile runtime wires the shared GPUI Backend facade to
+  v2 Direct/Relay routes.
 - This scenario covers the Rust client boundary: entry-bound one-time pairing,
   Direct-first Auto transport, typed WebRemoteBackend mapping, authoritative
   cursor recovery, and Terminal/File binary flow. Product Views remain outside
@@ -2249,8 +2244,8 @@ remote typed request + device proof
 ### 2. Signatures
 
 ```text
-PairingEntryHint { schema_version, kind, origin? }
-PairingEntryHintKind = origin | untrusted_custom_scheme
+PairingEntryHint { schema_version, kind, origin?, transport? }
+PairingEntryHintKind = mobile_app | origin | untrusted_custom_scheme
 select_pairing_claim_route(RemotePairingOffer, PairingEntryHint)
   -> PairingClaimRoute::Direct { claim_base_url, transport }
    | PairingClaimRoute::Relay(RemotePairingCandidate)
@@ -2277,11 +2272,15 @@ CredentialStore / ClientIdentityStore
 
 ### 3. Contracts
 
-- Parse and validate the full server-issued offer before using its candidates. A
-  `PairingEntryHint` may identify only an exact normalized origin already in the
-  offer. Direct, Tailnet, and self-hosted Relay are eligible; custom schemes,
-  unmatched origins, and ambiguous same-origin candidates fail closed. Never use
-  the hint itself as a request URL.
+- Parse and validate the full server-issued offer before using its candidates.
+  A `mobile_app` hint carries exactly one eligible transport and no origin; an
+  `origin` hint carries exactly one normalized development-host origin and no
+  transport. Either form may select only a Direct, Tailnet, or self-hosted Relay
+  route already in the offer. Untrusted schemes, unmatched routes, and ambiguous
+  origins fail closed. When several server-owned candidates share the mobile
+  hint's transport, claim through the first valid candidate in offer order, then
+  retain every validated candidate in the committed Auto route bundle. Never use
+  hint data itself as a request URL.
 - One confirmation chooses and invokes exactly one claim route. Do not fall back
   to another route after a timeout, write error, malformed response, or other
   failure that could occur after dispatch because the one-time offer may already
@@ -2295,7 +2294,7 @@ CredentialStore / ClientIdentityStore
   not claim a pairing offer, issue a ticket, or rotate a device grant. Candidate
   count, probe response bytes, and probe time are bounded. Selection is
   deterministic by measured latency then candidate priority.
-- Formal browser connections require HTTPS/WSS and reject URL credentials,
+- Product mobile connections require HTTPS/WSS and reject URL credentials,
   query strings, and fragments. HTTP/WS is accepted only for an explicit
   loopback development exception. The client checks the paired server id and
   static identity key before ticket/WS use.
@@ -2355,8 +2354,8 @@ CredentialStore / ClientIdentityStore
 
 | Condition | Required result |
 | --- | --- |
-| Entry hint schema/kind/origin is invalid or uses a custom scheme | `remote_pairing_entry_hint_incompatible`, `remote_pairing_entry_hint_invalid`, or `remote_pairing_entry_untrusted`; send no claim. |
-| Entry origin matches zero or multiple offered routes | `remote_pairing_entry_route_mismatch` or `_route_ambiguous`; send no claim. |
+| Entry hint schema/kind/origin/transport is invalid or uses an untrusted custom scheme | `remote_pairing_entry_hint_incompatible`, `remote_pairing_entry_hint_invalid`, or `remote_pairing_entry_untrusted`; send no claim. |
+| Mobile transport matches no offered route, or entry origin matches zero or multiple offered routes | `remote_pairing_entry_route_mismatch` or `_route_ambiguous`; send no claim. |
 | One-time claim has a possibly post-dispatch failure | Return the typed claim error; do not replay across Direct/Relay. |
 | Claim response device/public key/grant or route bundle is invalid | `remote_pairing_claim_response_invalid` or route validation error; export no credential. |
 | Candidate list empty/over limit | `remote_candidate_count_invalid`; no probe beyond the bound. |
@@ -2377,13 +2376,14 @@ CredentialStore / ClientIdentityStore
 
 ### 5. Good / Base / Bad Cases
 
-- Good: a Tailnet entry origin matches exactly the offer's Tailnet candidate,
+- Good: a mobile Tailnet entry selects the first valid Tailnet candidate in
+  server offer order,
   performs one claim, commits a credential containing all routes, and Auto later
   uses the same paired device identity across Direct/Relay handoff.
 - Good: Auto probes LAN and Tailnet candidates in parallel, chooses the healthy
   low-latency path, then uses the same paired device identity for the ticket and
   v2 handshake while exposing the selected active route.
-- Good: a browser sleep/reconnect or bounded queue overflow produces a lagged
+- Good: a mobile suspend/reconnect or bounded queue overflow produces a lagged
   event and authoritative timeline/runtime refetch; an uncertain Agent send is
   resolved by `GetMessageSubmission` before any retry.
 - Good: reconnecting from a server with `device_pairing` to one that advertises
@@ -2393,8 +2393,8 @@ CredentialStore / ClientIdentityStore
 - Good: a Terminal stream with an evicted frame emits `reset_required`, while a
   large file is written chunk-by-chunk into a sink and the final total/checksum
   is checked before commit.
-- Base: a loopback HTTP fixture is allowed only when the caller explicitly sets
-  the development exception; production browser state remains HTTPS/WSS-only.
+- Base: a loopback HTTP fixture is allowed only when the development host
+  explicitly sets the exception; product mobile state remains HTTPS/WSS-only.
 - Bad: use the entry hint as a URL, try Direct and Relay claims in sequence, probe
   by consuming the offer, put the grant in a URL, treat an RPC timeout as socket
   death, resend a prompt after reconnect, advance a cursor on a dropped event,
@@ -2415,7 +2415,7 @@ CredentialStore / ClientIdentityStore
   `projection_invalidation_gaps_coalesce_without_pausing_other_domains`, and
   `projection_invalidation_burst_coalesces_without_pausing_agent_events` green.
 - `cargo check -p vibex-remote-client --target wasm32-unknown-unknown --locked`
-  proves the browser transport, bounded WebSocket channel, Web Storage traits,
+  proves the mobile WASM transport, bounded WebSocket channel, storage traits,
   and shared Backend graph remain WASM-safe.
 - Direct smoke must cover `/api/v2/info` probe without offer consumption,
   pairing claim, device identity, WS ticket, v2 crypto confirmation, subscribe,
@@ -2423,10 +2423,9 @@ CredentialStore / ClientIdentityStore
   revoke, and reconnect without cross-route claim replay. A TLS/WSS fixture is
   required before a production LAN/Tailnet release claim; loopback HTTP is
   development evidence only.
-- `pnpm check:wasm-web` must rebuild release WASM, recapture source-bound
-  browser evidence after any target-reachable remote change, and pass Chromium
-  plus Firefox checks. Run workspace Rust checks and `git diff --check` before
-  commit.
+- `pnpm check:mobile-wasm-host` and `pnpm check:wasm-integration` must rebuild or
+  validate source-bound mobile runtime evidence after target-reachable remote
+  changes. Run workspace Rust checks and `git diff --check` before commit.
 
 ### 7. Wrong vs Correct
 
@@ -2523,13 +2522,13 @@ The Relay server may provide:
 - `/ws` for PC room connection
 - `/api/rooms/:room_id/pair`
 - `/api/rooms/:room_id/command`
-- `/` plus constrained GET/HEAD static assets and extensionless SPA fallback
-  when a validated GPUI Web release root is configured
 - Room TTL, heartbeat, connection limits, and rate limits
 
 The Relay server must not decrypt business payloads, inspect file paths, inspect
 terminal output, inspect Agent messages, or make authorization decisions beyond
-room-level transport rules.
+room-level transport rules. It must not host HTML, GPUI-WASM, PWA metadata,
+icons, fonts, or any other product asset; non-API product/static routes return
+404.
 
 ## Large Payloads
 
@@ -2557,4 +2556,5 @@ ids instead of duplicating sensitive payloads.
 - Do not implement a separate mobile-only API shape.
 - Do not let Relay room ids act as authorization secrets by themselves.
 - Do not send plaintext business payloads through Relay.
+- Do not restore Relay/Desktop static hosting for the mobile runtime.
 - Do not skip timeline catch-up after reconnect.

@@ -21,7 +21,6 @@ use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use url::Url;
 use vibex_backend::{BackendBound, BackendError, BackendErrorKind, BackendFuture, BackendResult};
-pub use vibex_core::WebBuildDescriptor as RelayWebBuildDescriptor;
 use vibex_core::{
     CorrelationId, RelayControlMessage, RelayError, RelayErrorCode, RelayFrameKind,
     RelayHandshakeHello, RelayPeerId, RelayPeerMessage, RelayPeerRole, RelayRoomId,
@@ -174,9 +173,9 @@ impl RemoteClientConfig {
             device_identity: None,
             expected_server_id: None,
             expected_server_identity_public_key: None,
-            client_id: "vibex-web".to_string(),
+            client_id: "vibex-mobile-wasm".to_string(),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
-            client_type: vibex_core::RemoteClientType::Browser,
+            client_type: vibex_core::RemoteClientType::Mobile,
             allow_insecure_local_dev: false,
             reconnect_initial: Duration::from_millis(250),
             reconnect_max: Duration::from_secs(15),
@@ -306,39 +305,18 @@ pub struct RelayEndpointInfo {
     pub protocol_version: vibex_core::RelayProtocolVersion,
     pub features: RelayEndpointFeatures,
     pub limits: RelayEndpointLimits,
-    #[serde(default)]
-    pub web_build: Option<RelayWebBuildDescriptor>,
 }
 
 impl RelayEndpointInfo {
-    pub fn validate_browser_bootstrap(
-        &self,
-        expected: &RelayWebBuildDescriptor,
-    ) -> BackendResult<()> {
+    pub fn validate_transport_capabilities(&self) -> BackendResult<()> {
         if !self.features.pc_websocket
             || !self.features.device_websocket
             || !self.features.websocket_frames
             || !self.features.http_pair_bridge
-            || !self.features.static_room_assets
         {
             return Err(BackendError::unsupported(
-                "relay_browser_bootstrap_unavailable",
-                "self-hosted Relay does not expose the required browser pairing surface",
-            ));
-        }
-        let Some(actual) = self.web_build.as_ref() else {
-            return Err(BackendError::unsupported(
-                "relay_web_build_missing",
-                "self-hosted Relay does not advertise a WebUI build",
-            ));
-        };
-        if actual.schema_version != "vibex-web-build.v1"
-            || actual.profile != "release"
-            || actual != expected
-        {
-            return Err(BackendError::unsupported(
-                "relay_web_build_incompatible",
-                "self-hosted Relay WebUI build does not match this Desktop",
+                "relay_transport_unavailable",
+                "self-hosted Relay does not expose the required mobile transport surface",
             ));
         }
         Ok(())
@@ -355,7 +333,6 @@ pub struct RelayEndpointFeatures {
     pub websocket_frames: bool,
     pub http_pair_bridge: bool,
     pub http_command_bridge: bool,
-    pub static_room_assets: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4992,6 +4969,13 @@ mod tests {
     }
 
     #[test]
+    fn remote_client_defaults_to_the_installed_mobile_product_identity() {
+        let config = test_config("https://desktop.example");
+        assert_eq!(config.client_id, "vibex-mobile-wasm");
+        assert_eq!(config.client_type, vibex_core::RemoteClientType::Mobile);
+    }
+
+    #[test]
     fn secure_context_policy_allows_only_explicit_loopback_exception() {
         let auth = test_config("https://desktop.example").auth;
         let config = RemoteClientConfig::new("http://192.168.1.5:8080", auth.clone());
@@ -5328,17 +5312,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_browser_bootstrap_requires_matching_release_build() {
-        let expected = RelayWebBuildDescriptor {
-            schema_version: "vibex-web-build.v1".to_string(),
-            build_id: "build-1".to_string(),
-            package_version: "0.1.0-rc.1".to_string(),
-            profile: "release".to_string(),
-            git_commit: "revision-1".to_string(),
-            wasm_sha256: "wasm".to_string(),
-            glue_sha256: "glue".to_string(),
-            static_sha256: "static".to_string(),
-        };
+    fn relay_transport_requires_mobile_protocol_capabilities() {
         let mut info = RelayEndpointInfo {
             service_name: "Relay".to_string(),
             server_version: "0.1.0-rc.1".to_string(),
@@ -5349,7 +5323,6 @@ mod tests {
                 websocket_frames: true,
                 http_pair_bridge: true,
                 http_command_bridge: true,
-                static_room_assets: true,
             },
             limits: RelayEndpointLimits {
                 max_total_connections: 10,
@@ -5357,18 +5330,13 @@ mod tests {
                 max_queue_bytes_per_connection: 1024,
                 max_bandwidth_bytes_per_window: 1024,
             },
-            web_build: Some(expected.clone()),
         };
-        info.validate_browser_bootstrap(&expected).unwrap();
+        info.validate_transport_capabilities().unwrap();
 
-        info.web_build.as_mut().unwrap().build_id = "other-build".to_string();
+        info.features.websocket_frames = false;
         assert_eq!(
-            info.validate_browser_bootstrap(&expected).unwrap_err().code,
-            "relay_web_build_incompatible"
+            info.validate_transport_capabilities().unwrap_err().code,
+            "relay_transport_unavailable"
         );
-        info.web_build = None;
-        let encoded = serde_json::to_value(&info).unwrap();
-        let legacy: RelayEndpointInfo = serde_json::from_value(encoded).unwrap();
-        assert!(legacy.web_build.is_none());
     }
 }

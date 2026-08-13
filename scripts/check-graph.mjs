@@ -68,6 +68,7 @@ function assertSharedUiIsolation() {
   }
   const forbiddenReferences = [
     "apps/web",
+    "apps/mobile-wasm",
     "packages/ui",
     "@vibex/ui",
     "react",

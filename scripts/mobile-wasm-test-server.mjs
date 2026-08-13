@@ -6,7 +6,7 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const DEFAULT_DIST = join(ROOT, "apps/web/dist");
+const DEFAULT_DIST = join(ROOT, "apps/mobile-wasm/dist");
 const WEB_SOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const CONTENT_TYPES = new Map([
   [".css", "text/css; charset=utf-8"],
@@ -123,7 +123,7 @@ function serveStatic(response, dist, pathname) {
 export async function startWasmServer({ dist = DEFAULT_DIST, host = "127.0.0.1", port = 0 } = {}) {
   const absoluteDist = resolve(dist);
   if (!existsSync(join(absoluteDist, "index.html"))) {
-    throw new Error(`Web dist is missing: ${absoluteDist}`);
+    throw new Error(`Mobile runtime dist is missing: ${absoluteDist}`);
   }
   const server = createServer((request, response) => {
     const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
@@ -155,7 +155,7 @@ export async function startWasmServer({ dist = DEFAULT_DIST, host = "127.0.0.1",
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const requestedPort = Number(process.env.PORT ?? process.argv[2] ?? 4173);
   const running = await startWasmServer({ port: requestedPort });
-  console.log(`Vibex Web: ${running.origin}`);
+  console.log(`Vibex mobile WASM development host: ${running.origin}`);
   const stop = async () => {
     await running.close();
     process.exit(0);

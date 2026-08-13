@@ -35,7 +35,7 @@ export const PRODUCT_PAIRING_WORKFLOWS = [
 export const PRODUCT_PAIRING_CHECKS = [
   "desktop_product_offer",
   "copy_link_broker",
-  "visible_web_confirm",
+  "visible_runtime_confirm",
   "fresh_mobile_viewport",
   "app_link_intake",
   "scanner_intake",
@@ -45,7 +45,7 @@ export const PRODUCT_PAIRING_CHECKS = [
   "scanner_oversized",
   "permission_matrix",
   "refresh_restore",
-  "browser_reopen",
+  "development_host_reopen",
   "desktop_restart",
   "method_recovery",
   "global_disable_reenable",
@@ -59,7 +59,7 @@ export const PRODUCT_PAIRING_CHECKS = [
   "storage_failure",
   "protocol_incompatible",
   "orphan_device_check",
-  "source_bound_relay",
+  "relay_transport_only",
   "secret_scan"
 ];
 
@@ -73,8 +73,8 @@ const PRODUCT_SOURCE_INPUTS = [
   "apps/mobile/native-shell-contract.json",
   "apps/mobile/scripts",
   "apps/relay-server/src",
-  "apps/web/src",
-  "apps/web/web",
+  "apps/mobile-wasm/src",
+  "apps/mobile-wasm/host",
   "crates/core/src/remote_v2.rs",
   "crates/desktop-runtime/src/remote_connectivity.rs",
   "crates/desktop-runtime/src/relay.rs",
@@ -118,32 +118,32 @@ function candidateDigest(candidate) {
       productSourceTreeSha256: candidate.productSourceTreeSha256,
       cargoLockSha256: candidate.cargoLockSha256,
       pnpmLockSha256: candidate.pnpmLockSha256,
-      webBuildId: candidate.webBuildId,
-      webGitCommit: candidate.webGitCommit,
-      webBuildSha256: candidate.webBuildSha256
+      mobileRuntimeBuildId: candidate.mobileRuntimeBuildId,
+      mobileRuntimeGitCommit: candidate.mobileRuntimeGitCommit,
+      mobileRuntimeBuildSha256: candidate.mobileRuntimeBuildSha256
     })
   );
 }
 
 export function resolveProductPairingCandidate(root) {
-  const webBuildBytes = readFileSync(join(root, "apps/web/dist/build.json"));
-  const webBuild = JSON.parse(webBuildBytes.toString("utf8"));
+  const mobileRuntimeBuildBytes = readFileSync(join(root, "apps/mobile-wasm/dist/build.json"));
+  const mobileRuntimeBuild = JSON.parse(mobileRuntimeBuildBytes.toString("utf8"));
   if (
-    webBuild.schemaVersion !== "vibex-web-build.v1" ||
-    webBuild.profile !== "release" ||
-    !/^[0-9a-f]{24}$/.test(webBuild.buildId ?? "") ||
-    !/^[0-9a-f]{40}$/.test(webBuild.gitCommit ?? "")
+    mobileRuntimeBuild.schemaVersion !== "vibex-mobile-wasm-build.v1" ||
+    mobileRuntimeBuild.profile !== "release" ||
+    !/^[0-9a-f]{24}$/.test(mobileRuntimeBuild.buildId ?? "") ||
+    !/^[0-9a-f]{40}$/.test(mobileRuntimeBuild.gitCommit ?? "")
   ) {
-    throw new Error("product_pairing_web_build_invalid");
+    throw new Error("product_pairing_mobile_runtime_build_invalid");
   }
   const candidate = {
     sourceCommit: currentCommit(root),
     productSourceTreeSha256: sourceTreeSha256(root, PRODUCT_SOURCE_INPUTS),
     cargoLockSha256: sha256(readFileSync(join(root, "Cargo.lock"))),
     pnpmLockSha256: sha256(readFileSync(join(root, "pnpm-lock.yaml"))),
-    webBuildId: webBuild.buildId,
-    webGitCommit: webBuild.gitCommit,
-    webBuildSha256: sha256(webBuildBytes)
+    mobileRuntimeBuildId: mobileRuntimeBuild.buildId,
+    mobileRuntimeGitCommit: mobileRuntimeBuild.gitCommit,
+    mobileRuntimeBuildSha256: sha256(mobileRuntimeBuildBytes)
   };
   return { ...candidate, candidateDigest: candidateDigest(candidate) };
 }
@@ -260,21 +260,24 @@ function validateCandidate(candidate) {
       "productSourceTreeSha256",
       "cargoLockSha256",
       "pnpmLockSha256",
-      "webBuildId",
-      "webGitCommit",
-      "webBuildSha256",
+      "mobileRuntimeBuildId",
+      "mobileRuntimeGitCommit",
+      "mobileRuntimeBuildSha256",
       "candidateDigest"
     ],
     "product_pairing_candidate_shape_invalid"
   );
   assert(/^[0-9a-f]{40}$/.test(candidate.sourceCommit), "product_pairing_commit_invalid");
-  assert(/^[0-9a-f]{24}$/.test(candidate.webBuildId), "product_pairing_build_id_invalid");
-  assert(/^[0-9a-f]{40}$/.test(candidate.webGitCommit), "product_pairing_web_commit_invalid");
+  assert(/^[0-9a-f]{24}$/.test(candidate.mobileRuntimeBuildId), "product_pairing_build_id_invalid");
+  assert(
+    /^[0-9a-f]{40}$/.test(candidate.mobileRuntimeGitCommit),
+    "product_pairing_mobile_runtime_commit_invalid"
+  );
   for (const field of [
     "productSourceTreeSha256",
     "cargoLockSha256",
     "pnpmLockSha256",
-    "webBuildSha256",
+    "mobileRuntimeBuildSha256",
     "candidateDigest"
   ]) {
     hash(candidate[field], `product_pairing_${field}_invalid`);
@@ -333,7 +336,7 @@ function validateAutomated(result, mode, digest) {
   }
   passedMap(
     result.entries,
-    ["browser_url", "app_link", "in_app_scanner"],
+    ["development_host", "app_link", "in_app_scanner"],
     `product_pairing_${mode}_entries_invalid`
   );
   passedMap(result.checks, PRODUCT_PAIRING_CHECKS, `product_pairing_${mode}_checks_invalid`);
@@ -414,7 +417,7 @@ function scanRedaction(value, path = "evidence") {
   }
   if (!value || typeof value !== "object") return;
   for (const [key, child] of Object.entries(value)) {
-    const classificationKey = path.endsWith("_entries") && key === "browser_url";
+    const classificationKey = path.endsWith("_entries") && key === "development_host";
     if (!classificationKey) {
       assert(
         !/(?:url|origin|room|peer|grant|challenge|fragment|privateKey|rawLog|serial|dnsName)$/i.test(key),

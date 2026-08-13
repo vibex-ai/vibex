@@ -1,8 +1,8 @@
 # Frontend Directory Structure
 
 The current presentation layer is Rust GPUI code shared by native and WASM targets.
-The GPUI Desktop result is the product baseline; Web/mobile add host bridges and a
-RemoteBackend, not independent page/component trees.
+The GPUI Desktop result is the product baseline; mobile adds a host bridge and a
+RemoteBackend, not an independent page/component tree or browser product.
 
 Primary architecture: [Architecture Baseline](../guides/architecture-baseline.md).
 
@@ -25,13 +25,14 @@ crates/vibex-remote-client/
   src/                   WebRemoteBackend, sync state machine, Direct/Relay transport
 apps/desktop/
   src/                   NativeBackend, platform bridge, DesktopRuntime bootstrap
-apps/web/
-  src/                   wasm-bindgen bootstrap and browser host bridge only
+apps/mobile-wasm/
+  src/                   wasm-bindgen bootstrap for the mobile runtime
+  host/                  Capacitor host adapter; browser use is development-only
 apps/mobile/
                          Capacitor metadata and native host bridge only
 ```
 
-The current `apps/web`, `apps/mobile`, and `apps/desktop` paths reuse locations
+The current `apps/mobile-wasm`, `apps/mobile`, and `apps/desktop` paths reuse locations
 that previously held React/Tauri implementations. Those former contents and
 `packages/ui` were deleted at the final legacy cutover. References to the old
 composition in detailed specs and evidence describe historical behavior only.
@@ -90,5 +91,5 @@ policy entry, and embedded source path synchronized, then prove the contract wit
   the GPUI tree.
 - No source-level legacy shell or `packages/ui` fallback for release rollback.
 - No User-Agent layout branching; use viewport and negotiated host capabilities.
-- No client-local Agent/Git/PTY/filesystem runtime on Web/mobile.
+- No client-local Agent/Git/PTY/filesystem runtime on mobile.
 - No provider-specific timeline renderer or raw transport parsing in a View.

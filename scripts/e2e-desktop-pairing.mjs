@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, extname, join, normalize, resolve } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { chromium } from "@playwright/test";
@@ -30,6 +30,19 @@ import { permissionContractSha256 } from "./workflow-e2e-evidence.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const MOBILE_VIEWPORT = { width: 390, height: 844 };
+const DEVELOPMENT_ORIGIN = "https://localhost";
+const MOBILE_RUNTIME_DIST = join(ROOT, "apps/mobile-wasm/dist");
+const DEVELOPMENT_CONTENT_TYPES = new Map([
+  [".css", "text/css; charset=utf-8"],
+  [".html", "text/html; charset=utf-8"],
+  [".js", "text/javascript; charset=utf-8"],
+  [".json", "application/json; charset=utf-8"],
+  [".png", "image/png"],
+  [".svg", "image/svg+xml"],
+  [".ttc", "font/collection"],
+  [".ttf", "font/ttf"],
+  [".wasm", "application/wasm"]
+]);
 const CONTROL_RESPONSE_LIMIT = 64 * 1024;
 const METHOD = Object.freeze({
   tailscale: "tailscale_serve",
@@ -413,6 +426,24 @@ async function newProductContext(browser, native = false) {
     viewport: MOBILE_VIEWPORT,
     serviceWorkers: "block"
   });
+  await context.route(`${DEVELOPMENT_ORIGIN}/**`, async (route) => {
+    const url = new URL(route.request().url());
+    const relative = url.pathname === "/" ? "index.html" : decodeURIComponent(url.pathname.slice(1));
+    const path = normalize(join(MOBILE_RUNTIME_DIST, relative));
+    if (
+      !path.startsWith(`${MOBILE_RUNTIME_DIST}/`) ||
+      !existsSync(path)
+    ) {
+      await route.fulfill({ status: 404, contentType: "text/plain", body: "Not found\n" });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: DEVELOPMENT_CONTENT_TYPES.get(extname(path)) ?? "application/octet-stream",
+      headers: { "cache-control": "no-store", "x-content-type-options": "nosniff" },
+      body: readFileSync(path)
+    });
+  });
   if (native) await context.addInitScript(nativeFixtureScript);
   return context;
 }
@@ -434,37 +465,34 @@ async function waitPairingState(page, states, code, timeout = 65_000) {
   fail(`${code}_state_${observedState}`);
 }
 
-async function gotoPublic(page, origin) {
+async function gotoDevelopmentHost(page) {
   try {
-    await page.goto(origin, { waitUntil: "domcontentloaded", timeout: 65_000 });
+    await page.goto(`${DEVELOPMENT_ORIGIN}/`, {
+      waitUntil: "domcontentloaded",
+      timeout: 65_000
+    });
   } catch {
-    fail("product_pairing_page_navigation_failed");
+    fail("product_pairing_development_host_navigation_failed");
   }
   await waitForRuntime(page);
 }
 
 async function openPairingIntake(browser, link, intake) {
-  const native = intake === "app_link" || intake === "scanner" || intake === "storage_failure";
-  const context = await newProductContext(browser, native);
+  const context = await newProductContext(browser, true);
   const page = await context.newPage();
-  if (intake === "browser_url") {
-    await gotoPublic(page, link);
+  await gotoDevelopmentHost(page);
+  await waitPairingState(page, ["unpaired", "idle"], "product_pairing_unpaired_state_missing");
+  if (intake === "app_link") {
+    await page.evaluate((value) => globalThis.__VIBEX_E2E_NATIVE__.appLink(value), link);
   } else {
-    const cleanOrigin = new URL(link).origin;
-    await gotoPublic(page, cleanOrigin);
-    await waitPairingState(page, ["unpaired", "idle"], "product_pairing_unpaired_state_missing");
-    if (intake === "app_link") {
-      await page.evaluate((value) => globalThis.__VIBEX_E2E_NATIVE__.appLink(value), link);
-    } else {
-      if (intake === "storage_failure") {
-        await page.evaluate(() => globalThis.__VIBEX_E2E_NATIVE__.failStorage(true));
-      }
-      await page.evaluate(
-        (value) => globalThis.__VIBEX_E2E_NATIVE__.scanner("value", value),
-        link
-      );
-      await page.locator("#pairing-scan").click();
+    if (intake === "storage_failure") {
+      await page.evaluate(() => globalThis.__VIBEX_E2E_NATIVE__.failStorage(true));
     }
+    await page.evaluate(
+      (value) => globalThis.__VIBEX_E2E_NATIVE__.scanner("value", value),
+      link
+    );
+    await page.locator("#pairing-scan").click();
   }
   assert(await page.evaluate(() => location.hash === ""), "pairing_fragment_not_scrubbed");
   return { context, page };
@@ -569,7 +597,7 @@ async function scannerNegative(environment, browser, kind, expectedState, value 
   const before = await trustSummary(environment);
   const context = await newProductContext(browser, true);
   const page = await context.newPage();
-  await gotoPublic(page, environment.entryOrigin);
+  await gotoDevelopmentHost(page);
   await waitPairingState(page, ["unpaired", "idle"], "scanner_negative_unpaired_missing");
   await page.evaluate(
     ({ fixtureKind, fixtureValue }) =>
@@ -608,9 +636,10 @@ async function negativeOffer(environment, browser, kind) {
   } else if (kind === "canceled") {
     await desktopAction(environment, { kind: "cancel_offer" });
   }
-  const context = await newProductContext(browser, false);
+  const context = await newProductContext(browser, true);
   const page = await context.newPage();
-  await gotoPublic(page, link);
+  await gotoDevelopmentHost(page);
+  await page.evaluate((value) => globalThis.__VIBEX_E2E_NATIVE__.appLink(value), link);
   const terminal =
     kind === "expired"
       ? ["expired"]
@@ -641,7 +670,7 @@ async function negativeOffer(environment, browser, kind) {
 
 async function replayOffer(environment, browser, link) {
   const before = await trustSummary(environment);
-  const context = await newProductContext(browser, false);
+  const context = await newProductContext(browser, true);
   const page = await context.newPage();
   let claimHttpStatus = null;
   let claimNetworkFailed = false;
@@ -658,7 +687,8 @@ async function replayOffer(environment, browser, link) {
   page.on("requestfailed", (request) => {
     if (isClaimRequest(request.url())) claimNetworkFailed = true;
   });
-  await gotoPublic(page, link);
+  await gotoDevelopmentHost(page);
+  await page.evaluate((value) => globalThis.__VIBEX_E2E_NATIVE__.appLink(value), link);
   const projection = await waitPairingState(
     page,
     ["preview", "route_error", "invalid"],
@@ -726,10 +756,9 @@ async function refreshAndReopen(paired) {
   await paired.page.reload({ waitUntil: "domcontentloaded", timeout: 65_000 });
   await waitForRuntime(paired.page);
   await waitForConnectedRuntime(paired.page);
-  const origin = new URL(paired.page.url()).origin;
   await paired.page.close();
   paired.page = await paired.context.newPage();
-  await gotoPublic(paired.page, origin);
+  await gotoDevelopmentHost(paired.page);
   await waitForConnectedRuntime(paired.page);
 }
 
@@ -792,7 +821,7 @@ export function recoveryDriver(environment, page) {
       async duringFallback() {
         const nonce = randomBytes(6).toString("hex");
         try {
-          await runFileWorkflow(page, nonce, "web_browser");
+          await runFileWorkflow(page, nonce, "mobile_wasm_host");
         } catch (error) {
           const code = /^[a-z0-9_]+$/.test(error?.code ?? "")
             ? error.code
@@ -800,7 +829,7 @@ export function recoveryDriver(environment, page) {
           fail(`fallback_${code}`);
         }
         try {
-          await runTerminalWorkflow(page, nonce, "web_browser");
+          await runTerminalWorkflow(page, nonce, "mobile_wasm_host");
         } catch (error) {
           const code = /^[a-z0-9_]+$/.test(error?.code ?? "")
             ? error.code
@@ -840,7 +869,7 @@ async function globalDisableReenable(environment, page) {
 }
 
 async function rePairAfterClear(environment, browser) {
-  const paired = await pairSuccess(environment, browser, "full_control", "browser_url");
+  const paired = await pairSuccess(environment, browser, "full_control", "app_link");
   await revokeExact(environment, paired.deviceIdentitySha256);
   await clearRevokedPage(paired.page);
   await paired.context.close();
@@ -859,7 +888,7 @@ function browserArgs(environment) {
 }
 
 function routeSetDigest(environment) {
-  const routes = [environment.directOrigin, environment.relayOrigin, environment.entryOrigin]
+  const routes = [environment.directOrigin, environment.relayOrigin]
     .filter(Boolean)
     .map((value) => sha256Classification(value))
     .sort();
@@ -892,12 +921,6 @@ export async function runProductPairingMode(environment) {
   let stage = "configure_methods";
   try {
     await configureMethods(environment);
-    environment.entryOrigin =
-      MODE_ENTRY[environment.mode] === METHOD.direct
-        ? environment.directOrigin
-        : MODE_ENTRY[environment.mode] === METHOD.relay
-          ? environment.relayOrigin
-          : null;
     stage = "browser_launch";
     browser = await chromium.launch({ headless: true, args: browserArgs(environment) });
 
@@ -905,7 +928,6 @@ export async function runProductPairingMode(environment) {
     const readOnly = await pairSuccess(environment, browser, "read_only", "app_link", {
       useDefault: true
     });
-    if (!environment.entryOrigin) environment.entryOrigin = new URL(readOnly.page.url()).origin;
     const permissionHashes = { read_only: readOnly.permissionContractSha256 };
     await finishPermissionDevice(environment, readOnly);
 
@@ -920,7 +942,7 @@ export async function runProductPairingMode(environment) {
     await finishPermissionDevice(environment, approveOnly);
 
     stage = "full_control_pairing";
-    full = await pairSuccess(environment, browser, "full_control", "browser_url", {
+    full = await pairSuccess(environment, browser, "full_control", "app_link", {
       retainForReplay: true
     });
     permissionHashes.full_control = full.permissionContractSha256;
@@ -952,7 +974,7 @@ export async function runProductPairingMode(environment) {
     const matrix = await runProductMatrix(
       full.page,
       recoveryDriver(environment, full.page),
-      "web_browser",
+      "mobile_wasm_host",
       environment.mode,
       null,
       environment.relayLogPath,
@@ -985,7 +1007,7 @@ export async function runProductPairingMode(environment) {
         full.page,
         randomBytes(6).toString("hex"),
         fixture.sessionIndex,
-        "web_browser"
+        "mobile_wasm_host"
       );
     } catch (error) {
       if (/^[a-z0-9_]+$/.test(error?.code ?? "")) {
@@ -1025,7 +1047,7 @@ export async function runProductPairingMode(environment) {
       transport: transportClassification(environment.mode),
       tailscaleConfigured: environment.mode === "tailscale",
       permissions: permissionHashes,
-      entries: passedMap(["browser_url", "app_link", "in_app_scanner"]),
+      entries: passedMap(["development_host", "app_link", "in_app_scanner"]),
       checks: passedMap(PRODUCT_PAIRING_CHECKS),
       workflows: passedMap(PRODUCT_PAIRING_WORKFLOWS),
       redactionScan: "passed"
@@ -1057,7 +1079,10 @@ export async function runProductPairingCli({ workflowAlias = false } = {}) {
   if (workflowAlias) {
     const targetIndex = process.argv.indexOf("--target");
     const target = targetIndex >= 0 ? process.argv[targetIndex + 1] : null;
-    assert(target === null || target === "web", "product_pairing_alias_target_invalid");
+    assert(
+      target === null || target === "mobile-wasm-host",
+      "product_pairing_alias_target_invalid"
+    );
   }
   const { runProductPairingEnvironment } = await import(
     "./e2e-local-env/run-product-pairing.mjs"

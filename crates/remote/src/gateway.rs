@@ -1,16 +1,16 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::path::{Component, Path as FsPath, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Request, State};
+use axum::extract::{Request, State};
 use axum::http::header::{
-    ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
-    CONTENT_TYPE, HOST, ORIGIN, SEC_WEBSOCKET_PROTOCOL, VARY,
+    ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN, HOST,
+    ORIGIN, SEC_WEBSOCKET_PROTOCOL, VARY,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
@@ -26,7 +26,6 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use url::Url;
-pub use vibex_core::WebBuildDescriptor as RemoteGatewayWebBuildDescriptor;
 use vibex_core::{
     CorrelationId, DeviceId, ErrorCategory, EventId, REMOTE_V2_MAX_BINARY_PAYLOAD_BYTES,
     RelayRemoteHandshakeContext, RemoteActionClass, RemoteAttachmentAcceptedV2,
@@ -172,8 +171,6 @@ pub struct RemoteGatewayConfig {
     pub tls_policy: RemoteGatewayTlsPolicy,
     pub allowed_hosts: Vec<String>,
     pub allowed_origins: Vec<String>,
-    pub static_dir: Option<PathBuf>,
-    pub web_build: Option<RemoteGatewayWebBuildDescriptor>,
     pub pairing_routes: RemoteGatewayPairingRoutes,
     pub max_connections: usize,
     pub max_in_flight_rpcs_per_connection: usize,
@@ -201,8 +198,6 @@ impl Default for RemoteGatewayConfig {
                 "https://[::1]".to_string(),
                 "capacitor://localhost".to_string(),
             ],
-            static_dir: None,
-            web_build: None,
             pairing_routes: RemoteGatewayPairingRoutes::default(),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             max_in_flight_rpcs_per_connection: DEFAULT_MAX_IN_FLIGHT_RPCS_PER_CONNECTION,
@@ -291,14 +286,6 @@ impl RemoteGatewayConfig {
         }
         for origin in &self.allowed_origins {
             validate_origin_value(origin)?;
-        }
-        if let Some(static_dir) = &self.static_dir
-            && static_dir.as_os_str().is_empty()
-        {
-            return Err(VibexError::validation(
-                "remote_gateway_static_dir_invalid",
-                "RemoteGateway static asset directory is invalid",
-            ));
         }
         let pairing_routes = self.pairing_routes.validated()?;
         if !pairing_routes.direct_candidates.is_empty() && !self.service.enabled {
@@ -1455,8 +1442,6 @@ fn build_gateway_router(state: GatewayState) -> Router {
         .route("/api/v2/pairing/claim", post(claim_pairing_offer))
         .route("/api/v2/ws-ticket", post(issue_ws_ticket))
         .route("/ws/v2", get(ws_v2))
-        .route("/", get(static_index))
-        .route("/{*path}", get(static_asset))
         .with_state(state.clone());
     v2.merge(legacy).layer(middleware::from_fn_with_state(
         state.clone(),
@@ -1482,7 +1467,6 @@ async fn gateway_info(State(state): State<GatewayState>) -> Response {
         },
         "sessionEpoch": state.session_epoch,
         "enabledFeatures": gateway_features(&state),
-        "webBuild": state.config.web_build.clone(),
     }))
     .into_response()
 }
@@ -3896,75 +3880,6 @@ fn apply_cors_headers_from_headers(
     }
 }
 
-async fn static_index(State(state): State<GatewayState>) -> Response {
-    serve_static_path(&state, "index.html")
-}
-
-async fn static_asset(State(state): State<GatewayState>, Path(path): Path<String>) -> Response {
-    serve_static_path(&state, &path)
-}
-
-fn serve_static_path(state: &GatewayState, request_path: &str) -> Response {
-    let Some(root) = state.config.static_dir.as_ref() else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let root = match root.canonicalize() {
-        Ok(root) => root,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
-    };
-    let relative = FsPath::new(request_path.trim_start_matches('/'));
-    if relative
-        .components()
-        .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
-    {
-        return protocol_error_response(
-            StatusCode::BAD_REQUEST,
-            VibexError::validation(
-                "remote_static_path_invalid",
-                "RemoteGateway static asset path is invalid",
-            ),
-        );
-    }
-    let candidate = root.join(relative);
-    let mut resolved = match candidate.canonicalize() {
-        Ok(candidate) if candidate.starts_with(&root) => candidate,
-        _ if relative.extension().is_none() => root.join("index.html"),
-        _ => return StatusCode::NOT_FOUND.into_response(),
-    };
-    if resolved.is_dir() {
-        resolved = resolved.join("index.html");
-    }
-    let resolved = match resolved.canonicalize() {
-        Ok(candidate) if candidate.starts_with(&root) && candidate.is_file() => candidate,
-        _ => return StatusCode::NOT_FOUND.into_response(),
-    };
-    let bytes = match std::fs::read(&resolved) {
-        Ok(bytes) => bytes,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
-    };
-    let content_type = content_type_for_path(&resolved);
-    let mut response = bytes.into_response();
-    response
-        .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
-    response
-}
-
-fn content_type_for_path(path: &FsPath) -> &'static str {
-    match path.extension().and_then(|extension| extension.to_str()) {
-        Some("html") => "text/html; charset=utf-8",
-        Some("js") | Some("mjs") => "text/javascript; charset=utf-8",
-        Some("css") => "text/css; charset=utf-8",
-        Some("wasm") => "application/wasm",
-        Some("json") => "application/json",
-        Some("png") => "image/png",
-        Some("svg") => "image/svg+xml",
-        Some("woff2") => "font/woff2",
-        Some("ttf") => "font/ttf",
-        _ => "application/octet-stream",
-    }
-}
-
 fn protocol_error_response(status: StatusCode, error: VibexError) -> Response {
     (status, Json(RemoteProtocolError::from_error(error))).into_response()
 }
@@ -4054,8 +3969,11 @@ fn bounded_diagnostic(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path as FsPath;
+
     use axum::body::{Body, to_bytes};
     use axum::http::Request as HttpRequest;
+    use axum::http::header::CONTENT_TYPE;
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -4133,13 +4051,11 @@ mod tests {
     #[tokio::test]
     async fn gateway_config_replacement_is_stopped_only_and_routes_are_independent() {
         let directory = tempfile::tempdir().unwrap();
-        let mut initial = RemoteGatewayConfig::loopback_enabled("127.0.0.1:0");
-        initial.static_dir = Some(directory.path().to_path_buf());
+        let initial = RemoteGatewayConfig::loopback_enabled("127.0.0.1:0");
         let gateway = test_gateway(&directory, initial);
 
         let mut replacement = RemoteGatewayConfig::loopback_enabled("127.0.0.1:0");
         replacement.max_connections = 7;
-        replacement.static_dir = Some(directory.path().to_path_buf());
         gateway
             .apply_config_while_stopped(replacement.clone())
             .await
@@ -4781,87 +4697,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(loopback_host.status(), StatusCode::MISDIRECTED_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn gateway_info_exposes_the_configured_web_build_identity() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut config = RemoteGatewayConfig::loopback_enabled("127.0.0.1:1428");
-        config.web_build = Some(RemoteGatewayWebBuildDescriptor {
-            schema_version: "vibex-web-build.v1".to_string(),
-            build_id: "build-id".to_string(),
-            package_version: "0.1.0-rc.1".to_string(),
-            profile: "release".to_string(),
-            git_commit: "revision".to_string(),
-            wasm_sha256: "wasm".to_string(),
-            glue_sha256: "glue".to_string(),
-            static_sha256: "static".to_string(),
-        });
-        let gateway = test_gateway(&directory, config);
-
-        let response = gateway
-            .router()
-            .unwrap()
-            .oneshot(
-                HttpRequest::get("/api/v2/info")
-                    .header(HOST, "127.0.0.1")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body: serde_json::Value =
-            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert_eq!(body["webBuild"]["buildId"], "build-id");
-        assert_eq!(body["webBuild"]["gitCommit"], "revision");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn static_assets_reject_traversal_and_symlink_escape() {
-        use std::os::unix::fs::symlink;
-
-        let directory = tempfile::tempdir().unwrap();
-        let static_dir = directory.path().join("static");
-        std::fs::create_dir_all(&static_dir).unwrap();
-        std::fs::write(static_dir.join("index.html"), "vibex-index").unwrap();
-        let outside = directory.path().join("outside.txt");
-        std::fs::write(&outside, "outside-secret-sentinel").unwrap();
-        symlink(&outside, static_dir.join("escape.txt")).unwrap();
-
-        let mut config = RemoteGatewayConfig::loopback_enabled("127.0.0.1:1428");
-        config.static_dir = Some(static_dir);
-        let gateway = test_gateway(&directory, config);
-        let router = gateway.router().unwrap();
-
-        let symlink_response = router
-            .clone()
-            .oneshot(
-                HttpRequest::get("/escape.txt")
-                    .header(HOST, "127.0.0.1")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(symlink_response.status(), StatusCode::NOT_FOUND);
-        let body = to_bytes(symlink_response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert!(!String::from_utf8_lossy(&body).contains("outside-secret-sentinel"));
-
-        let encoded_traversal = router
-            .oneshot(
-                HttpRequest::get("/%2e%2e/outside.txt")
-                    .header(HOST, "127.0.0.1")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(!encoded_traversal.status().is_success());
     }
 
     #[tokio::test]

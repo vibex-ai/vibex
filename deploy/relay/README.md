@@ -5,10 +5,8 @@ The Relay is a zero-knowledge room router. The PC and paired devices use
 full-duplex WebSocket connections on `/ws`; Remote v2 control, RPC, events, and
 binary frames stay E2EE between the device and PC.
 
-The same origin serves one source-bound release build of `apps/web` for
-fresh browsers. Static files are public bootstrap code only; room traffic,
-pairing claims, device grants, and product data remain inside the existing E2EE
-and PC authorization boundary.
+The Relay is transport-only. It does not contain or serve `apps/mobile-wasm`,
+HTML, a Service Worker, a PWA manifest, or any other product UI assets.
 
 The HTTP pair and command routes under `/api/rooms/:room_id/*` remain a
 versioned compatibility bridge. They are not the primary Web/mobile transport.
@@ -22,7 +20,6 @@ Run the Relay locally from the repository root:
 docker compose -f deploy/relay/docker-compose.yml up --build -d relay-server
 curl -fsS http://127.0.0.1:9700/health
 curl -fsS http://127.0.0.1:9700/api/info
-curl -fsS http://127.0.0.1:9700/build.json
 ```
 
 Stop it with:
@@ -44,8 +41,8 @@ VIBEX_RELAY_SITE_ADDRESS=relay.example.com \
   docker compose -f deploy/relay/docker-compose.yml --profile caddy up --build -d
 ```
 
-Caddy proxies WebUI files, `/ws`, `/health`, and `/api/*` on one HTTPS origin.
-WebSocket upgrades work for both PC and device peers. Use
+Caddy proxies `/ws`, `/health`, and `/api/*` on one HTTPS origin. Root and
+static-asset paths return 404. WebSocket upgrades work for both PC and device peers. Use
 `https://relay.example.com` as the configured Relay origin; clients derive
 `wss://relay.example.com/ws`.
 
@@ -68,10 +65,7 @@ still use `/ws`. Remove only this mapping with
 
 The image sets `VIBEX_RELAY_BIND_ADDR=0.0.0.0:9700`. `RELAY_PORT` is a local
 shorthand used only when `VIBEX_RELAY_BIND_ADDR` is absent; it binds
-`127.0.0.1:{port}`. It also sets
-`VIBEX_RELAY_WEB_STATIC_DIR=/app/web`; startup fails before bind when that
-release is missing, incomplete, debug-only, tampered, or does not match the
-build identity compiled into the Relay binary.
+`127.0.0.1:{port}`. There is no static-root or Web-build environment variable.
 
 All hard limits are configurable and the effective values are reported by
 `/api/info`:
@@ -164,11 +158,8 @@ The primary transport flags should be:
 - `websocketFrames: true`
 
 `httpPairBridge` and `httpCommandBridge` remain true for compatibility.
-`staticRoomAssets: true` and a complete `webBuild` descriptor are expected from
-the container deployment. Library and local test configurations that omit
-`VIBEX_RELAY_WEB_STATIC_DIR` remain transport-only and report
-`staticRoomAssets: false`. Feature flags never enable Agent, Git, File,
-Terminal, or Provider data without the encrypted PC handshake.
+`staticRoomAssets` and `webBuild` are absent. Feature flags never enable Agent,
+Git, File, Terminal, or Provider data without the encrypted PC handshake.
 
 ## Production Notes
 
@@ -183,11 +174,10 @@ Terminal, or Provider data without the encrypted PC handshake.
   They must not contain auth tokens, provider tokens, private keys, opaque
   notification fields, decrypted payloads, raw ciphertext, or nonces.
 
-The Dockerfile builds the pinned GPUI-WASM toolchain and Relay binary from the
-same source context, compiles the Web build id and revision into the binary,
-and copies only the binary, validated Web dist, and `/app/relay-image.json` into
-the runtime image. It does not package desktop SDKs, local databases, device
-grants, Git configuration, repository objects, or provider credentials.
+The Dockerfile builds the Relay binary and copies only that binary into the
+runtime image. It does not package the mobile runtime, desktop SDKs, local
+databases, device grants, Git configuration, repository objects, or provider
+credentials.
 
 ## Verification
 
@@ -195,10 +185,9 @@ Run deterministic local checks:
 
 ```bash
 pnpm smoke:relay:local
-pnpm check:relay-webui-package
 cargo test -p vibex-remote-client --test relay_smoke --locked -- --nocapture
 docker compose -f deploy/relay/docker-compose.yml config
-docker build -f deploy/relay/Dockerfile -t vibex-relay-webui:test .
+docker build -f deploy/relay/Dockerfile -t vibex-relay:test .
 ```
 
 The Rust smoke covers Relay-only pairing, E2EE RPC/event/binary transport,

@@ -4,9 +4,9 @@
 #
 # Caddy preserves WebSocket upgrades for /ws through reverse_proxy. PC and
 # device peers use this full-duplex path. Keep /api on the same origin for
-# health/info, push, the versioned HTTP pair/command compatibility bridge, and
-# the source-bound GPUI WebUI. URL fragments are browser-local and never enter
-# Caddy or Relay request logs.
+# health/info, push, and the versioned HTTP pair/command compatibility bridge.
+# Pairing fragments stay inside the installed app and never enter Caddy or
+# Relay request logs.
 
 {$VIBEX_RELAY_SITE_ADDRESS:relay.example.com} {
 	encode zstd gzip

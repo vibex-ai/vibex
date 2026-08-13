@@ -92,7 +92,7 @@
     },
     {
       "id": "OFL-1.1",
-      "rationale": "Approved for the Inter variable fonts embedded in the GPUI-WASM Web and mobile runtime; the complete OFL notice is redistributed with the source assets."
+      "rationale": "Approved for the Inter variable fonts embedded in the GPUI-WASM mobile runtime; the complete OFL notice is redistributed with the source assets."
     },
     {
       "id": "Unicode-3.0",
@@ -169,11 +169,11 @@
       "extensions": [
         ".svg"
       ],
-      "expectedFileCount": 105,
-      "treeSha256": "c8d0b5c8e37627d49e3a7fa9d358856a08454ef1fefc3fc004127a72061ee3c8",
+      "expectedFileCount": 101,
+      "treeSha256": "aed10ac6c8f49e433c9bcd55ecb35d9a3d0f44db9f82464d675220357ce1e269",
       "licenseExpression": "AGPL-3.0-or-later AND ISC AND MIT AND CC0-1.0 AND LicenseRef-Third-Party-Brand-Marks",
       "source": "https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/icons",
-      "licenseEvidence": "52 Lucide SVGs (ISC); 15 SVG Logos and 3 Simple Icons SVGs (CC0-1.0); 1 Material Icon Theme and 1 VSCode Icons SVG (MIT); 1 Vibex mark (AGPL-3.0-or-later); 32 Agent brand SVGs from the Agent Client Protocol registry and official vendor sources (third-party brand marks). Brand names and marks remain the property of their respective owners.",
+      "licenseEvidence": "52 Lucide SVGs (ISC); 15 SVG Logos and 3 Simple Icons SVGs (CC0-1.0); 1 Material Icon Theme and 1 VSCode Icons SVG (MIT); 1 Vibex mark (AGPL-3.0-or-later); 28 Agent brand SVGs from the Agent Client Protocol registry and official vendor sources (third-party brand marks). Brand names and marks remain the property of their respective owners.",
       "sourceComponents": [
         {
           "name": "Lucide",
@@ -213,7 +213,7 @@
         },
         {
           "name": "Agent brand marks",
-          "fileCount": 32,
+          "fileCount": 28,
           "licenseExpression": "LicenseRef-Third-Party-Brand-Marks",
           "source": "https://agentclientprotocol.com/get-started/registry#available-agents"
         }
@@ -235,11 +235,11 @@
       "source": "https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/app-icons"
     },
     {
-      "id": "vibex-web-application-icon",
-      "name": "Vibex GPUI-WASM Web application icon",
+      "id": "vibex-mobile-wasm-application-icon",
+      "name": "Vibex GPUI-WASM mobile runtime icon",
       "version": "0.1.0-rc.1",
       "ownerPackage": "vibex-ui",
-      "root": "apps/web/web",
+      "root": "apps/mobile-wasm/host",
       "files": [
         "icon.svg"
       ],
@@ -249,17 +249,17 @@
       "expectedFileCount": 1,
       "treeSha256": "55337e2a7ae8ba53e409bc494537ee94892fa3f5e611492a8d1eb93b15215dbd",
       "licenseExpression": "AGPL-3.0-or-later",
-      "source": "https://github.com/vibex-ai/vibex/blob/main/apps/web/web/icon.svg",
-      "licenseEvidence": "Repository-authored Web application treatment of the registered Vibex mark; distributed under the repository AGPL-3.0-or-later license."
+      "source": "https://github.com/vibex-ai/vibex/blob/main/apps/mobile-wasm/host/icon.svg",
+      "licenseEvidence": "Repository-authored mobile runtime treatment of the registered Vibex mark; distributed under the repository AGPL-3.0-or-later license."
     }
   ],
   "fontInputs": [
     {
-      "id": "vibex-web-inter-variable-fonts",
-      "name": "Inter variable Web runtime fonts",
+      "id": "vibex-mobile-wasm-inter-variable-fonts",
+      "name": "Inter variable mobile runtime fonts",
       "version": "5.2.8",
       "ownerPackage": "vibex-ui",
-      "root": "apps/web/assets/fonts",
+      "root": "apps/mobile-wasm/assets/fonts",
       "files": [
         "OFL.txt",
         "README.md",
@@ -272,17 +272,17 @@
         ".txt"
       ],
       "expectedFileCount": 4,
-      "treeSha256": "e10f9a6a0ef6976cc8bea761d3ec6e920d1639e460ce9c8fb56a783f459073e6",
+      "treeSha256": "5a0386b42c02a52ac6e574121619cff2ba36e7f90c4069c1e7c7cf56766475ca",
       "licenseExpression": "OFL-1.1",
       "source": "https://www.npmjs.com/package/@fontsource-variable/inter/v/5.2.8",
-      "licenseEvidence": "The shared UI token family owns this font contract. The TTF files are deterministic decompressions of the locked Fontsource WOFF2 assets embedded only by Web/Android; OFL.txt is redistributed unchanged."
+      "licenseEvidence": "The shared UI token family owns this font contract. The TTF files are deterministic decompressions of the locked Fontsource WOFF2 assets embedded by the GPUI-WASM mobile runtime; OFL.txt is redistributed unchanged."
     },
     {
-      "id": "vibex-web-wenquanyi-cjk-fallback",
+      "id": "vibex-mobile-wasm-wenquanyi-cjk-fallback",
       "name": "WenQuanYi Micro Hei CJK fallback",
       "version": "0.2.0-beta",
       "ownerPackage": "vibex-ui",
-      "root": "apps/web/assets/fonts",
+      "root": "apps/mobile-wasm/assets/fonts",
       "files": [
         "APACHE-2.0.txt",
         "wqy-microhei.ttc"
@@ -295,7 +295,7 @@
       "treeSha256": "5c1ac72fd0f922d911d5e31f8ee444dd719fcb34755b2893f5e9668a14ca775e",
       "licenseExpression": "Apache-2.0",
       "source": "https://wenq.org/wqy2/index.cgi?MicroHei",
-      "licenseEvidence": "WenQuanYi Micro Hei 0.2.0-beta is embedded as a CJK fallback for the GPUI-WASM Web and Android runtime. The Apache-2.0 license text is redistributed unchanged."
+      "licenseEvidence": "WenQuanYi Micro Hei 0.2.0-beta is embedded as a CJK fallback for the GPUI-WASM mobile runtime. The Apache-2.0 license text is redistributed unchanged."
     }
   ],
   "nativeInputs": [

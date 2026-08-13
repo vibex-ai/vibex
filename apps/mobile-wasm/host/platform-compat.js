@@ -58,7 +58,7 @@ function logicalCanvasPosition(canvas, event, scale) {
 export function createPlatformCompatibility({ onViewportChange, requestPlatformBack }) {
   const diagnostics = {
     schemaVersion: "vibex-platform-compat.v1",
-    owner: "apps/web",
+    owner: "apps/mobile-wasm",
     capabilities: {
       inputEventFallback: typeof InputEvent === "function" && typeof CompositionEvent === "function",
       touchScrollFallback: typeof PointerEvent === "function" && typeof WheelEvent === "function",

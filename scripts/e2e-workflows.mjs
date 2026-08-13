@@ -16,10 +16,10 @@ import {
   permissionContractSha256,
   resolveWorkflowCandidateIdentity
 } from "./workflow-e2e-evidence.mjs";
-import { startWasmServer } from "./wasm-test-server.mjs";
+import { startWasmServer } from "./mobile-wasm-test-server.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const DIST = join(ROOT, "apps/web/dist");
+const DIST = join(ROOT, "apps/mobile-wasm/dist");
 const ANDROID_BUILD_EVIDENCE = join(
   ROOT,
   "docs/platform/evidence/wasm-android-build.json"
@@ -671,10 +671,10 @@ export async function prepareWorkflowFixture(page, fixture) {
   });
 }
 
-async function browserTarget(credentials, recoveryHook, transport, relayLog, fixture) {
-  run("pnpm", ["--filter", "@vibex/web", "build:release"], {
+async function developmentHostTarget(credentials, recoveryHook, transport, relayLog, fixture) {
+  run("pnpm", ["--filter", "@vibex/mobile-wasm", "build:release"], {
     inherit: true,
-    code: "web_release_build_failed"
+    code: "mobile_runtime_release_build_failed"
   });
   const candidateDigest = resolveWorkflowCandidateIdentity(ROOT).candidateDigest;
   const server = option("origin") ? null : await startWasmServer({ dist: DIST });
@@ -695,7 +695,7 @@ async function browserTarget(credentials, recoveryHook, transport, relayLog, fix
     const result = await runProductMatrix(
       page,
       recoveryHook,
-      "web_browser",
+      "mobile_wasm_host",
       transport,
       credentials,
       relayLog,
@@ -705,7 +705,7 @@ async function browserTarget(credentials, recoveryHook, transport, relayLog, fix
       ...result,
       candidateDigest,
       environment: {
-        kind: "browser",
+        kind: "development_host",
         browserName: "chromium",
         browserVersion: browser.version(),
         platformSha256: sha256(`${process.platform}:${process.arch}`)
@@ -734,14 +734,20 @@ function assertAndroidBuildCurrent(identity) {
   assert(identity.androidApk, "current_android_apk_missing");
   assert(existsSync(ANDROID_BUILD_EVIDENCE), "android_build_evidence_missing");
   const build = JSON.parse(readFileSync(ANDROID_BUILD_EVIDENCE, "utf8"));
-  assert(build.source?.webSourceTreeSha256 === identity.source.sourceTreeSha256, "android_web_source_stale");
+  assert(
+    build.source?.mobileRuntimeSourceTreeSha256 === identity.source.sourceTreeSha256,
+    "android_mobile_runtime_source_stale"
+  );
   assert(
     build.source?.mobileShellTreeSha256 === identity.source.mobileShellTreeSha256,
     "android_shell_source_stale"
   );
   assert(build.source?.cargoLockfileSha256 === identity.source.cargoLockSha256, "android_cargo_lock_stale");
   assert(build.source?.pnpmLockfileSha256 === identity.source.pnpmLockSha256, "android_pnpm_lock_stale");
-  assert(build.webBuild?.buildId === identity.webBuild.buildId, "android_web_build_stale");
+  assert(
+    build.runtimeBuild?.buildId === identity.mobileRuntimeBuild.buildId,
+    "android_mobile_runtime_build_stale"
+  );
 }
 
 function assertInstalledApkCurrent(serial, identity) {
@@ -921,7 +927,10 @@ function targetEvidence(identity, target, transport, endpoint, captured) {
 async function main() {
   if (PAIR_VIA_PRODUCT) {
     const target = option("target");
-    assert(target === null || target === "web", "product_pairing_alias_target_invalid");
+    assert(
+      target === null || target === "mobile-wasm-host",
+      "product_pairing_alias_target_invalid"
+    );
     const transport = option("transport", option("mode"));
     const args = [join(ROOT, "scripts/e2e-desktop-pairing.mjs")];
     if (transport) args.push("--transport", transport);
@@ -934,7 +943,10 @@ async function main() {
   }
   const requestedTarget = option("target");
   const transport = option("transport");
-  assert(["web", "android"].includes(requestedTarget), "target_must_be_web_or_android");
+  assert(
+    ["mobile-wasm-host", "android"].includes(requestedTarget),
+    "target_must_be_mobile_wasm_host_or_android"
+  );
   assert(["direct", "relay"].includes(transport), "transport_must_be_direct_or_relay");
   const credentials = loadCredentials(
     option("credentials", process.env.VIBEX_E2E_CREDENTIALS_FILE)
@@ -943,7 +955,7 @@ async function main() {
   const recoveryHook = option("recovery-hook", process.env.VIBEX_E2E_RECOVERY_HOOK);
   const fixtureHook = option("fixture-hook", process.env.VIBEX_E2E_FIXTURE_HOOK);
   const relayLog = option("relay-log", process.env.VIBEX_E2E_RELAY_LOG_FILE);
-  const target = requestedTarget === "web" ? "web_browser" : "android_physical";
+  const target = requestedTarget === "mobile-wasm-host" ? "mobile_wasm_host" : "android_physical";
   const fixture = prepareDisposableFixture(fixtureHook, target, transport);
 
   let identity;
@@ -951,8 +963,8 @@ async function main() {
   try {
     identity = resolveWorkflowCandidateIdentity(ROOT);
     captured =
-      requestedTarget === "web"
-        ? await browserTarget(credentials, recoveryHook, transport, relayLog, fixture)
+      requestedTarget === "mobile-wasm-host"
+        ? await developmentHostTarget(credentials, recoveryHook, transport, relayLog, fixture)
         : await androidTarget(
             identity,
             credentials,

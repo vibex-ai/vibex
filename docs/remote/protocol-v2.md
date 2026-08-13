@@ -32,7 +32,7 @@ native and WASM clients consume those Rust contracts directly.
   started. Terminal attachments include their workspace scope, and terminal
   input is generation-checked, authorized, and audited without retaining bytes.
 
-## Pairing And Browser Authentication
+## Pairing And Mobile Authentication
 
 - The desktop identity is generated under the runtime home and persisted with
   `0600` permissions on Unix. The current identity/proof primitive uses mature
@@ -40,14 +40,18 @@ native and WASM clients consume those Rust contracts directly.
 - Pairing offers live for 60-120 seconds, are cancelable, and are consumed by a
   conditional update inside the same SQLite transaction that creates the device
   grant. Challenge, grant, nonce, and ticket plaintext are never stored.
-- QR/deep-link data is returned as `#/pair/<base64url-offer>`. Consumers must
-  parse it locally, then immediately remove it with `history.replaceState`.
+- QR/deep-link data uses
+  `vibex://open/<transport>#/pair/<base64url-offer>`, where `<transport>` is an
+  offered `direct`, `tailnet`, or `self_hosted_relay` route. The mobile host
+  parses it locally, removes the fragment before asynchronous work, and passes
+  only the transport hint plus offer to Rust for validation.
 - A QR contains Direct candidates, an optional user-provided self-hosted Relay,
   the desktop public identity, permission summary, expiry, and one-time
   challenge. It never contains a long-lived grant, provider secret, private key,
   or workspace data.
-- Browser WebSockets exchange a device grant for a 30-second, single-use ticket.
-  The ticket travels in a controlled WebSocket subprotocol and never in a URL.
+- WASM/WebView WebSockets exchange a device grant for a 30-second, single-use
+  ticket. The ticket travels in a controlled WebSocket subprotocol and never in
+  a URL.
 - The hello proof binds the single-use ticket challenge, full hello transcript,
   server identity, session epoch, paired device identity, and client ephemeral
   key. `server_info` returns a server ephemeral key and session-key confirmation.
@@ -60,9 +64,9 @@ native and WASM clients consume those Rust contracts directly.
   through Tailscale Serve or an equivalent controlled HTTPS/WSS reverse proxy.
 - Host and Origin are independently validated. CORS reflects only an accepted
   Origin, supports Private Network Access preflight, and never uses `*`.
-- Static `web` paths are canonicalized below the configured root; traversal
-  and symlink escape are rejected. Workspace file operations retain the stricter
-  `WorkspaceFileService` canonicalization and symlink policy.
+- `RemoteGateway` exposes protocol and health endpoints only. It never serves
+  the bundled mobile runtime or any browser UI. Workspace file operations retain
+  the stricter `WorkspaceFileService` canonicalization and symlink policy.
 
 Example Tailscale deployment (verify syntax against the installed version):
 

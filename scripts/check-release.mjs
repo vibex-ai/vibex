@@ -106,7 +106,10 @@ function validatePackaging() {
     assert(config.includes(`packaging/${applicationId}.desktop`), `${channel} package is missing its app-id desktop entry`);
     assert(desktopEntry.includes(`StartupWMClass=${applicationId}`), `${channel} desktop entry app id drifted`);
     assert(desktopEntry.includes("Icon=vibex-desktop"), `${channel} desktop entry icon drifted`);
-    assert(config.includes('src = "../web/dist"'), `${channel} package is missing Web assets`);
+    assert(
+      !config.includes("../web/dist") && !config.includes("../mobile-wasm/dist"),
+      `${channel} desktop package must not embed browser or mobile runtime assets`
+    );
     const command = packageJson.scripts?.[`package:${channel}`] ?? "";
     assert(command.includes(`build-channel.mjs ${channel}`), `${channel} package command drifted`);
     assert(command.includes("--formats deb,appimage"), `${channel} package formats drifted`);

@@ -1,7 +1,8 @@
 # Frontend Quality Guidelines
 
-Frontend quality means PC, Web, and mobile all operate against the same Vibex
-protocol while presenting the right amount of control for each form factor.
+Frontend quality means native desktop and the installed mobile runtime operate
+against the same Vibex domain contract while presenting the right amount of
+control for each form factor.
 
 Current evidence: [Architecture Baseline](../guides/architecture-baseline.md), GPUI Desktop source-bound
 evidence, and current runtime/protocol tests.
@@ -9,8 +10,8 @@ evidence, and current runtime/protocol tests.
 The long React/Tauri/Web-PWA scenarios retained below are historical validation
 evidence for deleted or completed migration surfaces. Their paths, commands, and
 writers are not current gates and must not be restored. New UI quality evidence
-must cover shared GPUI components, native/WASM dependency isolation,
-Wide/Medium/Compact layouts, browser/WebView input, and the
+must cover shared GPUI components, native/WASM dependency isolation, Wide on
+native desktop, Medium/Compact in the mobile runtime, WebView input, and the
 NativeBackend/WebRemoteBackend boundary.
 
 ## Review Checklist
@@ -18,7 +19,8 @@ NativeBackend/WebRemoteBackend boundary.
 - UI renders Vibex timeline and capability types, not raw provider SDK payloads.
 - Wide screens follow the GPUI Desktop workbench model; Medium/Compact recompose the
   same domain components.
-- Web/mobile remain remote clients and never run a local Agent/Git/PTY/filesystem.
+- The mobile runtime remains a remote client and never runs a local
+  Agent/Git/PTY/filesystem.
 - Permission, Plan, Tool call, Diff, and command cards are collapsible.
 - Destructive remote actions require clear confirmation.
 - Dark mode is implemented for every new screen.
@@ -58,7 +60,132 @@ Add tests or story coverage for:
 - Mobile layout for session detail, Git change, terminal, and Provider switch.
 - Dark mode snapshots or visual checks for major screens.
 
-## Scenario: GPUI-WASM Browser And Mobile Gate Evidence
+## Scenario: Mobile GPUI-WASM Runtime Product Boundary
+
+### 1. Scope / Trigger
+
+- Trigger: changing `apps/mobile-wasm`, `apps/mobile`, the mobile shell
+  resolver, Capacitor host bridges, pairing intake, or source-bound mobile
+  evidence.
+- This is the current product contract. Browser/PWA scenarios retained later in
+  this file are pre-retirement history and must not be used as implementation
+  requirements.
+
+### 2. Signatures
+
+```text
+apps/mobile/capacitor.config.ts.webDir = "../mobile-wasm/dist"
+ShellLayout::resolve_mobile(width, height) -> Compact | Medium
+
+vibex-mobile-wasm-build.v1 {
+  runtimeRole: "capacitor_mobile_runtime",
+  browserHost: "development_and_test_only",
+  buildId, gitCommit, wasmSha256, glueSha256, staticSha256
+}
+
+PairingEntryHint {
+  schemaVersion: "vibex-pairing-entry.v1",
+  kind: "mobile_app" | "origin" | "untrusted_custom_scheme",
+  origin?, transport?
+}
+
+pnpm dev:mobile-wasm
+pnpm check:mobile-wasm-host
+pnpm check:wasm-integration
+pnpm --filter @vibex/mobile validate
+```
+
+### 3. Contracts
+
+- `apps/mobile-wasm` is a Capacitor runtime, not a WebUI or PWA. Its browser
+  host is fixed local development/automation infrastructure and carries no
+  deployment, browser-support, or release claim.
+- The mobile runtime resolves only Compact/Medium. A wide development viewport
+  must still resolve Medium; only native Desktop may present Wide.
+- A build emits `index.html`, host JS/CSS, icons, `build.json`, WASM glue, and
+  WASM bytes. It must not emit a Service Worker, PWA manifest, offline page, or
+  browser-install metadata.
+- `apps/mobile` packages only `apps/mobile-wasm/dist`. It must never download a
+  hosted runtime, fall back to a Relay/Desktop Web page, or fork auth/transport
+  state into a second UI tree.
+- Capacitor credentials use secure storage and `clientType: "mobile"`.
+  Development-host storage is a diagnostic fallback only and is not a product
+  credential store.
+- Installed-app pairing uses `vibex://open/<transport>#/pair/<offer>`. A
+  `mobile_app` hint has no origin and selects only `direct`, `tailnet`, or
+  `self_hosted_relay` already present in the verified offer. HTTPS App/Universal
+  Links use `/open/<transport>` and produce the same origin-free hint. When a
+  transport has several candidates, the claim uses the first valid candidate in
+  signed offer order and the committed credential retains all candidates for
+  Auto probing. An `origin` hint is accepted only by the fixed development host
+  and likewise cannot inject a URL.
+- Pairing fragments are scrubbed before asynchronous work. Credentials, offer
+  challenges, private keys, endpoints, prompt/file/diff/terminal content, and
+  plugin payloads stay out of public Gate state, DOM, logs, and evidence.
+- Source identity includes the complete target-specific local Cargo dependency
+  graph plus host/evidence inputs. Any reachable change invalidates runtime,
+  Android, and workflow evidence until its writer recaptures it.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Runtime selects Wide at any viewport | Fail mobile host and shell tests. |
+| PWA/Service Worker/offline asset is emitted | Fail build/integration checks. |
+| Browser host is labeled deployable or release-supported | Fail runtime-build/evidence validation. |
+| Mobile hint carries an origin, unsupported transport, or unmatched route | `remote_pairing_entry_hint_invalid` or `_route_mismatch`; send no claim. |
+| Custom scheme is not a valid Vibex mobile route | `remote_pairing_entry_untrusted`; persist nothing. |
+| Credential has a non-mobile client type | Reject before storage/configuration. |
+| Runtime source/evidence/build identity differs | Reject stale evidence; rerun its writer. |
+| Android/iOS physical evidence is absent | Package checks may pass; physical release status remains pending. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: Desktop emits a `vibex://open/tailnet#/pair/...` QR, the installed app
+  selects the offered Tailnet route, commits a mobile credential transactionally,
+  and Auto transport later uses all verified routes.
+- Base: Chromium loads the fixed development host at 1280px, resolves Medium,
+  proves nonblank pixels and host bridges, and records `releaseClaim: "none"`.
+- Bad: publish `dist`, register a Service Worker, restore Wide Web, accept a
+  caller-provided claim URL, save a browser credential as a mobile credential,
+  or treat development-host automation as mobile-device proof.
+
+### 6. Tests Required
+
+- `cargo test -p vibex-ui --locked` covers `resolve_mobile` and host redaction.
+- `cargo test -p vibex-remote-client pairing::tests --locked` covers mobile
+  transport selection, origin isolation, mismatch, and untrusted schemes.
+- `cargo +nightly-2026-07-24 check -p vibex-mobile-wasm --target
+  wasm32-unknown-unknown --locked` validates the WASM graph.
+- `pnpm check:wasm-integration`, `pnpm check:mobile-wasm-host`,
+  `pnpm --filter @vibex/mobile validate`, `pnpm check:graph`, and
+  `pnpm check:licenses` cover source, package, and boundary drift.
+- Android/iOS physical claims require exact-artifact device evidence; the local
+  development host cannot substitute.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+apps/mobile -> https://relay.example.com/index.html
+wide browser viewport -> WideShell
+vibex://open#/pair/... + caller-controlled claim URL
+```
+
+#### Correct
+
+```text
+apps/mobile -> bundled ../mobile-wasm/dist
+any mobile-runtime viewport -> Compact | Medium
+vibex://open/<offered-transport>#/pair/... -> select exactly one offered route
+```
+
+## Retired Historical Scenario: GPUI-WASM Browser And Mobile Gate Evidence
+
+> Retired with the WebUI/PWA product. This section records the earlier browser
+> feasibility and evidence design only; its Wide/Firefox/PWA/release clauses are
+> not current requirements. Use the scenario above for implementation.
 
 ### 1. Scope / Trigger
 
@@ -80,7 +207,7 @@ vibex-wasm-browser-evidence.v1.source.sourceTreeSha256
 vibex-android-build.v1.source.{webSourceTreeSha256,mobileShellTreeSha256}
 vibex-mobile-physical-evidence.v1.targets.{android_physical,ios_physical}
 
-cargo tree -p vibex-web --target wasm32-unknown-unknown
+cargo tree -p vibex-mobile-wasm --target wasm32-unknown-unknown
            --edges normal --prefix none --format {p}
   -> every workspace-local crate root
   -> WEB_SOURCE_INPUTS contains <root>/Cargo.toml + <root>/src
@@ -97,7 +224,7 @@ cargo tree -p vibex-web --target wasm32-unknown-unknown
   same Web source hash, mobile-shell hash, lockfiles, upstream revisions, packaged
   WASM identity, SDK floor, toolchain, APK size, and APK SHA-256.
 - The Web source identity includes `Cargo.toml` and the complete `src` tree for
-  every workspace-local normal dependency reachable from `vibex-web` for
+  every workspace-local normal dependency reachable from `vibex-mobile-wasm` for
   `wasm32-unknown-unknown`. This includes transitive contract/model crates such as
   `core`, `desktop-model`, `relay`, and the complete `vibex-backend` tree, not
   only crates imported directly by the app. Non-Cargo host/evidence inputs remain
@@ -168,7 +295,7 @@ cargo tree -p vibex-web --target wasm32-unknown-unknown
 
 - `cargo test -p vibex-ui --locked` asserts ordered events, normalized host
   dimensions, breakpoints, shared token use, and sensitive host `Debug` redaction.
-- `cargo +nightly-2026-07-24 check -p vibex-web --target
+- `cargo +nightly-2026-07-24 check -p vibex-mobile-wasm --target
   wasm32-unknown-unknown --locked` verifies the locked WASM graph.
 - `pnpm check:wasm-integration` and its negative self-test compare the explicit
   source inputs with the target-specific Cargo tree and reject a missing local crate
@@ -245,11 +372,14 @@ struct HostShareRequest { title: Option<String>, text: Option<String>, url: Opti
 // Correct: custom Debug emits has_title/has_text/has_url only.
 ```
 
-## Scenario: Production Web/Capacitor Host Boundary
+## Retired Historical Scenario: Production Web/Capacitor Host Boundary
+
+> Retired with the WebUI/PWA product. Current pairing, storage, build, and host
+> rules are defined by Mobile GPUI-WASM Runtime Product Boundary above.
 
 ### 1. Scope / Trigger
 
-- Trigger: `apps/web` or `apps/mobile` changes remote credentials,
+- Trigger: `apps/mobile-wasm` or `apps/mobile` changes remote credentials,
   pairing/deep-link handling, lifecycle/network recovery, PWA cache identity,
   native capability plugins, or a `wasm-bindgen` host API.
 - JS remains a platform adapter. Rust owns pairing validation, remote state,
@@ -336,7 +466,7 @@ VIBEX_APP_LINK_HOST=<optional DNS host for generated App/Universal Links>
 - JS timestamps crossing `wasm-bindgen` use `f64` and are range-checked before
   conversion to Rust `i64`. An exported Rust `i64` parameter requires JS `BigInt`
   and is not compatible with `Date.now()`.
-- `apps/mobile` packages only `../web/dist`. Generated Android/iOS trees
+- `apps/mobile` packages only `../mobile-wasm/dist`. Generated Android/iOS trees
   stay ignored; committed scripts rerun `cap sync`, capability plugins, and native
   URL-handler generation.
 - `build.json.buildId` binds package/profile/git revision plus WASM glue/static
@@ -1965,11 +2095,15 @@ The editor can collapse because no parent in the chain owns a real height.
 </div>
 ```
 
-## Scenario: Phase 4 Web/PWA Remote Shell
+## Retired Historical Scenario: Phase 4 Web/PWA Remote Shell
+
+> This is pre-retirement implementation history, not an active browser-product
+> contract. Portable domain behavior survives only where current GPUI mobile
+> code and the architecture baseline implement it.
 
 ### 1. Scope / Trigger
 
-- Trigger: Phase 4 introduces `apps/web` as a lightweight browser/PWA remote
+- Trigger: Phase 4 introduces `apps/mobile-wasm` as a lightweight browser/PWA remote
   control shell for the PC runtime.
 - The shell owns login/auth proof entry, service capability display,
   workspace/project summaries, Agent session summaries, and a selected session
@@ -1983,13 +2117,13 @@ The editor can collapse because no parent in the chain owns a real height.
 Frontend package boundary:
 
 ```text
-apps/web/package.json
-apps/web/src/app/App.tsx
-apps/web/src/features/auth/*
-apps/web/src/features/remote/*
-apps/web/src/features/workspace/*
-apps/web/src/features/sessions/*
-apps/web/src/components/*
+apps/mobile-wasm/package.json
+apps/mobile-wasm/src/app/App.tsx
+apps/mobile-wasm/src/features/auth/*
+apps/mobile-wasm/src/features/remote/*
+apps/mobile-wasm/src/features/workspace/*
+apps/mobile-wasm/src/features/sessions/*
+apps/mobile-wasm/src/components/*
 ```
 
 Remote client inputs:
@@ -2019,7 +2153,7 @@ POST /api/agent
 - Web/PWA code consumes the shared Rust DTOs through `WebRemoteBackend`; it must not
   redefine remote envelopes, auth proof, service info, Agent requests, or
   workbench requests.
-- `apps/web` must not import Tauri APIs, Monaco/CodeMirror, Provider SDKs, or
+- `apps/mobile-wasm` must not import Tauri APIs, Monaco/CodeMirror, Provider SDKs, or
   PC-only desktop utilities. It may import xterm.js only for remote terminal
   rendering, and xterm input/resize must route through typed remote terminal
   APIs to the PC runtime.
@@ -2059,8 +2193,8 @@ POST /api/agent
 
 ### 6. Tests Required
 
-- `pnpm --filter @vibex/web typecheck`.
-- `pnpm --filter @vibex/web build`.
+- `pnpm --filter @vibex/mobile-wasm typecheck`.
+- `pnpm --filter @vibex/mobile-wasm build`.
 - `pnpm check:frontend`.
 - Root `pnpm check` before archiving the task unless a non-frontend unrelated
   failure is documented.
@@ -2098,11 +2232,14 @@ return postEnvelope(config, "/api/agent", "agent_session", request, validate);
 Mock data is available only through an explicit fixture mode, while live
 transport/auth errors remain visible to the user.
 
-## Scenario: Phase 4 Web/PWA Rich Remote Control
+## Retired Historical Scenario: Phase 4 Web/PWA Rich Remote Control
+
+> This is pre-retirement implementation history, not an active browser-product
+> contract.
 
 ### 1. Scope / Trigger
 
-- Trigger: Phase 4 extends `apps/web` beyond project/session summaries into
+- Trigger: Phase 4 extends `apps/mobile-wasm` beyond project/session summaries into
   selected-session remote control: timeline cards, composer, permission
   resolution, Git review, and terminal snapshots.
 - This scenario is still Web/mobile remote-control UI. It must not become a
@@ -2136,9 +2273,9 @@ writeTerminalInput(config, TerminalWriteRequest) -> boolean
 Feature folders:
 
 ```text
-apps/web/src/features/timeline/*
-apps/web/src/features/git/*
-apps/web/src/features/terminal/*
+apps/mobile-wasm/src/features/timeline/*
+apps/mobile-wasm/src/features/git/*
+apps/mobile-wasm/src/features/terminal/*
 ```
 
 ### 3. Contracts
@@ -2195,8 +2332,8 @@ apps/web/src/features/terminal/*
 
 ### 6. Tests Required
 
-- `pnpm --filter @vibex/web typecheck`.
-- `pnpm --filter @vibex/web build`.
+- `pnpm --filter @vibex/mobile-wasm typecheck`.
+- `pnpm --filter @vibex/mobile-wasm build`.
 - `pnpm check:frontend`.
 - Root `pnpm check` before archiving unless an unrelated failure is documented.
 - Desktop-width and mobile-width screenshots showing the rich remote-control
@@ -2228,13 +2365,15 @@ switch (item.payload.type) {
 Render generated Vibex payload variants into purpose-built cards and keep raw
 diagnostics out of user-facing remote-control screens.
 
-## Scenario: Phase 5 Mobile App Shell From Web/PWA
+## Retired Historical Scenario: Phase 5 Mobile App Shell From Web/PWA
+
+> Superseded by the dedicated `apps/mobile-wasm` runtime contract above.
 
 ### 1. Scope / Trigger
 
 - Trigger: Phase 5 packages the existing Web/PWA remote client as a mobile app
   shell.
-- This is a frontend packaging contract: mobile must reuse `apps/web` protocol,
+- This is a frontend packaging contract: mobile must reuse `apps/mobile-wasm` protocol,
   auth, Relay, Query, and UI code instead of becoming a second remote client.
 
 ### 2. Signatures
@@ -2251,10 +2390,10 @@ apps/mobile/README.md
 Shared Web/PWA source:
 
 ```text
-apps/web/src/app/*
-apps/web/src/features/auth/*
-apps/web/src/features/remote/*
-apps/web/src/features/{workspace,sessions,timeline,git,terminal,providers}/*
+apps/mobile-wasm/src/app/*
+apps/mobile-wasm/src/features/auth/*
+apps/mobile-wasm/src/features/remote/*
+apps/mobile-wasm/src/features/{workspace,sessions,timeline,git,terminal,providers}/*
 ```
 
 Recommended scripts:
@@ -2281,9 +2420,9 @@ system-images;android-36;google_apis;x86_64
 
 ### 3. Contracts
 
-- The mobile shell loads bundled `apps/web/dist` assets. It must not host a
+- The mobile shell loads bundled `apps/mobile-wasm/dist` assets. It must not host a
   separate remote UI, duplicate feature folders, or fork auth/query state.
-- `apps/web` remains the owner of direct, Relay, and fixture connection modes.
+- `apps/mobile-wasm` remains the owner of direct, Relay, and fixture connection modes.
 - Generated Android/iOS platform projects are local developer artifacts unless a
   task explicitly scopes committing them. Ignore them by default in the MVP
   shell stage.
@@ -2302,7 +2441,7 @@ system-images;android-36;google_apis;x86_64
 
 ### 4. Validation & Error Matrix
 
-- Missing `apps/web/dist` during native sync -> run the mobile shell Web build
+- Missing `apps/mobile-wasm/dist` during native sync -> run the mobile shell Web build
   script first; do not point the app at a remote hosted page as a fallback.
 - Invalid direct `baseUrl` or Relay `relayUrl` in launch metadata -> ignore the
   metadata or keep it as an unsaved draft validation error; never persist it.
@@ -2327,8 +2466,8 @@ system-images;android-36;google_apis;x86_64
 
 - `pnpm --filter @vibex/mobile typecheck`.
 - `pnpm --filter @vibex/mobile validate`.
-- `pnpm --filter @vibex/web typecheck`.
-- `pnpm --filter @vibex/web build`.
+- `pnpm --filter @vibex/mobile-wasm typecheck`.
+- `pnpm --filter @vibex/mobile-wasm build`.
 - `pnpm check:frontend`.
 - Android packaging smoke when closing native Android evidence:
   `pnpm --filter @vibex/mobile cap doctor android`,
@@ -2354,15 +2493,18 @@ between Web and mobile.
 #### Correct
 
 ```text
-apps/mobile/capacitor.config.ts -> webDir = ../web/dist
-apps/web/src/features/auth/*    -> one auth state owner
-apps/web/src/features/remote/*  -> one transport owner
+apps/mobile/capacitor.config.ts -> webDir = ../mobile-wasm/dist
+apps/mobile-wasm/src/features/auth/*    -> one auth state owner
+apps/mobile-wasm/src/features/remote/*  -> one transport owner
 ```
 
 Mobile is an installation shell for the shared Web/PWA remote client. Native
 code is added only when a later task needs native capabilities.
 
-## Scenario: Phase 5 Follow-up QR Pairing
+## Retired Historical Scenario: Phase 5 Follow-up QR Pairing
+
+> Superseded by installed-app pairing with server-issued offers and
+> transport-bound `vibex://open/<transport>` entries.
 
 ### 1. Scope / Trigger
 
@@ -2380,10 +2522,10 @@ code is added only when a later task needs native capabilities.
 Frontend modules:
 
 ```text
-apps/web/src/features/auth/qrLaunch.ts
-apps/web/src/features/auth/QrPairingPanel.tsx
-apps/web/src/features/auth/AuthPanel.tsx
-apps/web/src/styles.css
+apps/mobile-wasm/src/features/auth/qrLaunch.ts
+apps/mobile-wasm/src/features/auth/QrPairingPanel.tsx
+apps/mobile-wasm/src/features/auth/AuthPanel.tsx
+apps/mobile-wasm/src/styles.css
 apps/mobile/README.md
 ```
 
@@ -2428,7 +2570,7 @@ roomId | room_id         relay only, starts with relayroom_
   successful scan, explicit stop, and component unmount.
 - If camera access is unavailable, denied, or unsupported, paste/import,
   upload, and manual entry must remain available.
-- Mobile shell reuses the shared Web/PWA QR flow from `apps/web/dist`; do not
+- Mobile shell reuses the shared Web/PWA QR flow from `apps/mobile-wasm/dist`; do not
   add `apps/mobile/src/features/auth/*` or a native-only QR/auth store.
 
 ### 4. Validation & Error Matrix
@@ -2461,8 +2603,8 @@ roomId | room_id         relay only, starts with relayroom_
 
 ### 6. Tests Required
 
-- `pnpm --filter @vibex/web typecheck`.
-- `pnpm --filter @vibex/web build`.
+- `pnpm --filter @vibex/mobile-wasm typecheck`.
+- `pnpm --filter @vibex/mobile-wasm build`.
 - `pnpm --filter @vibex/mobile validate`.
 - Root `pnpm check` before archiving unless an unrelated blocker is documented.
 - Grep audit for forbidden fields in QR helpers/UI/docs.
@@ -2985,21 +3127,22 @@ APK hash matches currentBuild; only operator-confirmed scenarios are passed
 browser accessibility tree exposes role/name/state/focus/action => a11y can pass
 ```
 
-## Scenario: GPUI Workflow Shell And Four-Target E2E Evidence
+## Scenario: GPUI Workflow Shell And Mobile E2E Evidence
 
 ### 1. Scope / Trigger
 
 - Trigger: changing the shared Agent/File/Git/Terminal/Management workbench,
-  `WebRemoteBackend`, Web/Capacitor product entry, workflow E2E runner, or the
+  `WebRemoteBackend`, mobile/Capacitor product entry, workflow E2E runner, or the
   cross-platform release gate.
-- Web and Android consume the same GPUI-WASM workflow shell. Gate fixture APIs
-  remain diagnostics only and cannot satisfy a product workflow result.
+- The development host and Android consume the same GPUI-WASM mobile workflow
+  shell. The host is an automation target, not a browser product. Gate fixture
+  APIs remain diagnostics only and cannot satisfy a product workflow result.
 
 ### 2. Signatures
 
 ```text
 WorkflowWorkbenchView::from_facade(BackendFacade)
-pnpm e2e:workflows --target web|android --transport direct|relay --write
+pnpm e2e:workflows --target mobile-wasm-host|android --transport direct|relay --write
 pnpm check:workflow-e2e
 
 VIBEX_E2E_CREDENTIALS_FILE
@@ -3009,7 +3152,7 @@ VIBEX_E2E_RELAY_LOG_FILE
 VIBEX_E2E_RELAY_OWNERSHIP=user_self_hosted
 
 vibex-workflow-e2e.v1.targets = {
-  web_browser: { direct, relay },
+  mobile_wasm_host: { direct, relay },
   android_physical: { direct, relay }
 }
 ```
@@ -3020,8 +3163,8 @@ vibex-workflow-e2e.v1.targets = {
   result, live event, and reconnect/recovery checks. Direct and Relay targets
   must have one identical permission-contract hash; Relay topology is explicitly
   user-self-hosted and E2EE, never an official service claim.
-- Candidate identity binds the complete Web and workflow source trees, mobile
-  shell tree, both lockfiles, Zed/GPUI revisions, release Web build identity,
+- Candidate identity binds the complete mobile-runtime and workflow source trees,
+  mobile shell tree, both lockfiles, Zed/GPUI revisions, release runtime identity,
   host JS, and current APK bytes/hash/application id. Source commit is provenance;
   content hashes and ancestor validation allow an evidence-only commit without
   making the just-recorded evidence stale.
@@ -3029,10 +3172,10 @@ vibex-workflow-e2e.v1.targets = {
   preflight failure writes no target result. A partial artifact is allowed only
   after a target actually passes, but the checker and functional release gate
   remain blocked until all four target/transport rows pass.
-- Any target-reachable source change after capture invalidates the Web build and
-  APK evidence. The final-candidate order is: release Web build, browser capture,
+- Any target-reachable source change after capture invalidates the runtime build
+  and APK evidence. The final-candidate order is: release runtime build, development-host run,
   Android rebuild/evidence sync, current-APK physical capture, then the four
-  workflow runs. Rebuilding only `apps/web/dist` does not update an already
+  workflow runs. Rebuilding only `apps/mobile-wasm/dist` does not update an already
   packaged APK.
 - Android auxiliary capture waits for `__VIBEX_GATE__.state == "ready"` and
   for `#gate-status-layer` to have `visibility:hidden` and `opacity:0` before the
@@ -3048,7 +3191,7 @@ vibex-workflow-e2e.v1.targets = {
 | --- | --- |
 | A credentials/hook/Relay ownership input is missing | Exit non-zero with the stable preflight code; do not write or reuse evidence. |
 | One target/transport or one workflow field is missing/failed | `pnpm check:workflow-e2e` fails and the functional release gate keeps `product_workflow_e2e_missing`. |
-| Candidate digest, Web build, lockfile, source tree, or APK differs | Reject the entire stale target set; rerun from the earliest invalidated build step. |
+| Candidate digest, runtime build, lockfile, source tree, or APK differs | Reject the entire stale target set; rerun from the earliest invalidated build step. |
 | Direct/Relay permission hashes differ | Reject the matrix as inconsistent even when individual business actions passed. |
 | Android run is not a physical device or its APK hash differs | Reject `android_physical`; browser/emulator evidence cannot substitute. |
 | GPUI is still booting or the status layer is visible/translucent | Do not capture or mark pixels passed; wait for ready plus completed fade. |
@@ -3056,8 +3199,8 @@ vibex-workflow-e2e.v1.targets = {
 
 ### 5. Good / Base / Bad Cases
 
-- Good: all four rows operate the same shared workbench against disposable
-  fixtures, prove live/reconnect behavior, and bind current release Web/APK
+- Good: all four rows operate the same shared mobile workbench against disposable
+  fixtures, prove live/reconnect behavior, and bind current runtime/APK
   artifacts with one permission contract.
 - Base: implementation/unit/browser/mobile checks pass but controlled E2E inputs
   are unavailable; no workflow evidence is invented and the release report
@@ -3072,7 +3215,7 @@ vibex-workflow-e2e.v1.targets = {
   identity, inconsistent permissions, non-physical Android, official Relay, and
   secret-bearing evidence.
 - Run `cargo test -p vibex-ui --locked`,
-  `cargo test -p vibex-remote-client --locked`, browser/mobile source-bound checks,
+  `cargo test -p vibex-remote-client --locked`, host/mobile source-bound checks,
   and local Relay smoke before the external matrix.
 - For a current physical APK, assert GPUI `ready`, zero runtime errors, credible
   pixel metrics, secure-storage success, hidden status layer, current screenshot
@@ -3086,7 +3229,7 @@ vibex-workflow-e2e.v1.targets = {
 #### Wrong
 
 ```text
-edit shared GPUI source -> rebuild Web only -> reuse old APK screenshot/E2E rows
+edit shared GPUI source -> rebuild runtime only -> reuse old APK screenshot/E2E rows
 missing Relay fixture -> copy Direct result into relay -> release functional=passed
 canvas exists -> capture while GATE_BOOT is fading -> pixels=passed
 ```
@@ -3094,7 +3237,7 @@ canvas exists -> capture while GATE_BOOT is fading -> pixels=passed
 #### Correct
 
 ```text
-edit source -> build Web/capture -> rebuild APK -> recapture physical -> run 4-row matrix
+edit source -> build runtime/host check -> rebuild APK -> recapture physical -> run 4-row matrix
 missing controlled inputs -> leave evidence absent/partial -> release functional=blocked
 GPUI ready + status layer hidden/opacity 0 + live pixel/storage checks -> capture
 ```

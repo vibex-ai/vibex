@@ -1,10 +1,9 @@
 # Vibex Mobile Shell
 
-This Capacitor shell packages only `apps/web/dist` and exposes only typed
+This Capacitor shell packages only `apps/mobile-wasm/dist` and exposes typed
 safe-area, keyboard, lifecycle, storage, camera, file, share, URL, and network
-capabilities. It is separate from
-the legacy React mobile shell so the Gate cannot accidentally ship
-`apps/web/dist`.
+capabilities. The bundled GPUI-WASM runtime is the only mobile UI; there is no
+browser WebUI/PWA distribution or legacy React fallback.
 
 ## Validate
 
@@ -34,11 +33,14 @@ The APK proves packaging only. Physical Android input, IME, rotation,
 foreground/background, secure storage, WebGPU pixels, and resource behavior
 remain pending until captured by `scripts/capture-wasm-mobile.mjs`.
 
-On macOS/Xcode, the same Web build is validated in unsigned simulator Debug
+On macOS/Xcode, the same mobile runtime build is validated in unsigned simulator Debug
 and Release shells with `ios:debug` and `ios:release`. Signed physical-device
 artifacts remain part of the cross-platform release Gate.
 
-The build scripts regenerate the ignored native platform tree and install the
-`vibex://open#/pair/...` plus `dev.vibex.remote://open#/pair/...` URL handlers.
-Set `VIBEX_APP_LINK_HOST` on a deployment build to add an HTTPS App/Universal
-Link host; the fragment is still scrubbed by the shared Web host before claim.
+The build scripts regenerate the ignored native platform tree and install
+`vibex://open/<transport>#/pair/...` plus
+`dev.vibex.remote://open/<transport>#/pair/...` URL handlers. `<transport>` is
+`direct`, `tailnet`, or `self_hosted_relay` and must match an option in the
+signed pairing offer. Set `VIBEX_APP_LINK_HOST` on a deployment build to add an
+HTTPS App/Universal Link host using `/open/<transport>`; the fragment is
+scrubbed by the mobile runtime host before claim.

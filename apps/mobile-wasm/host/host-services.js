@@ -1,5 +1,6 @@
 /**
- * Typed, capability-first host services for the browser and Capacitor shell.
+ * Typed, capability-first host services for the Capacitor shell and its
+ * development host.
  *
  * This module deliberately contains no product navigation, RPC envelopes, or
  * rendering.  It only normalizes platform capabilities and keeps durable
@@ -20,6 +21,7 @@ const EXTERNAL_URL_SCHEMES = new Set(["http:", "https:", "mailto:", "tel:"]);
 const PAIRING_URL_SCHEMES = new Set(["http:", "https:", "vibex:", "dev.vibex.remote:"]);
 const OPAQUE_DEEP_LINK_SCHEMES = new Set(["http:", "https:", "vibex:", "dev.vibex.remote:"]);
 const OPAQUE_DEEP_LINK_PATTERN = /^[A-Za-z0-9_.-]+$/;
+const MOBILE_PAIRING_TRANSPORTS = new Set(["direct", "tailnet", "self_hosted_relay"]);
 
 function clone(value) {
   return value == null ? value : JSON.parse(JSON.stringify(value));
@@ -80,13 +82,32 @@ function parsePairingIntake(value, base = "https://vibex.invalid/") {
   if (fragment.length > MAX_PAIRING_FRAGMENT_BYTES) {
     throw new Error("pairing fragment exceeds the bounded size");
   }
-  const trustedWebEntry = url.protocol === "http:" || url.protocol === "https:";
+  const webScheme = url.protocol === "http:" || url.protocol === "https:";
+  const path = [url.hostname, ...url.pathname.split("/")].filter(Boolean);
+  const appLinkPath = url.pathname.split("/").filter(Boolean);
+  const mobilePath = !webScheme
+    ? path
+    : url.protocol === "https:" && appLinkPath[0] === "open" && appLinkPath.length >= 2
+      ? appLinkPath
+      : null;
+  let transport = null;
+  if (mobilePath) {
+    if (
+      mobilePath.length !== 2 ||
+      mobilePath[0] !== "open" ||
+      !MOBILE_PAIRING_TRANSPORTS.has(mobilePath[1])
+    ) {
+      throw new Error("mobile pairing route is invalid");
+    }
+    transport = mobilePath[1];
+  }
+  const developmentHost = transport === null;
   return {
     fragment,
     // Pairing links never need query state; dropping it prevents an operator
     // from accidentally retaining a copied grant/token in browser history.
-    cleanUrl: trustedWebEntry ? url.pathname || "/" : new URL(base).pathname || "/",
-    entryHint: trustedWebEntry
+    cleanUrl: developmentHost ? url.pathname || "/" : new URL(base).pathname || "/",
+    entryHint: developmentHost
       ? {
           schemaVersion: PAIRING_ENTRY_HINT_SCHEMA_VERSION,
           kind: "origin",
@@ -94,12 +115,13 @@ function parsePairingIntake(value, base = "https://vibex.invalid/") {
         }
       : {
           schemaVersion: PAIRING_ENTRY_HINT_SCHEMA_VERSION,
-          kind: "untrusted_custom_scheme"
+          kind: "mobile_app",
+          transport
         },
     receipt: {
       schemaVersion: "vibex-pairing-intake.v1",
       accepted: true,
-      entryType: trustedWebEntry ? "web_origin" : "custom_scheme"
+      entryType: developmentHost ? "development_host" : "mobile_app"
     }
   };
 }
@@ -119,9 +141,14 @@ function rejectedPairingCleanUrl(value, base = "https://vibex.invalid/") {
 function pairingEntryType(value, base = "https://vibex.invalid/") {
   try {
     const url = new URL(value, base);
-    return url.protocol === "http:" || url.protocol === "https:"
-      ? "web_origin"
-      : "custom_scheme";
+    const appLinkPath = url.pathname.split("/").filter(Boolean);
+    const isHttpsAppLink =
+      url.protocol === "https:" &&
+      appLinkPath[0] === "open" &&
+      appLinkPath.length >= 2;
+    return isHttpsAppLink || (url.protocol !== "http:" && url.protocol !== "https:")
+      ? "mobile_app"
+      : "development_host";
   } catch {
     return "unknown";
   }
@@ -185,7 +212,7 @@ export function extractOpaqueDeepLink(value, base = "https://vibex.invalid/") {
     notificationId,
     opaqueLocator,
     cleanUrl: url.pathname || "/",
-    source: url.protocol === "http:" || url.protocol === "https:" ? "browser_url" : "app_link"
+    source: url.protocol === "http:" || url.protocol === "https:" ? "development_host" : "app_link"
   };
 }
 
@@ -242,7 +269,7 @@ export function validateCredentialBundle(value) {
   ) {
     throw new Error("credential identity or grant fields are invalid");
   }
-  if (!["browser", "mobile", "desktop_web"].includes(value.clientType)) {
+  if (value.clientType !== "mobile") {
     throw new Error("credential client type is unsupported");
   }
   const encoded = JSON.stringify(value);
@@ -511,13 +538,13 @@ export function createHostServices({
     if (initialPairing) {
       const intake = initialPairing;
       initialPairing = null;
-      await deliverPairing(intake, "browser_url");
+      await deliverPairing(intake, "development_host");
     } else if (initialPairingError) {
       const errorCode = initialPairingError;
       initialPairingError = null;
-      await onPairingFragment?.({ errorCode, source: "browser_url", entryType: "web_origin" });
+      await onPairingFragment?.({ errorCode, source: "development_host", entryType: "development_host" });
     } else if (windowLike?.location?.href) {
-      await dispatchInboundUrl(windowLike.location.href, "browser_url");
+      await dispatchInboundUrl(windowLike.location.href, "development_host");
     }
     return snapshot();
   }

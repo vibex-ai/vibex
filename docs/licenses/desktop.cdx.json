@@ -3977,42 +3977,6 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:cfg_aliases@0.1.1:c19b7c6f923b580a",
-      "name": "cfg_aliases",
-      "version": "0.1.1",
-      "licenses": [
-        {
-          "expression": "MIT"
-        }
-      ],
-      "purl": "pkg:cargo/cfg_aliases@0.1.1",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "MIT"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/katharostech/cfg_aliases"
-        }
-      ]
-    },
-    {
-      "type": "library",
       "bom-ref": "cargo:cfg_aliases@0.2.1:c19b7c6f923b580a",
       "name": "cfg_aliases",
       "version": "0.2.1",
@@ -6794,6 +6758,42 @@
         }
       ],
       "purl": "pkg:cargo/downcast-rs@1.2.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/marcianx/downcast-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:downcast-rs@2.0.2:c19b7c6f923b580a",
+      "name": "downcast-rs",
+      "version": "2.0.2",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/downcast-rs@2.0.2",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -16289,42 +16289,6 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:nix@0.28.0:c19b7c6f923b580a",
-      "name": "nix",
-      "version": "0.28.0",
-      "licenses": [
-        {
-          "expression": "MIT"
-        }
-      ],
-      "purl": "pkg:cargo/nix@0.28.0",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "MIT"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/nix-rust/nix"
-        }
-      ]
-    },
-    {
-      "type": "library",
       "bom-ref": "cargo:nix@0.29.0:c19b7c6f923b580a",
       "name": "nix",
       "version": "0.29.0",
@@ -19920,42 +19884,6 @@
         {
           "type": "vcs",
           "url": "https://github.com/taiki-e/portable-atomic-util"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:portable-pty@0.9.0:c19b7c6f923b580a",
-      "name": "portable-pty",
-      "version": "0.9.0",
-      "licenses": [
-        {
-          "expression": "MIT"
-        }
-      ],
-      "purl": "pkg:cargo/portable-pty@0.9.0",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "MIT"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/wezterm/wezterm"
         }
       ]
     },
@@ -24929,42 +24857,6 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:serial2@0.2.37:c19b7c6f923b580a",
-      "name": "serial2",
-      "version": "0.2.37",
-      "licenses": [
-        {
-          "expression": "BSD-2-Clause OR Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/serial2@0.2.37",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "BSD-2-Clause"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/de-vri-es/serial2-rs"
-        }
-      ]
-    },
-    {
-      "type": "library",
       "bom-ref": "cargo:sha1@0.10.6:c19b7c6f923b580a",
       "name": "sha1",
       "version": "0.10.6",
@@ -25140,42 +25032,6 @@
         {
           "type": "vcs",
           "url": "https://github.com/hawkw/sharded-slab"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:shared_library@0.1.9:c19b7c6f923b580a",
-      "name": "shared_library",
-      "version": "0.1.9",
-      "licenses": [
-        {
-          "expression": "Apache-2.0 OR MIT"
-        }
-      ],
-      "purl": "pkg:cargo/shared_library@0.1.9",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "Apache-2.0"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/tomaka/shared_library/"
         }
       ]
     },
@@ -36485,42 +36341,6 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:winreg@0.10.1:c19b7c6f923b580a",
-      "name": "winreg",
-      "version": "0.10.1",
-      "licenses": [
-        {
-          "expression": "MIT"
-        }
-      ],
-      "purl": "pkg:cargo/winreg@0.10.1",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "MIT"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/gentoo90/winreg-rs"
-        }
-      ]
-    },
-    {
-      "type": "library",
       "bom-ref": "cargo:winreg@0.55.0:c19b7c6f923b580a",
       "name": "winreg",
       "version": "0.55.0",
@@ -37344,6 +37164,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/RazrFalcon/xmlwriter"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:xpty@0.3.6:c19b7c6f923b580a",
+      "name": "xpty",
+      "version": "0.3.6",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/xpty@0.3.6",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/paidaxingyo666/xpty"
         }
       ]
     },
@@ -39190,7 +39046,7 @@
     },
     {
       "type": "file",
-      "bom-ref": "asset:vibex-desktop-reviewed-icons:c8d0b5c8e37627d4",
+      "bom-ref": "asset:vibex-desktop-reviewed-icons:aed10ac6c8f49e43",
       "name": "Vibex Desktop GPUI reviewed icon bundle",
       "version": "0.1.0-rc.1",
       "licenses": [
@@ -39201,7 +39057,7 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "c8d0b5c8e37627d49e3a7fa9d358856a08454ef1fefc3fc004127a72061ee3c8"
+          "content": "aed10ac6c8f49e433c9bcd55ecb35d9a3d0f44db9f82464d675220357ce1e269"
         }
       ],
       "externalReferences": [
@@ -39221,7 +39077,7 @@
         },
         {
           "name": "vibex:file-count",
-          "value": "105"
+          "value": "101"
         },
         {
           "name": "vibex:selected-license",
@@ -39272,8 +39128,8 @@
     },
     {
       "type": "file",
-      "bom-ref": "asset:vibex-web-application-icon:55337e2a7ae8ba53",
-      "name": "Vibex GPUI-WASM Web application icon",
+      "bom-ref": "asset:vibex-mobile-wasm-application-icon:55337e2a7ae8ba53",
+      "name": "Vibex GPUI-WASM mobile runtime icon",
       "version": "0.1.0-rc.1",
       "licenses": [
         {
@@ -39289,7 +39145,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/vibex/blob/main/apps/web/web/icon.svg"
+          "url": "https://github.com/vibex-ai/vibex/blob/main/apps/mobile-wasm/host/icon.svg"
         }
       ],
       "properties": [
@@ -39299,7 +39155,7 @@
         },
         {
           "name": "vibex:asset-root",
-          "value": "apps/web/web"
+          "value": "apps/mobile-wasm/host"
         },
         {
           "name": "vibex:file-count",
@@ -39313,8 +39169,8 @@
     },
     {
       "type": "file",
-      "bom-ref": "font:vibex-web-inter-variable-fonts:e10f9a6a0ef6976c",
-      "name": "Inter variable Web runtime fonts",
+      "bom-ref": "font:vibex-mobile-wasm-inter-variable-fonts:5a0386b42c02a52a",
+      "name": "Inter variable mobile runtime fonts",
       "version": "5.2.8",
       "licenses": [
         {
@@ -39324,7 +39180,7 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "e10f9a6a0ef6976cc8bea761d3ec6e920d1639e460ce9c8fb56a783f459073e6"
+          "content": "5a0386b42c02a52ac6e574121619cff2ba36e7f90c4069c1e7c7cf56766475ca"
         }
       ],
       "externalReferences": [
@@ -39340,7 +39196,7 @@
         },
         {
           "name": "vibex:asset-root",
-          "value": "apps/web/assets/fonts"
+          "value": "apps/mobile-wasm/assets/fonts"
         },
         {
           "name": "vibex:file-count",
@@ -39354,7 +39210,7 @@
     },
     {
       "type": "file",
-      "bom-ref": "font:vibex-web-wenquanyi-cjk-fallback:5c1ac72fd0f922d9",
+      "bom-ref": "font:vibex-mobile-wasm-wenquanyi-cjk-fallback:5c1ac72fd0f922d9",
       "name": "WenQuanYi Micro Hei CJK fallback",
       "version": "0.2.0-beta",
       "licenses": [
@@ -39381,7 +39237,7 @@
         },
         {
           "name": "vibex:asset-root",
-          "value": "apps/web/assets/fonts"
+          "value": "apps/mobile-wasm/assets/fonts"
         },
         {
           "name": "vibex:file-count",
@@ -39617,11 +39473,11 @@
       "dependsOn": []
     },
     {
-      "ref": "asset:vibex-desktop-reviewed-icons:c8d0b5c8e37627d4",
+      "ref": "asset:vibex-desktop-reviewed-icons:aed10ac6c8f49e43",
       "dependsOn": []
     },
     {
-      "ref": "asset:vibex-web-application-icon:55337e2a7ae8ba53",
+      "ref": "asset:vibex-mobile-wasm-application-icon:55337e2a7ae8ba53",
       "dependsOn": []
     },
     {
@@ -40552,10 +40408,6 @@
       "dependsOn": []
     },
     {
-      "ref": "cargo:cfg_aliases@0.1.1:c19b7c6f923b580a",
-      "dependsOn": []
-    },
-    {
       "ref": "cargo:cfg_aliases@0.2.1:c19b7c6f923b580a",
       "dependsOn": []
     },
@@ -41147,6 +40999,10 @@
     },
     {
       "ref": "cargo:downcast-rs@1.2.1:c19b7c6f923b580a",
+      "dependsOn": []
+    },
+    {
+      "ref": "cargo:downcast-rs@2.0.2:c19b7c6f923b580a",
       "dependsOn": []
     },
     {
@@ -43399,15 +43255,6 @@
       ]
     },
     {
-      "ref": "cargo:nix@0.28.0:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:bitflags@2.13.0:c19b7c6f923b580a",
-        "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
-        "cargo:cfg_aliases@0.1.1:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
-      ]
-    },
-    {
       "ref": "cargo:nix@0.29.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
@@ -44177,24 +44024,6 @@
     {
       "ref": "cargo:portable-atomic@1.13.1:c19b7c6f923b580a",
       "dependsOn": []
-    },
-    {
-      "ref": "cargo:portable-pty@0.9.0:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
-        "cargo:bitflags@1.3.2:c19b7c6f923b580a",
-        "cargo:downcast-rs@1.2.1:c19b7c6f923b580a",
-        "cargo:filedescriptor@0.8.3:c19b7c6f923b580a",
-        "cargo:lazy_static@1.5.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
-        "cargo:log@0.4.33:c19b7c6f923b580a",
-        "cargo:nix@0.28.0:c19b7c6f923b580a",
-        "cargo:serial2@0.2.37:c19b7c6f923b580a",
-        "cargo:shared_library@0.1.9:c19b7c6f923b580a",
-        "cargo:shell-words@1.1.1:c19b7c6f923b580a",
-        "cargo:winapi@0.3.9:c19b7c6f923b580a",
-        "cargo:winreg@0.10.1:c19b7c6f923b580a"
-      ]
     },
     {
       "ref": "cargo:postage@0.5.0:c19b7c6f923b580a",
@@ -45342,14 +45171,6 @@
       ]
     },
     {
-      "ref": "cargo:serial2@0.2.37:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
-        "cargo:windows-sys@0.61.2:c19b7c6f923b580a"
-      ]
-    },
-    {
       "ref": "cargo:sha1@0.10.6:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
@@ -45381,13 +45202,6 @@
       "ref": "cargo:sharded-slab@0.1.7:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:lazy_static@1.5.0:c19b7c6f923b580a"
-      ]
-    },
-    {
-      "ref": "cargo:shared_library@0.1.9:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:lazy_static@1.5.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
       ]
     },
     {
@@ -46731,6 +46545,7 @@
         "cargo:async-trait@0.1.89:c19b7c6f923b580a",
         "cargo:base64@0.22.1:c19b7c6f923b580a",
         "cargo:command-group@5.0.1:c19b7c6f923b580a",
+        "cargo:libc@0.2.186:c19b7c6f923b580a",
         "cargo:semver@1.0.28:c19b7c6f923b580a",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
         "cargo:serde_json@1.0.150:c19b7c6f923b580a",
@@ -46859,7 +46674,6 @@
         "cargo:serde_json@1.0.150:c19b7c6f923b580a",
         "cargo:sha2@0.10.9:c19b7c6f923b580a",
         "cargo:thiserror@2.0.18:c19b7c6f923b580a",
-        "cargo:url@2.5.8:c19b7c6f923b580a",
         "cargo:vibex-core@0.1.0-rc.1:a1f32ad3e304847a",
         "cargo:vibex-markdown@0.1.0-rc.1:d874bdc43e124bf4",
         "cargo:windows-sys@0.59.0:c19b7c6f923b580a"
@@ -46907,9 +46721,10 @@
       "ref": "cargo:vibex-desktop@0.1.0-rc.1:8be20e5fa4f9b6f0",
       "dependsOn": [
         "asset:vibex-desktop-application-icons:9ae646c05c9fa1f7",
-        "asset:vibex-desktop-reviewed-icons:c8d0b5c8e37627d4",
+        "asset:vibex-desktop-reviewed-icons:aed10ac6c8f49e43",
         "cargo:base64@0.22.1:c19b7c6f923b580a",
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
+        "cargo:embed-resource@3.0.9:c19b7c6f923b580a",
         "cargo:gpui-component-assets@0.5.1:4d9608b0b417550c",
         "cargo:gpui-component@0.5.2:4d9608b0b417550c",
         "cargo:gpui@0.2.2:1e15125dab53b828",
@@ -47061,18 +46876,18 @@
       "ref": "cargo:vibex-terminal@0.1.0-rc.1:73363de7836b4dd0",
       "dependsOn": [
         "cargo:alacritty_terminal@0.26.0:c19b7c6f923b580a",
-        "cargo:portable-pty@0.9.0:c19b7c6f923b580a",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
         "cargo:serde_json@1.0.150:c19b7c6f923b580a",
         "cargo:sha2@0.10.9:c19b7c6f923b580a",
         "cargo:vibex-core@0.1.0-rc.1:a1f32ad3e304847a",
-        "cargo:vibex-terminal-ui@0.1.0-rc.1:81e25774d4aead5f"
+        "cargo:vibex-terminal-ui@0.1.0-rc.1:81e25774d4aead5f",
+        "cargo:xpty@0.3.6:c19b7c6f923b580a"
       ]
     },
     {
       "ref": "cargo:vibex-ui@0.1.0-rc.1:5b03b27578a01810",
       "dependsOn": [
-        "asset:vibex-web-application-icon:55337e2a7ae8ba53",
+        "asset:vibex-mobile-wasm-application-icon:55337e2a7ae8ba53",
         "cargo:gpui-component@0.5.2:4d9608b0b417550c",
         "cargo:gpui@0.2.2:1e15125dab53b828",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
@@ -47080,8 +46895,8 @@
         "cargo:vibex-core@0.1.0-rc.1:a1f32ad3e304847a",
         "cargo:vibex-desktop-model@0.1.0-rc.1:3eccb8226f5ee757",
         "cargo:vibex-terminal-ui@0.1.0-rc.1:81e25774d4aead5f",
-        "font:vibex-web-inter-variable-fonts:e10f9a6a0ef6976c",
-        "font:vibex-web-wenquanyi-cjk-fallback:5c1ac72fd0f922d9"
+        "font:vibex-mobile-wasm-inter-variable-fonts:5a0386b42c02a52a",
+        "font:vibex-mobile-wasm-wenquanyi-cjk-fallback:5c1ac72fd0f922d9"
       ]
     },
     {
@@ -47888,12 +47703,6 @@
       ]
     },
     {
-      "ref": "cargo:winreg@0.10.1:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:winapi@0.3.9:c19b7c6f923b580a"
-      ]
-    },
-    {
       "ref": "cargo:winreg@0.55.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
@@ -48031,6 +47840,21 @@
     {
       "ref": "cargo:xmlwriter@0.1.0:c19b7c6f923b580a",
       "dependsOn": []
+    },
+    {
+      "ref": "cargo:xpty@0.3.6:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:downcast-rs@2.0.2:c19b7c6f923b580a",
+        "cargo:filedescriptor@0.8.3:c19b7c6f923b580a",
+        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libloading@0.8.9:c19b7c6f923b580a",
+        "cargo:log@0.4.33:c19b7c6f923b580a",
+        "cargo:nix@0.29.0:c19b7c6f923b580a",
+        "cargo:shell-words@1.1.1:c19b7c6f923b580a",
+        "cargo:thiserror@2.0.18:c19b7c6f923b580a",
+        "cargo:windows-sys@0.59.0:c19b7c6f923b580a",
+        "cargo:winreg@0.55.0:c19b7c6f923b580a"
+      ]
     },
     {
       "ref": "cargo:xsum@0.1.6:c19b7c6f923b580a",
@@ -48522,11 +48346,11 @@
       ]
     },
     {
-      "ref": "font:vibex-web-inter-variable-fonts:e10f9a6a0ef6976c",
+      "ref": "font:vibex-mobile-wasm-inter-variable-fonts:5a0386b42c02a52a",
       "dependsOn": []
     },
     {
-      "ref": "font:vibex-web-wenquanyi-cjk-fallback:5c1ac72fd0f922d9",
+      "ref": "font:vibex-mobile-wasm-wenquanyi-cjk-fallback:5c1ac72fd0f922d9",
       "dependsOn": []
     },
     {

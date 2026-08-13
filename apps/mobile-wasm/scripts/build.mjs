@@ -16,34 +16,17 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
-const APP = join(ROOT, "apps/web");
+const APP = join(ROOT, "apps/mobile-wasm");
 const DIST = join(APP, "dist");
 const release = process.argv.includes("--release");
 const profile = release ? "release" : "debug";
-const CACHE_ASSETS = [
-  "./",
-  "./index.html",
-  "./offline.html",
-  "./styles.css",
-  "./host.js",
-  "./host-services.js",
-  "./platform-compat.js",
-  "./manifest.webmanifest",
-  "./icon.svg",
-  "./build.json",
-  "./pkg/vibex_web.js",
-  "./pkg/vibex_web_bg.wasm"
-];
 const STATIC_IDENTITY_ASSETS = [
   "index.html",
-  "offline.html",
   "styles.css",
   "host.js",
   "host-services.js",
   "platform-compat.js",
-  "manifest.webmanifest",
-  "icon.svg",
-  "service-worker.js"
+  "icon.svg"
 ];
 
 function fail(message) {
@@ -162,7 +145,7 @@ const cargoArgs = [
   "+nightly-2026-07-24",
   "build",
   "-p",
-  "vibex-web",
+  "vibex-mobile-wasm",
   "--target",
   "wasm32-unknown-unknown",
   "--locked"
@@ -172,13 +155,13 @@ run("cargo", cargoArgs);
 
 rmSync(DIST, { recursive: true, force: true });
 mkdirSync(join(DIST, "pkg"), { recursive: true });
-cpSync(join(APP, "web"), DIST, { recursive: true });
+cpSync(join(APP, "host"), DIST, { recursive: true });
 
 const wasmInput = join(
   ROOT,
   "target/wasm32-unknown-unknown",
   profile,
-  "vibex_web.wasm"
+  "vibex_mobile_wasm.wasm"
 );
 if (!existsSync(wasmInput)) fail(`compiled WASM is missing: ${wasmInput}`);
 run(wasmBindgen, [
@@ -188,30 +171,15 @@ run(wasmBindgen, [
   "--out-dir",
   join(DIST, "pkg"),
   "--out-name",
-  "vibex_web",
+  "vibex_mobile_wasm",
   "--no-typescript"
 ]);
 
-const wasmOutput = join(DIST, "pkg/vibex_web_bg.wasm");
+const wasmOutput = join(DIST, "pkg/vibex_mobile_wasm_bg.wasm");
 const bytes = readFileSync(wasmOutput);
 const wasmSha256 = createHash("sha256").update(bytes).digest("hex");
 const packageVersion = JSON.parse(readFileSync(join(APP, "package.json"), "utf8")).version;
 const gitCommit = sourceGitCommit();
-const serviceWorkerPath = join(DIST, "service-worker.js");
-const serviceWorkerTemplate = readFileSync(serviceWorkerPath, "utf8");
-if (
-  !serviceWorkerTemplate.includes("__VIBEX_BUILD_ID__") ||
-  !serviceWorkerTemplate.includes("__VIBEX_CACHE_ASSETS__")
-) {
-  fail("service worker build placeholders are missing");
-}
-writeFileSync(
-  serviceWorkerPath,
-  serviceWorkerTemplate.replace(
-    "__VIBEX_CACHE_ASSETS__",
-    JSON.stringify(CACHE_ASSETS)
-  )
-);
 const staticHash = createHash("sha256");
 for (const path of STATIC_IDENTITY_ASSETS) {
   staticHash.update(path);
@@ -221,7 +189,7 @@ for (const path of STATIC_IDENTITY_ASSETS) {
 }
 const staticSha256 = staticHash.digest("hex");
 const glueSha256 = createHash("sha256")
-  .update(readFileSync(join(DIST, "pkg/vibex_web.js")))
+  .update(readFileSync(join(DIST, "pkg/vibex_mobile_wasm.js")))
   .digest("hex");
 const buildId = createHash("sha256")
   .update(JSON.stringify({
@@ -238,7 +206,9 @@ writeFileSync(
   join(DIST, "build.json"),
   `${JSON.stringify(
     {
-      schemaVersion: "vibex-web-build.v1",
+      schemaVersion: "vibex-mobile-wasm-build.v1",
+      runtimeRole: "capacitor_mobile_runtime",
+      browserHost: "development_and_test_only",
       buildId,
       packageVersion,
       profile,
@@ -247,22 +217,11 @@ writeFileSync(
       wasmBytes: bytes.length,
       wasmSha256,
       glueSha256,
-      staticSha256,
-      cacheName: `vibex-static-${buildId}`,
-      cacheAssets: CACHE_ASSETS
+      staticSha256
     },
     null,
     2
   )}\n`
 );
 
-const serviceWorker = readFileSync(serviceWorkerPath, "utf8");
-if (!serviceWorker.includes("__VIBEX_BUILD_ID__")) {
-  fail("service worker build id placeholder is missing");
-}
-writeFileSync(
-  serviceWorkerPath,
-  serviceWorker.replace("__VIBEX_BUILD_ID__", buildId)
-);
-
-console.log(`Built apps/web/dist (${profile}, ${buildId}, ${bytes.length} WASM bytes)`);
+console.log(`Built apps/mobile-wasm/dist (${profile}, ${buildId}, ${bytes.length} WASM bytes)`);

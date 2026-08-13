@@ -363,7 +363,7 @@ impl WorkflowWorkbenchView {
             pending_workspace_selection: None,
             sidebar: SidebarState::default(),
             connection: WorkbenchConnectionState::Online,
-            layout: ShellLayout::resolve(360, 800),
+            layout: ShellLayout::resolve_mobile(360, 800),
             host_viewport: HostViewportSnapshot {
                 width: 360.0,
                 height: 800.0,
@@ -518,7 +518,7 @@ impl WorkflowWorkbenchView {
     }
 
     pub fn apply_host_viewport(&mut self, viewport: HostViewportSnapshot, cx: &mut Context<Self>) {
-        self.layout = ShellLayout::resolve(
+        self.layout = ShellLayout::resolve_mobile(
             normalized_dimension(viewport.width),
             normalized_dimension(viewport.height),
         );
@@ -3593,7 +3593,7 @@ impl Render for WorkflowWorkbenchView {
         let width = f32::from(window.viewport_size().width);
         let height = f32::from(window.viewport_size().height);
         self.layout =
-            ShellLayout::resolve(normalized_dimension(width), normalized_dimension(height));
+            ShellLayout::resolve_mobile(normalized_dimension(width), normalized_dimension(height));
         let surface = match self.active_surface() {
             WorkbenchSurface::Agent => self.render_agent(window, cx),
             WorkbenchSurface::Files => self.render_files(cx),

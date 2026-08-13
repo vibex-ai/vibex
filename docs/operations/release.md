@@ -24,8 +24,8 @@ pnpm package:rc
 pnpm package:stable
 ```
 
-Linux packages contain the GPUI desktop binary, source-bound GPUI-WASM WebUI,
-and reviewed PDFium runtime. Outputs are written below
+Linux packages contain the GPUI desktop binary and reviewed PDFium runtime.
+They do not contain or host the mobile GPUI-WASM runtime. Outputs are written below
 `target/release-packages/<channel>/`.
 
 ## Data Safety

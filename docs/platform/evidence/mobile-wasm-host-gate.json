@@ -1,0 +1,90 @@
+{
+  "schemaVersion": "vibex-mobile-wasm-host-evidence.v1",
+  "capturedAt": "2026-08-13T11:19:22.321Z",
+  "purpose": "development_and_automation_only",
+  "releaseClaim": "none",
+  "source": {
+    "dependencySourcePolicy": "upstream_git_root_cargo_lock",
+    "zedRevision": "c9e8e611dbc279afa0914d28c4d37ad07f38c03b",
+    "gpuiComponentRevision": "031555662e99a1b5a549990b47f246d475b8288a",
+    "sourceTreeSha256": "bc9ae99fb918c4463148c4f0abc70da154a6cb0712a282ce891bd9506a9fc4aa",
+    "cargoLockfileSha256": "6a0deb409f2e43c799b072c9f39c9e7305951565ad9e5fcdabf7a55d028437f0",
+    "pnpmLockfileSha256": "0df8e230152545ca1378c26708f020fe60b107310894b2d6e19dbd24bcaff23a"
+  },
+  "runtimeBuild": {
+    "schemaVersion": "vibex-mobile-wasm-build.v1",
+    "runtimeRole": "capacitor_mobile_runtime",
+    "browserHost": "development_and_test_only",
+    "buildId": "e849987cbbf5d359874386c9",
+    "packageVersion": "0.1.0-rc.1",
+    "profile": "release",
+    "gitCommit": "7d8a22836722cdb47794891aada45288824d6c16",
+    "wasmBindgenVersion": "0.2.125",
+    "wasmBytes": 24862521,
+    "wasmSha256": "cb044e39f25d96205d911c812c87f066bb72746841a72e8d3fa44ec1d103af04",
+    "glueSha256": "14021eae0958616f15046e0dc474ee8a683c4059d303f4089e45f1f4ee15c792",
+    "staticSha256": "575104c26dfe2828a840ec2df9e19c1011ff3ce03c753dc374c906158c0ec23b"
+  },
+  "targets": {
+    "chromium": {
+      "status": "passed",
+      "version": "149.0.7827.55",
+      "launchArguments": [
+        "--enable-unsafe-webgpu",
+        "--use-angle=vulkan",
+        "--enable-features=Vulkan"
+      ],
+      "maximumShell": "medium",
+      "viewports": {
+        "medium": {
+          "width": 1280,
+          "height": 800,
+          "deviceScaleFactor": 1,
+          "shell": "medium",
+          "pixels": {
+            "uniqueColors": 25,
+            "standardDeviation": 18.00640627786135
+          },
+          "canvas": {
+            "width": 1280,
+            "height": 800,
+            "cssWidth": 1280,
+            "cssHeight": 800
+          }
+        },
+        "compact": {
+          "width": 390,
+          "height": 844,
+          "deviceScaleFactor": 2,
+          "shell": "compact",
+          "pixels": {
+            "uniqueColors": 91,
+            "standardDeviation": 52.58510381028069
+          },
+          "canvas": {
+            "width": 390,
+            "height": 844,
+            "cssWidth": 390,
+            "cssHeight": 844
+          }
+        }
+      },
+      "hostBridge": {
+        "keyboard": "passed",
+        "appearance": "passed",
+        "lifecycle": "passed",
+        "touch": {
+          "status": "passed",
+          "before": 0,
+          "after": -225,
+          "scrollGestures": 1
+        },
+        "negativePath": {
+          "state": "unsupported",
+          "code": "WEBGPU_FORCED_UNSUPPORTED",
+          "canvasCount": 0
+        }
+      }
+    }
+  }
+}

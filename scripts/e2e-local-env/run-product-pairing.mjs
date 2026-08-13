@@ -92,28 +92,28 @@ function cargoExecutable(args, targetName, env, code) {
   return executable;
 }
 
-function readWebBuild() {
+function readMobileRuntimeBuild() {
   let build;
   try {
-    build = JSON.parse(readFileSync(join(ROOT, "apps/web/dist/build.json"), "utf8"));
+    build = JSON.parse(readFileSync(join(ROOT, "apps/mobile-wasm/dist/build.json"), "utf8"));
   } catch {
-    fail("product_pairing_web_build_missing");
+    fail("product_pairing_mobile_runtime_build_missing");
   }
   assert(
-    build.schemaVersion === "vibex-web-build.v1" &&
+    build.schemaVersion === "vibex-mobile-wasm-build.v1" &&
       build.profile === "release" &&
       /^[0-9a-f]{24}$/.test(build.buildId ?? "") &&
       /^[0-9a-f]{40}$/.test(build.gitCommit ?? ""),
-    "product_pairing_web_build_invalid"
+    "product_pairing_mobile_runtime_build_invalid"
   );
   return build;
 }
 
 function buildArtifacts() {
-  run("pnpm", ["--filter", "@vibex/web", "build:release"], {
-    code: "product_pairing_web_build_failed"
+  run("pnpm", ["--filter", "@vibex/mobile-wasm", "build:release"], {
+    code: "product_pairing_mobile_runtime_build_failed"
   });
-  const webBuild = readWebBuild();
+  const mobileRuntimeBuild = readMobileRuntimeBuild();
   const configuredHarness = process.env.VIBEX_E2E_HARNESS_BINARY;
   const harnessBinary = configuredHarness
     ? resolve(configuredHarness)
@@ -137,14 +137,11 @@ function buildArtifacts() {
   const relayBinary = cargoExecutable(
     ["build", "-p", "vibex-relay-server", "--bin", "vibex-relay-server", "--locked"],
     "vibex-relay-server",
-    {
-      VIBEX_RELAY_WEB_BUILD_ID: webBuild.buildId,
-      VIBEX_RELAY_WEB_GIT_COMMIT: webBuild.gitCommit
-    },
+    {},
     "product_pairing_relay_build_failed"
   );
   return {
-    webBuild,
+    mobileRuntimeBuild,
     harnessBinary,
     relayBinary,
     desktopArtifactSha256: sha256File(harnessBinary),
@@ -617,8 +614,7 @@ async function createModeEnvironment(mode, artifacts, certificate, writeEvidence
         VIBEX_RELAY_BIND_ADDR: `127.0.0.1:${relayPort}`,
         VIBEX_RELAY_MAX_TOTAL_CONNECTIONS: "64",
         VIBEX_RELAY_MAX_DEVICES_PER_ROOM: "8",
-        VIBEX_RELAY_MAX_QUEUE_BYTES_PER_CONNECTION: "1048576",
-        VIBEX_RELAY_WEB_STATIC_DIR: join(ROOT, "apps/web/dist")
+        VIBEX_RELAY_MAX_QUEUE_BYTES_PER_CONNECTION: "1048576"
       },
       logPath: relayLogPath,
       code: "product_pairing_relay_exited"

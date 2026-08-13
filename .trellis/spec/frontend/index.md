@@ -2,15 +2,15 @@
 
 These guidelines define the current GPUI presentation architecture for Vibex.
 `apps/desktop` is the only visual, interaction, and information-architecture
-baseline. Web uses GPUI-WASM, and mobile packages the same GPUI-WASM product through
-Capacitor with viewport-driven adaptive shells.
+baseline. Mobile uses a dedicated GPUI-WASM runtime packaged through Capacitor.
+The browser host is development/automation only and is not a WebUI product.
 
 Primary evidence:
 - [Architecture Baseline](../guides/architecture-baseline.md)
 - `apps/desktop`
 
 Superseded requirement documents, external design mockups, the former
-React/Tauri implementations that once occupied the current `apps/web`,
+React/Tauri implementations that once occupied the current `apps/mobile-wasm`,
 `apps/mobile`, and `apps/desktop` paths, and the deleted `packages/ui` tree are
 historical inputs. They are not component, style, navigation, transport, or
 rollback sources for current UI. Any detailed scenario that still names React,
@@ -36,12 +36,14 @@ Read these files before frontend work:
 
 - `crates/vibex-ui` owns shared tokens, primitives, View/Controller state,
   domain components, and Wide/Medium/Compact shells.
-- GPUI Desktop uses `NativeBackend`; GPUI-WASM Web/mobile use `WebRemoteBackend`.
+- GPUI Desktop uses `NativeBackend`; the GPUI-WASM mobile runtime uses
+  `WebRemoteBackend`.
 - `DesktopRuntime` remains the only authority for Agent, files, Git, PTY, Provider
   configuration, device permissions, and mutation results.
-- Wide/Medium/Compact are layouts over one component/state model. Compact may
-  reorder and reduce density, but it must not become a second mobile design system.
-- Web/mobile remain remote clients: lightweight text editing and review are in scope;
+- Desktop may use Wide/Medium/Compact. The mobile runtime is limited to
+  Medium/Compact; Compact may reorder and reduce density, but it must not become
+  a second mobile design system.
+- Mobile remains a remote client: lightweight text editing and review are in scope;
   a local Agent, local Git/PTY, heavy IDE editor, and local workspace filesystem are not.
 
 ## Non-Negotiable Frontend Rules

@@ -23,7 +23,7 @@ export default [
     }
   },
   {
-    files: ["apps/web/web/**/*.js"],
+    files: ["apps/mobile-wasm/host/**/*.js"],
     languageOptions: {
       ecmaVersion: 2024,
       globals: globals.browser,

@@ -4,7 +4,7 @@
 > baseline for Vibex. Implementation status is decided by code, tests, and the
 > evidence files listed in [Evidence Map](#evidence-map) — not by this document.
 
-Read this before designing anything that spans desktop, Web, mobile, or the
+Read this before designing anything that spans desktop, mobile, or the
 remote transport. Layer-specific rules live in
 [backend](../backend/index.md) and [frontend](../frontend/index.md); this file
 owns the decisions those layers must not contradict.
@@ -14,9 +14,9 @@ owns the decisions those layers must not contradict.
 - One GPUI design system, one set of domain components, one Local/Remote backend
   contract, one versioned remote protocol, and several viewport-driven shells.
 - `apps/desktop` is the only visual, interaction, and information-architecture
-  source. Web and mobile derive from it; they never define a parallel design.
-- The PC `DesktopRuntime` is the only authoritative state owner. Web and mobile
-  are network clients.
+  source. Mobile derives from it; it never defines a parallel design.
+- The PC `DesktopRuntime` is the only authoritative state owner. Mobile is a
+  network client.
 
 ### Non-Goals
 
@@ -28,6 +28,9 @@ owns the decisions those layers must not contradict.
   a re-layout, not a shrink.
 - Do not build a second design system for touch.
 - Do not let Relay become a second business database or state authority.
+- Do not restore a WebUI/PWA product, public WASM hosting, or a Wide
+  browser-workbench release target. The browser host is development and
+  automation infrastructure only.
 - V1 ships Direct and user self-hosted Relay only. There is no official Vibex
   Relay, no Vibex account system, and no public multi-tenant Relay operation.
   Protocol extension points may exist, but no default official endpoint ships
@@ -52,16 +55,16 @@ owns the decisions those layers must not contradict.
                                   LAN / private network        user self-hosted E2EE
                                           └─────────────┬─────────────┘
                                                WebRemoteBackend
-                                    ┌───────────────────┴───────────────────┐
-                             GPUI-WASM Web                        GPUI-WASM + Capacitor
-                         Wide / Medium / Compact                     Compact first
+                                                        │
+                                             GPUI-WASM + Capacitor
+                                               Compact / Medium
 ```
 
 Boundaries:
 
 - GPUI views and controllers depend only on the backend capability traits.
 - Desktop reaches `DesktopRuntime` in process through `NativeBackend`.
-- Web and mobile reach `RemoteGateway` through `WebRemoteBackend`.
+- Mobile reaches `RemoteGateway` through `WebRemoteBackend`.
 - `DesktopRuntime` decides permissions, data versions, and mutation results.
   Clients cannot bypass it.
 - Direct and Relay are transports only. They must not produce two RPC surfaces
@@ -77,7 +80,7 @@ boundary.
 
 ## GPUI Desktop Is The Only Design Source
 
-New Web and mobile surfaces inherit directly from the desktop assets:
+New mobile surfaces inherit directly from the desktop assets:
 
 - `apps/desktop/src/app.rs` — workbench structure and product hierarchy.
 - `apps/desktop/src/code_workbench.rs` — file, edit, Preview, Git, Agent flows.
@@ -121,6 +124,10 @@ content minimums and viewport size, never by User-Agent:
 window legitimately enters `CompactShell`; a tablet or landscape phone
 legitimately enters `MediumShell`.
 
+`apps/mobile-wasm` always resolves through `ShellLayout::resolve_mobile`, which
+caps the result at Medium even when a development host has desktop dimensions.
+Wide remains available to native desktop only.
+
 Structure conversion:
 
 | Desktop | Medium | Compact |
@@ -149,12 +156,13 @@ tools and global configuration must not be mixed into one bar.
 | Platform | Shells | Backend | Role |
 | --- | --- | --- | --- |
 | GPUI Desktop | Wide/Medium, Compact when narrow | `NativeBackend` | Full local workbench and authoritative runtime |
-| GPUI-WASM Web (`apps/web`) | All, chosen by viewport | `WebRemoteBackend` | Browser remote workbench; desktop experience on wide screens |
-| Capacitor mobile (`apps/mobile`) | Compact first, Medium in landscape | `WebRemoteBackend` | Pocket remote console with reduced density |
+| Mobile runtime (`apps/mobile-wasm`) | Compact/Medium only | `WebRemoteBackend` | GPUI-WASM remote client bundled into Capacitor |
+| Capacitor shell (`apps/mobile`) | Hosts the bundled runtime | `WebRemoteBackend` | Installed Android/iOS pocket remote console |
 
-"Desktop Web or mobile Web" is not a deploy-time choice. The same artifact picks
-a shell from available width. `apps/mobile` packages only `apps/web/dist` under
-the `dev.vibex.remote` application identity.
+`apps/mobile` packages only `apps/mobile-wasm/dist` under the
+`dev.vibex.remote` application identity. A fixed browser host may load the same
+runtime for local development and automation, but it is not distributed,
+hosted, paired as a browser client, or supported as a product.
 
 ## Mobile V1 Scope
 
@@ -196,7 +204,7 @@ checks. Hiding a button is not enforcement.
 
 | Capability | Constraint | Requirement |
 | --- | --- | --- |
-| WebGPU | No Canvas2D fallback if init fails | Real-device gates for desktop browsers and Android/iOS WebView; see `docs/platform/wasm-browser-gate.md` |
+| WebGPU | No Canvas2D fallback if init fails | Development-host plus Android/iOS WebView gates; see `docs/platform/mobile-wasm-runtime-gate.md` |
 | Native popup | Anchored popups unavailable | Use in-window GPUI popover/sheet |
 | File picker | Web path selection incomplete | Upload bytes through the DOM/Capacitor bridge |
 | Clipboard read | Synchronous read unavailable | Rely on paste events and the platform bridge |
@@ -224,7 +232,7 @@ crates/vibex-terminal-ui     portable terminal emulator, frame model, GPUI surfa
 crates/desktop-model         platform-neutral projections (timeline, preview tree, diff, UI settings)
 crates/desktop-runtime       typed facade, bootstrap, subscriptions, lifecycle
 apps/desktop                 NativeBackend, native platform bridges, DesktopRuntime startup
-apps/web                     wasm-bindgen entry, Web bridge, static assets
+apps/mobile-wasm             wasm-bindgen mobile entry, Capacitor host bridge, bundled assets
 apps/mobile                  Capacitor shell, push, secure storage, deep link, lifecycle bridge
 ```
 
@@ -246,9 +254,9 @@ RemoteTransport
 
 | Network shape | Vibex class | Typical entry | Third-party service |
 | --- | --- | --- | --- |
-| Same LAN | Direct | PC LAN address or same-origin WebUI | No |
-| Tailscale / Headscale / WireGuard / ZeroTier | Direct | Tailnet IP, MagicDNS, or HTTPS serve | Only the mesh tool the user chose |
-| User self-hosted Vibex Relay | Relay | User-configured WSS/HTTPS endpoint | Self-deployed |
+| Same LAN | Direct | Mobile App uses a validated PC LAN endpoint | No |
+| Tailscale / Headscale / WireGuard / ZeroTier | Direct | Mobile App uses Tailnet IP, MagicDNS, or HTTPS proxy | Only the mesh tool the user chose |
+| User self-hosted Vibex Relay | Relay | Mobile App uses a user-configured WSS/HTTPS endpoint | Self-deployed |
 
 - Private mesh networks stay classified as Direct even when the mesh internally
   relays packets.
@@ -273,27 +281,26 @@ transport keeps the same device identity and `DesktopRuntime` permissions.
 
 | Purpose | Protocol |
 | --- | --- |
-| HTML, GPUI-WASM, fonts, icons, manifest | HTTPS |
+| GPUI-WASM, fonts, icons, host JS | Bundled Capacitor assets |
 | Agent, Git, File, approval RPC and live events | WSS |
 | Terminal and file streams | WSS binary frames |
 | health, pairing bootstrap, controlled download | A small HTTPS API |
 
-Production uses HTTPS plus WSS. `http://localhost` and `ws://localhost` are
-development-only. `http://192.168.x.x` must not be a production entry point:
-WebGPU, PWA, camera, and some storage APIs require a secure context; an HTTPS
-page blocks cleartext `ws://` as mixed content; and an online WebUI reaching a
-private address additionally hits CORS and Private Network Access limits.
+The mobile runtime is installed with the app and never downloaded from the PC
+or Relay. Network traffic uses HTTPS/WSS outside explicit loopback development.
+The Capacitor origins are exact native-client Origin allowlist entries; they do
+not authorize `localhost` as a public Gateway Host.
 
 Recommended access shapes:
 
-- LAN WebUI — the PC `RemoteGateway` serves the `apps/web` bundle and WSS from
-  the same origin.
-- Private mesh WebUI — expose the loopback `RemoteGateway` as a mesh-internal
+- LAN mobile — the installed app connects to an explicitly enabled, validated
+  Direct Gateway endpoint.
+- Private mesh mobile — expose the loopback `RemoteGateway` as a mesh-internal
   HTTPS/WSS address through the mesh tool's reverse proxy.
-- Public WebUI — a trusted HTTPS static site loads GPUI-WASM and connects over
-  E2EE Relay.
-- Capacitor app — GPUI-WASM assets ship inside the app, never downloaded from
-  the PC; the network side still uses Direct WSS or E2EE Relay.
+- Relay mobile — the installed app connects to a user self-hosted Relay over
+  WSS with application-layer E2EE.
+- Development host — fixed localhost/Playwright host only; it carries no
+  release, deployment, PWA, or browser-support claim.
 
 HTTPS/WSS protects the transport only. Relay paths must keep application-layer
 E2EE on top so neither the TLS terminator nor Relay can read business content.
@@ -439,10 +446,23 @@ Management Center → pair new device → choose permissions
   → lands in Sessions
 ```
 
-The QR should be an HTTPS URL a Universal Link or App Link can intercept, so an
-installed app is invoked directly and a missing app lands on the HTTPS WebUI or
-install guidance. The fragment is not sent to the hosting site; the client
-should clear it from the address bar and history after parsing.
+The desktop emits an installed-app URI whose route selects only a transport
+already present in the signed offer:
+
+```text
+vibex://open/direct#/pair/<offer>
+vibex://open/tailnet#/pair/<offer>
+vibex://open/self_hosted_relay#/pair/<offer>
+```
+
+If the offer contains several candidates for that transport, the one-time claim
+uses the first valid candidate in desktop-issued order. The committed credential
+still retains all validated candidates so Auto transport can probe and select
+the healthiest route after pairing.
+
+There is no browser fallback when the app is missing. Distribution/install
+guidance belongs outside the one-time pairing URL. The fragment is scrubbed
+from host history before parsing or asynchronous work.
 
 The pairing offer carries at least:
 
@@ -500,9 +520,9 @@ the React WebUI, and the legacy Capacitor wrapper are retired. They exist only
 in Git and release history. They are not workspace members, rollback source
 paths, or implementation templates.
 
-- New Web/mobile code must not import, copy, or run old React UI, Tailwind or
+- New mobile code must not import, copy, or run old React UI, Tailwind or
   shadcn composition, old TypeScript transport, or old CSS.
-- `apps/mobile` packages only the current `apps/web/dist`.
+- `apps/mobile` packages only the current `apps/mobile-wasm/dist`.
 - GPUI tokens are not generated from a legacy CSS file.
 - Product rollback uses a published release artifact plus a compatible server
   and data backup. It never restores a second buildable UI source path on
@@ -520,14 +540,14 @@ Renumbering these headings breaks release traceability.
 
 ### 16.1 Design Consistency (设计一致性)
 
-- Desktop, wide Web, and phone use the same GPUI tokens, icons, and domain
-  components.
+- Desktop and the installed mobile runtime use the same GPUI tokens, icons, and
+  domain components.
 - The visual baseline for new UI comes only from GPUI Desktop.
-- Wide Web is explainably consistent with GPUI Desktop at the same viewport.
+- Native desktop owns Wide; the mobile runtime resolves only Medium or Compact.
 - Compact is re-layout and reduced density, not a second brand or component
   style.
-- 360×800, 390×844, 768×1024, 1200×800, and 1440×900 all have no unreachable
-  action.
+- The mobile runtime has no unreachable action at 360x800, 390x844, and
+  768x1024; native desktop has none at 1200x800 and 1440x900.
 - No hover-only primary action; touch target size, safe area, and soft-keyboard
   behaviour pass real-device acceptance.
 
@@ -625,6 +645,6 @@ third-party working copies.
 | Relay NAT/mobile smoke | `docs/smoke/relay-nat.md` |
 | Remote LAN smoke | `docs/smoke/remote-lan.md` |
 | Terminal | `crates/terminal/src/lib.rs`, `crates/vibex-terminal-ui` |
-| Browser support gate | `docs/platform/wasm-browser-gate.md`, `docs/platform/support-matrix.md` |
+| Mobile runtime gate | `docs/platform/mobile-wasm-runtime-gate.md`, `docs/platform/support-matrix.md` |
 | Migration contract | `docs/migration/wasm-ui-contract.md` |
 | Release gate | `docs/release/cross-platform-release-gate.json`, `scripts/check-cross-platform-release-gate.mjs` |

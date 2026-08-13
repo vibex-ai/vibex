@@ -69,7 +69,6 @@ enum RemoteAccessAction {
 #[derive(Clone, PartialEq, Eq)]
 struct PairingEntry {
     method: RemoteConnectivityMethod,
-    origin: String,
 }
 
 struct PrivateOfferMaterial {
@@ -97,20 +96,10 @@ impl ActivePairingOffer {
             preferred_pairing_entry(&entries, preferred_entry).ok_or_else(|| {
                 VibexError::capability(
                     "remote_pairing_routes_unavailable",
-                    "pairing offer has no usable browser entry",
+                    "pairing offer has no usable mobile entry",
                 )
             })?;
-        let origin = entries
-            .iter()
-            .find(|entry| entry.method == selected_entry)
-            .map(|entry| entry.origin.as_str())
-            .ok_or_else(|| {
-                VibexError::validation(
-                    "remote_pairing_entry_not_offered",
-                    "selected pairing entry is not part of the offer",
-                )
-            })?;
-        let private = compose_private_offer(origin, response.launch_fragment)?;
+        let private = compose_private_offer(selected_entry, response.launch_fragment)?;
         let qr_size_px = private.qr_size_px;
         Ok(Self {
             summary: response.offer.summary,
@@ -129,17 +118,12 @@ impl ActivePairingOffer {
         if self.selected_entry == method {
             return Ok(());
         }
-        let origin = self
-            .entries
-            .iter()
-            .find(|entry| entry.method == method)
-            .map(|entry| entry.origin.as_str())
-            .ok_or_else(|| {
-                VibexError::validation(
-                    "remote_pairing_entry_not_offered",
-                    "selected pairing entry is not part of the offer",
-                )
-            })?;
+        if !self.entries.iter().any(|entry| entry.method == method) {
+            return Err(VibexError::validation(
+                "remote_pairing_entry_not_offered",
+                "selected pairing entry is not part of the offer",
+            ));
+        }
         let launch_fragment = self
             .private
             .as_ref()
@@ -150,7 +134,7 @@ impl ActivePairingOffer {
                     "pairing offer is no longer available",
                 )
             })?;
-        let private = compose_private_offer(origin, launch_fragment)?;
+        let private = compose_private_offer(method, launch_fragment)?;
         self.qr_size_px = private.qr_size_px;
         self.private = Some(private);
         self.selected_entry = method;
@@ -1772,15 +1756,16 @@ pub(crate) fn open_remote_access_pairing(
 }
 
 fn compose_private_offer(
-    origin: &str,
+    method: RemoteConnectivityMethod,
     launch_fragment: String,
 ) -> VibexResult<PrivateOfferMaterial> {
-    let mut launch_url = Url::parse(origin).map_err(|_| {
-        VibexError::validation(
-            "remote_pairing_entry_invalid",
-            "pairing entry origin is invalid",
-        )
-    })?;
+    let mut launch_url = Url::parse(&format!("vibex://open/{}", pairing_transport_name(method)))
+        .map_err(|_| {
+            VibexError::validation(
+                "remote_pairing_entry_invalid",
+                "mobile pairing entry is invalid",
+            )
+        })?;
     let fragment = launch_fragment.strip_prefix('#').ok_or_else(|| {
         VibexError::validation(
             "remote_pairing_launch_fragment_invalid",
@@ -1795,6 +1780,14 @@ fn compose_private_offer(
         qr_image,
         qr_size_px,
     })
+}
+
+fn pairing_transport_name(method: RemoteConnectivityMethod) -> &'static str {
+    match method {
+        RemoteConnectivityMethod::TailscaleServe => "tailnet",
+        RemoteConnectivityMethod::Direct => "direct",
+        RemoteConnectivityMethod::SelfHostedRelay => "self_hosted_relay",
+    }
 }
 
 fn render_qr(value: &str) -> VibexResult<(Arc<RenderImage>, u32)> {
@@ -1850,16 +1843,12 @@ fn pairing_entries(summary: &RemotePairingOfferSummary) -> Vec<PairingEntry> {
             .iter()
             .any(|entry: &PairingEntry| entry.method == method)
         {
-            entries.push(PairingEntry {
-                method,
-                origin: candidate.url.clone(),
-            });
+            entries.push(PairingEntry { method });
         }
     }
-    if let Some(candidate) = &summary.relay_candidate {
+    if summary.relay_candidate.is_some() {
         entries.push(PairingEntry {
             method: RemoteConnectivityMethod::SelfHostedRelay,
-            origin: candidate.url.clone(),
         });
     }
     entries.sort_by_key(|entry| method_index(entry.method));
@@ -2039,9 +2028,6 @@ fn recovery_label(action: RemoteRecoveryAction) -> &'static str {
     match action {
         RemoteRecoveryAction::Retry => locale::text("Retry", "重试", "重試"),
         RemoteRecoveryAction::RepairRoute => locale::text("Repair route", "修复路由", "修復路由"),
-        RemoteRecoveryAction::UpdateWebBuild => {
-            locale::text("Check Web build", "检查 Web 构建", "檢查 Web 建置")
-        }
         RemoteRecoveryAction::ManualCommand => {
             locale::text("Check service", "检查服务", "檢查服務")
         }
@@ -2063,11 +2049,6 @@ fn remote_error_label(code: &str) -> &'static str {
             "Enter a valid HTTPS origin",
             "请输入有效的 HTTPS 地址",
             "請輸入有效的 HTTPS 位址",
-        ),
-        "web_assets_missing" | "web_assets_incompatible" => locale::text(
-            "The packaged WebUI build is unavailable or incompatible",
-            "内置 WebUI 构建不可用或版本不兼容",
-            "內建 WebUI 建置不可用或版本不相容",
         ),
         "tailscale_not_found" | "tailscale_daemon_offline" | "tailscale_dns_unavailable" => {
             locale::text(
@@ -2274,7 +2255,6 @@ mod tests {
 
         let entries = vec![PairingEntry {
             method: RemoteConnectivityMethod::Direct,
-            origin: "https://desktop.example".to_string(),
         }];
         assert_eq!(
             preferred_pairing_entry(&entries, Some(RemoteConnectivityMethod::SelfHostedRelay)),
@@ -2441,17 +2421,22 @@ mod tests {
             "#/pair/{}",
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(&offer).unwrap())
         );
-        let private = compose_private_offer(
-            "https://desktop-name.tail123456.ts.net:8444",
-            launch_fragment,
-        )
-        .unwrap();
+        let private =
+            compose_private_offer(RemoteConnectivityMethod::TailscaleServe, launch_fragment)
+                .unwrap();
         let code =
             QrCode::with_error_correction_level(private.launch_url.as_str().as_bytes(), EcLevel::L)
                 .unwrap();
         let expected_size = (code.width() + QR_QUIET_ZONE_MODULES * 2) * QR_MODULE_SCALE;
 
         assert!(private.launch_url.as_str().len() > 900);
+        assert!(
+            private
+                .launch_url
+                .as_str()
+                .starts_with("vibex://open/tailnet#/pair/")
+        );
+        assert!(!private.launch_url.as_str().contains("desktop-name"));
         assert!(
             expected_size <= 560,
             "realistic pairing QR grew beyond the desktop dialog: {expected_size}px"

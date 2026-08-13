@@ -239,7 +239,7 @@ const PAIRING_UI = Object.freeze({
   unpaired: {
     title: "Pair this device",
     detail: "Open a current pairing link from Vibex Desktop.",
-    status: "No Desktop is paired with this browser."
+    status: "No Desktop is paired with this device."
   },
   preview: {
     title: "Pair with Desktop",
@@ -370,8 +370,8 @@ function permissionLabel(value) {
 
 function entryLabel(source, entryType) {
   if (source === "qr_scan") return "QR scan";
-  if (source === "app_link") return entryType === "custom_scheme" ? "App Link" : "Universal Link";
-  return "Browser link";
+  if (source === "app_link") return entryType === "mobile_app" ? "App Link" : "Universal Link";
+  return "Development host";
 }
 
 function pairingErrorState(error, phase = "pairing") {
@@ -713,11 +713,13 @@ async function claimPendingPairing() {
   context.claimStarted = true;
   const preview = context.preview;
   setPairingState("claiming", { preview });
-  const clientType = hostServices.isNative ? "mobile" : "browser";
+  // The browser host is only a development/automation shell for the mobile
+  // runtime. It must claim with the same product identity as Capacitor.
+  const clientType = "mobile";
   const allowInsecureLocalDev = runtime.build?.profile !== "release" &&
     ["localhost", "127.0.0.1", "::1"].includes(location.hostname);
   const options = {
-    displayName: clientType === "mobile" ? "Vibex Mobile" : "Vibex Web",
+    displayName: "Vibex Mobile",
     clientType,
     allowInsecureLocalDev,
     nowMs: Date.now(),
@@ -824,7 +826,7 @@ async function handlePairingFragment(item) {
   try {
     const preview = {
       ...JSON.parse(wasmRuntime.pairing_preview(item.fragment, Date.now())),
-      entryType: item.entryType ?? "web_origin",
+      entryType: item.entryType ?? "mobile_app",
       source: item.source ?? "app_link"
     };
     releasePairingSecret();
@@ -1165,14 +1167,6 @@ function installPairingControls() {
   });
 }
 
-function registerServiceWorker() {
-  if (!("serviceWorker" in navigator)) return;
-  void navigator.serviceWorker.register("./service-worker.js", { scope: "./" }).catch(() => {
-    runtime.serviceWorker = { status: "unsupported" };
-  });
-  runtime.serviceWorker = { status: "requested" };
-}
-
 function scheduleViewport() {
   if (scheduleViewport.pending) return;
   scheduleViewport.pending = true;
@@ -1481,7 +1475,7 @@ async function boot() {
 
   try {
     runtime.build = await fetch("./build.json", { cache: "no-store" }).then((response) => response.json());
-    const wasm = await import("./pkg/vibex_web.js");
+    const wasm = await import("./pkg/vibex_mobile_wasm.js");
     await wasm.default();
     wasmRuntime = wasm;
     runtime.wasmReady = true;
@@ -1505,7 +1499,6 @@ async function boot() {
     probeWebStorage();
     void probeSecureStorage();
     void probeNetwork();
-    registerServiceWorker();
     wasm.start(diagnosticsGate);
     void initializeHostServices().catch((error) => {
       recordRemoteError(error, "HOST_SERVICES_INIT");

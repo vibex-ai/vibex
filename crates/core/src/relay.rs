@@ -28,71 +28,6 @@ impl Default for RelayProtocolVersion {
     }
 }
 
-pub const WEB_BUILD_SCHEMA_VERSION: &str = "vibex-web-build.v1";
-pub const WEB_REQUIRED_ASSETS: &[&str] = &[
-    "index.html",
-    "offline.html",
-    "styles.css",
-    "host.js",
-    "host-services.js",
-    "platform-compat.js",
-    "manifest.webmanifest",
-    "icon.svg",
-    "service-worker.js",
-    "build.json",
-    "pkg/vibex_web.js",
-    "pkg/vibex_web_bg.wasm",
-];
-pub const WEB_STATIC_IDENTITY_ASSETS: &[&str] = &[
-    "index.html",
-    "offline.html",
-    "styles.css",
-    "host.js",
-    "host-services.js",
-    "platform-compat.js",
-    "manifest.webmanifest",
-    "icon.svg",
-    "service-worker.js",
-];
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WebBuildDescriptor {
-    pub schema_version: String,
-    pub build_id: String,
-    pub package_version: String,
-    pub profile: String,
-    #[serde(default)]
-    pub git_commit: String,
-    #[serde(default)]
-    pub wasm_sha256: String,
-    #[serde(default)]
-    pub glue_sha256: String,
-    #[serde(default)]
-    pub static_sha256: String,
-}
-
-impl WebBuildDescriptor {
-    pub fn has_valid_identity(&self, allow_debug: bool) -> bool {
-        self.schema_version == WEB_BUILD_SCHEMA_VERSION
-            && is_lower_hex(&self.build_id, 24)
-            && !self.package_version.trim().is_empty()
-            && matches!(self.profile.as_str(), "release" | "debug")
-            && (allow_debug || self.profile == "release")
-            && is_lower_hex(&self.git_commit, 40)
-            && is_lower_hex(&self.wasm_sha256, 64)
-            && is_lower_hex(&self.glue_sha256, 64)
-            && is_lower_hex(&self.static_sha256, 64)
-    }
-}
-
-fn is_lower_hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RelayFrameKind {
@@ -561,26 +496,6 @@ impl fmt::Debug for RelayRemoteHandshakeContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn web_build_identity_requires_exact_release_fields() {
-        let mut descriptor = WebBuildDescriptor {
-            schema_version: WEB_BUILD_SCHEMA_VERSION.to_string(),
-            build_id: "a".repeat(24),
-            package_version: "0.1.0-rc.1".to_string(),
-            profile: "release".to_string(),
-            git_commit: "b".repeat(40),
-            wasm_sha256: "c".repeat(64),
-            glue_sha256: "d".repeat(64),
-            static_sha256: "e".repeat(64),
-        };
-        assert!(descriptor.has_valid_identity(false));
-        descriptor.profile = "debug".to_string();
-        assert!(!descriptor.has_valid_identity(false));
-        assert!(descriptor.has_valid_identity(true));
-        descriptor.build_id = "A".repeat(24);
-        assert!(!descriptor.has_valid_identity(true));
-    }
 
     #[test]
     fn relay_control_message_serializes_with_stable_tag() {

@@ -196,15 +196,16 @@ function tgit --wraps git; git --git-dir=(git rev-parse --show-toplevel)/.trelli
 ## 2. Project state
 
 Vibex is a Rust-first, local-first AI coding workbench, `0.1.0-rc.1`,
-AGPL-3.0-or-later. Three runnable client surfaces share one GPUI design system:
+AGPL-3.0-or-later. Two product clients share one GPUI design system; the mobile
+client has a separate WASM runtime and Capacitor host:
 
 | Surface | Source | Stack |
 | --- | --- | --- |
 | Native desktop | `apps/desktop` | Rust + GPUI |
-| WebUI / PWA | `apps/web` | Rust + GPUI-WASM |
-| Mobile shell | `apps/mobile` | Capacitor 8 + shared GPUI-WASM WebUI |
+| Mobile runtime | `apps/mobile-wasm` | Rust + GPUI-WASM, Compact/Medium only |
+| Mobile shell | `apps/mobile` | Capacitor 8 + bundled mobile runtime |
 
-Layout: `apps/` (desktop, web, mobile, relay-server) · `crates/` (~25 Rust
+Layout: `apps/` (desktop, mobile-wasm, mobile, relay-server) · `crates/` (~25 Rust
 crates: agent/ACP adapters, db, fs, git, terminal, relay, remote, content,
 diagnostics, vibex-ui, vibex-terminal-ui, ...) · `scripts/` (Node evidence and
 gate scripts) · `.trellis/` (workflow, spec, tasks).
@@ -213,15 +214,18 @@ The pnpm workspace covers `apps/*` only; there is no top-level `packages/`.
 
 Architectural invariants that constrain most changes — read
 `.trellis/spec/guides/architecture-baseline.md` before anything spanning
-desktop / web / mobile / remote:
+desktop / mobile / remote:
 
 - `apps/desktop` is the sole source of visual, interaction, and
-  information-architecture truth. Web and mobile derive from it.
-- The PC `DesktopRuntime` is the only authoritative state owner; web and mobile
-  are network clients.
+  information-architecture truth. Mobile derives from it.
+- The PC `DesktopRuntime` is the only authoritative state owner; mobile code is
+  a network client.
 - Shared UI lives in `crates/vibex-ui`; `apps/desktop` is never compiled to WASM
   as a whole.
 - Relay is transport, not a second database or state authority.
+- There is no WebUI/PWA product. `apps/mobile-wasm` is bundled into Capacitor;
+  its browser host exists only for local development and automation. Relay and
+  Desktop packages never host these assets.
 
 Toolchain: Rust 1.97.0 (pinned by `rust-toolchain.toml`), edition 2024,
 Node.js 22, pnpm 11.3.0 (pinned by `package.json`).
@@ -234,7 +238,7 @@ Run everything from the repository root.
 corepack enable && pnpm install --frozen-lockfile
 
 pnpm dev:desktop            # cargo run -p vibex-desktop --locked
-pnpm dev:wasm-web           # build @vibex/web + local test server
+pnpm dev:mobile-wasm        # mobile runtime in a local development host
 
 pnpm check:rust             # Rust quality gate
 pnpm check:frontend         # per-package typecheck + eslint

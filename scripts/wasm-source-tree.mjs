@@ -2,17 +2,17 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 
-export const WEB_SOURCE_INPUTS = [
+export const MOBILE_RUNTIME_SOURCE_INPUTS = [
   "Cargo.toml",
   "Cargo.lock",
   "pnpm-lock.yaml",
-  "apps/web/Cargo.toml",
-  "apps/web/assets",
-  "apps/web/package.json",
-  "apps/web/rust-toolchain.toml",
-  "apps/web/scripts",
-  "apps/web/src",
-  "apps/web/web",
+  "apps/mobile-wasm/Cargo.toml",
+  "apps/mobile-wasm/assets",
+  "apps/mobile-wasm/package.json",
+  "apps/mobile-wasm/rust-toolchain.toml",
+  "apps/mobile-wasm/scripts",
+  "apps/mobile-wasm/src",
+  "apps/mobile-wasm/host",
   "crates/core/Cargo.toml",
   "crates/core/src",
   "crates/desktop-model/Cargo.toml",
@@ -30,11 +30,11 @@ export const WEB_SOURCE_INPUTS = [
   "crates/vibex-ui/Cargo.toml",
   "crates/vibex-ui/src",
   "crates/vibex-ui/theme/tokens.json",
-  "scripts/capture-wasm-browser.mjs",
+  "scripts/capture-mobile-wasm-host.mjs",
   "scripts/check-workflow-e2e.mjs",
   "scripts/e2e-workflows.mjs",
   "scripts/wasm-source-tree.mjs",
-  "scripts/wasm-test-server.mjs",
+  "scripts/mobile-wasm-test-server.mjs",
   "scripts/workflow-e2e-evidence.mjs",
   "docs/platform/workflow-e2e.schema.json"
 ];
@@ -54,7 +54,7 @@ export const MOBILE_SOURCE_INPUTS = [
 ];
 
 export const WORKFLOW_SOURCE_INPUTS = [
-  ...WEB_SOURCE_INPUTS,
+  ...MOBILE_RUNTIME_SOURCE_INPUTS,
   "crates/remote/Cargo.toml",
   "crates/remote/src"
 ];

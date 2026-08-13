@@ -1,13 +1,13 @@
 # Remote LAN Smoke Checklist
 
-Use this checklist to verify the browser remote-control loop against a PC
-runtime on the same LAN or a user-managed private network.
+Use this checklist to verify the installed mobile app against a PC runtime on
+the same LAN or a user-managed private network.
 
 ## Preconditions
 
 - PC runtime is running with remote service intentionally enabled.
-- Remote bind address and port are known, for example `http://192.168.1.20:1428`.
-- Browser device is on the same LAN/private network.
+- A validated Direct or Tailnet HTTPS/WSS endpoint is enabled in Desktop.
+- The phone is on the same LAN/private network and has the current app installed.
 - A test workspace has at least one Agent session, a Git repository, and one
   terminal session.
 - Provider profiles exist in Vibex, including one profile that can show an
@@ -17,28 +17,27 @@ Do not expose a public listener without pairing/auth enabled. Do not paste auth
 tokens, pairing codes, provider secrets, or terminal input into screenshots or
 logs.
 
-## Evidence To Capture
+## Evidence To Record
 
-- PC remote URL and whether it is LAN or private network.
-- Browser device name and permission level.
-- Web/PWA screenshot of the connected shell.
-- Web/PWA screenshot of Provider settings summaries.
+- Bounded endpoint class (`direct` or `tailnet`), without credentials or pairing data.
+- Mobile device class, app/APK identity, and permission level.
 - Any structured error code if a step fails.
 - Reconnect/catch-up observation notes.
 
 ## Steps
 
-1. Pair or authenticate the browser device.
+1. Pair the installed mobile app.
 
    - Create or claim a device proof through the PC pairing flow.
    - Record the device permission level: `read_only`, `approve_only`, or
      `full_control`.
-   - Open Web/PWA at the PC remote URL.
+   - Scan or open the Desktop-generated `vibex://open/<transport>#/pair/...`
+     entry. There is no browser fallback.
    - Confirm `/api/info` reports remote enabled and expected capabilities.
 
 2. Verify Agent session message flow.
 
-   - Open a session from the Web/PWA session list.
+   - Open a session from the mobile session list.
    - Send a short non-secret message.
    - Refresh timeline or wait for live update.
    - Confirm the new user message appears with an authoritative sequence.
@@ -46,9 +45,9 @@ logs.
 3. Verify permission approval.
 
    - Trigger or select a pending permission request.
-   - Approve or deny from Web/PWA using an `approve_only` or `full_control`
+   - Approve or deny from mobile using an `approve_only` or `full_control`
      device.
-   - Confirm the resolution card shows the browser device as responder.
+   - Confirm the resolution card shows the mobile device as responder.
 
 4. Verify Git diff.
 
@@ -77,16 +76,16 @@ logs.
 
 7. Verify reconnect catch-up.
 
-   - Disconnect the browser network or close the tab.
+   - Disconnect the phone network or background the app.
    - Create one timeline change from the PC runtime while disconnected.
-   - Reopen Web/PWA with the same device proof.
+   - Resume the app with the same securely stored device proof.
    - Confirm the missed timeline item appears after catch-up before relying on
      live events.
 
 ## Pass Criteria
 
-- Browser connects to the PC runtime over LAN/private network.
-- Web/PWA sends an Agent message, resolves a permission, shows Git diff, writes
+- Mobile connects to the PC runtime over LAN/private network.
+- Mobile sends an Agent message, resolves a permission, shows Git diff, writes
   terminal input, and displays Provider settings through the remote backend.
 - Read-only devices can read Provider summaries but cannot run health probes.
 - Full-control Provider health probe is audited with a redacted summary.
@@ -94,5 +93,6 @@ logs.
 
 ## Local Development Note
 
-When a real LAN runtime is not available, use `apps/web` explicit fixture mode
-only for UI screenshots. Fixture mode proves rendering, not LAN transport.
+When a real LAN runtime is not available, use the fixed
+`pnpm dev:mobile-wasm` development host only for local UI/bridge diagnostics.
+It proves neither LAN transport nor a browser product.

@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 import { resolveGpuiSourceIdentities } from "../../../scripts/source-identities.mjs";
 import {
   MOBILE_SOURCE_INPUTS,
-  WEB_SOURCE_INPUTS,
+  MOBILE_RUNTIME_SOURCE_INPUTS,
   sourceTreeSha256
 } from "../../../scripts/wasm-source-tree.mjs";
 
@@ -138,16 +138,14 @@ function archiveContainsGpui(apk, unzip, expectedPlugins) {
     !listing.includes("assets/public/host.js") ||
     !listing.includes("assets/public/host-services.js") ||
     !listing.includes("assets/public/platform-compat.js") ||
-    !listing.includes("assets/public/manifest.webmanifest") ||
-    !listing.includes("assets/public/service-worker.js") ||
-    !listing.includes("assets/public/pkg/vibex_web_bg.wasm")
+    !listing.includes("assets/public/pkg/vibex_mobile_wasm_bg.wasm")
   ) {
-    fail("APK does not contain the Web host and WASM assets");
+    fail("APK does not contain the mobile runtime host and WASM assets");
   }
-  if (!listing.includes("assets/public/build.json")) fail("APK does not contain the Web build identity");
+  if (!listing.includes("assets/public/build.json")) fail("APK does not contain the mobile runtime build identity");
   if (!listing.includes("assets/capacitor.plugins.json")) fail("APK does not contain the Capacitor plugin manifest");
   if (listing.includes("assets/public/assets/")) {
-    fail("APK contains a legacy bundler assets directory instead of the scoped Web dist");
+    fail("APK contains a legacy bundler assets directory outside the mobile runtime dist");
   }
   const packagedPlugins = JSON.parse(output(unzip, ["-p", apk, "assets/capacitor.plugins.json"]));
   for (const expected of expectedPlugins) {
@@ -245,7 +243,7 @@ const environment = {
   PATH: `${join(java.home, "bin")}:${join(androidHome, "platform-tools")}:${process.env.PATH ?? ""}`
 };
 
-run("pnpm", ["--filter", "@vibex/web", "build:release"], { env: environment });
+run("pnpm", ["--filter", "@vibex/mobile-wasm", "build:release"], { env: environment });
 if (!existsSync(ANDROID)) {
   run("pnpm", ["exec", "cap", "add", "android"], { cwd: APP, env: environment });
 }
@@ -263,7 +261,7 @@ copyFileSync(APK_SOURCE, APK_OUTPUT);
 const apkanalyzer = join(androidHome, "cmdline-tools/latest/bin/apkanalyzer");
 const unzip = "/usr/bin/unzip";
 if (!existsSync(apkanalyzer)) fail(`apkanalyzer is missing: ${apkanalyzer}`);
-if (!existsSync(unzip)) fail("unzip is required to validate packaged Web assets");
+if (!existsSync(unzip)) fail("unzip is required to validate packaged mobile runtime assets");
 archiveContainsGpui(APK_OUTPUT, unzip, nativeShellContract.plugins);
 
 const apk = readFileSync(APK_OUTPUT);
@@ -277,14 +275,14 @@ if (packagedApplicationId !== nativeShellContract.applicationId) {
     `packaged Android application id ${packagedApplicationId} does not match the native shell contract`
   );
 }
-const webBuild = JSON.parse(readFileSync(join(ROOT, "apps/web/dist/build.json"), "utf8"));
+const runtimeBuild = JSON.parse(readFileSync(join(ROOT, "apps/mobile-wasm/dist/build.json"), "utf8"));
 const evidence = {
   schemaVersion: "vibex-android-build.v1",
   capturedAt: new Date().toISOString(),
   status: "packaged_not_device_validated",
   source: {
     ...resolveGpuiSourceIdentities(ROOT),
-    webSourceTreeSha256: sourceTreeSha256(ROOT, WEB_SOURCE_INPUTS),
+    mobileRuntimeSourceTreeSha256: sourceTreeSha256(ROOT, MOBILE_RUNTIME_SOURCE_INPUTS),
     mobileShellTreeSha256: sourceTreeSha256(ROOT, MOBILE_SOURCE_INPUTS),
     cargoLockfileSha256: sha256(readFileSync(join(ROOT, "Cargo.lock"))),
     pnpmLockfileSha256: sha256(readFileSync(join(ROOT, "pnpm-lock.yaml")))
@@ -297,7 +295,7 @@ const evidence = {
     minSdk: packagedMinSdk,
     targetSdk: Number(output(apkanalyzer, ["manifest", "target-sdk", APK_OUTPUT]))
   },
-  webBuild,
+  runtimeBuild,
   toolchain: {
     java: java.version,
     androidSdk: {
@@ -313,7 +311,7 @@ const evidence = {
     capacitor: output("pnpm", ["exec", "cap", "--version"], { cwd: APP, env: environment })
   },
   packageContract: {
-    webDir: "../web/dist",
+    webDir: "../mobile-wasm/dist",
     containsGpuiHost: true,
     containsPlatformCompatibilityAdapter: true,
     containsGpuiWasm: true,

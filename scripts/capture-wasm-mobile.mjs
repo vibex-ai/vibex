@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { chromium } from "@playwright/test";
 import {
   MOBILE_SOURCE_INPUTS,
-  WEB_SOURCE_INPUTS,
+  MOBILE_RUNTIME_SOURCE_INPUTS,
   sourceTreeSha256
 } from "./wasm-source-tree.mjs";
 
@@ -121,14 +121,14 @@ function verifyBuildEvidence() {
   assert(build.schemaVersion === "vibex-android-build.v1", "Android build evidence schema is invalid");
   assert(build.status === "packaged_not_device_validated", "Android build evidence overclaims physical validation");
   assert(
-    build.source.webSourceTreeSha256 === sourceTreeSha256(ROOT, WEB_SOURCE_INPUTS),
-    "Android build evidence does not match the current Web source"
+    build.source.mobileRuntimeSourceTreeSha256 === sourceTreeSha256(ROOT, MOBILE_RUNTIME_SOURCE_INPUTS),
+    "Android build evidence does not match the current mobile runtime source"
   );
   assert(
     build.source.mobileShellTreeSha256 === sourceTreeSha256(ROOT, MOBILE_SOURCE_INPUTS),
     "Android build evidence does not match the current mobile shell source"
   );
-  assert(build.packageContract.webDir === "../web/dist", "Android package references the wrong Web dist");
+  assert(build.packageContract.webDir === "../mobile-wasm/dist", "Android package references the wrong mobile runtime dist");
   assert(
     build.packageContract.containsPlatformCompatibilityAdapter === true,
     "Android package does not contain the platform compatibility adapter"

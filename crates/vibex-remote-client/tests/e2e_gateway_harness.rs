@@ -14,7 +14,7 @@
 //! ```text
 //! VIBEX_E2E_ROOT=... VIBEX_E2E_GATEWAY_PORT=... VIBEX_E2E_CONTROL_PORT=... \
 //! VIBEX_E2E_BUNDLE_FILE=... VIBEX_E2E_PUBLIC_URL=https://host.ts.net \
-//! VIBEX_E2E_TRANSPORT=direct VIBEX_E2E_CLIENT_TYPE=browser \
+//! VIBEX_E2E_TRANSPORT=direct VIBEX_E2E_CLIENT_TYPE=mobile \
 //! cargo test -p vibex-remote-client --test e2e_gateway_harness --locked -- --ignored --nocapture
 //! ```
 
@@ -86,7 +86,7 @@ async fn e2e_gateway_harness() {
     let control_port: u16 = env_required("VIBEX_E2E_CONTROL_PORT").parse().unwrap();
     let bundle_file = PathBuf::from(env_required("VIBEX_E2E_BUNDLE_FILE"));
     let transport = env_required("VIBEX_E2E_TRANSPORT");
-    let client_type = env_optional("VIBEX_E2E_CLIENT_TYPE").unwrap_or_else(|| "browser".into());
+    let client_type = env_optional("VIBEX_E2E_CLIENT_TYPE").unwrap_or_else(|| "mobile".into());
     let public_url = env_required("VIBEX_E2E_PUBLIC_URL");
     let relay_url = env_optional("VIBEX_E2E_RELAY_URL");
     let public_relay_url = env_optional("VIBEX_E2E_PUBLIC_RELAY_URL");

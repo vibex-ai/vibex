@@ -19,10 +19,6 @@ icons = [
   "assets/app-icons/icon.png",
   "assets/app-icons/icon.ico",
 ]
-resources = [
-  { src = "../web/dist", target = "web" },
-]
-
 [[binaries]]
 path = "vibex-desktop"
 main = true

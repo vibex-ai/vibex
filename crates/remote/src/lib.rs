@@ -72,7 +72,7 @@ mod pairing_v2;
 pub use gateway::{
     RelayAttachmentTasks, RelayRemoteOutbound, RemoteGateway, RemoteGatewayConfig,
     RemoteGatewayDeploymentMode, RemoteGatewayPairingRoutes, RemoteGatewayStatus,
-    RemoteGatewayTlsPolicy, RemoteGatewayWebBuildDescriptor,
+    RemoteGatewayTlsPolicy,
 };
 
 pub type RemoteRouter = Router;

@@ -34,7 +34,7 @@ if (process.platform !== "darwin") {
   fail("iOS GPUI shell builds require macOS with Xcode");
 }
 run("xcodebuild", ["-version"], { capture: true });
-run("pnpm", ["--filter", "@vibex/web", "build:release"]);
+run("pnpm", ["--filter", "@vibex/mobile-wasm", "build:release"]);
 if (!existsSync(IOS)) run("pnpm", ["exec", "cap", "add", "ios"], { cwd: APP });
 run("pnpm", ["exec", "cap", "sync", "ios"], { cwd: APP });
 run("node", ["scripts/configure-native-links.mjs"], { cwd: APP });
@@ -72,13 +72,13 @@ const appBundle = join(
   `Build/Products/${configuration}-iphonesimulator/App.app`
 );
 if (!existsSync(appBundle)) fail(`Xcode did not create ${appBundle}`);
-const webBuild = JSON.parse(readFileSync(join(ROOT, "apps/web/dist/build.json"), "utf8"));
+const runtimeBuild = JSON.parse(readFileSync(join(ROOT, "apps/mobile-wasm/dist/build.json"), "utf8"));
 const evidence = {
   schemaVersion: "vibex-ios-build.v1",
   status: "simulator_shell_built_not_device_validated",
   configuration,
   appBundle: `apps/mobile/artifacts/ios-derived-${configuration.toLowerCase()}/Build/Products/${configuration}-iphonesimulator/App.app`,
-  webBuild,
+  runtimeBuild,
   physicalValidation: {
     ios: "pending",
     signedDeviceBuild: false

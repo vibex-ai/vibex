@@ -1,13 +1,18 @@
 # Vibex
 
 Vibex is a Rust-first, local-first AI coding workbench. The repository contains
-three runnable client surfaces:
+two product clients; the mobile client is split into a WASM runtime and a native
+Capacitor shell:
 
 | Surface | Source | Stack |
 | --- | --- | --- |
 | Native desktop | `apps/desktop` | Rust + GPUI |
-| WebUI/PWA | `apps/web` | Rust + GPUI-WASM |
-| Mobile shell | `apps/mobile` | Capacitor 8 + shared GPUI-WASM WebUI |
+| Mobile runtime | `apps/mobile-wasm` | Rust + GPUI-WASM, Compact/Medium only |
+| Mobile shell | `apps/mobile` | Capacitor 8 + bundled mobile runtime |
+
+Vibex does not ship a browser WebUI or PWA. The browser host for
+`apps/mobile-wasm` is a development and automation tool only; it is not a
+deployable product surface.
 
 Run all commands below from the repository root unless a section says
 otherwise.
@@ -50,7 +55,7 @@ Relay binary:
 pnpm release:build-smoke
 ```
 
-Run the GPUI-WASM browser and mobile release gate with:
+Run the GPUI-WASM mobile runtime and package gate with:
 
 ```bash
 pnpm check:wasm-gate
@@ -107,9 +112,9 @@ release-controlled operations; follow the
 [desktop release runbook](docs/operations/release.md) before using
 `pnpm package:rc` or `pnpm package:stable`.
 
-## Web
+## Mobile GPUI-WASM Runtime
 
-The WebUI builds the shared Rust GPUI interface for
+The mobile runtime builds the Rust GPUI remote interface for
 `wasm32-unknown-unknown`. Install the pinned nightly target and the
 `wasm-bindgen-cli` version locked by the workspace before the first build:
 
@@ -119,32 +124,33 @@ rustup target add wasm32-unknown-unknown --toolchain nightly-2026-07-24
 cargo install wasm-bindgen-cli --version 0.2.125 --locked
 ```
 
-### Run
+### Development Host
 
 ```bash
-pnpm dev:wasm-web
+pnpm dev:mobile-wasm
 ```
 
-Open <http://127.0.0.1:4173>. The command builds the debug WASM bundle and
-serves it with the local Fetch and WebSocket probes used by the browser gate.
+Open <http://127.0.0.1:4173>. The command builds the debug runtime and serves it
+from a fixed local host for development and automation. Do not deploy this host
+or use it as a browser product.
 
 ### Test and Build
 
 ```bash
-pnpm --filter @vibex/web typecheck
-pnpm --filter @vibex/web build:release
+pnpm --filter @vibex/mobile-wasm typecheck
+pnpm --filter @vibex/mobile-wasm build:release
 pnpm check:wasm-integration
-pnpm check:wasm-web
+pnpm check:mobile-wasm-host
 ```
 
-The deployable HTML, host bridge, service worker, and GPUI-WASM files are
-written to `apps/web/dist/`. The Web client uses the remote backend; Agent,
-filesystem, Git, terminal, and provider operations remain authoritative on the
-connected desktop runtime.
+The Capacitor-ready HTML, host bridge, and GPUI-WASM files are written to
+`apps/mobile-wasm/dist/`. There is no Service Worker, PWA manifest, offline Web
+entry, or Wide shell. Agent, filesystem, Git, terminal, and provider operations
+remain authoritative on the connected desktop runtime.
 
 ## Mobile
 
-The Capacitor shell packages only the shared `apps/web/dist` client. Its
+The Capacitor shell packages only the shared `apps/mobile-wasm/dist` client. Its
 generated Android and iOS projects are intentionally ignored by Git.
 
 ### Validate the Shared Shell
@@ -153,8 +159,8 @@ generated Android and iOS projects are intentionally ignored by Git.
 pnpm --filter @vibex/mobile validate
 ```
 
-This type-checks the Capacitor configuration and builds the shared GPUI-WASM
-WebUI. It does not produce an APK or iOS app bundle.
+This type-checks the Capacitor configuration and builds the GPUI-WASM mobile
+runtime. It does not produce an APK or iOS app bundle.
 
 ### Android APK
 
@@ -224,9 +230,9 @@ The app bundles and build evidence are written under
 require an Apple signing team and separate release validation.
 
 More mobile-specific connection and fixture details are documented in the
-[GPUI mobile shell guide](apps/mobile/README.md). Browser and physical
-device support status is tracked by the
-[GPUI-WASM browser gate](docs/platform/wasm-browser-gate.md).
+[GPUI mobile shell guide](apps/mobile/README.md). Runtime-host and physical
+device validation status is tracked by the
+[GPUI-WASM mobile runtime gate](docs/platform/mobile-wasm-runtime-gate.md).
 
 ## Common Build Problems
 
@@ -239,5 +245,5 @@ device support status is tracked by the
   version 0.2.125, which must match `Cargo.lock`.
 - desktop package reports a missing PDFium runtime: run
   `pnpm prepare:pdfium` before the channel package command.
-- Port 4173 is busy: stop the existing GPUI-WASM WebUI dev server, or set
-  `PORT` when starting `pnpm dev:wasm-web`.
+- Port 4173 is busy: stop the existing mobile WASM development host, or set
+  `PORT` when starting `pnpm dev:mobile-wasm`.

@@ -21,7 +21,6 @@ icons = [
 ]
 resources = [
   { src = "../../target/native/pdfium/linux-x86_64", target = "pdfium" },
-  { src = "../web/dist", target = "web" },
 ]
 
 [[binaries]]

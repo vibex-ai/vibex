@@ -1,8 +1,8 @@
 # Backend Quality Guidelines
 
-Backend quality is measured by whether PC, Web, and mobile can rely on one
-local-first service model without provider leakage, data loss, or unsafe config
-side effects.
+Backend quality is measured by whether native Desktop and the installed mobile
+client can rely on one local-first service model without provider leakage, data
+loss, or unsafe config side effects.
 
 Current evidence: source code, tests, completed Trellis tasks, and
 [Architecture Baseline](../guides/architecture-baseline.md) for cross-platform/remote architecture.
@@ -10,7 +10,7 @@ Current evidence: source code, tests, completed Trellis tasks, and
 > Legacy cutover note (2026-07-29): long Tauri build, command, UI-state import,
 > and browser fixture scenarios retained below are pre-cutover evidence. They do
 > not define current commands or release gates. Current checks target GPUI
-> Desktop, GPUI-WASM Web/mobile, Relay, the Rust workspace, and published-artifact
+> Desktop, the GPUI-WASM mobile runtime, Relay, the Rust workspace, and published-artifact
 > rollback.
 
 ## Required Design Checks
@@ -573,7 +573,7 @@ Task evidence:
 - The command must not run as part of `pnpm check`; it is explicit release
   evidence.
 - The command must not start real Claude, Codex, OpenCode, ACP, scheduled
-  real-provider runtimes, public Relay, physical mobile, browser credential
+  real-provider runtimes, public Relay, physical mobile, mobile pairing credential
   flows, or network credential flows.
 - Coverage must include:
   - mock Agent create/send/fetch timeline flow;
@@ -625,9 +625,9 @@ Task evidence:
   path.
 - Bad: E2E regression is added to `pnpm check`, causing the default deterministic
   quality gate to start PTY/Git fixtures on every type-check run.
-- Bad: the harness opens HTTP/WebSocket listeners or browser automation when the
-  required Web/PWA contract can be covered through `RemoteDispatcher` envelopes
-  plus `pnpm check` binding/type validation.
+- Bad: the harness opens HTTP/WebSocket listeners or the mobile development host
+  when the required remote contract can be covered through `RemoteDispatcher`
+  envelopes plus `pnpm check` binding/type validation.
 
 ### 6. Tests Required
 
@@ -650,7 +650,7 @@ Task evidence:
 ```text
 pnpm check -> always run E2E PTY/Git fixtures
 JSON evidence -> includes RemoteAuthProof/authToken for debugging
-Remote/Web coverage -> launches a browser or public Relay before packaging work
+Remote/mobile coverage -> launches a development host or public Relay before packaging work
 ```
 
 #### Correct
@@ -658,11 +658,15 @@ Remote/Web coverage -> launches a browser or public Relay before packaging work
 ```text
 pnpm e2e:regression -> explicit provider-free release evidence command
 crates/diagnostics -> aggregates local service/protocol checks
-Remote/Web coverage -> RemoteDispatcher envelopes + pnpm check binding/type validation
+Remote/mobile coverage -> RemoteDispatcher envelopes + pnpm check binding/type validation
 JSON evidence -> records statuses, counts, fixture sizes, and classifications only
 ```
 
-## Scenario: Phase 9 Release Packaging Matrix
+## Retired Historical Scenario: Phase 9 Release Packaging Matrix
+
+> Retired with the former Tauri desktop and Web/PWA products. Current packaging
+> contracts live in `docs/operations/release-packaging-matrix.md`; this section
+> remains only as pre-cutover evidence and its commands are not current gates.
 
 ### 1. Scope / Trigger
 
@@ -2235,7 +2239,7 @@ artifact `{ path, bytes, sha256, applicationId }`.
 
 - Run `node scripts/check-cross-platform-release-gate.mjs --self-test` and assert that
   stale hashes, false PASS mutations, and official Relay claims are rejected.
-- Run the Web/mobile evidence checkers, remote/core/db/runtime tests, Relay local smoke,
+- Run the mobile runtime evidence checkers, remote/core/db/runtime tests, Relay local smoke,
   backup/diagnostics smoke, and `pnpm release:build-smoke` where disk capacity allows.
 - Verify the final report has nine gate entries, a bounded redaction section, and a
   decision consistent with every gate status.

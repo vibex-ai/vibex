@@ -1,9 +1,9 @@
 # Agent Session Protocol
 
-Vibex must present a provider-neutral Agent session protocol across PC, Web,
-and mobile clients. Every online Agent, including Claude and Codex, executes
-through ACP. Native Claude/Codex transcript and parity crates are offline
-compatibility inputs only.
+Vibex must present a provider-neutral Agent session protocol across native
+Desktop and installed mobile clients. Every online Agent, including Claude and
+Codex, executes through ACP. Native Claude/Codex transcript and parity crates
+are offline compatibility inputs only.
 
 Evidence: current Agent/runtime code, tests, and completed Agent-session Trellis tasks.
 
@@ -894,7 +894,7 @@ session/request_permission
   session-scoped `form` while a turn is active.
 - This contract spans ACP capability negotiation and typed schema decoding,
   provider-neutral Timeline/Core DTOs, SQLite request state, native and Remote
-  mutation APIs, and the shared desktop/Web/mobile workbench.
+  mutation APIs, and the shared desktop/mobile workbench.
 - Support is capability-based for every ACP Agent. It must not branch on
   Claude, Codex, OpenCode, or another Agent id.
 
@@ -992,7 +992,7 @@ elicitation_requests(
 - The manager passes the exact durable binding id and activation generation to
   the ACP runtime. Before touching pending state, runtime matches that identity,
   native session id, and Provider Profile against the current attachment.
-- Native desktop and shared Web/mobile UI render the same typed fields and fence
+- Native desktop and shared mobile UI render the same typed fields and fence
   duplicate submissions per elicitation request. Agent mutation tasks are held
   by mutation request id so answering a form cannot cancel an in-flight send,
   permission response, or another elicitation response.
@@ -1574,7 +1574,7 @@ completed, and automation run failed.
 
 Do not introduce a second UI-only event bus for delegated agents or scheduled
 runs. Child sessions may have their own timeline, but parent sessions need a
-durable reference and summary event so Web/mobile clients can reconstruct the
+durable reference and summary event so mobile clients can reconstruct the
 workflow after reconnect.
 
 ## MCP Sidecar Tools
@@ -1841,7 +1841,7 @@ agent_timeline_items(session_id = vibex_session_id, sequence = repository_transa
 ### 1. Scope / Trigger
 
 - Trigger: `SendAgentMessageRequest` carries provider-neutral user attachments
-  from desktop/Web clients through the Agent service and authoritative
+  from desktop/mobile clients through the Agent service and authoritative
   timeline.
 - This is a cross-layer contract because Rust DTOs, generated TypeScript
   bindings, desktop composer state, remote callers, optimistic timeline

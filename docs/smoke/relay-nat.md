@@ -12,11 +12,11 @@ timeline catch-up.
 
 - A self-hosted Relay is running from `deploy/relay/` or an equivalent build of
   `vibex-relay-server`.
-- The Relay is reachable from the browser/mobile network at a final URL, for
+- The Relay is reachable from the mobile network at a final URL, for
   example `https://relay.example.com`.
 - The PC desktop runtime can reach that Relay URL outbound.
 - The PC Relay client is intentionally enabled with a known room id.
-- A browser or mobile shell can use Web/PWA Relay mode.
+- The installed mobile app can use Relay mode.
 - A test device auth proof exists for the PC remote runtime.
 - A disposable workspace/session exists for harmless remote actions.
 
@@ -44,7 +44,8 @@ Pass criteria:
   - `websocketFrames: true`
   - `httpPairBridge: true`
   - `httpCommandBridge: true`
-  - `staticRoomAssets: false`
+- `/api/info` omits the retired `staticRoomAssets` feature and top-level
+  `webBuild` field.
 - environment overrides for device and queue limits appear in `/api/info`.
 - the global WebSocket connection limit appears in `/api/info`.
 
@@ -91,10 +92,10 @@ binary can start and report the bridge features that the NAT path needs.
    curl -fsS https://relay.example.com/api/info
    ```
 
-4. Confirm the Relay URL has one origin for both PC and browser/mobile:
+4. Confirm the Relay URL has one origin for both PC and mobile:
 
    - PC Relay WebSocket: `wss://relay.example.com/ws`.
-   - browser/mobile full-duplex WebSocket: `wss://relay.example.com/ws`.
+   - mobile full-duplex WebSocket: `wss://relay.example.com/ws`.
    - compatibility pair endpoint:
      `https://relay.example.com/api/rooms/:room_id/pair`.
    - compatibility command endpoint:
@@ -129,26 +130,26 @@ binary can start and report the bridge features that the NAT path needs.
 Room ids and connection ids may appear in logs. They are routing metadata, not
 business authorization.
 
-## Browser Or Mobile Relay Check
+## Mobile Relay Check
 
-1. Open Web/PWA Relay mode in a browser or the mobile shell.
+1. Open Relay mode in the installed mobile app.
 
 2. Enter only non-secret Relay metadata:
 
    - Relay URL.
    - room id.
 
-3. Enter the normal PC remote device auth proof through the Web/PWA auth form.
+3. Complete the normal PC remote device proof through the mobile pairing flow.
    Do not put auth tokens in launch links, QR URLs, screenshots, or log output.
 
 4. Test the connection.
 
 5. Pass criteria:
 
-   - Web/PWA validates Relay `/api/info`.
+   - the mobile runtime validates Relay `/api/info`.
    - a first Relay-only claim can use the bounded compatibility pair/command
      bridge without exposing the pairing challenge.
-   - normal Web/PWA Remote v2 handshake, RPC, events, and binary frames use the
+   - normal mobile Remote v2 handshake, RPC, events, and binary frames use the
      device WebSocket on `/ws`.
    - the UI enables business surfaces from the decrypted PC
      `RemoteHandshakeResponse`, not from Relay `/api/info`.
@@ -193,9 +194,9 @@ Provider setting value into captured evidence.
 
 ## Reconnect And Catch-Up Check
 
-1. While the browser/mobile client is connected through Relay, record the latest
+1. While the mobile client is connected through Relay, record the latest
    visible timeline item or session state.
-2. Refresh the browser/mobile app, or temporarily stop and restart the PC Relay
+2. background and resume the mobile app, or temporarily stop and restart the PC Relay
    client.
 3. Create one safe timeline change from the PC runtime while the remote client
    is disconnected.
@@ -203,7 +204,7 @@ Provider setting value into captured evidence.
 
 Pass criteria:
 
-- Web/PWA pairs again with memory-only Relay key material.
+- the mobile app reconnects with its securely stored paired-device material.
 - the existing device auth proof remains subject to PC revocation and
   permission checks.
 - missed timeline/session state appears after authoritative fetch/catch-up

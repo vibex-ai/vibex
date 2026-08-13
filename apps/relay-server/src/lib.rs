@@ -1,22 +1,19 @@
 use std::collections::HashMap;
-use std::fs;
 use std::net::SocketAddr;
-use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
+use axum::http::header::AUTHORIZATION;
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
@@ -25,8 +22,7 @@ use vibex_core::{
     RelayError, RelayErrorCode, RelayFrameKind, RelayHandshakeHello, RelayHeartbeatAck,
     RelayNotificationProviderKind, RelayOpaqueNotification, RelayPeerId, RelayPeerMessage,
     RelayPeerRole, RelayProtocolVersion, RelayPushDispatchResult, RelayPushRegistration,
-    RelayRoomId, WEB_REQUIRED_ASSETS, WEB_STATIC_IDENTITY_ASSETS, WebBuildDescriptor,
-    unix_timestamp_ms,
+    RelayRoomId, unix_timestamp_ms,
 };
 
 pub type RelayServerRouter = Router;
@@ -56,7 +52,6 @@ pub struct RelayServerConfig {
     pub push_auth_token: Option<String>,
     pub push_adapter_url: Option<String>,
     pub push_adapter_auth_token: Option<String>,
-    pub web_static_dir: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for RelayServerConfig {
@@ -98,7 +93,6 @@ impl std::fmt::Debug for RelayServerConfig {
                 "has_push_adapter_auth_token",
                 &self.push_adapter_auth_token.is_some(),
             )
-            .field("has_web_static_dir", &self.web_static_dir.is_some())
             .finish()
     }
 }
@@ -111,11 +105,6 @@ impl RelayServerConfig {
         } else if let Ok(port) = std::env::var("RELAY_PORT") {
             config.bind_addr = format!("127.0.0.1:{port}").parse()?;
         }
-        config.web_static_dir = std::env::var("VIBEX_RELAY_WEB_STATIC_DIR")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from);
         apply_env_i64(&mut config.room_ttl_ms, "VIBEX_RELAY_ROOM_TTL_MS")?;
         apply_env_i64(
             &mut config.bridge_timeout_ms,
@@ -340,7 +329,6 @@ impl Default for RelayServerConfig {
             push_auth_token: None,
             push_adapter_url: None,
             push_adapter_auth_token: None,
-            web_static_dir: None,
         }
     }
 }
@@ -370,8 +358,6 @@ pub struct RelayServerInfo {
     pub protocol_version: RelayProtocolVersion,
     pub features: RelayServerFeatures,
     pub limits: RelayServerLimits,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub web_build: Option<WebBuildDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -382,7 +368,6 @@ pub struct RelayServerFeatures {
     pub websocket_frames: bool,
     pub http_pair_bridge: bool,
     pub http_command_bridge: bool,
-    pub static_room_assets: bool,
     pub push_registration: bool,
     pub push_dispatch: bool,
     pub push_provider_configured: bool,
@@ -409,122 +394,6 @@ pub struct RelayServerLimits {
     pub push_adapter_timeout_ms: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RelayServerStartupError {
-    pub code: &'static str,
-    pub message: &'static str,
-}
-
-impl std::fmt::Display for RelayServerStartupError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}: {}", self.code, self.message)
-    }
-}
-
-impl std::error::Error for RelayServerStartupError {}
-
-#[derive(Clone)]
-struct RelayWebAssets {
-    root: PathBuf,
-    descriptor: WebBuildDescriptor,
-}
-
-impl RelayWebAssets {
-    fn load(root: &FsPath) -> Result<Self, RelayServerStartupError> {
-        let metadata = fs::symlink_metadata(root).map_err(|_| web_assets_missing())?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(web_assets_invalid());
-        }
-        let root = root.canonicalize().map_err(|_| web_assets_invalid())?;
-        for relative in WEB_REQUIRED_ASSETS {
-            let path = root.join(relative);
-            let metadata = fs::symlink_metadata(&path).map_err(|_| web_assets_missing())?;
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                return Err(web_assets_invalid());
-            }
-            let resolved = path.canonicalize().map_err(|_| web_assets_invalid())?;
-            if !resolved.starts_with(&root) {
-                return Err(web_assets_invalid());
-            }
-        }
-        let descriptor: WebBuildDescriptor = serde_json::from_slice(
-            &fs::read(root.join("build.json")).map_err(|_| web_assets_missing())?,
-        )
-        .map_err(|_| web_assets_invalid())?;
-        if !descriptor.has_valid_identity(false)
-            || descriptor.package_version != env!("CARGO_PKG_VERSION")
-        {
-            return Err(web_assets_incompatible());
-        }
-        if option_env!("VIBEX_RELAY_WEB_BUILD_ID")
-            .is_some_and(|expected| expected != descriptor.build_id)
-            || option_env!("VIBEX_RELAY_WEB_GIT_COMMIT")
-                .is_some_and(|expected| expected != descriptor.git_commit)
-        {
-            return Err(web_assets_incompatible());
-        }
-        verify_web_asset_hashes(&root, &descriptor)?;
-        Ok(Self { root, descriptor })
-    }
-}
-
-fn verify_web_asset_hashes(
-    root: &FsPath,
-    descriptor: &WebBuildDescriptor,
-) -> Result<(), RelayServerStartupError> {
-    let wasm = fs::read(root.join("pkg/vibex_web_bg.wasm")).map_err(|_| web_assets_missing())?;
-    let glue = fs::read(root.join("pkg/vibex_web.js")).map_err(|_| web_assets_missing())?;
-    let mut static_hash = Sha256::new();
-    for relative in WEB_STATIC_IDENTITY_ASSETS {
-        let mut bytes = fs::read(root.join(relative)).map_err(|_| web_assets_missing())?;
-        if *relative == "service-worker.js" {
-            let source = String::from_utf8(bytes).map_err(|_| web_assets_incompatible())?;
-            if !source.contains(&descriptor.build_id) {
-                return Err(web_assets_incompatible());
-            }
-            bytes = source
-                .replace(&descriptor.build_id, "__VIBEX_BUILD_ID__")
-                .into_bytes();
-        }
-        static_hash.update(relative.as_bytes());
-        static_hash.update(b"\0");
-        static_hash.update(bytes);
-        static_hash.update(b"\0");
-    }
-    if sha256_hex(&wasm) != descriptor.wasm_sha256
-        || sha256_hex(&glue) != descriptor.glue_sha256
-        || format!("{:x}", static_hash.finalize()) != descriptor.static_sha256
-    {
-        return Err(web_assets_incompatible());
-    }
-    Ok(())
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
-
-fn web_assets_missing() -> RelayServerStartupError {
-    RelayServerStartupError {
-        code: "relay_web_assets_missing",
-        message: "the configured WebUI release is missing required assets",
-    }
-}
-
-fn web_assets_invalid() -> RelayServerStartupError {
-    RelayServerStartupError {
-        code: "relay_web_assets_invalid",
-        message: "the configured WebUI asset root is invalid",
-    }
-}
-
-fn web_assets_incompatible() -> RelayServerStartupError {
-    RelayServerStartupError {
-        code: "relay_web_assets_incompatible",
-        message: "the configured WebUI release identity is incompatible",
-    }
-}
-
 #[derive(Clone)]
 pub struct RelayServerState {
     inner: std::sync::Arc<RelayServerInner>,
@@ -545,7 +414,6 @@ impl Drop for WebSocketConnectionGuard {
 
 struct RelayServerInner {
     config: RelayServerConfig,
-    web_assets: Option<RelayWebAssets>,
     started_at_ms: i64,
     active_connections: AtomicUsize,
     rooms: Mutex<HashMap<RelayRoomId, RoomState>>,
@@ -613,13 +481,7 @@ struct RelayServerError {
 }
 
 pub fn build_router(config: RelayServerConfig) -> RelayServerRouter {
-    try_build_router(config).expect("Relay Web asset configuration is valid")
-}
-
-pub fn try_build_router(
-    config: RelayServerConfig,
-) -> Result<RelayServerRouter, RelayServerStartupError> {
-    Ok(build_router_with_state(RelayServerState::try_new(config)?))
+    build_router_with_state(RelayServerState::new(config))
 }
 
 pub fn build_router_with_state(state: RelayServerState) -> RelayServerRouter {
@@ -632,18 +494,15 @@ pub fn build_router_with_state(state: RelayServerState) -> RelayServerRouter {
         .route("/api/push/dispatch", post(dispatch_push))
         .route("/api/rooms/{room_id}/pair", post(pair))
         .route("/api/rooms/{room_id}/command", post(command))
-        .route("/", get(static_index))
-        .route("/{*path}", get(static_asset))
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .layer(middleware::from_fn(cors))
         .with_state(state)
 }
 
-/// Browser peers (Web app origins and the Capacitor `https://localhost`
-/// WebView) reach the zero-knowledge Relay cross-origin. The Relay carries
-/// only E2EE payloads, uses no cookies or ambient credentials, and is already
-/// reachable by any non-browser client, so a wildcard non-credentialed CORS
-/// policy adds browser reachability without widening the trust model.
+/// The Capacitor-hosted mobile runtime reaches the zero-knowledge Relay
+/// cross-origin. The Relay carries only E2EE payloads and uses no cookies or
+/// ambient credentials, so wildcard non-credentialed CORS does not widen the
+/// trust model.
 async fn cors(request: axum::extract::Request, next: Next) -> Response {
     let preflight = request.method() == Method::OPTIONS;
     let mut response = if preflight {
@@ -673,19 +532,9 @@ async fn cors(request: axum::extract::Request, next: Next) -> Response {
 
 impl RelayServerState {
     pub fn new(config: RelayServerConfig) -> Self {
-        Self::try_new(config).expect("Relay Web asset configuration is valid")
-    }
-
-    pub fn try_new(config: RelayServerConfig) -> Result<Self, RelayServerStartupError> {
-        let web_assets = config
-            .web_static_dir
-            .as_deref()
-            .map(RelayWebAssets::load)
-            .transpose()?;
-        Ok(Self {
+        Self {
             inner: std::sync::Arc::new(RelayServerInner {
                 config,
-                web_assets,
                 started_at_ms: unix_timestamp_ms(),
                 active_connections: AtomicUsize::new(0),
                 rooms: Mutex::new(HashMap::new()),
@@ -695,7 +544,7 @@ impl RelayServerState {
                     .build()
                     .expect("Relay push HTTP client configuration is valid"),
             }),
-        })
+        }
     }
 
     fn config(&self) -> &RelayServerConfig {
@@ -761,7 +610,6 @@ impl RelayServerState {
                 websocket_frames: true,
                 http_pair_bridge: true,
                 http_command_bridge: true,
-                static_room_assets: self.inner.web_assets.is_some(),
                 push_registration: config.push_adapter_configured(),
                 push_dispatch: config.push_adapter_configured(),
                 push_provider_configured: config.push_adapter_configured(),
@@ -784,11 +632,6 @@ impl RelayServerState {
                 max_push_dedup_entries: config.max_push_dedup_entries,
                 push_adapter_timeout_ms: config.push_adapter_timeout_ms,
             },
-            web_build: self
-                .inner
-                .web_assets
-                .as_ref()
-                .map(|assets| assets.descriptor.clone()),
         }
     }
 
@@ -1374,108 +1217,6 @@ async fn health(State(state): State<RelayServerState>) -> Json<RelayHealthStatus
 
 async fn info(State(state): State<RelayServerState>) -> Json<RelayServerInfo> {
     Json(state.info())
-}
-
-async fn static_index(State(state): State<RelayServerState>) -> Response {
-    serve_static_path(&state, "index.html")
-}
-
-async fn static_asset(State(state): State<RelayServerState>, Path(path): Path<String>) -> Response {
-    if is_reserved_static_path(&path) {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    serve_static_path(&state, &path)
-}
-
-fn serve_static_path(state: &RelayServerState, request_path: &str) -> Response {
-    let Some(assets) = state.inner.web_assets.as_ref() else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let relative = FsPath::new(request_path.trim_start_matches('/'));
-    if relative.as_os_str().is_empty()
-        || relative
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-    let candidate = assets.root.join(relative);
-    let resolved = match fs::symlink_metadata(&candidate) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                return StatusCode::NOT_FOUND.into_response();
-            }
-            match candidate.canonicalize() {
-                Ok(path) if path.starts_with(&assets.root) => path,
-                _ => return StatusCode::NOT_FOUND.into_response(),
-            }
-        }
-        Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound && relative.extension().is_none() =>
-        {
-            assets.root.join("index.html")
-        }
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
-    };
-    let bytes = match fs::read(&resolved) {
-        Ok(bytes) => bytes,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
-    };
-    let mut response = bytes.into_response();
-    response.headers_mut().insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static(content_type_for_path(&resolved)),
-    );
-    response.headers_mut().insert(
-        CACHE_CONTROL,
-        HeaderValue::from_static(cache_control_for_path(&resolved)),
-    );
-    for (name, value) in [
-        ("x-content-type-options", "nosniff"),
-        ("x-frame-options", "DENY"),
-        ("referrer-policy", "no-referrer"),
-        ("cross-origin-resource-policy", "same-origin"),
-    ] {
-        response.headers_mut().insert(
-            HeaderName::from_static(name),
-            HeaderValue::from_static(value),
-        );
-    }
-    response
-}
-
-fn is_reserved_static_path(path: &str) -> bool {
-    ["api", "ws", "health"].iter().any(|prefix| {
-        path.eq_ignore_ascii_case(prefix)
-            || path
-                .get(..prefix.len() + 1)
-                .is_some_and(|value| value.eq_ignore_ascii_case(&format!("{prefix}/")))
-    })
-}
-
-fn content_type_for_path(path: &FsPath) -> &'static str {
-    match path.extension().and_then(|extension| extension.to_str()) {
-        Some("html") => "text/html; charset=utf-8",
-        Some("js") | Some("mjs") => "text/javascript; charset=utf-8",
-        Some("css") => "text/css; charset=utf-8",
-        Some("wasm") => "application/wasm",
-        Some("json") => "application/json; charset=utf-8",
-        Some("webmanifest") => "application/manifest+json; charset=utf-8",
-        Some("png") => "image/png",
-        Some("svg") => "image/svg+xml",
-        Some("ico") => "image/x-icon",
-        Some("woff2") => "font/woff2",
-        Some("ttf") => "font/ttf",
-        _ => "application/octet-stream",
-    }
-}
-
-fn cache_control_for_path(path: &FsPath) -> &'static str {
-    match path.file_name().and_then(|name| name.to_str()) {
-        Some("index.html" | "offline.html" | "build.json" | "service-worker.js") => "no-cache",
-        Some("manifest.webmanifest") => "public, max-age=300, must-revalidate",
-        _ => "public, max-age=3600",
-    }
 }
 
 async fn register_push(
@@ -2325,8 +2066,6 @@ mod tests {
         assert!(info.features.pc_websocket);
         assert!(info.features.http_pair_bridge);
         assert!(info.features.http_command_bridge);
-        assert!(!info.features.static_room_assets);
-        assert!(info.web_build.is_none());
         assert_eq!(info.limits.max_connections_per_room, 1);
         assert_eq!(
             info.limits.max_total_connections,
@@ -2367,187 +2106,6 @@ mod tests {
                 .await
                 .unwrap()
                 .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn validated_web_assets_are_reported_and_served_with_safe_routing() {
-        let directory = tempfile::tempdir().unwrap();
-        let descriptor = write_test_web_build(directory.path(), "release");
-        let mut config = test_config();
-        config.web_static_dir = Some(directory.path().to_path_buf());
-        let router = try_build_router(config).unwrap();
-
-        let info_response = router
-            .clone()
-            .oneshot(Request::get("/api/info").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        let info: RelayServerInfo = json_body(info_response).await;
-        assert!(info.features.static_room_assets);
-        assert_eq!(info.web_build, Some(descriptor.clone()));
-
-        let root = router
-            .clone()
-            .oneshot(Request::get("/").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(root.status(), StatusCode::OK);
-        assert_eq!(
-            root.headers().get(CONTENT_TYPE).unwrap(),
-            "text/html; charset=utf-8"
-        );
-        assert_eq!(
-            root.headers().get("x-content-type-options").unwrap(),
-            "nosniff"
-        );
-        assert_eq!(root.headers().get(CACHE_CONTROL).unwrap(), "no-cache");
-        assert_eq!(
-            String::from_utf8_lossy(&to_bytes(root.into_body(), usize::MAX).await.unwrap()),
-            "relay-web-index"
-        );
-
-        for (path, expected_content_type) in [
-            ("/host.js", "text/javascript; charset=utf-8"),
-            ("/pkg/vibex_web_bg.wasm", "application/wasm"),
-            (
-                "/manifest.webmanifest",
-                "application/manifest+json; charset=utf-8",
-            ),
-        ] {
-            let response = router
-                .clone()
-                .oneshot(Request::get(path).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "{path}");
-            assert_eq!(
-                response.headers().get(CONTENT_TYPE).unwrap(),
-                expected_content_type,
-                "{path}"
-            );
-        }
-
-        let build = router
-            .clone()
-            .oneshot(Request::get("/build.json").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(build.headers().get(CACHE_CONTROL).unwrap(), "no-cache");
-        let advertised: WebBuildDescriptor =
-            serde_json::from_slice(&to_bytes(build.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert_eq!(advertised, descriptor);
-
-        let head = router
-            .clone()
-            .oneshot(Request::head("/host.js").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(head.status(), StatusCode::OK);
-        assert!(
-            to_bytes(head.into_body(), usize::MAX)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-
-        let navigation = router
-            .clone()
-            .oneshot(
-                Request::get("/settings/remote")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(navigation.status(), StatusCode::OK);
-        assert_eq!(
-            String::from_utf8_lossy(&to_bytes(navigation.into_body(), usize::MAX).await.unwrap()),
-            "relay-web-index"
-        );
-
-        for path in ["/missing.js", "/api/missing", "/ws/missing", "/pkg"] {
-            let response = router
-                .clone()
-                .oneshot(Request::get(path).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
-        }
-        let post_navigation = router
-            .clone()
-            .oneshot(
-                Request::post("/settings/remote")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(post_navigation.status(), StatusCode::METHOD_NOT_ALLOWED);
-        let traversal = router
-            .oneshot(
-                Request::get("/%2e%2e/outside.txt")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(!traversal.status().is_success());
-    }
-
-    #[test]
-    fn production_web_assets_fail_closed_when_missing_debug_or_tampered() {
-        let missing = tempfile::tempdir().unwrap();
-        let mut config = test_config();
-        config.web_static_dir = Some(missing.path().to_path_buf());
-        assert_eq!(
-            try_build_router(config).unwrap_err().code,
-            "relay_web_assets_missing"
-        );
-
-        let debug = tempfile::tempdir().unwrap();
-        write_test_web_build(debug.path(), "debug");
-        let mut config = test_config();
-        config.web_static_dir = Some(debug.path().to_path_buf());
-        assert_eq!(
-            try_build_router(config).unwrap_err().code,
-            "relay_web_assets_incompatible"
-        );
-
-        let tampered = tempfile::tempdir().unwrap();
-        write_test_web_build(tampered.path(), "release");
-        fs::write(tampered.path().join("host.js"), "tampered").unwrap();
-        let mut config = test_config();
-        config.web_static_dir = Some(tampered.path().to_path_buf());
-        assert_eq!(
-            try_build_router(config).unwrap_err().code,
-            "relay_web_assets_incompatible"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn static_web_assets_reject_symlink_escape() {
-        use std::os::unix::fs::symlink;
-
-        let directory = tempfile::tempdir().unwrap();
-        let outside_directory = tempfile::tempdir().unwrap();
-        write_test_web_build(directory.path(), "release");
-        let outside = outside_directory.path().join("relay-outside.txt");
-        fs::write(&outside, "outside-secret-sentinel").unwrap();
-        symlink(&outside, directory.path().join("escape.txt")).unwrap();
-        let mut config = test_config();
-        config.web_static_dir = Some(directory.path().to_path_buf());
-        let response = try_build_router(config)
-            .unwrap()
-            .oneshot(Request::get("/escape.txt").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert!(
-            !String::from_utf8_lossy(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
-                .contains("outside-secret-sentinel")
         );
     }
 
@@ -3162,51 +2720,6 @@ mod tests {
             max_requests_per_window_per_room: 100,
             ..RelayServerConfig::default()
         }
-    }
-
-    fn write_test_web_build(root: &FsPath, profile: &str) -> WebBuildDescriptor {
-        fs::create_dir_all(root.join("pkg")).unwrap();
-        for relative in WEB_STATIC_IDENTITY_ASSETS {
-            let contents = match *relative {
-                "index.html" => "relay-web-index".to_string(),
-                "service-worker.js" => "const BUILD_ID = \"__VIBEX_BUILD_ID__\";\n".to_string(),
-                _ => format!("test asset: {relative}\n"),
-            };
-            fs::write(root.join(relative), contents).unwrap();
-        }
-        fs::write(root.join("pkg/vibex_web.js"), "test glue\n").unwrap();
-        fs::write(root.join("pkg/vibex_web_bg.wasm"), b"\0asmtest").unwrap();
-
-        let build_id = "a".repeat(24);
-        let mut static_hash = Sha256::new();
-        for relative in WEB_STATIC_IDENTITY_ASSETS {
-            static_hash.update(relative.as_bytes());
-            static_hash.update(b"\0");
-            static_hash.update(fs::read(root.join(relative)).unwrap());
-            static_hash.update(b"\0");
-        }
-        let descriptor = WebBuildDescriptor {
-            schema_version: vibex_core::WEB_BUILD_SCHEMA_VERSION.to_string(),
-            build_id: build_id.clone(),
-            package_version: env!("CARGO_PKG_VERSION").to_string(),
-            profile: profile.to_string(),
-            git_commit: "b".repeat(40),
-            wasm_sha256: sha256_hex(b"\0asmtest"),
-            glue_sha256: sha256_hex(b"test glue\n"),
-            static_sha256: format!("{:x}", static_hash.finalize()),
-        };
-        fs::write(
-            root.join("build.json"),
-            serde_json::to_vec_pretty(&descriptor).unwrap(),
-        )
-        .unwrap();
-        let service_worker = fs::read_to_string(root.join("service-worker.js")).unwrap();
-        fs::write(
-            root.join("service-worker.js"),
-            service_worker.replace("__VIBEX_BUILD_ID__", &build_id),
-        )
-        .unwrap();
-        descriptor
     }
 
     struct ObservedPushAdapterRequest {

@@ -12,9 +12,9 @@
     "targets": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["web_browser", "android_physical"],
+      "required": ["mobile_wasm_host", "android_physical"],
       "properties": {
-        "web_browser": { "$ref": "#/$defs/transportTargets" },
+        "mobile_wasm_host": { "$ref": "#/$defs/transportTargets" },
         "android_physical": { "$ref": "#/$defs/transportTargets" }
       }
     },
@@ -43,7 +43,7 @@
     "candidate": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["source", "webBuild", "androidApk", "candidateDigest"],
+      "required": ["source", "mobileRuntimeBuild", "androidApk", "candidateDigest"],
       "properties": {
         "source": {
           "type": "object",
@@ -69,7 +69,7 @@
             "gpuiComponentRevision": { "$ref": "#/$defs/gitRevision" }
           }
         },
-        "webBuild": {
+        "mobileRuntimeBuild": {
           "type": "object",
           "additionalProperties": false,
           "required": [
@@ -140,7 +140,7 @@
         "redactionScan"
       ],
       "properties": {
-        "target": { "enum": ["web_browser", "android_physical"] },
+        "target": { "enum": ["mobile_wasm_host", "android_physical"] },
         "transport": { "enum": ["direct", "relay"] },
         "status": { "const": "passed" },
         "capturedAt": { "type": "string", "format": "date-time" },

@@ -6,7 +6,7 @@ import { resolveGpuiSourceIdentities } from "./source-identities.mjs";
 import {
   WORKFLOW_SOURCE_INPUTS,
   MOBILE_SOURCE_INPUTS,
-  WEB_SOURCE_INPUTS,
+  MOBILE_RUNTIME_SOURCE_INPUTS,
   sourceTreeSha256
 } from "./wasm-source-tree.mjs";
 
@@ -14,8 +14,8 @@ export const WORKFLOW_EVIDENCE_SCHEMA_VERSION = "vibex-workflow-e2e.v1";
 export const WORKFLOW_EVIDENCE_PATH = "docs/platform/evidence/workflow-e2e.json";
 export const WORKFLOW_IDS = ["agent", "files", "git", "terminal", "management"];
 export const TARGET_IDS = [
-  ["web_browser", "direct"],
-  ["web_browser", "relay"],
+  ["mobile_wasm_host", "direct"],
+  ["mobile_wasm_host", "relay"],
   ["android_physical", "direct"],
   ["android_physical", "relay"]
 ];
@@ -51,11 +51,11 @@ export function sourceCommitIsAncestor(root, ancestor, descendant = currentCommi
   }
 }
 
-function androidBuildIsCurrent(androidBuild, source, webBuild) {
+function androidBuildIsCurrent(androidBuild, source, mobileRuntimeBuild) {
   if (androidBuild?.schemaVersion !== "vibex-android-build.v1") return false;
   const buildSource = androidBuild.source;
   if (
-    buildSource?.webSourceTreeSha256 !== source.sourceTreeSha256 ||
+    buildSource?.mobileRuntimeSourceTreeSha256 !== source.sourceTreeSha256 ||
     buildSource?.mobileShellTreeSha256 !== source.mobileShellTreeSha256 ||
     buildSource?.cargoLockfileSha256 !== source.cargoLockSha256 ||
     buildSource?.pnpmLockfileSha256 !== source.pnpmLockSha256 ||
@@ -65,12 +65,12 @@ function androidBuildIsCurrent(androidBuild, source, webBuild) {
     return false;
   }
   return ["buildId", "profile", "wasmBytes", "wasmSha256", "glueSha256", "staticSha256"].every(
-    (field) => androidBuild.webBuild?.[field] === webBuild[field]
+    (field) => androidBuild.runtimeBuild?.[field] === mobileRuntimeBuild[field]
   );
 }
 
-function normalizedApk(root, androidBuild, source, webBuild) {
-  if (!androidBuildIsCurrent(androidBuild, source, webBuild)) return null;
+function normalizedApk(root, androidBuild, source, mobileRuntimeBuild) {
+  if (!androidBuildIsCurrent(androidBuild, source, mobileRuntimeBuild)) return null;
   const artifact = androidBuild?.artifact;
   if (!artifact?.path) return null;
   const absolute = join(root, artifact.path);
@@ -97,7 +97,7 @@ function digestInput(identity) {
     pnpmLockSha256: identity.source.pnpmLockSha256,
     zedRevision: identity.source.zedRevision,
     gpuiComponentRevision: identity.source.gpuiComponentRevision,
-    webBuild: identity.webBuild,
+    mobileRuntimeBuild: identity.mobileRuntimeBuild,
     androidApk: identity.androidApk
   };
 }
@@ -107,26 +107,26 @@ export function workflowCandidateDigest(identity) {
 }
 
 export function resolveWorkflowCandidateIdentity(root) {
-  const webBuildPath = join(root, "apps/web/dist/build.json");
-  if (!existsSync(webBuildPath)) throw new Error("apps/web/dist/build.json is missing");
-  const webBuild = readJson(webBuildPath);
-  if (webBuild.schemaVersion !== "vibex-web-build.v1") {
-    throw new Error("Web build identity has an invalid schema");
+  const mobileRuntimeBuildPath = join(root, "apps/mobile-wasm/dist/build.json");
+  if (!existsSync(mobileRuntimeBuildPath)) throw new Error("apps/mobile-wasm/dist/build.json is missing");
+  const mobileRuntimeBuild = readJson(mobileRuntimeBuildPath);
+  if (mobileRuntimeBuild.schemaVersion !== "vibex-mobile-wasm-build.v1") {
+    throw new Error("Mobile runtime build identity has an invalid schema");
   }
-  const hostPath = join(root, "apps/web/dist/host.js");
-  const wasmPath = join(root, "apps/web/dist/pkg/vibex_web_bg.wasm");
+  const hostPath = join(root, "apps/mobile-wasm/dist/host.js");
+  const wasmPath = join(root, "apps/mobile-wasm/dist/pkg/vibex_mobile_wasm_bg.wasm");
   if (!existsSync(hostPath) || !existsSync(wasmPath)) {
-    throw new Error("Web dist is incomplete");
+    throw new Error("Mobile runtime dist is incomplete");
   }
-  if (fileSha256(wasmPath) !== webBuild.wasmSha256) {
-    throw new Error("Web WASM does not match build.json");
+  if (fileSha256(wasmPath) !== mobileRuntimeBuild.wasmSha256) {
+    throw new Error("Mobile runtime WASM does not match build.json");
   }
   const androidBuildPath = join(root, "docs/platform/evidence/wasm-android-build.json");
   const androidBuild = existsSync(androidBuildPath) ? readJson(androidBuildPath) : null;
   const dependency = resolveGpuiSourceIdentities(root);
   const source = {
     sourceCommit: currentCommit(root),
-    sourceTreeSha256: sourceTreeSha256(root, WEB_SOURCE_INPUTS),
+    sourceTreeSha256: sourceTreeSha256(root, MOBILE_RUNTIME_SOURCE_INPUTS),
     workflowSourceTreeSha256: sourceTreeSha256(root, WORKFLOW_SOURCE_INPUTS),
     mobileShellTreeSha256: sourceTreeSha256(root, MOBILE_SOURCE_INPUTS),
     cargoLockSha256: fileSha256(join(root, "Cargo.lock")),
@@ -134,20 +134,20 @@ export function resolveWorkflowCandidateIdentity(root) {
     zedRevision: dependency.zedRevision,
     gpuiComponentRevision: dependency.gpuiComponentRevision
   };
-  const normalizedWebBuild = {
-    buildId: webBuild.buildId,
-    profile: webBuild.profile,
-    wasmBytes: webBuild.wasmBytes,
-    wasmSha256: webBuild.wasmSha256,
-    glueSha256: webBuild.glueSha256,
-    staticSha256: webBuild.staticSha256,
-    buildJsonSha256: fileSha256(webBuildPath),
+  const normalizedRuntimeBuild = {
+    buildId: mobileRuntimeBuild.buildId,
+    profile: mobileRuntimeBuild.profile,
+    wasmBytes: mobileRuntimeBuild.wasmBytes,
+    wasmSha256: mobileRuntimeBuild.wasmSha256,
+    glueSha256: mobileRuntimeBuild.glueSha256,
+    staticSha256: mobileRuntimeBuild.staticSha256,
+    buildJsonSha256: fileSha256(mobileRuntimeBuildPath),
     hostJsSha256: fileSha256(hostPath)
   };
   const identity = {
     source,
-    webBuild: normalizedWebBuild,
-    androidApk: normalizedApk(root, androidBuild, source, normalizedWebBuild)
+    mobileRuntimeBuild: normalizedRuntimeBuild,
+    androidApk: normalizedApk(root, androidBuild, source, normalizedRuntimeBuild)
   };
   return {
     ...identity,
@@ -161,7 +161,7 @@ export function emptyWorkflowEvidence(identity) {
     updatedAt: new Date().toISOString(),
     candidate: identity,
     targets: {
-      web_browser: { direct: null, relay: null },
+      mobile_wasm_host: { direct: null, relay: null },
       android_physical: { direct: null, relay: null }
     },
     redaction: {
@@ -203,7 +203,7 @@ function validateHash(value, label) {
 }
 
 function validateCandidate(candidate) {
-  exactKeys(candidate, ["source", "webBuild", "androidApk", "candidateDigest"], "candidate");
+  exactKeys(candidate, ["source", "mobileRuntimeBuild", "androidApk", "candidateDigest"], "candidate");
   exactKeys(
     candidate.source,
     [
@@ -232,7 +232,7 @@ function validateCandidate(candidate) {
     assert(/^[0-9a-f]{40}$/.test(candidate.source[field] ?? ""), `${field} is invalid`);
   }
   exactKeys(
-    candidate.webBuild,
+    candidate.mobileRuntimeBuild,
     [
       "buildId",
       "profile",
@@ -243,11 +243,11 @@ function validateCandidate(candidate) {
       "buildJsonSha256",
       "hostJsSha256"
     ],
-    "candidate.webBuild"
+    "candidate.mobileRuntimeBuild"
   );
-  assert(/^[0-9a-f]{24}$/.test(candidate.webBuild.buildId ?? ""), "Web build id is invalid");
-  assert(candidate.webBuild.profile === "release", "workflow evidence requires a release Web build");
-  assert(Number.isSafeInteger(candidate.webBuild.wasmBytes) && candidate.webBuild.wasmBytes > 0, "WASM size is invalid");
+  assert(/^[0-9a-f]{24}$/.test(candidate.mobileRuntimeBuild.buildId ?? ""), "Mobile runtime build id is invalid");
+  assert(candidate.mobileRuntimeBuild.profile === "release", "workflow evidence requires a release Mobile runtime build");
+  assert(Number.isSafeInteger(candidate.mobileRuntimeBuild.wasmBytes) && candidate.mobileRuntimeBuild.wasmBytes > 0, "WASM size is invalid");
   for (const field of [
     "wasmSha256",
     "glueSha256",
@@ -255,7 +255,7 @@ function validateCandidate(candidate) {
     "buildJsonSha256",
     "hostJsSha256"
   ]) {
-    validateHash(candidate.webBuild[field], `candidate.webBuild.${field}`);
+    validateHash(candidate.mobileRuntimeBuild[field], `candidate.mobileRuntimeBuild.${field}`);
   }
   validateHash(candidate.candidateDigest, "candidate digest");
   assert(
@@ -328,14 +328,17 @@ function validateTarget(target, targetKind, transport, candidateDigest, androidA
     assert(target.topology.selfHosted === true, "Relay must be self-hosted");
     assert(target.topology.e2ee === true, "Relay evidence does not prove E2EE");
   }
-  if (targetKind === "web_browser") {
+  if (targetKind === "mobile_wasm_host") {
     exactKeys(
       target.environment,
       ["kind", "browserName", "browserVersion", "platformSha256"],
       `${targetKind}/${transport}.environment`
     );
-    assert(target.environment.kind === "browser", "Web target environment is invalid");
-    validateHash(target.environment.platformSha256, "browser platform hash");
+    assert(
+      target.environment.kind === "development_host",
+      "Mobile runtime development-host environment is invalid"
+    );
+    validateHash(target.environment.platformSha256, "development host platform hash");
   } else {
     assert(androidApk !== null, "Android workflow evidence has no current APK");
     exactKeys(
@@ -415,7 +418,7 @@ export function validateWorkflowEvidence(evidence, currentIdentity = null, repos
       "workflow evidence source commit is not current or an ancestor"
     );
   }
-  exactKeys(evidence.targets, ["web_browser", "android_physical"], "targets");
+  exactKeys(evidence.targets, ["mobile_wasm_host", "android_physical"], "targets");
   const permissionContracts = new Set();
   for (const [targetKind, transport] of TARGET_IDS) {
     const target = evidence.targets[targetKind]?.[transport];

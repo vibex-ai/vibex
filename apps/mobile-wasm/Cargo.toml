@@ -1,5 +1,5 @@
 [package]
-name = "vibex-web"
+name = "vibex-mobile-wasm"
 version = "0.1.0-rc.1"
 edition.workspace = true
 rust-version.workspace = true

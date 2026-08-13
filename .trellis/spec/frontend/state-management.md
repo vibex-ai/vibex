@@ -1439,7 +1439,7 @@ CreateAgentSessionRequest.workspaceMode -> WorkspaceMode
   presents Project/Workspace/Session identity and concurrent Agent status.
 - `DesktopRuntime` remains authoritative for Git and Workspace creation.
   `desktop-model` owns pure form/projection state; `apps/desktop` owns Backend
-  calls and GPUI composition. Web/mobile may consume read-only identity but do
+  calls and GPUI composition. Mobile may consume read-only identity but does
   not gain local Worktree mutation.
 
 ### 2. Signatures
@@ -1760,7 +1760,7 @@ adapter remain authoritative for authentication and credentials.
   logged-in account, then choose a model or the Agent's own default behavior.
 - `DesktopRuntime`/Backend owns catalog and authentication state. GPUI stores
   only the selected view, pending presentation state, and bounded desired
-  request; Web/mobile consume the same projection through the remote backend.
+  request; mobile consumes the same projection through the remote backend.
 
 ### 2. Signatures
 
@@ -2437,7 +2437,7 @@ ManagementWorkflowController::revoke_device(request)
 - `GitWorktreeLifecycleSnapshot` is the single authoritative input for both the
   detailed Changes surface and compact Workspace/Session identity. The view
   never owns a second operation state or infers Git completion from a toast.
-- Desktop is the mutation surface. Web/mobile may render negotiated read-only
+- Desktop is the mutation surface. Mobile may render negotiated read-only
   lifecycle state but never expose local Worktree mutation controls.
 
 ### 2. Signatures
