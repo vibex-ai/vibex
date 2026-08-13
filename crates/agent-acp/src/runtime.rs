@@ -13904,21 +13904,15 @@ async fn probe_runtime_session_config_with_config(
                         "ACP session/new did not return a session identity",
                     )
                 })?;
-            let model_config_id = config_options_array(&session).and_then(|options| {
-                options.iter().find_map(|option| {
-                    let id = option
+            let model_config_id = model_config_options(&session)
+                .into_iter()
+                .find_map(|option| {
+                    option
                         .get("id")
                         .or_else(|| option.get("configId"))
-                        .and_then(Value::as_str)?;
-                    let category = option
-                        .get("category")
                         .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    (normalize_identifier(id) == "model"
-                        || normalize_identifier(category) == "model")
-                        .then(|| id.to_string())
-                })
-            });
+                        .map(ToString::to_string)
+                });
             let initial_config_update = process.register_probe_config_update(native_session_id);
             let (response, config_update) = if let Some(config_id) = model_config_id {
                 match process
@@ -15926,15 +15920,10 @@ pub(crate) fn extract_model_ids(response: &Value) -> Vec<String> {
             }
         }
     }
-    if let Some(config_options) = response.get("configOptions").and_then(Value::as_array) {
-        for option in config_options {
-            if option.get("category").and_then(Value::as_str) != Some("model") {
-                continue;
-            }
-            if let Some(options) = option.get("options").and_then(Value::as_array) {
-                for model in options {
-                    push_model(model);
-                }
+    for option in model_config_options(response) {
+        if let Some(options) = option.get("options").and_then(Value::as_array) {
+            for model in options {
+                push_model(model);
             }
         }
     }
@@ -16000,18 +15989,9 @@ pub(crate) fn extract_current_model_id(response: &Value) -> Option<String> {
                 .and_then(Value::as_str)
         })
         .or_else(|| {
-            response
-                .get("configOptions")
-                .and_then(Value::as_array)
-                .and_then(|options| {
-                    options
-                        .iter()
-                        .find(|option| {
-                            option.get("category").and_then(Value::as_str) == Some("model")
-                        })
-                        .and_then(|option| option.get("currentValue"))
-                        .and_then(Value::as_str)
-                })
+            model_config_options(response)
+                .into_iter()
+                .find_map(|option| option.get("currentValue").and_then(Value::as_str))
         })
         .map(redact_summary)
         .filter(|value| !value.is_empty())
@@ -16098,14 +16078,38 @@ fn model_candidates(response: &Value) -> Vec<&Value> {
     {
         candidates.push(value);
     }
-    for option in config_options_array(response).map_or(&[][..], Vec::as_slice) {
-        if option.get("category").and_then(Value::as_str) == Some("model")
-            && let Some(value) = option.get("options").or_else(|| option.get("values"))
-        {
+    for option in model_config_options(response) {
+        if let Some(value) = option.get("options").or_else(|| option.get("values")) {
             candidates.push(value);
         }
     }
     candidates
+}
+
+fn model_config_options(response: &Value) -> Vec<&Value> {
+    let options = config_options_array(response).map_or(&[][..], Vec::as_slice);
+    let explicitly_named = options
+        .iter()
+        .filter(|option| {
+            option
+                .get("id")
+                .or_else(|| option.get("configId"))
+                .and_then(Value::as_str)
+                .is_some_and(|id| normalize_identifier(id) == "model")
+        })
+        .collect::<Vec<_>>();
+    if !explicitly_named.is_empty() {
+        return explicitly_named;
+    }
+    options
+        .iter()
+        .filter(|option| {
+            option
+                .get("category")
+                .and_then(Value::as_str)
+                .is_some_and(|category| normalize_identifier(category) == "model")
+        })
+        .collect()
 }
 
 fn mode_candidates(response: &Value) -> Vec<&Value> {
@@ -18262,6 +18266,60 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
         assert_eq!(
             extract_current_model_id(&response).as_deref(),
             Some("anthropic/claude-sonnet-4")
+        );
+    }
+
+    #[test]
+    fn model_extraction_ignores_other_controls_in_cline_model_category() {
+        let response = json!({
+            "sessionId": "s1",
+            "configOptions": [
+                {
+                    "id": "provider",
+                    "category": "model",
+                    "currentValue": "cline",
+                    "options": [
+                        { "value": "cline", "name": "Cline" },
+                        { "value": "cline-pass", "name": "ClinePass" },
+                        { "value": "openai-codex", "name": "ChatGPT Subscription" }
+                    ]
+                },
+                {
+                    "id": "model",
+                    "category": "model",
+                    "currentValue": "anthropic/claude-sonnet-4",
+                    "options": [
+                        { "value": "anthropic/claude-sonnet-4", "name": "Sonnet" },
+                        { "value": "openai/gpt-5", "name": "GPT-5" }
+                    ]
+                }
+            ]
+        });
+
+        assert_eq!(
+            extract_model_ids(&response),
+            vec![
+                "anthropic/claude-sonnet-4".to_string(),
+                "openai/gpt-5".to_string(),
+            ]
+        );
+        assert_eq!(
+            extract_current_model_id(&response).as_deref(),
+            Some("anthropic/claude-sonnet-4")
+        );
+        assert_eq!(
+            extract_config_values(model_candidates(&response))
+                .into_iter()
+                .map(|model| model.value)
+                .collect::<Vec<_>>(),
+            vec!["anthropic/claude-sonnet-4", "openai/gpt-5"]
+        );
+        assert_eq!(
+            model_config_options(&response)
+                .into_iter()
+                .filter_map(|option| option.get("id").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec!["model"]
         );
     }
 

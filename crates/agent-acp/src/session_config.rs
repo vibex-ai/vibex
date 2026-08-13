@@ -359,9 +359,30 @@ impl SessionConfigPlanner {
             ));
         }
         if category_is_semantic {
+            // ACP categories may group several controls rather than identify
+            // one control. Cline, for example, advertises both `provider` and
+            // `model` in the `model` category. Prefer the explicitly named
+            // semantic option and use the category only as a compatibility
+            // fallback when no option id claims that semantic key.
+            if !id_is_semantic && self.has_explicit_option_for_key(&category_key)? {
+                return Ok(id_key);
+            }
             return Ok(category_key);
         }
         Ok(id_key)
+    }
+
+    fn has_explicit_option_for_key(
+        &self,
+        key: &CanonicalSessionConfigKey,
+    ) -> Result<bool, CanonicalKeyError> {
+        for option in &self.options {
+            let option_key = self.option_key(&option.id)?;
+            if self.is_registered_semantic_key(&option_key) && option_key == *key {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn is_registered_semantic_key(&self, key: &CanonicalSessionConfigKey) -> bool {
@@ -1810,6 +1831,43 @@ mod tests {
             planner.option_for_key(&reasoning_key),
             Err(CanonicalKeyError::Ambiguous(_))
         ));
+    }
+
+    #[test]
+    fn explicit_model_option_wins_over_other_controls_in_the_model_category() {
+        let aliases = BTreeMap::from([(CANONICAL_MODEL.to_string(), vec!["model".to_string()])]);
+        let provider = catalog_option(
+            "provider",
+            Some(CANONICAL_MODEL),
+            ProviderSessionConfigOptionKind::Select,
+            "cline",
+            &[("cline", "Cline"), ("cline-pass", "ClinePass")],
+        );
+        let model = catalog_option(
+            CANONICAL_MODEL,
+            Some(CANONICAL_MODEL),
+            ProviderSessionConfigOptionKind::Select,
+            "anthropic/claude-sonnet-4",
+            &[("anthropic/claude-sonnet-4", "Sonnet")],
+        );
+        let planner = SessionConfigPlanner::new(
+            "adapter=cline@3.0.53",
+            1,
+            aliases,
+            BTreeMap::new(),
+            vec![provider, model],
+        );
+        let model_key = CanonicalSessionConfigKey::parse(CANONICAL_MODEL).unwrap();
+        let provider_key = CanonicalSessionConfigKey::parse("provider").unwrap();
+
+        assert_eq!(
+            planner.option_for_key(&model_key).unwrap().unwrap().id,
+            CANONICAL_MODEL
+        );
+        assert_eq!(
+            planner.option_for_key(&provider_key).unwrap().unwrap().id,
+            "provider"
+        );
     }
 
     #[test]
