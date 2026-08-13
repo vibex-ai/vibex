@@ -338,6 +338,29 @@ cache invalidation path.
 - Do not update multiple local stores from the same event with duplicated
   switch statements.
 
+### GPUI Parent / Child Entity Updates
+
+When a parent GPUI entity updates a child entity, the child update closure must
+not synchronously `read` or `read_with` the parent. The parent entity is already
+leased for update, so a reverse read panics at runtime. Snapshot every required
+parent-owned value before entering the child update and pass those values into
+the child method.
+
+```rust
+// Wrong: sync_controls reads workbench while workbench is being rendered.
+self.settings.update(cx, |settings, cx| settings.sync_controls(cx));
+
+// Correct: the parent passes an owned snapshot across the entity boundary.
+let terminal = self.ui_state.terminal_preferences.clone();
+self.settings.update(cx, |settings, cx| {
+    settings.sync_controls(&terminal, cx)
+});
+```
+
+Regression coverage for parent-driven control synchronization must assert that
+the child method accepts the required state snapshots and contains no reverse
+access to the parent entity.
+
 ## Scenario: Interface And Code Font Preferences
 
 ### 1. Scope / Trigger

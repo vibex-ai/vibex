@@ -15203,8 +15203,9 @@ impl VibexWorkbench {
 
         let appearance = self.ui_state.appearance.clone();
         let session = self.ui_state.session.clone();
+        let terminal_preferences = self.ui_state.terminal_preferences.clone();
         self.settings_view.update(cx, |settings, cx| {
-            settings.sync_controls(&appearance, &session, window, cx)
+            settings.sync_controls(&appearance, &session, &terminal_preferences, window, cx)
         });
         self.rebuild_timeline_sizes();
         self.queue_ui_state();
@@ -31783,6 +31784,7 @@ impl FoundationSettings {
         &mut self,
         appearance: &vibex_desktop_model::AppearanceUiState,
         session: &SessionUiState,
+        terminal_preferences: &vibex_desktop_model::TerminalPreferencesUiState,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -31808,7 +31810,7 @@ impl FoundationSettings {
         });
         self.terminal_shells.update(cx, |select, cx| {
             select.set_items(shell_choices(), window, cx);
-            let shell = self.terminal_preferences(&*cx).shell.unwrap_or_default();
+            let shell = terminal_preferences.shell.clone().unwrap_or_default();
             select.set_selected_value(&shell, window, cx);
         });
         self.session_content_widths.update(cx, |select, cx| {
@@ -31834,7 +31836,8 @@ impl FoundationSettings {
             let _ = settings.update(cx, |this, cx| {
                 let appearance = this.appearance(cx);
                 let session = this.session(cx);
-                this.sync_controls(&appearance, &session, window, cx);
+                let terminal_preferences = this.terminal_preferences(cx);
+                this.sync_controls(&appearance, &session, &terminal_preferences, window, cx);
             });
         });
         cx.notify();
@@ -33966,8 +33969,9 @@ impl Render for VibexWorkbench {
             locale::apply_locale(appearance.locale);
             self.sync_locale_dependents(window, cx);
             let session = self.ui_state.session.clone();
+            let terminal_preferences = self.ui_state.terminal_preferences.clone();
             self.settings_view.update(cx, |settings, cx| {
-                settings.sync_controls(&appearance, &session, window, cx)
+                settings.sync_controls(&appearance, &session, &terminal_preferences, window, cx)
             });
         }
         if self.open_settings_on_start {
@@ -40259,6 +40263,21 @@ mod tests {
             &session,
             &desktop_behavior
         ));
+    }
+
+    #[test]
+    fn settings_control_sync_uses_parent_owned_state_snapshots() {
+        let source = include_str!("app.rs");
+        let sync_controls = source
+            .split_once("    fn sync_controls(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn set_theme("))
+            .map(|(body, _)| body)
+            .expect("settings control synchronization should remain inspectable");
+
+        assert!(sync_controls.contains("terminal_preferences: &"));
+        assert!(sync_controls.contains("terminal_preferences.shell.clone()"));
+        assert!(!sync_controls.contains("self.workbench"));
+        assert!(!sync_controls.contains("self.terminal_preferences("));
     }
 
     #[test]
