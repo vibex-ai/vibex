@@ -80,12 +80,14 @@ impl TextInput {
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let offset = clamp_offset_to_boundary(&self.content, offset);
         self.selected_range = offset..offset;
         self.selection_reversed = false;
         cx.notify();
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let offset = clamp_offset_to_boundary(&self.content, offset);
         if self.selection_reversed {
             self.selected_range.start = offset;
         } else {
@@ -130,6 +132,11 @@ impl TextInput {
     }
 
     fn index_for_position(&self, position: Point<Pixels>) -> usize {
+        // The shaped line contains the placeholder while the document is empty.
+        // Placeholder byte offsets are never valid document offsets.
+        if self.content.is_empty() {
+            return 0;
+        }
         let (Some(bounds), Some(line)) = (self.last_bounds, self.last_layout.as_ref()) else {
             return 0;
         };
@@ -139,7 +146,10 @@ impl TextInput {
         if position.x >= bounds.right() {
             return self.content.len();
         }
-        line.closest_index_for_x(position.x - bounds.left())
+        clamp_offset_to_boundary(
+            &self.content,
+            line.closest_index_for_x(position.x - bounds.left()),
+        )
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
@@ -272,6 +282,20 @@ fn range_from_utf16(text: &str, range: &Range<usize>) -> Range<usize> {
     offset_from_utf16(text, range.start)..offset_from_utf16(text, range.end)
 }
 
+fn clamp_offset_to_boundary(text: &str, offset: usize) -> usize {
+    let mut offset = offset.min(text.len());
+    while !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
+fn clamp_range_to_text(text: &str, range: Range<usize>) -> Range<usize> {
+    let start = clamp_offset_to_boundary(text, range.start);
+    let end = clamp_offset_to_boundary(text, range.end).max(start);
+    start..end
+}
+
 impl EntityInputHandler for TextInput {
     fn text_for_range(
         &mut self,
@@ -319,6 +343,7 @@ impl EntityInputHandler for TextInput {
             .map(|range| self.range_from_utf16(range))
             .or_else(|| self.marked_range.clone())
             .unwrap_or_else(|| self.selected_range.clone());
+        let range = clamp_range_to_text(&self.content, range);
         let normalized = text.replace(['\r', '\n'], " ");
         self.content = format!(
             "{}{}{}",
@@ -346,6 +371,7 @@ impl EntityInputHandler for TextInput {
             .map(|range| self.range_from_utf16(range))
             .or_else(|| self.marked_range.clone())
             .unwrap_or_else(|| self.selected_range.clone());
+        let base = clamp_range_to_text(&self.content, base);
         let normalized = text.replace(['\r', '\n'], " ");
         self.content = format!(
             "{}{}{}",
@@ -639,5 +665,18 @@ mod tests {
         let selected = range_from_utf16(inserted, &(1..3));
 
         assert_eq!(base + selected.start..base + selected.end, 8..12);
+    }
+
+    #[test]
+    fn placeholder_offsets_cannot_escape_the_empty_document() {
+        assert_eq!(clamp_offset_to_boundary("", 18), 0);
+        assert_eq!(clamp_range_to_text("", 18..18), 0..0);
+    }
+
+    #[test]
+    fn stale_offsets_clamp_to_a_utf8_boundary() {
+        assert_eq!(clamp_offset_to_boundary("A中", usize::MAX), 4);
+        assert_eq!(clamp_offset_to_boundary("A中", 3), 1);
+        assert_eq!(clamp_range_to_text("A中", 3..99), 1..4);
     }
 }

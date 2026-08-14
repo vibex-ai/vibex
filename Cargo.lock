@@ -3264,6 +3264,7 @@ dependencies = [
  "futures",
  "gpui",
  "gpui_wgpu",
+ "jni",
  "libc",
  "log",
  "parking_lot",

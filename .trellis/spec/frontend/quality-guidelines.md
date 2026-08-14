@@ -107,6 +107,19 @@ pnpm build:mobile:ios
 - Native text fields explicitly move GPUI focus on touch and request the soft
   keyboard. Pairing honors the transport encoded in the trusted
   `vibex://open/<transport>` entry instead of silently preferring another route.
+- Android text fields expose a real focusable `View` and non-null
+  `InputConnection` to the IME. Calling `showSoftInput` against NativeActivity's
+  DecorView is not text-input integration. The Java editor is a platform adapter;
+  the focused GPUI input handler remains the document owner and synchronizes text
+  and selection back to that editor.
+- Android `TextWatcher` and selection offsets cross the JNI boundary as UTF-16
+  ranges and are queued onto the GPUI thread before they reach an input handler.
+  Stale ranges are clamped before slicing, and shaped placeholder offsets must
+  never become document offsets when the document is empty.
+- Android platform initialization accepts a replacement `AndroidApp` when an
+  Activity is recreated in the same process and clears pending IME events for the
+  previous Activity. A process-global one-shot Activity handle is invalid for the
+  NativeActivity lifecycle.
 - The session drawer follows the pointer continuously after a horizontal
   threshold, cancels clearly vertical pans, then snaps by final direction or
   half-width with a faster close animation. A tap remains a tap and must not
@@ -130,6 +143,9 @@ pnpm build:mobile:ios
 | No session exists | Offer typed session creation after runtime/workspace catalogs load; never make the composer a silent no-op. |
 | Agent requests elicitation input | Render and validate the compact form, or show a typed unsupported-field error; never drop the request. |
 | Safe-area or IME inset changes | Refresh and recompute root padding from `Window::insets()` without hard-coded device geometry. |
+| Android input is focused | `dumpsys input_method` identifies the bridge editor as `mServedView`, reports a non-null `mServedInputConnection`, and exposes text input rather than the DecorView fallback. |
+| Placeholder is clicked while its document is empty | Resolve the selection to document offset zero; never slice with the shaped placeholder's byte offset. |
+| Android Activity is recreated while its process survives | Replace the platform Activity handle, discard stale IME events, and start normally without a one-shot initialization panic. |
 | Approval or composer action is unavailable while the server is busy | The control is disabled with an explicit busy state; no duplicate mutation is sent. |
 | Timeline generation/sequence is stale | Ignore the result and request authoritative refresh. |
 
@@ -137,7 +153,8 @@ pnpm build:mobile:ios
 
 - `cargo test -p vibex-mobile --locked` covers storage permissions/atomicity and
   malformed-file removal, secret-redacted `Debug`, UTF-8/UTF-16 IME editing,
-  drawer snap decisions, Markdown block projection, and route bundle validation.
+  empty-placeholder hit testing, stale selection clamping, drawer snap decisions,
+  Markdown block projection, and route bundle validation.
 - `cargo test -p vibex-ui --locked` covers the shared controller, timeline
   projection, approval surfaces, and compact shell semantics.
 - `node scripts/check-mobile-native.mjs --self-test` covers the negative source
@@ -147,6 +164,9 @@ pnpm build:mobile:ios
   drawer navigation, safe-area/IME changes, timeline streaming, approval and
   elicitation resolution, new-session creation, send/stop/continue, reconnect,
   bundled Latin/CJK text, and credential redaction before a release claim.
+- Android device validation must also inspect the served editor/InputConnection,
+  perform insert/delete/cursor/insert editing, and recreate the Activity at least
+  twice in the same process while checking native and Java crash logs.
 
 ### 6. Wrong vs Correct
 

@@ -4,12 +4,11 @@
 
     <application
         android:allowBackup="false"
-        android:hasCode="false"
         android:label="Vibex"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">
         <activity
-            android:name="android.app.NativeActivity"
+            android:name=".GpuiNativeActivity"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|screenLayout|uiMode"
             android:exported="true"
             android:launchMode="singleTask"
@@ -25,4 +24,3 @@
         </activity>
     </application>
 </manifest>
-

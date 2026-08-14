@@ -25,8 +25,12 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     "apps/mobile/assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf",
     "apps/mobile/assets/fonts/wqy-microhei/wqy-microhei.ttc",
     "apps/mobile/android/app/src/main/AndroidManifest.xml",
+    "apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiNativeActivity.java",
     "apps/mobile/ios/project.yml",
-    "apps/mobile/ios/Vibex/main.m"
+    "apps/mobile/ios/Vibex/main.m",
+    "vendor/zed/crates/gpui_android/src/ime.rs",
+    "vendor/zed/crates/gpui_android/src/platform.rs",
+    "vendor/zed/crates/gpui_android/src/window.rs"
   ]) {
     assert(exists(path), `native_mobile_file_missing:${path}`);
   }
@@ -40,6 +44,10 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   const storage = read("apps/mobile/src/storage.rs");
   const gpuiWindow = read("vendor/zed/crates/gpui/src/window.rs");
   const android = read("apps/mobile/android/app/src/main/AndroidManifest.xml");
+  const androidActivity = read("apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiNativeActivity.java");
+  const androidIme = read("vendor/zed/crates/gpui_android/src/ime.rs");
+  const androidPlatform = read("vendor/zed/crates/gpui_android/src/platform.rs");
+  const androidWindow = read("vendor/zed/crates/gpui_android/src/window.rs");
   const iosMain = read("apps/mobile/ios/Vibex/main.m");
   const iosProject = read("apps/mobile/ios/project.yml");
 
@@ -54,10 +62,23 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   assert(input.includes("self.focus_handle.focus(window, cx)"), "native_text_input_focus_missing");
   assert(input.includes("window.show_soft_keyboard()"), "native_text_input_keyboard_missing");
 
-  assert(android.includes("android.app.NativeActivity"), "android_native_activity_missing");
+  assert(android.includes('android:name=".GpuiNativeActivity"'), "android_gpui_activity_missing");
   assert(android.includes('android:value="vibex_mobile"'), "android_native_library_name_invalid");
   assert(android.includes('android:windowSoftInputMode="adjustResize"'), "android_keyboard_resize_missing");
+  assert(!android.includes('android:hasCode="false"'), "android_java_host_disabled");
   assert(!android.includes("WebView"), "android_webview_host_present");
+  assert(androidActivity.includes("extends NativeActivity"), "android_native_activity_base_missing");
+  assert(androidActivity.includes("extends EditText"), "android_ime_editor_missing");
+  assert(androidActivity.includes("showGpuiKeyboard"), "android_ime_show_bridge_missing");
+  assert(androidActivity.includes("nativeReplaceText"), "android_ime_replace_callback_missing");
+  assert(androidActivity.includes("nativeSetSelection"), "android_ime_selection_callback_missing");
+  assert(androidIme.includes("VecDeque<ImeEvent>"), "android_ime_event_queue_missing");
+  assert(androidIme.includes("nativeReplaceText"), "android_ime_jni_replace_missing");
+  assert(androidIme.includes("nativeSetSelection"), "android_ime_jni_selection_missing");
+  assert(androidWindow.includes("update_java_editor"), "android_ime_editor_sync_missing");
+  assert(androidWindow.includes("apply_pending_ime_events"), "android_ime_event_drain_missing");
+  assert(androidPlatform.includes("Mutex<Option<AndroidApp>>"), "android_reentrant_activity_handle_missing");
+  assert(androidPlatform.includes("clear_events()"), "android_stale_ime_event_cleanup_missing");
 
   assert(iosMain.includes("vibex_mobile_main();"), "ios_rust_entry_call_missing");
   assert(!iosMain.includes("UIApplicationMain"), "ios_host_double_enters_ui_application");
@@ -102,7 +123,7 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     assert(pairing.includes(marker), `native_pairing_contract_missing:${marker}`);
   }
 
-  const scopedSource = [manifest, entry, app, input, pairing, android, iosMain, iosProject].join("\n");
+  const scopedSource = [manifest, entry, app, input, pairing, android, androidActivity, iosMain, iosProject].join("\n");
   for (const forbidden of ["Capacitor", "capacitor", "wasm-bindgen", "mobile-wasm"]) {
     assert(!scopedSource.includes(forbidden), `legacy_mobile_technology_present:${forbidden}`);
   }
@@ -121,23 +142,40 @@ function runSelfTest() {
     ["apps/mobile/assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf", "font"],
     ["apps/mobile/assets/fonts/wqy-microhei/wqy-microhei.ttc", "font"],
     ["apps/mobile/android/app/src/main/AndroidManifest.xml", source("apps/mobile/android/app/src/main/AndroidManifest.xml")],
+    ["apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiNativeActivity.java", source("apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiNativeActivity.java")],
     ["apps/mobile/ios/project.yml", source("apps/mobile/ios/project.yml")],
-    ["apps/mobile/ios/Vibex/main.m", source("apps/mobile/ios/Vibex/main.m")]
+    ["apps/mobile/ios/Vibex/main.m", source("apps/mobile/ios/Vibex/main.m")],
+    ["vendor/zed/crates/gpui_android/src/ime.rs", source("vendor/zed/crates/gpui_android/src/ime.rs")],
+    ["vendor/zed/crates/gpui_android/src/platform.rs", source("vendor/zed/crates/gpui_android/src/platform.rs")],
+    ["vendor/zed/crates/gpui_android/src/window.rs", source("vendor/zed/crates/gpui_android/src/window.rs")]
   ]);
-  files.set(
-    "apps/mobile/android/app/src/main/AndroidManifest.xml",
-    files.get("apps/mobile/android/app/src/main/AndroidManifest.xml").replace(
-      "android.app.NativeActivity",
-      "android.webkit.WebView"
-    )
-  );
-  let rejected = false;
-  try {
-    validateContract((path) => files.get(path), (path) => path !== "apps/mobile-wasm" && files.has(path));
-  } catch {
-    rejected = true;
+
+  function expectRejected(path, from, to, code) {
+    const original = files.get(path);
+    files.set(path, original.replace(from, to));
+    let rejected = false;
+    try {
+      validateContract((candidate) => files.get(candidate), (candidate) => candidate !== "apps/mobile-wasm" && files.has(candidate));
+    } catch {
+      rejected = true;
+    } finally {
+      files.set(path, original);
+    }
+    assert(rejected, code);
   }
-  assert(rejected, "native_mobile_checker_self_test_accepted_webview_host");
+
+  expectRejected(
+    "apps/mobile/android/app/src/main/AndroidManifest.xml",
+    'android:name=".GpuiNativeActivity"',
+    'android:name="android.webkit.WebView"',
+    "native_mobile_checker_self_test_accepted_webview_host"
+  );
+  expectRejected(
+    "apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiNativeActivity.java",
+    "extends NativeActivity",
+    "extends Activity",
+    "native_mobile_checker_self_test_accepted_non_native_activity_host"
+  );
 }
 
 try {
