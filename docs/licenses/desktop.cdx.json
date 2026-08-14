@@ -737,6 +737,150 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:android-activity@0.6.1:c19b7c6f923b580a",
+      "name": "android-activity",
+      "version": "0.6.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/android-activity@0.6.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-mobile/android-activity"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:android-properties@0.2.2:c19b7c6f923b580a",
+      "name": "android-properties",
+      "version": "0.2.2",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/android-properties@0.2.2",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/miklelappo/android-properties"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:android_log-sys@0.3.2:c19b7c6f923b580a",
+      "name": "android_log-sys",
+      "version": "0.3.2",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/android_log-sys@0.3.2",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-mobile/android_log-sys-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:android_logger@0.15.1:c19b7c6f923b580a",
+      "name": "android_logger",
+      "version": "0.15.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/android_logger@0.15.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-mobile/android_logger-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:android_system_properties@0.1.5:c19b7c6f923b580a",
       "name": "android_system_properties",
       "version": "0.1.5",
@@ -4475,7 +4619,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#49d9758e84846bf83f7595dde7e4478c8235e833"
         }
       ]
     },
@@ -6419,7 +6563,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#49d9758e84846bf83f7595dde7e4478c8235e833"
         }
       ]
     },
@@ -7392,6 +7536,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/dtolnay/enumn"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:env_filter@0.1.4:c19b7c6f923b580a",
+      "name": "env_filter",
+      "version": "0.1.4",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/env_filter@0.1.4",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-cli/env_logger"
         }
       ]
     },
@@ -10379,7 +10559,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#49d9758e84846bf83f7595dde7e4478c8235e833"
         }
       ]
     },
@@ -10493,6 +10673,78 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:gpui_android@0.1.0:3738e49034b3d570",
+      "name": "gpui_android",
+      "version": "0.1.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/gpui_android@0.1.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "path:vendor/zed/crates/gpui_android"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/vibex-ai/zed.git#49d9758e84846bf83f7595dde7e4478c8235e833"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:gpui_ios@0.1.0:a624b9346de27f9a",
+      "name": "gpui_ios",
+      "version": "0.1.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/gpui_ios@0.1.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "path:vendor/zed/crates/gpui_ios"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/vibex-ai/zed.git#49d9758e84846bf83f7595dde7e4478c8235e833"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:gpui_linux@0.1.0:5277bbb1e9f77bc3",
       "name": "gpui_linux",
       "version": "0.1.0",
@@ -10523,7 +10775,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#49d9758e84846bf83f7595dde7e4478c8235e833"
         }
       ]
     },
@@ -10559,7 +10811,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#49d9758e84846bf83f7595dde7e4478c8235e833"
         }
       ]
     },
@@ -10595,7 +10847,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#49d9758e84846bf83f7595dde7e4478c8235e833"
         }
       ]
     },
@@ -10631,7 +10883,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#49d9758e84846bf83f7595dde7e4478c8235e833"
         }
       ]
     },
@@ -10667,7 +10919,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#49d9758e84846bf83f7595dde7e4478c8235e833"
         }
       ]
     },
@@ -10703,7 +10955,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#49d9758e84846bf83f7595dde7e4478c8235e833"
         }
       ]
     },
@@ -10739,7 +10991,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#49d9758e84846bf83f7595dde7e4478c8235e833"
         }
       ]
     },
@@ -10775,7 +11027,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#49d9758e84846bf83f7595dde7e4478c8235e833"
         }
       ]
     },
@@ -10811,7 +11063,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#49d9758e84846bf83f7595dde7e4478c8235e833"
         }
       ]
     },
@@ -10847,7 +11099,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#49d9758e84846bf83f7595dde7e4478c8235e833"
         }
       ]
     },
@@ -11891,7 +12143,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#49d9758e84846bf83f7595dde7e4478c8235e833"
         }
       ]
     },
@@ -15671,7 +15923,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#49d9758e84846bf83f7595dde7e4478c8235e833"
         }
       ]
     },
@@ -16176,6 +16428,78 @@
         {
           "type": "vcs",
           "url": "https://github.com/gfx-rs/wgpu"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:ndk@0.9.0:c19b7c6f923b580a",
+      "name": "ndk",
+      "version": "0.9.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/ndk@0.9.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-mobile/ndk"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:ndk-context@0.1.1:c19b7c6f923b580a",
+      "name": "ndk-context",
+      "version": "0.1.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/ndk-context@0.1.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-windowing/android-ndk-rs"
         }
       ]
     },
@@ -19019,7 +19343,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#49d9758e84846bf83f7595dde7e4478c8235e833"
         }
       ]
     },
@@ -22115,7 +22439,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#49d9758e84846bf83f7595dde7e4478c8235e833"
         }
       ]
     },
@@ -23699,7 +24023,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#49d9758e84846bf83f7595dde7e4478c8235e833"
         }
       ]
     },
@@ -26543,7 +26867,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#49d9758e84846bf83f7595dde7e4478c8235e833"
         }
       ]
     },
@@ -31475,7 +31799,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#49d9758e84846bf83f7595dde7e4478c8235e833"
         }
       ]
     },
@@ -38387,7 +38711,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#49d9758e84846bf83f7595dde7e4478c8235e833"
         }
       ]
     },
@@ -38567,7 +38891,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#49d9758e84846bf83f7595dde7e4478c8235e833"
         }
       ]
     },
@@ -38603,7 +38927,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#49d9758e84846bf83f7595dde7e4478c8235e833"
         }
       ]
     },
@@ -39648,6 +39972,38 @@
     {
       "ref": "cargo:allocator-api2@0.2.21:c19b7c6f923b580a",
       "dependsOn": []
+    },
+    {
+      "ref": "cargo:android-activity@0.6.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:android-properties@0.2.2:c19b7c6f923b580a",
+        "cargo:bitflags@2.13.0:c19b7c6f923b580a",
+        "cargo:cc@1.2.65:c19b7c6f923b580a",
+        "cargo:jni@0.22.4:c19b7c6f923b580a",
+        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:log@0.4.33:c19b7c6f923b580a",
+        "cargo:ndk-context@0.1.1:c19b7c6f923b580a",
+        "cargo:ndk-sys@0.6.0+11769913:c19b7c6f923b580a",
+        "cargo:ndk@0.9.0:c19b7c6f923b580a",
+        "cargo:num_enum@0.7.6:c19b7c6f923b580a",
+        "cargo:thiserror@2.0.18:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:android-properties@0.2.2:c19b7c6f923b580a",
+      "dependsOn": []
+    },
+    {
+      "ref": "cargo:android_log-sys@0.3.2:c19b7c6f923b580a",
+      "dependsOn": []
+    },
+    {
+      "ref": "cargo:android_logger@0.15.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:android_log-sys@0.3.2:c19b7c6f923b580a",
+        "cargo:env_filter@0.1.4:c19b7c6f923b580a",
+        "cargo:log@0.4.33:c19b7c6f923b580a"
+      ]
     },
     {
       "ref": "cargo:android_system_properties@0.1.5:c19b7c6f923b580a",
@@ -41109,6 +41465,13 @@
       ]
     },
     {
+      "ref": "cargo:env_filter@0.1.4:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:log@0.4.33:c19b7c6f923b580a",
+        "cargo:regex@1.12.4:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:equator-macro@0.4.2:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
@@ -41888,6 +42251,38 @@
       ]
     },
     {
+      "ref": "cargo:gpui_android@0.1.0:3738e49034b3d570",
+      "dependsOn": [
+        "cargo:android-activity@0.6.1:c19b7c6f923b580a",
+        "cargo:android_logger@0.15.1:c19b7c6f923b580a",
+        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
+        "cargo:futures@0.3.32:c19b7c6f923b580a",
+        "cargo:gpui@0.2.2:639af286d43bf32b",
+        "cargo:gpui_wgpu@0.1.0:694946df1c2f93ee",
+        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:log@0.4.33:c19b7c6f923b580a",
+        "cargo:parking_lot@0.12.5:c19b7c6f923b580a",
+        "cargo:raw-window-handle@0.6.2:c19b7c6f923b580a",
+        "cargo:uuid@1.23.3:c19b7c6f923b580a",
+        "cargo:wgpu@29.0.4:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:gpui_ios@0.1.0:a624b9346de27f9a",
+      "dependsOn": [
+        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
+        "cargo:async-task@4.7.1:c19b7c6f923b580a",
+        "cargo:dispatch2@0.3.1:c19b7c6f923b580a",
+        "cargo:futures@0.3.32:c19b7c6f923b580a",
+        "cargo:gpui@0.2.2:639af286d43bf32b",
+        "cargo:gpui_wgpu@0.1.0:694946df1c2f93ee",
+        "cargo:log@0.4.33:c19b7c6f923b580a",
+        "cargo:objc@0.2.7:c19b7c6f923b580a",
+        "cargo:raw-window-handle@0.6.2:c19b7c6f923b580a",
+        "cargo:uuid@1.23.3:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:gpui_linux@0.1.0:5277bbb1e9f77bc3",
       "dependsOn": [
         "cargo:accesskit@0.24.1:c19b7c6f923b580a",
@@ -41998,6 +42393,8 @@
       "dependsOn": [
         "cargo:console_error_panic_hook@0.1.7:c19b7c6f923b580a",
         "cargo:gpui@0.2.2:639af286d43bf32b",
+        "cargo:gpui_android@0.1.0:3738e49034b3d570",
+        "cargo:gpui_ios@0.1.0:a624b9346de27f9a",
         "cargo:gpui_linux@0.1.0:5277bbb1e9f77bc3",
         "cargo:gpui_macos@0.1.0:b1880b4155df1643",
         "cargo:gpui_web@0.1.0:831621201e4c1b95",
@@ -43237,9 +43634,24 @@
       ]
     },
     {
+      "ref": "cargo:ndk-context@0.1.1:c19b7c6f923b580a",
+      "dependsOn": []
+    },
+    {
       "ref": "cargo:ndk-sys@0.6.0+11769913:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:jni-sys@0.3.1:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:ndk@0.9.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:bitflags@2.13.0:c19b7c6f923b580a",
+        "cargo:jni-sys@0.3.1:c19b7c6f923b580a",
+        "cargo:log@0.4.33:c19b7c6f923b580a",
+        "cargo:ndk-sys@0.6.0+11769913:c19b7c6f923b580a",
+        "cargo:num_enum@0.7.6:c19b7c6f923b580a",
+        "cargo:thiserror@1.0.69:c19b7c6f923b580a"
       ]
     },
     {
