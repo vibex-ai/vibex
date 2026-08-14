@@ -196,6 +196,7 @@ const OPENCODE_INLINE_CONFIG_ENV: &str = "OPENCODE_CONFIG_CONTENT";
 const OPENCODE_PROVIDER_API_KEY_ENV: &str = "VIBEX_OPENCODE_PROVIDER_API_KEY";
 const OPENCODE_MODEL_API_ERROR_CODE: &str = "opencode_model_api_error";
 const OPENCODE_MODEL_API_RETRYING_CODE: &str = "opencode_model_api_retrying";
+const ACP_TURN_STOPPED_ERROR_CODE: &str = "acp_turn_stopped_abnormally";
 const CODEX_STREAM_RECONNECTING_CODE: &str = "codex_stream_reconnecting";
 const CODEX_STREAM_RECONNECT_EXHAUSTED_CODE: &str = "codex_stream_reconnect_exhausted";
 const CODEX_HTTP_STATUS_ERROR_CODE: &str = "codex_http_status_error";
@@ -1095,6 +1096,29 @@ fn provider_terminal_error_text(text: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+}
+
+/// codex-acp also forwards non-error advisories (config warnings, context
+/// compaction, review-mode transitions) as unattributed
+/// `agent_message_chunk`s — the same shape it uses for terminal provider
+/// failures. Route the advisory vocabulary to system notices so a turn that
+/// merely warned is neither failed nor promoted into a final Agent reply.
+fn codex_unattributed_advisory(text: &str) -> Option<(SystemNoticeLevel, String)> {
+    let trimmed = text.trim();
+    if ["Warning:", "Config warning:"]
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+    {
+        return Some((SystemNoticeLevel::Warning, redact_summary(trimmed)));
+    }
+    [
+        "*Context compacted",
+        "Entered review mode:",
+        "Exited review mode:",
+    ]
+    .iter()
+    .any(|prefix| trimmed.starts_with(prefix))
+    .then(|| (SystemNoticeLevel::Info, redact_summary(trimmed)))
 }
 
 fn acp_authentication_required_text(text: &str) -> bool {
@@ -2824,6 +2848,10 @@ impl AcpSessionAttachment {
                                 recoverable: true,
                                 provider_correlation_id: Some(provider_correlation_id),
                             });
+                            return;
+                        }
+                        if let Some((level, message)) = codex_unattributed_advisory(&text) {
+                            self.emit_turn_event(AcpEvent::SystemNotice { level, message });
                             return;
                         }
                         if self.record_codex_reconnect_terminal_message(&text) {
@@ -7689,12 +7717,21 @@ impl AcpRuntimeClient {
                     exact_descriptor: true,
                 });
             }
+            // Managed installations track the remote registry, so the local
+            // version routinely runs ahead of the compiled descriptor. Keep
+            // the adapter family's event enricher active for those versions:
+            // silently degrading to Passthrough turns off the dialect's error
+            // recovery (e.g. Codex terminal errors textualized as message
+            // chunks) and lets failed turns masquerade as normal completions.
+            let event_enricher = descriptor
+                .map(|descriptor| descriptor.event_enricher)
+                .unwrap_or(AgentEventEnricherKind::Passthrough);
             return Ok(EffectiveAdapterIdentity {
                 compatibility_identity: format!("adapter={adapter_id}@{version}"),
                 adapter_id,
                 adapter_version: version,
                 exact_descriptor: false,
-                event_enricher: AgentEventEnricherKind::Passthrough,
+                event_enricher,
             });
         }
 
@@ -14795,6 +14832,7 @@ impl AcpClient for AcpRuntimeClient {
             "cancelled" | "canceled" | "interrupted" => AgentUsageExecutionStatus::Interrupted,
             _ => AgentUsageExecutionStatus::Completed,
         };
+        let user_initiated_stop = usage_status == AgentUsageExecutionStatus::Interrupted;
         if usage_changed {
             process.publish_attachment_payload(&payload);
         }
@@ -14818,6 +14856,20 @@ impl AcpClient for AcpRuntimeClient {
             .with_recovery_hint(
                 "Verify the provider API root, model id, and authentication, then retry. Anthropic-compatible API roots normally end in /v1.",
             )
+            .with_diagnostic("stopReason", stop_reason));
+        }
+        // Any stop reason that is neither a completed reply (`end_turn`) nor a
+        // user-initiated stop is an abnormal turn end (refusal, max_tokens,
+        // max_turn_requests, or an unknown adapter-specific reason). Surface it
+        // as a turn failure instead of manufacturing a normal final Agent
+        // message, so the session lands in a state that requires continuation.
+        if stop_reason != "end_turn" && !user_initiated_stop && !has_pending_permissions {
+            turn_guard.abort(false, AgentUsageExecutionStatus::Failed);
+            return Err(VibexError::provider(
+                ACP_TURN_STOPPED_ERROR_CODE,
+                format!("ACP turn stopped before a completed reply: {stop_reason}"),
+            )
+            .with_recovery_hint("Continue the session to retry from the stopped turn")
             .with_diagnostic("stopReason", stop_reason));
         }
         let buffered_events = turn_guard.complete(!has_pending_permissions, usage_status)?;
@@ -16725,7 +16777,7 @@ mod tests {
             "adapter=claude-agent-acp@0.65.0"
         );
         assert!(!identity.exact_descriptor);
-        assert_eq!(identity.event_enricher, AgentEventEnricherKind::Passthrough);
+        assert_eq!(identity.event_enricher, AgentEventEnricherKind::Claude);
 
         let codex = test_acp_config("/managed/node", vec!["/managed/codex-acp.js".to_string()]);
         persist_managed_runtime(&conn, "codex", "codex-acp", "1.1.9", &codex);
@@ -20277,6 +20329,73 @@ for line in sys.stdin:
                 },
             })
             send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
+            continue
+        if prompt_mode == "codex_unattributed_stream_disconnect":
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {
+                            "type": "text",
+                            "text": "stream disconnected before completion: Our servers are currently overloaded. Please try again later.\n\n",
+                        },
+                    },
+                },
+            })
+            send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
+            continue
+        if prompt_mode == "codex_unattributed_warning":
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {
+                            "type": "text",
+                            "text": "Warning: Heads up: Long threads can reduce accuracy.\n\n",
+                        },
+                    },
+                },
+            })
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "messageId": "codex-warned-answer",
+                        "content": {
+                            "type": "text",
+                            "text": "the actual reply",
+                        },
+                    },
+                },
+            })
+            send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
+            continue
+        if prompt_mode == "stopped_without_reply":
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "messageId": "partial-before-stop",
+                        "content": {
+                            "type": "text",
+                            "text": "partial output before the stop",
+                        },
+                    },
+                },
+            })
+            send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "refusal"}})
             continue
         if prompt_mode == "stream_error":
             send_stream_error(session_id, True, "AI_RetryError: title generation failed")
@@ -25859,6 +25978,203 @@ for line in sys.stdin:
                 AcpEvent::AssistantDelta { .. } | AcpEvent::AssistantMessage { .. }
             )
         }));
+
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn codex_unattributed_stream_disconnect_fails_the_turn() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "codex-unattributed-stream-disconnect",
+            Some(AgentId::parse("codex").unwrap()),
+        ) else {
+            return;
+        };
+        fixture.set_prompt_mode("codex_unattributed_stream_disconnect");
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let error = prepare_and_send_turn(
+            &client,
+            AcpSendTurnRequest {
+                session_id: session_id.clone(),
+                message_submission_id: None,
+                required_runtime: None,
+                text: "trigger a provider stream failure".to_string(),
+                attachments: Vec::new(),
+                workspace_root: fixture.workspace.display().to_string(),
+                binding: binding.clone(),
+                runtime_resources: ProviderRuntimeResources::default(),
+                execution_identity: None,
+                event_sender: Some(event_tx),
+                usage_execution_context: None,
+                usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                usage_event_sender: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.category, vibex_core::ErrorCategory::Provider);
+        assert_eq!(error.code, CODEX_UNATTRIBUTED_ERROR_CODE);
+        assert!(
+            error
+                .message
+                .starts_with("stream disconnected before completion"),
+            "unexpected error message: {}",
+            error.message
+        );
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(!events.iter().any(|event| {
+            matches!(
+                event,
+                AcpEvent::AssistantDelta { .. } | AcpEvent::AssistantMessage { .. }
+            )
+        }));
+
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn codex_unattributed_warning_is_a_notice_not_a_turn_failure() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "codex-unattributed-warning",
+            Some(AgentId::parse("codex").unwrap()),
+        ) else {
+            return;
+        };
+        fixture.set_prompt_mode("codex_unattributed_warning");
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let turn = prepare_and_send_turn(
+            &client,
+            AcpSendTurnRequest {
+                session_id: session_id.clone(),
+                message_submission_id: None,
+                required_runtime: None,
+                text: "reply after an advisory warning".to_string(),
+                attachments: Vec::new(),
+                workspace_root: fixture.workspace.display().to_string(),
+                binding: binding.clone(),
+                runtime_resources: ProviderRuntimeResources::default(),
+                execution_identity: None,
+                event_sender: Some(event_tx),
+                usage_execution_context: None,
+                usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                usage_event_sender: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(turn.completed);
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AcpEvent::SystemNotice {
+                level: SystemNoticeLevel::Warning,
+                message,
+            } if message.contains("Heads up")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AcpEvent::AssistantMessage { text, is_final: true } if text == "the actual reply"
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AcpEvent::Error { .. }))
+        );
+
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abnormal_stop_reason_fails_the_turn_for_any_adapter() {
+        let Some(fixture) = MockAcpFixture::create("abnormal-stop-reason") else {
+            return;
+        };
+        fixture.set_prompt_mode("stopped_without_reply");
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let error = prepare_and_send_turn(
+            &client,
+            AcpSendTurnRequest {
+                session_id: session_id.clone(),
+                message_submission_id: None,
+                required_runtime: None,
+                text: "stop this turn without a reply".to_string(),
+                attachments: Vec::new(),
+                workspace_root: fixture.workspace.display().to_string(),
+                binding: binding.clone(),
+                runtime_resources: ProviderRuntimeResources::default(),
+                execution_identity: None,
+                event_sender: Some(event_tx),
+                usage_execution_context: None,
+                usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                usage_event_sender: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.category, vibex_core::ErrorCategory::Provider);
+        assert_eq!(error.code, ACP_TURN_STOPPED_ERROR_CODE);
+        assert!(error.message.contains("refusal"));
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AcpEvent::AssistantDelta { text_delta, .. }
+                if text_delta == "partial output before the stop"
+        )));
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                AcpEvent::AssistantMessage { is_final: true, .. }
+            )),
+            "an abnormal stop must not manufacture a final Agent message"
+        );
 
         client.close_session(&binding).await.unwrap();
         fixture.cleanup();
