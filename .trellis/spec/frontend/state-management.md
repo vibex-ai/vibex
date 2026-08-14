@@ -1921,6 +1921,7 @@ render_status(source.availability);
 ManagementNavigation::switch(section, discard_dirty_current) -> bool
 ManagementCenter::refresh() -> generation-fenced snapshot
 AutomationGraphDraft::to_definition_request() -> Result<..., issues>
+InputEvent::{Change, Focus, Blur, PressEnter { .. }}
 ```
 
 ### 3. Contracts
@@ -1930,6 +1931,10 @@ AutomationGraphDraft::to_definition_request() -> Result<..., issues>
 - A dirty section blocks navigation until an explicit discard confirmation. Each
   accepted switch increments a generation, and stale refresh completions are
   ignored.
+- Management form subscriptions mark a draft dirty only for `InputEvent::Change`.
+  `Focus`, `Blur`, and `PressEnter` are interaction events, not evidence that
+  the input value changed; treating them as edits creates false discard prompts
+  and can incorrectly mark credentials as touched.
 - The graph draft is a pure model. Canvas controls only dispatch reducer actions;
   runtime/DB services execute and persist automation.
 - Pairing, diagnostics, backup, and plugin projections contain bounded display
@@ -1938,6 +1943,9 @@ AutomationGraphDraft::to_definition_request() -> Result<..., issues>
 ### 4. Validation & Error Matrix
 
 - Dirty current section plus no confirmation -> switch returns `false`.
+- Focus, blur, or submit without a value change -> keep the section clean.
+- Value change -> mark the owning section dirty and preserve the draft until it
+  is saved or explicitly discarded.
 - Refresh completion with an old generation -> discard without mutating active
   section data.
 - Invalid graph title/node/edge -> render validation issues and do not submit.
@@ -1950,12 +1958,16 @@ AutomationGraphDraft::to_definition_request() -> Result<..., issues>
 - Good: a refresh that completes after a section switch cannot replace the new
   section's visible error or draft.
 - Base: a clean section can switch immediately and keeps authoritative data.
+- Bad: subscribing to every `InputEvent` and marking the section dirty when a
+  field merely receives focus.
 - Bad: rebuilding a section entity on every tab click or clearing a form when a
   background query enters loading.
 
 ### 6. Tests Required
 
 - Model tests cover blocked/confirmed section switches and generation increments.
+- A GPUI event test emits `Focus` and asserts the section remains clean, then
+  emits `Change` and asserts that the section becomes dirty.
 - GPUI tests cover stale refresh fencing, dirty graph confirmation, and redacted
   Provider draft debug/serialization.
 - Run the narrow layout/accessibility checks plus frontend and binding checks for
@@ -1968,6 +1980,10 @@ AutomationGraphDraft::to_definition_request() -> Result<..., issues>
 ```rust
 self.active_section = next;
 self.form = Default::default();
+
+cx.subscribe(&input, |this, _, _: &InputEvent, _| {
+    this.navigation.mark_dirty(section, true);
+});
 ```
 
 #### Correct
@@ -1976,6 +1992,12 @@ self.form = Default::default();
 if self.navigation.switch(next, confirmed_discard) {
     self.generation = self.generation.saturating_add(1);
 }
+
+cx.subscribe(&input, |this, _, event: &InputEvent, _| {
+    if matches!(event, InputEvent::Change) {
+        this.navigation.mark_dirty(section, true);
+    }
+});
 ```
 
 ## Scenario: GPUI Desktop UI-State Persistence After Tauri Retirement

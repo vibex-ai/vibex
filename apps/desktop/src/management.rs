@@ -92,6 +92,10 @@ const PROVIDER_OPTION_CC_SWITCH_PROVIDER_ID: &str = "ccSwitchProviderId";
 const PROVIDER_OPTION_CC_SWITCH_APP_TYPE: &str = "ccSwitchAppType";
 const PROVIDER_OPTION_NATIVE_SOURCE: &str = "nativeSource";
 
+fn management_input_changed(event: &InputEvent) -> bool {
+    matches!(event, InputEvent::Change)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ManagementEvent {
     AgentRegistryChanged,
@@ -816,42 +820,69 @@ impl ManagementCenter {
             cx.subscribe(&agent_search, |_, _, _: &InputEvent, cx| cx.notify()),
             cx.subscribe(&mcp_search, |_, _, _: &InputEvent, cx| cx.notify()),
             cx.subscribe(&skill_search, |_, _, _: &InputEvent, cx| cx.notify()),
-            cx.subscribe(&profile_name, |this, _, _: &InputEvent, cx| {
+            cx.subscribe(&profile_name, |this, _, event: &InputEvent, cx| {
+                if !management_input_changed(event) {
+                    return;
+                }
                 this.projection_editor.mark_draft_changed();
                 this.navigation.mark_dirty(ManagementSection::Agents, true);
                 cx.notify();
             }),
-            cx.subscribe(&profile_note, |this, _, _: &InputEvent, cx| {
+            cx.subscribe(&profile_note, |this, _, event: &InputEvent, cx| {
+                if !management_input_changed(event) {
+                    return;
+                }
                 this.projection_editor.mark_draft_changed();
                 this.navigation.mark_dirty(ManagementSection::Agents, true);
                 cx.notify();
             }),
-            cx.subscribe(&profile_website_url, |this, _, _: &InputEvent, cx| {
+            cx.subscribe(&profile_website_url, |this, _, event: &InputEvent, cx| {
+                if !management_input_changed(event) {
+                    return;
+                }
                 this.projection_editor.mark_draft_changed();
                 this.navigation.mark_dirty(ManagementSection::Agents, true);
                 cx.notify();
             }),
-            cx.subscribe(&profile_base_url, |this, _, _: &InputEvent, cx| {
+            cx.subscribe(&profile_base_url, |this, _, event: &InputEvent, cx| {
+                if !management_input_changed(event) {
+                    return;
+                }
                 this.projection_editor.mark_draft_changed();
                 this.navigation.mark_dirty(ManagementSection::Agents, true);
                 cx.notify();
             }),
-            cx.subscribe(&profile_model_draft, |this, _, _: &InputEvent, cx| {
+            cx.subscribe(&profile_model_draft, |this, _, event: &InputEvent, cx| {
+                if !management_input_changed(event) {
+                    return;
+                }
                 this.projection_editor.mark_draft_changed();
                 this.navigation.mark_dirty(ManagementSection::Agents, true);
                 cx.notify();
             }),
-            cx.subscribe(&profile_model_edit_id, |this, _, _: &InputEvent, cx| {
+            cx.subscribe(&profile_model_edit_id, |this, _, event: &InputEvent, cx| {
+                if !management_input_changed(event) {
+                    return;
+                }
                 this.projection_editor.mark_draft_changed();
                 this.navigation.mark_dirty(ManagementSection::Agents, true);
                 cx.notify();
             }),
-            cx.subscribe(&profile_model_edit_name, |this, _, _: &InputEvent, cx| {
-                this.projection_editor.mark_draft_changed();
-                this.navigation.mark_dirty(ManagementSection::Agents, true);
-                cx.notify();
-            }),
-            cx.subscribe(&profile_api_key, |this, _, _: &InputEvent, cx| {
+            cx.subscribe(
+                &profile_model_edit_name,
+                |this, _, event: &InputEvent, cx| {
+                    if !management_input_changed(event) {
+                        return;
+                    }
+                    this.projection_editor.mark_draft_changed();
+                    this.navigation.mark_dirty(ManagementSection::Agents, true);
+                    cx.notify();
+                },
+            ),
+            cx.subscribe(&profile_api_key, |this, _, event: &InputEvent, cx| {
+                if !management_input_changed(event) {
+                    return;
+                }
                 this.profile_secret_touched = true;
                 let clear = this.profile_api_key.read(cx).value().trim().is_empty();
                 this.projection_editor.set_secret_intent(true, clear);
@@ -859,72 +890,114 @@ impl ManagementCenter {
                 this.navigation.mark_dirty(ManagementSection::Agents, true);
                 cx.notify();
             }),
-            cx.subscribe(&acp_command, |this, _, _: &InputEvent, cx| {
+            cx.subscribe(&acp_command, |this, _, event: &InputEvent, cx| {
+                if !management_input_changed(event) {
+                    return;
+                }
                 this.navigation
                     .mark_dirty(ManagementSection::Advanced, true);
                 cx.notify();
             }),
-            cx.subscribe(&acp_args, |this, _, _: &InputEvent, cx| {
+            cx.subscribe(&acp_args, |this, _, event: &InputEvent, cx| {
+                if !management_input_changed(event) {
+                    return;
+                }
                 this.navigation
                     .mark_dirty(ManagementSection::Advanced, true);
                 cx.notify();
             }),
-            cx.subscribe(&acp_cwd, |this, _, _: &InputEvent, cx| {
+            cx.subscribe(&acp_cwd, |this, _, event: &InputEvent, cx| {
+                if !management_input_changed(event) {
+                    return;
+                }
                 this.navigation
                     .mark_dirty(ManagementSection::Advanced, true);
                 cx.notify();
             }),
-            cx.subscribe(&scheduled_title, |this, _, _: &InputEvent, cx| {
+            cx.subscribe(&scheduled_title, |this, _, event: &InputEvent, cx| {
+                if !management_input_changed(event) {
+                    return;
+                }
                 this.navigation
                     .mark_dirty(ManagementSection::Scheduled, true);
                 cx.notify();
             }),
-            cx.subscribe(&scheduled_prompt, |this, _, _: &InputEvent, cx| {
+            cx.subscribe(&scheduled_prompt, |this, _, event: &InputEvent, cx| {
+                if !management_input_changed(event) {
+                    return;
+                }
                 this.navigation
                     .mark_dirty(ManagementSection::Scheduled, true);
                 cx.notify();
             }),
-            cx.subscribe(&automation_title, |this, _, _: &InputEvent, cx| {
+            cx.subscribe(&automation_title, |this, _, event: &InputEvent, cx| {
+                if !management_input_changed(event) {
+                    return;
+                }
                 this.graph_draft.title = this.automation_title.read(cx).value().to_string();
                 this.graph_draft.dirty = true;
                 this.navigation
                     .mark_dirty(ManagementSection::Automation, true);
                 cx.notify();
             }),
-            cx.subscribe(&automation_description, |this, _, _: &InputEvent, cx| {
-                this.graph_draft.description =
-                    this.automation_description.read(cx).value().to_string();
-                this.graph_draft.dirty = true;
-                this.navigation
-                    .mark_dirty(ManagementSection::Automation, true);
-                cx.notify();
-            }),
-            cx.subscribe(&prompt_name, |this, _, _: &InputEvent, cx| {
-                this.navigation
-                    .mark_dirty(ManagementSection::Advanced, true);
-                cx.notify();
-            }),
-            cx.subscribe(&prompt_body, |this, _, _: &InputEvent, cx| {
-                this.navigation
-                    .mark_dirty(ManagementSection::Advanced, true);
-                cx.notify();
-            }),
-            cx.subscribe(&hook_name, |this, _, _: &InputEvent, cx| {
-                this.navigation
-                    .mark_dirty(ManagementSection::Advanced, true);
-                cx.notify();
-            }),
-            cx.subscribe(&hook_command, |this, _, _: &InputEvent, cx| {
+            cx.subscribe(
+                &automation_description,
+                |this, _, event: &InputEvent, cx| {
+                    if !management_input_changed(event) {
+                        return;
+                    }
+                    this.graph_draft.description =
+                        this.automation_description.read(cx).value().to_string();
+                    this.graph_draft.dirty = true;
+                    this.navigation
+                        .mark_dirty(ManagementSection::Automation, true);
+                    cx.notify();
+                },
+            ),
+            cx.subscribe(&prompt_name, |this, _, event: &InputEvent, cx| {
+                if !management_input_changed(event) {
+                    return;
+                }
                 this.navigation
                     .mark_dirty(ManagementSection::Advanced, true);
                 cx.notify();
             }),
-            cx.subscribe(&backup_path, |this, _, _: &InputEvent, cx| {
+            cx.subscribe(&prompt_body, |this, _, event: &InputEvent, cx| {
+                if !management_input_changed(event) {
+                    return;
+                }
+                this.navigation
+                    .mark_dirty(ManagementSection::Advanced, true);
+                cx.notify();
+            }),
+            cx.subscribe(&hook_name, |this, _, event: &InputEvent, cx| {
+                if !management_input_changed(event) {
+                    return;
+                }
+                this.navigation
+                    .mark_dirty(ManagementSection::Advanced, true);
+                cx.notify();
+            }),
+            cx.subscribe(&hook_command, |this, _, event: &InputEvent, cx| {
+                if !management_input_changed(event) {
+                    return;
+                }
+                this.navigation
+                    .mark_dirty(ManagementSection::Advanced, true);
+                cx.notify();
+            }),
+            cx.subscribe(&backup_path, |this, _, event: &InputEvent, cx| {
+                if !management_input_changed(event) {
+                    return;
+                }
                 this.navigation
                     .mark_dirty(ManagementSection::Recovery, true);
                 cx.notify();
             }),
-            cx.subscribe(&restore_target, |this, _, _: &InputEvent, cx| {
+            cx.subscribe(&restore_target, |this, _, event: &InputEvent, cx| {
+                if !management_input_changed(event) {
+                    return;
+                }
                 this.navigation
                     .mark_dirty(ManagementSection::Recovery, true);
                 cx.notify();
@@ -3507,7 +3580,10 @@ impl ManagementCenter {
                     .placeholder("https://provider.example")
             });
             self._subscriptions
-                .push(cx.subscribe(&input, |this, _, _: &InputEvent, cx| {
+                .push(cx.subscribe(&input, |this, _, event: &InputEvent, cx| {
+                    if !management_input_changed(event) {
+                        return;
+                    }
                     this.projection_editor.mark_draft_changed();
                     this.navigation.mark_dirty(ManagementSection::Agents, true);
                     cx.notify();
@@ -15986,6 +16062,36 @@ fn empty_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn management_drafts_only_change_for_input_value_changes() {
+        assert!(management_input_changed(&InputEvent::Change));
+        assert!(!management_input_changed(&InputEvent::Focus));
+        assert!(!management_input_changed(&InputEvent::Blur));
+        assert!(!management_input_changed(&InputEvent::PressEnter {
+            secondary: false,
+            shift: false,
+        }));
+    }
+
+    #[gpui::test]
+    fn focusing_management_input_does_not_create_unsaved_draft(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        let profile_name = center.read_with(cx, |center, _| center.profile_name.clone());
+
+        profile_name.update(cx, |_, cx| cx.emit(InputEvent::Focus));
+        cx.run_until_parked();
+        assert!(!center.read_with(cx, |center, _| {
+            center.navigation.is_dirty(ManagementSection::Agents)
+        }));
+
+        profile_name.update(cx, |_, cx| cx.emit(InputEvent::Change));
+        cx.run_until_parked();
+        assert!(center.read_with(cx, |center, _| {
+            center.navigation.is_dirty(ManagementSection::Agents)
+        }));
+    }
 
     #[test]
     fn provider_api_key_editor_loads_saved_value_into_masked_input() {
