@@ -3104,12 +3104,216 @@ pub(crate) fn redact_summary(value: &str) -> String {
     if looks_sensitive(value) {
         return "[redacted-sensitive-output]".to_string();
     }
+    bounded_summary(value)
+}
+
+/// Timeline labels may contain security vocabulary in paths, symbols, and search
+/// queries. Only credential-shaped data uses the placeholder on this surface.
+pub(crate) fn redact_timeline_summary(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        return String::new();
+    }
+    if contains_sensitive_data(value) {
+        return REDACTED_SENSITIVE_OUTPUT.to_string();
+    }
+    bounded_summary(value)
+}
+
+fn bounded_summary(value: &str) -> String {
     if value.len() > 300 {
         let prefix: String = value.chars().take(300).collect();
         format!("{prefix}...(truncated)")
     } else {
         value.to_string()
     }
+}
+
+pub(crate) fn contains_sensitive_data(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    if contains_secret_literal(value) {
+        return true;
+    }
+    if let Ok(json) = serde_json::from_str::<Value>(value)
+        && json_contains_sensitive_data(&json)
+    {
+        return true;
+    }
+    contains_sensitive_assignment(value)
+}
+
+fn json_contains_sensitive_data(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(key, value)| {
+            (sensitive_field_name(key) && json_value_can_contain_secret(value))
+                || json_contains_sensitive_data(value)
+        }),
+        Value::Array(items) => items.iter().any(json_contains_sensitive_data),
+        Value::String(value) => {
+            contains_secret_literal(value) || contains_sensitive_assignment(value)
+        }
+        _ => false,
+    }
+}
+
+fn json_value_can_contain_secret(value: &Value) -> bool {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+        Value::String(value) => !value.trim().is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(object) => !object.is_empty(),
+    }
+}
+
+fn contains_secret_literal(value: &str) -> bool {
+    let tokens = value
+        .split(|character: char| {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    '\'' | '"' | '`' | '<' | '>' | '{' | '}' | '[' | ']' | '(' | ')' | ',' | ';'
+                )
+        })
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+
+    for (index, token) in tokens.iter().enumerate() {
+        let token = token.trim_matches(|character: char| matches!(character, ':' | '='));
+        let lower = token.to_ascii_lowercase();
+        if [
+            "sk-",
+            "ghp_",
+            "github_pat_",
+            "glpat-",
+            "xoxb-",
+            "xoxp-",
+            "xoxa-",
+            "xoxr-",
+        ]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix) && token.len() > prefix.len() + 4)
+            || token.starts_with("AKIA") && token.len() >= 16
+            || token.starts_with("AIza") && token.len() >= 20
+            || looks_like_jwt(token)
+        {
+            return true;
+        }
+        if lower == "bearer"
+            && tokens
+                .get(index + 1)
+                .is_some_and(|next| !next.trim_matches([':', '=']).is_empty())
+        {
+            return true;
+        }
+    }
+    value.contains("-----BEGIN PRIVATE KEY-----")
+        || value.contains("-----BEGIN RSA PRIVATE KEY-----")
+        || value.contains("-----BEGIN OPENSSH PRIVATE KEY-----")
+}
+
+fn looks_like_jwt(value: &str) -> bool {
+    let mut segments = value.split('.');
+    let Some(header) = segments.next() else {
+        return false;
+    };
+    let Some(payload) = segments.next() else {
+        return false;
+    };
+    let Some(signature) = segments.next() else {
+        return false;
+    };
+    segments.next().is_none()
+        && header.starts_with("eyJ")
+        && payload.len() >= 8
+        && signature.len() >= 8
+        && [header, payload, signature].iter().all(|segment| {
+            segment.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            })
+        })
+}
+
+fn contains_sensitive_assignment(value: &str) -> bool {
+    let tokens = value.split_whitespace().collect::<Vec<_>>();
+    tokens.iter().enumerate().any(|(index, token)| {
+        let token = token.trim_matches(|character: char| {
+            matches!(
+                character,
+                '\'' | '"' | '`' | '{' | '}' | '[' | ']' | '(' | ')' | ',' | ';'
+            )
+        });
+        for separator in ['=', ':'] {
+            if let Some((key, assigned)) = token.split_once(separator)
+                && sensitive_field_name(key)
+                && (!assigned.trim_matches(['\'', '"']).is_empty()
+                    || tokens.get(index + 1).is_some_and(|next| !next.is_empty()))
+            {
+                return true;
+            }
+        }
+
+        let key = token.trim_end_matches(['=', ':']);
+        if !sensitive_field_name(key) {
+            return false;
+        }
+        let separated_assignment = tokens
+            .get(index + 1)
+            .is_some_and(|next| matches!(*next, "=" | ":"))
+            && tokens.get(index + 2).is_some_and(|next| !next.is_empty());
+        let option_or_env_value = (key.starts_with('-') || is_environment_style_key(key))
+            && tokens.get(index + 1).is_some_and(|next| !next.is_empty());
+        separated_assignment || option_or_env_value
+    })
+}
+
+fn sensitive_field_name(value: &str) -> bool {
+    let compact = value
+        .trim_matches(|character: char| {
+            matches!(
+                character,
+                '-' | '$' | '\'' | '"' | '`' | '{' | '}' | '[' | ']' | '(' | ')'
+            )
+        })
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect::<String>();
+    matches!(
+        compact.as_str(),
+        "auth"
+            | "authorization"
+            | "apikey"
+            | "password"
+            | "passwd"
+            | "privatekey"
+            | "secret"
+            | "token"
+    ) || [
+        "accesstoken",
+        "apikey",
+        "authtoken",
+        "clientsecret",
+        "password",
+        "privatekey",
+        "refreshtoken",
+        "secret",
+        "secretkey",
+        "token",
+    ]
+    .iter()
+    .any(|suffix| compact.ends_with(suffix))
+}
+
+fn is_environment_style_key(value: &str) -> bool {
+    let value = value
+        .trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '_');
+    value.contains('_')
+        && value.chars().all(|character| {
+            character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_'
+        })
 }
 
 fn provider_binding(
@@ -3862,6 +4066,34 @@ mod tests {
         assert!(summary.contains("[redacted]"));
         assert!(!summary.contains("plain-secret-value"));
         assert!(summary.ends_with("--mode safe"));
+    }
+
+    #[test]
+    fn timeline_summary_preserves_sensitive_vocabulary_without_secret_values() {
+        for summary in [
+            "Read file '/workspace/src/authentication.rs'",
+            "Search for 'token_usage' in registry.rs",
+            "Run cargo test secret_store",
+            "Inspect password policy",
+            r#"{"path":"/workspace/src/auth.rs","query":"supports_logout"}"#,
+        ] {
+            assert_eq!(redact_timeline_summary(summary), summary);
+            assert!(!contains_sensitive_data(summary));
+        }
+    }
+
+    #[test]
+    fn timeline_summary_redacts_structured_credentials() {
+        for summary in [
+            "OPENAI_API_KEY=sk-sensitive-value",
+            "curl --token private-value",
+            "Authorization: Bearer private-value",
+            r#"{"token":"private-value","path":"src/lib.rs"}"#,
+            "-----BEGIN PRIVATE KEY----- private material",
+        ] {
+            assert_eq!(redact_timeline_summary(summary), REDACTED_SENSITIVE_OUTPUT);
+            assert!(contains_sensitive_data(summary));
+        }
     }
 
     #[test]

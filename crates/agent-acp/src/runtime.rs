@@ -142,8 +142,9 @@ use crate::spawn_config::{ProcessSpawnConfigSnapshot, secret_reference_version};
 use crate::{
     AcpClient, AcpCreateSessionRequest, AcpElicitationResolution, AcpEvent,
     AcpImportSessionRequest, AcpPermissionResolution, AcpRuntimeCommand, AcpRuntimeSessionProbe,
-    AcpSendTurnRequest, AcpSession, AcpTurn, infer_permission_risk_category, looks_sensitive,
-    redact_summary, redacted_args, redacted_args_summary,
+    AcpSendTurnRequest, AcpSession, AcpTurn, contains_sensitive_data,
+    infer_permission_risk_category, looks_sensitive, redact_summary, redact_timeline_summary,
+    redacted_args, redacted_args_summary,
 };
 use crate::{
     AgentEventInput, AgentEventInputSource, ClaudeBackgroundWorkRegistry, ClaudeWorkKey,
@@ -2964,7 +2965,7 @@ impl AcpSessionAttachment {
         };
         let snapshot = state.tool_calls.entry(tool_call_id.clone()).or_default();
         if let Some(title) = update.get("title").and_then(Value::as_str) {
-            snapshot.title = redact_summary(title);
+            snapshot.title = redact_timeline_summary(title);
         }
         if let Some(tool_kind) = update.get("kind").and_then(Value::as_str) {
             snapshot.kind = tool_kind.to_string();
@@ -15689,7 +15690,7 @@ fn truncate_optional_summary(value: impl AsRef<str>) -> Option<String> {
     if value.is_empty() || value == "null" {
         return None;
     }
-    if looks_sensitive(value) {
+    if contains_sensitive_data(value) {
         return Some("[redacted-sensitive-output]".to_string());
     }
     if value.len() > ACP_SUMMARY_LIMIT {
@@ -15704,7 +15705,7 @@ fn safe_tool_raw_output(value: String) -> Option<String> {
     if value.trim().is_empty() || value.trim() == "null" {
         return None;
     }
-    if looks_sensitive(&value) {
+    if contains_sensitive_data(&value) {
         return Some("[redacted-sensitive-output]".to_string());
     }
     Some(value)
