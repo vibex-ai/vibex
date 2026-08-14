@@ -1606,6 +1606,12 @@ impl MobileApp {
                     .justify_center()
                     .gap(px(theme::SPACING_SM))
                     .child(
+                        svg()
+                            .path("brand/logo.svg")
+                            .size(px(theme::ICON_SM))
+                            .text_color(theme::text_primary()),
+                    )
+                    .child(
                         div()
                             .size(px(theme::ICON_STATUS))
                             .flex_shrink_0()

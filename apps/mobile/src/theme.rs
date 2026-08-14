@@ -52,8 +52,9 @@ pub const ICON_STATUS: f32 = 6.0;
 // Layout
 // ---------------------------------------------------------------------------
 
-pub const HEADER_HEIGHT: f32 = 48.0;
-pub const HEADER_BUTTON_SIZE: f32 = 42.0;
+/// The compact top bar stays below the native status-bar inset supplied by GPUI.
+pub const HEADER_HEIGHT: f32 = 40.0;
+pub const HEADER_BUTTON_SIZE: f32 = 40.0;
 /// Minimum tappable edge for controls that are not header buttons.
 pub const TOUCH_TARGET: f32 = 44.0;
 /// Caps centered panel content so tablets do not stretch a phone layout.

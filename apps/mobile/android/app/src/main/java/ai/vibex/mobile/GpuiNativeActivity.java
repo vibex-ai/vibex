@@ -15,6 +15,8 @@ import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 
+import androidx.core.view.WindowCompat;
+
 /** NativeActivity host that supplies Android's IME with a real InputConnection. */
 public final class GpuiNativeActivity extends NativeActivity {
     static {
@@ -31,6 +33,10 @@ public final class GpuiNativeActivity extends NativeActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
+        // Keep the GPUI content rectangle below Android system bars. GPUI then
+        // publishes the same geometry through Window::insets() as iOS does.
+        WindowCompat.setDecorFitsSystemWindows(getWindow(), true);
 
         textInput = new GpuiEditText(this);
         FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(1, 1);

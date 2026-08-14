@@ -39493,6 +39493,47 @@
     },
     {
       "type": "file",
+      "bom-ref": "asset:vibex-mobile-application-icons:aec7f4cb3cd3714a",
+      "name": "Vibex native mobile application icons",
+      "version": "0.1.0-rc.1",
+      "licenses": [
+        {
+          "expression": "AGPL-3.0-or-later"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "aec7f4cb3cd3714a8997b2d812ac20a270bca28b0f0eefba792cde987e8dc1d7"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/vibex-ai/vibex/tree/main/apps/mobile/ios/Vibex/Assets.xcassets/AppIcon.appiconset"
+        }
+      ],
+      "properties": [
+        {
+          "name": "vibex:input-kind",
+          "value": "asset"
+        },
+        {
+          "name": "vibex:asset-root",
+          "value": "apps/mobile/ios/Vibex/Assets.xcassets/AppIcon.appiconset"
+        },
+        {
+          "name": "vibex:file-count",
+          "value": "19"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "AGPL-3.0-or-later"
+        }
+      ]
+    },
+    {
+      "type": "file",
       "bom-ref": "asset:vibex-mobile-native-icons:2f960264f6103d8d",
       "name": "Vibex native mobile Lucide controls",
       "version": "0.1.0-rc.1",
@@ -39839,6 +39880,10 @@
     },
     {
       "ref": "asset:vibex-desktop-reviewed-icons:aed10ac6c8f49e43",
+      "dependsOn": []
+    },
+    {
+      "ref": "asset:vibex-mobile-application-icons:aec7f4cb3cd3714a",
       "dependsOn": []
     },
     {
@@ -47345,6 +47390,7 @@
     {
       "ref": "cargo:vibex-ui@0.1.0-rc.1:5b03b27578a01810",
       "dependsOn": [
+        "asset:vibex-mobile-application-icons:aec7f4cb3cd3714a",
         "asset:vibex-mobile-brand-marks:84a77e160e305979",
         "asset:vibex-mobile-native-icons:2f960264f6103d8d",
         "cargo:serde@1.0.228:c19b7c6f923b580a",

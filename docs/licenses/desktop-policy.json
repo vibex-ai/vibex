@@ -251,6 +251,21 @@
       "source": "https://github.com/vibex-ai/vibex/tree/main/apps/mobile/assets/brand"
     },
     {
+      "id": "vibex-mobile-application-icons",
+      "name": "Vibex native mobile application icons",
+      "version": "0.1.0-rc.1",
+      "ownerPackage": "vibex-ui",
+      "root": "apps/mobile/ios/Vibex/Assets.xcassets/AppIcon.appiconset",
+      "extensions": [
+        ".json",
+        ".png"
+      ],
+      "expectedFileCount": 19,
+      "treeSha256": "aec7f4cb3cd3714a8997b2d812ac20a270bca28b0f0eefba792cde987e8dc1d7",
+      "licenseExpression": "AGPL-3.0-or-later",
+      "source": "https://github.com/vibex-ai/vibex/tree/main/apps/mobile/ios/Vibex/Assets.xcassets/AppIcon.appiconset"
+    },
+    {
       "id": "vibex-mobile-native-icons",
       "name": "Vibex native mobile Lucide controls",
       "version": "0.1.0-rc.1",
