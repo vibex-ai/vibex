@@ -164,7 +164,6 @@ struct ManagementCopy {
     agents: &'static str,
     mcp: &'static str,
     skills: &'static str,
-    advanced: &'static str,
     search_agents: &'static str,
     search_mcp: &'static str,
     search_skills: &'static str,
@@ -186,7 +185,6 @@ fn management_copy() -> ManagementCopy {
             agents: "Agent",
             mcp: "MCP",
             skills: "Skills",
-            advanced: "Advanced",
             search_agents: "Search Agent",
             search_mcp: "Search MCP",
             search_skills: "Search Skills",
@@ -205,7 +203,6 @@ fn management_copy() -> ManagementCopy {
             agents: "Agent",
             mcp: "MCP",
             skills: "技能",
-            advanced: "高级",
             search_agents: "搜索 Agent",
             search_mcp: "搜索 MCP",
             search_skills: "搜索技能",
@@ -224,7 +221,6 @@ fn management_copy() -> ManagementCopy {
             agents: "Agent",
             mcp: "MCP",
             skills: "技能",
-            advanced: "進階",
             search_agents: "搜尋 Agent",
             search_mcp: "搜尋 MCP",
             search_skills: "搜尋技能",
@@ -6901,11 +6897,6 @@ impl ManagementCenter {
             (ManagementSection::Agents, copy.agents, IconName::Bot),
             (ManagementSection::Mcp, copy.mcp, IconName::Network),
             (ManagementSection::Skills, copy.skills, IconName::BookOpen),
-            (
-                ManagementSection::Advanced,
-                copy.advanced,
-                IconName::Settings2,
-            ),
         ];
         let mut nav = h_flex()
             .id("management-section-nav")
@@ -16127,6 +16118,21 @@ mod tests {
                 ManagementSection::Advanced
             );
         }
+    }
+
+    #[test]
+    fn management_primary_navigation_hides_advanced() {
+        let source = include_str!("management.rs");
+        let renderer = source
+            .split_once("    fn render_nav(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_header("))
+            .map(|(body, _)| body)
+            .expect("management primary navigation should remain inspectable");
+
+        assert!(renderer.contains("ManagementSection::Agents"));
+        assert!(renderer.contains("ManagementSection::Mcp"));
+        assert!(renderer.contains("ManagementSection::Skills"));
+        assert!(!renderer.contains("ManagementSection::Advanced"));
     }
 
     #[test]
