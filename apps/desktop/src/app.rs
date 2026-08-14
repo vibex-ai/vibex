@@ -36,7 +36,7 @@ use gpui_component::{
         MoveDown as InputMoveDown, MoveLeft as InputMoveLeft, MoveRight as InputMoveRight,
         MoveUp as InputMoveUp, Paste as InputPaste,
     },
-    menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
+    menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem},
     notification::Notification,
     popover::Popover,
     progress::ProgressCircle,
@@ -3109,6 +3109,14 @@ struct SidebarProjectDragState {
     project_id: String,
     original_ids: Vec<String>,
     preview_ids: Vec<String>,
+}
+
+#[derive(Clone)]
+struct SidebarProjectMenuTarget {
+    project_id: ProjectId,
+    project_name: String,
+    import_workspace: (String, WorkspaceMode),
+    auto_continue_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -15936,6 +15944,71 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
+    fn build_sidebar_project_menu(
+        menu: PopupMenu,
+        target: SidebarProjectMenuTarget,
+        strings: Strings,
+        entity: WeakEntity<Self>,
+        cx: &mut Context<PopupMenu>,
+    ) -> PopupMenu {
+        let _ = entity.update(cx, |this, _| this.retain_sidebar_hover_preview());
+        let auto_continue_entity = entity.clone();
+        let import_entity = entity.clone();
+        let delete_entity = entity;
+        let auto_continue_project_id = target.project_id.clone();
+        let import_workspace = target.import_workspace.clone();
+        let import_project_name = target.project_name.clone();
+        let delete_project_id = target.project_id;
+        let delete_project_name = target.project_name.clone();
+        let auto_continue_enabled = target.auto_continue_enabled;
+        let auto_continue_label = locale::text("Auto continue", "自动继续", "自動繼續");
+
+        menu.item(PopupMenuItem::label(target.project_name))
+            .separator()
+            .item(
+                PopupMenuItem::new(auto_continue_label)
+                    .checked(auto_continue_enabled)
+                    .on_click(move |_, _, cx| {
+                        let _ = auto_continue_entity.update(cx, |this, cx| {
+                            this.set_project_auto_continue_enabled(
+                                auto_continue_project_id.clone(),
+                                !auto_continue_enabled,
+                                cx,
+                            )
+                        });
+                    }),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new(strings.sidebar_import_sessions)
+                    .icon(sidebar_icon("icons/vibex/import.svg"))
+                    .on_click(move |_, window, cx| {
+                        let _ = import_entity.update(cx, |this, cx| {
+                            this.open_external_import_dialog(
+                                Some(import_workspace.clone()),
+                                Some(import_project_name.clone()),
+                                window,
+                                cx,
+                            )
+                        });
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(strings.sidebar_delete_project)
+                    .icon(sidebar_icon("icons/vibex/trash-2.svg"))
+                    .on_click(move |_, window, cx| {
+                        let _ = delete_entity.update(cx, |this, cx| {
+                            this.confirm_delete_project(
+                                delete_project_id.clone(),
+                                delete_project_name.clone(),
+                                window,
+                                cx,
+                            )
+                        });
+                    }),
+            )
+    }
+
     fn render_sidebar_project(
         &mut self,
         group: &SidebarProjectProjection,
@@ -15989,18 +16062,16 @@ impl VibexWorkbench {
         let click_project_id = project_id.clone();
         let new_session_project_id = project_id.clone();
         let batch_ids = project_session_ids.clone();
-        let import_workspace = (current_workspace.root_path.clone(), current_workspace.mode);
+        let project_menu_target = SidebarProjectMenuTarget {
+            project_id: project_id.clone(),
+            project_name: project_name.clone(),
+            import_workspace: (current_workspace.root_path.clone(), current_workspace.mode),
+            auto_continue_enabled: self.project_auto_continue_enabled(&project_id),
+        };
+        let context_menu_target = project_menu_target.clone();
+        let context_menu_entity = cx.weak_entity();
         let menu_entity = cx.weak_entity();
-        let auto_continue_entity = cx.weak_entity();
-        let auto_continue_project_id = project_id.clone();
-        let import_entity = cx.weak_entity();
-        let delete_entity = cx.weak_entity();
-        let delete_project_id = project_id.clone();
-        let delete_project_name = project_name.clone();
-        let menu_project_name = project_name.clone();
         let locale = self.resolved_locale();
-        let project_auto_continue_enabled = self.project_auto_continue_enabled(&project_id);
-        let auto_continue_label = locale::text("Auto continue", "自动继续", "自動繼續");
         let project_actions_label = sidebar_project_actions_label(locale, &project_name);
         let new_session_label = sidebar_new_session_for_project_label(locale, &project_name);
 
@@ -16027,6 +16098,15 @@ impl VibexWorkbench {
                     cx,
                 )
             }))
+            .context_menu(move |menu, _, cx| {
+                Self::build_sidebar_project_menu(
+                    menu,
+                    context_menu_target.clone(),
+                    strings,
+                    context_menu_entity.clone(),
+                    cx,
+                )
+            })
             .child(
                 h_flex()
                     .size_full()
@@ -16098,63 +16178,13 @@ impl VibexWorkbench {
                                 .icon(IconName::Ellipsis)
                                 .tooltip(project_actions_label)
                                 .dropdown_menu(move |menu, _, cx| {
-                                    let _ = menu_entity
-                                        .update(cx, |this, _| this.retain_sidebar_hover_preview());
-                                    let auto_continue_entity = auto_continue_entity.clone();
-                                    let auto_continue_project_id = auto_continue_project_id.clone();
-                                    let import_entity = import_entity.clone();
-                                    let import_workspace = import_workspace.clone();
-                                    let import_project_name = menu_project_name.to_string();
-                                    let delete_entity = delete_entity.clone();
-                                    let delete_project_id = delete_project_id.clone();
-                                    let delete_project_name = delete_project_name.clone();
-                                    menu.item(PopupMenuItem::label(menu_project_name.clone()))
-                                        .separator()
-                                        .item(
-                                            PopupMenuItem::new(auto_continue_label)
-                                                .checked(project_auto_continue_enabled)
-                                                .on_click(move |_, _, cx| {
-                                                    let _ = auto_continue_entity.update(
-                                                        cx,
-                                                        |this, cx| {
-                                                            this.set_project_auto_continue_enabled(
-                                                                auto_continue_project_id.clone(),
-                                                                !project_auto_continue_enabled,
-                                                                cx,
-                                                            )
-                                                        },
-                                                    );
-                                                }),
-                                        )
-                                        .separator()
-                                        .item(
-                                            PopupMenuItem::new(strings.sidebar_import_sessions)
-                                                .icon(sidebar_icon("icons/vibex/import.svg"))
-                                                .on_click(move |_, window, cx| {
-                                                    let _ = import_entity.update(cx, |this, cx| {
-                                                        this.open_external_import_dialog(
-                                                            Some(import_workspace.clone()),
-                                                            Some(import_project_name.clone()),
-                                                            window,
-                                                            cx,
-                                                        )
-                                                    });
-                                                }),
-                                        )
-                                        .item(
-                                            PopupMenuItem::new(strings.sidebar_delete_project)
-                                                .icon(sidebar_icon("icons/vibex/trash-2.svg"))
-                                                .on_click(move |_, window, cx| {
-                                                    let _ = delete_entity.update(cx, |this, cx| {
-                                                        this.confirm_delete_project(
-                                                            delete_project_id.clone(),
-                                                            delete_project_name.clone(),
-                                                            window,
-                                                            cx,
-                                                        )
-                                                    });
-                                                }),
-                                        )
+                                    Self::build_sidebar_project_menu(
+                                        menu,
+                                        project_menu_target.clone(),
+                                        strings,
+                                        menu_entity.clone(),
+                                        cx,
+                                    )
                                 })
                                 .anchor(gpui::Anchor::TopRight),
                         )
@@ -36926,6 +36956,25 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_project_row_and_action_button_share_the_project_menu() {
+        let source = include_str!("app.rs");
+        let project = source
+            .split_once("    fn render_sidebar_project(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_workspace("))
+            .map(|(body, _)| body)
+            .expect("project renderer should remain inspectable");
+
+        let row_menu = project
+            .find(".context_menu(move |menu, _, cx|")
+            .expect("the full project row should expose a context menu");
+        let action_menu = project
+            .find(".dropdown_menu(move |menu, _, cx|")
+            .expect("the project action button should expose a menu");
+        assert!(project[row_menu..].contains("Self::build_sidebar_project_menu("));
+        assert!(project[action_menu..].contains("Self::build_sidebar_project_menu("));
+    }
+
+    #[test]
     fn batch_session_delete_exits_selection_and_updates_the_sidebar_optimistically() {
         let source = include_str!("app.rs");
         let deletion = source
@@ -38592,9 +38641,15 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_workspace("))
             .map(|(body, _)| body)
             .expect("sidebar project renderer should remain inspectable");
-        assert!(project.contains("PopupMenuItem::new(auto_continue_label)"));
-        assert!(project.contains(".checked(project_auto_continue_enabled)"));
-        assert!(project.contains("this.set_project_auto_continue_enabled("));
+        let project_menu = source
+            .split_once("    fn build_sidebar_project_menu(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_project("))
+            .map(|(body, _)| body)
+            .expect("project menu builder should remain inspectable");
+        assert!(project_menu.contains("PopupMenuItem::new(auto_continue_label)"));
+        assert!(project_menu.contains(".checked(auto_continue_enabled)"));
+        assert!(project_menu.contains("this.set_project_auto_continue_enabled("));
+        assert!(project.contains("Self::build_sidebar_project_menu("));
 
         let project_toggle = source
             .split_once("    fn set_project_auto_continue_enabled(")
