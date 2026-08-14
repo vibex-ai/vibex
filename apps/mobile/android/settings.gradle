@@ -1,3 +1,5 @@
+import groovy.json.JsonSlurper
+
 pluginManagement {
     repositories {
         google()
@@ -6,14 +8,40 @@ pluginManagement {
     }
 }
 
+String findRustlsPlatformVerifierProject() {
+    def dependencyText = providers.exec {
+        it.workingDir = rootDir
+        commandLine(
+            'cargo',
+            'metadata',
+            '--format-version', '1',
+            '--filter-platform', 'aarch64-linux-android',
+            '--manifest-path', '../Cargo.toml',
+            '--locked')
+    }.standardOutput.asText.get()
+
+    def dependencyJson = new JsonSlurper().parseText(dependencyText)
+    def verifier = dependencyJson.packages.find {
+        it.name == 'rustls-platform-verifier-android'
+    }
+    if (verifier == null) {
+        throw new GradleException('rustls-platform-verifier-android is missing from Cargo metadata')
+    }
+    def manifestPath = file(verifier.manifest_path)
+    return new File(manifestPath.parentFile, 'maven').path
+}
+
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
         google()
         mavenCentral()
+        maven {
+            url = uri(findRustlsPlatformVerifierProject())
+            metadataSources.artifact()
+        }
     }
 }
 
 rootProject.name = 'VibexMobile'
 include ':app'
-

@@ -23,9 +23,13 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     "apps/mobile/src/pairing.rs",
     "apps/mobile/src/scanner.rs",
     "apps/mobile/src/storage.rs",
+    "crates/vibex-remote-client/Cargo.toml",
+    "crates/vibex-remote-client/src/transport.rs",
     "apps/mobile/assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf",
     "apps/mobile/assets/fonts/wqy-microhei/wqy-microhei.ttc",
     "apps/mobile/android/app/src/main/AndroidManifest.xml",
+    "apps/mobile/android/settings.gradle",
+    "apps/mobile/android/app/build.gradle",
     "apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiNativeActivity.java",
     "apps/mobile/android/app/src/main/java/ai/vibex/mobile/PairingQrScannerActivity.java",
     "apps/mobile/android/app/src/main/res/values/styles.xml",
@@ -48,8 +52,12 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   const pairing = read("apps/mobile/src/pairing.rs");
   const scanner = read("apps/mobile/src/scanner.rs");
   const storage = read("apps/mobile/src/storage.rs");
+  const remoteManifest = read("crates/vibex-remote-client/Cargo.toml");
+  const remoteTransport = read("crates/vibex-remote-client/src/transport.rs");
   const gpuiWindow = read("vendor/zed/crates/gpui/src/window.rs");
   const android = read("apps/mobile/android/app/src/main/AndroidManifest.xml");
+  const androidSettings = read("apps/mobile/android/settings.gradle");
+  const androidBuild = read("apps/mobile/android/app/build.gradle");
   const androidActivity = read("apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiNativeActivity.java");
   const androidScanner = read("apps/mobile/android/app/src/main/java/ai/vibex/mobile/PairingQrScannerActivity.java");
   const androidStyles = read("apps/mobile/android/app/src/main/res/values/styles.xml");
@@ -65,7 +73,36 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   assert(!workspace.includes('"apps/mobile-wasm"'), "legacy_mobile_workspace_member_present");
   assert(manifest.includes('crate-type = ["cdylib", "staticlib", "rlib"]'), "native_mobile_crate_types_invalid");
   assert(manifest.includes('../../vendor/zed/crates/gpui_android'), "vibex_zed_android_backend_missing");
+  assert(manifest.includes('rustls-platform-verifier = "0.7"'), "android_tls_platform_verifier_dependency_missing");
+  assert(workspace.includes('webpki-root-certs = "1"'), "android_webpki_root_workspace_dependency_missing");
+  assert(remoteManifest.includes("webpki-root-certs.workspace = true"), "android_webpki_root_dependency_missing");
+  assert(remoteManifest.includes("rustls.workspace = true"), "android_rustls_dependency_missing");
+  assert(remoteTransport.includes('cfg(target_os = "android")'), "android_remote_tls_target_guard_missing");
+  assert(remoteTransport.includes(".tls_certs_only(roots)"), "android_remote_http_webpki_roots_missing");
+  assert(remoteTransport.includes("android_websocket_connector"), "android_remote_websocket_connector_missing");
+  assert(
+    remoteTransport.includes("connect_async_tls_with_config"),
+    "android_remote_websocket_webpki_roots_missing"
+  );
+  assert(
+    remoteTransport.includes("webpki_root_certs::TLS_SERVER_ROOT_CERTS"),
+    "android_remote_tls_root_set_missing"
+  );
+  assert(
+    (remoteTransport.match(/reqwest::Client::new\(\)/g) ?? []).length === 1,
+    "android_remote_http_client_bypass_present"
+  );
+  assert(
+    !remoteTransport.includes("danger_accept_invalid_certs"),
+    "android_remote_tls_verification_disabled"
+  );
   assert(entry.includes("gpui_platform::android_init(android_app)"), "android_gpui_init_missing");
+  assert(entry.includes("rustls_platform_verifier::android::init_with_env"), "android_tls_platform_verifier_init_missing");
+  assert(entry.includes('"getApplicationContext"'), "android_tls_application_context_missing");
+  assert(
+    entry.indexOf("initialize_android_tls(&android_app)") < entry.indexOf("gpui_platform::android_init(android_app)"),
+    "android_tls_platform_verifier_init_order_invalid"
+  );
   assert(entry.includes("scanner::initialize_android(&android_app)"), "android_qr_scanner_init_missing");
   assert(entry.includes("gpui_platform::application()"), "native_gpui_application_missing");
   assert(entry.includes('target_os = "ios"'), "ios_rust_entry_missing");
@@ -79,6 +116,7 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   assert(!android.includes('android:hasCode="false"'), "android_java_host_disabled");
   assert(!android.includes("WebView"), "android_webview_host_present");
   assert(androidActivity.includes("extends NativeActivity"), "android_native_activity_base_missing");
+  assert(androidActivity.includes('System.loadLibrary("vibex_mobile")'), "android_gpui_native_library_classloader_load_missing");
   assert(androidActivity.includes("extends EditText"), "android_ime_editor_missing");
   assert(androidActivity.includes("showGpuiKeyboard"), "android_ime_show_bridge_missing");
   assert(androidActivity.includes("nativeReplaceText"), "android_ime_replace_callback_missing");
@@ -86,9 +124,25 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   assert(androidActivity.includes("launchPairingQrScanner"), "android_qr_scanner_launch_bridge_missing");
   assert(android.includes("android.permission.CAMERA"), "android_camera_permission_missing");
   assert(android.includes("PairingQrScannerActivity"), "android_qr_scanner_activity_missing");
+  assert(
+    /android:name="\.PairingQrScannerActivity"[\s\S]*?android:exported="false"/.test(android),
+    "android_qr_scanner_activity_exported"
+  );
+  assert(androidScanner.includes('System.loadLibrary("vibex_mobile")'), "android_qr_scanner_native_library_classloader_load_missing");
   assert(androidScanner.includes("nativeOnPairingQrScanned"), "android_qr_scanner_result_bridge_missing");
   assert(androidScanner.includes("CameraSelector.DEFAULT_BACK_CAMERA"), "android_qr_scanner_camera_missing");
   assert(androidStyles.includes("ScannerTheme"), "android_qr_scanner_theme_missing");
+  assert(!androidScanner.includes("debugPairingQr"), "android_qr_scanner_debug_injection_present");
+  assert(
+    androidSettings.includes("it.name == 'rustls-platform-verifier-android'"),
+    "android_tls_verifier_cargo_metadata_lookup_missing"
+  );
+  assert(androidSettings.includes("--filter-platform', 'aarch64-linux-android"), "android_tls_verifier_cargo_target_missing");
+  assert(androidSettings.includes("metadataSources.artifact()"), "android_tls_verifier_maven_artifact_source_missing");
+  assert(
+    androidBuild.includes("implementation 'rustls:rustls-platform-verifier:latest.release'"),
+    "android_tls_verifier_aar_dependency_missing"
+  );
   assert(androidIme.includes("VecDeque<ImeEvent>"), "android_ime_event_queue_missing");
   assert(androidIme.includes("nativeReplaceText"), "android_ime_jni_replace_missing");
   assert(androidIme.includes("nativeSetSelection"), "android_ime_jni_selection_missing");
@@ -165,10 +219,14 @@ function runSelfTest() {
     ["apps/mobile/src/pairing.rs", source("apps/mobile/src/pairing.rs")],
     ["apps/mobile/src/scanner.rs", source("apps/mobile/src/scanner.rs")],
     ["apps/mobile/src/storage.rs", source("apps/mobile/src/storage.rs")],
+    ["crates/vibex-remote-client/Cargo.toml", source("crates/vibex-remote-client/Cargo.toml")],
+    ["crates/vibex-remote-client/src/transport.rs", source("crates/vibex-remote-client/src/transport.rs")],
     ["vendor/zed/crates/gpui/src/window.rs", source("vendor/zed/crates/gpui/src/window.rs")],
     ["apps/mobile/assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf", "font"],
     ["apps/mobile/assets/fonts/wqy-microhei/wqy-microhei.ttc", "font"],
     ["apps/mobile/android/app/src/main/AndroidManifest.xml", source("apps/mobile/android/app/src/main/AndroidManifest.xml")],
+    ["apps/mobile/android/settings.gradle", source("apps/mobile/android/settings.gradle")],
+    ["apps/mobile/android/app/build.gradle", source("apps/mobile/android/app/build.gradle")],
     ["apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiNativeActivity.java", source("apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiNativeActivity.java")],
     ["apps/mobile/android/app/src/main/java/ai/vibex/mobile/PairingQrScannerActivity.java", source("apps/mobile/android/app/src/main/java/ai/vibex/mobile/PairingQrScannerActivity.java")],
     ["apps/mobile/android/app/src/main/res/values/styles.xml", source("apps/mobile/android/app/src/main/res/values/styles.xml")],
@@ -202,10 +260,88 @@ function runSelfTest() {
     "native_mobile_checker_self_test_accepted_webview_host"
   );
   expectRejected(
+    "apps/mobile/android/app/src/main/AndroidManifest.xml",
+    'android:exported="false"',
+    'android:exported="true"',
+    "native_mobile_checker_self_test_accepted_exported_scanner"
+  );
+  expectRejected(
     "apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiNativeActivity.java",
     "extends NativeActivity",
     "extends Activity",
     "native_mobile_checker_self_test_accepted_non_native_activity_host"
+  );
+  expectRejected(
+    "apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiNativeActivity.java",
+    'System.loadLibrary("vibex_mobile")',
+    'System.loadLibrary("missing")',
+    "native_mobile_checker_self_test_accepted_unloaded_gpui_jni"
+  );
+  expectRejected(
+    "apps/mobile/android/app/src/main/java/ai/vibex/mobile/PairingQrScannerActivity.java",
+    'System.loadLibrary("vibex_mobile")',
+    'System.loadLibrary("missing")',
+    "native_mobile_checker_self_test_accepted_unloaded_scanner_jni"
+  );
+  expectRejected(
+    "apps/mobile/Cargo.toml",
+    'rustls-platform-verifier = "0.7"',
+    'rustls-platform-verifier = "missing"',
+    "native_mobile_checker_self_test_accepted_missing_tls_verifier_dependency"
+  );
+  expectRejected(
+    "apps/mobile/src/lib.rs",
+    "rustls_platform_verifier::android::init_with_env",
+    "rustls_platform_verifier::android::missing_init",
+    "native_mobile_checker_self_test_accepted_missing_tls_verifier_init"
+  );
+  expectRejected(
+    "apps/mobile/src/lib.rs",
+    '"getApplicationContext"',
+    '"getBaseContext"',
+    "native_mobile_checker_self_test_accepted_activity_tls_context"
+  );
+  expectRejected(
+    "apps/mobile/android/settings.gradle",
+    "it.name == 'rustls-platform-verifier-android'",
+    "it.name == 'missing-platform-verifier-android'",
+    "native_mobile_checker_self_test_accepted_missing_tls_verifier_repository"
+  );
+  expectRejected(
+    "apps/mobile/android/app/build.gradle",
+    "implementation 'rustls:rustls-platform-verifier:latest.release'",
+    "implementation 'rustls:missing:latest.release'",
+    "native_mobile_checker_self_test_accepted_missing_tls_verifier_aar"
+  );
+  expectRejected(
+    "crates/vibex-remote-client/Cargo.toml",
+    "webpki-root-certs.workspace = true",
+    "webpki-root-certs.workspace = false",
+    "native_mobile_checker_self_test_accepted_missing_webpki_roots"
+  );
+  expectRejected(
+    "crates/vibex-remote-client/src/transport.rs",
+    ".tls_certs_only(roots)",
+    ".tls_certs_merge(roots)",
+    "native_mobile_checker_self_test_accepted_platform_http_verifier"
+  );
+  expectRejected(
+    "crates/vibex-remote-client/src/transport.rs",
+    "connect_async_tls_with_config",
+    "connect_async_with_config",
+    "native_mobile_checker_self_test_accepted_platform_websocket_verifier"
+  );
+  expectRejected(
+    "crates/vibex-remote-client/src/transport.rs",
+    ".tls_certs_only(roots)",
+    ".danger_accept_invalid_certs(true).tls_certs_only(roots)",
+    "native_mobile_checker_self_test_accepted_disabled_tls_verification"
+  );
+  expectRejected(
+    "crates/vibex-remote-client/src/transport.rs",
+    "remote_http_client()?.post(endpoint)",
+    "reqwest::Client::new().post(endpoint)",
+    "native_mobile_checker_self_test_accepted_http_client_bypass"
   );
 }
 

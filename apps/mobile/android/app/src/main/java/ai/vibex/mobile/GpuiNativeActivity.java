@@ -17,6 +17,12 @@ import android.widget.FrameLayout;
 
 /** NativeActivity host that supplies Android's IME with a real InputConnection. */
 public final class GpuiNativeActivity extends NativeActivity {
+    static {
+        // NativeActivity's manifest loader does not register the library with
+        // this ClassLoader, so Java-declared JNI callbacks need an explicit load.
+        System.loadLibrary("vibex_mobile");
+    }
+
     private GpuiEditText textInput;
 
     private static native void nativeReplaceText(int start, int before, String replacement);

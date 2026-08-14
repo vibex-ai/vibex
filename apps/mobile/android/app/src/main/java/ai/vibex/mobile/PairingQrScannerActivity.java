@@ -39,6 +39,12 @@ import java.util.concurrent.Executors;
 
 /** Full-screen camera scanner for the one-time Vibex desktop pairing QR code. */
 public final class PairingQrScannerActivity extends AppCompatActivity {
+    static {
+        // This Activity may be restored directly after process death, without
+        // GpuiNativeActivity first associating the Rust library with its ClassLoader.
+        System.loadLibrary("vibex_mobile");
+    }
+
     private static final int CAMERA_PERMISSION_REQUEST = 100;
     private static final String PAIRING_PREFIX = "vibex://open/";
 

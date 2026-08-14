@@ -1931,6 +1931,8 @@ select_pairing_claim_route(RemotePairingOffer, PairingEntryHint)
   -> PairingClaimRoute::Direct { claim_base_url, transport }
    | PairingClaimRoute::Relay(RemotePairingCandidate)
 claim_pairing_offer(...) / claim_pairing_offer_via_relay(...)
+remote_http_client() -> BackendResult<reqwest::Client>
+android_websocket_connector() -> BackendResult<tokio_tungstenite::Connector>
 
 DirectWebSocketTransport::probe() -> RemoteGatewayInfo
 DirectWebSocketTransport::probe_direct_candidates(Vec<DirectCandidate>)
@@ -1979,6 +1981,14 @@ CredentialStore / ClientIdentityStore
   query strings, and fragments. HTTP/WS is accepted only for an explicit
   loopback development exception. The client checks the paired server id and
   static identity key before ticket/WS use.
+- Android product HTTP and WebSocket routes use the same bundled Mozilla
+  WebPKI roots. The HTTP client installs them with `tls_certs_only`; the WSS
+  client supplies an explicit rustls connector backed by the same root set.
+  This avoids an Android platform-verifier failure that can map a valid public
+  chain with CRL metadata but no OCSP responder to `Revoked`. Hostname, chain,
+  signature, validity-window, and trusted-root checks remain mandatory;
+  accepting invalid certificates is forbidden. Non-Android clients retain
+  their existing platform-root behavior.
 - A connection obtains a single-use WS ticket, sends v2 hello first, proves
   the paired X25519 device identity over the ticket challenge and hello
   transcript, and verifies the ephemeral X25519/HKDF/HMAC session confirmation.
@@ -2041,6 +2051,8 @@ CredentialStore / ClientIdentityStore
 | Claim response device/public key/grant or route bundle is invalid | `remote_pairing_claim_response_invalid` or route validation error; export no credential. |
 | Candidate list empty/over limit | `remote_candidate_count_invalid`; no probe beyond the bound. |
 | Direct URL is insecure outside explicit loopback, contains credentials/query/fragment, or has invalid backoff/queue limits | Structured local validation error; no network request. |
+| Android receives a valid public chain with no OCSP responder | Verify both HTTP and WSS through the bundled WebPKI roots; do not publish a false `Revoked` state. |
+| Android certificate hostname, chain, signature, validity window, or root trust is invalid | Return the typed HTTP/WS transport failure and remain offline; never bypass certificate verification. |
 | `/api/v2/info` identity or v2 range mismatch | `remote_server_identity_mismatch` / `remote_protocol_incompatible`; do not issue a WS ticket. |
 | Reconnect removes an enabled feature or permission | Replace the shared facade snapshot and remove the operation; never retain stale UI authority. |
 | Pairing claim challenge/nonce/device key is missing or insecure URL is used | `remote_pairing_request_invalid` / `remote_secure_context_required`; challenge is not retained. |
@@ -2064,6 +2076,9 @@ CredentialStore / ClientIdentityStore
 - Good: Auto probes LAN and Tailnet candidates in parallel, chooses the healthy
   low-latency path, then uses the same paired device identity for the ticket and
   v2 handshake while exposing the selected active route.
+- Good: an Android client claims and attaches over a publicly trusted Tailnet
+  HTTPS/WSS endpoint whose leaf has CRL metadata but no OCSP responder; both
+  transports validate the same chain and neither reports `Revoked`.
 - Good: a mobile suspend/reconnect or bounded queue overflow produces a lagged
   event and authoritative timeline/runtime refetch; an uncertain Agent send is
   resolved by `GetMessageSubmission` before any retry.
@@ -2076,6 +2091,7 @@ CredentialStore / ClientIdentityStore
   is checked before commit.
 - Base: a loopback HTTP fixture is allowed only when the development host
   explicitly sets the exception; product mobile state remains HTTPS/WSS-only.
+- Base: non-Android clients continue using their existing platform trust path.
 - Bad: use the entry hint as a URL, try Direct and Relay claims in sequence, probe
   by consuming the offer, put the grant in a URL, treat an RPC timeout as socket
   death, resend a prompt after reconnect, advance a cursor on a dropped event,
@@ -2083,6 +2099,9 @@ CredentialStore / ClientIdentityStore
   before enforcing the HTTP limit.
 - Bad: merge reconnect capabilities into the old snapshot, or let a projection
   invalidation gap pause unrelated sequenced domains.
+- Bad: fix an Android availability failure with
+  `danger_accept_invalid_certs`, or configure WebPKI roots for HTTP while
+  leaving WSS on the failing platform verifier.
 
 ### 6. Tests Required
 
@@ -2105,8 +2124,12 @@ CredentialStore / ClientIdentityStore
   required before a production LAN/Tailnet release claim; loopback HTTP is
   development evidence only.
 - `pnpm check:mobile-native` must validate the native mobile contract after
-  target-reachable remote changes. Run workspace Rust checks and `git diff --check`
-  before commit.
+  target-reachable remote changes. Its self-test must reject a missing Android
+  HTTP root override, missing WSS connector, or disabled certificate
+  verification. Run workspace Rust checks and `git diff --check` before commit.
+- Android device qualification must claim a real publicly trusted HTTPS offer,
+  establish its WSS session, and confirm logs contain neither a false
+  certificate `Revoked` result nor a process crash.
 
 ### 7. Wrong vs Correct
 
@@ -2119,6 +2142,8 @@ for route in [claim_url, offer.relay_candidate.url] {
 }
 let bytes = response.bytes().await?;
 if bytes.len() > MAX_JSON_BYTES { return Err(too_large()); }
+let client = reqwest::Client::new(); // Android platform verifier on product routes.
+let socket = tokio_tungstenite::connect_async(request).await?;
 // A slow WebSocket consumer advances the cursor before the event is retained.
 send_message_again_after_timeout(request).await?;
 facade_capabilities.extend(reconnected_server_capabilities);
@@ -2129,6 +2154,13 @@ facade_capabilities.extend(reconnected_server_capabilities);
 ```rust
 let route = select_pairing_claim_route(&offer, &entry_hint)?;
 let response = claim_exactly_once(route, request).await?;
+let info = http_json(remote_http_client()?.get(info_url)).await?;
+let socket = connect_async_tls_with_config(
+    request,
+    None,
+    false,
+    Some(android_websocket_connector()?),
+).await?;
 validate_claim_response(&offer, &provisional_identity, &response)?;
 let body = read_chunks_with_limit(response, MAX_JSON_BYTES).await?;
 let decision = if is_projection_invalidation(&event) {

@@ -55,6 +55,39 @@ const MAX_HTTP_JSON_BYTES: usize = 64 * 1024;
 const PROJECTION_INVALIDATION_CHANNEL_COUNT: usize = 4;
 const RELAY_REMOTE_JSON_KIND: RelayFrameKind = RelayFrameKind::Command;
 
+#[cfg(target_os = "android")]
+fn remote_http_client() -> BackendResult<reqwest::Client> {
+    let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+        .iter()
+        .map(|certificate| {
+            reqwest::Certificate::from_der(certificate.as_ref()).map_err(|_| {
+                BackendError::failed(
+                    "remote_tls_root_certificate_invalid",
+                    "bundled remote TLS root certificate is invalid",
+                )
+            })
+        })
+        .collect::<BackendResult<Vec<_>>>()?;
+    reqwest::Client::builder()
+        // Android's platform verifier can reject otherwise valid public chains
+        // when the leaf omits an OCSP responder.  A Mozilla WebPKI store keeps
+        // normal chain, hostname, signature, and validity checks in rustls
+        // without accepting invalid certificates.
+        .tls_certs_only(roots)
+        .build()
+        .map_err(|_| {
+            BackendError::failed(
+                "remote_http_client_build_failed",
+                "remote HTTP TLS client could not be initialized",
+            )
+        })
+}
+
+#[cfg(not(target_os = "android"))]
+fn remote_http_client() -> BackendResult<reqwest::Client> {
+    Ok(reqwest::Client::new())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteConnectionState {
@@ -472,7 +505,7 @@ pub fn claim_pairing_offer(
         url.set_query(None);
         url.set_fragment(None);
         let endpoint = endpoint_url(&url, "/api/v2/pairing/claim")?;
-        http_json(reqwest::Client::new().post(endpoint).json(&request)).await
+        http_json(remote_http_client()?.post(endpoint).json(&request)).await
     })
 }
 
@@ -544,7 +577,7 @@ pub fn claim_pairing_offer_via_relay(
 
         let pair_path = format!("/api/rooms/{}/pair", room_id.as_str());
         let ready_message: RelayControlMessage = http_json(
-            reqwest::Client::new()
+            remote_http_client()?
                 .post(endpoint_url(&base, &pair_path)?)
                 .json(&RelayControlMessage::Hello(hello)),
         )
@@ -655,7 +688,7 @@ pub fn claim_pairing_offer_via_relay(
             .map_err(BackendError::from)?;
         let command_path = format!("/api/rooms/{}/command", room_id.as_str());
         let response: RelayControlMessage = http_json(
-            reqwest::Client::new()
+            remote_http_client()?
                 .post(endpoint_url(&base, &command_path)?)
                 .json(&frame),
         )
@@ -1232,7 +1265,7 @@ impl DirectWebSocketTransport {
         let base = self.config.validate()?;
         let url = endpoint_url(&base, "api/v2/info")?;
         set_state(&self.inner.state, RemoteConnectionState::Probing, None);
-        let info: RemoteGatewayInfo = http_json(reqwest::Client::new().get(url)).await?;
+        let info: RemoteGatewayInfo = http_json(remote_http_client()?.get(url)).await?;
         if self
             .config
             .expected_server_id
@@ -1315,7 +1348,7 @@ impl DirectWebSocketTransport {
         let base = self.config.validate()?;
         let ticket_url = endpoint_url(&base, &gateway.ws_ticket_path)?;
         let ticket: RemoteWsTicketResponse = http_json(
-            reqwest::Client::new()
+            remote_http_client()?
                 .post(ticket_url)
                 .json(&RemoteWsTicketRequest {
                     auth: self.config.auth.clone(),
@@ -1871,7 +1904,7 @@ impl RelayE2eeTransport {
     async fn probe_inner(&self) -> BackendResult<RelayEndpointInfo> {
         let base = self.config.validate()?;
         let info: RelayEndpointInfo =
-            http_json(reqwest::Client::new().get(endpoint_url(&base, "/api/info")?)).await?;
+            http_json(remote_http_client()?.get(endpoint_url(&base, "/api/info")?)).await?;
         if info.protocol_version != vibex_core::RelayProtocolVersion::foundation() {
             return Err(BackendError::unsupported(
                 "relay_protocol_incompatible",
@@ -3370,6 +3403,32 @@ fn decode_relay_binary(value: &JsonValue) -> BackendResult<Option<Vec<u8>>> {
     })
 }
 
+#[cfg(target_os = "android")]
+fn android_websocket_connector() -> BackendResult<tokio_tungstenite::Connector> {
+    let mut roots = rustls::RootCertStore::empty();
+    let (added, _) =
+        roots.add_parsable_certificates(webpki_root_certs::TLS_SERVER_ROOT_CERTS.iter().cloned());
+    if added == 0 {
+        return Err(BackendError::failed(
+            "remote_tls_root_certificate_invalid",
+            "bundled remote TLS root certificate set is empty",
+        ));
+    }
+    let config = rustls::ClientConfig::builder_with_provider(
+        rustls::crypto::aws_lc_rs::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .map_err(|_| {
+        BackendError::failed(
+            "remote_tls_config_invalid",
+            "remote WebSocket TLS configuration is invalid",
+        )
+    })?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(tokio_tungstenite::Connector::Rustls(Arc::new(config)))
+}
+
 #[cfg(not(target_family = "wasm"))]
 async fn open_socket(
     url: &Url,
@@ -3418,14 +3477,22 @@ async fn open_socket(
             })?,
         );
     }
-    let (stream, _) = tokio_tungstenite::connect_async(request)
-        .await
-        .map_err(|error| {
-            BackendError::offline(
-                "remote_ws_connect_failed",
-                format!("remote WebSocket connection failed: {error}"),
-            )
-        })?;
+    #[cfg(target_os = "android")]
+    let socket_result = tokio_tungstenite::connect_async_tls_with_config(
+        request,
+        None,
+        false,
+        Some(android_websocket_connector()?),
+    )
+    .await;
+    #[cfg(not(target_os = "android"))]
+    let socket_result = tokio_tungstenite::connect_async(request).await;
+    let (stream, _) = socket_result.map_err(|error| {
+        BackendError::offline(
+            "remote_ws_connect_failed",
+            format!("remote WebSocket connection failed: {error}"),
+        )
+    })?;
     let (sink, stream) = stream.split();
     Ok((NativeSocketWriter { sink }, NativeReader { stream }))
 }

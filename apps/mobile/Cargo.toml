@@ -30,6 +30,7 @@ vibex-ui = { path = "../../crates/vibex-ui" }
 [target.'cfg(target_os = "android")'.dependencies]
 gpui_android = { path = "../../vendor/zed/crates/gpui_android" }
 jni = "0.22"
+rustls-platform-verifier = "0.7"
 
 [dev-dependencies]
 tempfile = "3"

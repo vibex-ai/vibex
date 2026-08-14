@@ -192,6 +192,8 @@ scanner::subscribe() -> UnboundedReceiver<String>
 Android nativeOnPairingQrScanned(value: String) -> ()
 iOS vibex_mobile_pairing_qr_scanned(value: *const char) -> ()
 claim_pairing_link(link: String) -> BackendResult<MobileCredentialBundle>
+Android Activity static initializer -> System.loadLibrary("vibex_mobile")
+initialize_android_tls(AndroidApp) -> application Context registered before GPUI
 ```
 
 ### 3. Contracts
@@ -202,6 +204,15 @@ claim_pairing_link(link: String) -> BackendResult<MobileCredentialBundle>
 - Android uses a non-exported camera Activity and iOS uses a full-screen native
   camera presentation. Both accept only full `vibex://open/<transport>#/pair/...`
   entries and leave unrelated QR codes unhandled.
+- Every Android Activity that declares a Java-to-Rust native method explicitly
+  loads `libvibex_mobile.so` in a static initializer. NativeActivity manifest
+  metadata loads the entry library but does not associate Java JNI callbacks
+  with the application ClassLoader. The scanner may be restored directly after
+  process death, so it cannot rely on `GpuiNativeActivity` loading first.
+- The Android package locates the `rustls-platform-verifier` AAR through locked
+  Cargo metadata and initializes it with the application Context before GPUI or
+  remote networking starts. Missing JVM support is a packaging failure, not a
+  reason to weaken TLS verification.
 - Native callbacks enqueue the opaque link without logging or persisting it.
   GPUI consumes the result once, then delegates parsing, expiry, selected-route,
   identity, claim, and credential validation to the existing pairing owner.
@@ -220,6 +231,8 @@ claim_pairing_link(link: String) -> BackendResult<MobileCredentialBundle>
 | QR value does not start with `vibex://open/` | Keep scanning; do not forward or log the value. |
 | Pairing offer is malformed, expired, or route-invalid | Existing structured pairing error is shown on the QR pairing screen; no credential is saved. |
 | Native result callback fires more than once | Consume one pending value and let the pairing busy guard prevent duplicate claims. |
+| An Android Activity declares a native callback without loading `vibex_mobile` | `check-mobile-native` fails; never ship the resulting `UnsatisfiedLinkError` crash path. |
+| Android TLS verifier AAR or application-Context initialization is missing | Native contract/build check fails before device qualification; do not fall back to accepting invalid certificates. |
 | Pairing claim and credential validation succeed | Atomically save the bundle and enter the existing connecting flow. |
 
 ### 5. Good / Base / Bad Cases
@@ -227,10 +240,14 @@ claim_pairing_link(link: String) -> BackendResult<MobileCredentialBundle>
 - Good: scan a Desktop-generated Direct, Tailnet, or self-hosted Relay QR code;
   the encoded transport reaches `claim_pairing_link` unchanged and pairing uses
   that route.
+- Good: after process death Android restores the scanner Activity first, loads
+  the Rust library, delivers one JNI result, and enters the paired interface.
 - Base: cancel the native scanner and remain on the QR pairing screen with no
   state or credential mutation.
 - Bad: render `TextInput::new("Paste pairing link", ...)`, log a scanned value,
   or parse and claim the offer independently in Android/iOS host code.
+- Bad: rely only on `android.app.lib_name`, or assume the main NativeActivity
+  always runs before a secondary Activity invokes its JNI callback.
 
 ### 6. Tests Required
 
@@ -238,7 +255,9 @@ claim_pairing_link(link: String) -> BackendResult<MobileCredentialBundle>
   once and retains pairing route, credential validation, storage, and redaction
   coverage.
 - `node scripts/check-mobile-native.mjs` asserts Android/iOS camera declarations,
-  native result bridges, the GPUI scanner queue, and absence of `pairing_input`.
+  native result bridges, explicit Android library loading, TLS runtime
+  packaging/initialization, the GPUI scanner queue, and absence of
+  `pairing_input`; its self-test must reject each missing Android bridge.
 - Android/iOS platform builds compile their CameraX/ML Kit and AVFoundation
   implementations. Device qualification covers allow, deny, cancel, unrelated
   QR, expired offer, and one successful pairing for every supported route.
@@ -246,8 +265,8 @@ claim_pairing_link(link: String) -> BackendResult<MobileCredentialBundle>
 ### 7. Wrong vs Correct
 
 ```text
-Wrong: first-run TextInput -> pasted secret link -> platform-specific parsing.
-Correct: native QR scanner -> one-shot GPUI queue -> claim_pairing_link -> validated credential storage.
+Wrong: manifest library metadata -> restored scanner Activity -> unresolved JNI callback crash.
+Correct: Activity System.loadLibrary -> one-shot GPUI queue -> claim_pairing_link -> validated credential storage.
 ```
 
 

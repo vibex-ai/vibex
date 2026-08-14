@@ -42,12 +42,36 @@ fn run(data_dir: PathBuf) {
 }
 
 #[cfg(target_os = "android")]
+fn initialize_android_tls(android_app: &gpui_android::AndroidApp) {
+    use jni::{JavaVM, objects::JObject, refs::Global, signature::RuntimeMethodSignature};
+
+    let vm = unsafe { JavaVM::from_raw(android_app.vm_as_ptr().cast()) };
+    vm.attach_current_thread_for_scope(|env| -> jni::errors::Result<()> {
+        let raw_activity = android_app.activity_as_ptr() as jni::sys::jobject;
+        let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw_activity)? };
+        let signature = RuntimeMethodSignature::from_str("()Landroid/content/Context;")?;
+        let context = env
+            .call_method(
+                activity,
+                jni::jni_str!("getApplicationContext"),
+                signature.method_signature(),
+                &[],
+            )?
+            .l()?;
+
+        rustls_platform_verifier::android::init_with_env(env, context)
+    })
+    .expect("failed to initialize Android TLS certificate verifier");
+}
+
+#[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 pub fn android_main(android_app: gpui_android::AndroidApp) {
     let data_dir = android_app
         .internal_data_path()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
+    initialize_android_tls(&android_app);
     scanner::initialize_android(&android_app);
     gpui_platform::android_init(android_app);
     run(data_dir);

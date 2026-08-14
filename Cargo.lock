@@ -9874,6 +9874,7 @@ dependencies = [
  "gpui_platform",
  "gpui_tokio",
  "jni",
+ "rustls-platform-verifier",
  "serde",
  "serde_json",
  "tempfile",
@@ -9964,6 +9965,7 @@ dependencies = [
  "js-sys",
  "rand_core 0.6.4",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -9983,6 +9985,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "webpki-root-certs",
  "x25519-dalek",
 ]
 
