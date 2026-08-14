@@ -597,6 +597,7 @@ pub struct ManagementCenter {
     agent_auth_context: Option<AgentAuthContext>,
     agent_auth_model_catalog: Option<AgentAuthModelCatalogSnapshot>,
     agent_auth_logout_preview: Option<AgentAuthContextLogoutPreview>,
+    agent_auth_reauthentication: bool,
     agent_auth_loading: bool,
     agent_auth_error: Option<String>,
     agent_auth_generation: u64,
@@ -992,6 +993,7 @@ impl ManagementCenter {
             agent_auth_context: None,
             agent_auth_model_catalog: None,
             agent_auth_logout_preview: None,
+            agent_auth_reauthentication: false,
             agent_auth_loading: false,
             agent_auth_error: None,
             agent_auth_generation: 0,
@@ -1060,6 +1062,7 @@ impl ManagementCenter {
             self.agent_auth_context = None;
             self.agent_auth_model_catalog = None;
             self.agent_auth_logout_preview = None;
+            self.agent_auth_reauthentication = false;
             self.agent_auth_error = None;
             self.agent_auth_inputs.clear();
             self.agent_auth_clear_values.clear();
@@ -1179,6 +1182,7 @@ impl ManagementCenter {
         self.agent_auth_context = None;
         self.agent_auth_model_catalog = None;
         self.agent_auth_logout_preview = None;
+        self.agent_auth_reauthentication = false;
         self.agent_auth_error = None;
         self.agent_auth_inputs.clear();
         self.agent_auth_clear_values.clear();
@@ -1314,6 +1318,7 @@ impl ManagementCenter {
             self.agent_auth_context = None;
             self.agent_auth_model_catalog = None;
             self.agent_auth_logout_preview = None;
+            self.agent_auth_reauthentication = false;
             self.agent_auth_loading = false;
             self.agent_auth_error = None;
             self.agent_auth_inputs.clear();
@@ -1350,6 +1355,7 @@ impl ManagementCenter {
             self.agent_auth_context = None;
             self.agent_auth_model_catalog = None;
             self.agent_auth_logout_preview = None;
+            self.agent_auth_reauthentication = false;
             self.agent_auth_inputs.clear();
             self.agent_auth_clear_values.clear();
             self.clear_agent_auth_terminal();
@@ -1375,9 +1381,16 @@ impl ManagementCenter {
                 this.agent_auth_loading = false;
                 match outcome {
                     Ok(Ok((catalog, context))) => {
+                        let reauthentication_still_available =
+                            context.as_ref().is_some_and(|context| {
+                                context.status == AgentAuthContextStatus::Authenticated
+                            }) && agent_auth_catalog_supports_reauthentication(&catalog);
                         this.agent_auth_catalog = Some(catalog);
                         this.agent_auth_context = context;
                         this.agent_auth_logout_preview = None;
+                        if !reauthentication_still_available {
+                            this.agent_auth_reauthentication = false;
+                        }
                         this.agent_auth_error = None;
                         this.agent_auth_inputs.clear();
                         this.agent_auth_clear_values.clear();
@@ -1385,11 +1398,13 @@ impl ManagementCenter {
                     Ok(Err(error)) => {
                         this.agent_auth_catalog = None;
                         this.agent_auth_context = None;
+                        this.agent_auth_reauthentication = false;
                         this.agent_auth_error = Some(format!("{}: {}", error.code, error.message));
                     }
                     Err(error) => {
                         this.agent_auth_catalog = None;
                         this.agent_auth_context = None;
+                        this.agent_auth_reauthentication = false;
                         this.agent_auth_error = Some(format!(
                             "{}: {error}",
                             management_error_text(
@@ -1471,6 +1486,30 @@ impl ManagementCenter {
         if !self.agent_auth_clear_values.remove(&key) {
             self.agent_auth_clear_values.insert(key);
         }
+        cx.notify();
+    }
+
+    fn begin_agent_reauthentication(&mut self, cx: &mut Context<Self>) {
+        let can_reauthenticate = self
+            .agent_auth_context
+            .as_ref()
+            .is_some_and(|context| context.status == AgentAuthContextStatus::Authenticated)
+            && self
+                .agent_auth_catalog
+                .as_ref()
+                .is_some_and(agent_auth_catalog_supports_reauthentication);
+        if !can_reauthenticate {
+            return;
+        }
+        self.agent_auth_logout_preview = None;
+        self.agent_auth_reauthentication = true;
+        self.agent_auth_error = None;
+        self.clear_agent_auth_terminal();
+        cx.notify();
+    }
+
+    fn cancel_agent_reauthentication(&mut self, cx: &mut Context<Self>) {
+        self.agent_auth_reauthentication = false;
         cx.notify();
     }
 
@@ -1626,6 +1665,7 @@ impl ManagementCenter {
                                 );
                             }
                         } else {
+                            this.agent_auth_reauthentication = false;
                             this.notice = Some(
                                 management_locale_text_for(
                                     active_locale,
@@ -2267,6 +2307,7 @@ impl ManagementCenter {
         else {
             return;
         };
+        self.agent_auth_reauthentication = false;
         if scope.1.is_none() {
             self.preview_agent_auth_context_logout(scope, cx);
             return;
@@ -2662,6 +2703,7 @@ impl ManagementCenter {
                     Ok(Ok(AgentAuthTerminalCompletion::AgentAccount(result))) => {
                         this.agent_auth_context = Some(result.context);
                         this.agent_auth_model_catalog = result.model_catalog;
+                        this.agent_auth_reauthentication = false;
                         this.agent_auth_terminal_state = Some(AgentAuthTerminalState::Succeeded);
                         this.agent_auth_error = None;
                         this.notice = Some(
@@ -8316,6 +8358,11 @@ impl ManagementCenter {
             .as_ref()
             .is_some_and(|catalog| catalog.supports_logout)
             && native_authenticated;
+        let supports_reauthentication = native_authenticated
+            && catalog
+                .as_ref()
+                .is_some_and(agent_auth_catalog_supports_reauthentication);
+        let reauthenticating = supports_reauthentication && self.agent_auth_reauthentication;
         let logout_loading = selected_agent_id.as_deref().is_some_and(|agent_id| {
             matches!(
                 self.agent_mutations.get(agent_id),
@@ -8427,6 +8474,36 @@ impl ManagementCenter {
                                 ),
                             ))
                         })
+                        .when(supports_reauthentication && !reauthenticating, |actions| {
+                            actions.child(management_detail_icon_action(
+                                Button::new("agent-auth-reauthenticate")
+                                    .small()
+                                    .outline()
+                                    .icon(Icon::default().path("icons/vibex/rotate-ccw.svg"))
+                                    .disabled(pending)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.begin_agent_reauthentication(cx)
+                                    })),
+                                management_locale_text("Re-authenticate", "重新认证", "重新驗證"),
+                            ))
+                        })
+                        .when(reauthenticating, |actions| {
+                            actions.child(management_detail_icon_action(
+                                Button::new("agent-auth-reauthenticate-cancel")
+                                    .small()
+                                    .outline()
+                                    .icon(IconName::Close)
+                                    .disabled(pending)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.cancel_agent_reauthentication(cx)
+                                    })),
+                                management_locale_text(
+                                    "Cancel re-authentication",
+                                    "取消重新认证",
+                                    "取消重新驗證",
+                                ),
+                            ))
+                        })
                         .when(supports_logout, |actions| {
                             actions.child(management_detail_icon_action(
                                 Button::new("agent-auth-logout")
@@ -8441,6 +8518,34 @@ impl ManagementCenter {
                         }),
                 ),
         );
+        if reauthenticating {
+            content = content.child(
+                h_flex()
+                    .w_full()
+                    .items_start()
+                    .gap_2()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(cx.theme().warning.opacity(0.45))
+                    .bg(cx.theme().warning.opacity(0.08))
+                    .p_3()
+                    .child(
+                        Icon::new(IconName::TriangleAlert)
+                            .size(px(16.0))
+                            .text_color(cx.theme().warning),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_sm()
+                            .child(management_locale_text(
+                                "Choose a method to update the shared Agent credentials. Agent processes using the previous credentials will stop.",
+                                "选择一种方式来更新共享的 Agent 凭证。使用旧凭证的 Agent 进程将停止。",
+                                "選擇一種方式來更新共用的 Agent 憑證。使用舊憑證的 Agent 處理程序將停止。",
+                            )),
+                    ),
+            );
+        }
         if let Some(preview) = self.agent_auth_logout_preview.clone() {
             let affected_count = preview.affected_session_ids.len();
             content = content.child(
@@ -8564,11 +8669,19 @@ impl ManagementCenter {
                             .text_sm()
                             .font_medium()
                             .text_color(cx.theme().success)
-                            .child(management_locale_text(
-                                "Native credentials are signed in; sign out before changing methods",
-                                "原生凭证已登录；如需切换方式，请先退出登录",
-                                "原生憑證已登入；如需切換方式，請先登出",
-                            )),
+                            .child(if supports_logout {
+                                management_locale_text(
+                                    "Native credentials are signed in; sign out or re-authenticate to change them",
+                                    "原生凭证已登录；可退出登录或重新认证来更改凭证",
+                                    "原生憑證已登入；可登出或重新驗證來變更憑證",
+                                )
+                            } else {
+                                management_locale_text(
+                                    "Native credentials are signed in; re-authenticate to update them",
+                                    "原生凭证已登录；可通过重新认证来更新凭证",
+                                    "原生憑證已登入；可透過重新驗證來更新憑證",
+                                )
+                            }),
                     ),
             );
         }
@@ -8599,7 +8712,8 @@ impl ManagementCenter {
             for method in methods {
                 let method_authenticated = native_authenticated
                     && authenticated_method_id.as_deref() == Some(method.id.as_str());
-                let method_locked = native_authenticated && !method_authenticated;
+                let method_locked =
+                    native_authenticated && !reauthenticating && !method_authenticated;
                 let method_operation = active_auth_operation
                     .as_ref()
                     .filter(|operation| operation.method_id == method.id)
@@ -8610,7 +8724,7 @@ impl ManagementCenter {
                         .agent_auth_terminal
                         .as_ref()
                         .is_some_and(|terminal| terminal.id == method.id);
-                let submit_disabled = pending || native_authenticated;
+                let submit_disabled = pending || (native_authenticated && !reauthenticating);
                 let submit_method_id = method.id.clone();
                 let action_button_id =
                     SharedString::from(format!("agent-auth-submit-{}", method.id));
@@ -8653,7 +8767,7 @@ impl ManagementCenter {
                             ),
                         management_locale_text("Stop sign-in", "终止登录", "終止登入"),
                     )
-                } else if method_authenticated {
+                } else if method_authenticated && !reauthenticating {
                     (
                         Button::new(action_button_id)
                             .small()
@@ -8667,18 +8781,32 @@ impl ManagementCenter {
                         ),
                     )
                 } else {
-                    let action_label = match method.kind {
-                        AgentAuthMethodKind::Agent => {
-                            management_locale_text("Sign in", "登录", "登入")
+                    let action_label = if reauthenticating {
+                        if method_authenticated {
+                            management_locale_text("Re-authenticate", "重新认证", "重新驗證")
+                        } else {
+                            management_locale_text(
+                                "Switch and re-authenticate",
+                                "切换并重新认证",
+                                "切換並重新驗證",
+                            )
                         }
-                        AgentAuthMethodKind::Environment => {
-                            management_locale_text("Save and sign in", "保存并登录", "儲存並登入")
+                    } else {
+                        match method.kind {
+                            AgentAuthMethodKind::Agent => {
+                                management_locale_text("Sign in", "登录", "登入")
+                            }
+                            AgentAuthMethodKind::Environment => management_locale_text(
+                                "Save and sign in",
+                                "保存并登录",
+                                "儲存並登入",
+                            ),
+                            AgentAuthMethodKind::Terminal => management_locale_text(
+                                "Open sign-in terminal",
+                                "打开登录终端",
+                                "開啟登入終端",
+                            ),
                         }
-                        AgentAuthMethodKind::Terminal => management_locale_text(
-                            "Open sign-in terminal",
-                            "打开登录终端",
-                            "開啟登入終端",
-                        ),
                     };
                     let action_icon = match method.kind {
                         AgentAuthMethodKind::Agent => Icon::new(IconName::ArrowRight),
@@ -8777,9 +8905,9 @@ impl ManagementCenter {
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child(management_locale_text(
-                                "Sign out before switching to this method",
-                                "请先退出当前登录，再切换到此方式",
-                                "請先登出目前帳號，再切換到此方式",
+                                "Re-authentication is required to switch to this method",
+                                "切换到此方式需要重新认证",
+                                "切換到此方式需要重新驗證",
                             )),
                     );
                 }
@@ -14127,6 +14255,13 @@ fn agent_auth_input_key(method_id: &str, variable_name: &str) -> String {
     format!("{}:{method_id}{variable_name}", method_id.len())
 }
 
+fn agent_auth_catalog_supports_reauthentication(catalog: &AgentAuthCatalog) -> bool {
+    catalog.methods.iter().any(|method| {
+        method.effect != AgentAuthMethodEffect::RequiresProviderProfile
+            && method.kind != AgentAuthMethodKind::Environment
+    })
+}
+
 fn profile_secret_scope_matches(
     editor_open: bool,
     selected_agent_id: Option<&str>,
@@ -17021,13 +17156,59 @@ mod tests {
             "authenticated_method_id",
             "method_authenticated",
             "method_locked",
-            "let submit_disabled = pending || native_authenticated",
+            "agent-auth-reauthenticate",
+            "agent-auth-reauthenticate-cancel",
+            "begin_agent_reauthentication",
+            "agent_auth_reauthentication",
+            "catalog.supports_logout",
+            "when(supports_logout",
+            "let submit_disabled = pending || (native_authenticated && !reauthenticating)",
             "Authenticated through this native credential method",
-            "Sign out before switching to this method",
-            "Native credentials are signed in; sign out before changing methods",
+            "Re-authentication is required to switch to this method",
+            "Native credentials are signed in; re-authenticate to update them",
         ] {
             assert!(render.contains(expected), "missing auth flow: {expected}");
         }
+    }
+
+    #[test]
+    fn agent_reauthentication_requires_a_default_account_method() {
+        let method = |kind, effect| vibex_core::AgentAuthMethod {
+            id: "sign-in".to_string(),
+            name: "Sign in".to_string(),
+            description: None,
+            kind,
+            effect,
+            environment: Vec::new(),
+            credential_link: None,
+        };
+        let mut catalog = AgentAuthCatalog {
+            agent_id: AgentId::parse("codex").expect("valid Agent id"),
+            methods: Vec::new(),
+            supports_logout: false,
+            status: AgentAuthStatus::Authenticated,
+            refreshed_at_ms: 0,
+        };
+
+        assert!(!agent_auth_catalog_supports_reauthentication(&catalog));
+
+        catalog.methods = vec![method(
+            AgentAuthMethodKind::Environment,
+            AgentAuthMethodEffect::WritesAgentStateHome,
+        )];
+        assert!(!agent_auth_catalog_supports_reauthentication(&catalog));
+
+        catalog.methods = vec![method(
+            AgentAuthMethodKind::Agent,
+            AgentAuthMethodEffect::RequiresProviderProfile,
+        )];
+        assert!(!agent_auth_catalog_supports_reauthentication(&catalog));
+
+        catalog.methods = vec![method(
+            AgentAuthMethodKind::Terminal,
+            AgentAuthMethodEffect::AgentManagedExternal,
+        )];
+        assert!(agent_auth_catalog_supports_reauthentication(&catalog));
     }
 
     #[test]
