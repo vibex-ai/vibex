@@ -1102,6 +1102,8 @@ AgentProvider::discover_commands(AgentCommandDiscoverRequest)
   -> AgentCommandDiscoverResponse
 AgentProvider::execute_command(handle, AgentCommandExecuteRequest, ProviderTurnRequest)
   -> ProviderTurnResult
+AcpClient::list_session_commands(session_id)
+  -> Option<Vec<AcpRuntimeCommand>>
 ```
 
 Tauri commands:
@@ -1127,10 +1129,11 @@ AgentCommandDiscoverRequest {
 }
 ```
 
-Command discovery must use a concrete `agent_id` plus ACP
-`provider_profile_id`, or derive both from the session's current durable
-selection. ProviderKind is not part of the request and cannot distinguish ACP
-Agents.
+Command discovery must use a concrete `agent_id`, or derive it from the
+session's current durable selection. A Provider Profile id is required only
+when the durable auth source is a Provider Profile; an Agent-account session
+keeps `provider_profile_id=None`. ProviderKind is not part of the request and
+cannot distinguish ACP Agents.
 
 ### 3. Contracts
 
@@ -1143,6 +1146,10 @@ Agents.
 - Send-time provider slash commands call `agent_execute_command`, which
   validates the current selection/binding/generation fence and delegates to
   the exact ACP route's `AgentProvider::execute_command`.
+- Session-scoped slash discovery always calls the exact Agent provider even
+  when its static `ProviderCapabilities.slash_commands` hint is false. Static
+  capabilities may describe a pre-session fallback, but they must not hide a
+  live Agent catalog.
 - User slash prompts use `source_kind=prompt` and
   `execution_behavior=expand_prompt_and_send`.
 - `$` skills and `@` references are insert-only in this contract and must not
@@ -1153,19 +1160,34 @@ Agents.
 - Desktop may merge workspace file references and local skill manifests at the
   Tauri layer, but provider commands stay owned by provider adapters.
 - A live ACP `available_commands_update` catalog is authoritative for an
-  attached session. Before a Logical Session exists, the provider adapter may
-  expose the built-in catalog of an exact pinned managed Adapter; the Codex
+  attached session. `Some(commands)` means an attached authoritative catalog,
+  including `Some([])`; `None` means no attachment/catalog exists and permits a
+  pre-session fallback. Before a Logical Session exists, the provider adapter
+  may expose the built-in catalog of an exact pinned managed Adapter; the Codex
   fallback must match the selected `codex` Agent, a `codex-acp` launch shape,
   and a Profile with `slash_commands` enabled.
+- Provider execution accepts only command text beginning with one `/name`
+  token, requires an optional request `command_name` to match that token, and
+  requires the current session catalog to advertise the same Provider slash
+  command. Unknown or stale commands fail before `session/prompt`.
+- The exact slash command text must begin the ACP prompt's first text block.
+  A pending Context Bridge remains pending for the next ordinary turn and must
+  not be prefixed to a provider slash command; adapters such as Codex recognize
+  commands only at the beginning of that text block.
 - ACP/OpenCode provider slash commands are profile-aware. Generic ACP profiles
   must not receive the OpenCode command catalog unless their typed profile
   config identifies an OpenCode-compatible runtime or catalog marker.
 
 ### 4. Validation & Error Matrix
 
-- Unsupported provider slash command -> `capability/<provider>_slash_commands_unsupported`.
+- Current session does not advertise the requested Provider command ->
+  `capability/acp_slash_command_not_available`; no provider turn.
 - Non-slash provider command trigger -> `validation/provider_command_trigger_invalid`.
 - Empty provider command text -> `validation/provider_command_empty`.
+- Command text does not begin with one `/name` token ->
+  `validation/provider_command_text_invalid`.
+- Optional `command_name` differs from the text token ->
+  `validation/provider_command_name_mismatch`.
 - Direct execution of `skill` or `reference` -> `capability/agent_command_source_not_executable`.
 - Unregistered immediate client built-in -> `capability/client_builtin_command_unregistered`.
 - Missing session on execution -> `validation/session_not_found`.
@@ -1176,24 +1198,31 @@ Agents.
   into the composer, edited by the user, and executed only after Send.
 - Good: OpenCode ACP `/status` is discovered through the ACP adapter and
   executes by sending the slash command text through the ACP provider turn.
-- Base: Provider has no slash capability; discovery returns no provider
-  commands while prompts, references, or skills may still appear if supported.
+- Good: an Agent-account session with a stale static slash capability still
+  exposes its live `/review` catalog with no unrelated Provider Profile id.
+- Base: an attached Agent publishes an empty live catalog; discovery returns no
+  provider commands and does not revive a static Codex fallback.
 - Bad: UI hard-codes Claude/Codex/OpenCode commands without provider adapter
   participation.
 - Bad: Selecting `/review` immediately starts execution before the user presses
   Send.
 - Bad: Multiple ACP sources share one ProviderKind-based static catalog when
   their command sets diverge; discovery must remain Agent/auth-source-aware.
+- Bad: prefix a Context Bridge before `/review`, causing the Agent to parse the
+  request as ordinary conversation text.
 
 ### 6. Tests Required
 
 - Provider adapter tests assert deterministic command discovery for every
   static catalog added.
 - Codex ACP tests assert the pinned built-in catalog is available with no
-  `session_id`, live session commands replace that fallback, and Generic ACP
-  Profiles never inherit it.
-- Manager tests assert provider command execution delegates through
-  `agent_execute_command` and unsupported sources return capability errors.
+  `session_id`, live session commands replace that fallback, an explicitly
+  empty live catalog suppresses it, and Generic ACP Profiles never inherit it.
+- Manager tests assert a session catalog is queried despite a false static
+  slash capability, Agent-account discovery preserves a null Profile id,
+  unknown commands do not reach the provider, and valid command text reaches
+  `execute_command` unchanged. Parser tests cover missing, empty, nested, and
+  argument-bearing slash tokens.
 - Desktop/Tauri tests assert `$` local skills and `@` references are merged
   without duplicating provider entries.
 - Frontend checks assert typed generated DTOs are consumed and command
@@ -1215,9 +1244,10 @@ if (agentId === "claude") {
 #### Correct
 
 ```text
-composer -> agent_discover_commands -> AgentManager -> AgentProvider
+composer -> agent_discover_commands -> AgentManager -> live AgentProvider catalog
 selection -> insert text only
-send -> agent_execute_command -> AgentProvider::execute_command
+send -> validate current catalog -> preserve pending bridge
+  -> AgentProvider::execute_command with first text block beginning `/name`
 ```
 
 ## Scenario: Failed Turn One-Click Continue

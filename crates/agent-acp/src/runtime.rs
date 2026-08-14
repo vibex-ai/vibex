@@ -15070,11 +15070,10 @@ impl AcpClient for AcpRuntimeClient {
     async fn list_session_commands(
         &self,
         session_id: &VibexSessionId,
-    ) -> VibexResult<Vec<AcpRuntimeCommand>> {
-        let Some(attachment) = self.current_attachment(session_id) else {
-            return Ok(Vec::new());
-        };
-        Ok(attachment.payload().available_commands())
+    ) -> VibexResult<Option<Vec<AcpRuntimeCommand>>> {
+        Ok(self
+            .current_attachment(session_id)
+            .map(|attachment| attachment.payload().available_commands()))
     }
 }
 
@@ -25343,7 +25342,11 @@ for line in sys.stdin:
             assert_eq!(logged_request_count(&log, "session/resume"), 1);
             assert_eq!(logged_request_count(&log, "session/load"), expected_load);
             assert_eq!(logged_request_count(&log, "session/new"), 0);
-            let commands = client.list_session_commands(&session_id).await.unwrap();
+            let commands = client
+                .list_session_commands(&session_id)
+                .await
+                .unwrap()
+                .expect("restored attachment should expose its command catalog");
             assert_eq!(
                 commands.first().map(|command| command.name.as_str()),
                 Some(if expected_load == 0 {
@@ -26230,7 +26233,11 @@ for line in sys.stdin:
             .await
             .unwrap();
 
-        let commands = client.list_session_commands(&session_id).await.unwrap();
+        let commands = client
+            .list_session_commands(&session_id)
+            .await
+            .unwrap()
+            .expect("created attachment should expose its command catalog");
         assert_eq!(
             commands,
             vec![AcpRuntimeCommand {
@@ -26426,7 +26433,11 @@ for line in sys.stdin:
         ));
 
         // Session commands announced through available_commands_update.
-        let commands = client.list_session_commands(&session_id).await.unwrap();
+        let commands = client
+            .list_session_commands(&session_id)
+            .await
+            .unwrap()
+            .expect("active attachment should expose its command catalog");
         assert!(commands.iter().any(|command| command.name == "compact"));
 
         // Turn 2: the agent requests permission mid-turn; approve it and the

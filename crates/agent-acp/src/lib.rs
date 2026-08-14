@@ -572,8 +572,8 @@ pub trait AcpClient: Send + Sync {
     async fn list_session_commands(
         &self,
         _session_id: &VibexSessionId,
-    ) -> VibexResult<Vec<AcpRuntimeCommand>> {
-        Ok(Vec::new())
+    ) -> VibexResult<Option<Vec<AcpRuntimeCommand>>> {
+        Ok(None)
     }
 }
 
@@ -2439,8 +2439,7 @@ impl AgentProvider for AcpAgentProvider {
         // Prefer commands announced by the live ACP agent through
         // available_commands_update; they are authoritative for the session.
         if let Some(session_id) = request.session_id.as_ref()
-            && let Ok(commands) = self.client.list_session_commands(session_id).await
-            && !commands.is_empty()
+            && let Some(commands) = self.client.list_session_commands(session_id).await?
         {
             return Ok(AgentCommandDiscoverResponse {
                 entries: commands
@@ -3539,7 +3538,7 @@ mod tests {
     struct FixtureAcpClient {
         session: AcpSession,
         turn: Mutex<Option<VibexResult<AcpTurn>>>,
-        commands: Vec<AcpRuntimeCommand>,
+        commands: Option<Vec<AcpRuntimeCommand>>,
     }
 
     impl FixtureAcpClient {
@@ -3547,12 +3546,12 @@ mod tests {
             Self {
                 session,
                 turn: Mutex::new(Some(turn)),
-                commands: Vec::new(),
+                commands: None,
             }
         }
 
         fn with_commands(mut self, commands: Vec<AcpRuntimeCommand>) -> Self {
-            self.commands = commands;
+            self.commands = Some(commands);
             self
         }
     }
@@ -3581,7 +3580,7 @@ mod tests {
         async fn list_session_commands(
             &self,
             _session_id: &VibexSessionId,
-        ) -> VibexResult<Vec<AcpRuntimeCommand>> {
+        ) -> VibexResult<Option<Vec<AcpRuntimeCommand>>> {
             Ok(self.commands.clone())
         }
     }
@@ -3882,6 +3881,39 @@ mod tests {
                 .iter()
                 .any(|entry| entry.label == "/status")
         );
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.key == "catalogSource" && diagnostic.value == "acp-session-runtime"
+        }));
+    }
+
+    #[tokio::test]
+    async fn empty_live_acp_catalog_suppresses_the_codex_pre_session_catalog() {
+        let provider = AcpAgentProvider::new(Arc::new(
+            FixtureAcpClient::new(
+                AcpSession::default(),
+                Ok(AcpTurn {
+                    events: Vec::new(),
+                    binding_update: None,
+                    completed: true,
+                }),
+            )
+            .with_commands(Vec::new()),
+        ));
+
+        let response = provider
+            .discover_commands(AgentCommandDiscoverRequest {
+                agent_id: Some(vibex_core::AgentId::parse(registry::CODEX_AGENT_ID).unwrap()),
+                provider_profile_id: None,
+                session_id: Some(VibexSessionId::new()),
+                workspace_id: None,
+                trigger: Some(AgentCommandTrigger::Slash),
+                query: None,
+                limit: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(response.entries.is_empty());
         assert!(response.diagnostics.iter().any(|diagnostic| {
             diagnostic.key == "catalogSource" && diagnostic.value == "acp-session-runtime"
         }));

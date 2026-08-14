@@ -128,6 +128,12 @@ enum InitialRuntimeMaterialization {
     Deferred,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextBridgeTurnBehavior {
+    ConsumePending,
+    PreservePending,
+}
+
 impl AgentManager {
     pub fn new(db_path: impl Into<PathBuf>) -> VibexResult<Self> {
         let db_path = db_path.into();
@@ -934,6 +940,7 @@ impl AgentManager {
         self.run_agent_turn(
             turn_request,
             true,
+            ContextBridgeTurnBehavior::ConsumePending,
             submission_id,
             |provider, handle, turn_request| async move {
                 provider.send_turn(handle, turn_request).await
@@ -976,6 +983,7 @@ impl AgentManager {
                 correlation_id: request.correlation_id,
             },
             false,
+            ContextBridgeTurnBehavior::ConsumePending,
             None,
             |provider, handle, turn_request| async move {
                 provider.send_turn(handle, turn_request).await
@@ -995,9 +1003,7 @@ impl AgentManager {
         let mut entries = Vec::new();
         let mut diagnostics = Vec::new();
 
-        if command_trigger_matches(request.trigger, AgentCommandTrigger::Slash)
-            && capabilities.slash_commands
-        {
+        if command_trigger_matches(request.trigger, AgentCommandTrigger::Slash) {
             let provider_response = provider.discover_commands(request.clone()).await?;
             diagnostics.extend(provider_response.diagnostics);
             entries.extend(provider_response.entries.into_iter().filter(|entry| {
@@ -1075,13 +1081,19 @@ impl AgentManager {
         let request = self.normalize_command_discover_request(request.clone())?;
         let provider =
             self.runtime(&self.route_for_agent(&required_command_discovery_agent_id(&request)?)?)?;
-        Ok(provider.capabilities_for_profile(request.provider_profile_id.as_ref()))
+        let mut capabilities =
+            provider.capabilities_for_profile(request.provider_profile_id.as_ref());
+        if request.session_id.is_some() {
+            capabilities.slash_commands = true;
+        }
+        Ok(capabilities)
     }
 
     fn normalize_command_discover_request(
         &self,
         mut request: AgentCommandDiscoverRequest,
     ) -> VibexResult<AgentCommandDiscoverRequest> {
+        let session_scoped = request.session_id.is_some();
         if let Some(session_id) = request.session_id.clone() {
             let conn = self.open_migrated()?;
             let session = SessionRepository::get(&conn, &session_id)?.ok_or_else(|| {
@@ -1122,7 +1134,7 @@ impl AgentManager {
                 ));
             }
             request.agent_id = Some(profile.agent_id);
-        } else {
+        } else if !session_scoped {
             let agent_id = required_command_discovery_agent_id(&request)?;
             let workspace = match request.workspace_id.as_ref() {
                 Some(workspace_id) => WorkspaceRepository::get(&conn, workspace_id)?
@@ -1186,14 +1198,47 @@ impl AgentManager {
         let (selection, _binding, _identity, route_key) =
             self.durable_session_execution(&conn, &session)?;
         let provider = self.runtime(&route_key)?;
-        let capabilities = provider.capabilities_for_profile(selection.provider_profile_id());
-        if !capabilities.slash_commands {
-            return Err(VibexError::capability(
-                "acp_slash_commands_unsupported",
-                "this provider profile does not support provider slash commands",
+        let command_name = slash_command_name(&request.command_text).ok_or_else(|| {
+            VibexError::validation(
+                "provider_command_text_invalid",
+                "provider command text must begin with a slash command name",
+            )
+        })?;
+        if request
+            .command_name
+            .as_deref()
+            .is_some_and(|requested| !requested.eq_ignore_ascii_case(command_name))
+        {
+            return Err(VibexError::validation(
+                "provider_command_name_mismatch",
+                "provider command name does not match command text",
             ));
         }
+        let discover_request = AgentCommandDiscoverRequest {
+            agent_id: Some(selection.agent_id.clone()),
+            provider_profile_id: selection.provider_profile_id().cloned(),
+            session_id: Some(session.id.clone()),
+            workspace_id: Some(session.workspace_id.clone()),
+            trigger: Some(AgentCommandTrigger::Slash),
+            query: None,
+            limit: None,
+        };
         drop(conn);
+
+        let available = provider.discover_commands(discover_request).await?;
+        if !available.entries.iter().any(|entry| {
+            entry.source_kind == AgentCommandSourceKind::Provider
+                && entry.trigger == AgentCommandTrigger::Slash
+                && entry
+                    .command_name
+                    .as_deref()
+                    .is_some_and(|available| available.eq_ignore_ascii_case(command_name))
+        }) {
+            return Err(VibexError::capability(
+                "acp_slash_command_not_available",
+                "the current ACP session did not advertise this slash command",
+            ));
+        }
 
         let send_request = AgentTurnRequest {
             session_id: request.session_id.clone(),
@@ -1208,6 +1253,7 @@ impl AgentManager {
             .run_agent_turn(
                 send_request,
                 true,
+                ContextBridgeTurnBehavior::PreservePending,
                 None,
                 move |provider, handle, turn_request| {
                     let command_request = command_request.clone();
@@ -1284,6 +1330,7 @@ impl AgentManager {
                     correlation_id: request.correlation_id,
                 },
                 true,
+                ContextBridgeTurnBehavior::ConsumePending,
                 None,
                 |provider, handle, turn_request| async move {
                     provider.send_turn(handle, turn_request).await
@@ -1302,6 +1349,7 @@ impl AgentManager {
         &self,
         request: AgentTurnRequest,
         display_user_message: bool,
+        context_bridge_behavior: ContextBridgeTurnBehavior,
         message_submission_id: Option<MessageSubmissionId>,
         runner: F,
     ) -> VibexResult<Vec<TimelineItem>>
@@ -1385,12 +1433,14 @@ impl AgentManager {
                 runtime_state.activation_generation,
             )?;
         let provider = self.runtime(&route_key)?;
-        let prepared_context_bridge: Option<PreparedContextBridge> =
-            self.context_bridge.pending_for_turn(
+        let prepared_context_bridge: Option<PreparedContextBridge> = match context_bridge_behavior {
+            ContextBridgeTurnBehavior::ConsumePending => self.context_bridge.pending_for_turn(
                 &session.id,
                 &expected_execution_identity.binding_id,
                 expected_execution_identity.activation_generation,
-            )?;
+            )?,
+            ContextBridgeTurnBehavior::PreservePending => None,
+        };
         SessionRepository::claim_running_turn(&conn, &session.id, session.state)?;
 
         let user_item = if display_user_message {
@@ -1561,7 +1611,7 @@ impl AgentManager {
             push_or_replace_timeline_item(&mut appended, item);
         }
 
-        if turn_completed {
+        if turn_completed && context_bridge_behavior == ContextBridgeTurnBehavior::ConsumePending {
             let identity = &expected_execution_identity;
             let consumed_context_sequence = appended
                 .iter()
@@ -3600,6 +3650,13 @@ fn command_trigger_matches(
     requested.is_none_or(|trigger| trigger == candidate)
 }
 
+fn slash_command_name(text: &str) -> Option<&str> {
+    let command = text.trim().strip_prefix('/')?;
+    let name_end = command.find(char::is_whitespace).unwrap_or(command.len());
+    let name = &command[..name_end];
+    (!name.is_empty() && !name.contains('/')).then_some(name)
+}
+
 fn command_token_from_display_name(value: &str) -> String {
     let mut token = String::new();
     let mut last_was_separator = false;
@@ -3748,6 +3805,12 @@ mod tests {
         delivered: Mutex<Vec<vibex_core::ElicitationResolution>>,
     }
 
+    struct CommandProvider {
+        identity: ProviderTurnExecutionIdentity,
+        discoveries: Mutex<Vec<AgentCommandDiscoverRequest>>,
+        executed_turns: Mutex<Vec<String>>,
+    }
+
     #[async_trait]
     impl AgentProvider for TestProvider {
         fn kind(&self) -> ProviderKind {
@@ -3889,6 +3952,239 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[async_trait]
+    impl AgentProvider for CommandProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Acp
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::conservative(ProviderKind::Acp, "command-test")
+        }
+
+        async fn create_session(
+            &self,
+            _request: ProviderCreateRequest,
+        ) -> VibexResult<ProviderSessionHandle> {
+            unreachable!("command test resumes its seeded binding")
+        }
+
+        async fn resume_session(
+            &self,
+            binding: ProviderBinding,
+        ) -> VibexResult<ProviderSessionHandle> {
+            Ok(ProviderSessionHandle {
+                binding,
+                capabilities: self.capabilities(),
+            })
+        }
+
+        async fn prepare_turn_execution(
+            &self,
+            _handle: &ProviderSessionHandle,
+            _request: &ProviderTurnRequest,
+        ) -> VibexResult<Option<ProviderTurnExecutionIdentity>> {
+            Ok(Some(self.identity.clone()))
+        }
+
+        async fn send_turn(
+            &self,
+            _handle: ProviderSessionHandle,
+            _request: ProviderTurnRequest,
+        ) -> VibexResult<ProviderTurnResult> {
+            unreachable!("provider slash commands use execute_command")
+        }
+
+        async fn discover_commands(
+            &self,
+            request: AgentCommandDiscoverRequest,
+        ) -> VibexResult<AgentCommandDiscoverResponse> {
+            self.discoveries.lock().unwrap().push(request);
+            Ok(AgentCommandDiscoverResponse {
+                entries: vec![AgentCommandEntry {
+                    id: "provider:test:review".to_string(),
+                    trigger: AgentCommandTrigger::Slash,
+                    source_kind: AgentCommandSourceKind::Provider,
+                    label: "/review".to_string(),
+                    description: Some("Review the current changes".to_string()),
+                    insertion_text: "/review ".to_string(),
+                    command_name: Some("review".to_string()),
+                    provider_kind: Some(ProviderKind::Acp),
+                    prompt_id: None,
+                    skill_id: None,
+                    reference_path: None,
+                    selection_behavior: AgentCommandSelectionBehavior::Insert,
+                    execution_behavior: AgentCommandExecutionBehavior::ProviderCommand,
+                    destructive: false,
+                    metadata: Vec::new(),
+                }],
+                diagnostics: Vec::new(),
+            })
+        }
+
+        async fn execute_command(
+            &self,
+            _handle: ProviderSessionHandle,
+            _request: AgentCommandExecuteRequest,
+            turn: ProviderTurnRequest,
+        ) -> VibexResult<ProviderTurnResult> {
+            self.executed_turns.lock().unwrap().push(turn.text);
+            Ok(ProviderTurnResult {
+                events: Vec::new(),
+                binding_update: None,
+                completed: true,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn live_agent_account_commands_ignore_static_slash_capability_and_execute_exact_text() {
+        let db_path = temp_db_path("live-agent-account-commands");
+        let workspace_root = temp_workspace_path("live-agent-account-commands");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let mut manager = AgentManager::new(&db_path).unwrap();
+        let mut conn = manager.open_migrated().unwrap();
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let agent_id = AgentId::parse("command-test-agent").unwrap();
+        let adapter_id = AcpAdapterId::parse("command-test-acp").unwrap();
+        let session = insert_session(
+            &conn,
+            "live Agent account commands",
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            agent_id.clone(),
+            AgentSessionState::Idle,
+        );
+        let auth_context = AgentAuthContextRepository::ensure_default(&conn, &agent_id).unwrap();
+        let selection =
+            SessionRuntimeSelection::agent_default(agent_id.clone(), auth_context.id.clone());
+        let mut runtime_config = SessionRuntimeConfigState::default();
+        runtime_config.mark_generation_if_converged(0);
+        let now = unix_timestamp_ms();
+        let binding = RuntimeBinding {
+            binding_id: RuntimeBindingId::new(),
+            session_id: session.id.clone(),
+            agent_id: agent_id.clone(),
+            transport_kind: TransportKind::Acp,
+            auth_source: selection.auth_source.clone(),
+            auth_source_revision: 1,
+            adapter_id: adapter_id.clone(),
+            adapter_version: "1.0.0".to_string(),
+            adapter_compatibility_identity: "command-test-acp@1".to_string(),
+            native_session_id: Some("native-command-test".to_string()),
+            native_state_home_id: NativeStateHomeId::new(),
+            provider_resume_identity: None,
+            process_spawn_fingerprint: "command-test".to_string(),
+            session_runtime_config_state: runtime_config,
+            capability_snapshot: None,
+            restore_compatibility_key: None,
+            last_context_sequence: 0,
+            last_summary_sequence: 0,
+            context_bridge_version: 0,
+            activation_generation: 0,
+            binding_state: BindingState::Current,
+            created_by_switch_id: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        AgentSessionRuntimeRepository::initialize_runtime_selection(
+            &mut conn, &binding, &selection,
+        )
+        .unwrap();
+        drop(conn);
+
+        let provider = Arc::new(CommandProvider {
+            identity: ProviderTurnExecutionIdentity {
+                binding_id: binding.binding_id,
+                activation_generation: binding.activation_generation,
+                model_id: None,
+            },
+            discoveries: Mutex::new(Vec::new()),
+            executed_turns: Mutex::new(Vec::new()),
+        });
+        manager
+            .register_runtime(
+                AgentRuntimeRouteKey {
+                    agent_id: agent_id.clone(),
+                    transport_kind: TransportKind::Acp,
+                    adapter_id,
+                },
+                provider.clone(),
+            )
+            .unwrap();
+        let discover_request = AgentCommandDiscoverRequest {
+            agent_id: Some(agent_id),
+            provider_profile_id: None,
+            session_id: Some(session.id.clone()),
+            workspace_id: Some(workspace.id),
+            trigger: Some(AgentCommandTrigger::Slash),
+            query: None,
+            limit: None,
+        };
+
+        assert!(
+            manager
+                .command_discovery_capabilities(&discover_request)
+                .unwrap()
+                .slash_commands
+        );
+        let discovered = manager.discover_commands(discover_request).await.unwrap();
+        assert!(discovered.entries.iter().any(|entry| {
+            entry.source_kind == AgentCommandSourceKind::Provider
+                && entry.command_name.as_deref() == Some("review")
+        }));
+        assert_eq!(
+            provider.discoveries.lock().unwrap()[0].provider_profile_id,
+            None
+        );
+
+        let unknown_error = manager
+            .execute_command(AgentCommandExecuteRequest {
+                session_id: session.id.clone(),
+                command_id: None,
+                trigger: AgentCommandTrigger::Slash,
+                source_kind: AgentCommandSourceKind::Provider,
+                command_text: "/unknown".to_string(),
+                command_name: Some("unknown".to_string()),
+                arguments: None,
+                prompt_id: None,
+                attachments: Vec::new(),
+                reasoning_effort: None,
+                correlation_id: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(unknown_error.code, "acp_slash_command_not_available");
+        assert!(provider.executed_turns.lock().unwrap().is_empty());
+
+        manager
+            .execute_command(AgentCommandExecuteRequest {
+                session_id: session.id,
+                command_id: Some("provider:test:review".to_string()),
+                trigger: AgentCommandTrigger::Slash,
+                source_kind: AgentCommandSourceKind::Provider,
+                command_text: "/review focus on correctness".to_string(),
+                command_name: Some("review".to_string()),
+                arguments: Some("focus on correctness".to_string()),
+                prompt_id: None,
+                attachments: Vec::new(),
+                reasoning_effort: None,
+                correlation_id: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            provider.executed_turns.lock().unwrap().as_slice(),
+            &["/review focus on correctness"]
+        );
+
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
     }
 
     #[tokio::test]
@@ -4117,6 +4413,7 @@ mod tests {
                     correlation_id: None,
                 },
                 true,
+                ContextBridgeTurnBehavior::ConsumePending,
                 None,
                 |_provider, _handle, _request| {
                     let elicitation = elicitation.clone();
@@ -4252,6 +4549,18 @@ mod tests {
         );
         let error = normalize_reasoning_effort(Some("high=value")).unwrap_err();
         assert_eq!(error.code, "reasoning_effort_invalid");
+    }
+
+    #[test]
+    fn slash_command_name_requires_one_leading_command_token() {
+        assert_eq!(slash_command_name("/review"), Some("review"));
+        assert_eq!(
+            slash_command_name("  /review focus on correctness  "),
+            Some("review")
+        );
+        assert_eq!(slash_command_name("review"), None);
+        assert_eq!(slash_command_name("/ review"), None);
+        assert_eq!(slash_command_name("/review/nested"), None);
     }
 
     #[test]
