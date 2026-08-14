@@ -74,17 +74,18 @@ use vibex_core::{
     AgentProviderProjectionRegistry, AgentReasoningEffort, AgentRuntimeProbeStatus,
     AgentRuntimeRouteKey, AgentSessionConfigProbe, AgentSessionRestoreCompatibility,
     AgentSessionRestoreCompatibilityKey, AgentSessionRestoreMethod, AgentSessionRestoreOutcome,
-    AgentSessionState, AgentTokenUsage, AgentUsageCounterOrigin, AgentUsageExecution,
-    AgentUsageExecutionContext, AgentUsageExecutionStatus, AgentUsageExecutionStatusUpdate,
-    AgentUsageObservation, AgentUsageObservationSource, AgentUsageTokenValues, BindingState,
-    ElicitationAnswerValue, ElicitationField, ElicitationFieldKind, ElicitationOption,
-    ElicitationRequest, ElicitationRequestStatus, ElicitationResolutionAction,
-    ElicitationStringFormat, ExternalSessionContinuationStatus, ExternalSessionImportCandidate,
-    ExternalSessionImportCandidateStatus, ExternalSessionImportSource, MAX_AGENT_USAGE_TOKEN_VALUE,
-    NativeStateHomeId, PermissionActionDetail, PermissionRequest, PermissionRequestStatus,
-    PermissionResponseKind, PermissionResponseOption, PermissionRiskCategory, PlanStepPayload,
-    PlanStepStatus, ProjectionDescriptorMatch, ProviderBinding, ProviderBindingMetadata,
-    ProviderKind, ProviderModelWireApi, ProviderNativeBinding, ProviderProfile, ProviderProfileId,
+    AgentSessionState, AgentTokenUsage, AgentUsageCounterOrigin, AgentUsageCounterScope,
+    AgentUsageExecution, AgentUsageExecutionContext, AgentUsageExecutionStatus,
+    AgentUsageExecutionStatusUpdate, AgentUsageObservation, AgentUsageObservationSource,
+    AgentUsageTokenValues, BindingState, ElicitationAnswerValue, ElicitationField,
+    ElicitationFieldKind, ElicitationOption, ElicitationRequest, ElicitationRequestStatus,
+    ElicitationResolutionAction, ElicitationStringFormat, ExternalSessionContinuationStatus,
+    ExternalSessionImportCandidate, ExternalSessionImportCandidateStatus,
+    ExternalSessionImportSource, MAX_AGENT_USAGE_TOKEN_VALUE, NativeStateHomeId,
+    PermissionActionDetail, PermissionRequest, PermissionRequestStatus, PermissionResponseKind,
+    PermissionResponseOption, PermissionRiskCategory, PlanStepPayload, PlanStepStatus,
+    ProjectionDescriptorMatch, ProviderBinding, ProviderBindingMetadata, ProviderKind,
+    ProviderModelWireApi, ProviderNativeBinding, ProviderProfile, ProviderProfileId,
     ProviderProfileStatus, ProviderSecretBackend, ProviderSessionConfigOption,
     ProviderSessionConfigOptionKind, ProviderSessionConfigState, ProviderSessionConfigValue,
     RequestId, RuntimeAttachmentSnapshot, RuntimeAttachmentStatus, RuntimeAuthSource,
@@ -97,7 +98,7 @@ use vibex_core::{
     SessionRuntimeConfigPatch, SessionRuntimeConfigState, SessionRuntimeSelection,
     SystemNoticeLevel, TerminalAuthActionDescriptor, TerminalId, TimelineRedactionState,
     ToolCallStatus, TransportKind, VibexError, VibexResult, VibexSessionId, WorkspaceMode,
-    unix_timestamp_ms,
+    agent_usage_reporting_contract, unix_timestamp_ms,
 };
 use vibex_db::{
     AgentAuthContextRepository, AgentAuthModelCatalogRepository,
@@ -952,6 +953,9 @@ struct DecodedAcpUsage {
     cumulative: AgentUsageTokenValues,
     context_window_used_tokens: Option<u64>,
     context_window_size_tokens: Option<u64>,
+    /// Contract the adapter declared for these counters, when it declares one.
+    /// `None` falls back to the per-agent table in `vibex_core`.
+    declared_scope: Option<AgentUsageCounterScope>,
     source: AgentUsageObservationSource,
 }
 
@@ -1889,15 +1893,36 @@ impl AcpSessionAttachment {
                     .usage_observation_sequence
                     .saturating_add(1)
                     .max(wall_sequence);
+                let contract = agent_usage_reporting_contract(&execution.stream.agent_id);
+                let counter_scope = decoded.declared_scope.unwrap_or(contract.counter_scope);
+                // An adapter whose `usage_update` carries per-request totals
+                // turns each notification into the only record of a request
+                // that the turn-level reading leaves out entirely.
+                let request_sample = decoded.source
+                    == AgentUsageObservationSource::SessionUsageUpdate
+                    && contract.usage_update_is_request_total
+                    && decoded.context_window_used_tokens.is_some();
+                let (source, cumulative) = if request_sample {
+                    (
+                        AgentUsageObservationSource::RequestSample,
+                        AgentUsageTokenValues {
+                            total_tokens: decoded.context_window_used_tokens,
+                            ..AgentUsageTokenValues::default()
+                        },
+                    )
+                } else {
+                    (decoded.source, decoded.cumulative)
+                };
                 let observation = AgentUsageObservation {
                     stream: execution.stream.clone(),
                     execution: Some(execution),
                     counter_origin,
+                    counter_scope,
                     observation_sequence: state.usage_observation_sequence,
-                    cumulative: decoded.cumulative,
+                    cumulative,
                     context_window_used_tokens: decoded.context_window_used_tokens,
                     context_window_size_tokens: decoded.context_window_size_tokens,
-                    source: decoded.source,
+                    source,
                     observed_at_ms,
                 };
                 (sender, AgentUsageTelemetryEvent::Observation(observation))
@@ -15808,6 +15833,7 @@ fn decode_context_window_usage(update: &Value) -> AcpUsageDecode {
             cumulative: AgentUsageTokenValues::default(),
             context_window_used_tokens: Some(used),
             context_window_size_tokens: Some(size),
+            declared_scope: None,
             source: AgentUsageObservationSource::SessionUsageUpdate,
         }),
         diagnostics,
@@ -15853,9 +15879,28 @@ fn decode_prompt_response_usage(response: &Value) -> AcpUsageDecode {
             cumulative,
             context_window_used_tokens: None,
             context_window_size_tokens: None,
+            declared_scope: decode_declared_counter_scope(usage),
             source: AgentUsageObservationSource::PromptResponse,
         }),
         diagnostics,
+    }
+}
+
+/// Reads an adapter's own declaration of what its `usage` counters cover.
+///
+/// ACP reserves `_meta` for exactly this kind of extension, so an adapter that
+/// knows it reports turn- or request-scoped numbers can say so instead of
+/// relying on the per-agent table. Unknown values are ignored rather than
+/// guessed at, which leaves the schema-mandated session contract in place.
+fn decode_declared_counter_scope(usage: &Value) -> Option<AgentUsageCounterScope> {
+    match usage
+        .pointer("/_meta/dev.vibex/usageScope")
+        .and_then(Value::as_str)?
+    {
+        "session" => Some(AgentUsageCounterScope::Session),
+        "turn" => Some(AgentUsageCounterScope::Turn),
+        "request" => Some(AgentUsageCounterScope::Request),
+        _ => None,
     }
 }
 
@@ -16788,6 +16833,52 @@ mod tests {
         assert_eq!(usage.cached_read_tokens, Some(1_400));
         assert_eq!(usage.cached_write_tokens, Some(250));
         assert_eq!(usage.total_tokens, Some(2_370));
+    }
+
+    #[test]
+    fn adapters_may_declare_their_usage_scope_and_are_otherwise_table_resolved() {
+        // ACP documents `usage` as session-cumulative, so an adapter that says
+        // nothing keeps that contract.
+        let undeclared = decode_prompt_response_usage(&json!({
+            "usage": { "inputTokens": 10, "outputTokens": 5, "totalTokens": 15 }
+        }));
+        assert_eq!(undeclared.usage.unwrap().declared_scope, None);
+
+        let declared = decode_prompt_response_usage(&json!({
+            "usage": {
+                "inputTokens": 10,
+                "outputTokens": 5,
+                "totalTokens": 15,
+                "_meta": { "dev.vibex": { "usageScope": "turn" } }
+            }
+        }));
+        assert_eq!(
+            declared.usage.unwrap().declared_scope,
+            Some(AgentUsageCounterScope::Turn)
+        );
+
+        // An unrecognised declaration is ignored rather than guessed at.
+        let unknown = decode_prompt_response_usage(&json!({
+            "usage": {
+                "inputTokens": 10,
+                "outputTokens": 5,
+                "totalTokens": 15,
+                "_meta": { "dev.vibex": { "usageScope": "per-token" } }
+            }
+        }));
+        assert_eq!(unknown.usage.unwrap().declared_scope, None);
+
+        let claude = agent_usage_reporting_contract(&AgentId::parse("claude").unwrap());
+        assert_eq!(claude.counter_scope, AgentUsageCounterScope::Turn);
+        assert!(!claude.usage_update_is_request_total);
+
+        let codex = agent_usage_reporting_contract(&AgentId::parse("codex").unwrap());
+        assert_eq!(codex.counter_scope, AgentUsageCounterScope::Request);
+        assert!(codex.usage_update_is_request_total);
+
+        let unknown = agent_usage_reporting_contract(&AgentId::parse("gemini").unwrap());
+        assert_eq!(unknown.counter_scope, AgentUsageCounterScope::Session);
+        assert!(!unknown.usage_update_is_request_total);
     }
 
     #[test]

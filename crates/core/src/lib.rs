@@ -366,16 +366,17 @@ pub use timeline::{
 };
 pub use usage::{
     AgentTurnUsageFact, AgentUsageAggregate, AgentUsageAnnualDay, AgentUsageAnnualProjection,
-    AgentUsageCacheHitRate, AgentUsageCounterOrigin, AgentUsageCoverage, AgentUsageCoverageSummary,
-    AgentUsageDailyModelUsage, AgentUsageDimension, AgentUsageDimensionRow,
-    AgentUsageEffectiveRange, AgentUsageExecution, AgentUsageExecutionContext,
-    AgentUsageExecutionStatus, AgentUsageExecutionStatusUpdate, AgentUsageFilterOption,
-    AgentUsageFilterOptions, AgentUsageMetricCoverage, AgentUsageMetricValue,
-    AgentUsageObservation, AgentUsageObservationSource, AgentUsageRange, AgentUsageReportedFields,
-    AgentUsageSortDirection, AgentUsageSortMetric, AgentUsageStatistics,
-    AgentUsageStatisticsRequest, AgentUsageStreamAttribution, AgentUsageTimeZone,
-    AgentUsageTokenValues, AgentUsageTrendBucket, AgentUsageTrendMetric,
-    MAX_AGENT_USAGE_TOKEN_VALUE,
+    AgentUsageCacheHitRate, AgentUsageCounterOrigin, AgentUsageCounterScope, AgentUsageCoverage,
+    AgentUsageCoverageSummary, AgentUsageDailyModelUsage, AgentUsageDimension,
+    AgentUsageDimensionRow, AgentUsageEffectiveRange, AgentUsageExecution,
+    AgentUsageExecutionContext, AgentUsageExecutionStatus, AgentUsageExecutionStatusUpdate,
+    AgentUsageFilterOption, AgentUsageFilterOptions, AgentUsageMetricCoverage,
+    AgentUsageMetricValue, AgentUsageObservation, AgentUsageObservationSource, AgentUsageRange,
+    AgentUsageReportedFields, AgentUsageReportingContract, AgentUsageSortDirection,
+    AgentUsageSortMetric, AgentUsageStatistics, AgentUsageStatisticsRequest,
+    AgentUsageStreamAttribution, AgentUsageTimeZone, AgentUsageTokenValues, AgentUsageTrendBucket,
+    AgentUsageTrendMetric, MAX_AGENT_USAGE_TOKEN_VALUE, agent_usage_counter_scope,
+    agent_usage_reporting_contract,
 };
 pub use workbench::{WorkbenchPanel, WorkbenchTabKind};
 pub use workspace::{

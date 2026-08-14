@@ -544,9 +544,14 @@ impl UsageView {
                 ),
                 summary_metric(
                     "requests",
-                    locale::text("Requests", "请求数", "請求數"),
+                    // Turns and API requests differ by two orders of magnitude
+                    // on agentic adapters, so the tile names whichever it shows.
+                    match aggregate.api_requests {
+                        Some(_) => locale::text("API requests", "API 请求数", "API 請求數"),
+                        None => locale::text("Turns", "对话轮次", "對話輪次"),
+                    },
                     IconName::Inbox,
-                    format_compact_number(aggregate.requests),
+                    format_compact_number(aggregate.api_requests.unwrap_or(aggregate.requests)),
                     false,
                     cx,
                 ),
@@ -700,7 +705,7 @@ impl UsageView {
             .compact()
             .child(
                 Button::new("usage-model-metric-requests")
-                    .label(locale::text("Requests", "请求数", "請求數"))
+                    .label(locale::text("Turns", "对话轮次", "對話輪次"))
                     .selected(self.model_metric == UsageModelMetric::Requests),
             )
             .child(
@@ -1078,7 +1083,15 @@ fn summary_metric_value(
 ) -> AnyElement {
     let display_value = metric
         .value
-        .map(format_compact_number)
+        .map(|value| {
+            // Partial coverage means the reported numbers cover only part of the
+            // work behind these turns, so the figure is a floor, not the total.
+            let formatted = format_compact_number(value);
+            match metric.coverage {
+                AgentUsageMetricCoverage::Partial => format!("≥ {formatted}"),
+                _ => formatted,
+            }
+        })
         .unwrap_or_else(|| locale::text("Unknown", "未知", "未知").to_string());
     summary_metric(id, label, icon, display_value, metric.value.is_none(), cx)
 }
@@ -1142,7 +1155,11 @@ fn metric_coverage_label(coverage: AgentUsageMetricCoverage) -> &'static str {
 
 fn trend_value(aggregate: &AgentUsageAggregate, metric: AgentUsageTrendMetric) -> Option<u64> {
     match metric {
-        AgentUsageTrendMetric::Requests => Some(aggregate.requests),
+        // Same rule as the summary tile: API requests when the adapters report
+        // them, turns otherwise.
+        AgentUsageTrendMetric::Requests => {
+            Some(aggregate.api_requests.unwrap_or(aggregate.requests))
+        }
         AgentUsageTrendMetric::TotalTokens => {
             token_trend_value(aggregate.requests, aggregate.total_tokens.value)
         }
@@ -1754,7 +1771,7 @@ fn model_metric_value(model: &AgentUsageDailyModelUsage, metric: UsageModelMetri
 
 fn model_metric_label(metric: UsageModelMetric) -> &'static str {
     match metric {
-        UsageModelMetric::Requests => locale::text("Requests", "请求数", "請求數"),
+        UsageModelMetric::Requests => locale::text("Turns", "对话轮次", "對話輪次"),
         UsageModelMetric::TotalTokens => locale::text("Total tokens", "总 Token", "總 Token"),
     }
 }

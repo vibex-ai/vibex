@@ -1,10 +1,12 @@
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use vibex_core::{
-    AgentAuthContextId, AgentId, AgentTurnUsageFact, AgentUsageCounterOrigin, AgentUsageCoverage,
-    AgentUsageExecution, AgentUsageExecutionStatus, AgentUsageExecutionStatusUpdate,
-    AgentUsageObservation, AgentUsageReportedFields, AgentUsageTokenValues, MessageSubmissionId,
-    ProjectId, ProviderProfileId, RuntimeAuthSource, RuntimeAuthSourceKind, RuntimeBindingId,
+    AgentAuthContextId, AgentId, AgentTurnUsageFact, AgentUsageCounterOrigin,
+    AgentUsageCounterScope, AgentUsageCoverage, AgentUsageExecution, AgentUsageExecutionStatus,
+    AgentUsageExecutionStatusUpdate, AgentUsageObservation, AgentUsageObservationSource,
+    AgentUsageReportedFields, AgentUsageTokenValues, MessageSubmissionId, ProjectId,
+    ProviderProfileId, RuntimeAuthSource, RuntimeAuthSourceKind, RuntimeBindingId,
     UsageExecutionId, VibexError, VibexResult, VibexSessionId, WorkspaceId,
+    agent_usage_counter_scope,
 };
 
 use crate::{enum_from_db, enum_to_db, storage_err};
@@ -215,10 +217,19 @@ impl AgentUsageRepository {
             Some(execution) => has_prior_execution_on_stream(&tx, execution)?,
             None => false,
         };
-        let regression = checkpoint
-            .as_ref()
-            .is_some_and(|current| tokens_regress(&observation.cumulative, &current.cumulative));
-        let accepted_cumulative = if same_execution {
+        let counter_scope = observation.counter_scope;
+        // A per-request sample is not a counter reading: it is one request's own
+        // total, to be added to the turn rather than compared against anything.
+        let request_sample_tokens = (observation.source
+            == AgentUsageObservationSource::RequestSample)
+            .then_some(observation.cumulative.total_tokens)
+            .flatten();
+        let regression = request_sample_tokens.is_none()
+            && counter_scope.is_cumulative()
+            && checkpoint.as_ref().is_some_and(|current| {
+                tokens_regress(&observation.cumulative, &current.cumulative)
+            });
+        let accepted_cumulative = if same_execution && counter_scope.is_cumulative() {
             checkpoint
                 .as_ref()
                 .map(|current| {
@@ -228,8 +239,12 @@ impl AgentUsageRepository {
         } else {
             observation.cumulative.clone()
         };
-        let incoming_fields = AgentUsageReportedFields::from_tokens(&accepted_cumulative);
-        let has_cumulative = accepted_cumulative.any_reported();
+        let incoming_fields = if request_sample_tokens.is_some() {
+            AgentUsageReportedFields::default()
+        } else {
+            AgentUsageReportedFields::from_tokens(&accepted_cumulative)
+        };
+        let has_cumulative = request_sample_tokens.is_none() && accepted_cumulative.any_reported();
         let now = observation.observed_at_ms;
         let stream_counter_origin = checkpoint
             .as_ref()
@@ -263,11 +278,16 @@ impl AgentUsageRepository {
                 AgentUsageTokenValues::default(),
                 preserve_unknown_baseline.any(),
             )
-        } else if reset_epoch_started {
+        } else if !counter_scope.is_cumulative() || reset_epoch_started {
+            // Turn- and request-scoped adapters report an absolute reading for
+            // the turn, and a cumulative counter that just restarted reports
+            // usage since the restart. Both are the turn's own usage, so the
+            // reading is the delta — differencing it against the checkpoint
+            // would cancel out real usage, and discarding it loses the turn.
             (
                 observation.cumulative.clone(),
-                AgentUsageTokenValues::default(),
-                true,
+                accepted_cumulative.clone(),
+                false,
             )
         } else {
             calculate_delta(
@@ -279,8 +299,40 @@ impl AgentUsageRepository {
         };
 
         fact.reset_epoch = next_reset_epoch;
-        fact.delta = add_token_values(&fact.delta, &delta)?;
-        fact.cumulative_after = merge_cumulative(&fact.cumulative_after, &accepted_cumulative);
+        fact.counter_scope = counter_scope;
+        fact.delta = if counter_scope.is_cumulative() && !reset_epoch_started {
+            add_token_values(&fact.delta, &delta)?
+        } else {
+            // Absolute readings replace rather than accumulate: a second
+            // observation for the same turn restates it, it does not add to it.
+            let mut restated = merge_cumulative(&fact.delta, &delta);
+            if fact.api_requests.is_some() {
+                // Per-request samples already total the whole turn. The
+                // turn-level reading covers only its last request, so letting it
+                // replace that total would throw the other requests away.
+                restated.total_tokens = fact.delta.total_tokens;
+            }
+            restated
+        };
+        if let Some(sample) = request_sample_tokens {
+            fact.api_requests = Some(fact.api_requests.unwrap_or(0).saturating_add(1));
+            fact.delta.total_tokens = Some(
+                fact.delta
+                    .total_tokens
+                    .unwrap_or(0)
+                    .checked_add(sample)
+                    .ok_or_else(|| {
+                        VibexError::validation(
+                            "agent_usage_delta_overflow",
+                            "Agent usage delta exceeded the supported range",
+                        )
+                    })?,
+            );
+            fact.reported_fields.total_tokens = true;
+        }
+        if request_sample_tokens.is_none() {
+            fact.cumulative_after = merge_cumulative(&fact.cumulative_after, &accepted_cumulative);
+        }
         fact.reported_fields.merge(incoming_fields);
         fact.last_source = Some(observation.source);
         fact.last_observed_at_ms = Some(observation.observed_at_ms);
@@ -289,12 +341,12 @@ impl AgentUsageRepository {
             fact.reset_reason = Some("counter_regression".to_string());
         }
         apply_context_observation(&mut fact, observation);
-        fact.coverage = fact_coverage(&fact, baseline_only || reset_epoch_started);
+        fact.coverage = fact_coverage(&fact, baseline_only);
         update_fact(&tx, &fact)?;
         outcome.fact_changed = true;
         outcome.reset_epoch_started = reset_epoch_started;
 
-        if has_cumulative || checkpoint.is_some() {
+        if has_cumulative || request_sample_tokens.is_some() || checkpoint.is_some() {
             let created_at_ms = checkpoint
                 .as_ref()
                 .map(|current| current.created_at_ms)
@@ -401,10 +453,10 @@ impl AgentUsageRepository {
             .query_map(params![start_at_ms, end_at_ms, limit as i64], |row| {
                 Ok((
                     read_raw_fact(row)?,
-                    row.get::<_, String>(38)?,
-                    row.get::<_, String>(39)?,
-                    row.get::<_, String>(40)?,
-                    row.get::<_, String>(41)?,
+                    row.get::<_, String>(FACT_COLUMNS.len())?,
+                    row.get::<_, String>(FACT_COLUMNS.len() + 1)?,
+                    row.get::<_, String>(FACT_COLUMNS.len() + 2)?,
+                    row.get::<_, String>(FACT_COLUMNS.len() + 3)?,
                 ))
             })
             .map_err(storage_err(
@@ -532,11 +584,12 @@ fn record_execution_on_conn(
             cumulative_output_after, cumulative_thought_after, cumulative_cached_read_after,
             cumulative_cached_write_after, cumulative_total_after, context_window_used_tokens,
             context_window_size_tokens, reported_fields, coverage, last_source, reset_reason,
-            dispatched_at_ms, completed_at_ms, last_observed_at_ms, created_at_ms, updated_at_ms
+            dispatched_at_ms, completed_at_ms, last_observed_at_ms, created_at_ms, updated_at_ms,
+            counter_scope, api_requests
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
             NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-            NULL, NULL, 0, ?15, NULL, NULL, ?16, NULL, NULL, ?16, ?16
+            NULL, NULL, 0, ?15, NULL, NULL, ?16, NULL, NULL, ?16, ?16, ?17, NULL
         )
         ",
         params![
@@ -563,6 +616,7 @@ fn record_execution_on_conn(
             enum_to_db(&AgentUsageExecutionStatus::Dispatched)?,
             enum_to_db(&AgentUsageCoverage::Unreported)?,
             execution.dispatched_at_ms,
+            enum_to_db(&agent_usage_counter_scope(&execution.stream.agent_id))?,
         ],
     )
     .map_err(storage_err(
@@ -1079,7 +1133,9 @@ fn update_fact(conn: &Connection, fact: &AgentTurnUsageFact) -> VibexResult<()> 
             reset_reason = ?21,
             completed_at_ms = ?22,
             last_observed_at_ms = ?23,
-            updated_at_ms = ?24
+            updated_at_ms = ?24,
+            counter_scope = ?25,
+            api_requests = ?26
         WHERE usage_execution_id = ?1
         ",
         params![
@@ -1107,6 +1163,8 @@ fn update_fact(conn: &Connection, fact: &AgentTurnUsageFact) -> VibexResult<()> 
             fact.completed_at_ms,
             fact.last_observed_at_ms,
             fact.updated_at_ms,
+            enum_to_db(&fact.counter_scope)?,
+            token_to_db(fact.api_requests)?,
         ],
     )
     .map_err(storage_err(
@@ -1137,51 +1195,58 @@ fn get_fact(
     raw.map(decode_raw_fact).transpose()
 }
 
+/// Columns selected for every fact read, in the order `read_raw_fact` expects.
+/// Queries that select extra columns index them from `FACT_COLUMNS.len()` so
+/// adding a fact column can never silently shift them onto the wrong values.
+const FACT_COLUMNS: &[&str] = &[
+    "usage_execution_id",
+    "message_submission_id",
+    "session_id",
+    "project_id",
+    "workspace_id",
+    "binding_id",
+    "activation_generation",
+    "reset_epoch",
+    "agent_id",
+    "provider_profile_id",
+    "auth_source_kind",
+    "auth_source_id",
+    "auth_source_revision",
+    "model_id",
+    "execution_status",
+    "input_delta",
+    "output_delta",
+    "thought_delta",
+    "cached_read_delta",
+    "cached_write_delta",
+    "total_delta",
+    "cumulative_input_after",
+    "cumulative_output_after",
+    "cumulative_thought_after",
+    "cumulative_cached_read_after",
+    "cumulative_cached_write_after",
+    "cumulative_total_after",
+    "context_window_used_tokens",
+    "context_window_size_tokens",
+    "reported_fields",
+    "coverage",
+    "last_source",
+    "reset_reason",
+    "dispatched_at_ms",
+    "completed_at_ms",
+    "last_observed_at_ms",
+    "created_at_ms",
+    "updated_at_ms",
+    "counter_scope",
+    "api_requests",
+];
+
 fn fact_columns(alias: &str) -> String {
-    [
-        "usage_execution_id",
-        "message_submission_id",
-        "session_id",
-        "project_id",
-        "workspace_id",
-        "binding_id",
-        "activation_generation",
-        "reset_epoch",
-        "agent_id",
-        "provider_profile_id",
-        "auth_source_kind",
-        "auth_source_id",
-        "auth_source_revision",
-        "model_id",
-        "execution_status",
-        "input_delta",
-        "output_delta",
-        "thought_delta",
-        "cached_read_delta",
-        "cached_write_delta",
-        "total_delta",
-        "cumulative_input_after",
-        "cumulative_output_after",
-        "cumulative_thought_after",
-        "cumulative_cached_read_after",
-        "cumulative_cached_write_after",
-        "cumulative_total_after",
-        "context_window_used_tokens",
-        "context_window_size_tokens",
-        "reported_fields",
-        "coverage",
-        "last_source",
-        "reset_reason",
-        "dispatched_at_ms",
-        "completed_at_ms",
-        "last_observed_at_ms",
-        "created_at_ms",
-        "updated_at_ms",
-    ]
-    .into_iter()
-    .map(|column| format!("{alias}.{column}"))
-    .collect::<Vec<_>>()
-    .join(", ")
+    FACT_COLUMNS
+        .iter()
+        .map(|column| format!("{alias}.{column}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[derive(Debug)]
@@ -1214,6 +1279,8 @@ struct RawUsageFact {
     last_observed_at_ms: Option<i64>,
     created_at_ms: i64,
     updated_at_ms: i64,
+    counter_scope: String,
+    api_requests: Option<i64>,
 }
 
 fn read_raw_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawUsageFact> {
@@ -1260,10 +1327,32 @@ fn read_raw_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawUsageFact> {
         last_observed_at_ms: row.get(35)?,
         created_at_ms: row.get(36)?,
         updated_at_ms: row.get(37)?,
+        counter_scope: row.get(38)?,
+        api_requests: row.get(39)?,
     })
 }
 
 fn decode_raw_fact(raw: RawUsageFact) -> VibexResult<AgentTurnUsageFact> {
+    let agent_id = AgentId::parse(raw.agent_id)?;
+    let delta = AgentUsageTokenValues {
+        input_tokens: token_from_db(raw.delta[0])?,
+        output_tokens: token_from_db(raw.delta[1])?,
+        thought_tokens: token_from_db(raw.delta[2])?,
+        cached_read_tokens: token_from_db(raw.delta[3])?,
+        cached_write_tokens: token_from_db(raw.delta[4])?,
+        total_tokens: token_from_db(raw.delta[5])?,
+    };
+    let cumulative_after = AgentUsageTokenValues {
+        input_tokens: token_from_db(raw.cumulative_after[0])?,
+        output_tokens: token_from_db(raw.cumulative_after[1])?,
+        thought_tokens: token_from_db(raw.cumulative_after[2])?,
+        cached_read_tokens: token_from_db(raw.cumulative_after[3])?,
+        cached_write_tokens: token_from_db(raw.cumulative_after[4])?,
+        total_tokens: token_from_db(raw.cumulative_after[5])?,
+    };
+    let stored_scope: AgentUsageCounterScope = enum_from_db(raw.counter_scope)?;
+    let (counter_scope, delta) =
+        reproject_legacy_delta(&agent_id, stored_scope, delta, &cumulative_after);
     Ok(AgentTurnUsageFact {
         usage_execution_id: UsageExecutionId::parse(raw.usage_execution_id)?,
         message_submission_id: raw
@@ -1276,7 +1365,7 @@ fn decode_raw_fact(raw: RawUsageFact) -> VibexResult<AgentTurnUsageFact> {
         binding_id: RuntimeBindingId::parse(raw.binding_id)?,
         activation_generation: raw.activation_generation,
         reset_epoch: raw.reset_epoch,
-        agent_id: AgentId::parse(raw.agent_id)?,
+        agent_id,
         auth_source: decode_usage_auth_source(
             raw.auth_source_kind,
             raw.auth_source_id,
@@ -1285,22 +1374,10 @@ fn decode_raw_fact(raw: RawUsageFact) -> VibexResult<AgentTurnUsageFact> {
         auth_source_revision: raw.auth_source_revision,
         model_id: raw.model_id,
         execution_status: enum_from_db(raw.execution_status)?,
-        delta: AgentUsageTokenValues {
-            input_tokens: token_from_db(raw.delta[0])?,
-            output_tokens: token_from_db(raw.delta[1])?,
-            thought_tokens: token_from_db(raw.delta[2])?,
-            cached_read_tokens: token_from_db(raw.delta[3])?,
-            cached_write_tokens: token_from_db(raw.delta[4])?,
-            total_tokens: token_from_db(raw.delta[5])?,
-        },
-        cumulative_after: AgentUsageTokenValues {
-            input_tokens: token_from_db(raw.cumulative_after[0])?,
-            output_tokens: token_from_db(raw.cumulative_after[1])?,
-            thought_tokens: token_from_db(raw.cumulative_after[2])?,
-            cached_read_tokens: token_from_db(raw.cumulative_after[3])?,
-            cached_write_tokens: token_from_db(raw.cumulative_after[4])?,
-            total_tokens: token_from_db(raw.cumulative_after[5])?,
-        },
+        delta,
+        cumulative_after,
+        counter_scope,
+        api_requests: token_from_db(raw.api_requests)?,
         context_window_used_tokens: token_from_db(raw.context_window_used_tokens)?,
         context_window_size_tokens: token_from_db(raw.context_window_size_tokens)?,
         reported_fields: reported_fields_from_mask(raw.reported_fields),
@@ -1313,6 +1390,32 @@ fn decode_raw_fact(raw: RawUsageFact) -> VibexResult<AgentTurnUsageFact> {
         created_at_ms: raw.created_at_ms,
         updated_at_ms: raw.updated_at_ms,
     })
+}
+
+/// Re-derives a turn's usage for rows written before the reporting contract was
+/// tracked.
+///
+/// Rows stored under the schema-mandated session contract hold a delta that was
+/// differenced against the stream checkpoint. When the agent is now known to
+/// report absolute per-turn or per-request readings, that delta cancelled out
+/// most of the turn's usage — or was dropped entirely when the reading fell and
+/// looked like a counter reset. `cumulative_after` still holds the raw reading,
+/// so the correct delta can be recovered from it without touching stored raw
+/// data. Rewriting is idempotent: re-derived rows already equal their reading.
+fn reproject_legacy_delta(
+    agent_id: &AgentId,
+    stored_scope: AgentUsageCounterScope,
+    delta: AgentUsageTokenValues,
+    cumulative_after: &AgentUsageTokenValues,
+) -> (AgentUsageCounterScope, AgentUsageTokenValues) {
+    if !stored_scope.is_cumulative() {
+        return (stored_scope, delta);
+    }
+    let resolved = agent_usage_counter_scope(agent_id);
+    if resolved.is_cumulative() {
+        return (stored_scope, delta);
+    }
+    (resolved, merge_cumulative(&delta, cumulative_after))
 }
 
 fn token_to_db(value: Option<u64>) -> VibexResult<Option<i64>> {
@@ -1498,6 +1601,7 @@ mod tests {
             stream: execution.stream.clone(),
             execution: Some(execution),
             counter_origin: origin,
+            counter_scope: AgentUsageCounterScope::Session,
             observation_sequence: sequence,
             cumulative: AgentUsageTokenValues {
                 input_tokens: Some(total),
@@ -1611,6 +1715,167 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(deltas, [1_000, 800, 700]);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn turn_scoped_readings_are_summed_instead_of_differenced() {
+        let path = temp_db("turn-scoped");
+        let mut conn = open_database(&path).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let context = seeded(&conn, "turn-scoped");
+
+        // A turn-scoped adapter restates each turn from zero, so its readings
+        // rise and fall with the turn's own size. Differencing them would score
+        // this sequence as 1_000 + 0 + 0; the turns are worth 1_000 + 800 + 900.
+        let mut executions = Vec::new();
+        for (index, reading) in [1_000, 800, 900].into_iter().enumerate() {
+            let mut next = context.clone();
+            if index > 0 {
+                next.usage_execution_id = UsageExecutionId::new();
+            }
+            let execution = next.dispatched_at(2_000 + index as i64 * 100);
+            let mut turn = observation(
+                execution.clone(),
+                index as u64 + 1,
+                reading,
+                AgentUsageCounterOrigin::KnownZero,
+            );
+            turn.counter_scope = AgentUsageCounterScope::Turn;
+            let outcome = AgentUsageRepository::apply_observation(&mut conn, &turn).unwrap();
+            assert!(!outcome.reset_epoch_started, "reading {reading} reset");
+            executions.push(execution.usage_execution_id);
+        }
+
+        let facts = executions
+            .iter()
+            .map(|id| AgentUsageRepository::get_fact(&conn, id).unwrap().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            facts
+                .iter()
+                .map(|fact| fact.delta.total_tokens.unwrap())
+                .collect::<Vec<_>>(),
+            [1_000, 800, 900]
+        );
+        assert!(facts.iter().all(|fact| fact.reset_epoch == 0));
+        assert!(
+            facts
+                .iter()
+                .all(|fact| fact.counter_scope == AgentUsageCounterScope::Turn)
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn repeated_observations_restate_a_turn_scoped_turn_rather_than_adding_up() {
+        let path = temp_db("turn-scoped-restate");
+        let mut conn = open_database(&path).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let execution = seeded(&conn, "turn-scoped-restate").dispatched_at(2_000);
+
+        for (sequence, reading) in [(1_u64, 400_u64), (2, 900)] {
+            let mut turn = observation(
+                execution.clone(),
+                sequence,
+                reading,
+                AgentUsageCounterOrigin::KnownZero,
+            );
+            turn.counter_scope = AgentUsageCounterScope::Turn;
+            AgentUsageRepository::apply_observation(&mut conn, &turn).unwrap();
+        }
+
+        let fact = AgentUsageRepository::get_fact(&conn, &execution.usage_execution_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fact.delta.total_tokens, Some(900));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn legacy_rows_are_repaired_from_the_raw_reading_for_known_adapters() {
+        let path = temp_db("legacy-repair");
+        let mut conn = open_database(&path).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let execution = seeded(&conn, "legacy-repair").dispatched_at(2_000);
+        AgentUsageRepository::apply_observation(
+            &mut conn,
+            &observation(
+                execution.clone(),
+                1,
+                5_000,
+                AgentUsageCounterOrigin::KnownZero,
+            ),
+        )
+        .unwrap();
+
+        // Rewrite the row the way the pre-fix code stored it for an adapter now
+        // known to report per-request readings: the turn's usage cancelled out.
+        conn.execute(
+            "
+            UPDATE agent_turn_usage_facts
+            SET agent_id = 'codex',
+                counter_scope = 'session',
+                total_delta = NULL,
+                input_delta = NULL
+            WHERE usage_execution_id = ?1
+            ",
+            params![execution.usage_execution_id.as_str()],
+        )
+        .unwrap();
+
+        let fact = AgentUsageRepository::get_fact(&conn, &execution.usage_execution_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fact.counter_scope, AgentUsageCounterScope::Request);
+        assert_eq!(fact.delta.total_tokens, fact.cumulative_after.total_tokens);
+        assert_eq!(fact.delta.input_tokens, fact.cumulative_after.input_tokens);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn per_request_samples_total_the_turn_the_last_reading_understates() {
+        let path = temp_db("request-samples");
+        let mut conn = open_database(&path).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let execution = seeded(&conn, "request-samples").dispatched_at(2_000);
+
+        // Four API requests inside one turn, each reporting its own total.
+        for (index, request_total) in [40_000_u64, 60_000, 80_000, 90_000].into_iter().enumerate() {
+            let mut sample = observation(
+                execution.clone(),
+                index as u64 + 1,
+                request_total,
+                AgentUsageCounterOrigin::KnownZero,
+            );
+            sample.source = AgentUsageObservationSource::RequestSample;
+            sample.counter_scope = AgentUsageCounterScope::Request;
+            sample.cumulative = AgentUsageTokenValues {
+                total_tokens: Some(request_total),
+                ..AgentUsageTokenValues::default()
+            };
+            AgentUsageRepository::apply_observation(&mut conn, &sample).unwrap();
+        }
+
+        // The turn-level reading covers only the last request.
+        let mut turn_end = observation(
+            execution.clone(),
+            5,
+            90_000,
+            AgentUsageCounterOrigin::KnownZero,
+        );
+        turn_end.counter_scope = AgentUsageCounterScope::Request;
+        AgentUsageRepository::apply_observation(&mut conn, &turn_end).unwrap();
+
+        let fact = AgentUsageRepository::get_fact(&conn, &execution.usage_execution_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fact.api_requests, Some(4));
+        assert_eq!(fact.delta.total_tokens, Some(270_000));
+        // The breakdown still comes from the turn-level reading, so it stays a
+        // lower bound and must never exceed the per-request total.
+        assert_eq!(fact.delta.input_tokens, Some(90_000));
+        assert!(fact.delta.input_tokens.unwrap() <= fact.delta.total_tokens.unwrap());
         cleanup(&path);
     }
 
@@ -2170,7 +2435,9 @@ mod tests {
         let fact = AgentUsageRepository::get_fact(&conn, &second.usage_execution_id)
             .unwrap()
             .unwrap();
-        assert_eq!(fact.delta.total_tokens, None);
+        // A restarted counter reports usage since the restart, which is this
+        // turn's own usage. Discarding it would lose the turn entirely.
+        assert_eq!(fact.delta.total_tokens, Some(300));
         assert_eq!(fact.reset_epoch, 1);
 
         let mut late = observation(first.clone(), 3, 4_900, AgentUsageCounterOrigin::KnownZero);
@@ -2227,7 +2494,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(fact.reset_epoch, 1);
-        assert_eq!(fact.delta.total_tokens, None);
+        assert_eq!(fact.delta.total_tokens, Some(300));
         cleanup(&path);
     }
 

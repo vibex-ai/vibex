@@ -646,11 +646,38 @@ fn build_dimension_rows(
 
 fn aggregate(facts: &[&AgentUsageFactProjection]) -> VibexResult<AgentUsageAggregate> {
     let total_requests = facts.len() as u64;
-    let input_tokens = metric(facts, |fact| fact.delta.input_tokens)?;
-    let output_tokens = metric(facts, |fact| fact.delta.output_tokens)?;
-    let cached_tokens = metric(facts, |fact| fact.delta.cached_read_tokens)?;
-    let thought_tokens = metric(facts, |fact| fact.delta.thought_tokens)?;
-    let cached_write_tokens = metric(facts, |fact| fact.delta.cached_write_tokens)?;
+    // Turns are always countable; API requests only when an adapter reports
+    // them. A turn that reports none contributes nothing rather than one, so a
+    // mixed selection never presents a turn count as a request count.
+    let api_requests = facts
+        .iter()
+        .filter_map(|projection| projection.fact.api_requests)
+        .try_fold(None::<u64>, |total, requests| {
+            checked_add(total.unwrap_or(0), requests).map(Some)
+        })?;
+    // A request-scoped adapter breaks its turn total down for one request only,
+    // so the breakdown is a floor under a turn that made several requests even
+    // though every turn reported it. Saying "complete" there would be a lie.
+    let breakdown_is_partial = facts.iter().any(|projection| {
+        projection.fact.counter_scope.is_lower_bound()
+            && projection
+                .fact
+                .api_requests
+                .is_some_and(|requests| requests > 1)
+    });
+    let input_tokens =
+        breakdown_metric(facts, breakdown_is_partial, |fact| fact.delta.input_tokens)?;
+    let output_tokens =
+        breakdown_metric(facts, breakdown_is_partial, |fact| fact.delta.output_tokens)?;
+    let cached_tokens = breakdown_metric(facts, breakdown_is_partial, |fact| {
+        fact.delta.cached_read_tokens
+    })?;
+    let thought_tokens = breakdown_metric(facts, breakdown_is_partial, |fact| {
+        fact.delta.thought_tokens
+    })?;
+    let cached_write_tokens = breakdown_metric(facts, breakdown_is_partial, |fact| {
+        fact.delta.cached_write_tokens
+    })?;
     let total_tokens = total_metric(facts)?;
 
     let mut cached_read = 0_u64;
@@ -666,7 +693,11 @@ fn aggregate(facts: &[&AgentUsageFactProjection]) -> VibexResult<AgentUsageAggre
             eligible_requests = eligible_requests.saturating_add(1);
         }
     }
-    let cache_coverage = metric_coverage(eligible_requests, total_requests, false);
+    let cache_coverage = if breakdown_is_partial && eligible_requests > 0 {
+        AgentUsageMetricCoverage::Partial
+    } else {
+        metric_coverage(eligible_requests, total_requests, false)
+    };
     let basis_points = if eligible_requests == 0 {
         None
     } else if denominator == 0 {
@@ -698,6 +729,7 @@ fn aggregate(facts: &[&AgentUsageFactProjection]) -> VibexResult<AgentUsageAggre
 
     Ok(AgentUsageAggregate {
         requests: total_requests,
+        api_requests,
         total_tokens,
         input_tokens,
         output_tokens,
@@ -715,6 +747,20 @@ fn aggregate(facts: &[&AgentUsageFactProjection]) -> VibexResult<AgentUsageAggre
         coverage,
         last_activity_at_ms,
     })
+}
+
+/// A per-token-kind metric, downgraded to partial when the underlying readings
+/// cover fewer API requests than the turns they were recorded for.
+fn breakdown_metric(
+    facts: &[&AgentUsageFactProjection],
+    is_partial: bool,
+    value: impl Fn(&AgentTurnUsageFact) -> Option<u64>,
+) -> VibexResult<AgentUsageMetricValue> {
+    let mut computed = metric(facts, value)?;
+    if is_partial && computed.value.is_some() {
+        computed.coverage = AgentUsageMetricCoverage::Partial;
+    }
+    Ok(computed)
 }
 
 fn metric(
@@ -842,10 +888,11 @@ mod tests {
     use tempfile::tempdir;
     use vibex_core::{
         AgentId, AgentSession, AgentSessionSafety, AgentSessionState, AgentUsageCounterOrigin,
-        AgentUsageDimension, AgentUsageExecution, AgentUsageExecutionStatus,
-        AgentUsageExecutionStatusUpdate, AgentUsageObservation, AgentUsageObservationSource,
-        AgentUsageStreamAttribution, AgentUsageTokenValues, ProviderProfileId, RuntimeAuthSource,
-        RuntimeBindingId, UsageExecutionId, VibexSessionId, WorkspaceMode,
+        AgentUsageCounterScope, AgentUsageDimension, AgentUsageExecution,
+        AgentUsageExecutionStatus, AgentUsageExecutionStatusUpdate, AgentUsageObservation,
+        AgentUsageObservationSource, AgentUsageStreamAttribution, AgentUsageTokenValues,
+        ProviderProfileId, RuntimeAuthSource, RuntimeBindingId, UsageExecutionId, VibexSessionId,
+        WorkspaceMode,
     };
     use vibex_db::{AgentAuthContextRepository, SessionRepository, WorkspaceRepository};
 
@@ -1102,6 +1149,7 @@ mod tests {
             stream: execution.stream.clone(),
             execution: Some(execution.clone()),
             counter_origin: AgentUsageCounterOrigin::KnownZero,
+            counter_scope: AgentUsageCounterScope::Session,
             observation_sequence: sequence,
             cumulative: AgentUsageTokenValues {
                 input_tokens: Some(input),
@@ -1758,5 +1806,62 @@ mod tests {
         );
         assert_eq!(statistics.totals.coverage.complete_requests, 2);
         assert_eq!(statistics.totals.coverage.partial_requests, 1);
+    }
+
+    #[test]
+    fn per_request_totals_are_counted_while_their_breakdown_stays_a_floor() {
+        let (_directory, service, session) = seeded_service();
+        let stream = stream(
+            &service,
+            &session,
+            session.agent_id.as_str(),
+            ProviderProfileId::new(),
+            "request-scoped-model",
+        );
+        let execution = execution(&service, &session, &stream, 9);
+        service
+            .apply_telemetry_event(dispatched_event(execution.clone()))
+            .unwrap();
+
+        // Three API requests inside the turn, each reporting its own total.
+        for (index, request_total) in [40_000_u64, 60_000, 80_000].into_iter().enumerate() {
+            let mut sample = observation(execution.clone(), index as u64 + 1, 0, 0, 0, 0);
+            sample.source = AgentUsageObservationSource::RequestSample;
+            sample.counter_scope = AgentUsageCounterScope::Request;
+            sample.cumulative = AgentUsageTokenValues {
+                total_tokens: Some(request_total),
+                ..AgentUsageTokenValues::default()
+            };
+            service
+                .apply_telemetry_event(AgentUsageTelemetryEvent::Observation(sample))
+                .unwrap();
+        }
+
+        // The turn-level reading breaks down that last request alone.
+        let mut turn_end = observation(execution, 4, 5_000, 1_000, 74_000, 80_000);
+        turn_end.counter_scope = AgentUsageCounterScope::Request;
+        service
+            .apply_telemetry_event(AgentUsageTelemetryEvent::Observation(turn_end))
+            .unwrap();
+
+        let statistics = service
+            .query_statistics_at(fixed_request(AgentUsageRange::Today), dispatched_at(12))
+            .unwrap();
+        assert_eq!(statistics.totals.requests, 1);
+        assert_eq!(statistics.totals.api_requests, Some(3));
+        assert_eq!(statistics.totals.total_tokens.value, Some(180_000));
+        assert_eq!(statistics.totals.input_tokens.value, Some(5_000));
+        assert_eq!(
+            statistics.totals.input_tokens.coverage,
+            AgentUsageMetricCoverage::Partial
+        );
+        assert_eq!(
+            statistics.totals.cached_tokens.coverage,
+            AgentUsageMetricCoverage::Partial
+        );
+        assert_eq!(
+            statistics.totals.cache_hit_rate.coverage,
+            AgentUsageMetricCoverage::Partial
+        );
     }
 }

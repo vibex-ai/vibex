@@ -2144,6 +2144,7 @@ mod tests {
                 "45:agent_auth_context_and_runtime_source",
                 "46:runtime_auth_source_nullable_legacy_columns",
                 "47:agent_default_usage_model_nullable",
+                "48:agent_usage_counter_scope",
             ]
         );
         assert_eq!(

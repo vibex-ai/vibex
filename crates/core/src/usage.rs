@@ -112,6 +112,102 @@ pub enum AgentUsageExecutionStatus {
 pub enum AgentUsageObservationSource {
     PromptResponse,
     SessionUsageUpdate,
+    /// One API request's own total, taken from an adapter whose `usage_update`
+    /// reports per-request totals instead of context occupancy.
+    RequestSample,
+}
+
+/// What an adapter's reported `usage` counters actually cover.
+///
+/// The ACP schema documents `Usage` as session-cumulative ("Sum of all token
+/// types across session", "Total input tokens across all turns"), so
+/// [`Session`](Self::Session) stays the contract for unknown adapters. Shipped
+/// adapters disagree with the schema in two different directions, and accounting
+/// is wrong by orders of magnitude when the difference is ignored:
+///
+/// - `claude-agent-acp` sums every API request of a turn but resets the tally on
+///   each turn activation, so its numbers are [`Turn`](Self::Turn)-scoped.
+/// - `codex-acp` forwards Codex's `last_token_usage` and never its
+///   `total_token_usage`, so its numbers cover a single
+///   [`Request`](Self::Request) — the last one of the turn.
+///
+/// Only [`Session`](Self::Session) counters may be differenced against a
+/// checkpoint. The others are absolute per-turn readings: differencing them
+/// cancels out most of the usage, and their natural decreases look like counter
+/// resets, which silently drops whole turns.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentUsageCounterScope {
+    /// Monotonic session-cumulative counters, per the ACP schema.
+    #[default]
+    Session,
+    /// Absolute per-turn totals that reset when the next turn starts.
+    Turn,
+    /// A single API request's counters — a lower bound on the turn's usage.
+    Request,
+}
+
+impl AgentUsageCounterScope {
+    /// Whether observations may be differenced against the stream checkpoint.
+    pub fn is_cumulative(self) -> bool {
+        matches!(self, Self::Session)
+    }
+
+    /// Whether a turn's recorded usage understates what the provider bills.
+    pub fn is_lower_bound(self) -> bool {
+        matches!(self, Self::Request)
+    }
+}
+
+/// What an agent's ACP adapter actually reports, as read from its shipped
+/// source rather than assumed from the schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentUsageReportingContract {
+    pub counter_scope: AgentUsageCounterScope,
+    /// Whether each `usage_update` carries one API request's total tokens.
+    ///
+    /// The ACP schema defines `usage_update.used` as "Tokens currently in
+    /// context", which must never be summed. An adapter that instead forwards
+    /// its backend's per-request counter turns that stream into the only
+    /// per-request signal available, and summing it is then the difference
+    /// between counting one request per turn and counting all of them.
+    pub usage_update_is_request_total: bool,
+}
+
+/// Resolves the usage contract an agent's ACP adapter actually implements.
+///
+/// Entries are only added once an adapter's reporting has been read directly
+/// from its shipped source. Everything else keeps the schema-mandated
+/// [`AgentUsageCounterScope::Session`] with no per-request stream, and an
+/// adapter that contradicts that at runtime has the contradicting turn counted
+/// from its own reading rather than dropped.
+pub fn agent_usage_reporting_contract(agent_id: &AgentId) -> AgentUsageReportingContract {
+    match agent_id.as_str() {
+        // claude-agent-acp: `session.accumulatedUsage` is reset on turn
+        // activation and summed across the turn's API requests. Its
+        // `usage_update.used` is context occupancy, per the schema.
+        "claude" => AgentUsageReportingContract {
+            counter_scope: AgentUsageCounterScope::Turn,
+            usage_update_is_request_total: false,
+        },
+        // codex-acp: `buildPromptUsage(sessionState.lastTokenUsage)` — the last
+        // request only; `totalTokenUsage` is tracked but never sent. Its
+        // `usage_update.used` is `lastTokenUsage.totalTokens`, so every model
+        // response emits that request's own total.
+        "codex" => AgentUsageReportingContract {
+            counter_scope: AgentUsageCounterScope::Request,
+            usage_update_is_request_total: true,
+        },
+        _ => AgentUsageReportingContract {
+            counter_scope: AgentUsageCounterScope::Session,
+            usage_update_is_request_total: false,
+        },
+    }
+}
+
+/// Convenience accessor for the contract's counter scope.
+pub fn agent_usage_counter_scope(agent_id: &AgentId) -> AgentUsageCounterScope {
+    agent_usage_reporting_contract(agent_id).counter_scope
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,6 +291,10 @@ pub struct AgentUsageObservation {
     pub stream: AgentUsageStreamAttribution,
     pub execution: Option<AgentUsageExecution>,
     pub counter_origin: AgentUsageCounterOrigin,
+    /// What the reported counters cover. Defaults to the schema contract so
+    /// replayed backups and older payloads keep their original meaning.
+    #[serde(default)]
+    pub counter_scope: AgentUsageCounterScope,
     pub observation_sequence: u64,
     pub cumulative: AgentUsageTokenValues,
     pub context_window_used_tokens: Option<u64>,
@@ -238,6 +338,15 @@ pub struct AgentTurnUsageFact {
     pub execution_status: AgentUsageExecutionStatus,
     pub delta: AgentUsageTokenValues,
     pub cumulative_after: AgentUsageTokenValues,
+    /// Contract the delta was derived under. Legacy rows written before the
+    /// contract was tracked stay `Session`, matching how they were computed.
+    #[serde(default)]
+    pub counter_scope: AgentUsageCounterScope,
+    /// API requests observed inside this turn, when the adapter reports them.
+    /// `None` means the adapter gives no per-request signal, so the turn is the
+    /// finest unit that can honestly be counted.
+    #[serde(default)]
+    pub api_requests: Option<u64>,
     pub context_window_used_tokens: Option<u64>,
     pub context_window_size_tokens: Option<u64>,
     pub reported_fields: AgentUsageReportedFields,
@@ -397,6 +506,10 @@ pub struct AgentUsageCoverageSummary {
 #[serde(rename_all = "camelCase")]
 pub struct AgentUsageAggregate {
     pub requests: u64,
+    /// API requests behind those turns, when the adapters involved report them.
+    /// Absent when no turn in the aggregate carries a per-request signal.
+    #[serde(default)]
+    pub api_requests: Option<u64>,
     pub total_tokens: AgentUsageMetricValue,
     pub input_tokens: AgentUsageMetricValue,
     pub output_tokens: AgentUsageMetricValue,
@@ -553,6 +666,7 @@ mod tests {
             },
             totals: AgentUsageAggregate {
                 requests: 0,
+                api_requests: None,
                 total_tokens: metric.clone(),
                 input_tokens: metric.clone(),
                 output_tokens: metric.clone(),

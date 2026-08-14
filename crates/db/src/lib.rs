@@ -72,7 +72,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 47;
+pub const CURRENT_SCHEMA_VERSION: i64 = 48;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -9586,6 +9586,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
 
     apply_runtime_auth_source_table_rebuild(conn, &mut applied)?;
     apply_usage_model_id_nullable_table_rebuild(conn, &mut applied)?;
+    apply_usage_counter_scope_column(conn, &mut applied)?;
 
     // Seed compatibility Profiles before the v37 backfill while no caller
     // transaction is active. Repository reads may run inside a transaction and
@@ -10165,6 +10166,56 @@ fn apply_usage_model_id_nullable_table_rebuild(
     tx.commit().map_err(storage_err(
         "migration_commit_failed",
         "failed to commit Agent usage model migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
+
+/// Records which reporting contract each turn's usage was accounted under, and
+/// how many API requests the turn actually made.
+///
+/// Runs after the v47 table rebuild because that rebuild recreates
+/// `agent_turn_usage_facts` from a literal definition and would drop a column
+/// added by an earlier migration. Existing rows keep `session` — the contract
+/// they were actually computed under — so the read path can tell a legacy row
+/// from one written with the contract known and repair it from the raw reading.
+fn apply_usage_counter_scope_column(
+    conn: &mut Connection,
+    applied: &mut Vec<String>,
+) -> VibexResult<()> {
+    const VERSION: i64 = 48;
+    const NAME: &str = "agent_usage_counter_scope";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+
+    let tx = conn.transaction().map_err(storage_err(
+        "migration_transaction_failed",
+        "failed to start Agent usage counter scope migration transaction",
+    ))?;
+    tx.execute_batch(
+        "
+        ALTER TABLE agent_turn_usage_facts
+            ADD COLUMN counter_scope TEXT NOT NULL DEFAULT 'session';
+        ALTER TABLE agent_turn_usage_facts
+            ADD COLUMN api_requests INTEGER NULL CHECK(api_requests >= 0);
+        ",
+    )
+    .map_err(storage_err(
+        "migration_apply_failed",
+        "failed to add the Agent usage counter scope column",
+    ))?;
+    tx.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record Agent usage counter scope migration",
+    ))?;
+    tx.commit().map_err(storage_err(
+        "migration_commit_failed",
+        "failed to commit Agent usage counter scope migration",
     ))?;
     applied.push(format!("{VERSION}:{NAME}"));
     Ok(())
@@ -12318,7 +12369,10 @@ mod tests {
 
         assert_eq!(
             apply_migrations(&mut conn).unwrap(),
-            ["47:agent_default_usage_model_nullable"]
+            [
+                "47:agent_default_usage_model_nullable",
+                "48:agent_usage_counter_scope"
+            ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
             .query_row(
@@ -12449,6 +12503,7 @@ mod tests {
                 "45:agent_auth_context_and_runtime_source",
                 "46:runtime_auth_source_nullable_legacy_columns",
                 "47:agent_default_usage_model_nullable",
+                "48:agent_usage_counter_scope",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -12560,7 +12615,8 @@ mod tests {
                 "44:runtime_switch_activation_completion",
                 "45:agent_auth_context_and_runtime_source",
                 "46:runtime_auth_source_nullable_legacy_columns",
-                "47:agent_default_usage_model_nullable"
+                "47:agent_default_usage_model_nullable",
+                "48:agent_usage_counter_scope"
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -12710,7 +12766,8 @@ mod tests {
                 "44:runtime_switch_activation_completion",
                 "45:agent_auth_context_and_runtime_source",
                 "46:runtime_auth_source_nullable_legacy_columns",
-                "47:agent_default_usage_model_nullable"
+                "47:agent_default_usage_model_nullable",
+                "48:agent_usage_counter_scope"
             ]
         );
         assert_eq!(
@@ -14071,7 +14128,8 @@ mod tests {
                 "44:runtime_switch_activation_completion",
                 "45:agent_auth_context_and_runtime_source",
                 "46:runtime_auth_source_nullable_legacy_columns",
-                "47:agent_default_usage_model_nullable"
+                "47:agent_default_usage_model_nullable",
+                "48:agent_usage_counter_scope"
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)

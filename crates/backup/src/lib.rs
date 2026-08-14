@@ -731,10 +731,11 @@ mod tests {
     use super::*;
     use vibex_core::{
         AcpAdapterId, AgentId, AgentSession, AgentSessionSafety, AgentSessionState,
-        AgentUsageCounterOrigin, AgentUsageExecutionContext, AgentUsageObservation,
-        AgentUsageObservationSource, AgentUsageStreamAttribution, AgentUsageTokenValues,
-        BindingState, NativeStateHomeId, ProviderProfileId, RuntimeBinding, RuntimeBindingId,
-        SessionRuntimeConfigState, TransportKind, UsageExecutionId, VibexSessionId, WorkspaceMode,
+        AgentUsageCounterOrigin, AgentUsageCounterScope, AgentUsageExecutionContext,
+        AgentUsageObservation, AgentUsageObservationSource, AgentUsageStreamAttribution,
+        AgentUsageTokenValues, BindingState, NativeStateHomeId, ProviderProfileId, RuntimeBinding,
+        RuntimeBindingId, SessionRuntimeConfigState, TransportKind, UsageExecutionId,
+        VibexSessionId, WorkspaceMode,
     };
     use vibex_db::{
         AgentUsageRepository, DbConnection, RuntimeBindingRepository, SessionRepository,
@@ -993,6 +994,7 @@ mod tests {
                 stream: execution.stream.clone(),
                 execution: Some(execution),
                 counter_origin: AgentUsageCounterOrigin::KnownZero,
+                counter_scope: AgentUsageCounterScope::Session,
                 observation_sequence: 1,
                 cumulative: AgentUsageTokenValues {
                     input_tokens: Some(800),
