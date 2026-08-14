@@ -296,8 +296,10 @@ const IMAGE_PREVIEW_MIN_ZOOM: f32 = 0.25;
 const IMAGE_PREVIEW_MAX_ZOOM: f32 = 4.0;
 const IMAGE_PREVIEW_HORIZONTAL_PADDING: f32 = 24.0;
 const IMAGE_PREVIEW_VERTICAL_PADDING: f32 = 64.0;
-const SETTINGS_ROW_INLINE_MIN_WIDTH: f32 = 640.0;
+const SETTINGS_ROW_INLINE_MIN_VIEWPORT_WIDTH: f32 = 896.0;
 const SETTINGS_VERTICAL_TABS_MIN_WIDTH: f32 = 768.0;
+const SETTINGS_NAVIGATION_WIDTH: f32 = 208.0;
+const SETTINGS_NAVIGATION_ROW_HEIGHT: f32 = 36.0;
 const SETTINGS_DIALOG_MAX_WIDTH: f32 = 864.0;
 const SETTINGS_DIALOG_MAX_HEIGHT: f32 = 640.0;
 
@@ -31204,7 +31206,7 @@ impl Render for SettingsDialogTitle {
             locale::system_locale().as_deref(),
         ));
         let header_inline =
-            f32::from(window.viewport_size().width) >= SETTINGS_ROW_INLINE_MIN_WIDTH;
+            f32::from(window.viewport_size().width) >= SETTINGS_ROW_INLINE_MIN_VIEWPORT_WIDTH;
         let defaults_restored = self.settings.read(cx).all_defaults_restored(cx);
         let settings = self.settings.clone();
 
@@ -32342,97 +32344,137 @@ impl FoundationSettings {
         let foreground = theme::semantic_color("foreground", is_dark);
         let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
         let muted = theme::semantic_color("muted", is_dark);
-        let input = theme::semantic_color("input", is_dark);
-        let background = theme::semantic_color("background", is_dark);
-        let inactive_foreground = if is_dark {
-            muted_foreground
-        } else {
-            foreground.opacity(0.60)
-        };
-        let active_background = if is_dark {
-            input.opacity(0.30)
-        } else {
-            background
-        };
+        let border = theme::semantic_color("border", is_dark);
+        let active_background = muted.opacity(if is_dark { 0.72 } else { 0.88 });
         let sections = [
-            (SettingsSection::General, strings.general),
-            (SettingsSection::Appearance, strings.appearance),
+            (
+                SettingsSection::General,
+                strings.general,
+                IconName::Settings2,
+            ),
+            (
+                SettingsSection::Appearance,
+                strings.appearance,
+                IconName::Palette,
+            ),
             (
                 SettingsSection::Workbench,
                 locale::text("Workbench", "工作台", "工作台"),
+                IconName::LayoutDashboard,
             ),
-            (SettingsSection::Session, strings.session_settings),
+            (
+                SettingsSection::Session,
+                strings.session_settings,
+                IconName::Bot,
+            ),
             (
                 SettingsSection::Terminal,
                 locale::text("Terminal", "终端", "終端機"),
+                IconName::SquareTerminal,
             ),
             (
                 SettingsSection::Shortcuts,
                 locale::text("Shortcuts", "快捷键", "快速鍵"),
+                IconName::CaseSensitive,
             ),
             (
                 SettingsSection::Data,
                 locale::text("Data & Diagnostics", "数据与诊断", "資料與診斷"),
+                IconName::HardDrive,
             ),
             (
                 SettingsSection::About,
                 locale::text("About", "关于", "關於"),
+                IconName::Info,
             ),
         ];
-        let section_button = |(section, label): (SettingsSection, &'static str)| {
-            let active = self.active_section == section;
-            Button::new(SharedString::from(format!("settings-{section:?}")))
-                .small()
-                .ghost()
-                .h(px(26.0))
-                .px(px(6.0))
-                .rounded(px(8.0))
-                .selected(active)
-                .border_1()
-                .border_color(if active && is_dark {
-                    input
-                } else {
-                    cx.theme().transparent
-                })
-                .text_color(if active {
-                    foreground
-                } else {
-                    inactive_foreground
-                })
-                .when(active, |this| this.bg(active_background))
-                .when(wide, |this| this.w_full())
-                .when(!wide, |this| this.flex_1())
-                .tooltip(label)
-                .child(
-                    div()
-                        .w_full()
-                        .text_left()
-                        .text_xs()
-                        .font_medium()
-                        .child(label),
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.active_section = section;
-                    cx.notify();
-                }))
-                .into_any_element()
+        let mut buttons = sections
+            .into_iter()
+            .map(|(section, label, icon)| {
+                let active = self.active_section == section;
+                Button::new(SharedString::from(format!("settings-{section:?}")))
+                    .small()
+                    .ghost()
+                    .h(px(SETTINGS_NAVIGATION_ROW_HEIGHT))
+                    .px_2()
+                    .rounded(px(6.0))
+                    .selected(active)
+                    .text_color(if active { foreground } else { muted_foreground })
+                    .when(active, |this| this.bg(active_background))
+                    .when(wide, |this| this.w_full().justify_start())
+                    .when(!wide, |this| this.min_w(px(112.0)).flex_1())
+                    .icon(icon)
+                    .label(label)
+                    .tooltip(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.active_section = section;
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let search = Input::new(&self.search)
+            .small()
+            .h(px(36.0))
+            .w_full()
+            .prefix(
+                Icon::new(IconName::Search)
+                    .small()
+                    .text_color(muted_foreground),
+            );
+
+        if !wide {
+            return v_flex()
+                .w_full()
+                .gap_2()
+                .child(search)
+                .child(div().flex().flex_wrap().gap_1().children(buttons))
+                .into_any_element();
+        }
+
+        let support = buttons.split_off(6);
+        let workflow = buttons.split_off(2);
+        let group_label = |label| {
+            div()
+                .px_2()
+                .pb_1()
+                .text_xs()
+                .font_medium()
+                .text_color(muted_foreground)
+                .child(label)
         };
-        let children = sections.into_iter().map(section_button);
+
         v_flex()
-            .when(wide, |this| this.w(px(160.0)).flex_none())
-            .when(!wide, |this| this.w_full())
-            .gap_1()
+            .w(px(SETTINGS_NAVIGATION_WIDTH))
+            .h_full()
+            .flex_none()
+            .gap_3()
+            .pr_3()
+            .border_r_1()
+            .border_color(border.opacity(0.72))
+            .child(search)
             .child(
-                div()
-                    .flex()
-                    .when(wide, |this| this.flex_col())
-                    .when(!wide, |this| this.flex_row())
-                    .p(px(3.0))
-                    .rounded(px(10.0))
-                    .bg(muted)
-                    .children(children),
+                v_flex()
+                    .gap(px(2.0))
+                    .child(group_label(locale::text(
+                        "Preferences",
+                        "偏好设置",
+                        "偏好設定",
+                    )))
+                    .children(buttons),
             )
-            .child(Input::new(&self.search).small().h(px(28.0)).w_full())
+            .child(
+                v_flex()
+                    .gap(px(2.0))
+                    .child(group_label(locale::text("Workflow", "工作流", "工作流程")))
+                    .children(workflow),
+            )
+            .child(
+                v_flex()
+                    .gap(px(2.0))
+                    .child(group_label(locale::text("Support", "支持", "支援")))
+                    .children(support),
+            )
             .into_any_element()
     }
 
@@ -33738,7 +33780,7 @@ impl Render for FoundationSettings {
         ));
         let viewport_width = f32::from(window.viewport_size().width);
         let vertical_tabs = viewport_width >= SETTINGS_VERTICAL_TABS_MIN_WIDTH;
-        let stacked_rows = viewport_width < SETTINGS_ROW_INLINE_MIN_WIDTH;
+        let stacked_rows = viewport_width < SETTINGS_ROW_INLINE_MIN_VIEWPORT_WIDTH;
         let navigation = self.render_navigation(vertical_tabs, strings, cx);
         let page = match self.active_section {
             SettingsSection::General => {
@@ -40302,6 +40344,30 @@ mod tests {
             .expect("settings page should own a dedicated scroll viewport");
         assert!(navigation < page_scroll);
         assert!(settings.contains(".overflow_y_scrollbar()"));
+    }
+
+    #[test]
+    fn settings_navigation_keeps_grouped_large_targets() {
+        assert_eq!(SETTINGS_NAVIGATION_WIDTH, 208.0);
+        assert_eq!(SETTINGS_NAVIGATION_ROW_HEIGHT, 36.0);
+        assert_eq!(SETTINGS_ROW_INLINE_MIN_VIEWPORT_WIDTH, 896.0);
+
+        let source = include_str!("app.rs");
+        let navigation = source
+            .split_once("    fn render_navigation(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_general_page("))
+            .map(|(body, _)| body)
+            .expect("settings navigation should remain inspectable");
+
+        assert!(navigation.contains("IconName::Search"));
+        assert!(navigation.contains("IconName::Palette"));
+        assert!(navigation.contains("IconName::SquareTerminal"));
+        assert!(navigation.contains("IconName::HardDrive"));
+        assert!(navigation.contains("\"偏好设置\""));
+        assert!(navigation.contains("\"工作流\""));
+        assert!(navigation.contains("\"支持\""));
+        assert!(navigation.contains(".h(px(SETTINGS_NAVIGATION_ROW_HEIGHT))"));
+        assert!(navigation.contains(".flex_wrap()"));
     }
 
     #[test]
