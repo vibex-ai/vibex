@@ -177,6 +177,79 @@ Correct: native GPUI -> shared AgentWorkflowController -> authoritative desktop
          timeline -> compact GUI cards and composer.
 ```
 
+## Scenario: Native Mobile QR Pairing Entry
+
+### 1. Scope / Trigger
+
+- Trigger: changing the first-run mobile screen, native camera integration,
+  pairing result delivery, or the one-time desktop pairing claim.
+
+### 2. Signatures
+
+```text
+scanner::launch() -> BackendResult<()>
+scanner::subscribe() -> UnboundedReceiver<String>
+Android nativeOnPairingQrScanned(value: String) -> ()
+iOS vibex_mobile_pairing_qr_scanned(value: *const char) -> ()
+claim_pairing_link(link: String) -> BackendResult<MobileCredentialBundle>
+```
+
+### 3. Contracts
+
+- An unpaired mobile client opens on a QR pairing surface. The primary action
+  launches the platform camera scanner; the screen must not expose a text field
+  for pasting the pairing link or secret fragment.
+- Android uses a non-exported camera Activity and iOS uses a full-screen native
+  camera presentation. Both accept only full `vibex://open/<transport>#/pair/...`
+  entries and leave unrelated QR codes unhandled.
+- Native callbacks enqueue the opaque link without logging or persisting it.
+  GPUI consumes the result once, then delegates parsing, expiry, selected-route,
+  identity, claim, and credential validation to the existing pairing owner.
+- Camera permissions are declared by each platform host. Permission denial or a
+  missing camera returns to the pairing screen and never falls back to manual
+  secret entry.
+- A successful claim persists only the validated credential bundle through
+  `CredentialStorage`; session/private transport keys retain their existing
+  in-memory and redaction boundaries.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Camera permission denied or camera unavailable | Show a native camera error, dismiss the scanner, and keep the QR pairing screen available. |
+| QR value does not start with `vibex://open/` | Keep scanning; do not forward or log the value. |
+| Pairing offer is malformed, expired, or route-invalid | Existing structured pairing error is shown on the QR pairing screen; no credential is saved. |
+| Native result callback fires more than once | Consume one pending value and let the pairing busy guard prevent duplicate claims. |
+| Pairing claim and credential validation succeed | Atomically save the bundle and enter the existing connecting flow. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: scan a Desktop-generated Direct, Tailnet, or self-hosted Relay QR code;
+  the encoded transport reaches `claim_pairing_link` unchanged and pairing uses
+  that route.
+- Base: cancel the native scanner and remain on the QR pairing screen with no
+  state or credential mutation.
+- Bad: render `TextInput::new("Paste pairing link", ...)`, log a scanned value,
+  or parse and claim the offer independently in Android/iOS host code.
+
+### 6. Tests Required
+
+- `cargo test -p vibex-mobile --locked` asserts pending scan results are consumed
+  once and retains pairing route, credential validation, storage, and redaction
+  coverage.
+- `node scripts/check-mobile-native.mjs` asserts Android/iOS camera declarations,
+  native result bridges, the GPUI scanner queue, and absence of `pairing_input`.
+- Android/iOS platform builds compile their CameraX/ML Kit and AVFoundation
+  implementations. Device qualification covers allow, deny, cancel, unrelated
+  QR, expired offer, and one successful pairing for every supported route.
+
+### 7. Wrong vs Correct
+
+```text
+Wrong: first-run TextInput -> pasted secret link -> platform-specific parsing.
+Correct: native QR scanner -> one-shot GPUI queue -> claim_pairing_link -> validated credential storage.
+```
+
 
 ## Scenario: Deterministic Desktop Browser Fixtures
 

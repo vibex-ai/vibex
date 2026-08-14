@@ -7,9 +7,10 @@ extern "C" {
 
 void vibex_mobile_main(void);
 
+void vibex_mobile_pairing_qr_scanned(const char *value);
+
 #ifdef __cplusplus
 }
 #endif
 
 #endif
-

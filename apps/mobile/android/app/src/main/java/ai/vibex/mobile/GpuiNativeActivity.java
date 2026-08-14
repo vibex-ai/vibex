@@ -2,6 +2,7 @@ package ai.vibex.mobile;
 
 import android.app.NativeActivity;
 import android.content.Context;
+import android.content.Intent;
 import android.graphics.Color;
 import android.os.Bundle;
 import android.text.Editable;
@@ -55,6 +56,11 @@ public final class GpuiNativeActivity extends NativeActivity {
             manager.hideSoftInputFromWindow(textInput.getWindowToken(), 0);
             textInput.clearFocus();
         });
+    }
+
+    public void launchPairingQrScanner() {
+        runOnUiThread(() ->
+                startActivity(new Intent(this, PairingQrScannerActivity.class)));
     }
 
     private static final class GpuiEditText extends EditText {

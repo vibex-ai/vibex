@@ -21,13 +21,18 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     "apps/mobile/src/app.rs",
     "apps/mobile/src/input.rs",
     "apps/mobile/src/pairing.rs",
+    "apps/mobile/src/scanner.rs",
     "apps/mobile/src/storage.rs",
     "apps/mobile/assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf",
     "apps/mobile/assets/fonts/wqy-microhei/wqy-microhei.ttc",
     "apps/mobile/android/app/src/main/AndroidManifest.xml",
     "apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiNativeActivity.java",
+    "apps/mobile/android/app/src/main/java/ai/vibex/mobile/PairingQrScannerActivity.java",
+    "apps/mobile/android/app/src/main/res/values/styles.xml",
     "apps/mobile/ios/project.yml",
     "apps/mobile/ios/Vibex/main.m",
+    "apps/mobile/ios/Vibex/QRScanner.swift",
+    "apps/mobile/ios/Headers/vibex_mobile.h",
     "vendor/zed/crates/gpui_android/src/ime.rs",
     "vendor/zed/crates/gpui_android/src/platform.rs",
     "vendor/zed/crates/gpui_android/src/window.rs"
@@ -41,21 +46,27 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   const app = read("apps/mobile/src/app.rs");
   const input = read("apps/mobile/src/input.rs");
   const pairing = read("apps/mobile/src/pairing.rs");
+  const scanner = read("apps/mobile/src/scanner.rs");
   const storage = read("apps/mobile/src/storage.rs");
   const gpuiWindow = read("vendor/zed/crates/gpui/src/window.rs");
   const android = read("apps/mobile/android/app/src/main/AndroidManifest.xml");
   const androidActivity = read("apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiNativeActivity.java");
+  const androidScanner = read("apps/mobile/android/app/src/main/java/ai/vibex/mobile/PairingQrScannerActivity.java");
+  const androidStyles = read("apps/mobile/android/app/src/main/res/values/styles.xml");
   const androidIme = read("vendor/zed/crates/gpui_android/src/ime.rs");
   const androidPlatform = read("vendor/zed/crates/gpui_android/src/platform.rs");
   const androidWindow = read("vendor/zed/crates/gpui_android/src/window.rs");
   const iosMain = read("apps/mobile/ios/Vibex/main.m");
   const iosProject = read("apps/mobile/ios/project.yml");
+  const iosScanner = read("apps/mobile/ios/Vibex/QRScanner.swift");
+  const iosHeader = read("apps/mobile/ios/Headers/vibex_mobile.h");
 
   assert(workspace.includes('"apps/mobile"'), "native_mobile_workspace_member_missing");
   assert(!workspace.includes('"apps/mobile-wasm"'), "legacy_mobile_workspace_member_present");
   assert(manifest.includes('crate-type = ["cdylib", "staticlib", "rlib"]'), "native_mobile_crate_types_invalid");
   assert(manifest.includes('../../vendor/zed/crates/gpui_android'), "vibex_zed_android_backend_missing");
   assert(entry.includes("gpui_platform::android_init(android_app)"), "android_gpui_init_missing");
+  assert(entry.includes("scanner::initialize_android(&android_app)"), "android_qr_scanner_init_missing");
   assert(entry.includes("gpui_platform::application()"), "native_gpui_application_missing");
   assert(entry.includes('target_os = "ios"'), "ios_rust_entry_missing");
   assert(entry.includes("assets::load_fonts(cx)"), "native_mobile_font_loading_missing");
@@ -72,6 +83,12 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   assert(androidActivity.includes("showGpuiKeyboard"), "android_ime_show_bridge_missing");
   assert(androidActivity.includes("nativeReplaceText"), "android_ime_replace_callback_missing");
   assert(androidActivity.includes("nativeSetSelection"), "android_ime_selection_callback_missing");
+  assert(androidActivity.includes("launchPairingQrScanner"), "android_qr_scanner_launch_bridge_missing");
+  assert(android.includes("android.permission.CAMERA"), "android_camera_permission_missing");
+  assert(android.includes("PairingQrScannerActivity"), "android_qr_scanner_activity_missing");
+  assert(androidScanner.includes("nativeOnPairingQrScanned"), "android_qr_scanner_result_bridge_missing");
+  assert(androidScanner.includes("CameraSelector.DEFAULT_BACK_CAMERA"), "android_qr_scanner_camera_missing");
+  assert(androidStyles.includes("ScannerTheme"), "android_qr_scanner_theme_missing");
   assert(androidIme.includes("VecDeque<ImeEvent>"), "android_ime_event_queue_missing");
   assert(androidIme.includes("nativeReplaceText"), "android_ime_jni_replace_missing");
   assert(androidIme.includes("nativeSetSelection"), "android_ime_jni_selection_missing");
@@ -83,6 +100,15 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   assert(iosMain.includes("vibex_mobile_main();"), "ios_rust_entry_call_missing");
   assert(!iosMain.includes("UIApplicationMain"), "ios_host_double_enters_ui_application");
   assert(iosProject.includes("VibexFFI.xcframework"), "ios_xcframework_missing");
+  assert(iosProject.includes("INFOPLIST_KEY_NSCameraUsageDescription"), "ios_camera_permission_missing");
+  assert(iosScanner.includes("AVCaptureMetadataOutput"), "ios_qr_scanner_camera_missing");
+  assert(iosScanner.includes("vibex_mobile_pairing_qr_scanned"), "ios_qr_scanner_result_bridge_missing");
+  assert(iosHeader.includes("vibex_mobile_pairing_qr_scanned"), "ios_qr_scanner_header_missing");
+  assert(scanner.includes("mpsc::unbounded()"), "mobile_qr_scanner_event_queue_missing");
+  assert(scanner.includes("nativeOnPairingQrScanned"), "android_qr_scanner_rust_callback_missing");
+  assert(scanner.includes("vibex_mobile_pairing_qr_scanned"), "ios_qr_scanner_rust_callback_missing");
+  assert(app.includes("start_scanner_result_stream"), "mobile_qr_scanner_gpui_stream_missing");
+  assert(!app.includes("pairing_input"), "mobile_pairing_link_input_still_present");
 
   for (const marker of [
     "AgentWorkflowController",
@@ -123,7 +149,7 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     assert(pairing.includes(marker), `native_pairing_contract_missing:${marker}`);
   }
 
-  const scopedSource = [manifest, entry, app, input, pairing, android, androidActivity, iosMain, iosProject].join("\n");
+  const scopedSource = [manifest, entry, app, input, pairing, scanner, android, androidActivity, androidScanner, androidStyles, iosMain, iosProject, iosScanner, iosHeader].join("\n");
   for (const forbidden of ["Capacitor", "capacitor", "wasm-bindgen", "mobile-wasm"]) {
     assert(!scopedSource.includes(forbidden), `legacy_mobile_technology_present:${forbidden}`);
   }
@@ -137,14 +163,19 @@ function runSelfTest() {
     ["apps/mobile/src/app.rs", source("apps/mobile/src/app.rs")],
     ["apps/mobile/src/input.rs", source("apps/mobile/src/input.rs")],
     ["apps/mobile/src/pairing.rs", source("apps/mobile/src/pairing.rs")],
+    ["apps/mobile/src/scanner.rs", source("apps/mobile/src/scanner.rs")],
     ["apps/mobile/src/storage.rs", source("apps/mobile/src/storage.rs")],
     ["vendor/zed/crates/gpui/src/window.rs", source("vendor/zed/crates/gpui/src/window.rs")],
     ["apps/mobile/assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf", "font"],
     ["apps/mobile/assets/fonts/wqy-microhei/wqy-microhei.ttc", "font"],
     ["apps/mobile/android/app/src/main/AndroidManifest.xml", source("apps/mobile/android/app/src/main/AndroidManifest.xml")],
     ["apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiNativeActivity.java", source("apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiNativeActivity.java")],
+    ["apps/mobile/android/app/src/main/java/ai/vibex/mobile/PairingQrScannerActivity.java", source("apps/mobile/android/app/src/main/java/ai/vibex/mobile/PairingQrScannerActivity.java")],
+    ["apps/mobile/android/app/src/main/res/values/styles.xml", source("apps/mobile/android/app/src/main/res/values/styles.xml")],
     ["apps/mobile/ios/project.yml", source("apps/mobile/ios/project.yml")],
     ["apps/mobile/ios/Vibex/main.m", source("apps/mobile/ios/Vibex/main.m")],
+    ["apps/mobile/ios/Vibex/QRScanner.swift", source("apps/mobile/ios/Vibex/QRScanner.swift")],
+    ["apps/mobile/ios/Headers/vibex_mobile.h", source("apps/mobile/ios/Headers/vibex_mobile.h")],
     ["vendor/zed/crates/gpui_android/src/ime.rs", source("vendor/zed/crates/gpui_android/src/ime.rs")],
     ["vendor/zed/crates/gpui_android/src/platform.rs", source("vendor/zed/crates/gpui_android/src/platform.rs")],
     ["vendor/zed/crates/gpui_android/src/window.rs", source("vendor/zed/crates/gpui_android/src/window.rs")]

@@ -34,7 +34,7 @@ use crate::input::{
 };
 use crate::pairing::{MobileCredentialBundle, claim_pairing_link};
 use crate::storage::CredentialStorage;
-use crate::{markdown, theme};
+use crate::{markdown, scanner, theme};
 
 const TIMELINE_NEAR_BOTTOM_PX: f32 = 96.0;
 
@@ -96,7 +96,6 @@ pub struct MobileApp {
     mode: RootMode,
     backend: Option<Arc<WebRemoteBackend>>,
     controller: Option<AgentWorkflowController>,
-    pairing_input: Entity<TextInput>,
     composer_input: Entity<TextInput>,
     timeline_scroll: ScrollHandle,
     drawer_scroll: ScrollHandle,
@@ -134,7 +133,6 @@ impl MobileApp {
             mode,
             backend: None,
             controller: None,
-            pairing_input: cx.new(|cx| TextInput::new("Paste pairing link", cx)),
             composer_input: cx.new(|cx| TextInput::new("Message Vibex", cx)),
             timeline_scroll: ScrollHandle::new(),
             drawer_scroll: ScrollHandle::new(),
@@ -160,7 +158,25 @@ impl MobileApp {
         if let Ok(Some(bundle)) = stored {
             app.defer_bundle_install(bundle, cx);
         }
+        app.start_scanner_result_stream(cx);
         app
+    }
+
+    fn start_scanner_result_stream(&mut self, cx: &mut Context<Self>) {
+        let mut results = scanner::subscribe();
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            while let Some(link) = results.next().await {
+                if entity
+                    .update(cx, |this, cx| {
+                        this.claim_scanned_pairing_link(link, cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        self.tasks.push(task);
     }
 
     fn defer_bundle_install(&mut self, bundle: MobileCredentialBundle, cx: &mut Context<Self>) {
@@ -298,22 +314,21 @@ impl MobileApp {
         self.tasks.push(task);
     }
 
-    fn claim_pairing(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn scan_pairing_code(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.pairing_busy {
             return;
         }
-        let link = self.pairing_input.read(cx).text().trim().to_string();
-        if link.is_empty() {
-            self.error = Some(BackendError::failed(
-                "remote_pairing_fragment_invalid",
-                "pairing link is empty",
-            ));
-            cx.notify();
+        window.hide_soft_keyboard();
+        self.error = scanner::launch().err();
+        cx.notify();
+    }
+
+    fn claim_scanned_pairing_link(&mut self, link: String, cx: &mut Context<Self>) {
+        if self.pairing_busy || self.mode != RootMode::Pairing {
             return;
         }
         self.pairing_busy = true;
         self.error = None;
-        window.hide_soft_keyboard();
         let runner = gpui_tokio::Tokio::spawn(cx, async move { claim_pairing_link(link).await });
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
@@ -322,8 +337,6 @@ impl MobileApp {
                 match outcome {
                     Ok(Ok(bundle)) => match this.storage.save(&bundle) {
                         Ok(()) => {
-                            this.pairing_input
-                                .update(cx, |input, cx| input.set_text("", cx));
                             this.install_bundle(bundle, cx);
                         }
                         Err(error) => this.error = Some(error),
@@ -1216,15 +1229,7 @@ impl MobileApp {
                         div()
                             .text_size(px(theme::FONT_DETAIL))
                             .text_color(theme::text_muted())
-                            .child("Paste the pairing link from Vibex desktop."),
-                    )
-                    .child(
-                        div()
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .border_1()
-                            .border_color(theme::border_default())
-                            .bg(theme::bg_card())
-                            .child(self.pairing_input.clone()),
+                            .child("Scan the pairing QR code shown in Vibex desktop."),
                     )
                     .when_some(self.error.as_ref(), |panel, error| {
                         panel.child(
@@ -1241,7 +1246,7 @@ impl MobileApp {
                     })
                     .child(
                         div()
-                            .id("pair-desktop")
+                            .id("scan-pairing-qr")
                             .h(px(theme::TOUCH_TARGET))
                             .rounded(px(theme::RADIUS_CONTROL))
                             .bg(rgb(theme::TEXT_PRIMARY))
@@ -1250,13 +1255,26 @@ impl MobileApp {
                             .items_center()
                             .justify_center()
                             .text_size(px(theme::FONT_HEADING))
-                            .cursor_pointer()
-                            .active(|style| style.opacity(0.7))
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::claim_pairing))
+                            .gap(px(theme::SPACING_SM))
+                            .when(!self.pairing_busy, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .active(|style| style.opacity(0.7))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(Self::scan_pairing_code),
+                                    )
+                            })
+                            .child(
+                                svg()
+                                    .path("icons/scan-line.svg")
+                                    .size(px(theme::ICON_MD))
+                                    .text_color(rgb(theme::BG_PRIMARY)),
+                            )
                             .child(if self.pairing_busy {
                                 "Pairing\u{2026}"
                             } else {
-                                "Pair"
+                                "Scan QR Code"
                             }),
                     ),
             )

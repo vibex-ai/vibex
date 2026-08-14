@@ -8,6 +8,7 @@ mod assets;
 mod input;
 mod markdown;
 mod pairing;
+mod scanner;
 mod storage;
 mod theme;
 
@@ -47,6 +48,7 @@ pub fn android_main(android_app: gpui_android::AndroidApp) {
         .internal_data_path()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
+    scanner::initialize_android(&android_app);
     gpui_platform::android_init(android_app);
     run(data_dir);
 }

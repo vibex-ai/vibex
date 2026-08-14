@@ -1114,7 +1114,7 @@ This inventory records source and license provenance. The corresponding license 
 | Vibex Desktop GPUI reviewed icon bundle | 101 | https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/icons | AGPL-3.0-or-later AND ISC AND MIT AND CC0-1.0 AND LicenseRef-Third-Party-Brand-Marks | (AGPL-3.0-or-later AND (ISC AND (MIT AND (CC0-1.0 AND LicenseRef-Third-Party-Brand-Marks)))) |
 | Vibex desktop application and tray icons | 10 | https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/app-icons | AGPL-3.0-or-later | AGPL-3.0-or-later |
 | Vibex native mobile brand mark | 1 | https://github.com/vibex-ai/vibex/tree/main/apps/mobile/assets/brand | AGPL-3.0-or-later | AGPL-3.0-or-later |
-| Vibex native mobile Lucide controls | 6 | https://github.com/lucide-icons/lucide | ISC | ISC |
+| Vibex native mobile Lucide controls | 7 | https://github.com/lucide-icons/lucide | ISC | ISC |
 | IBM Plex Sans mobile interface fonts | 5 | https://github.com/zed-industries/zed/tree/49d9758/assets/fonts/ibm-plex-sans | OFL-1.1 | OFL-1.1 |
 | WenQuanYi Micro Hei mobile CJK fallback | 2 | https://sourceforge.net/projects/wqy/files/wqy-microhei/0.2.0-beta/ | Apache-2.0 | Apache-2.0 |
 

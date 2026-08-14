@@ -37,6 +37,7 @@ targets:
         INFOPLIST_KEY_CFBundleDisplayName: Vibex
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_NSCameraUsageDescription: Scan the QR code shown in Vibex desktop to pair this device.
         INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
         CLANG_ENABLE_OBJC_ARC: YES
         HEADER_SEARCH_PATHS: ["$(inherited)", "$(SRCROOT)/Headers"]
