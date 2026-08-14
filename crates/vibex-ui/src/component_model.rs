@@ -266,7 +266,7 @@ impl fmt::Debug for GitCommitConfirmationModel {
 }
 
 /// Provider-neutral view projection consumed by both the native GPUI shell and
-/// the WASM/Capacitor shell. It contains no socket, runtime, or provider state.
+/// native mobile and desktop shells. It contains no socket, runtime, or provider state.
 #[derive(Clone, PartialEq, Eq)]
 pub struct AgentWorkflowView {
     pub generation: u64,

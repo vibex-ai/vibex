@@ -7,8 +7,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-gpui.workspace = true
-gpui-component.workspace = true
 serde.workspace = true
 vibex-core = { path = "../core" }
 vibex-desktop-model = { path = "../desktop-model" }

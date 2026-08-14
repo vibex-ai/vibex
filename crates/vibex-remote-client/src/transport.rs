@@ -173,7 +173,7 @@ impl RemoteClientConfig {
             device_identity: None,
             expected_server_id: None,
             expected_server_identity_public_key: None,
-            client_id: "vibex-mobile-wasm".to_string(),
+            client_id: "vibex-mobile".to_string(),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             client_type: vibex_core::RemoteClientType::Mobile,
             allow_insecure_local_dev: false,
@@ -4971,7 +4971,7 @@ mod tests {
     #[test]
     fn remote_client_defaults_to_the_installed_mobile_product_identity() {
         let config = test_config("https://desktop.example");
-        assert_eq!(config.client_id, "vibex-mobile-wasm");
+        assert_eq!(config.client_id, "vibex-mobile");
         assert_eq!(config.client_type, vibex_core::RemoteClientType::Mobile);
     }
 

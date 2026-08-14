@@ -1,95 +1,55 @@
 # Frontend Directory Structure
 
-The current presentation layer is Rust GPUI code shared by native and WASM targets.
-The GPUI Desktop result is the product baseline; mobile adds a host bridge and a
-RemoteBackend, not an independent page/component tree or browser product.
-
-Primary architecture: [Architecture Baseline](../guides/architecture-baseline.md).
-
-## Target Layout
+The presentation layer is Rust GPUI code. Desktop and native mobile share typed
+domain projections; neither product has a browser or DOM UI tree.
 
 ```text
 crates/vibex-ui/
   theme/                 Structured semantic token source
   src/
-    generated_tokens.rs  Shared semantic token projection
-    component_model.rs   Portable domain component models
-    controller.rs        Backend-driven controller and pure UI state
-    shell.rs             Current Wide, Medium, Compact composition owner
-    host_bridge.rs       Platform-service contract without product navigation
+    generated_tokens.rs  Derived token constants
+    component_model.rs   Portable timeline/session models
+    controller.rs        Backend-driven workflow state
+    shell.rs             Wide/Medium/Compact layout policy
     agent/ files/ git/ terminal/ management/
-                         Provider-neutral domain components added by workflows
+                          Provider-neutral domain components
 crates/vibex-backend/
-  src/                   Current domain Backend traits, NativeBackend, and facade
+  src/                   Backend traits, capabilities, errors, NativeBackend
 crates/vibex-remote-client/
-  src/                   WebRemoteBackend, sync state machine, Direct/Relay transport
+  src/                   Remote adapter, sync, Direct/Relay transports
 apps/desktop/
-  src/                   NativeBackend, platform bridge, DesktopRuntime bootstrap
-apps/mobile-wasm/
-  src/                   wasm-bindgen bootstrap for the mobile runtime
-  host/                  Capacitor host adapter; browser use is development-only
+  src/                   NativeBackend and DesktopRuntime composition
 apps/mobile/
-                         Capacitor metadata and native host bridge only
+  src/                   Native GPUI app, input, pairing, storage, Markdown view
+  android/                Checked-in NativeActivity Gradle project
+  ios/                    XcodeGen project and Objective-C host
+apps/relay-server/
+  src/                   User-self-hosted zero-knowledge Relay service
 ```
-
-The current `apps/mobile-wasm`, `apps/mobile`, and `apps/desktop` paths reuse locations
-that previously held React/Tauri implementations. Those former contents and
-`packages/ui` were deleted at the final legacy cutover. References to the old
-composition in detailed specs and evidence describe historical behavior only.
-New UI must not recreate, import, copy, or package it; rollback uses published
-artifacts.
 
 ## Feature Boundaries
 
-- `agent` owns session/timeline/composer/approval presentation over `AgentBackend`.
-- `files` owns tree/search/view/light-edit UI over revision-aware `FileBackend`.
-- `git` owns the approved review subset over capability-gated `GitBackend`.
-- `terminal` owns portable emulator/frame presentation over raw-byte `TerminalBackend`.
-- `management` owns Provider/Relay/device projections, never raw config files.
-- `shell` owns layout/navigation only. It must not duplicate domain behavior per
-  viewport or platform.
+- `agent` owns session/timeline/composer/approval presentation over
+  `AgentBackend`.
+- `files`, `git`, `terminal`, and `management` own their corresponding typed
+  projections and capability-gated actions.
+- `shell` owns layout/navigation only; it does not duplicate domain behavior per
+  platform.
+- `apps/mobile` owns platform bootstrap and compact composition, not a second
+  protocol or state authority.
 
 ## State Boundaries
 
 - DesktopRuntime/server state is authoritative.
-- Controllers reconcile typed snapshots/events/mutation results from the injected
-  Backend; Views do not own reconnect or protocol state.
-- Local state is limited to layout, focus, draft, selection, sheet/dialog, and bounded
-  presentation buffers.
-- Persist only safe non-secret preferences through a versioned shared model.
+- Controllers reconcile typed snapshots, events, and mutation results.
+- Local state is limited to layout, focus, draft, selection, drawer/sheet state,
+  and bounded presentation buffers.
+- Persist only safe, versioned preferences and the native credential bundle; keep
+  private keys and grants out of logs and debug output.
 
-## Platform Bridge Boundary
+## Naming And Anti-Patterns
 
-Host bridges may expose safe area, soft keyboard, lifecycle, secure storage,
-push/deep link, camera/file picker, share/download, clipboard events, and system URL.
-They do not render routes, own server state, or implement domain operations.
-
-Host bridge DTOs keep their full serialized payload for the host call, but sensitive
-`Debug` output is metadata-only. Push tokens, deep links, storage values, selected
-file names/bytes, and share title/text/URL must not appear in logs or evidence;
-presence flags, MIME type, and bounded byte counts are sufficient diagnostics.
-
-## Build-Time Asset Dependencies
-
-Rust `include_bytes!`/`include_str!` paths that resolve through root
-`node_modules/.pnpm` must have an exact direct dependency in the surviving root
-`package.json`. Do not rely on a deleted React/Tauri package to pull the asset into
-the install graph. Keep the declared version, pnpm virtual-store path, license
-policy entry, and embedded source path synchronized, then prove the contract with
-`pnpm install --frozen-lockfile` followed by a clean `cargo check`.
-
-## Naming
-
-- Name components by Vibex semantics (`PermissionRequestCard`, `UnifiedDiffView`).
-- Keep provider names in assets/diagnostics where genuinely required.
-- Do not create `Mobile*` and `Desktop*` copies of the same domain component; name
-  Shell/container differences explicitly.
-
-## Anti-Patterns
-
-- No new React, Tailwind, shadcn/Radix, xterm.js, Monaco, or Tauri UI dependencies in
-  the GPUI tree.
-- No source-level legacy shell or `packages/ui` fallback for release rollback.
-- No User-Agent layout branching; use viewport and negotiated host capabilities.
-- No client-local Agent/Git/PTY/filesystem runtime on mobile.
-- No provider-specific timeline renderer or raw transport parsing in a View.
+- Name components by domain semantics (`PermissionRequestCard`, `AgentComposer`).
+- Do not create `Mobile*` and `Desktop*` copies of the same domain component.
+- Do not add React, Tailwind, shadcn, Monaco, xterm, or DOM transport code.
+- Do not put local Agent/Git/PTY/filesystem behavior in mobile views.

@@ -208,15 +208,15 @@ GET <relay-origin>/api/info -> RelayPublicationInfo
   back to a proxy-aware client or mutate process proxy variables/global proxy
   configuration.
 - A published Direct/Tailscale Gateway separates network Host authority from
-  native-client Origin authority. Allowed Hosts contain only the validated
-  published Direct origins. Android Capacitor `https://localhost` and iOS
-  Capacitor `capacitor://localhost` are exact Origin allowlist entries for
-  claim, ticket, and WebSocket requests; adding either client Origin must never
-  add `localhost` to the LAN Gateway Host allowlist.
-- Native secure storage maps only the platform plugin's exact missing-key
-  results to an unpaired device. Decryption, transport, and malformed-value
-  failures remain typed storage/credential errors and must not be treated as an
-  empty credential store.
+  client Origin authority. Allowed Hosts contain only validated published Direct
+  origins; configured HTTPS origins are exact entries for claim, ticket, and
+  WebSocket requests. An application origin must never add a host to the LAN
+  Gateway Host allowlist.
+- Native mobile credential storage treats only an absent sandbox file as an
+  unpaired device. Writes are atomic and owner-only on Unix; malformed or
+  invalid records are removed and reported as typed credential failures rather
+  than silently becoming an empty credential store. Auth grants and identity
+  private keys stay out of `Debug` output.
 - Desktop pairing creates a 90-second offer through the controller with only the
   selected permission level; the Gateway injects every validated route. Status
   polling and cancel use the offer id and return only
@@ -231,9 +231,9 @@ GET <relay-origin>/api/info -> RelayPublicationInfo
   claimed device and the selected method is verified as one of that offer's
   routes; enabling, validating, selecting, copying, canceling, or expiring a
   route must not update it.
-- Desktop packages and RemoteGateway do not contain or serve
-  `apps/mobile-wasm/dist`. Mobile runtime construction and source identity are
-  owned by the mobile package pipeline.
+- Desktop packages and RemoteGateway do not embed or serve mobile application
+  assets. Native mobile construction and source identity are owned by the
+  Android/iOS package pipeline.
 
 ### 4. Validation & Error Matrix
 
@@ -289,9 +289,8 @@ GET <relay-origin>/api/info -> RelayPublicationInfo
 - Probe tests cover proxy bypass for Tailscale and private/Tailnet Direct origins,
   system proxy retention for public Direct origins, and fail-closed behavior when
   the proxy-bypassing client is unavailable.
-- Gateway perimeter tests cover Android/iOS Capacitor preflight from the exact
-  packaged-app origins while proving that the published LAN Host allowlist still
-  rejects `localhost`.
+- Gateway perimeter tests cover exact configured HTTPS preflight origins while
+  proving that the published LAN Host allowlist still rejects `localhost`.
 - GPUI pairing tests cover the read-only default, all three permission choices,
   healthy preference fallback, entry switching without offer replacement,
   cancel/expiry/regenerate/close cleanup, narrow layout, clipboard failure, and
@@ -414,7 +413,7 @@ duplicate resolutions.
 - Trigger: Phase 5 first child introduces `crates/relay`, Relay protocol DTOs,
   and E2EE transport helpers.
 - This scenario establishes the encrypted transport foundation only. Relay
-  server routes, PC outbound connection loops, Web/PWA Relay mode, mobile shell
+  server routes, PC outbound connection loops, native mobile Relay mode, mobile
   packaging, Docker/Caddy deployment, and public hosted Relay remain later
   children.
 
@@ -467,7 +466,7 @@ RelaySession::open_json(RelayEncryptedFrame) -> RelayPlaintextEnvelope
 
 ### 3. Contracts
 
-- `crates/core/src/relay.rs` owns Relay DTOs. GPUI and Web/PWA Relay mode consume
+- `crates/core/src/relay.rs` owns Relay DTOs. GPUI and native mobile Relay mode consume
   those Rust types through the shared Backend contracts instead of redefining
   frame variants.
 - `crates/relay` owns E2EE helpers, encrypted frame encode/decode, room and
@@ -578,7 +577,7 @@ decrypt, forge, replay, or authorize business operations.
 - Trigger: Phase 5 second child introduces `apps/relay-server` as an
   independently runnable Axum app.
 - This scenario establishes the self-hosted room bridge only. PC outbound Relay
-  client wiring, desktop settings, Web/PWA Relay mode, mobile shell packaging,
+  client wiring, desktop settings, native mobile Relay mode, mobile packaging,
   deployment assets, NAT smoke automation, and public hosted Relay remain later
   children.
 
@@ -633,7 +632,7 @@ RelayBridgeMessage {
   leave its receive loop, abort its writer, and unregister its exact connection;
   a device socket must not remain attached to a room with no authoritative PC.
 - `/r/:room_id/*path` static room assets are intentionally deferred until
-  Web/PWA Relay mode or deployment packaging consumes them.
+  native mobile Relay mode or deployment packaging consumes them.
 
 ### 4. Validation & Error Matrix
 
@@ -729,8 +728,8 @@ business runtime.
   self-hosted Relay server through an outbound WebSocket client.
 - This scenario covers the PC-side Relay client, shared bridge envelope,
   in-process remote dispatcher, desktop settings/status commands, heartbeat,
-  reconnect, E2EE decrypt, and business dispatch. Web/PWA Relay transport,
-  browser-side E2EE, mobile shell packaging, deployment assets, NAT smoke, and
+  reconnect, E2EE decrypt, and business dispatch. Native mobile Relay transport,
+  client-side E2EE, mobile packaging, deployment assets, NAT smoke, and
   public hosted Relay remain later children.
 
 ### 2. Signatures
@@ -830,7 +829,7 @@ RelayClientStatus {
   still comes from the `RemoteAuthProof` embedded in typed remote request
   payloads and checked by `RemoteTrustService`.
 - Desktop settings are in-memory for this child; durable user preferences can be
-  added later when the final Web/PWA Relay UX and deployment smoke define the
+  added later when the final native mobile Relay UX and deployment smoke define the
   storage requirements.
 
 ### 4. Validation & Error Matrix
@@ -869,7 +868,7 @@ RelayClientStatus {
   envelope shape, so transport errors cannot be confused with business claim
   errors.
 - Base: desktop Relay settings report disabled status until explicitly enabled,
-  so direct LAN/Web/PWA mode remains unaffected by Phase 5 Relay work.
+  so direct LAN/native mobile mode remains unaffected by Phase 5 Relay work.
 - Bad: the PC Relay client parses a command payload and directly calls Agent,
   file, Git, terminal, or Provider services without using `RemoteDispatcher`.
   This creates a second auth/permission/audit path and violates the one business
@@ -929,182 +928,6 @@ Relay transport handles encrypted delivery only. `RemoteDispatcher` remains the
 single business execution boundary for direct HTTP, direct WebSocket, and Relay
 commands.
 
-## Retired Historical Scenario: Phase 5 Web/PWA Relay Transport Mode
-
-> Retired with the WebUI/PWA product. Current mobile Relay transport uses the
-> shared Rust `WebRemoteBackend` and the installed-app contracts below; this
-> section remains only as protocol-evolution history.
-
-### 1. Scope / Trigger
-
-- Trigger: Phase 5 fourth child adds Relay transport mode to `apps/mobile-wasm`.
-- This scenario covers browser-side Relay pairing, browser-compatible E2EE,
-  encrypted remote handshake, encrypted command transport, auth-state mode
-  selection, and direct/Relay cache separation. Native mobile shell packaging,
-  Relay deployment docs, static `/r/:room_id/*path` assets, NAT smoke
-  automation, browser live-event Relay streams, and public hosted Relay remain
-  later children.
-
-### 2. Signatures
-
-Web connection state:
-
-```text
-RemoteConnectionMode = direct | relay | fixture
-RemoteAuthState {
-  mode,
-  base_url,
-  relay_url,
-  room_id,
-  relay_peer_id,
-  auth: RemoteAuthProof,
-  mock_mode,
-  permission_level
-}
-```
-
-Web transport boundary:
-
-```text
-RemoteTransport::get_service_info() -> RemoteServiceInfo
-RemoteTransport::post_envelope(path, operation, payload, validate) -> typed payload
-
-DirectHttpTransport:
-  GET {base_url}/api/info
-  POST {base_url}/api/{agent|workbench|provider}
-
-RelayHttpTransport:
-  GET {relay_url}/api/info
-  POST {relay_url}/api/rooms/:room_id/pair RelayControlMessage::Hello
-    -> RelayControlMessage::Ready
-  POST {relay_url}/api/rooms/:room_id/command RelayEncryptedFrame(command)
-    -> RelayControlMessage::Encrypted(response)
-```
-
-Browser Relay crypto helper:
-
-```text
-RelayBrowserSession::establish(local_keypair, remote_public_key_base64,
-  { room_id, session_id, local_peer_id, remote_peer_id })
-RelayBrowserSession::seal_json(kind, correlation_id, business_payload_json)
-  -> RelayEncryptedFrame
-RelayBrowserSession::open_json(RelayEncryptedFrame)
-  -> RelayPlaintextEnvelope
-```
-
-### 3. Contracts
-
-- `apps/mobile-wasm` consumes Relay and Remote DTOs through shared Rust contracts and
-  `WebRemoteBackend`. It must not redefine wire variants for Relay control messages,
-  encrypted frames, or remote business envelopes.
-- Direct, Relay, and fixture modes are explicit in auth state. Old direct-mode
-  localStorage entries without `mode` are migrated as `direct`; old fixture
-  entries with `mockMode = true` are migrated as `fixture`.
-- Relay mode stores only non-secret connection metadata plus the existing
-  `RemoteAuthProof`. Browser Relay private keys are memory-only and are
-  regenerated after refresh.
-- Browser E2EE must match `crates/relay`: X25519 shared secret, HKDF-SHA256
-  with salt `{room_id}:{session_id}`, HKDF info
-  `vibex-relay-e2ee-v1:{sorted_peer_0}:{sorted_peer_1}:{sorted_public_key_0}:{sorted_public_key_1}`,
-  and XChaCha20-Poly1305 with the visible frame metadata authenticated as AEAD
-  associated data.
-- Browser associated-data JSON uses camelCase fields in Rust struct order:
-  `protocolVersion`, `roomId`, `sessionId`, `senderPeerId`,
-  `recipientPeerId`, `correlationId`, `kind`, and `counter`.
-- Relay mode first validates Relay server `/api/info`, then pairs with
-  `RelayControlMessage::Hello`, requires `RelayControlMessage::Ready`, and
-  establishes an encrypted session with the PC public key from `Ready`.
-- PC remote capabilities are recovered by sending an encrypted
-  `RemoteOperationKind::Handshake` through `/api/rooms/:room_id/command`.
-  The Web client maps the decrypted `RemoteHandshakeResponse` into the existing
-  `RemoteServiceInfo` display/query contract; the Relay server never provides
-  PC business service info directly.
-- Every Relay business request is the same `RemoteRequestEnvelope` used by
-  direct mode, encrypted as `RelayFrameKind::Command`. The decrypted PC response
-  must be the same `RemoteResponseEnvelope` used by direct mode.
-- Relay command frames must have a visible `correlation_id`. If the business
-  envelope does not already carry one, the Web transport sets one before
-  encryption.
-- TanStack Query keys include connection mode, base URL or Relay URL, room id,
-  device id, and fixture flag so direct and Relay server state cannot share
-  cache entries accidentally.
-
-### 4. Validation & Error Matrix
-
-- Invalid direct URL -> local `RemoteTransportError` before fetch.
-- Invalid Relay URL or missing room id -> local `RemoteTransportError` before
-  pair.
-- Relay `/api/info` missing pair or command bridge support ->
-  `RemoteTransportError` and no business command is sent.
-- Relay protocol version mismatch -> `remote/relay_unsupported_protocol` or
-  local `RemoteTransportError`.
-- Pair response not `Ready`, wrong room, or wrong protocol ->
-  `RemoteTransportError`.
-- Command response not `Encrypted(response)`, wrong correlation, wrong
-  room/session, wrong sender/recipient, tampered ciphertext, replayed counter,
-  or out-of-order counter -> structured Relay transport error.
-- Relay control messages with a known tag but malformed `data` payload must
-  fail with `RemoteTransportError` before field access; do not rely on the tag
-  alone as runtime validation.
-- Decrypted payload not a `RemoteResponseEnvelope` -> `RemoteTransportError`.
-- Decrypted `RemoteResponseEnvelope.status = error` with `VibexError` ->
-  existing `RemoteClientError` path.
-- Errors and UI labels must not include Relay private keys, auth tokens, pairing
-  codes, nonce bytes, ciphertext bytes, decrypted business payload JSON, prompt
-  bodies, file paths, terminal content, Git diffs, or Provider setting details.
-
-### 5. Good/Base/Bad Cases
-
-- Good: a browser user selects Relay mode, enters a self-hosted Relay URL and
-  room id, pairs with the PC Relay client, sends an encrypted remote handshake,
-  sees PC capabilities, and then uses the same Web/PWA session, workspace, Git,
-  terminal, and Provider queries through encrypted Relay commands.
-- Base: a refreshed browser pairs again with a new memory-only Relay keypair
-  while keeping the same durable `RemoteAuthProof`; PC device revocation still
-  fails inside the decrypted remote business response.
-- Bad: Web/PWA creates a Relay-specific Agent/file/Git/terminal API, stores
-  Relay private keys in localStorage, treats Relay `/api/info` as PC service
-  info, or lets the Relay server inspect `RemoteAuthProof` or business payloads.
-
-### 6. Tests Required
-
-- `@vibex/mobile-wasm` typecheck and build.
-- Browser Relay helper checks, when test tooling exists, for associated-data
-  parity, encrypt/decrypt happy path, tamper rejection, replay rejection,
-  out-of-order rejection, and plaintext-leak checks.
-- Query key regression proving direct and Relay modes use different cache
-  scopes.
-- Existing Relay/server/desktop regression checks:
-  `cargo test -p vibex-core relay`, `cargo test -p vibex-relay`,
-  `cargo test -p vibex-relay-server`, and `cargo test -p vibex-desktop relay`.
-
-### 7. Wrong vs Correct
-
-#### Wrong
-
-```text
-Web/PWA Relay mode
-  -> GET relay /api/info
-  -> treat RelayServerInfo as PC RemoteServiceInfo
-  -> enable Agent/Git/terminal UI based on Relay server features
-```
-
-Relay server features describe only the room bridge. They are not PC business
-capabilities.
-
-#### Correct
-
-```text
-Web/PWA Relay mode
-  -> GET relay /api/info
-  -> pair and establish Relay E2EE with PC
-  -> send encrypted RemoteOperationKind::Handshake
-  -> decrypt RemoteHandshakeResponse
-  -> enable UI from PC RemoteCapabilitySummary
-```
-
-Relay validates only transport support. The PC remains authoritative for
-business capability, auth, permission, audit, and state.
 
 ## Scenario: Phase 5 Relay Deployment Docs And NAT Smoke
 
@@ -1256,148 +1079,6 @@ Relay deployment guide
 The Relay remains an opaque transport bridge. The PC remains authoritative for
 business auth, permission, audit, and state.
 
-## Retired Historical Scenario: Self-Hosted Relay GPUI WebUI Hosting
-
-> Retired. Relay static hosting, `WebBuildDescriptor`,
-> `VIBEX_RELAY_WEB_STATIC_DIR`, SPA fallback, and Relay image Web identity no
-> longer exist. The current invariant is transport-only Relay: `/health`,
-> `/api/*`, and `/ws`; all product/static paths return 404.
-
-### 1. Scope / Trigger
-
-- Trigger: changing Relay static hosting, `WebBuildDescriptor`, the GPUI
-  Web release builder, or `deploy/relay` image/Compose/Caddy assets.
-- This scenario lets a fresh browser load the release GPUI WebUI from the same
-  trusted HTTPS origin as Relay API/WebSocket transport. Pairing claims, device
-  grants, and business payloads remain E2EE and PC-authorized.
-
-### 2. Signatures
-
-```text
-WebBuildDescriptor {
-  schemaVersion, buildId, packageVersion, profile, gitCommit,
-  wasmSha256, glueSha256, staticSha256
-}
-
-RelayServerConfig.web_static_dir: Option<PathBuf>
-VIBEX_RELAY_WEB_STATIC_DIR=/app/mobile-wasm
-VIBEX_RELAY_WEB_BUILD_ID=<24 lowercase hex>       # compile-time image binding
-VIBEX_RELAY_WEB_GIT_COMMIT=<40 lowercase hex>     # compile-time image binding
-
-try_build_router(config) -> Result<Router, RelayServerStartupError>
-GET /api/info -> RelayServerInfo {
-  features.staticRoomAssets,
-  webBuild?: WebBuildDescriptor
-}
-GET|HEAD /<asset-or-extensionless-navigation> -> static file or index.html
-
-/app/relay-image.json {
-  schemaVersion: "vibex-relay-image.v1",
-  serverVersion, sourceRevision, webBuild
-}
-```
-
-### 3. Contracts
-
-- `vibex-core` owns the one wire descriptor plus required/static-identity asset
-  lists. Gateway, Desktop, Relay server, and Web client use aliases or the
-  shared type; they must not redefine camel-case wire fields independently.
-- When `web_static_dir` is configured, startup canonicalizes a non-symlink
-  directory, requires every release asset as a contained regular non-symlink
-  file, parses `build.json`, and checks release profile, package version,
-  descriptor shape, WASM/glue/static hashes, and service-worker build id.
-- A source-bound container compiles the build id and Git revision into the
-  Relay binary. Either compiled value differing from `build.json` fails before
-  the listener binds. A configuration without `web_static_dir` remains a valid
-  transport-only mode and advertises no Web build.
-- Explicit `/health`, `/api/*`, and `/ws` routes take precedence. Static
-  fallback accepts only GET/HEAD, rejects traversal, symlinks, directories,
-  reserved prefixes, and missing asset filenames, and returns `index.html`
-  only for a missing extensionless SPA navigation.
-- HTML, JS, CSS, WASM, JSON, Web manifest, image, and font responses use
-  explicit MIME types plus `nosniff`, frame denial, no-referrer, and same-origin
-  resource policy headers. Entry/build/service-worker files revalidate; other
-  assets use bounded public caching and are never assumed content-hashed.
-- `staticRoomAssets=true` and `webBuild` are emitted only from a successfully
-  validated asset root. They describe browser bootstrap capability, not Agent,
-  Git, Terminal, File, Provider, device permission, or PC runtime capability.
-- The Docker builder compiles release GPUI-WASM and Relay from one source
-  context, validates the locked wasm-bindgen version, and copies only the
-  binary, dist, CA/runtime files, and non-secret image manifest to the final
-  unprivileged image. The context exposes only Git HEAD/refs needed to resolve
-  source revision, never Git config or objects.
-- Caddy keeps Web files, API, and WebSocket on one origin. URL fragments are
-  browser-local and must never appear in Relay/Caddy requests, logs, or image
-  metadata. Public static assets contain no room, grant, auth, or provider data.
-
-### 4. Validation & Error Matrix
-
-| Condition | Required result |
-| --- | --- |
-| Static root or required file missing | Startup error `relay_web_assets_missing`; no bind. |
-| Root/required asset is a symlink, directory, or escapes canonical root | Startup error `relay_web_assets_invalid`; no bind. |
-| Debug/malformed descriptor, wrong package, bad hash, stale service worker, or compiled identity mismatch | Startup error `relay_web_assets_incompatible`; no bind. |
-| Static root omitted | `staticRoomAssets=false`, `webBuild` omitted, transport routes remain available. |
-| Existing valid asset requested with GET/HEAD | Correct MIME/security/cache headers; HEAD has no response body. |
-| Missing extensionless product navigation | Serve `index.html` with entry cache policy. |
-| `/api*`, `/ws*`, `/health*`, directory, missing extension, or non-GET/HEAD request | 400/404/405 as applicable; never SPA HTML. |
-| Encoded/decoded traversal or runtime symlink replacement | Reject without reading or exposing the target. |
-| `/api/info.webBuild` differs from packaged image manifest | Deployment identity failure; do not publish a pairing entry. |
-
-### 5. Good / Base / Bad Cases
-
-- Good: a clean image starts behind Caddy, a fresh Chromium context loads `/`,
-  JS, WASM, manifest, service worker, and `build.json`, reaches GPUI `ready`,
-  reports `remote=unconfigured`, and sees the same build id in browser,
-  `/api/info`, binary binding, and `/app/relay-image.json`.
-- Base: local Relay smoke omits `VIBEX_RELAY_WEB_STATIC_DIR`, retains all E2EE
-  room transport behavior, and reports no static bootstrap capability.
-- Bad: copy a host's stale untracked `dist`, serve debug assets, fall back to
-  HTML for `/api/missing` or `missing.js`, advertise a descriptor before asset
-  validation, use immutable caching for unhashed filenames, or put pairing
-  secrets in static files/URLs.
-
-### 6. Tests Required
-
-- `cargo test -p vibex-core relay --locked` validates exact descriptor identity.
-- `cargo test -p vibex-relay-server --locked` covers info, startup failures,
-  MIME/HEAD/SPA routing, traversal, directories, methods, and symlink escape.
-- `cargo test -p vibex-remote-client --test relay_smoke --locked -- --nocapture`
-  proves existing E2EE room transport, revoke, and reconnect behavior remains.
-- `pnpm check:relay-webui-package` rebuilds release assets, identity-binds the
-  Relay, checks HTTP assets, and boots a fresh Playwright Chromium context.
-- `pnpm smoke:relay:local` proves the transport-only compatibility mode.
-- Build and run `deploy/relay/Dockerfile`; assert health, actual static assets,
-  `/api/info`, image manifest identity, unprivileged runtime contents, and no
-  workspace/Git-secret material. Run Compose config, bindings, format, Clippy,
-  and `git diff --check` before commit.
-
-### 7. Wrong vs Correct
-
-#### Wrong
-
-```text
-COPY apps/mobile-wasm/dist /app/mobile-wasm
-Relay starts -> staticRoomAssets=true
-GET /api/missing -> index.html
-```
-
-This trusts stale host output, advertises unvalidated capability, and lets SPA
-fallback shadow the zero-knowledge transport API.
-
-#### Correct
-
-```text
-same clean source context
-  -> build release GPUI-WASM + build.json
-  -> compile buildId/sourceRevision into Relay
-  -> validate required files + hashes before bind
-  -> publish matching /api/info + relay-image.json
-  -> explicit API/WS routes, constrained GET/HEAD static fallback
-```
-
-Static hosting bootstraps code only. Relay remains unable to decrypt or
-authorize PC business operations.
 
 ## Scenario: Phase 4 Remote Foundation Envelope
 
@@ -1438,7 +1119,7 @@ GET /ws -> WebSocket RemoteRequestEnvelope / RemoteResponseEnvelope frames
 ### 3. Contracts
 
 - Rust serde types in `crates/core/src/remote.rs` are the source of truth;
-  frontend and Web/PWA clients consume them through `WebRemoteBackend`.
+  frontend and native mobile clients consume them through `WebRemoteBackend`.
 - `RemoteRequestEnvelope` and `RemoteResponseEnvelope` include protocol
   version, request id, optional correlation id, optional device id, operation,
   timestamp, and a temporary `unknown` JSON payload placeholder.
@@ -1567,7 +1248,7 @@ revoke_device(request) -> RemoteDeviceDetail
   `crates/agent::AgentManager` for authenticated Agent session APIs and
   reconnect-safe timeline catch-up.
 - This scenario is limited to Agent sessions. File, Git, terminal, Provider
-  settings, Web/PWA UI, Relay, and public listener behavior remain separate
+  settings, native mobile UI, Relay, and public listener behavior remain separate
   child tasks.
 
 ### 2. Signatures
@@ -1676,7 +1357,7 @@ crates/remote -> Arc<AgentManager> -> AgentManager::{list_sessions,
 #### Wrong
 
 ```text
-Web/PWA reconnect -> subscribe live events -> assume no frames were missed
+native mobile reconnect -> subscribe live events -> assume no frames were missed
 ```
 
 This loses timeline items when the browser sleeps or the WebSocket reconnects.
@@ -1684,7 +1365,7 @@ This loses timeline items when the browser sleeps or the WebSocket reconnects.
 #### Correct
 
 ```text
-Web/PWA reconnect
+native mobile reconnect
   -> authenticate device
   -> POST /api/agent catch_up(session_id, after_sequence)
   -> apply authoritative timeline events
@@ -1701,7 +1382,7 @@ Catch-up uses the PC-side `AgentManager` timeline as the source of truth.
   workspace summaries, workspace-contained files, Git review/actions, and
   terminal snapshots/actions.
 - The PC desktop runtime remains authoritative. This scenario does not add
-  Web/PWA UI, Provider settings APIs, Relay infrastructure, or public listener
+  native mobile UI, Provider settings APIs, Relay infrastructure, or public listener
   behavior.
 
 ### 2. Signatures
@@ -1843,10 +1524,10 @@ existing service crates.
 ### 1. Scope / Trigger
 
 - Trigger: Phase 4 final child wires authenticated remote Provider settings
-  summaries and safe Provider actions for Web/PWA.
+  summaries and safe Provider actions for native mobile.
 - The PC runtime remains authoritative for Provider profiles, health, usage,
   failover, and injection preview. This scenario does not expose native config
-  export apply/rollback, native import apply, Provider SDK calls from Web/PWA,
+  export apply/rollback, native import apply, Provider SDK calls from native mobile,
   Relay infrastructure, or public listener behavior.
 
 ### 2. Signatures
@@ -1936,7 +1617,7 @@ apps/desktop -> build_router_with_agent_and_workbench(
   row for the safe action.
 - Bad: a read-only browser attempts to run health probes or native config
   export apply; the operation is denied or unavailable before any side effect,
-  and no Provider secret/native file content is returned to Web/PWA.
+  and no Provider secret/native file content is returned to native mobile.
 
 ### 6. Tests Required
 
@@ -1946,7 +1627,7 @@ apps/desktop -> build_router_with_agent_and_workbench(
   `run_health_probes`.
 - Audit redaction tests proving auth tokens and Provider secrets are not
   persisted in remote audit summaries.
-- Web/PWA typecheck/build and screenshot tests for Provider settings capability,
+- native mobile typecheck/build and screenshot tests for Provider settings capability,
   unsupported, loading, error, empty, and permission-gated safe-action states.
 
 ### 7. Wrong vs Correct
@@ -1961,7 +1642,7 @@ POST /api/provider/native-export-apply
 ```
 
 This bypasses the staged native export confirmation contract, exposes native
-configuration detail to Web/PWA, and weakens remote device permissions.
+configuration detail to native mobile, and weakens remote device permissions.
 
 #### Correct
 
@@ -2206,7 +1887,7 @@ trait RemoteAgentAuthContextSource {
 - Reconnect tests start an operation, drop the client transport, query it by id,
   then cancel or complete it without duplicate host authentication.
 - Run `cargo test -p vibex-core -p vibex-remote -p vibex-remote-client` and the
-  GPUI-WASM typecheck after protocol changes.
+  native mobile typecheck after protocol changes.
 
 ### 7. Wrong vs Correct
 
@@ -2229,12 +1910,12 @@ remote typed request + device proof
   -> keep Relay as ciphertext transport only
 ```
 
-## Scenario: Mobile GPUI-WASM Pairing, Auto Transport, And Bounded Streams
+## Scenario: Native Mobile Pairing, Auto Transport, And Bounded Streams
 
 ### 1. Scope / Trigger
 
 - Trigger: `crates/vibex-remote-client` pairing/transport code is changed, or
-  the GPUI-WASM/Capacitor mobile runtime wires the shared GPUI Backend facade to
+  the native mobile client wires the shared GPUI Backend facade to
   v2 Direct/Relay routes.
 - This scenario covers the Rust client boundary: entry-bound one-time pairing,
   Direct-first Auto transport, typed WebRemoteBackend mapping, authoritative
@@ -2347,8 +2028,8 @@ CredentialStore / ClientIdentityStore
   Terminal output is persisted.
 - HTTP JSON bodies are consumed incrementally and rejected once the bounded
   response limit is exceeded; a large `Content-Length` fails before body read.
-  Browser WebSocket callbacks feed a bounded channel and may force reconnect /
-  resync when a slow consumer exhausts capacity.
+  WebSocket callbacks feed a bounded channel and may force reconnect/resync when
+  a slow consumer exhausts capacity.
 
 ### 4. Validation & Error Matrix
 
@@ -2414,18 +2095,18 @@ CredentialStore / ClientIdentityStore
   `shared_facade_tracks_capability_additions_and_removals_after_reconnect`,
   `projection_invalidation_gaps_coalesce_without_pausing_other_domains`, and
   `projection_invalidation_burst_coalesces_without_pausing_agent_events` green.
-- `cargo check -p vibex-remote-client --target wasm32-unknown-unknown --locked`
-  proves the mobile WASM transport, bounded WebSocket channel, storage traits,
-  and shared Backend graph remain WASM-safe.
+- `cargo check -p vibex-mobile --locked` proves the native mobile transport,
+  bounded WebSocket channel, storage traits, and shared Backend graph remain
+  native-platform-safe.
 - Direct smoke must cover `/api/v2/info` probe without offer consumption,
   pairing claim, device identity, WS ticket, v2 crypto confirmation, subscribe,
   heartbeat, disconnect, and reconnect. Relay smoke covers E2EE claim, handoff,
   revoke, and reconnect without cross-route claim replay. A TLS/WSS fixture is
   required before a production LAN/Tailnet release claim; loopback HTTP is
   development evidence only.
-- `pnpm check:mobile-wasm-host` and `pnpm check:wasm-integration` must rebuild or
-  validate source-bound mobile runtime evidence after target-reachable remote
-  changes. Run workspace Rust checks and `git diff --check` before commit.
+- `pnpm check:mobile-native` must validate the native mobile contract after
+  target-reachable remote changes. Run workspace Rust checks and `git diff --check`
+  before commit.
 
 ### 7. Wrong vs Correct
 
@@ -2526,9 +2207,8 @@ The Relay server may provide:
 
 The Relay server must not decrypt business payloads, inspect file paths, inspect
 terminal output, inspect Agent messages, or make authorization decisions beyond
-room-level transport rules. It must not host HTML, GPUI-WASM, PWA metadata,
-icons, fonts, or any other product asset; non-API product/static routes return
-404.
+room-level transport rules. It must not host product application assets;
+non-API product/static routes return 404.
 
 ## Large Payloads
 

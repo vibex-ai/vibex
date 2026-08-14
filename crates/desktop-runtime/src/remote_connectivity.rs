@@ -51,8 +51,6 @@ const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const DIRECT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const DIRECT_PROBE_MAX_BYTES: usize = 128 * 1024;
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const CAPACITOR_CLIENT_ORIGINS: [&str; 2] = ["https://localhost", "capacitor://localhost"];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteConnectivityMethod {
@@ -736,7 +734,6 @@ fn gateway_authority_allowlists(network_origins: Vec<String>) -> (Vec<String>, V
         .collect();
     let allowed_origins = network_origins
         .into_iter()
-        .chain(CAPACITOR_CLIENT_ORIGINS.map(str::to_string))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -3103,7 +3100,7 @@ mod tests {
     }
 
     #[test]
-    fn gateway_allowlists_keep_capacitor_origins_out_of_lan_hosts() {
+    fn gateway_allowlists_keep_client_origins_out_of_lan_hosts() {
         let (hosts, origins) = gateway_authority_allowlists(vec![
             "https://desktop.tailnet.ts.net:8443".to_string(),
             "https://direct.example.test".to_string(),
@@ -3118,7 +3115,6 @@ mod tests {
         );
         assert!(origins.contains(&"https://desktop.tailnet.ts.net:8443".to_string()));
         assert!(origins.contains(&"https://localhost".to_string()));
-        assert!(origins.contains(&"capacitor://localhost".to_string()));
         assert!(!hosts.contains(&"localhost".to_string()));
     }
 
@@ -3663,11 +3659,6 @@ mod tests {
             config
                 .allowed_origins
                 .contains(&"https://localhost".to_string())
-        );
-        assert!(
-            config
-                .allowed_origins
-                .contains(&"capacitor://localhost".to_string())
         );
         assert!(!config.allowed_hosts.contains(&"localhost".to_string()));
         controller

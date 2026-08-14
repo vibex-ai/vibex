@@ -93,6 +93,6 @@ logs.
 
 ## Local Development Note
 
-When a real LAN runtime is not available, use the fixed
-`pnpm dev:mobile-wasm` development host only for local UI/bridge diagnostics.
-It proves neither LAN transport nor a browser product.
+When a real LAN runtime is not available, use the native mobile client for local
+pairing and route diagnostics. This is local development evidence and does not
+replace a physical LAN validation.

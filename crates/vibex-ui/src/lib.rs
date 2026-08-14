@@ -2,17 +2,14 @@
 
 pub mod agent;
 pub mod async_state;
-pub mod browser_gate;
 pub mod component_model;
 pub mod controller;
 pub mod files;
 mod generated_tokens;
 pub mod git;
-pub mod host_bridge;
 pub mod management;
 pub mod shell;
 pub mod terminal;
-pub mod workbench;
 pub mod workflow;
 
 pub use agent::*;
@@ -22,11 +19,9 @@ pub use controller::*;
 pub use files::*;
 pub use generated_tokens::*;
 pub use git::*;
-pub use host_bridge::*;
 pub use management::*;
 pub use shell::*;
 pub use terminal::*;
-pub use workbench::*;
 pub use workflow::*;
 
 /// Canonical structured source used to generate the shared Rust token constants.

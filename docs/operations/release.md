@@ -1,91 +1,56 @@
-# Desktop Release Operations
+# Release Runbook
 
-Desktop owns the stable native application identity. Release and rollback use
-published, exact-hash artifacts built from the current GPUI source tree.
+## Scope
 
-## Channels And Homes
-
-| Channel | App id | Home | Ownership |
-| --- | --- | --- | --- |
-| Preview | `dev.vibex.desktop.preview` | `desktop-preview` | Isolated local preview |
-| RC | `dev.vibex.desktop.rc` | `desktop-rc` | Explicit opt-in candidate |
-| Stable | `dev.vibex.desktop` | `desktop-stable` | Stable native product |
-
-Every channel acquires `.vibex-runtime.lock` before opening SQLite, Agent
-processes, or PTYs. Preview, RC, and Stable must not share a live home.
-
-Channel identity is compiled into the release binary. Use the repository
-wrappers so the binary, application id, package metadata, and output directory
-stay aligned:
-
-```bash
-pnpm package:preview
-pnpm package:rc
-pnpm package:stable
-```
-
-Linux packages contain the GPUI desktop binary and reviewed PDFium runtime.
-They do not contain or host the mobile GPUI-WASM runtime. Outputs are written below
-`target/release-packages/<channel>/`.
-
-## Data Safety
-
-The desktop runtime owns `desktop-ui-state.json` and preserves:
-
-- versioned schema decoding and deterministic migration;
-- atomic private-file replacement and parent-directory synchronization;
-- read-only startup inspection before the runtime lock is acquired;
-- corrupt-file quarantine with bounded backup retention;
-- explicit UI-state backup metadata for release rollback.
-
-SQLite migration, business-data backup/restore, diagnostics, device grants,
-Agent sessions, terminals, and Relay trust remain owned by their Rust services.
-A UI-state failure must not overwrite those stores.
+Vibex release work covers the native desktop package, optional native Android/iOS
+clients, and the transport-only Relay service. Desktop remains the authority for
+all Agent and workspace state.
 
 ## Preflight
 
-Run deterministic checks before producing a candidate:
-
 ```bash
+pnpm install --frozen-lockfile
+pnpm check
+pnpm check:mobile-native
 pnpm check:release
-pnpm smoke:backup
-pnpm smoke:diagnostics
-pnpm e2e:regression
-pnpm release:build-smoke
+pnpm check:licenses
+git diff --check
 ```
 
-`pnpm release:preflight` runs the release checks and writes the bounded report
-to `docs/release/release-preflight.json`. Generate that report only for the
-exact committed candidate it describes.
+Confirm that the public repository contains only source-owned changes and that
+private Trellis task paths are not staged. Do not publish a package from a dirty
+or unverified source identity.
 
-## Candidate Evidence
+## Desktop
 
-A native release claim needs platform-host evidence for every claimed target.
-For Linux, record at least:
+Prepare PDFium, build the selected channel, and run the package-specific native
+content and installation checks:
 
-1. Exact source commit and `Cargo.lock` SHA-256.
-2. Preview, RC, and Stable package SHA-256 values.
-3. Clean install, upgrade, uninstall, and retained-data results.
-4. X11 and Wayland launch, accessibility, process-tree, and input results.
-5. Redacted diagnostics and package privacy scan results.
-6. Rollback to the previously published exact-hash desktop artifact.
+```bash
+pnpm prepare:pdfium --offline
+pnpm package:preview
+```
 
-macOS and Windows require their own build, package, signing, install, native
-behavior, and rollback evidence. Linux results do not establish support on
-another platform.
+RC and Stable builds additionally require the signing, rollback, and operator
+approvals recorded by the release owner.
 
-## Rollback
+## Mobile
 
-1. Stop the failing GPUI process and verify the home lock is released.
-2. Preserve the current UI-state file, SQLite backup manifest, diagnostics, and
-   package identity before mutation.
-3. Restore the prior published desktop artifact by its recorded SHA-256.
-4. Restore data only when the compatibility matrix requires it; do not replace a
-   newer compatible database merely to change the UI artifact.
-5. Verify schema startup, sessions, terminals, device grants, Direct access, and
-   user-self-hosted Relay connectivity with provider-free smokes.
-6. Record the trigger, artifact hashes, backup identity, bounded diagnostics,
-   and final active version.
+Android and iOS are built independently from the desktop package:
 
-Source history is not an operational rollback mechanism. A release rollback
-uses a previously published artifact and compatible data backup.
+```bash
+pnpm package:mobile:android
+pnpm build:mobile:ios
+```
+
+Before a release claim, validate the exact generated artifact on the intended
+device class. Exercise pairing, Direct/Tailnet/Relay route selection, reconnect,
+timeline catch-up, approval resolution, send/stop/continue, and credential
+redaction. Keep signing material, provisioning profiles, and device identifiers
+out of the repository and evidence logs.
+
+## Relay
+
+Relay deployment remains zero-knowledge and transport-only. Run the local smoke,
+then validate the operator's TLS, reverse proxy, NAT, room limits, and health
+endpoints against the same source and Cargo lockfile.

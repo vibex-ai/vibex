@@ -5,11 +5,11 @@ The Relay is a zero-knowledge room router. The PC and paired devices use
 full-duplex WebSocket connections on `/ws`; Remote v2 control, RPC, events, and
 binary frames stay E2EE between the device and PC.
 
-The Relay is transport-only. It does not contain or serve `apps/mobile-wasm`,
-HTML, a Service Worker, a PWA manifest, or any other product UI assets.
+The Relay is transport-only. It does not contain or serve native mobile or
+desktop application assets.
 
 The HTTP pair and command routes under `/api/rooms/:room_id/*` remain a
-versioned compatibility bridge. They are not the primary Web/mobile transport.
+versioned compatibility bridge. They are not the primary native mobile transport.
 The Relay must not decrypt, authorize, store, or log Vibex business payloads.
 
 ## Quick Start

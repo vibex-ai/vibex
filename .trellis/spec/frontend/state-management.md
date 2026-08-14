@@ -2213,7 +2213,7 @@ return api.desktopUiStateImport(request);
 
 ### 1. Scope / Trigger
 
-- Trigger: Native GPUI and Web/Capacitor GPUI need the same Agent timeline,
+- Trigger: Native GPUI desktop and native GPUI mobile need the same Agent timeline,
   approval, file editor, and Git review behavior over either `NativeBackend` or
   `WebRemoteBackend`.
 - The shared controller lives in `vibex-ui`; it may depend on
@@ -2329,7 +2329,7 @@ GitWorkflowController::begin_confirmed_commit() -> GitMutationOperation
   mutation.
 - Sentinel Debug tests format workflow state, approval, file conflict/save, and
   commit models and assert user text/file contents/diffs/messages are absent.
-- WASM checks compile the controller graph; remote capability tests assert file
+- Native mobile checks compile the controller graph; remote capability tests assert file
   move/delete are not advertised; Native desktop checks exercise the same
   facade construction path.
 
@@ -2357,7 +2357,7 @@ if operation.generation == generation
 
 ### 1. Scope / Trigger
 
-- Trigger: Native GPUI and Web/Capacitor GPUI need one recoverable Terminal
+- Trigger: Native GPUI desktop and native GPUI mobile need one recoverable Terminal
   surface and one compact ManagementCenter over Native/Remote Backend facades.
 - Portable ANSI presentation is owned by `vibex-terminal-ui`; PTY/process and
   socket ownership remain in the backend. The shared controller consumes raw
@@ -2439,7 +2439,7 @@ ManagementWorkflowController::revoke_device(request)
 ### 6. Tests Required
 
 - Portable emulator tests cover ANSI/CJK/frame projection on native and the
-  WASM-safe fallback compiles without `polling`, `home`, PTY, or runtime crates.
+  platform-neutral fallback compiles without `polling`, `home`, PTY, or runtime crates.
 - Terminal controller tests cover contiguous replay, rebuild/gap, bounded raw
   memory, read-only input rejection, key-bar touch discoverability, and keyboard
   viewport math.
@@ -2448,7 +2448,7 @@ ManagementWorkflowController::revoke_device(request)
   sensitive `Debug` output.
 - Remote backend tests assert redacted profile/health capabilities and that device
   administration/profile selection are not advertised when unsupported.
-- Run the locked Terminal/UI/Remote tests, WASM graph check, browser gate, and
+- Run the locked Terminal/UI/Remote tests, native mobile gate, and
   workspace Rust quality gate before commit.
 
 ## Scenario: Current-Worktree Changes Lifecycle And Conflict Projection

@@ -196,7 +196,6 @@ impl Default for RemoteGatewayConfig {
                 "https://localhost".to_string(),
                 "https://127.0.0.1".to_string(),
                 "https://[::1]".to_string(),
-                "capacitor://localhost".to_string(),
             ],
             pairing_routes: RemoteGatewayPairingRoutes::default(),
             max_connections: DEFAULT_MAX_CONNECTIONS,
@@ -3710,13 +3709,8 @@ fn origin_allowed(config: &RemoteGatewayConfig, origin: &str, request_host: &str
             .any(|allowed| allowed == origin)
     });
     let scheme_allowed = match config.tls_policy {
-        RemoteGatewayTlsPolicy::LoopbackHttp => {
-            matches!(url.scheme(), "http" | "https")
-                || (url.scheme() == "capacitor" && explicitly_allowed)
-        }
-        RemoteGatewayTlsPolicy::TrustedHttpsProxy => {
-            url.scheme() == "https" || (url.scheme() == "capacitor" && explicitly_allowed)
-        }
+        RemoteGatewayTlsPolicy::LoopbackHttp => matches!(url.scheme(), "http" | "https"),
+        RemoteGatewayTlsPolicy::TrustedHttpsProxy => url.scheme() == "https",
     };
     if !scheme_allowed {
         return false;
@@ -3800,7 +3794,7 @@ fn validate_origin_value(origin: &str) -> VibexResult<()> {
 
 fn normalize_origin(origin: &str) -> Option<String> {
     let url = Url::parse(origin.trim()).ok()?;
-    if !matches!(url.scheme(), "http" | "https" | "capacitor")
+    if !matches!(url.scheme(), "http" | "https")
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
@@ -3811,9 +3805,6 @@ fn normalize_origin(origin: &str) -> Option<String> {
         return None;
     }
     let host = url.host_str()?.to_ascii_lowercase();
-    if url.scheme() == "capacitor" && (host != "localhost" || url.port().is_some()) {
-        return None;
-    }
     let host = if host.parse::<std::net::Ipv6Addr>().is_ok() {
         format!("[{host}]")
     } else {
@@ -4649,7 +4640,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lan_security_perimeter_allows_exact_capacitor_origins_without_loopback_hosts() {
+    async fn lan_security_perimeter_allows_exact_origins_without_loopback_hosts() {
         let directory = tempfile::tempdir().unwrap();
         let mut config = RemoteGatewayConfig::loopback_enabled("127.0.0.1:1428");
         config.deployment_mode = RemoteGatewayDeploymentMode::Lan;
@@ -4658,12 +4649,11 @@ mod tests {
         config.allowed_origins = vec![
             "https://desktop.tailnet.ts.net".to_string(),
             "https://localhost".to_string(),
-            "capacitor://localhost".to_string(),
         ];
         let gateway = test_gateway(&directory, config);
         let router = gateway.router().unwrap();
 
-        for origin in ["https://localhost", "capacitor://localhost"] {
+        for origin in ["https://localhost"] {
             let response = router
                 .clone()
                 .oneshot(

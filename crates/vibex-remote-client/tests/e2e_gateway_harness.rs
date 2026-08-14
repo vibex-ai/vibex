@@ -1,15 +1,14 @@
 #![cfg(not(target_family = "wasm"))]
 
-//! Long-running local controlled-environment harness for the four-target GPUI
-//! workflow E2E matrix (`scripts/e2e-workflows.mjs`).
+//! Long-running local controlled-environment harness for native mobile workflow
+//! validation.
 //!
 //! This is not a regular test: it boots the full `DesktopRuntime` (agent
 //! submission coordinator, runtime selection, provider services, terminals,
 //! RemoteGateway and RelayClientRuntime) with the gateway listener enabled,
 //! writes a `vibex-remote-client-credentials.v1` bundle for the client under
 //! test, and then serves a loopback control API for the runner's fixture and
-//! recovery hooks until the process is killed.  Launch it through
-//! `scripts/e2e-local-env/run-target.mjs`; direct invocation:
+//! recovery hooks until the process is killed. Direct invocation:
 //!
 //! ```text
 //! VIBEX_E2E_ROOT=... VIBEX_E2E_GATEWAY_PORT=... VIBEX_E2E_CONTROL_PORT=... \

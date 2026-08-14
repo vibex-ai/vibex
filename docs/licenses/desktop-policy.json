@@ -92,7 +92,7 @@
     },
     {
       "id": "OFL-1.1",
-      "rationale": "Approved for the Inter variable fonts embedded in the GPUI-WASM mobile runtime; the complete OFL notice is redistributed with the source assets."
+      "rationale": "SIL Open Font License used by reviewed bundled interface fonts."
     },
     {
       "id": "Unicode-3.0",
@@ -237,67 +237,67 @@
       "source": "https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/app-icons"
     },
     {
-      "id": "vibex-mobile-wasm-application-icon",
-      "name": "Vibex GPUI-WASM mobile runtime icon",
+      "id": "vibex-mobile-brand-marks",
+      "name": "Vibex native mobile brand mark",
       "version": "0.1.0-rc.1",
       "ownerPackage": "vibex-ui",
-      "root": "apps/mobile-wasm/host",
-      "files": [
-        "icon.svg"
-      ],
+      "root": "apps/mobile/assets/brand",
       "extensions": [
         ".svg"
       ],
       "expectedFileCount": 1,
-      "treeSha256": "55337e2a7ae8ba53e409bc494537ee94892fa3f5e611492a8d1eb93b15215dbd",
+      "treeSha256": "84a77e160e3059796c7edc27494bedef446102b0eeea6f7ce7945836c3d44e2a",
       "licenseExpression": "AGPL-3.0-or-later",
-      "source": "https://github.com/vibex-ai/vibex/blob/main/apps/mobile-wasm/host/icon.svg",
-      "licenseEvidence": "Repository-authored mobile runtime treatment of the registered Vibex mark; distributed under the repository AGPL-3.0-or-later license."
+      "source": "https://github.com/vibex-ai/vibex/tree/main/apps/mobile/assets/brand"
+    },
+    {
+      "id": "vibex-mobile-native-icons",
+      "name": "Vibex native mobile Lucide controls",
+      "version": "0.1.0-rc.1",
+      "ownerPackage": "vibex-ui",
+      "root": "apps/mobile/assets/icons",
+      "extensions": [
+        ".svg"
+      ],
+      "expectedFileCount": 6,
+      "treeSha256": "fb3f3436dfeb9244958d40141940d68244ef2f8ae7c6ddd82676f1c9a19f9a08",
+      "licenseExpression": "ISC",
+      "source": "https://github.com/lucide-icons/lucide",
+      "licenseEvidence": "The native mobile toolbar controls are derived from Lucide SVG paths and redistributed under the Lucide ISC license."
     }
   ],
   "fontInputs": [
     {
-      "id": "vibex-mobile-wasm-inter-variable-fonts",
-      "name": "Inter variable mobile runtime fonts",
-      "version": "5.2.8",
+      "id": "vibex-mobile-ibm-plex-sans",
+      "name": "IBM Plex Sans mobile interface fonts",
+      "version": "vendor/zed@49d9758",
       "ownerPackage": "vibex-ui",
-      "root": "apps/mobile-wasm/assets/fonts",
-      "files": [
-        "OFL.txt",
-        "README.md",
-        "inter-latin-ext-wght-normal.ttf",
-        "inter-latin-wght-normal.ttf"
-      ],
+      "root": "apps/mobile/assets/fonts/ibm-plex-sans",
       "extensions": [
-        ".md",
         ".ttf",
         ".txt"
       ],
-      "expectedFileCount": 4,
-      "treeSha256": "5a0386b42c02a52ac6e574121619cff2ba36e7f90c4069c1e7c7cf56766475ca",
+      "expectedFileCount": 5,
+      "treeSha256": "73c85a21223a7956c41bf54613641708be246364aa7386eda38e1d5623a760a0",
       "licenseExpression": "OFL-1.1",
-      "source": "https://www.npmjs.com/package/@fontsource-variable/inter/v/5.2.8",
-      "licenseEvidence": "The shared UI token family owns this font contract. The TTF files are deterministic decompressions of the locked Fontsource WOFF2 assets embedded by the GPUI-WASM mobile runtime; OFL.txt is redistributed unchanged."
+      "source": "https://github.com/zed-industries/zed/tree/49d9758/assets/fonts/ibm-plex-sans",
+      "licenseEvidence": "Four upstream IBM Plex Sans faces and the complete SIL Open Font License 1.1 text are bundled for native mobile rendering."
     },
     {
-      "id": "vibex-mobile-wasm-wenquanyi-cjk-fallback",
-      "name": "WenQuanYi Micro Hei CJK fallback",
+      "id": "vibex-mobile-wqy-microhei",
+      "name": "WenQuanYi Micro Hei mobile CJK fallback",
       "version": "0.2.0-beta",
       "ownerPackage": "vibex-ui",
-      "root": "apps/mobile-wasm/assets/fonts",
-      "files": [
-        "APACHE-2.0.txt",
-        "wqy-microhei.ttc"
-      ],
+      "root": "apps/mobile/assets/fonts/wqy-microhei",
       "extensions": [
         ".ttc",
         ".txt"
       ],
       "expectedFileCount": 2,
-      "treeSha256": "5c1ac72fd0f922d911d5e31f8ee444dd719fcb34755b2893f5e9668a14ca775e",
+      "treeSha256": "a3f978f28b2b2efa4b59976274ff5da74c6d1e981ef2a46ded9e3533aa4f09f9",
       "licenseExpression": "Apache-2.0",
-      "source": "https://wenq.org/wqy2/index.cgi?MicroHei",
-      "licenseEvidence": "WenQuanYi Micro Hei 0.2.0-beta is embedded as a CJK fallback for the GPUI-WASM mobile runtime. The Apache-2.0 license text is redistributed unchanged."
+      "source": "https://sourceforge.net/projects/wqy/files/wqy-microhei/0.2.0-beta/",
+      "licenseEvidence": "The reviewed TTC payload has SHA-256 e4bca8df123ce01b104780f576ea1a58b9a5ff1662a91124b6d3180cb6c88212 and is accompanied by the complete Apache-2.0 license."
     }
   ],
   "nativeInputs": [

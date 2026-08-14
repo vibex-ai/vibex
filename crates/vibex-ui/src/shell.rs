@@ -83,19 +83,6 @@ impl ShellLayout {
         Self::resolve_for_content(width, height, ShellContentMinimums::default())
     }
 
-    /// Resolve the compact-first shell used by the Capacitor mobile runtime.
-    /// A Wide workbench is intentionally not a mobile product surface.
-    pub fn resolve_mobile(width: u32, height: u32) -> Self {
-        Self::resolve_for_content(
-            width,
-            height,
-            ShellContentMinimums {
-                wide: f32::MAX,
-                ..ShellContentMinimums::default()
-            },
-        )
-    }
-
     pub fn resolve_for_content(width: u32, height: u32, minimums: ShellContentMinimums) -> Self {
         let viewport_width = width.max(ABSOLUTE_MIN_WIDTH);
         let viewport_height = height.max(ABSOLUTE_MIN_HEIGHT);
@@ -425,22 +412,6 @@ mod tests {
             },
         );
         assert_eq!(layout.kind, ShellKind::Medium);
-    }
-
-    #[test]
-    fn mobile_layout_never_selects_the_wide_shell() {
-        assert_eq!(
-            ShellLayout::resolve_mobile(390, 844).kind,
-            ShellKind::Compact
-        );
-        assert_eq!(
-            ShellLayout::resolve_mobile(900, 720).kind,
-            ShellKind::Medium
-        );
-        assert_eq!(
-            ShellLayout::resolve_mobile(1_600, 900).kind,
-            ShellKind::Medium
-        );
     }
 
     #[test]

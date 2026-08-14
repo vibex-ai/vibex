@@ -8,8 +8,8 @@ Current evidence: [Architecture Baseline](../guides/architecture-baseline.md), G
 source-bound GPUI parity evidence.
 
 React/Tailwind/shadcn/Radix sections retained below are historical evidence from
-the deleted legacy apps, not maintenance contracts. Their paths, APIs, and test
-instructions must not be used to build current GPUI or GPUI-WASM components.
+deleted legacy apps, not maintenance contracts. Their paths, APIs, and test
+instructions must not be used to build current GPUI components.
 
 ## Layout Components
 
@@ -577,7 +577,7 @@ information.
 
 ## Styling
 
-- Use semantic tokens from `crates/vibex-ui/theme/tokens.json` across native and WASM GPUI.
+- Use semantic tokens from `crates/vibex-ui/theme/tokens.json` across desktop and native mobile GPUI.
 - Preserve dark mode as a first-class path.
 - Use shared GPUI/gpui-component primitives; legacy React may keep shadcn/Radix until cutover.
 - GPUI delete, remove, clear, and destructive close actions must use the shared

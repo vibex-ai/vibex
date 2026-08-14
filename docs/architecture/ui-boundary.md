@@ -3,105 +3,60 @@
 ## Authority
 
 `.trellis/spec/guides/architecture-baseline.md` is the product and architecture
-authority. `apps/desktop` is the only visual, interaction, and information
-architecture source.
+authority. `apps/desktop` is the information-architecture and Agent-session
+baseline. `apps/mobile` derives the same session semantics through typed remote
+projections and applies the native compact visual treatment used by Zedra.
 
 ## Product Boundary
 
-- Desktop uses GPUI with an in-process `NativeBackend` and is the complete local
-  product.
-- `apps/mobile-wasm` uses GPUI-WASM with `WebRemoteBackend` and exposes only
-  Compact/Medium mobile shells.
-- `apps/mobile` packages only `apps/mobile-wasm/dist` under the
-  `dev.vibex.remote` application identity.
-- There is no WebUI/PWA product. A fixed browser host may load the mobile
-  runtime for local development and automation only. Desktop, Relay, and public
-  hosting must not serve the runtime assets.
-- DesktopRuntime is authoritative for Agent, files, Git, PTY, Provider config,
-  device permission, sequence/revision, and mutation results.
-- Wide, Medium, and Compact are shells over one component and state model.
-- V1 supports Direct LAN/private-network connections and user self-hosted Relay.
-  It does not provide an official Vibex Relay.
+- `apps/desktop` is the complete local GPUI workbench and owns the
+  `DesktopRuntime`.
+- `apps/mobile` is a native GPUI iOS/Android client built against
+  `vendor/zed`'s `gpui_ios` and `gpui_android` implementations.
+- Mobile renders a GUI Agent timeline: user messages, Markdown responses,
+  process/tool details, approvals, and the composer. It does not replace the
+  session page with a terminal UI.
+- Mobile never owns Agent processes, filesystem state, Git state, PTYs, provider
+  configuration, or permission authority. It sends typed mutations to the PC.
+- Relay is an encrypted transport only. It does not serve application assets or
+  become a second database.
 
 ## Shared Code Boundary
 
-Shared across shells:
+Shared across desktop and mobile:
 
-- Rust domain DTOs and request/response semantics in `crates/core`.
-- Framework-neutral projection/state in `crates/desktop-model`.
-- DesktopRuntime and Agent/File/Git/Terminal/Provider services.
-- Remote/Relay service behavior and protocol tests.
-- GPUI theme, primitives, icons, View behavior, and evidence fixtures.
+- Domain DTOs and request/response semantics in `crates/core`.
+- Framework-neutral timeline and session projections in `crates/desktop-model`.
+- Backend capability contracts and workflow state in `crates/vibex-backend` and
+  `crates/vibex-ui`.
+- Remote/Relay protocol behavior and tests.
 
-Not permitted:
+The native mobile renderer owns only platform bootstrap, pairing/storage, input,
+and the compact composition of those shared projections. It must not introduce a
+second Agent protocol, a local authority, or a separate terminal-first session
+experience.
 
-- A Capacitor packaging relationship to any non-GPUI Web artifact.
-- A second component family for touch surfaces.
+## Visual Contract
 
-## Shared Design Contract
+The structured token source is `crates/vibex-ui/theme/tokens.json`; generated Rust
+values remain the only token implementation source. Desktop and mobile use the
+same semantic colors, typography, radii, and state names. Mobile may reduce
+density, use a session drawer, and turn auxiliary surfaces into sheets, but it
+must preserve desktop Agent timeline semantics and explicit approval actions.
 
-The structured token source is `crates/vibex-ui/theme/tokens.json`. It owns
-semantic light/dark colors, syntax highlighting, typography defaults, radii,
-spacing, border widths, and shadow policy. Generated Rust is a derived artifact.
-Desktop and WASM consumers use the same crate and source identity.
+The native mobile surface follows Zedra's restrained dark palette, compact spacing,
+small radii, clear hierarchy, and edge-drawer navigation. Product-specific
+content remains Vibex GUI session content rather than Zedra's terminal workflow.
 
-The source uses schema `vibex-design-tokens.v1` and binds the exact GPUI revision
-from the `vendor/zed` submodule plus the gpui-component revision resolved by the
-root `Cargo.lock`. It freezes 53 semantic colors per theme and the locked
-gpui-component Default light/dark highlight themes.
-`scripts/generate-tokens.mjs` validates the schema and produces only
-`crates/vibex-ui/src/generated_tokens.rs`. `apps/desktop/src/theme.rs` consumes the
-shared colors, typography policy, radii, shadow policy, and syntax highlight values
-through the crate.
+## Required Evidence
 
-Component semantics are stable across shells:
+```text
+pnpm check:tokens
+pnpm check:graph
+pnpm check:mobile-native
+cargo test -p vibex-ui --locked
+cargo test -p vibex-mobile --locked
+```
 
-- Agent timeline, approval, diff, file tree, Terminal, and ManagementCenter names
-  and states remain shared.
-- Compact may reorder and reduce density, and a dialog/popover may become a sheet.
-  It must not change brand language or create a second component family.
-- Critical actions cannot depend on hover. Touch surfaces provide explicit buttons,
-  More sheets, or a documented long-press action.
-
-## Asset And Workbench Inventory
-
-The canonical icon and brand inventory is `apps/desktop/assets/icons`:
-
-- `vibex-mark.svg` is the product mark.
-- Agent and model brands include Claude, OpenAI, Gemini, Copilot, OpenCode, and Qwen.
-- `open-tools/` owns the reviewed IDE/tool brand set.
-- File-kind, navigation, approval, Agent, Git, Terminal, import/download, and panel
-  action glyphs use the checked-in GPUI assets or gpui-component primitives.
-
-Future extraction moves reviewed GPUI assets into the shared crate without
-redrawing them. Multicolor brand assets render as images; monochrome action glyphs
-follow semantic theme color.
-
-The workbench/state inventory is:
-
-- Wide: project/session rail, primary workspace, contextual right rail, and optional
-  Terminal; Medium retains one primary plus one auxiliary surface.
-- Compact: one task stack with host/project/session/detail navigation and explicit
-  sheets for auxiliary surfaces; it reorders shared domain components rather than
-  introducing mobile-specific copies.
-- Agent timeline, Permission, Plan, Tool call, command, Diff, files, Git, Terminal,
-  ManagementCenter, preview, and error/system cards retain their existing names and
-  state semantics.
-- Baselines cover light/dark, Chinese text, loading, empty, streaming, error,
-  reconnecting, approval-pending, destructive confirmation, and recovery states.
-
-## Baseline Evidence
-
-GPUI Desktop evidence is the visual/interaction baseline:
-
-- `pnpm check:tokens`
-- `pnpm check:graph`
-- `pnpm check:foundation:linux`
-- `pnpm check:acp`
-- `pnpm check:code-workbench`
-- `pnpm check:terminal`
-- `pnpm check:native-content`
-
-Required structural viewports are 360x620, 360x800, 390x844, 768x1024, 1200x800,
-and 1440x900. Evidence must state which dimensions are physical, headless,
-model-only, or deferred; one category cannot silently satisfy another.
+Platform SDK builds are separate evidence: Android requires the Android SDK/NDK
+and `cargo-ndk`; iOS requires Xcode, XcodeGen, and the Apple Rust targets.

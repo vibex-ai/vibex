@@ -9863,21 +9863,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "vibex-mobile-wasm"
+name = "vibex-mobile"
 version = "0.1.0-rc.1"
 dependencies = [
+ "futures-channel",
+ "futures-util",
  "gpui",
- "gpui-component",
+ "gpui_android",
  "gpui_platform",
- "js-sys",
+ "gpui_tokio",
  "serde",
  "serde_json",
+ "tempfile",
+ "unicode-segmentation",
+ "url",
  "vibex-backend",
  "vibex-core",
+ "vibex-desktop-model",
+ "vibex-markdown",
  "vibex-remote-client",
  "vibex-ui",
- "wasm-bindgen",
- "wasm-bindgen-futures",
 ]
 
 [[package]]
@@ -10005,8 +10010,6 @@ dependencies = [
 name = "vibex-ui"
 version = "0.1.0-rc.1"
 dependencies = [
- "gpui",
- "gpui-component",
  "serde",
  "serde_json",
  "tempfile",

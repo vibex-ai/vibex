@@ -2,7 +2,7 @@
 members = [
   "apps/desktop",
   "apps/relay-server",
-  "apps/mobile-wasm",
+  "apps/mobile",
   "crates/agent",
   "crates/agent-acp",
   "crates/agent-claude",

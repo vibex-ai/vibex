@@ -1,9 +1,10 @@
-//! WASM-safe remote backend for the shared GPUI contracts.
+//! Platform-neutral remote backend for the shared GPUI contracts.
 //!
 //! The crate deliberately keeps the wire protocol below the backend adapters:
 //! views/controllers only see the seven domain traits from
-//! `vibex-backend`. Direct and future Relay transports share the same
-//! request/event/synchronisation machinery.
+//! `vibex-backend`. Direct and Relay transports share the same request/event/
+//! synchronisation machinery; native mobile and desktop clients remain the
+//! product hosts.
 
 #![forbid(unsafe_code)]
 

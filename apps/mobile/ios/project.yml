@@ -1,0 +1,43 @@
+name: Vibex
+options:
+  minimumXcodeGenVersion: "2.45.0"
+  projectFormat: xcode15_3
+  bundleIdPrefix: ai.vibex
+  deploymentTarget:
+    iOS: "17.0"
+
+settings:
+  base:
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+
+targets:
+  Vibex:
+    type: application
+    platform: iOS
+    sources:
+      - path: Vibex
+    dependencies:
+      - framework: VibexFFI.xcframework
+        embed: false
+      - sdk: Metal.framework
+      - sdk: MetalKit.framework
+      - sdk: QuartzCore.framework
+      - sdk: CoreFoundation.framework
+      - sdk: CoreGraphics.framework
+      - sdk: CoreText.framework
+      - sdk: UIKit.framework
+      - sdk: Security.framework
+      - sdk: Network.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.vibex.mobile
+        PRODUCT_NAME: Vibex
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Vibex
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+        CLANG_ENABLE_OBJC_ARC: YES
+        HEADER_SEARCH_PATHS: ["$(inherited)", "$(SRCROOT)/Headers"]
+        OTHER_LDFLAGS: ["$(inherited)", "-ObjC", "-all_load"]

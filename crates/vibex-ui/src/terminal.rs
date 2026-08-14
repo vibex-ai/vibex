@@ -21,7 +21,7 @@ use vibex_core::{
 };
 use vibex_terminal_ui::{TerminalEmulator, TerminalFrameSnapshot, TerminalModeSnapshot};
 
-use crate::{HostViewportSnapshot, MIN_TOUCH_TARGET_PX, ShellKind};
+use crate::{MIN_TOUCH_TARGET_PX, ShellKind};
 
 pub const TERMINAL_WORKFLOW_SCHEMA_VERSION: &str = "vibex-terminal-workflow.v1";
 pub const TERMINAL_RAW_FRAME_LIMIT: usize = 2_048;
@@ -133,11 +133,11 @@ pub struct TerminalViewport {
 }
 
 impl TerminalViewport {
-    pub fn from_host(snapshot: &HostViewportSnapshot) -> Self {
-        let width_px = finite_dimension(snapshot.width);
-        let height_px = finite_dimension(snapshot.height);
-        let keyboard_inset_px = finite_dimension(snapshot.keyboard_inset);
-        let safe_bottom_px = finite_dimension(snapshot.safe_area.bottom);
+    pub fn from_native(width: f32, height: f32, keyboard_inset: f32, safe_bottom: f32) -> Self {
+        let width_px = finite_dimension(width);
+        let height_px = finite_dimension(height);
+        let keyboard_inset_px = finite_dimension(keyboard_inset);
+        let safe_bottom_px = finite_dimension(safe_bottom);
         let visible_height_px = height_px.saturating_sub(keyboard_inset_px.max(safe_bottom_px));
         Self {
             width_px,
@@ -1335,8 +1335,14 @@ impl TerminalWorkflowController {
         outcome
     }
 
-    pub fn apply_host_viewport(&mut self, snapshot: &HostViewportSnapshot) -> TerminalViewport {
-        let viewport = TerminalViewport::from_host(snapshot);
+    pub fn apply_native_viewport(
+        &mut self,
+        width: f32,
+        height: f32,
+        keyboard_inset: f32,
+        safe_bottom: f32,
+    ) -> TerminalViewport {
+        let viewport = TerminalViewport::from_native(width, height, keyboard_inset, safe_bottom);
         self.state.viewport = Some(viewport);
         viewport
     }
@@ -1585,17 +1591,7 @@ mod tests {
 
     #[test]
     fn viewport_subtracts_keyboard_and_safe_area() {
-        let viewport = TerminalViewport::from_host(&HostViewportSnapshot {
-            width: 390.0,
-            height: 844.0,
-            safe_area: crate::HostInsets {
-                bottom: 34.0,
-                ..Default::default()
-            },
-            keyboard_visible: true,
-            keyboard_inset: 300.0,
-            keyboard_source: crate::HostKeyboardSource::Capacitor,
-        });
+        let viewport = TerminalViewport::from_native(390.0, 844.0, 300.0, 34.0);
         assert_eq!(viewport.visible_height_px, 544);
         assert!(viewport.keeps_recent_output_visible());
     }

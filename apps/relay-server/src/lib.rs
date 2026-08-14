@@ -499,7 +499,7 @@ pub fn build_router_with_state(state: RelayServerState) -> RelayServerRouter {
         .with_state(state)
 }
 
-/// The Capacitor-hosted mobile runtime reaches the zero-knowledge Relay
+/// Native mobile clients reach the zero-knowledge Relay
 /// cross-origin. The Relay carries only E2EE payloads and uses no cookies or
 /// ambient credentials, so wildcard non-credentialed CORS does not widen the
 /// trust model.

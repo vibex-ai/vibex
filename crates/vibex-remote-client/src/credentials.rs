@@ -43,10 +43,10 @@ pub trait CredentialStore: BackendBound {
     fn clear(&self) -> BackendFuture<'_, ()>;
 }
 
-/// Durable store for the paired device's long-lived identity.  It is separate
-/// from [`CredentialStore`] so a Capacitor host can keep the private key in a
-/// secure-storage plugin while browser builds use a scoped Web Storage key.
-/// Ephemeral connection/session keys never cross this boundary.
+/// Durable store for the paired device's long-lived identity. It is separate
+/// from [`CredentialStore`] so native clients can keep the private key in an
+/// OS-backed secure store. Ephemeral connection/session keys never cross this
+/// boundary.
 pub trait ClientIdentityStore: BackendBound {
     fn load(&self) -> BackendFuture<'_, Option<ClientDeviceIdentity>>;
     fn save(&self, identity: ClientDeviceIdentity) -> BackendFuture<'_, ()>;
@@ -161,8 +161,9 @@ impl ClientIdentityStore for MemoryClientIdentityStore {
     }
 }
 
-/// Browser Web Storage implementation.  Capacitor can provide the same trait
-/// with a Secure Storage bridge without changing `WebRemoteBackend`.
+/// Browser Web Storage implementations remain available for library consumers
+/// that compile the transport for a browser host. The native mobile product
+/// uses its app-sandbox credential store instead.
 #[cfg(target_family = "wasm")]
 #[derive(Clone)]
 pub struct WebStorageCredentialStore {

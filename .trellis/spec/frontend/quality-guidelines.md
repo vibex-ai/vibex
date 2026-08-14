@@ -7,11 +7,11 @@ control for each form factor.
 Current evidence: [Architecture Baseline](../guides/architecture-baseline.md), GPUI Desktop source-bound
 evidence, and current runtime/protocol tests.
 
-The long React/Tauri/Web-PWA scenarios retained below are historical validation
-evidence for deleted or completed migration surfaces. Their paths, commands, and
-writers are not current gates and must not be restored. New UI quality evidence
-must cover shared GPUI components, native/WASM dependency isolation, Wide on
-native desktop, Medium/Compact in the mobile runtime, WebView input, and the
+The long React/Tauri scenarios retained below are historical validation evidence
+for deleted migration surfaces. Their paths, commands, and writers are not
+current gates and must not be restored. New UI quality evidence must cover
+shared GPUI components, platform dependency isolation, Wide on native desktop,
+the compact native mobile client, native input, and the
 NativeBackend/WebRemoteBackend boundary.
 
 ## Review Checklist
@@ -19,7 +19,7 @@ NativeBackend/WebRemoteBackend boundary.
 - UI renders Vibex timeline and capability types, not raw provider SDK payloads.
 - Wide screens follow the GPUI Desktop workbench model; Medium/Compact recompose the
   same domain components.
-- The mobile runtime remains a remote client and never runs a local
+- The native mobile client remains a remote client and never runs a local
   Agent/Git/PTY/filesystem.
 - Permission, Plan, Tool call, Diff, and command cards are collapsible.
 - Destructive remote actions require clear confirmation.
@@ -41,12 +41,13 @@ Desktop:
   right rail is open; keep dense forms stacked or wait until `2xl`/a proven
   container width before enabling secondary columns.
 
-Mobile:
+Native mobile:
 - Single-column list-to-detail flows.
 - Bottom or thumb-accessible action bars.
 - Compact timeline cards.
 - Permission approvals optimized for quick review.
-- Terminal command-card summaries where raw terminal output is hard to read.
+- GUI Agent timeline content remains primary; terminal data is shown only in the
+  shared terminal surface when the session exposes it.
 
 ## Test Expectations
 
@@ -60,503 +61,102 @@ Add tests or story coverage for:
 - Mobile layout for session detail, Git change, terminal, and Provider switch.
 - Dark mode snapshots or visual checks for major screens.
 
-## Scenario: Mobile GPUI-WASM Runtime Product Boundary
+## Scenario: Native Mobile GPUI Contract
 
 ### 1. Scope / Trigger
 
-- Trigger: changing `apps/mobile-wasm`, `apps/mobile`, the mobile shell
-  resolver, Capacitor host bridges, pairing intake, or source-bound mobile
-  evidence.
-- This is the current product contract. Browser/PWA scenarios retained later in
-  this file are pre-retirement history and must not be used as implementation
-  requirements.
+- Trigger: changing `apps/mobile`, shared Agent timeline projections, native
+  pairing/storage/input code, or the vendored mobile platform integration.
+- The contract covers Android and iOS source structure and the GUI session
+  behavior. It does not require a platform SDK on every development machine.
 
 ### 2. Signatures
 
 ```text
-apps/mobile/capacitor.config.ts.webDir = "../mobile-wasm/dist"
-ShellLayout::resolve_mobile(width, height) -> Compact | Medium
-
-vibex-mobile-wasm-build.v1 {
-  runtimeRole: "capacitor_mobile_runtime",
-  browserHost: "development_and_test_only",
-  buildId, gitCommit, wasmSha256, glueSha256, staticSha256
-}
-
-PairingEntryHint {
-  schemaVersion: "vibex-pairing-entry.v1",
-  kind: "mobile_app" | "origin" | "untrusted_custom_scheme",
-  origin?, transport?
-}
-
-pnpm dev:mobile-wasm
-pnpm check:mobile-wasm-host
-pnpm check:wasm-integration
-pnpm --filter @vibex/mobile validate
+cargo check -p vibex-mobile --locked
+cargo test -p vibex-mobile --locked
+node scripts/check-mobile-native.mjs
+node scripts/check-mobile-native.mjs --self-test
+pnpm build:mobile:android
+pnpm build:mobile:ios
 ```
 
 ### 3. Contracts
 
-- `apps/mobile-wasm` is a Capacitor runtime, not a WebUI or PWA. Its browser
-  host is fixed local development/automation infrastructure and carries no
-  deployment, browser-support, or release claim.
-- The mobile runtime resolves only Compact/Medium. A wide development viewport
-  must still resolve Medium; only native Desktop may present Wide.
-- A build emits `index.html`, host JS/CSS, icons, `build.json`, WASM glue, and
-  WASM bytes. It must not emit a Service Worker, PWA manifest, offline page, or
-  browser-install metadata.
-- `apps/mobile` packages only `apps/mobile-wasm/dist`. It must never download a
-  hosted runtime, fall back to a Relay/Desktop Web page, or fork auth/transport
-  state into a second UI tree.
-- Capacitor credentials use secure storage and `clientType: "mobile"`.
-  Development-host storage is a diagnostic fallback only and is not a product
-  credential store.
-- Installed-app pairing uses `vibex://open/<transport>#/pair/<offer>`. A
-  `mobile_app` hint has no origin and selects only `direct`, `tailnet`, or
-  `self_hosted_relay` already present in the verified offer. HTTPS App/Universal
-  Links use `/open/<transport>` and produce the same origin-free hint. When a
-  transport has several candidates, the claim uses the first valid candidate in
-  signed offer order and the committed credential retains all candidates for
-  Auto probing. An `origin` hint is accepted only by the fixed development host
-  and likewise cannot inject a URL.
-- Pairing fragments are scrubbed before asynchronous work. Credentials, offer
-  challenges, private keys, endpoints, prompt/file/diff/terminal content, and
-  plugin payloads stay out of public Gate state, DOM, logs, and evidence.
-- Source identity includes the complete target-specific local Cargo dependency
-  graph plus host/evidence inputs. Any reachable change invalidates runtime,
-  Android, and workflow evidence until its writer recaptures it.
+- `apps/mobile` is a Rust GPUI crate. Android enters through NativeActivity and
+  `gpui_android`; iOS exports the Rust entry point and uses `gpui_ios`' UIKit
+  loop. No DOM, browser host, or downloaded application bundle is part of the
+  product.
+- The mobile view consumes `AgentWorkflowController` and the shared desktop
+  timeline projection. User bubbles, Agent Markdown, process/tool details,
+  approval cards, and the composer remain GUI components; a terminal cannot be
+  substituted for the session page.
+- Zedra alignment is visual and ergonomic: restrained dark surfaces, compact
+  spacing, small radii, clear secondary text, edge drawer navigation, and
+  thumb-safe explicit actions. Vibex labels, state semantics, and approval
+  behavior remain authoritative.
+- Pairing, route selection, reconnect, and credential storage stay outside View
+  rendering. Credentials are validated, atomically persisted, and redacted from
+  diagnostics; the PC remains the state authority.
+- Native fonts are loaded before opening the first window. IBM Plex Sans is the
+  interface family and the reviewed WenQuanYi payload is the CJK fallback; both
+  remain registered in the license gate.
+- `Window::insets()` is the only safe-area/IME geometry source. GPUI refreshes
+  the window when platform insets change, and the root composition applies the
+  effective top/right/bottom/left padding.
+- Native text fields explicitly move GPUI focus on touch and request the soft
+  keyboard. Pairing honors the transport encoded in the trusted
+  `vibex://open/<transport>` entry instead of silently preferring another route.
+- The session drawer follows the pointer continuously after a horizontal
+  threshold, cancels clearly vertical pans, then snaps by final direction or
+  half-width with a faster close animation. A tap remains a tap and must not
+  steal vertical timeline scrolling.
+- A mobile client can create a session through the shared typed backend using
+  an available runtime and desktop-owned workspace. Pending ACP elicitation
+  forms render as explicit text/number/boolean/single/multi controls and resolve
+  through `AgentWorkflowController`; they are never silently omitted.
+- Every interactive control has a stable size and an explicit pressed/disabled/
+  busy state. Loading, empty, streaming, reconnecting, error, and pending
+  approval states must be renderable without layout jumps.
 
 ### 4. Validation & Error Matrix
 
 | Condition | Required result |
 | --- | --- |
-| Runtime selects Wide at any viewport | Fail mobile host and shell tests. |
-| PWA/Service Worker/offline asset is emitted | Fail build/integration checks. |
-| Browser host is labeled deployable or release-supported | Fail runtime-build/evidence validation. |
-| Mobile hint carries an origin, unsupported transport, or unmatched route | `remote_pairing_entry_hint_invalid` or `_route_mismatch`; send no claim. |
-| Custom scheme is not a valid Vibex mobile route | `remote_pairing_entry_untrusted`; persist nothing. |
-| Credential has a non-mobile client type | Reject before storage/configuration. |
-| Runtime source/evidence/build identity differs | Reject stale evidence; rerun its writer. |
-| Android/iOS physical evidence is absent | Package checks may pass; physical release status remains pending. |
+| Old mobile runtime tree or host metadata returns | `check-mobile-native` fails. |
+| Mobile view bypasses the shared controller or renders a terminal-only session | Review fails; no platform build claim. |
+| Pairing record is malformed, mismatched, or not redacted | Storage validation fails closed and the record is cleared. |
+| Stored connection cannot reach Desktop | Keep the credential and show Retry plus explicit Disconnect; do not force re-pairing. |
+| No session exists | Offer typed session creation after runtime/workspace catalogs load; never make the composer a silent no-op. |
+| Agent requests elicitation input | Render and validate the compact form, or show a typed unsupported-field error; never drop the request. |
+| Safe-area or IME inset changes | Refresh and recompute root padding from `Window::insets()` without hard-coded device geometry. |
+| Approval or composer action is unavailable while the server is busy | The control is disabled with an explicit busy state; no duplicate mutation is sent. |
+| Timeline generation/sequence is stale | Ignore the result and request authoritative refresh. |
 
-### 5. Good / Base / Bad Cases
+### 5. Tests Required
 
-- Good: Desktop emits a `vibex://open/tailnet#/pair/...` QR, the installed app
-  selects the offered Tailnet route, commits a mobile credential transactionally,
-  and Auto transport later uses all verified routes.
-- Base: Chromium loads the fixed development host at 1280px, resolves Medium,
-  proves nonblank pixels and host bridges, and records `releaseClaim: "none"`.
-- Bad: publish `dist`, register a Service Worker, restore Wide Web, accept a
-  caller-provided claim URL, save a browser credential as a mobile credential,
-  or treat development-host automation as mobile-device proof.
+- `cargo test -p vibex-mobile --locked` covers storage permissions/atomicity and
+  malformed-file removal, secret-redacted `Debug`, UTF-8/UTF-16 IME editing,
+  drawer snap decisions, Markdown block projection, and route bundle validation.
+- `cargo test -p vibex-ui --locked` covers the shared controller, timeline
+  projection, approval surfaces, and compact shell semantics.
+- `node scripts/check-mobile-native.mjs --self-test` covers the negative source
+  contract, native entry points, vendored platform dependencies, GUI session
+  markers, and forbidden legacy paths.
+- Android and iOS device validation must separately exercise touch/keyboard,
+  drawer navigation, safe-area/IME changes, timeline streaming, approval and
+  elicitation resolution, new-session creation, send/stop/continue, reconnect,
+  bundled Latin/CJK text, and credential redaction before a release claim.
 
-### 6. Tests Required
-
-- `cargo test -p vibex-ui --locked` covers `resolve_mobile` and host redaction.
-- `cargo test -p vibex-remote-client pairing::tests --locked` covers mobile
-  transport selection, origin isolation, mismatch, and untrusted schemes.
-- `cargo +nightly-2026-07-24 check -p vibex-mobile-wasm --target
-  wasm32-unknown-unknown --locked` validates the WASM graph.
-- `pnpm check:wasm-integration`, `pnpm check:mobile-wasm-host`,
-  `pnpm --filter @vibex/mobile validate`, `pnpm check:graph`, and
-  `pnpm check:licenses` cover source, package, and boundary drift.
-- Android/iOS physical claims require exact-artifact device evidence; the local
-  development host cannot substitute.
-
-### 7. Wrong vs Correct
-
-#### Wrong
+### 6. Wrong vs Correct
 
 ```text
-apps/mobile -> https://relay.example.com/index.html
-wide browser viewport -> WideShell
-vibex://open#/pair/... + caller-controlled claim URL
+Wrong: copy a terminal screen into mobile, keep a second session reducer, or
+       load a remote page at runtime.
+Correct: native GPUI -> shared AgentWorkflowController -> authoritative desktop
+         timeline -> compact GUI cards and composer.
 ```
 
-#### Correct
-
-```text
-apps/mobile -> bundled ../mobile-wasm/dist
-any mobile-runtime viewport -> Compact | Medium
-vibex://open/<offered-transport>#/pair/... -> select exactly one offered route
-```
-
-## Retired Historical Scenario: GPUI-WASM Browser And Mobile Gate Evidence
-
-> Retired with the WebUI/PWA product. This section records the earlier browser
-> feasibility and evidence design only; its Wide/Firefox/PWA/release clauses are
-> not current requirements. Use the scenario above for implementation.
-
-### 1. Scope / Trigger
-
-- Trigger: adding or changing the GPUI-WASM entry, browser host bridge, shared
-  responsive fixture, Capacitor shell, Android package, or their evidence.
-- Browser automation may prove Web behavior. Android/iOS IME, system clipboard,
-  soft keyboard, lifecycle, secure storage, and minimum WebView versions remain
-  physical claims and must stay pending until a representative device runs the
-  strict capture protocol.
-
-### 2. Signatures
-
-```text
-pnpm capture:wasm-web       -> writes browser evidence and screenshots
-pnpm capture:wasm-android   -> writes Android build evidence and local APK
-pnpm check:wasm-gate        -> live browser + source-bound mobile decision check
-
-vibex-wasm-browser-evidence.v1.source.sourceTreeSha256
-vibex-android-build.v1.source.{webSourceTreeSha256,mobileShellTreeSha256}
-vibex-mobile-physical-evidence.v1.targets.{android_physical,ios_physical}
-
-cargo tree -p vibex-mobile-wasm --target wasm32-unknown-unknown
-           --edges normal --prefix none --format {p}
-  -> every workspace-local crate root
-  -> WEB_SOURCE_INPUTS contains <root>/Cargo.toml + <root>/src
-```
-
-### 3. Contracts
-
-- Start Web with `gpui_platform::web_init()` and `single_threaded_web`; retain
-  `ApplicationHandle` under an explicit thread-local owner rather than leaking it.
-- Dispatch ordered host events to both `BrowserHostSnapshot` and the GPUI runtime.
-  An `appearance` event changes `gpui_component::Theme` and semantic colors; merely
-  changing the diagnostic snapshot is not dark-mode support.
-- Browser evidence hashes all Web source inputs. Android build evidence records the
-  same Web source hash, mobile-shell hash, lockfiles, upstream revisions, packaged
-  WASM identity, SDK floor, toolchain, APK size, and APK SHA-256.
-- The Web source identity includes `Cargo.toml` and the complete `src` tree for
-  every workspace-local normal dependency reachable from `vibex-mobile-wasm` for
-  `wasm32-unknown-unknown`. This includes transitive contract/model crates such as
-  `core`, `desktop-model`, `relay`, and the complete `vibex-backend` tree, not
-  only crates imported directly by the app. Non-Cargo host/evidence inputs remain
-  explicitly declared. `check-wasm-integration.mjs` derives local crate roots
-  from the same target-specific `cargo tree` and fails when either required input
-  is absent; changing a controller, Shell, DTO, manifest, or transitive local crate
-  must invalidate browser and Android evidence.
-- Host bridge `Debug` output is a diagnostic boundary, not a serialization shortcut.
-  It may expose viewport data, presence flags, MIME type, and byte counts, but never
-  push tokens, deep-link values, storage values, selected file names/bytes, or share
-  title/text/URL payloads.
-- Remove the previous APK output before `assembleDebug`. Incrementally rewriting an
-  existing APK can retain orphaned ZIP data, producing a larger, non-reproducible
-  package even when its logical entry list is correct.
-- Embedded fonts are registered license inputs with exact file count/tree hash and
-  complete redistributed notice. Locked GPUI Web currently requires SFNT/TTF input;
-  deterministic WOFF2 decompression must preserve upstream font identity/license.
-- Synthetic DOM paste/composition and Playwright touch events are labeled as
-  automation. They never satisfy physical clipboard, CJK IME, soft keyboard, or
-  non-US hardware-keyboard claims.
-- Physical Android evidence may be recorded as `partial_physical` when the
-  workspace user confirms a bounded interaction baseline for the current APK.
-  Each confirmed scenario is `passed`; every omitted scenario remains
-  `not_tested`. This does not promote Android auxiliary probes or iOS/macOS to
-  pass. A user-approved iOS/macOS deferral must use `accepted_deviation`, name
-  the Android baseline, and include an explicit signed-device follow-up.
-- Pointer and wheel coordinates crossing the canvas/GPUI boundary must be derived
-  from the actual backing store: `scaleX = canvas.width / rect.width / dpr` and
-  `scaleY = canvas.height / rect.height / dpr`, with finite bounded fallbacks.
-  Apply those scales to `offsetX/Y` (or the client-coordinate fallback) before
-  dispatching GPUI events. Do not infer the scale from `devicePixelContentBoxSize`
-  alone; some WebViews expose CSS-sized values there while events still use the
-  physical viewport.
-
-### 4. Validation & Error Matrix
-
-| Condition | Required result |
-| --- | --- |
-| WebGPU missing, insecure context, initialization error, or blank canvas | Render a stable diagnostic page/code; never report ready from canvas existence alone. |
-| Browser evidence source hash differs from current inputs | Fail and require explicit Web recapture. |
-| A local crate reported by the target-specific Cargo tree lacks `<root>/Cargo.toml` or `<root>/src` in the Web source inputs | Reject the evidence scope; add both inputs and recapture browser and Android artifacts. |
-| Android Web/mobile source hash, lockfile, APK hash, SDK, or packaged asset differs | Fail and require Android rebuild/recapture. |
-| Two unchanged Android builds produce different APK size/hash | Fail reproducibility review; inspect stale output, signing, timestamps, and toolchain. |
-| Host says dark while `Theme::global(cx).is_dark()` remains light | Fail appearance evidence. |
-| GPUI roles are not exposed in the browser accessibility tree | Keep production release `NO_GO`, even when pixels and input pass. |
-| DPR reports 2 while the backing store remains CSS-pixel sized | Record the mismatch as a production condition; do not claim sharp high-DPI support. |
-| A touch tap opens the wrong GPUI control or a swipe leaves scroll offsets unchanged at DPR > 1 | Fail the host adapter check; inspect backing-store/CSS/DPR normalization before changing hit-test or fixture state. |
-| Host bridge `Debug` contains a token, deep link, storage/file/share payload, or file name | Fail the shared UI redaction test; keep only bounded metadata. |
-| Android physical evidence is partial, or iOS/macOS physical target is pending | Technical Web spike and Android interaction baseline may close when scoped that way; untested scenarios remain `not_tested`, iOS/macOS remain `accepted_deviation`, and production release stays blocked by unresolved P0/other gates. |
-
-### 5. Good / Base / Bad Cases
-
-- Good: Chromium and another browser render credible GPUI pixels; Dialog, Sheet,
-  input, scroll, theme, fullscreen, error paths, storage, and bounded network probes
-  pass, and Android packages the exact same source-bound release assets.
-- Good: editing `controller.rs`, `shell.rs`, `host_bridge.rs`, or a shared Backend
-  contract makes both browser and Android Web source identities stale until recapture.
-- Good: adding `core`, `desktop-model`, `relay`, or another local transitive WASM
-  dependency fails the integration check until its manifest and complete source tree
-  participate in the source hash.
-- Base: Android APK is reproducible and installable but physical status remains
-  `pending`; the decision says technical spike `GO` and production release `NO_GO`.
-- Bad: accept a screenshot-only canvas, copy the legacy React dist into Capacitor,
-  treat synthetic composition as physical IME evidence, or update an evidence hash
-  without rerunning its writer.
-
-### 6. Tests Required
-
-- `cargo test -p vibex-ui --locked` asserts ordered events, normalized host
-  dimensions, breakpoints, shared token use, and sensitive host `Debug` redaction.
-- `cargo +nightly-2026-07-24 check -p vibex-mobile-wasm --target
-  wasm32-unknown-unknown --locked` verifies the locked WASM graph.
-- `pnpm check:wasm-integration` and its negative self-test compare the explicit
-  source inputs with the target-specific Cargo tree and reject a missing local crate
-  manifest or source tree before evidence is accepted.
-- `pnpm check:wasm-gate` runs live Chromium/Firefox checks and validates all
-  committed source/evidence identities.
-- Build Android twice from unchanged inputs and assert identical APK byte size and
-  SHA-256 before publishing the artifact path.
-- Run a DPR=2 touch regression with a CSS-sized canvas backing store and assert
-  both the normalized GPUI tap target (Dialog/Back state) and page/timeline scroll
-  offsets; event counts alone are insufficient.
-- `pnpm check:frontend`, `pnpm check:graph`, `pnpm check:licenses`, and
-  `pnpm check:rust` remain required cross-workspace checks.
-
-### 7. Wrong vs Correct
-
-#### Wrong
-
-```rust
-BrowserHostEvent::Appearance { dark_mode } => self.dark_mode = dark_mode;
-// The status row changes, but GPUI keeps rendering the previous Theme.
-```
-
-```javascript
-run("./gradlew", ["assembleDebug"]); // may update a stale APK in place
-```
-
-#### Correct
-
-```rust
-apply_browser_gate_theme_mode(dark_mode, cx);
-view.apply_host_event(envelope, cx);
-```
-
-```javascript
-rmSync(apkOutput, { force: true });
-run("./gradlew", ["--no-daemon", "assembleDebug"]);
-```
-
-#### Canvas coordinates
-
-```javascript
-// Wrong: client pixels are not necessarily GPUI logical pixels.
-const x = event.clientX - canvas.getBoundingClientRect().left;
-
-// Correct: use the backing store and the runtime DPR at the event boundary.
-const rect = canvas.getBoundingClientRect();
-const dpr = Math.max(1, Number(window.devicePixelRatio) || 1);
-const scaleX = canvas.width / Math.max(1, rect.width) / dpr;
-const x = (Number.isFinite(event.offsetX) ? event.offsetX : event.clientX - rect.left) * scaleX;
-```
-
-The same conversion applies to `y`, wheel deltas, and replayed tap positions.
-The scale must be bounded and recomputed when the canvas or viewport changes.
-
-#### Source binding and host diagnostics
-
-```javascript
-// Wrong: a hand-picked direct dependency list misses transitive local crates.
-const webInputs = ["crates/vibex-ui/src", "crates/vibex-backend/src"];
-
-// Correct: declare each local crate manifest/tree, then enforce coverage from Cargo.
-for (const root of targetSpecificCargoTreeLocalRoots) {
-  assert(webInputs.includes(`${root}/Cargo.toml`));
-  assert(webInputs.includes(`${root}/src`));
-}
-```
-
-```rust
-// Wrong: derived Debug serializes the secret-bearing host payload.
-#[derive(Debug)]
-struct HostShareRequest { title: Option<String>, text: Option<String>, url: Option<String> }
-
-// Correct: custom Debug emits has_title/has_text/has_url only.
-```
-
-## Retired Historical Scenario: Production Web/Capacitor Host Boundary
-
-> Retired with the WebUI/PWA product. Current pairing, storage, build, and host
-> rules are defined by Mobile GPUI-WASM Runtime Product Boundary above.
-
-### 1. Scope / Trigger
-
-- Trigger: `apps/mobile-wasm` or `apps/mobile` changes remote credentials,
-  pairing/deep-link handling, lifecycle/network recovery, PWA cache identity,
-  native capability plugins, or a `wasm-bindgen` host API.
-- JS remains a platform adapter. Rust owns pairing validation, remote state,
-  workflow controllers, and Compact navigation.
-
-### 2. Signatures
-
-```text
-configure_remote(credentials_json: string) -> sanitized_runtime_json
-connect_remote() / disconnect_remote() -> Promise<sanitized_runtime_json>
-forget_remote() -> sanitized_runtime_json
-pairing_preview(fragment: string, now_ms: f64) -> challenge-free_preview_json
-claim_pairing_fragment(fragment: string, options_json: string)
-  -> Promise<{ credentials, device, serverId, sessionId }>
-remote_lifecycle({ kind, ... }) -> sanitized_runtime_json
-navigation_action({ kind, ... }) -> compact_navigation_json
-
-PairingClaimOptions {
-  displayName, clientType, allowInsecureLocalDev, nowMs,
-  entryHint: PairingEntryHint
-}
-PairingEntryHint = {
-  schemaVersion: "vibex-pairing-entry.v1",
-  kind: "origin" | "untrusted_custom_scheme",
-  origin?: string
-}
-
-HostServices::dispatchPairing(url, source) -> challenge-free intake receipt
-HostServices::scanQr() -> { status, value?, format? }
-
-vibex-remote-client-credentials.v1 = {
-  record, identityPrivateKey, expectedServerId, clientType,
-  allowInsecureLocalDev?
-}
-
-VIBEX_APP_LINK_HOST=<optional DNS host for generated App/Universal Links>
-```
-
-### 3. Contracts
-
-- Pairing payloads and exact entry hints exist only in closure-private host memory.
-  Call `history.replaceState` synchronously before preview, storage, callbacks, or
-  network work, including malformed runtime App Links. Public Gate state, DOM,
-  errors, console output, snapshots, and evidence receive only challenge-free
-  projections and typed codes. The WASM module and credential storage methods are
-  not exposed on `window.__VIBEX_GATE__`.
-- A Web entry hint contains only the normalized origin derived from the actual
-  link. Rust may use it only to select exactly one origin-matching Direct,
-  Tailnet, or self-hosted Relay candidate already present in the server-issued offer.
-  An unmatched or ambiguous origin and an untrusted custom scheme fail closed;
-  the hint cannot inject a claim URL.
-- Explicit confirmation starts at most one one-time claim. A failure after request
-  dispatch may mean that the offer was consumed, so the host must not replay the
-  claim through another transport. Recovery requires a newly generated offer and
-  the intended Desktop entry.
-- Claim returns the grant/private identity exactly once to the host. Credential
-  commit order is `validate -> write -> read/shape verify -> configure -> connect`.
-  A write/read/configuration failure restores the previous credential or clears
-  only the scoped Vibex key; it never leaves a new half-persisted online runtime.
-- A new offer temporarily supersedes a stored credential. Cancel, expiry, invalid
-  replacement, or claim failure releases the private fragment and restores the
-  old connection. Successful commit replaces it. `forget_remote()` is called only
-  after this origin's credential was deliberately cleared.
-- Stored credentials carry every validated Direct/Tailnet candidate plus optional
-  Relay metadata. The Rust Auto transport owns reconnect, Direct-first fallback,
-  authoritative catch-up, and `connection.activeRoute`; JS must not add a second
-  retry loop.
-- Browser storage is a scoped degraded fallback. Capacitor uses
-  `SecureStoragePlugin`. Packaged mobile declares the pinned barcode scanner,
-  Android camera permission/minSdk, and iOS camera usage text in
-  `native-shell-contract.json`; generated native files are validated against that
-  contract. Scanner results are QR-only and bounded before they enter the same
-  `dispatchPairing -> preview -> confirm` path as browser/App Links.
-- Permission denial, scan cancellation, invalid/oversized QR, unavailable plugin,
-  revoked device, incompatible protocol, identity mismatch, corrupt credential,
-  and ordinary offline state have distinct typed recovery states. Ordinary
-  offline retains credentials; terminal states stop pointless retry. The persistent
-  `unpaired` sheet cannot be dismissed with Escape when no other pairing entry is
-  available.
-- Refreshing a host capability snapshot must preserve the callable bridge methods
-  (`safeArea`, `viewport`, file/camera/share, and system URL).
-  Replacing the method-bearing object with a plain post-initialize snapshot is a
-  broken host contract even when the diagnostic capability values are current.
-- JS timestamps crossing `wasm-bindgen` use `f64` and are range-checked before
-  conversion to Rust `i64`. An exported Rust `i64` parameter requires JS `BigInt`
-  and is not compatible with `Date.now()`.
-- `apps/mobile` packages only `../mobile-wasm/dist`. Generated Android/iOS trees
-  stay ignored; committed scripts rerun `cap sync`, capability plugins, and native
-  URL-handler generation.
-- `build.json.buildId` binds package/profile/git revision plus WASM glue/static
-  hashes. The service worker cache name includes that ID and deletes older caches.
-
-### 4. Validation & Error Matrix
-
-| Condition | Required result |
-| --- | --- |
-| Pairing fragment is empty, oversized, expired, replayed, has no usable Direct/Relay route, or contains a candidate URL with credentials/query/fragment | Reject with stable `remote_pairing_*`; make no claim and persist nothing. |
-| Entry hint is custom-scheme, malformed, unmatched, or matches multiple offered routes | `remote_pairing_entry_untrusted`, `_hint_invalid`, `_route_mismatch`, or `_route_ambiguous`; send no claim. |
-| One-time claim returns an ambiguous network failure | Do not retry another candidate; release the secret and require a new offer. |
-| Claim response is invalid, storage round-trip fails, or configure rejects the new bundle | Roll back the scoped stored credential, restore the previous runtime when available, and never connect the new bundle. |
-| Stored device id/public/private identity or server pin disagree | `remote_client_identity_mismatch` / `remote_credentials_invalid`; delete or re-pair, never connect. |
-| Host receives a valid or malformed pairing URL | Fragment/query are removed before the async callback; only a safe receipt/preview or typed code becomes public. |
-| QR scan is canceled, denied, oversized, invalid, or unavailable | `qr_scan_canceled`, `qr_camera_permission_denied`, `qr_scan_result_too_large`, `pairing_link_invalid`, or `qr_scanner_unsupported`; persist nothing. |
-| Secure storage or another native plugin is unavailable | Report `degraded`/`unsupported`; do not inject success data. |
-| `pairing_preview` receives non-finite/out-of-range JS time | `remote_timestamp_invalid`. |
-| Static/WASM source changes but cache/build evidence does not | Build/evidence check fails and requires rebuild/recapture. |
-| Android/iOS physical evidence is absent | Package checks may pass; physical/signed release status remains pending. |
-
-### 5. Good / Base / Bad Cases
-
-- Good: scan/open a Relay entry -> scrub history -> safe Rust preview -> explicit
-  single-route claim -> validate/write/read -> configure/connect -> sanitized
-  Online state with `activeRoute`.
-- Good: cancel a new offer while an old device is connected; the private offer is
-  released and the prior stored credential reconnects without a claim.
-- Base: browser has only scoped local storage and no QR plugin; App Link pairing
-  still works while scanner capability remains unsupported.
-- Bad: log the fragment, derive a claim URL from a caller hint, retry an ambiguous
-  claim through Relay, connect before storage verification, expose credential/WASM
-  injection methods, or pass `Date.now()` to an exported Rust `i64` parameter.
-
-### 6. Tests Required
-
-- Rust pairing tests cover bounded base64url/JSON, protocol/expiry/replay,
-  Direct/Relay candidate URL secrets, exact Direct/Tailnet/Relay origin selection,
-  unmatched/ambiguous/custom-scheme rejection, nonce/display validation, and
-  Debug redaction.
-- WASM check compiles the exact exported signatures. A live browser calls
-  `pairing_preview(fragment, Date.now())` and asserts no `BigInt` conversion error.
-- Host self-test asserts synchronous valid/invalid App Link cleanup, scanner
-  success/cancel/denial/oversize/unavailable paths, old-credential restoration,
-  transactional commit/rollback, and absence of raw payloads in public objects.
-  Static integration checks reject public `connectRemote`, `claimPairing`, or WASM
-  credential APIs. Browser interaction covers preview confirmation, focus trap,
-  cancel restoration, and the non-dismissible `unpaired` state.
-- Browser Gate validates manifest/cache/offline/unsupported behavior; Android
-  Debug/Release packages verify the same build ID, scanner plugin, minSdk/camera
-  contract, native URL handlers, and absence of legacy Web dist assets.
-
-### 7. Wrong vs Correct
-
-#### Wrong
-
-```rust
-#[wasm_bindgen]
-pub fn pairing_preview(fragment: &str, now_ms: i64) { /* JS must pass BigInt */ }
-```
-
-```javascript
-runtime.events.push({ fragment });
-const claimUrl = options.entryHint.origin; // caller-controlled route injection
-await claimEveryCandidateUntilOneWorks(claimUrl, offer);
-configureAndConnect(claim.credentials); // before durable commit
-```
-
-#### Correct
-
-```rust
-#[wasm_bindgen]
-pub fn pairing_preview(fragment: &str, now_ms: f64) -> Result<String, JsValue> {
-    let now_ms = normalize_now_ms(now_ms)?;
-    // parse and return a challenge-free projection
-}
-```
-
-```javascript
-clearPairingFragment(window, cleanUrl);
-const claim = JSON.parse(await wasm.claim_pairing_fragment(fragment, JSON.stringify({
-  ...safeOptions,
-  entryHint: privateEntryHint
-}))); // Rust selects and claims exactly one offered route.
-const credentials = validateCredentialBundle(claim.credentials);
-await secureStorage.set(SCOPED_VIBEX_KEY, credentials);
-assertDeepEqual(await secureStorage.get(SCOPED_VIBEX_KEY), credentials);
-configureRemote(credentials);
-await connectConfigured();
-```
 
 ## Scenario: Deterministic Desktop Browser Fixtures
 
@@ -2095,549 +1695,6 @@ The editor can collapse because no parent in the chain owns a real height.
 </div>
 ```
 
-## Retired Historical Scenario: Phase 4 Web/PWA Remote Shell
-
-> This is pre-retirement implementation history, not an active browser-product
-> contract. Portable domain behavior survives only where current GPUI mobile
-> code and the architecture baseline implement it.
-
-### 1. Scope / Trigger
-
-- Trigger: Phase 4 introduces `apps/mobile-wasm` as a lightweight browser/PWA remote
-  control shell for the PC runtime.
-- The shell owns login/auth proof entry, service capability display,
-  workspace/project summaries, Agent session summaries, and a selected session
-  detail shell.
-- Full timeline rendering, message composer, permission approval UI, Git diff
-  review, terminal controls, Provider settings, Relay, and native mobile
-  packaging remain separate follow-up slices.
-
-### 2. Signatures
-
-Frontend package boundary:
-
-```text
-apps/mobile-wasm/package.json
-apps/mobile-wasm/src/app/App.tsx
-apps/mobile-wasm/src/features/auth/*
-apps/mobile-wasm/src/features/remote/*
-apps/mobile-wasm/src/features/workspace/*
-apps/mobile-wasm/src/features/sessions/*
-apps/mobile-wasm/src/components/*
-```
-
-Remote client inputs:
-
-```typescript
-type RemoteConnectionConfig = {
-  baseUrl: string;
-  auth: RemoteAuthProof | null;
-  mockMode: boolean;
-};
-```
-
-Remote client operations:
-
-```text
-GET /api/info -> RemoteServiceInfo
-POST /api/workbench
-  RemoteRequestEnvelope(operation = workspace_file, payload = RemoteWorkbenchRequest)
-  -> RemoteResponseEnvelope(payload = RemoteWorkbenchListWorkspacesResponse)
-POST /api/agent
-  RemoteRequestEnvelope(operation = agent_session, payload = RemoteAgentRequest)
-  -> RemoteResponseEnvelope(payload = RemoteAgentSessionListResponse)
-```
-
-### 3. Contracts
-
-- Web/PWA code consumes the shared Rust DTOs through `WebRemoteBackend`; it must not
-  redefine remote envelopes, auth proof, service info, Agent requests, or
-  workbench requests.
-- `apps/mobile-wasm` must not import Tauri APIs, Monaco/CodeMirror, Provider SDKs, or
-  PC-only desktop utilities. It may import xterm.js only for remote terminal
-  rendering, and xterm input/resize must route through typed remote terminal
-  APIs to the PC runtime.
-- Auth MVP fields are `baseUrl`, `deviceId`, and `authToken`. They may be stored
-  in browser local storage only under a deliberately named Web remote key, and
-  the UI must expose a forget-device action.
-- Tokens must not be printed to console diagnostics, rendered in error cards,
-  included in screenshot labels, or copied into mock data names.
-- Real remote failures must stay failures. Screenshot/development fixtures must
-  require an explicit mock mode such as `?mock=1` or `mock://fixture`.
-- TanStack Query owns remote server state. Query keys include host/base URL,
-  device id where authenticated, and mock/live mode.
-
-### 4. Validation & Error Matrix
-
-- Empty or invalid URL -> local validation error before fetch.
-- Non-HTTP(S) live URL -> local validation error.
-- Missing device id or token -> local validation error.
-- `/api/info` unavailable -> disconnected/error state with retry or edit-login
-  path; do not silently load fixture data.
-- Malformed response envelope -> transport error with no token details.
-- `RemoteResponseEnvelope.status = error` with `VibexError` -> structured
-  user-safe error message.
-- `supportsWorkspaceFiles = false` -> disabled workspace list with explanation.
-- `supportsAgentSessions = false` -> disabled session list with explanation.
-- Empty workspace/session arrays -> empty states, not fatal errors.
-
-### 5. Good/Base/Bad Cases
-
-- Good: a paired device opens the Web/PWA shell, fetches PC service
-  capabilities, workspaces, sessions, and shows selected session metadata in a
-  mobile-first list-to-detail layout.
-- Base: a browser without a running PC remote service shows validation or
-  disconnected state; explicit fixture mode can be used for screenshots.
-- Bad: a real fetch failure falls back to mock success, a token appears in the
-  UI or console, or the Web bundle includes desktop IDE/terminal dependencies.
-
-### 6. Tests Required
-
-- `pnpm --filter @vibex/mobile-wasm typecheck`.
-- `pnpm --filter @vibex/mobile-wasm build`.
-- `pnpm check:frontend`.
-- Root `pnpm check` before archiving the task unless a non-frontend unrelated
-  failure is documented.
-- For requested or high-risk responsive UI changes, capture desktop-width and
-  mobile-width screenshots; identify fixture mode when no live remote service is
-  used.
-- When screenshots are captured, review the browser console: first-party
-  runtime errors and first-party 404s must be fixed or documented.
-
-### 7. Wrong vs Correct
-
-#### Wrong
-
-```typescript
-try {
-  return await listAgentSessions(liveConfig);
-} catch {
-  return mockSessions;
-}
-```
-
-This makes a disconnected or unauthorized real PC look like a successful live
-session list.
-
-#### Correct
-
-```typescript
-if (config.mockMode) {
-  return mockSessions;
-}
-
-return postEnvelope(config, "/api/agent", "agent_session", request, validate);
-```
-
-Mock data is available only through an explicit fixture mode, while live
-transport/auth errors remain visible to the user.
-
-## Retired Historical Scenario: Phase 4 Web/PWA Rich Remote Control
-
-> This is pre-retirement implementation history, not an active browser-product
-> contract.
-
-### 1. Scope / Trigger
-
-- Trigger: Phase 4 extends `apps/mobile-wasm` beyond project/session summaries into
-  selected-session remote control: timeline cards, composer, permission
-  resolution, Git review, and terminal snapshots.
-- This scenario is still Web/mobile remote-control UI. It must not become a
-  full PC IDE, Provider settings surface, LAN smoke test, Relay client, or
-  native mobile shell.
-
-### 2. Signatures
-
-Remote Agent helpers:
-
-```text
-fetchTimeline(config, FetchTimelineRequest) -> TimelinePage
-sendAgentMessage(config, SendAgentMessageRequest) -> TimelineItem[]
-interruptAgent(config, VibexSessionId) -> boolean
-resolvePermission(config, ResolvePermissionRequest) -> TimelineItem
-catchUpAgent(config, RemoteAgentTimelineCursor[], limit) -> RemoteAgentCatchUpResponse
-```
-
-Remote workbench helpers:
-
-```text
-getGitStatus(config, WorkspaceId) -> GitStatusSummary
-getGitDiff(config, GitDiffRequest) -> GitDiffResponse
-stageGitPaths(config, GitStageRequest) -> GitStatusSummary
-unstageGitPaths(config, GitStageRequest) -> GitStatusSummary
-listTerminals(config, WorkspaceId) -> TerminalSession[]
-getTerminalSnapshot(config, TerminalId) -> TerminalSnapshot
-writeTerminalInput(config, TerminalWriteRequest) -> boolean
-```
-
-Feature folders:
-
-```text
-apps/mobile-wasm/src/features/timeline/*
-apps/mobile-wasm/src/features/git/*
-apps/mobile-wasm/src/features/terminal/*
-```
-
-### 3. Contracts
-
-- Timeline UI renders generated `TimelineItem` / `TimelinePayload`
-  discriminated unions. It must not branch on raw Codex, Claude, or ACP native
-  event objects.
-- Composer, interrupt, permission resolution, Git, and terminal actions use
-  typed `RemoteAgentRequest` or `RemoteWorkbenchRequest` helpers through the
-  shared remote envelope.
-- TanStack Query owns remote timeline, Git, and terminal server state. Local
-  React state may own selected tab, selected diff path, selected terminal, and
-  form drafts only.
-- Catch-up is authoritative HTTP/WebSocket envelope data, not optimistic local
-  state. After mutations that affect timeline correctness, invalidate/fetch
-  timeline or run catch-up.
-- Terminal UI uses xterm.js for raw PTY interaction when
-  `supportsTerminal = true`. The browser controls PC-side PTY sessions through
-  typed remote workbench terminal APIs; it must not spawn a local OS PTY.
-  Snapshot/card summaries can still be added as a mobile readability mode, but
-  they are not the only terminal surface.
-- Git diff review uses plain text diff rendering. Commit, push, pull, revert,
-  branch delete, and other destructive Git actions require explicit scope and
-  confirmation before appearing in Web/mobile UI.
-- Fixture mode may cover timeline, permissions, Git, and terminal for
-  screenshots, but only through explicit mock mode and never as a fallback for
-  live failures.
-
-### 4. Validation & Error Matrix
-
-- `supportsAgentSessions = false` -> disable timeline, composer, interrupt,
-  permission, and catch-up controls with explanation.
-- `supportsGit = false` -> disable Git panel with explanation.
-- `supportsTerminal = false` -> disable terminal panel with explanation.
-- Missing session/workspace/terminal selection -> render an empty state, not a
-  throwing component.
-- Structured `VibexError` -> user-safe error message with no auth token,
-  terminal input secret, provider credential, or raw native payload.
-- First-party form controls -> include accessible labels and `id` or `name`
-  attributes to avoid browser accessibility issues.
-- Browser screenshots -> no first-party runtime errors, unresolved form-field
-  accessibility issues, or first-party 404s.
-
-### 5. Good/Base/Bad Cases
-
-- Good: selecting a session in explicit fixture or live mode shows timeline
-  cards, pending permission approval buttons, composer, catch-up status, Git
-  diff, and an xterm-backed remote PTY terminal.
-- Base: a read-only device can fetch timeline/Git/terminal read views while
-  server-side permissions deny mutations as structured errors.
-- Bad: Web/mobile renders raw provider JSON, silently swaps live remote errors
-  to fixture data, spawns a browser-local PTY, includes Monaco/Tauri, or exposes
-  destructive Git actions without confirmation.
-
-### 6. Tests Required
-
-- `pnpm --filter @vibex/mobile-wasm typecheck`.
-- `pnpm --filter @vibex/mobile-wasm build`.
-- `pnpm check:frontend`.
-- Root `pnpm check` before archiving unless an unrelated failure is documented.
-- Desktop-width and mobile-width screenshots showing the rich remote-control
-  UI. If fixture mode is used, the UI and report must say so.
-- Browser console review after screenshots.
-
-### 7. Wrong vs Correct
-
-#### Wrong
-
-```tsx
-<pre>{JSON.stringify(item.payload, null, 2)}</pre>
-```
-
-This exposes transport internals as UI and makes provider-specific leakage easy
-when payloads evolve.
-
-#### Correct
-
-```tsx
-switch (item.payload.type) {
-  case "command":
-    return <CommandCard command={item.payload.data.command} />;
-  case "permission_request":
-    return <PermissionCard permission={item.payload.data} />;
-}
-```
-
-Render generated Vibex payload variants into purpose-built cards and keep raw
-diagnostics out of user-facing remote-control screens.
-
-## Retired Historical Scenario: Phase 5 Mobile App Shell From Web/PWA
-
-> Superseded by the dedicated `apps/mobile-wasm` runtime contract above.
-
-### 1. Scope / Trigger
-
-- Trigger: Phase 5 packages the existing Web/PWA remote client as a mobile app
-  shell.
-- This is a frontend packaging contract: mobile must reuse `apps/mobile-wasm` protocol,
-  auth, Relay, Query, and UI code instead of becoming a second remote client.
-
-### 2. Signatures
-
-Mobile shell package boundary:
-
-```text
-apps/mobile/package.json
-apps/mobile/capacitor.config.ts
-apps/mobile/tsconfig.json
-apps/mobile/README.md
-```
-
-Shared Web/PWA source:
-
-```text
-apps/mobile-wasm/src/app/*
-apps/mobile-wasm/src/features/auth/*
-apps/mobile-wasm/src/features/remote/*
-apps/mobile-wasm/src/features/{workspace,sessions,timeline,git,terminal,providers}/*
-```
-
-Recommended scripts:
-
-```text
-pnpm --filter @vibex/mobile validate
-pnpm --filter @vibex/mobile web:build
-pnpm --filter @vibex/mobile cap add android
-pnpm --filter @vibex/mobile cap add ios
-pnpm --filter @vibex/mobile sync
-```
-
-Android packaging smoke environment:
-
-```text
-JDK 21
-Android SDK cmdline-tools;latest
-platform-tools
-platforms;android-36
-build-tools;36.0.0
-emulator
-system-images;android-36;google_apis;x86_64
-```
-
-### 3. Contracts
-
-- The mobile shell loads bundled `apps/mobile-wasm/dist` assets. It must not host a
-  separate remote UI, duplicate feature folders, or fork auth/query state.
-- `apps/mobile-wasm` remains the owner of direct, Relay, and fixture connection modes.
-- Generated Android/iOS platform projects are local developer artifacts unless a
-  task explicitly scopes committing them. Ignore them by default in the MVP
-  shell stage.
-- Capacitor Android 8 requires JDK 21 for native Gradle builds. JDK 17 can pass
-  Web/mobile TypeScript validation but fails Android compilation with
-  `invalid source release: 21`.
-- Launch/query metadata may prefill only non-secret connection fields:
-  `mode`, `baseUrl`, `relayUrl`, and `roomId`.
-- Launch/query metadata must not accept, persist, log, or display auth tokens,
-  pairing codes, private keys, decrypted payloads, ciphertext, nonce values,
-  prompt bodies, file paths, terminal content, Git diffs, or Provider settings.
-- Mobile shell code must not import Tauri APIs, Monaco/CodeMirror, native
-  provider SDKs, or desktop-only utilities. xterm.js may appear only through the
-  shared Web/PWA remote terminal UI and must use remote terminal APIs rather
-  than native mobile shell process APIs.
-
-### 4. Validation & Error Matrix
-
-- Missing `apps/mobile-wasm/dist` during native sync -> run the mobile shell Web build
-  script first; do not point the app at a remote hosted page as a fallback.
-- Invalid direct `baseUrl` or Relay `relayUrl` in launch metadata -> ignore the
-  metadata or keep it as an unsaved draft validation error; never persist it.
-- Missing or invalid Relay `roomId` in launch metadata -> normal auth screen,
-  not an attempted Relay pair.
-- Query/deep-link contains token-like parameters -> do not read them.
-- No Android Studio/Xcode in the local environment -> package typecheck and Web
-  build must still validate the committed shell config.
-
-### 5. Good/Base/Bad Cases
-
-- Good: `apps/mobile` packages the same Web/PWA auth screen, Relay entry, session
-  timeline, Git, terminal, and Provider surfaces through Capacitor while direct
-  Web/PWA remains unchanged.
-- Base: without native platforms generated, `pnpm --filter @vibex/mobile
-  validate` still typechecks config and builds shared Web assets.
-- Bad: mobile creates its own auth store, copies Web feature components into a
-  second tree, persists Relay private keys natively, or hides live remote errors
-  behind fixture data.
-
-### 6. Tests Required
-
-- `pnpm --filter @vibex/mobile typecheck`.
-- `pnpm --filter @vibex/mobile validate`.
-- `pnpm --filter @vibex/mobile-wasm typecheck`.
-- `pnpm --filter @vibex/mobile-wasm build`.
-- `pnpm check:frontend`.
-- Android packaging smoke when closing native Android evidence:
-  `pnpm --filter @vibex/mobile cap doctor android`,
-  `pnpm --filter @vibex/mobile sync`, `./gradlew assembleDebug`, emulator boot,
-  APK install, APK launch, and screenshot.
-- Root `pnpm check` before archiving unless an unrelated blocker is documented.
-- Mobile-width screenshot of the auth or Relay entry state. Console review must
-  show no first-party runtime errors, form-field accessibility warnings, or
-  first-party 404s.
-
-### 7. Wrong vs Correct
-
-#### Wrong
-
-```text
-apps/mobile/src/features/auth/*
-apps/mobile/src/features/remote/*
-```
-
-This forks the remote client and makes direct/Relay/fixture behavior drift
-between Web and mobile.
-
-#### Correct
-
-```text
-apps/mobile/capacitor.config.ts -> webDir = ../mobile-wasm/dist
-apps/mobile-wasm/src/features/auth/*    -> one auth state owner
-apps/mobile-wasm/src/features/remote/*  -> one transport owner
-```
-
-Mobile is an installation shell for the shared Web/PWA remote client. Native
-code is added only when a later task needs native capabilities.
-
-## Retired Historical Scenario: Phase 5 Follow-up QR Pairing
-
-> Superseded by installed-app pairing with server-issued offers and
-> transport-bound `vibex://open/<transport>` entries.
-
-### 1. Scope / Trigger
-
-- Trigger: Phase 5 acceptance classified QR pairing as partial because Web/PWA
-  and mobile shell supported safe query metadata but not QR generation or scan.
-- This scenario covers QR launch metadata in the shared Web/PWA auth flow:
-  generate QR, paste/import QR text, upload QR image, and scan QR through the
-  browser camera when available.
-- It does not change backend pairing-code storage, `RemoteAuthProof`, Relay
-  E2EE, device permissions, native mobile platform projects, or the Relay
-  server protocol.
-
-### 2. Signatures
-
-Frontend modules:
-
-```text
-apps/mobile-wasm/src/features/auth/qrLaunch.ts
-apps/mobile-wasm/src/features/auth/QrPairingPanel.tsx
-apps/mobile-wasm/src/features/auth/AuthPanel.tsx
-apps/mobile-wasm/src/styles.css
-apps/mobile/README.md
-```
-
-QR helpers:
-
-```typescript
-buildSafeQrLaunchUrl(AuthDraft, currentHref) -> string
-parseSafeQrLaunchPayload(payload, currentHref) -> QrLaunchPatch
-applyQrLaunchPatch(AuthDraft, QrLaunchPatch) -> AuthDraft
-```
-
-Allowed QR payload fields:
-
-```text
-mode = direct | relay
-baseUrl | base_url       direct only, http(s)
-relayUrl | relay_url     relay only, http(s)
-roomId | room_id         relay only, starts with relayroom_
-```
-
-### 3. Contracts
-
-- QR codes are launch metadata only. They must never be treated as
-  authorization, and they must not save auth state or start a connection by
-  themselves.
-- QR generation may read only `mode`, `baseUrl`, `relayUrl`, and `roomId` from
-  the auth draft. It must not read or encode `deviceId`, `authToken`, pairing
-  codes, private keys, ciphertext, nonce values, payload JSON, prompt bodies,
-  file paths, terminal content, Git diffs, Provider settings, or Provider
-  secrets.
-- QR import uses an allowlist. Unknown keys and secret-like keys are rejected
-  before mutating the auth draft.
-- QR import must also enforce mode-specific keys: Direct QR payloads reject
-  Relay keys, and Relay QR payloads reject Direct keys. Do not accept and
-  silently ignore cross-mode metadata.
-- QR import may update only safe connection fields and the selected mode. The
-  existing "Test and continue" path remains responsible for saving auth state.
-- QR interaction must clear stale parent auth success/error text before showing
-  a new QR result, so a failed import cannot appear beside a previous
-  "metadata applied" state.
-- Camera scanning uses browser media APIs only. It must stop media tracks on
-  successful scan, explicit stop, and component unmount.
-- If camera access is unavailable, denied, or unsupported, paste/import,
-  upload, and manual entry must remain available.
-- Mobile shell reuses the shared Web/PWA QR flow from `apps/mobile-wasm/dist`; do not
-  add `apps/mobile/src/features/auth/*` or a native-only QR/auth store.
-
-### 4. Validation & Error Matrix
-
-- Fixture mode QR generation -> local user-safe error.
-- Missing or unsupported `mode` -> local user-safe error.
-- Direct QR without valid HTTP(S) `baseUrl` -> local user-safe error.
-- Relay QR without valid HTTP(S) `relayUrl` or `relayroom_` room id -> local
-  user-safe error.
-- QR payload with `authToken`, `pairingCode`, `privateKey`, `deviceId`,
-  `ciphertext`, `nonce`, `prompt`, `filePath`, `terminal`, `gitDiff`,
-  `provider`, or any unknown key -> local user-safe error.
-- Direct QR with Relay-only fields, or Relay QR with Direct-only fields ->
-  local user-safe error.
-- Uploaded image with no QR -> local user-safe error.
-- Camera unsupported, unavailable, or denied -> local user-safe error and
-  fallback controls stay usable.
-- Error text must not echo raw QR payload contents.
-
-### 5. Good/Base/Bad Cases
-
-- Good: a PC or browser shows a Relay QR containing only Relay URL and room id;
-  a mobile browser scans it, sees the Relay fields prefilled, enters normal
-  device proof, and then connects through encrypted Relay mode.
-- Base: a user without camera access uploads a QR image or pastes the QR text
-  and receives the same safe prefilled draft.
-- Bad: a QR code includes `authToken`, a pairing code, private key, device id,
-  or Provider settings; or scan success persists auth before the user runs the
-  existing connection test.
-
-### 6. Tests Required
-
-- `pnpm --filter @vibex/mobile-wasm typecheck`.
-- `pnpm --filter @vibex/mobile-wasm build`.
-- `pnpm --filter @vibex/mobile validate`.
-- Root `pnpm check` before archiving unless an unrelated blocker is documented.
-- Grep audit for forbidden fields in QR helpers/UI/docs.
-- Desktop-width and mobile-width screenshots of the auth QR flow.
-- Browser console review. Camera hardware may be unavailable locally, but the
-  safe unavailable/denied path must be verified when real camera scan cannot be
-  exercised.
-
-### 7. Wrong vs Correct
-
-#### Wrong
-
-```text
-QR payload:
-  ?mode=relay&relayUrl=https://relay.example.com&roomId=relayroom_...
-  &deviceId=device_...&authToken=secret
-```
-
-This leaks authorization material into URLs, screenshots, camera apps, browser
-history, logs, and support artifacts.
-
-#### Correct
-
-```text
-QR payload:
-  ?mode=relay&relayUrl=https://relay.example.com&roomId=relayroom_...
-
-Auth form:
-  deviceId + authToken entered separately before Test and continue
-```
-
-The QR improves connection metadata entry while PC-side auth, permission,
-revocation, audit, and Relay E2EE remain authoritative.
 
 ## Scenario: Phase 6 ACP Provider Settings Surface
 
@@ -2931,7 +1988,7 @@ pnpm check:code-workbench   -> offline identity/contract check and negative self
   `:line[:column]`, absolute current-workspace, and leading-slash workspace-root
   links all produce the exact workspace-relative target passed to Preview.
 - Run `cargo clippy -p vibex-markdown --all-targets -- -D warnings`, the affected
-  desktop model/GPUI tests, `wasm32-unknown-unknown` no-default-feature check, and
+  desktop model/GPUI tests, a locked no-default-feature check, and
   `rg -n 'TextView::markdown|project_markdown_for_host' apps/desktop crates/desktop-model`.
 - Run `cargo metadata --locked`, `pnpm check:graph`, and
   `pnpm check:licenses`; regenerated notices/SBOM must bind the selected local
@@ -3052,192 +2109,23 @@ explicit user actions only.
 - Do not make dark mode depend on one global inversion hack.
 - Do not expose destructive actions as swipe-only or hover-only interactions.
 
-## Scenario: Physical Cross-Platform UI Evidence
+## Scenario: Native Mobile Device Evidence
 
-### 1. Scope / Trigger
+Native SDK/device evidence is tied to the exact source, Cargo lock, vendored Zed
+revision, and produced application artifact. A host-side check proves source and
+type contracts only.
 
-- Trigger: recording Web, Android, or iOS release evidence for a shared GPUI-WASM
-  surface and its adaptive Compact shell.
+Required device scenarios are:
 
-### 2. Signatures
+- first frame and safe-area layout;
+- touch scrolling and session-drawer edge gesture;
+- IME commit, selection, paste, keyboard resize, and focus recovery;
+- GUI timeline streaming, Markdown, process expansion, and approval actions;
+- send, stop, continue, disconnect, reconnect, and authoritative catch-up;
+- Direct/Tailnet/Relay route selection and credential persistence/redaction;
+- foreground/background lifecycle and network transition.
 
-```text
-PhysicalScenario { id, status: passed | failed | not_tested, note }
-MobileEvidence.targets.android_physical.currentBuild.scenarios: PhysicalScenario[]
-```
-
-The Android scenario set includes IME commit, touch scroll, keyboard/focus/inset,
-Compact overlays, Back, rotation, lifecycle, network, secure storage, WebGPU pixels,
-clipboard, and non-US hardware keyboard.
-
-### 3. Contracts
-
-- `not_tested` is an explicit result and must remain bound to the exact APK hash until
-  an operator performs the scenario on a physical device.
-- A browser Canvas with configured GPUI roles is not browser accessibility evidence;
-  role/name/state/focus/action exposure must be present in the browser accessibility
-  tree before the production gate can pass.
-- Synthetic touch, DOM composition, emulator output, and a visible boot page may prove
-  host plumbing only; they do not prove physical IME, scroll, safe-area, IME resize,
-  or Android Back behavior.
-- Compact layouts may reorder/reduce density but must not clip dialogs, trap sheets,
-  or hide destructive/approval actions behind hover-only behavior.
-
-### 4. Validation & Error Matrix
-
-- Current APK differs from `currentBuild.apk` -> evidence checker rejects the record.
-- Any required physical scenario is missing or `not_tested` -> Android target remains
-  `pending`.
-- GPUI semantic tree is absent from the browser accessibility tree -> production Web
-  release is `NO_GO` / P0 blocker.
-- Dialog clips with the software keyboard or Android Back cannot dismiss a sheet ->
-  physical Compact gate is `failed`.
-
-### 5. Good/Base/Bad Cases
-
-- Good: a real device screenshot records viewport, safe area, input, and approval UI,
-  while the report separately says the full interaction matrix is not tested.
-- Base: Web Chromium/Firefox pixels and keyboard probes pass, but physical mobile and
-  browser a11y remain pending/blocking.
-- Bad: promote an old partial Android screenshot after rebuilding the APK, or claim
-  screen-reader support from GPUI-internal roles that never reach the DOM tree.
-
-### 6. Tests Required
-
-- Run `node scripts/capture-wasm-mobile.mjs` to verify current APK binding and
-  scenario completeness; physical capture requires every explicit operator flag.
-- Run the browser capture/checker and assert `decision.productionRelease === "no_go"`
-  while `decision.a11yReleaseBlocker === true`.
-- Inspect current Compact screenshots at original resolution for clipping, safe-area,
-  keyboard overlap, and visible approval/destructive states.
-
-### 7. Wrong vs Correct
-
-#### Wrong
-
-```text
-APK installed + screenshot captured => all Android scenarios passed
-GPUI roles configured internally => screen-reader gate passed
-```
-
-#### Correct
-
-```text
-APK hash matches currentBuild; only operator-confirmed scenarios are passed
-browser accessibility tree exposes role/name/state/focus/action => a11y can pass
-```
-
-## Scenario: GPUI Workflow Shell And Mobile E2E Evidence
-
-### 1. Scope / Trigger
-
-- Trigger: changing the shared Agent/File/Git/Terminal/Management workbench,
-  `WebRemoteBackend`, mobile/Capacitor product entry, workflow E2E runner, or the
-  cross-platform release gate.
-- The development host and Android consume the same GPUI-WASM mobile workflow
-  shell. The host is an automation target, not a browser product. Gate fixture
-  APIs remain diagnostics only and cannot satisfy a product workflow result.
-
-### 2. Signatures
-
-```text
-WorkflowWorkbenchView::from_facade(BackendFacade)
-pnpm e2e:workflows --target mobile-wasm-host|android --transport direct|relay --write
-pnpm check:workflow-e2e
-
-VIBEX_E2E_CREDENTIALS_FILE
-VIBEX_E2E_RECOVERY_HOOK
-VIBEX_E2E_FIXTURE_HOOK
-VIBEX_E2E_RELAY_LOG_FILE
-VIBEX_E2E_RELAY_OWNERSHIP=user_self_hosted
-
-vibex-workflow-e2e.v1.targets = {
-  mobile_wasm_host: { direct, relay },
-  android_physical: { direct, relay }
-}
-```
-
-### 3. Contracts
-
-- Each target records all five workflows with passed permission, business
-  result, live event, and reconnect/recovery checks. Direct and Relay targets
-  must have one identical permission-contract hash; Relay topology is explicitly
-  user-self-hosted and E2EE, never an official service claim.
-- Candidate identity binds the complete mobile-runtime and workflow source trees,
-  mobile shell tree, both lockfiles, Zed/GPUI revisions, release runtime identity,
-  host JS, and current APK bytes/hash/application id. Source commit is provenance;
-  content hashes and ancestor validation allow an evidence-only commit without
-  making the just-recorded evidence stale.
-- A credentials, disposable-fixture, recovery-hook, Relay-ownership, or Relay-log
-  preflight failure writes no target result. A partial artifact is allowed only
-  after a target actually passes, but the checker and functional release gate
-  remain blocked until all four target/transport rows pass.
-- Any target-reachable source change after capture invalidates the runtime build
-  and APK evidence. The final-candidate order is: release runtime build, development-host run,
-  Android rebuild/evidence sync, current-APK physical capture, then the four
-  workflow runs. Rebuilding only `apps/mobile-wasm/dist` does not update an already
-  packaged APK.
-- Android auxiliary capture waits for `__VIBEX_GATE__.state == "ready"` and
-  for `#gate-status-layer` to have `visibility:hidden` and `opacity:0` before the
-  screenshot. `--pixels-pass` and `--secure-storage-pass` must also match live
-  WebView state; a boot label, fade ghost, or prior APK screenshot is invalid.
-- Evidence stores hashes, counts, statuses, bounded labels, and redacted device
-  metadata only. It rejects raw endpoints, private paths, serials, prompts,
-  file/diff/terminal content, tokens, pairing material, and Relay plaintext.
-
-### 4. Validation & Error Matrix
-
-| Condition | Required result |
-| --- | --- |
-| A credentials/hook/Relay ownership input is missing | Exit non-zero with the stable preflight code; do not write or reuse evidence. |
-| One target/transport or one workflow field is missing/failed | `pnpm check:workflow-e2e` fails and the functional release gate keeps `product_workflow_e2e_missing`. |
-| Candidate digest, runtime build, lockfile, source tree, or APK differs | Reject the entire stale target set; rerun from the earliest invalidated build step. |
-| Direct/Relay permission hashes differ | Reject the matrix as inconsistent even when individual business actions passed. |
-| Android run is not a physical device or its APK hash differs | Reject `android_physical`; browser/emulator evidence cannot substitute. |
-| GPUI is still booting or the status layer is visible/translucent | Do not capture or mark pixels passed; wait for ready plus completed fade. |
-| Redaction scan finds a raw endpoint, serial, path, token, pairing value, prompt, diff, or terminal bytes | Reject the artifact and keep the release gate `FAIL`. |
-
-### 5. Good / Base / Bad Cases
-
-- Good: all four rows operate the same shared mobile workbench against disposable
-  fixtures, prove live/reconnect behavior, and bind current runtime/APK
-  artifacts with one permission contract.
-- Base: implementation/unit/browser/mobile checks pass but controlled E2E inputs
-  are unavailable; no workflow evidence is invented and the release report
-  truthfully remains `FAIL`.
-- Bad: reuse an earlier APK result, write hashes by hand, count Gate fixture
-  interactions as product workflows, or promote Direct contract tests to a
-  physical Relay result.
-
-### 6. Tests Required
-
-- `pnpm check:workflow-e2e:self-test` rejects missing rows, stale candidate
-  identity, inconsistent permissions, non-physical Android, official Relay, and
-  secret-bearing evidence.
-- Run `cargo test -p vibex-ui --locked`,
-  `cargo test -p vibex-remote-client --locked`, host/mobile source-bound checks,
-  and local Relay smoke before the external matrix.
-- For a current physical APK, assert GPUI `ready`, zero runtime errors, credible
-  pixel metrics, secure-storage success, hidden status layer, current screenshot
-  hash, and cleanup of ADB forwards/device rotation settings.
-- `pnpm check:cross-platform-release-gate` must pass its checker/self-test even
-  when the report decision is `FAIL`; missing workflow evidence is a valid
-  fail-closed report state, not a checker crash.
-
-### 7. Wrong vs Correct
-
-#### Wrong
-
-```text
-edit shared GPUI source -> rebuild runtime only -> reuse old APK screenshot/E2E rows
-missing Relay fixture -> copy Direct result into relay -> release functional=passed
-canvas exists -> capture while GATE_BOOT is fading -> pixels=passed
-```
-
-#### Correct
-
-```text
-edit source -> build runtime/host check -> rebuild APK -> recapture physical -> run 4-row matrix
-missing controlled inputs -> leave evidence absent/partial -> release functional=blocked
-GPUI ready + status layer hidden/opacity 0 + live pixel/storage checks -> capture
-```
+Each scenario records `passed`, `failed`, or `not_tested`. Missing device evidence
+remains `not_tested`; it is never inferred from a successful Rust or Gradle/Xcode
+compile. Evidence stores hashes, bounded platform labels, and status only, never
+pairing links, tokens, device serials, prompts, file contents, or terminal bytes.

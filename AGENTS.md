@@ -196,16 +196,14 @@ function tgit --wraps git; git --git-dir=(git rev-parse --show-toplevel)/.trelli
 ## 2. Project state
 
 Vibex is a Rust-first, local-first AI coding workbench, `0.1.0-rc.1`,
-AGPL-3.0-or-later. Two product clients share one GPUI design system; the mobile
-client has a separate WASM runtime and Capacitor host:
+AGPL-3.0-or-later. Two product clients share one GPUI design system:
 
 | Surface | Source | Stack |
 | --- | --- | --- |
 | Native desktop | `apps/desktop` | Rust + GPUI |
-| Mobile runtime | `apps/mobile-wasm` | Rust + GPUI-WASM, Compact/Medium only |
-| Mobile shell | `apps/mobile` | Capacitor 8 + bundled mobile runtime |
+| Native mobile | `apps/mobile` | Rust + GPUI with `gpui_ios` / `gpui_android` from `vendor/zed` |
 
-Layout: `apps/` (desktop, mobile-wasm, mobile, relay-server) · `crates/` (~25 Rust
+Layout: `apps/` (desktop, mobile, relay-server) · `crates/` (~25 Rust
 crates: agent/ACP adapters, db, fs, git, terminal, relay, remote, content,
 diagnostics, vibex-ui, vibex-terminal-ui, ...) · `scripts/` (Node evidence and
 gate scripts) · `.trellis/` (workflow, spec, tasks).
@@ -216,16 +214,16 @@ Architectural invariants that constrain most changes — read
 `.trellis/spec/guides/architecture-baseline.md` before anything spanning
 desktop / mobile / remote:
 
-- `apps/desktop` is the sole source of visual, interaction, and
-  information-architecture truth. Mobile derives from it.
+- `apps/desktop` is the source of visual, interaction, and information-architecture
+  truth. Native mobile derives its Agent session semantics from it while using the
+  Zedra-aligned compact visual treatment.
 - The PC `DesktopRuntime` is the only authoritative state owner; mobile code is
   a network client.
-- Shared UI lives in `crates/vibex-ui`; `apps/desktop` is never compiled to WASM
-  as a whole.
+- Shared UI contracts and projections live in `crates/vibex-ui`; the desktop app is
+  not compiled as the mobile app.
 - Relay is transport, not a second database or state authority.
-- There is no WebUI/PWA product. `apps/mobile-wasm` is bundled into Capacitor;
-  its browser host exists only for local development and automation. Relay and
-  Desktop packages never host these assets.
+- There is no WebUI/PWA product. `apps/mobile` is a native GPUI client and Relay
+  and Desktop packages never host mobile application assets.
 
 Toolchain: Rust 1.97.0 (pinned by `rust-toolchain.toml`), edition 2024,
 Node.js 22, pnpm 11.3.0 (pinned by `package.json`).
@@ -235,15 +233,21 @@ Node.js 22, pnpm 11.3.0 (pinned by `package.json`).
 Run everything from the repository root.
 
 ```bash
-corepack enable && pnpm install --frozen-lockfile
+pnpm install --frozen-lockfile
 
 pnpm dev:desktop            # cargo run -p vibex-desktop --locked
-pnpm dev:mobile-wasm        # mobile runtime in a local development host
+pnpm check:mobile-native    # native mobile crate and project contract
 
 pnpm check:rust             # Rust quality gate
 pnpm check:frontend         # per-package typecheck + eslint
 pnpm lint
 ```
+
+`apps/` holds no TypeScript since the Capacitor host was removed, so `pnpm lint`
+usually matches nothing; it stays wired up to catch any web code added back
+under `apps/`. The `scripts/` tooling is deliberately outside eslint: those
+files are hashed into the `docs/platform/evidence/*.json` release gates, so a
+cosmetic edit there invalidates captured evidence and forces a re-capture.
 
 `pnpm check` chains roughly thirty gates and takes a long time — treat it as a
 pre-release gate, not an edit-loop command. During iteration run only the gates

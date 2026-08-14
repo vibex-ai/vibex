@@ -39,7 +39,10 @@ const ASSET_EXTENSIONS = new Set([
   ".woff",
   ".woff2"
 ]);
-const GENERATED_ASSET_ROOTS = [resolve(ROOT, "apps/mobile-wasm/dist")];
+const GENERATED_ASSET_ROOTS = [
+  resolve(ROOT, "apps/mobile/android/app/src/main/jniLibs"),
+  resolve(ROOT, "apps/mobile/ios/VibexFFI.xcframework")
+];
 
 function fail(message) {
   console.error(message);
@@ -421,7 +424,7 @@ function auditInputs(policyState, runtime) {
     auditExpression(input.licenseExpression, input.id, policyState);
   }
 
-  const scanRoots = [resolve(ROOT, "apps/desktop"), resolve(ROOT, "apps/mobile-wasm")];
+  const scanRoots = [resolve(ROOT, "apps/desktop"), resolve(ROOT, "apps/mobile")];
   const unregistered = scanRoots
     .filter(existsSync)
     .flatMap(walkFiles)

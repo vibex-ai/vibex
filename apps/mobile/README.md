@@ -1,46 +1,31 @@
-# Vibex Mobile Shell
+# Vibex Mobile
 
-This Capacitor shell packages only `apps/mobile-wasm/dist` and exposes typed
-safe-area, keyboard, lifecycle, storage, camera, file, share, URL, and network
-capabilities. The bundled GPUI-WASM runtime is the only mobile UI; there is no
-browser WebUI/PWA distribution or legacy React fallback.
+`vibex-mobile` is the native GPUI client for iOS and Android. It links the
+mobile platform implementations from `vendor/zed`, connects to the
+authoritative desktop runtime, and renders Vibex Agent sessions as a GUI.
 
-## Validate
+## Android
 
-```bash
-pnpm --filter @vibex/mobile validate
-```
-
-## Build Android Debug APK
-
-The build script discovers the repository's supported JDK 21 and Android SDK,
-generates the ignored native project when needed, syncs release GPUI-WASM
-assets, and copies the resulting APK into the ignored artifacts directory.
+Prerequisites: Android SDK/NDK, `cargo-ndk`, and the Android Rust targets used
+by the build (`arm64-v8a` plus `x86_64` for debug; `arm64-v8a` for release).
 
 ```bash
-pnpm --filter @vibex/mobile android:debug
-pnpm --filter @vibex/mobile android:release
+pnpm build:mobile:android
 ```
 
-Output:
+The command builds `libvibex_mobile.so` and packages a debug APK through the
+checked-in NativeActivity Gradle project.
 
-```text
-apps/mobile/artifacts/vibex-gate-debug.apk
-apps/mobile/artifacts/android-debug-build.json
+Set `VIBEX_MOBILE_ANDROID_TARGETS` to a space-separated ABI list to override
+the defaults during local development.
+
+## iOS
+
+Prerequisites: Xcode, XcodeGen, and the `aarch64-apple-ios` plus
+`aarch64-apple-ios-sim` Rust targets.
+
+```bash
+pnpm build:mobile:ios
 ```
 
-The APK proves packaging only. Physical Android input, IME, rotation,
-foreground/background, secure storage, WebGPU pixels, and resource behavior
-remain pending until captured by `scripts/capture-wasm-mobile.mjs`.
-
-On macOS/Xcode, the same mobile runtime build is validated in unsigned simulator Debug
-and Release shells with `ios:debug` and `ios:release`. Signed physical-device
-artifacts remain part of the cross-platform release Gate.
-
-The build scripts regenerate the ignored native platform tree and install
-`vibex://open/<transport>#/pair/...` plus
-`dev.vibex.remote://open/<transport>#/pair/...` URL handlers. `<transport>` is
-`direct`, `tailnet`, or `self_hosted_relay` and must match an option in the
-signed pairing offer. Set `VIBEX_APP_LINK_HOST` on a deployment build to add an
-HTTPS App/Universal Link host using `/open/<transport>`; the fragment is
-scrubbed by the mobile runtime host before claim.
+The command builds `VibexFFI.xcframework` and generates the Xcode project.

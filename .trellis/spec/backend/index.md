@@ -1,8 +1,8 @@
 # Backend Development Guidelines
 
 These guidelines describe the current source-backed backend contracts for Vibex.
-The PC `DesktopRuntime` remains authoritative while GPUI Desktop and the
-GPUI-WASM/Capacitor mobile client consume shared Native/Remote capabilities.
+The PC `DesktopRuntime` remains authoritative while GPUI Desktop and the native
+GPUI mobile client consume shared Native/Remote capabilities.
 
 Primary evidence:
 - [Architecture Baseline](../guides/architecture-baseline.md) for current cross-platform UI and remote architecture.
@@ -10,7 +10,7 @@ Primary evidence:
 - Current Rust code, tests, and completed Trellis tasks for domain behavior.
 
 Superseded planning documents are not authoritative and must not override the
-current GPUI/GPUI-WASM architecture. They are kept out of this repository; see
+current GPUI architecture. They are kept out of this repository; see
 [Vibex Reference Materials](../guides/reference-materials.md) for where current
 evidence lives.
 
@@ -57,8 +57,8 @@ the trusted backend runtime: Agent CLI process management, filesystem access,
 Git operations, PTY terminals, Provider configuration injection, Relay
 connections, and durable storage.
 
-The backend must expose one provider-neutral service surface to desktop and
-mobile clients. UI code must not speak directly to Claude Code, Codex, or
+The backend must expose one provider-neutral service surface to desktop and the
+native mobile client. UI code must not speak directly to Claude Code, Codex, or
 ACP-specific APIs. Every online Agent session is routed through ACP; native
 Claude/Codex files are read only by offline import and parity tooling.
 

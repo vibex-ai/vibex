@@ -15,22 +15,6 @@ export default [
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
-    files: ["apps/*/scripts/**/*.mjs"],
-    languageOptions: {
-      ecmaVersion: 2024,
-      globals: globals.node,
-      sourceType: "module"
-    }
-  },
-  {
-    files: ["apps/mobile-wasm/host/**/*.js"],
-    languageOptions: {
-      ecmaVersion: 2024,
-      globals: globals.browser,
-      sourceType: "module"
-    }
-  },
-  {
     files: ["**/*.{ts,tsx}"],
     languageOptions: {
       ecmaVersion: 2024,

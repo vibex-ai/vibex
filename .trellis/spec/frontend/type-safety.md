@@ -5,7 +5,7 @@ payloads. Use discriminated unions for timeline items, permission requests,
 capabilities, and remote events.
 
 Current evidence: [Architecture Baseline](../guides/architecture-baseline.md),
-shared Rust DTOs, and protocol golden tests. GPUI Desktop and GPUI-WASM consume
+shared Rust DTOs, and protocol golden tests. GPUI Desktop and native mobile consume
 Rust contracts directly; the unused TypeScript compatibility package was retired
 after the React/Tauri cutover.
 
@@ -195,8 +195,8 @@ return source ? `${source.agentLabel} · ${source.providerProfileLabel} · ${sou
 
 ### 1. Scope / Trigger
 
-- Trigger: rendering or refreshing Provider binding controls in GPUI Desktop,
-  GPUI-WASM Web, or mobile.
+- Trigger: rendering or refreshing Provider binding controls in GPUI Desktop or
+  native mobile.
 - The editor consumes the backend's version-matched capability and redacted
   preview. It never parses a Provider-native options blob or invents support
   from Agent/catalog metadata.

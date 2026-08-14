@@ -2,8 +2,12 @@
 node_modules/
 dist/
 apps/*/dist/
-apps/mobile/android/
-apps/mobile/ios/
+apps/mobile/android/.gradle/
+apps/mobile/android/**/build/
+apps/mobile/android/local.properties
+apps/mobile/android/app/src/main/jniLibs/
+apps/mobile/ios/*.xcodeproj/
+apps/mobile/ios/VibexFFI.xcframework/
 apps/mobile/artifacts/
 crates/core/bindings/
 *.tsbuildinfo
