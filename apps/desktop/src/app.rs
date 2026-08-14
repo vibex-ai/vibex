@@ -221,6 +221,7 @@ const TIMELINE_MARKDOWN_SOURCE_CACHE_LIMIT: usize = 32;
 const TIMELINE_MARKDOWN_SOURCE_CACHE_BYTES: usize = 2 * 1024 * 1024;
 const TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 const TIMELINE_STREAMING_MARKDOWN_REFRESH_BYTES: usize = 8 * 1024;
+const AGENT_THINKING_SCROLL_DURATION: Duration = Duration::from_secs(12);
 const TIMELINE_TOOL_PROJECTION_CACHE_LIMIT: usize = 128;
 const TIMELINE_TOOL_PROJECTION_CACHE_BYTES: usize = 2 * 1024 * 1024;
 const TIMELINE_FILE_DIFF_PREVIEW_CACHE_LIMIT: usize = 64;
@@ -21999,8 +22000,12 @@ impl VibexWorkbench {
                         .unwrap_or(strings.agent_pending_response)
                         .to_string()
                 };
+                let pending_tooltip =
+                    agent_progress_tooltip(&pending_label, strings.agent_pending_response);
                 response = response.child(render_agent_thinking_indicator(
+                    &turn.id,
                     &agent_progress_label(&pending_label, strings.agent_pending_response),
+                    &pending_tooltip,
                     cx,
                 ));
             }
@@ -28193,38 +28198,99 @@ fn agent_progress_label(label: &str, fallback: &str) -> String {
     format!("{stem}...")
 }
 
-fn render_agent_thinking_indicator(label: &str, cx: &App) -> AnyElement {
+fn agent_progress_tooltip(label: &str, fallback: &str) -> String {
+    let (plain_text, _) = agent_markdown_summary(label);
+    let text = plain_text.trim();
+    if text.is_empty() {
+        fallback.to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+fn agent_thinking_scroll_progress(delta: f32) -> f32 {
+    const START_HOLD: f32 = 0.18;
+    const END_HOLD: f32 = 0.18;
+
+    if delta <= START_HOLD {
+        0.0
+    } else if delta >= 1.0 - END_HOLD {
+        1.0
+    } else {
+        (delta - START_HOLD) / (1.0 - START_HOLD - END_HOLD)
+    }
+}
+
+fn render_agent_thinking_indicator(
+    turn_id: &str,
+    label: &str,
+    tooltip: &str,
+    cx: &App,
+) -> AnyElement {
     let base = cx.theme().muted_foreground.opacity(0.75);
     let glow = cx.theme().foreground;
+    let background = cx.theme().background;
     let label = label.to_string();
-    let character_count = label.chars().count();
+    let tooltip = tooltip.to_string();
+    let element_id = format!("agent-thinking-{turn_id}");
+    let animation_id = format!("{element_id}-animation");
+    let scroll_id = format!("{element_id}-scroll");
+    let scroll = gpui::ScrollHandle::new();
+    let animation_scroll = scroll.clone();
     h_flex()
         .w_full()
         .min_w_0()
         .justify_start()
         .py_1()
-        .child(h_flex().text_sm().with_animation(
-            "agent-thinking-glow",
-            Animation::new(Duration::from_millis(1_200)).repeat(),
-            move |this, delta| {
-                let scan_position = -0.35 + delta * 1.7;
-                this.children(label.chars().enumerate().map(|(index, character)| {
-                    let position = if character_count > 1 {
-                        index as f32 / (character_count - 1) as f32
-                    } else {
-                        0.5
-                    };
-                    let intensity = (1.0 - (position - scan_position).abs() / 0.42).clamp(0.0, 1.0);
-                    let intensity = intensity * intensity * (3.0 - 2.0 * intensity);
-                    div().child(character.to_string()).text_color(Hsla {
-                        h: base.h + (glow.h - base.h) * intensity,
-                        s: base.s + (glow.s - base.s) * intensity,
-                        l: base.l + (glow.l - base.l) * intensity,
-                        a: base.a + (glow.a - base.a) * intensity,
-                    })
-                }))
-            },
-        ))
+        .child(
+            div()
+                .id(element_id)
+                .relative()
+                .min_w_0()
+                .flex_1()
+                .overflow_hidden()
+                .text_sm()
+                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                .with_animation(
+                    animation_id,
+                    Animation::new(AGENT_THINKING_SCROLL_DURATION).repeat(),
+                    move |this, delta| {
+                        let progress = agent_thinking_scroll_progress(delta);
+                        let max_offset = animation_scroll.max_offset().x;
+                        animation_scroll.set_offset(point(-max_offset * progress, px(0.0)));
+                        let intensity = (delta * 10.0 * std::f32::consts::TAU).sin() * 0.5 + 0.5;
+                        this.text_color(Hsla {
+                            h: base.h + (glow.h - base.h) * intensity,
+                            s: base.s + (glow.s - base.s) * intensity,
+                            l: base.l + (glow.l - base.l) * intensity,
+                            a: base.a + (glow.a - base.a) * intensity,
+                        })
+                        .child(
+                            div()
+                                .id(scroll_id.clone())
+                                .w_full()
+                                .overflow_x_scroll()
+                                .track_scroll(&animation_scroll)
+                                .child(div().flex_none().whitespace_nowrap().child(label.clone())),
+                        )
+                        .when(
+                            max_offset > px(0.0) && progress < 1.0,
+                            |this| {
+                                this.child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .right_0()
+                                        .bottom_0()
+                                        .pl_1()
+                                        .bg(background)
+                                        .child("…"),
+                                )
+                            },
+                        )
+                    },
+                ),
+        )
         .into_any_element()
 }
 
@@ -35673,7 +35739,26 @@ mod tests {
     }
 
     #[test]
-    fn agent_thinking_indicator_uses_one_shared_animation_clock() {
+    fn agent_progress_tooltips_keep_the_full_plain_text() {
+        let label = "**定逻辑，agent_message_phase 的行为，以及 manager 侧对 prompt 错误的处理。**";
+        assert_eq!(
+            agent_progress_tooltip(label, "Thinking..."),
+            "定逻辑，agent_message_phase 的行为，以及 manager 侧对 prompt 错误的处理。"
+        );
+        assert_eq!(agent_progress_tooltip("   ", "思考中..."), "思考中...");
+    }
+
+    #[test]
+    fn agent_thinking_scroll_holds_at_each_end() {
+        assert_eq!(agent_thinking_scroll_progress(0.0), 0.0);
+        assert_eq!(agent_thinking_scroll_progress(0.18), 0.0);
+        assert!((agent_thinking_scroll_progress(0.5) - 0.5).abs() < f32::EPSILON);
+        assert_eq!(agent_thinking_scroll_progress(0.82), 1.0);
+        assert_eq!(agent_thinking_scroll_progress(1.0), 1.0);
+    }
+
+    #[test]
+    fn agent_thinking_indicator_scrolls_overflow_and_keeps_full_tooltip() {
         let source = include_str!("app.rs");
         let renderer = source
             .split_once("fn render_agent_thinking_indicator(")
@@ -35682,11 +35767,15 @@ mod tests {
             .expect("thinking indicator renderer should remain inspectable");
 
         assert_eq!(renderer.matches(".with_animation(").count(), 1);
-        assert!(
-            renderer.find(".with_animation(").unwrap()
-                < renderer.find(".children(label.chars()").unwrap()
-        );
-        assert!(!renderer.contains("agent-thinking-glow-{index}"));
+        assert!(renderer.contains("animation_scroll.max_offset().x"));
+        assert!(renderer.contains("animation_scroll.set_offset"));
+        assert!(renderer.contains(".overflow_x_scroll()"));
+        assert!(renderer.contains(".track_scroll(&animation_scroll)"));
+        assert!(renderer.contains(".whitespace_nowrap()"));
+        assert!(renderer.contains(".child(\"…\")"));
+        assert!(renderer.contains("Tooltip::new(tooltip.clone())"));
+        assert!(renderer.contains(".child(label.clone())"));
+        assert!(!renderer.contains("label.chars()"));
     }
 
     #[test]
