@@ -26,6 +26,7 @@ members = [
   "crates/vibex-ui",
   "crates/vibex-terminal-ui",
 ]
+exclude = ["vendor/zed"]
 resolver = "3"
 
 [workspace.package]
@@ -67,9 +68,9 @@ futures-util = { version = "0.3", features = ["sink"] }
 futures-channel = "0.3"
 reqwest = { version = "0.13.4", features = ["json", "stream"] }
 fs2 = "0.4.3"
-gpui = { git = "https://github.com/zed-industries/zed" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
-gpui_tokio = { git = "https://github.com/zed-industries/zed" }
+gpui = { path = "vendor/zed/crates/gpui" }
+gpui_platform = { path = "vendor/zed/crates/gpui_platform", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
+gpui_tokio = { path = "vendor/zed/crates/gpui_tokio" }
 gpui-component = { git = "https://github.com/longbridge/gpui-component" }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
 image = { version = "=0.25.10", default-features = false }
@@ -94,6 +95,11 @@ url = "=2.5.8"
 ropey = "=2.0.0-beta.1"
 x25519-dalek = { version = "2", default-features = false, features = ["alloc", "precomputed-tables", "static_secrets", "zeroize"] }
 zip = { version = "=8.4.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[patch."https://github.com/zed-industries/zed"]
+# gpui-component still names upstream Zed; keep that edge on the fork submodule too.
+gpui = { path = "vendor/zed/crates/gpui" }
+gpui_macros = { path = "vendor/zed/crates/gpui_macros" }
 
 [profile.dev]
 incremental = true

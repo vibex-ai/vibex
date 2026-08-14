@@ -23,6 +23,7 @@ CI uses Node.js 22, pnpm 11.3.0, and Rust 1.97.0. The Rust version is pinned by
 `rust-toolchain.toml`, and the pnpm version is pinned by `package.json`.
 
 ```bash
+git submodule update --init --recursive
 corepack enable
 pnpm install --frozen-lockfile
 ```

@@ -9,7 +9,7 @@ const SOURCE = "crates/vibex-ui/theme/tokens.json";
 const OUTPUT = "crates/vibex-ui/src/generated_tokens.rs";
 const SCHEMA_VERSION = "vibex-design-tokens.v1";
 const PRODUCT_VISUAL_SOURCE = "apps/desktop";
-const DEPENDENCY_SOURCE_POLICY = "upstream_git_root_cargo_lock";
+const DEPENDENCY_SOURCE_POLICY = "fork_submodule_root_cargo_lock";
 const FORBIDDEN_SOURCE_REFERENCES = [
   "apps/web",
   "apps/mobile-wasm",

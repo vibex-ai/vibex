@@ -57,7 +57,7 @@ pub fn first_frame_probe() -> FirstFrameProbe {
     FirstFrameProbe {
         schema_version: "first-frame-probe.v1",
         status: "compiled_probe",
-        dependency_source_policy: "upstream_git_root_cargo_lock",
+        dependency_source_policy: "fork_submodule_root_cargo_lock",
         platform: std::env::consts::OS,
         architecture: std::env::consts::ARCH,
         display_backend: std::env::var("XDG_SESSION_TYPE")
@@ -111,7 +111,7 @@ mod tests {
         let probe = first_frame_probe();
         assert_eq!(
             probe.dependency_source_policy,
-            "upstream_git_root_cargo_lock"
+            "fork_submodule_root_cargo_lock"
         );
         assert_eq!((probe.default_width, probe.default_height), (1200, 780));
         assert_eq!((probe.min_width, probe.min_height), (360, 620));

@@ -136,7 +136,7 @@ This inventory records source and license provenance. The corresponding license 
 | cocoa-foundation | 0.1.2 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
 | cocoa-foundation | 0.2.0 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
 | codespan-reporting | 0.13.1 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
-| collections | 0.1.0 | git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| collections | 0.1.0 | path:vendor/zed/crates/collections | Apache-2.0 | Apache-2.0 | cargo-manifest |
 | color_quant | 1.1.0 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
 | combine | 4.6.7 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
 | command-group | 5.0.1 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 OR MIT | Apache-2.0 | cargo-manifest |
@@ -190,7 +190,7 @@ This inventory records source and license provenance. The corresponding license 
 | deranged | 0.5.8 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
 | derive_more | 2.1.1 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
 | derive_more-impl | 2.1.1 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
-| derive_refineable | 0.1.0 | git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| derive_refineable | 0.1.0 | path:vendor/zed/crates/refineable/derive_refineable | Apache-2.0 | Apache-2.0 | cargo-manifest |
 | digest | 0.10.7 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
 | digest | 0.11.3 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
 | dirs | 6.0.0 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
@@ -300,20 +300,20 @@ This inventory records source and license provenance. The corresponding license 
 | gpu-allocator | 0.28.0 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
 | gpu-descriptor | 0.3.2 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
 | gpu-descriptor-types | 0.2.0 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
-| gpui | 0.2.2 | git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| gpui | 0.2.2 | path:vendor/zed/crates/gpui | Apache-2.0 | Apache-2.0 | cargo-manifest |
 | gpui-component | 0.5.2 | git+https://github.com/longbridge/gpui-component#031555662e99a1b5a549990b47f246d475b8288a | Apache-2.0 | Apache-2.0 | cargo-manifest |
 | gpui-component-assets | 0.5.1 | git+https://github.com/longbridge/gpui-component#031555662e99a1b5a549990b47f246d475b8288a | Apache-2.0 | Apache-2.0 | cargo-manifest |
 | gpui-component-macros | 0.5.1 | git+https://github.com/longbridge/gpui-component#031555662e99a1b5a549990b47f246d475b8288a | Apache-2.0 | Apache-2.0 | cargo-manifest |
-| gpui_linux | 0.1.0 | git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b | Apache-2.0 | Apache-2.0 | cargo-manifest |
-| gpui_macos | 0.1.0 | git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b | Apache-2.0 | Apache-2.0 | cargo-manifest |
-| gpui_macros | 0.1.0 | git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b | Apache-2.0 | Apache-2.0 | cargo-manifest |
-| gpui_platform | 0.1.0 | git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b | Apache-2.0 | Apache-2.0 | cargo-manifest |
-| gpui_shared_string | 0.1.0 | git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b | Apache-2.0 | Apache-2.0 | crates/gpui_shared_string/LICENSE-APACHE@Cargo.lock#sha256=752daf2fb234ca4a1fa372c073fe127f44b7b90fd2529ae44273a64f9d53da7a |
-| gpui_tokio | 0.1.0 | git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b | Apache-2.0 | Apache-2.0 | cargo-manifest |
-| gpui_util | 0.1.0 | git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b | Apache-2.0 | Apache-2.0 | crates/gpui_util/LICENSE-APACHE@Cargo.lock#sha256=752daf2fb234ca4a1fa372c073fe127f44b7b90fd2529ae44273a64f9d53da7a |
-| gpui_web | 0.1.0 | git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b | Apache-2.0 | Apache-2.0 | cargo-manifest |
-| gpui_wgpu | 0.1.0 | git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b | Apache-2.0 | Apache-2.0 | cargo-manifest |
-| gpui_windows | 0.1.0 | git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| gpui_linux | 0.1.0 | path:vendor/zed/crates/gpui_linux | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| gpui_macos | 0.1.0 | path:vendor/zed/crates/gpui_macos | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| gpui_macros | 0.1.0 | path:vendor/zed/crates/gpui_macros | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| gpui_platform | 0.1.0 | path:vendor/zed/crates/gpui_platform | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| gpui_shared_string | 0.1.0 | path:vendor/zed/crates/gpui_shared_string | Apache-2.0 | Apache-2.0 | vendor/zed/crates/gpui_shared_string/LICENSE-APACHE@c9e8e611dbc279afa0914d28c4d37ad07f38c03b#sha256=752daf2fb234ca4a1fa372c073fe127f44b7b90fd2529ae44273a64f9d53da7a |
+| gpui_tokio | 0.1.0 | path:vendor/zed/crates/gpui_tokio | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| gpui_util | 0.1.0 | path:vendor/zed/crates/gpui_util | Apache-2.0 | Apache-2.0 | vendor/zed/crates/gpui_util/LICENSE-APACHE@c9e8e611dbc279afa0914d28c4d37ad07f38c03b#sha256=752daf2fb234ca4a1fa372c073fe127f44b7b90fd2529ae44273a64f9d53da7a |
+| gpui_web | 0.1.0 | path:vendor/zed/crates/gpui_web | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| gpui_wgpu | 0.1.0 | path:vendor/zed/crates/gpui_wgpu | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| gpui_windows | 0.1.0 | path:vendor/zed/crates/gpui_windows | Apache-2.0 | Apache-2.0 | cargo-manifest |
 | granit-parser | 0.0.7 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
 | grid | 1.0.1 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
 | gtk | 0.18.2 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
@@ -342,7 +342,7 @@ This inventory records source and license provenance. The corresponding license 
 | http | 1.4.2 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
 | http-body | 1.0.1 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
 | http-body-util | 0.1.3 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
-| http_client | 0.1.0 | git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| http_client | 0.1.0 | path:vendor/zed/crates/http_client | Apache-2.0 | Apache-2.0 | cargo-manifest |
 | httparse | 1.10.1 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
 | httpdate | 1.0.3 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
 | hybrid-array | 0.4.13 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
@@ -447,7 +447,7 @@ This inventory records source and license provenance. The corresponding license 
 | maybe-owned | 0.3.4 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
 | maybe-rayon | 0.1.1 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
 | md-5 | 0.10.6 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
-| media | 0.1.0 | git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| media | 0.1.0 | path:vendor/zed/crates/media | Apache-2.0 | Apache-2.0 | cargo-manifest |
 | memchr | 2.8.2 | registry+https://github.com/rust-lang/crates.io-index | Unlicense OR MIT | Unlicense | cargo-manifest |
 | memmap2 | 0.9.11 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
 | memoffset | 0.9.1 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
@@ -540,7 +540,7 @@ This inventory records source and license provenance. The corresponding license 
 | pbkdf2 | 0.12.2 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
 | pdfium-render | 0.9.3 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
 | percent-encoding | 2.3.2 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
-| perf | 0.1.0 | git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| perf | 0.1.0 | path:vendor/zed/tooling/perf | Apache-2.0 | Apache-2.0 | cargo-manifest |
 | phf | 0.11.3 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
 | phf | 0.13.1 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
 | phf_codegen | 0.11.3 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
@@ -626,7 +626,7 @@ This inventory records source and license provenance. The corresponding license 
 | redox_users | 0.5.2 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
 | ref-cast | 1.0.25 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
 | ref-cast-impl | 1.0.25 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
-| refineable | 0.1.0 | git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| refineable | 0.1.0 | path:vendor/zed/crates/refineable | Apache-2.0 | Apache-2.0 | cargo-manifest |
 | regex | 1.12.4 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
 | regex-automata | 0.4.14 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
 | regex-syntax | 0.8.11 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
@@ -670,7 +670,7 @@ This inventory records source and license provenance. The corresponding license 
 | ryu-js | 1.0.3 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 OR BSL-1.0 | Apache-2.0 | cargo-manifest |
 | same-file | 1.0.6 | registry+https://github.com/rust-lang/crates.io-index | Unlicense OR MIT | Unlicense | cargo-manifest |
 | schannel | 0.1.29 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
-| scheduler | 0.1.0 | git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| scheduler | 0.1.0 | path:vendor/zed/crates/scheduler | Apache-2.0 | Apache-2.0 | cargo-manifest |
 | schemars | 0.9.0 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
 | schemars | 1.2.1 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
 | schemars_derive | 1.2.1 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
@@ -749,7 +749,7 @@ This inventory records source and license provenance. The corresponding license 
 | strum_macros | 0.27.2 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
 | strum_macros | 0.28.0 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
 | subtle | 2.6.1 | registry+https://github.com/rust-lang/crates.io-index | BSD-3-Clause | BSD-3-Clause | cargo-manifest |
-| sum_tree | 0.1.0 | git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| sum_tree | 0.1.0 | path:vendor/zed/crates/sum_tree | Apache-2.0 | Apache-2.0 | cargo-manifest |
 | sval | 2.20.0 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 OR MIT | Apache-2.0 | cargo-manifest |
 | sval_buffer | 2.20.0 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 OR MIT | Apache-2.0 | cargo-manifest |
 | sval_dynamic | 2.20.0 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 OR MIT | Apache-2.0 | cargo-manifest |
@@ -886,7 +886,7 @@ This inventory records source and license provenance. The corresponding license 
 | utf16_iter | 1.0.5 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 OR MIT | Apache-2.0 | cargo-manifest |
 | utf16string | 0.2.0 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
 | utf8_iter | 1.0.4 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 OR MIT | Apache-2.0 | cargo-manifest |
-| util_macros | 0.1.0 | git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| util_macros | 0.1.0 | path:vendor/zed/crates/util_macros | Apache-2.0 | Apache-2.0 | cargo-manifest |
 | uuid | 1.23.3 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 OR MIT | Apache-2.0 | cargo-manifest |
 | v_frame | 0.3.9 | registry+https://github.com/rust-lang/crates.io-index | BSD-2-Clause | BSD-2-Clause | cargo-manifest |
 | valuable | 0.1.1 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
@@ -1078,13 +1078,13 @@ This inventory records source and license provenance. The corresponding license 
 | zerovec-derive | 0.11.3 | registry+https://github.com/rust-lang/crates.io-index | Unicode-3.0 | Unicode-3.0 | cargo-manifest |
 | zip | 8.4.0 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
 | zlib-rs | 0.6.6 | registry+https://github.com/rust-lang/crates.io-index | Zlib | Zlib | cargo-manifest |
-| zlog | 0.1.0 | git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b | GPL-3.0-or-later | GPL-3.0-or-later | cargo-manifest |
+| zlog | 0.1.0 | path:vendor/zed/crates/zlog | GPL-3.0-or-later | GPL-3.0-or-later | cargo-manifest |
 | zmij | 1.0.21 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
 | zstd | 0.13.3 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
 | zstd-safe | 7.2.4 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
 | zstd-sys | 2.0.16+zstd.1.5.7 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
-| ztracing | 0.1.0 | git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b | GPL-3.0-or-later | GPL-3.0-or-later | cargo-manifest |
-| ztracing_macro | 0.1.0 | git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b | GPL-3.0-or-later | GPL-3.0-or-later | cargo-manifest |
+| ztracing | 0.1.0 | path:vendor/zed/crates/ztracing | GPL-3.0-or-later | GPL-3.0-or-later | cargo-manifest |
+| ztracing_macro | 0.1.0 | path:vendor/zed/crates/ztracing_macro | GPL-3.0-or-later | GPL-3.0-or-later | cargo-manifest |
 | zune-core | 0.4.12 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 OR Zlib | MIT | cargo-manifest |
 | zune-core | 0.5.1 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 OR Zlib | MIT | cargo-manifest |
 | zune-inflate | 0.2.54 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 OR Zlib | MIT | cargo-manifest |

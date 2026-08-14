@@ -45,9 +45,10 @@ semantic light/dark colors, syntax highlighting, typography defaults, radii,
 spacing, border widths, and shadow policy. Generated Rust is a derived artifact.
 Desktop and WASM consumers use the same crate and source identity.
 
-The source uses schema `vibex-design-tokens.v1` and binds the exact GPUI and
-gpui-component revisions resolved by the root `Cargo.lock`. It freezes 53 semantic
-colors per theme and the locked gpui-component Default light/dark highlight themes.
+The source uses schema `vibex-design-tokens.v1` and binds the exact GPUI revision
+from the `vendor/zed` submodule plus the gpui-component revision resolved by the
+root `Cargo.lock`. It freezes 53 semantic colors per theme and the locked
+gpui-component Default light/dark highlight themes.
 `scripts/generate-tokens.mjs` validates the schema and produces only
 `crates/vibex-ui/src/generated_tokens.rs`. `apps/desktop/src/theme.rs` consumes the
 shared colors, typography policy, radii, shadow policy, and syntax highlight values

@@ -3,35 +3,52 @@
 Vibex consumes third-party Rust projects from their upstream Cargo sources. The
 repository does not maintain copied, patched, or shimmed third-party source trees.
 
-## Scenario: Upstream Git Dependencies With A Reviewed Root Lockfile
+## Scenario: Forked Zed Submodule With A Reviewed Root Lockfile
 
 ### 1. Scope / Trigger
 
-- Trigger: adding or updating a Rust Git dependency, changing `Cargo.lock`, changing
-  a third-party license decision, or changing evidence whose validity depends on the
-  resolved Rust graph.
-- The GPUI ecosystem is the reference contract: Zed GPUI and gpui-component use
-  upstream Git declarations without `rev`, `tag`, or `branch`; the committed root
-  `Cargo.lock` is the exact reviewed snapshot.
+- Trigger: adding or updating a Rust Git dependency, moving the `vendor/zed`
+  submodule pointer, changing `Cargo.lock`, changing a third-party license decision,
+  or changing evidence whose validity depends on the resolved Rust graph.
+- The GPUI ecosystem uses two source controls: the Zed fork is a pinned Git
+  submodule, while gpui-component remains an unqualified upstream Git dependency
+  pinned by the committed root `Cargo.lock`.
 
 ### 2. Signatures
 
+```ini
+# .gitmodules
+[submodule "vendor/zed"]
+    path = vendor/zed
+    url = https://github.com/vibex-ai/zed.git
+    branch = main
+    shallow = true
+```
+
 ```toml
 # Cargo.toml
+[workspace]
+exclude = ["vendor/zed"]
+
 [workspace.dependencies]
-gpui = { git = "https://github.com/zed-industries/zed" }
-gpui_platform = { git = "https://github.com/zed-industries/zed" }
-gpui_tokio = { git = "https://github.com/zed-industries/zed" }
+gpui = { path = "vendor/zed/crates/gpui" }
+gpui_platform = { path = "vendor/zed/crates/gpui_platform" }
+gpui_tokio = { path = "vendor/zed/crates/gpui_tokio" }
 gpui-component = { git = "https://github.com/longbridge/gpui-component" }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
+
+[patch."https://github.com/zed-industries/zed"]
+gpui = { path = "vendor/zed/crates/gpui" }
+gpui_macros = { path = "vendor/zed/crates/gpui_macros" }
 ```
 
 ```text
-Cargo.lock                                      one committed workspace lockfile
-cargo metadata --locked --format-version 1     resolved source identity
-pnpm check:graph                           source-shape and single-source gate
-pnpm check:licenses                        SPDX, asset, SBOM, and notice gate
-pnpm check:rust                                 locked fmt/check/clippy/test gate
+git submodule update --init --recursive          initialize the pinned Zed tree
+Cargo.lock                                       one Vibex workspace lockfile
+cargo metadata --locked --format-version 1       resolved source identity
+pnpm check:graph                                 submodule and source-shape gate
+pnpm check:licenses                              SPDX, asset, SBOM, and notice gate
+pnpm check:rust                                  locked fmt/check/clippy/test gate
 ```
 
 ```text
@@ -43,103 +60,109 @@ upstream-dependency-revalidation.v1 {
 
 ### 3. Contracts
 
-- Third-party Git manifests name the canonical upstream repository. Do not add
-  `rev`, `tag`, or `branch` to the GPUI or gpui-component declarations.
-- Reproducibility comes from the committed root `Cargo.lock` and normal `--locked`
-  commands. A dependency update is a reviewed lockfile change, not an automatic
-  fetch of upstream HEAD during ordinary builds.
-- All Zed packages resolve to one Git source commit, and both gpui-component
-  packages resolve to one upstream gpui-component commit.
-- Do not add a tracked `vendor/` tree, Git submodule, local third-party path patch,
-  compatibility shim, or copied upstream source as a fallback.
+- `vendor/zed` is the only approved vendor entry. It is a Git submodule, not a
+  copied or directly edited source tree, and its committed gitlink is the exact Zed
+  revision used by source-identity and evidence tooling.
+- The submodule URL is `https://github.com/vibex-ai/zed.git`. The tracked branch is
+  `main`, but ordinary builds use the committed gitlink; they never select remote
+  `main` automatically.
+- Exclude `vendor/zed` from the Vibex workspace. Without the exclusion, Cargo makes
+  Zed crates inherit Vibex's `[workspace.dependencies]` and manifest loading fails.
+- Vibex's direct `gpui`, `gpui_platform`, and `gpui_tokio` dependencies are path
+  dependencies. The patch for the canonical Zed URL is required because
+  gpui-component still declares `gpui` and `gpui_macros` from that URL.
+- All Zed-family packages in Cargo metadata must resolve from the one submodule
+  tree. No package may remain on either the official Zed Git source or a separate
+  Git fetch of the fork.
+- gpui-component declarations remain unqualified upstream Git dependencies without
+  `rev`, `tag`, or `branch`; the root lockfile selects their reviewed commit.
+- Reproducibility is the combination of the committed Zed gitlink and root
+  `Cargo.lock`. A Zed update reviews and commits the submodule pointer, lockfile,
+  license outputs, source identities, and evidence disposition together.
+- Every CI checkout that builds, checks, packages, or validates evidence must enable
+  recursive submodule checkout.
+- No other tracked `vendor/` tree, Git submodule, local third-party path patch,
+  compatibility shim, or copied upstream source is approved.
 - Use crates.io packages unmodified unless the user explicitly approves a new
-  source policy. Known future-incompatibility warnings require an exact
-  package/version allowlist with owner and removal condition; they do not justify a
-  local fork.
+  source policy. Future-incompatibility warnings require an exact package/version
+  allowlist with owner and removal condition; they do not justify another fork.
 - Vibex package metadata uses `AGPL-3.0-or-later`. Approved dependency licenses may
   include `GPL-3.0-or-later`, but dependency license metadata is never rewritten as
   Vibex's license.
-- Physical evidence tied to a previous `Cargo.lock` remains historical. A reviewed
-  revalidation disposition must classify it as `historical_pending_recapture`; do
-  not regenerate metadata that presents old screenshots as current-lock proof.
-- Repositories may retain more than one historical dependency generation. Record
-  each generation separately under `historicalSources`, keyed by its exact Zed
-  revision, gpui-component revision, and `Cargo.lock` SHA-256. Each evidence path
-  belongs to one generation; do not overwrite the prior generation when the lock
-  changes again.
-- Long-running or unavailable physical captures may also bind their historical
-  `sourceInputTreeSha256` in `sourceInputTreeSha256ByEvidence`. The verifier must
-  reject a changed tree hash even while returning `historical_pending_recapture`.
-  Deterministic/headless evidence should be recaptured against the current graph
-  when practical instead of being needlessly carried as historical.
+- Physical evidence tied to a previous source policy or `Cargo.lock` remains
+  historical. A reviewed revalidation disposition must classify it as
+  `historical_pending_recapture`; do not rewrite old captures as current proof.
+- Each historical generation is keyed by its exact Zed revision, gpui-component
+  revision, and `Cargo.lock` SHA-256. Each evidence path belongs to one generation.
+  Preserve any reviewed `sourceInputTreeSha256ByEvidence` binding.
 
 ### 4. Validation & Error Matrix
 
 | Condition | Required result |
 | --- | --- |
-| GPUI manifest contains `rev`, `tag`, or `branch` | `check:graph` fails. |
-| Zed or gpui-component resolves from multiple source commits | Graph check fails and reports the conflicting identities. |
-| A tracked `vendor/` directory, third-party path patch, or nested lockfile appears | Graph check fails. |
+| `vendor/zed` is absent, uninitialized, not a gitlink, or points at another URL | `check:graph` fails with the missing submodule contract. |
+| A direct GPUI dependency does not use its exact `vendor/zed` path | Graph check fails. |
+| The upstream Zed patch omits `gpui` or `gpui_macros` | Graph check fails before duplicate sources can enter the graph. |
+| Cargo metadata contains an official or fork Zed Git package | Graph check fails and reports the escaped package names. |
+| gpui-component contains `rev`, `tag`, or `branch`, or resolves from multiple commits | Graph check fails. |
+| Another entry appears under `vendor/` or another root-managed lockfile appears | Graph check fails. The Zed submodule's own lockfile is outside the Vibex lock scan. |
 | `proc-macro-error2` is not crates.io `2.0.1`, or another future-incompatible package appears | Rust quality check fails until the graph or reviewed allowlist is corrected. |
 | An unapproved or missing SPDX selection enters the graph | License check fails; do not silently broaden the policy. |
-| Physical evidence lock identity differs from the current root lock | Classify it as historical only when the revalidation disposition recognizes it; otherwise fail as stale. |
-| Evidence path is absent from every historical generation, appears in two generations, or its revisions/lock do not match its generation | Fail closed; do not infer the closest generation. |
-| Historical evidence has a reviewed source-tree identity and the stored tree hash changes | Reject the artifact even though its lock generation is recognized. |
+| Physical evidence identity differs from the current root source | Classify it as historical only when the revalidation disposition recognizes it; otherwise fail as stale. |
 | Generated SBOM, notices, baseline inventory, or decision hashes drift | Regenerate the owning artifact and rerun its verification command. |
 
 ### 5. Good / Base / Bad Cases
 
-- Good: update upstream dependencies with `cargo update`, review the exact
-  `Cargo.lock` diff, regenerate notices/evidence identities, and run `pnpm check`.
-- Base: ordinary development uses `cargo check --locked`; no network-selected
-  dependency revision changes occur when the lockfile is unchanged.
-- Base: a service dependency changes the root lock without changing the Zed commit;
-  current physical artifacts are recaptured where practical and the remaining prior
-  lock artifacts move into a new exact historical generation.
-- Bad: pin a Zed `rev` to avoid reviewing future lock updates, copy gpui-component
-  into `vendor/`, or patch a warning-producing crate locally.
-- Bad: overwrite historical evidence source hashes after a dependency transition
-  without rerunning the physical protocol.
-- Bad: replace the single historical source with the newest old lock and thereby
-  make older vendor-era evidence unclassifiable.
+- Good: fetch and review a fork commit, check out that exact revision inside
+  `vendor/zed`, review the gitlink and `Cargo.lock` diffs, regenerate licenses and
+  evidence identities, then run the full dependency-source gates.
+- Base: ordinary development initializes the submodule once and uses `--locked`;
+  neither the fork revision nor gpui-component revision moves automatically.
+- Base: a non-Zed dependency changes the root lock without moving the gitlink;
+  evidence is recaptured or recorded under an exact historical lock generation.
+- Bad: run `git submodule update --remote` and commit the result without reviewing
+  the fork diff, resolved graph, licenses, and evidence disposition.
+- Bad: remove the canonical-URL patch and allow gpui-component to reintroduce a
+  second GPUI package from the official repository.
+- Bad: copy Zed files into `vendor/zed`, vendor gpui-component, or patch a
+  warning-producing crates.io package locally.
 
 ### 6. Tests Required
 
-- `cargo metadata --locked --format-version 1` resolves successfully.
-- `pnpm check:graph` asserts unqualified upstream Git declarations, one source
-  commit per upstream family, crates.io proc-macro-error2, upstream Zed tracing, no
-  vendor directory, and exactly one root lockfile.
+- `git submodule status --recursive` reports the initialized reviewed revision.
+- `cargo metadata --locked --format-version 1` resolves successfully and every
+  Zed-family manifest path is under `vendor/zed`.
+- `pnpm check:graph` asserts the fork URL, gitlink mode, exact path declarations,
+  canonical-URL patch, one gpui-component commit, crates.io proc-macro-error2,
+  forked Zed tracing, one Vibex root lockfile, and no extra vendor entry.
 - `pnpm check:rust` accepts only the reviewed `proc-macro-error2 v2.0.1`
   future-incompatibility entry and rejects any additional package.
-- `pnpm check:licenses` verifies the full Cargo graph, asset provenance, SBOM,
-  notices, and the intended AGPL/GPL selections.
+- `pnpm check:licenses` verifies path-package provenance, the fork revision in the
+  SBOM, the full Cargo graph, assets, notices, and intended AGPL/GPL selections.
 - Evidence checks assert either `current` or the reviewed
-  `historical_pending_recapture` classification from exact lockfile identities;
-  negative tests mutate a bound historical source-tree hash and must be rejected.
-- Run the repository-level `pnpm check` before committing a dependency-source
-  migration.
+  `historical_pending_recapture` classification from exact source identities.
+- Run repository-level `pnpm check` before committing a dependency-source migration.
 
 ### 7. Wrong vs Correct
 
 #### Wrong
 
 ```toml
-gpui = { git = "https://github.com/zed-industries/zed", rev = "819fe337" }
+gpui = { git = "https://github.com/vibex-ai/zed.git", branch = "main" }
 gpui-component = { path = "vendor/gpui-component/crates/ui" }
-
-[patch.crates-io]
-proc-macro-error2 = { path = "vendor/proc-macro-error2" }
 ```
+
+This fetches branch state through Cargo and bypasses the reviewed submodule gitlink.
 
 #### Correct
 
 ```toml
-gpui = { git = "https://github.com/zed-industries/zed" }
-gpui-component = { git = "https://github.com/longbridge/gpui-component" }
-```
+gpui = { path = "vendor/zed/crates/gpui" }
 
-Commit and review the resulting root `Cargo.lock`; keep builds and checks on
-`--locked`.
+[patch."https://github.com/zed-industries/zed"]
+gpui = { path = "vendor/zed/crates/gpui" }
+gpui_macros = { path = "vendor/zed/crates/gpui_macros" }
+```
 
 #### Wrong
 
@@ -149,7 +172,7 @@ Commit and review the resulting root `Cargo.lock`; keep builds and checks on
 }
 ```
 
-This loses the identity of any earlier physical evidence generation.
+This loses the identity of earlier evidence generations.
 
 #### Correct
 
@@ -157,7 +180,7 @@ This loses the identity of any earlier physical evidence generation.
 {
   "historicalSources": [
     { "source": { "cargoLockSha256": "vendor-lock" }, "evidence": ["old.json"] },
-    { "source": { "cargoLockSha256": "prior-upstream-lock" }, "evidence": ["newer.json"] }
+    { "source": { "cargoLockSha256": "prior-lock" }, "evidence": ["newer.json"] }
   ]
 }
 ```

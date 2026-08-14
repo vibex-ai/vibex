@@ -66,7 +66,7 @@
     },
     {
       "id": "locked_gpui_source_identity",
-      "description": "The production graph contains one reviewed Zed revision and the controlled gpui-component vendor."
+      "description": "The production graph contains one reviewed Zed fork submodule revision and one locked gpui-component source."
     },
     {
       "id": "workspace_rust_tests",

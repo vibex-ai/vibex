@@ -6,8 +6,8 @@
   "gplFallbackDisposition": {
     "status": "activated",
     "activated": true,
-    "rationale": "Vibex is licensed AGPL-3.0-or-later and intentionally uses the upstream Zed GPL-3.0-or-later tracing packages instead of maintaining a local compatibility shim.",
-    "activationGate": "GPL-3.0-or-later remains limited to the reviewed upstream Zed tracing family; any additional copyleft family requires explicit allowlist review."
+    "rationale": "Vibex is licensed AGPL-3.0-or-later and intentionally uses the reviewed Zed fork's GPL-3.0-or-later tracing packages instead of maintaining a local compatibility shim.",
+    "activationGate": "GPL-3.0-or-later remains limited to the reviewed Zed fork tracing family; any additional copyleft family requires explicit allowlist review."
   },
   "allowedLicenses": [
     {
@@ -52,7 +52,7 @@
     },
     {
       "id": "GPL-3.0-or-later",
-      "rationale": "Approved for the upstream Zed tracing family used by the AGPL-3.0-or-later Vibex application."
+      "rationale": "Approved for the reviewed Zed fork tracing family used by the AGPL-3.0-or-later Vibex application."
     },
     {
       "id": "IJG",
@@ -129,19 +129,21 @@
     {
       "name": "gpui_shared_string",
       "version": "0.1.0",
-      "sourceRepository": "https://github.com/zed-industries/zed",
+      "sourcePath": "vendor/zed/crates/gpui_shared_string",
+      "sourceRepository": "https://github.com/vibex-ai/zed.git",
       "licenseExpression": "Apache-2.0",
       "evidencePath": "LICENSE-APACHE",
-      "upstreamPath": "crates/gpui_shared_string/LICENSE-APACHE@Cargo.lock",
+      "upstreamPath": "vendor/zed/crates/gpui_shared_string/LICENSE-APACHE@c9e8e611dbc279afa0914d28c4d37ad07f38c03b",
       "evidenceSha256": "752daf2fb234ca4a1fa372c073fe127f44b7b90fd2529ae44273a64f9d53da7a"
     },
     {
       "name": "gpui_util",
       "version": "0.1.0",
-      "sourceRepository": "https://github.com/zed-industries/zed",
+      "sourcePath": "vendor/zed/crates/gpui_util",
+      "sourceRepository": "https://github.com/vibex-ai/zed.git",
       "licenseExpression": "Apache-2.0",
       "evidencePath": "LICENSE-APACHE",
-      "upstreamPath": "crates/gpui_util/LICENSE-APACHE@Cargo.lock",
+      "upstreamPath": "vendor/zed/crates/gpui_util/LICENSE-APACHE@c9e8e611dbc279afa0914d28c4d37ad07f38c03b",
       "evidenceSha256": "752daf2fb234ca4a1fa372c073fe127f44b7b90fd2529ae44273a64f9d53da7a"
     }
   ],

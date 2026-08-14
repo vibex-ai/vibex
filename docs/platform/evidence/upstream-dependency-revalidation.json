@@ -2,10 +2,10 @@
   "schemaVersion": "upstream-dependency-revalidation.v1",
   "status": "pending_physical_recapture",
   "currentSource": {
-    "dependencySourcePolicy": "upstream_git_root_cargo_lock",
+    "dependencySourcePolicy": "fork_submodule_root_cargo_lock",
     "zedRevision": "c9e8e611dbc279afa0914d28c4d37ad07f38c03b",
     "gpuiComponentRevision": "031555662e99a1b5a549990b47f246d475b8288a",
-    "cargoLockSha256": "9f369bb4fef16ff737c1ac6951740e4f37b56e75bcbbb1b195e41221762e043a"
+    "cargoLockSha256": "ebad2caf48492610325754c0b33da3cc43a46c48e4a34761b4c1e5a4d66c2873"
   },
   "historicalSources": [
     {

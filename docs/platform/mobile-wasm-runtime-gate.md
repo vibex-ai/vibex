@@ -35,7 +35,8 @@ The machine-readable sources of truth are:
 
 ## Toolchain Contract
 
-- GPUI and gpui-component revisions come from the root `Cargo.lock`.
+- The GPUI revision comes from the `vendor/zed` submodule; the gpui-component
+  revision comes from the root `Cargo.lock`.
 - `wasm-bindgen-cli` must match the lockfile version.
 - The WASM compiler is `nightly-2026-07-24`.
 - The runtime uses `single_threaded_web`; no `SharedArrayBuffer` is required.

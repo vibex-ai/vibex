@@ -1,9 +1,20 @@
 import { spawnSync } from "node:child_process";
+import { resolve, sep } from "node:path";
 
-export const GPUI_DEPENDENCY_SOURCE_POLICY = "upstream_git_root_cargo_lock";
+export const GPUI_DEPENDENCY_SOURCE_POLICY = "fork_submodule_root_cargo_lock";
+export const ZED_REPOSITORY = "https://github.com/vibex-ai/zed.git";
+export const ZED_SUBMODULE_PATH = "vendor/zed";
+export const UPSTREAM_ZED_REPOSITORY = "https://github.com/zed-industries/zed";
+export const GPUI_COMPONENT_REPOSITORY = "https://github.com/longbridge/gpui-component";
 
-const ZED_REPOSITORY = "https://github.com/zed-industries/zed";
-const COMPONENT_REPOSITORY = "https://github.com/longbridge/gpui-component";
+function git(root, args, label) {
+  const result = spawnSync("git", args, { cwd: root, encoding: "utf8" });
+  if (result.error) throw new Error(`${label} failed to start: ${result.error.message}`);
+  if (result.status !== 0) {
+    throw new Error(result.stderr || `${label} exited ${result.status ?? 1}`);
+  }
+  return result.stdout.trim();
+}
 
 function metadata(root) {
   const result = spawnSync(
@@ -38,21 +49,36 @@ function singlePackage(packages, name) {
   return matches[0];
 }
 
+function packageIsInSubmodule(pkg, root) {
+  const submoduleRoot = resolve(root, ZED_SUBMODULE_PATH);
+  const manifestPath = resolve(pkg.manifest_path);
+  return pkg.source === null && manifestPath.startsWith(`${submoduleRoot}${sep}`);
+}
+
+export function resolveZedSubmoduleRevision(root) {
+  const revision = git(
+    root,
+    ["-C", ZED_SUBMODULE_PATH, "rev-parse", "--verify", "HEAD"],
+    "Zed submodule revision lookup"
+  );
+  if (!/^[a-f0-9]{40}$/.test(revision)) {
+    throw new Error(`Zed submodule HEAD is not a full Git revision: ${revision}`);
+  }
+  return revision;
+}
+
 export function resolveGpuiSourceIdentities(root) {
   const graph = metadata(root);
-  const zedPackages = graph.packages.filter((pkg) =>
-    pkg.source?.startsWith(`git+${ZED_REPOSITORY}`)
-  );
-  const zedCommits = new Set(
-    zedPackages.map((pkg) => commitFromSource(pkg.source, ZED_REPOSITORY, pkg.name))
-  );
-  if (zedCommits.size !== 1) {
-    throw new Error(`Zed packages resolve from multiple commits: ${[...zedCommits].join(", ")}`);
+  for (const name of ["gpui", "gpui_platform", "gpui_tokio"]) {
+    const pkg = singlePackage(graph.packages, name);
+    if (!packageIsInSubmodule(pkg, root)) {
+      throw new Error(`${name} resolved outside ${ZED_SUBMODULE_PATH}: ${pkg.source ?? pkg.manifest_path}`);
+    }
   }
-  const zedRevision = [...zedCommits][0];
+  const zedRevision = resolveZedSubmoduleRevision(root);
   const gpuiComponentRevision = commitFromSource(
     singlePackage(graph.packages, "gpui-component").source,
-    COMPONENT_REPOSITORY,
+    GPUI_COMPONENT_REPOSITORY,
     "gpui-component"
   );
   return {

@@ -4445,7 +4445,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:collections@0.1.0:1e15125dab53b828",
+      "bom-ref": "cargo:collections@0.1.0:7d3dd2996f7d7d18",
       "name": "collections",
       "version": "0.1.0",
       "licenses": [
@@ -4457,7 +4457,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "value": "path:vendor/zed/crates/collections"
         },
         {
           "name": "vibex:selected-license",
@@ -4475,7 +4475,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
         }
       ]
     },
@@ -6389,7 +6389,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:derive_refineable@0.1.0:1e15125dab53b828",
+      "bom-ref": "cargo:derive_refineable@0.1.0:4ff7da202d7ebfc9",
       "name": "derive_refineable",
       "version": "0.1.0",
       "licenses": [
@@ -6401,7 +6401,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "value": "path:vendor/zed/crates/refineable/derive_refineable"
         },
         {
           "name": "vibex:selected-license",
@@ -6419,7 +6419,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
         }
       ]
     },
@@ -10349,7 +10349,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui@0.2.2:1e15125dab53b828",
+      "bom-ref": "cargo:gpui@0.2.2:639af286d43bf32b",
       "name": "gpui",
       "version": "0.2.2",
       "licenses": [
@@ -10361,7 +10361,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "value": "path:vendor/zed/crates/gpui"
         },
         {
           "name": "vibex:selected-license",
@@ -10379,7 +10379,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/zed-industries/zed"
+          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
         }
       ]
     },
@@ -10493,7 +10493,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui_linux@0.1.0:1e15125dab53b828",
+      "bom-ref": "cargo:gpui_linux@0.1.0:5277bbb1e9f77bc3",
       "name": "gpui_linux",
       "version": "0.1.0",
       "licenses": [
@@ -10505,7 +10505,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "value": "path:vendor/zed/crates/gpui_linux"
         },
         {
           "name": "vibex:selected-license",
@@ -10523,13 +10523,13 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
         }
       ]
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui_macos@0.1.0:1e15125dab53b828",
+      "bom-ref": "cargo:gpui_macos@0.1.0:b1880b4155df1643",
       "name": "gpui_macos",
       "version": "0.1.0",
       "licenses": [
@@ -10541,7 +10541,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "value": "path:vendor/zed/crates/gpui_macos"
         },
         {
           "name": "vibex:selected-license",
@@ -10559,13 +10559,13 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
         }
       ]
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui_macros@0.1.0:1e15125dab53b828",
+      "bom-ref": "cargo:gpui_macros@0.1.0:68a634b806535a7e",
       "name": "gpui_macros",
       "version": "0.1.0",
       "licenses": [
@@ -10577,7 +10577,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "value": "path:vendor/zed/crates/gpui_macros"
         },
         {
           "name": "vibex:selected-license",
@@ -10595,13 +10595,13 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
         }
       ]
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui_platform@0.1.0:1e15125dab53b828",
+      "bom-ref": "cargo:gpui_platform@0.1.0:d84003249f53c9d3",
       "name": "gpui_platform",
       "version": "0.1.0",
       "licenses": [
@@ -10613,7 +10613,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "value": "path:vendor/zed/crates/gpui_platform"
         },
         {
           "name": "vibex:selected-license",
@@ -10631,13 +10631,13 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
         }
       ]
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui_shared_string@0.1.0:1e15125dab53b828",
+      "bom-ref": "cargo:gpui_shared_string@0.1.0:65e4be665b28764c",
       "name": "gpui_shared_string",
       "version": "0.1.0",
       "licenses": [
@@ -10649,7 +10649,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "value": "path:vendor/zed/crates/gpui_shared_string"
         },
         {
           "name": "vibex:selected-license",
@@ -10661,19 +10661,19 @@
         },
         {
           "name": "vibex:license-evidence",
-          "value": "crates/gpui_shared_string/LICENSE-APACHE@Cargo.lock#sha256=752daf2fb234ca4a1fa372c073fe127f44b7b90fd2529ae44273a64f9d53da7a"
+          "value": "vendor/zed/crates/gpui_shared_string/LICENSE-APACHE@c9e8e611dbc279afa0914d28c4d37ad07f38c03b#sha256=752daf2fb234ca4a1fa372c073fe127f44b7b90fd2529ae44273a64f9d53da7a"
         }
       ],
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
         }
       ]
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui_tokio@0.1.0:1e15125dab53b828",
+      "bom-ref": "cargo:gpui_tokio@0.1.0:d0725b3477647b75",
       "name": "gpui_tokio",
       "version": "0.1.0",
       "licenses": [
@@ -10685,7 +10685,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "value": "path:vendor/zed/crates/gpui_tokio"
         },
         {
           "name": "vibex:selected-license",
@@ -10703,13 +10703,13 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
         }
       ]
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui_util@0.1.0:1e15125dab53b828",
+      "bom-ref": "cargo:gpui_util@0.1.0:b9f3001c16e3909e",
       "name": "gpui_util",
       "version": "0.1.0",
       "licenses": [
@@ -10721,7 +10721,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "value": "path:vendor/zed/crates/gpui_util"
         },
         {
           "name": "vibex:selected-license",
@@ -10733,19 +10733,19 @@
         },
         {
           "name": "vibex:license-evidence",
-          "value": "crates/gpui_util/LICENSE-APACHE@Cargo.lock#sha256=752daf2fb234ca4a1fa372c073fe127f44b7b90fd2529ae44273a64f9d53da7a"
+          "value": "vendor/zed/crates/gpui_util/LICENSE-APACHE@c9e8e611dbc279afa0914d28c4d37ad07f38c03b#sha256=752daf2fb234ca4a1fa372c073fe127f44b7b90fd2529ae44273a64f9d53da7a"
         }
       ],
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
         }
       ]
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui_web@0.1.0:1e15125dab53b828",
+      "bom-ref": "cargo:gpui_web@0.1.0:831621201e4c1b95",
       "name": "gpui_web",
       "version": "0.1.0",
       "licenses": [
@@ -10757,7 +10757,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "value": "path:vendor/zed/crates/gpui_web"
         },
         {
           "name": "vibex:selected-license",
@@ -10775,13 +10775,13 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
         }
       ]
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui_wgpu@0.1.0:1e15125dab53b828",
+      "bom-ref": "cargo:gpui_wgpu@0.1.0:694946df1c2f93ee",
       "name": "gpui_wgpu",
       "version": "0.1.0",
       "licenses": [
@@ -10793,7 +10793,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "value": "path:vendor/zed/crates/gpui_wgpu"
         },
         {
           "name": "vibex:selected-license",
@@ -10811,13 +10811,13 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
         }
       ]
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui_windows@0.1.0:1e15125dab53b828",
+      "bom-ref": "cargo:gpui_windows@0.1.0:3b463fd5ef335d4c",
       "name": "gpui_windows",
       "version": "0.1.0",
       "licenses": [
@@ -10829,7 +10829,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "value": "path:vendor/zed/crates/gpui_windows"
         },
         {
           "name": "vibex:selected-license",
@@ -10847,7 +10847,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
         }
       ]
     },
@@ -11861,7 +11861,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:http_client@0.1.0:1e15125dab53b828",
+      "bom-ref": "cargo:http_client@0.1.0:a2ee54afcd668cac",
       "name": "http_client",
       "version": "0.1.0",
       "licenses": [
@@ -11873,7 +11873,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "value": "path:vendor/zed/crates/http_client"
         },
         {
           "name": "vibex:selected-license",
@@ -11891,7 +11891,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
         }
       ]
     },
@@ -15641,7 +15641,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:media@0.1.0:1e15125dab53b828",
+      "bom-ref": "cargo:media@0.1.0:fff3ea2cd108b5c9",
       "name": "media",
       "version": "0.1.0",
       "licenses": [
@@ -15653,7 +15653,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "value": "path:vendor/zed/crates/media"
         },
         {
           "name": "vibex:selected-license",
@@ -15671,7 +15671,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
         }
       ]
     },
@@ -18989,7 +18989,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:perf@0.1.0:1e15125dab53b828",
+      "bom-ref": "cargo:perf@0.1.0:bccd121581a434b4",
       "name": "perf",
       "version": "0.1.0",
       "licenses": [
@@ -19001,7 +19001,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "value": "path:vendor/zed/tooling/perf"
         },
         {
           "name": "vibex:selected-license",
@@ -19019,7 +19019,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
         }
       ]
     },
@@ -22085,7 +22085,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:refineable@0.1.0:1e15125dab53b828",
+      "bom-ref": "cargo:refineable@0.1.0:3b1a0b83dab40436",
       "name": "refineable",
       "version": "0.1.0",
       "licenses": [
@@ -22097,7 +22097,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "value": "path:vendor/zed/crates/refineable"
         },
         {
           "name": "vibex:selected-license",
@@ -22115,7 +22115,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
         }
       ]
     },
@@ -23669,7 +23669,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:scheduler@0.1.0:1e15125dab53b828",
+      "bom-ref": "cargo:scheduler@0.1.0:702e91d7065ee89a",
       "name": "scheduler",
       "version": "0.1.0",
       "licenses": [
@@ -23681,7 +23681,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "value": "path:vendor/zed/crates/scheduler"
         },
         {
           "name": "vibex:selected-license",
@@ -23699,7 +23699,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
         }
       ]
     },
@@ -26513,7 +26513,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:sum_tree@0.1.0:1e15125dab53b828",
+      "bom-ref": "cargo:sum_tree@0.1.0:4be25d71ea23994e",
       "name": "sum_tree",
       "version": "0.1.0",
       "licenses": [
@@ -26525,7 +26525,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "value": "path:vendor/zed/crates/sum_tree"
         },
         {
           "name": "vibex:selected-license",
@@ -26543,7 +26543,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
         }
       ]
     },
@@ -31445,7 +31445,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:util_macros@0.1.0:1e15125dab53b828",
+      "bom-ref": "cargo:util_macros@0.1.0:68d96308134eb097",
       "name": "util_macros",
       "version": "0.1.0",
       "licenses": [
@@ -31457,7 +31457,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "value": "path:vendor/zed/crates/util_macros"
         },
         {
           "name": "vibex:selected-license",
@@ -31475,7 +31475,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
         }
       ]
     },
@@ -38357,7 +38357,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:zlog@0.1.0:1e15125dab53b828",
+      "bom-ref": "cargo:zlog@0.1.0:79e142a907c245ed",
       "name": "zlog",
       "version": "0.1.0",
       "licenses": [
@@ -38369,7 +38369,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "value": "path:vendor/zed/crates/zlog"
         },
         {
           "name": "vibex:selected-license",
@@ -38387,7 +38387,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
         }
       ]
     },
@@ -38537,7 +38537,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:ztracing@0.1.0:1e15125dab53b828",
+      "bom-ref": "cargo:ztracing@0.1.0:2ef71bbe95310c4b",
       "name": "ztracing",
       "version": "0.1.0",
       "licenses": [
@@ -38549,7 +38549,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "value": "path:vendor/zed/crates/ztracing"
         },
         {
           "name": "vibex:selected-license",
@@ -38567,13 +38567,13 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
         }
       ]
     },
     {
       "type": "library",
-      "bom-ref": "cargo:ztracing_macro@0.1.0:1e15125dab53b828",
+      "bom-ref": "cargo:ztracing_macro@0.1.0:3d0ef0a5a6381faa",
       "name": "ztracing_macro",
       "version": "0.1.0",
       "licenses": [
@@ -38585,7 +38585,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "value": "path:vendor/zed/crates/ztracing_macro"
         },
         {
           "name": "vibex:selected-license",
@@ -38603,7 +38603,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/zed-industries/zed#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
+          "url": "https://github.com/vibex-ai/zed.git#c9e8e611dbc279afa0914d28c4d37ad07f38c03b"
         }
       ]
     },
@@ -40525,9 +40525,9 @@
       ]
     },
     {
-      "ref": "cargo:collections@0.1.0:1e15125dab53b828",
+      "ref": "cargo:collections@0.1.0:7d3dd2996f7d7d18",
       "dependsOn": [
-        "cargo:gpui_util@0.1.0:1e15125dab53b828",
+        "cargo:gpui_util@0.1.0:b9f3001c16e3909e",
         "cargo:indexmap@2.14.0:c19b7c6f923b580a",
         "cargo:rustc-hash@2.1.2:c19b7c6f923b580a"
       ]
@@ -40926,7 +40926,7 @@
       ]
     },
     {
-      "ref": "cargo:derive_refineable@0.1.0:1e15125dab53b828",
+      "ref": "cargo:derive_refineable@0.1.0:4ff7da202d7ebfc9",
       "dependsOn": [
         "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
         "cargo:quote@1.0.46:c19b7c6f923b580a",
@@ -41718,7 +41718,7 @@
       "dependsOn": [
         "asset:gpui-component-lucide-icons:6da0d2d4b0dd99f1",
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
-        "cargo:gpui@0.2.2:1e15125dab53b828",
+        "cargo:gpui@0.2.2:639af286d43bf32b",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:rust-embed@8.12.0:c19b7c6f923b580a",
         "cargo:wasm-bindgen-futures@0.4.75:c19b7c6f923b580a",
@@ -41746,8 +41746,8 @@
         "cargo:futures@0.3.32:c19b7c6f923b580a",
         "cargo:gpui-component-assets@0.5.1:4d9608b0b417550c",
         "cargo:gpui-component-macros@0.5.1:4d9608b0b417550c",
-        "cargo:gpui@0.2.2:1e15125dab53b828",
-        "cargo:gpui_macros@0.1.0:1e15125dab53b828",
+        "cargo:gpui@0.2.2:639af286d43bf32b",
+        "cargo:gpui_macros@0.1.0:68a634b806535a7e",
         "cargo:html5ever@0.27.0:c19b7c6f923b580a",
         "cargo:instant@0.1.13:c19b7c6f923b580a",
         "cargo:itertools@0.13.0:c19b7c6f923b580a",
@@ -41806,7 +41806,7 @@
       ]
     },
     {
-      "ref": "cargo:gpui@0.2.2:1e15125dab53b828",
+      "ref": "cargo:gpui@0.2.2:639af286d43bf32b",
       "dependsOn": [
         "cargo:accesskit@0.24.1:c19b7c6f923b580a",
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
@@ -41820,7 +41820,7 @@
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
         "cargo:cocoa-foundation@0.2.0:c19b7c6f923b580a",
         "cargo:cocoa@0.26.0:c19b7c6f923b580a",
-        "cargo:collections@0.1.0:1e15125dab53b828",
+        "cargo:collections@0.1.0:7d3dd2996f7d7d18",
         "cargo:core-foundation-sys@0.8.7:c19b7c6f923b580a",
         "cargo:core-foundation@0.10.1:c19b7c6f923b580a",
         "cargo:core-graphics@0.24.0:c19b7c6f923b580a",
@@ -41834,18 +41834,18 @@
         "cargo:futures-concurrency@7.7.1:c19b7c6f923b580a",
         "cargo:futures@0.3.32:c19b7c6f923b580a",
         "cargo:getrandom@0.3.4:c19b7c6f923b580a",
-        "cargo:gpui_macros@0.1.0:1e15125dab53b828",
-        "cargo:gpui_shared_string@0.1.0:1e15125dab53b828",
-        "cargo:gpui_util@0.1.0:1e15125dab53b828",
+        "cargo:gpui_macros@0.1.0:68a634b806535a7e",
+        "cargo:gpui_shared_string@0.1.0:65e4be665b28764c",
+        "cargo:gpui_util@0.1.0:b9f3001c16e3909e",
         "cargo:heapless@0.9.3:c19b7c6f923b580a",
-        "cargo:http_client@0.1.0:1e15125dab53b828",
+        "cargo:http_client@0.1.0:a2ee54afcd668cac",
         "cargo:image@0.25.10:c19b7c6f923b580a",
         "cargo:inventory@0.3.24:c19b7c6f923b580a",
         "cargo:itertools@0.14.0:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:lyon@1.0.19:c19b7c6f923b580a",
         "cargo:mach2@0.5.0:c19b7c6f923b580a",
-        "cargo:media@0.1.0:1e15125dab53b828",
+        "cargo:media@0.1.0:fff3ea2cd108b5c9",
         "cargo:metal@0.33.0:c19b7c6f923b580a",
         "cargo:num_cpus@1.17.0:c19b7c6f923b580a",
         "cargo:objc@0.2.7:c19b7c6f923b580a",
@@ -41859,10 +41859,10 @@
         "cargo:proptest@1.10.0:54cab8b0ad0094d4",
         "cargo:rand@0.9.4:c19b7c6f923b580a",
         "cargo:raw-window-handle@0.6.2:c19b7c6f923b580a",
-        "cargo:refineable@0.1.0:1e15125dab53b828",
+        "cargo:refineable@0.1.0:3b1a0b83dab40436",
         "cargo:regex@1.12.4:c19b7c6f923b580a",
         "cargo:resvg@0.46.0:c19b7c6f923b580a",
-        "cargo:scheduler@0.1.0:1e15125dab53b828",
+        "cargo:scheduler@0.1.0:702e91d7065ee89a",
         "cargo:schemars@1.2.1:c19b7c6f923b580a",
         "cargo:seahash@4.1.0:c19b7c6f923b580a",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
@@ -41872,13 +41872,13 @@
         "cargo:spin@0.10.1:c19b7c6f923b580a",
         "cargo:stacksafe@0.1.4:c19b7c6f923b580a",
         "cargo:strum@0.27.2:c19b7c6f923b580a",
-        "cargo:sum_tree@0.1.0:1e15125dab53b828",
+        "cargo:sum_tree@0.1.0:4be25d71ea23994e",
         "cargo:taffy@0.12.2:c19b7c6f923b580a",
         "cargo:thiserror@2.0.18:c19b7c6f923b580a",
         "cargo:ttf-parser@0.25.1:c19b7c6f923b580a",
         "cargo:url@2.5.8:c19b7c6f923b580a",
         "cargo:usvg@0.46.0:c19b7c6f923b580a",
-        "cargo:util_macros@0.1.0:1e15125dab53b828",
+        "cargo:util_macros@0.1.0:68d96308134eb097",
         "cargo:uuid@1.23.3:c19b7c6f923b580a",
         "cargo:waker-fn@1.2.0:c19b7c6f923b580a",
         "cargo:web-time@1.1.0:c19b7c6f923b580a",
@@ -41888,7 +41888,7 @@
       ]
     },
     {
-      "ref": "cargo:gpui_linux@0.1.0:1e15125dab53b828",
+      "ref": "cargo:gpui_linux@0.1.0:5277bbb1e9f77bc3",
       "dependsOn": [
         "cargo:accesskit@0.24.1:c19b7c6f923b580a",
         "cargo:accesskit_unix@0.21.1:c19b7c6f923b580a",
@@ -41899,13 +41899,13 @@
         "cargo:bytemuck@1.25.0:c19b7c6f923b580a",
         "cargo:calloop-wayland-source@0.4.1:c19b7c6f923b580a",
         "cargo:calloop@0.14.4:c19b7c6f923b580a",
-        "cargo:collections@0.1.0:1e15125dab53b828",
+        "cargo:collections@0.1.0:7d3dd2996f7d7d18",
         "cargo:filedescriptor@0.8.3:c19b7c6f923b580a",
         "cargo:futures@0.3.32:c19b7c6f923b580a",
-        "cargo:gpui@0.2.2:1e15125dab53b828",
-        "cargo:gpui_util@0.1.0:1e15125dab53b828",
-        "cargo:gpui_wgpu@0.1.0:1e15125dab53b828",
-        "cargo:http_client@0.1.0:1e15125dab53b828",
+        "cargo:gpui@0.2.2:639af286d43bf32b",
+        "cargo:gpui_util@0.1.0:b9f3001c16e3909e",
+        "cargo:gpui_wgpu@0.1.0:694946df1c2f93ee",
+        "cargo:http_client@0.1.0:a2ee54afcd668cac",
         "cargo:image@0.25.10:c19b7c6f923b580a",
         "cargo:itertools@0.14.0:c19b7c6f923b580a",
         "cargo:libc@0.2.186:c19b7c6f923b580a",
@@ -41938,7 +41938,7 @@
       ]
     },
     {
-      "ref": "cargo:gpui_macos@0.1.0:1e15125dab53b828",
+      "ref": "cargo:gpui_macos@0.1.0:b1880b4155df1643",
       "dependsOn": [
         "cargo:accesskit@0.24.1:c19b7c6f923b580a",
         "cargo:accesskit_macos@0.26.3:c19b7c6f923b580a",
@@ -41948,7 +41948,7 @@
         "cargo:block@0.1.6:c19b7c6f923b580a",
         "cargo:cbindgen@0.28.0:c19b7c6f923b580a",
         "cargo:cocoa@0.26.0:c19b7c6f923b580a",
-        "cargo:collections@0.1.0:1e15125dab53b828",
+        "cargo:collections@0.1.0:7d3dd2996f7d7d18",
         "cargo:core-foundation-sys@0.8.7:c19b7c6f923b580a",
         "cargo:core-foundation@0.10.1:c19b7c6f923b580a",
         "cargo:core-graphics@0.24.0:c19b7c6f923b580a",
@@ -41960,14 +41960,14 @@
         "cargo:etagere@0.2.15:c19b7c6f923b580a",
         "cargo:foreign-types@0.5.0:c19b7c6f923b580a",
         "cargo:futures@0.3.32:c19b7c6f923b580a",
-        "cargo:gpui@0.2.2:1e15125dab53b828",
-        "cargo:gpui_util@0.1.0:1e15125dab53b828",
+        "cargo:gpui@0.2.2:639af286d43bf32b",
+        "cargo:gpui_util@0.1.0:b9f3001c16e3909e",
         "cargo:image@0.25.10:c19b7c6f923b580a",
         "cargo:itertools@0.14.0:c19b7c6f923b580a",
         "cargo:libc@0.2.186:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:mach2@0.5.0:c19b7c6f923b580a",
-        "cargo:media@0.1.0:1e15125dab53b828",
+        "cargo:media@0.1.0:fff3ea2cd108b5c9",
         "cargo:metal@0.33.0:c19b7c6f923b580a",
         "cargo:objc2-app-kit@0.3.2:c19b7c6f923b580a",
         "cargo:objc2-foundation@0.3.2:c19b7c6f923b580a",
@@ -41985,7 +41985,7 @@
       ]
     },
     {
-      "ref": "cargo:gpui_macros@0.1.0:1e15125dab53b828",
+      "ref": "cargo:gpui_macros@0.1.0:68a634b806535a7e",
       "dependsOn": [
         "cargo:heck@0.5.0:c19b7c6f923b580a",
         "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
@@ -41994,18 +41994,18 @@
       ]
     },
     {
-      "ref": "cargo:gpui_platform@0.1.0:1e15125dab53b828",
+      "ref": "cargo:gpui_platform@0.1.0:d84003249f53c9d3",
       "dependsOn": [
         "cargo:console_error_panic_hook@0.1.7:c19b7c6f923b580a",
-        "cargo:gpui@0.2.2:1e15125dab53b828",
-        "cargo:gpui_linux@0.1.0:1e15125dab53b828",
-        "cargo:gpui_macos@0.1.0:1e15125dab53b828",
-        "cargo:gpui_web@0.1.0:1e15125dab53b828",
-        "cargo:gpui_windows@0.1.0:1e15125dab53b828"
+        "cargo:gpui@0.2.2:639af286d43bf32b",
+        "cargo:gpui_linux@0.1.0:5277bbb1e9f77bc3",
+        "cargo:gpui_macos@0.1.0:b1880b4155df1643",
+        "cargo:gpui_web@0.1.0:831621201e4c1b95",
+        "cargo:gpui_windows@0.1.0:3b463fd5ef335d4c"
       ]
     },
     {
-      "ref": "cargo:gpui_shared_string@0.1.0:1e15125dab53b828",
+      "ref": "cargo:gpui_shared_string@0.1.0:65e4be665b28764c",
       "dependsOn": [
         "cargo:schemars@1.2.1:c19b7c6f923b580a",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
@@ -42013,16 +42013,16 @@
       ]
     },
     {
-      "ref": "cargo:gpui_tokio@0.1.0:1e15125dab53b828",
+      "ref": "cargo:gpui_tokio@0.1.0:d0725b3477647b75",
       "dependsOn": [
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
-        "cargo:gpui@0.2.2:1e15125dab53b828",
-        "cargo:gpui_util@0.1.0:1e15125dab53b828",
+        "cargo:gpui@0.2.2:639af286d43bf32b",
+        "cargo:gpui_util@0.1.0:b9f3001c16e3909e",
         "cargo:tokio@1.52.3:c19b7c6f923b580a"
       ]
     },
     {
-      "ref": "cargo:gpui_util@0.1.0:1e15125dab53b828",
+      "ref": "cargo:gpui_util@0.1.0:b9f3001c16e3909e",
       "dependsOn": [
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
@@ -42030,14 +42030,14 @@
       ]
     },
     {
-      "ref": "cargo:gpui_web@0.1.0:1e15125dab53b828",
+      "ref": "cargo:gpui_web@0.1.0:831621201e4c1b95",
       "dependsOn": [
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
         "cargo:console_error_panic_hook@0.1.7:c19b7c6f923b580a",
         "cargo:futures@0.3.32:c19b7c6f923b580a",
-        "cargo:gpui@0.2.2:1e15125dab53b828",
-        "cargo:gpui_wgpu@0.1.0:1e15125dab53b828",
-        "cargo:http_client@0.1.0:1e15125dab53b828",
+        "cargo:gpui@0.2.2:639af286d43bf32b",
+        "cargo:gpui_wgpu@0.1.0:694946df1c2f93ee",
+        "cargo:http_client@0.1.0:a2ee54afcd668cac",
         "cargo:js-sys@0.3.102:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:parking_lot@0.12.5:c19b7c6f923b580a",
@@ -42052,15 +42052,15 @@
       ]
     },
     {
-      "ref": "cargo:gpui_wgpu@0.1.0:1e15125dab53b828",
+      "ref": "cargo:gpui_wgpu@0.1.0:694946df1c2f93ee",
       "dependsOn": [
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
         "cargo:bytemuck@1.25.0:c19b7c6f923b580a",
-        "cargo:collections@0.1.0:1e15125dab53b828",
+        "cargo:collections@0.1.0:7d3dd2996f7d7d18",
         "cargo:cosmic-text@0.19.0:c19b7c6f923b580a",
         "cargo:etagere@0.2.15:c19b7c6f923b580a",
-        "cargo:gpui@0.2.2:1e15125dab53b828",
-        "cargo:gpui_util@0.1.0:1e15125dab53b828",
+        "cargo:gpui@0.2.2:639af286d43bf32b",
+        "cargo:gpui_util@0.1.0:b9f3001c16e3909e",
         "cargo:itertools@0.14.0:c19b7c6f923b580a",
         "cargo:js-sys@0.3.102:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
@@ -42079,17 +42079,17 @@
       ]
     },
     {
-      "ref": "cargo:gpui_windows@0.1.0:1e15125dab53b828",
+      "ref": "cargo:gpui_windows@0.1.0:3b463fd5ef335d4c",
       "dependsOn": [
         "cargo:accesskit@0.24.1:c19b7c6f923b580a",
         "cargo:accesskit_windows@0.33.1:c19b7c6f923b580a",
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
-        "cargo:collections@0.1.0:1e15125dab53b828",
+        "cargo:collections@0.1.0:7d3dd2996f7d7d18",
         "cargo:dunce@1.0.5:c19b7c6f923b580a",
         "cargo:etagere@0.2.15:c19b7c6f923b580a",
         "cargo:futures@0.3.32:c19b7c6f923b580a",
-        "cargo:gpui@0.2.2:1e15125dab53b828",
-        "cargo:gpui_util@0.1.0:1e15125dab53b828",
+        "cargo:gpui@0.2.2:639af286d43bf32b",
+        "cargo:gpui_util@0.1.0:b9f3001c16e3909e",
         "cargo:image@0.25.10:c19b7c6f923b580a",
         "cargo:itertools@0.14.0:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
@@ -42312,7 +42312,7 @@
       ]
     },
     {
-      "ref": "cargo:http_client@0.1.0:1e15125dab53b828",
+      "ref": "cargo:http_client@0.1.0:a2ee54afcd668cac",
       "dependsOn": [
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
         "cargo:async-compression@0.4.42:c19b7c6f923b580a",
@@ -43098,7 +43098,7 @@
       ]
     },
     {
-      "ref": "cargo:media@0.1.0:1e15125dab53b828",
+      "ref": "cargo:media@0.1.0:fff3ea2cd108b5c9",
       "dependsOn": [
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
         "cargo:bindgen@0.71.1:c19b7c6f923b580a",
@@ -43860,9 +43860,9 @@
       "dependsOn": []
     },
     {
-      "ref": "cargo:perf@0.1.0:1e15125dab53b828",
+      "ref": "cargo:perf@0.1.0:bccd121581a434b4",
       "dependsOn": [
-        "cargo:collections@0.1.0:1e15125dab53b828",
+        "cargo:collections@0.1.0:7d3dd2996f7d7d18",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
         "cargo:serde_json@1.0.150:c19b7c6f923b580a"
       ]
@@ -44488,9 +44488,9 @@
       ]
     },
     {
-      "ref": "cargo:refineable@0.1.0:1e15125dab53b828",
+      "ref": "cargo:refineable@0.1.0:3b1a0b83dab40436",
       "dependsOn": [
-        "cargo:derive_refineable@0.1.0:1e15125dab53b828"
+        "cargo:derive_refineable@0.1.0:4ff7da202d7ebfc9"
       ]
     },
     {
@@ -44894,7 +44894,7 @@
       ]
     },
     {
-      "ref": "cargo:scheduler@0.1.0:1e15125dab53b828",
+      "ref": "cargo:scheduler@0.1.0:702e91d7065ee89a",
       "dependsOn": [
         "cargo:async-task@4.7.1:c19b7c6f923b580a",
         "cargo:backtrace@0.3.76:c19b7c6f923b580a",
@@ -45458,13 +45458,13 @@
       "dependsOn": []
     },
     {
-      "ref": "cargo:sum_tree@0.1.0:1e15125dab53b828",
+      "ref": "cargo:sum_tree@0.1.0:4be25d71ea23994e",
       "dependsOn": [
         "cargo:heapless@0.9.3:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:rayon@1.12.0:c19b7c6f923b580a",
         "cargo:tracing@0.1.44:c19b7c6f923b580a",
-        "cargo:ztracing@0.1.0:1e15125dab53b828"
+        "cargo:ztracing@0.1.0:2ef71bbe95310c4b"
       ]
     },
     {
@@ -46464,9 +46464,9 @@
       "dependsOn": []
     },
     {
-      "ref": "cargo:util_macros@0.1.0:1e15125dab53b828",
+      "ref": "cargo:util_macros@0.1.0:68d96308134eb097",
       "dependsOn": [
-        "cargo:perf@0.1.0:1e15125dab53b828",
+        "cargo:perf@0.1.0:bccd121581a434b4",
         "cargo:quote@1.0.46:c19b7c6f923b580a",
         "cargo:syn@2.0.118:c19b7c6f923b580a"
       ]
@@ -46727,9 +46727,9 @@
         "cargo:embed-resource@3.0.9:c19b7c6f923b580a",
         "cargo:gpui-component-assets@0.5.1:4d9608b0b417550c",
         "cargo:gpui-component@0.5.2:4d9608b0b417550c",
-        "cargo:gpui@0.2.2:1e15125dab53b828",
-        "cargo:gpui_platform@0.1.0:1e15125dab53b828",
-        "cargo:gpui_tokio@0.1.0:1e15125dab53b828",
+        "cargo:gpui@0.2.2:639af286d43bf32b",
+        "cargo:gpui_platform@0.1.0:d84003249f53c9d3",
+        "cargo:gpui_tokio@0.1.0:d0725b3477647b75",
         "cargo:gtk@0.18.2:c19b7c6f923b580a",
         "cargo:image@0.25.10:c19b7c6f923b580a",
         "cargo:pdfium-render@0.9.3:c19b7c6f923b580a",
@@ -46807,7 +46807,7 @@
       "dependsOn": [
         "cargo:base64@0.22.1:c19b7c6f923b580a",
         "cargo:gpui-component@0.5.2:4d9608b0b417550c",
-        "cargo:gpui@0.2.2:1e15125dab53b828",
+        "cargo:gpui@0.2.2:639af286d43bf32b",
         "cargo:html5ever@0.27.0:c19b7c6f923b580a",
         "cargo:image@0.25.10:c19b7c6f923b580a",
         "cargo:markup5ever_rcdom@0.3.0:c19b7c6f923b580a",
@@ -46889,7 +46889,7 @@
       "dependsOn": [
         "asset:vibex-mobile-wasm-application-icon:55337e2a7ae8ba53",
         "cargo:gpui-component@0.5.2:4d9608b0b417550c",
-        "cargo:gpui@0.2.2:1e15125dab53b828",
+        "cargo:gpui@0.2.2:639af286d43bf32b",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
         "cargo:vibex-backend@0.1.0-rc.1:14559522eff35735",
         "cargo:vibex-core@0.1.0-rc.1:a1f32ad3e304847a",
@@ -48215,11 +48215,11 @@
       "dependsOn": []
     },
     {
-      "ref": "cargo:zlog@0.1.0:1e15125dab53b828",
+      "ref": "cargo:zlog@0.1.0:79e142a907c245ed",
       "dependsOn": [
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
-        "cargo:collections@0.1.0:1e15125dab53b828",
+        "cargo:collections@0.1.0:7d3dd2996f7d7d18",
         "cargo:log@0.4.33:c19b7c6f923b580a"
       ]
     },
@@ -48247,16 +48247,16 @@
       ]
     },
     {
-      "ref": "cargo:ztracing@0.1.0:1e15125dab53b828",
+      "ref": "cargo:ztracing@0.1.0:2ef71bbe95310c4b",
       "dependsOn": [
         "cargo:tracing-subscriber@0.3.23:c19b7c6f923b580a",
         "cargo:tracing@0.1.44:c19b7c6f923b580a",
-        "cargo:zlog@0.1.0:1e15125dab53b828",
-        "cargo:ztracing_macro@0.1.0:1e15125dab53b828"
+        "cargo:zlog@0.1.0:79e142a907c245ed",
+        "cargo:ztracing_macro@0.1.0:3d0ef0a5a6381faa"
       ]
     },
     {
-      "ref": "cargo:ztracing_macro@0.1.0:1e15125dab53b828",
+      "ref": "cargo:ztracing_macro@0.1.0:3d0ef0a5a6381faa",
       "dependsOn": []
     },
     {
