@@ -3521,6 +3521,7 @@ pub struct VibexWorkbench {
     fork_session_pending: bool,
     pending_agent_turn_session_ids: BTreeSet<String>,
     unread_agent_completion_session_ids: BTreeSet<String>,
+    notification_suppressed_session_ids: BTreeSet<String>,
     agent_turn_pending: bool,
     auto_continue_default_project_ids: BTreeSet<String>,
     auto_continue_session_ids: BTreeSet<String>,
@@ -4103,6 +4104,7 @@ impl VibexWorkbench {
             fork_session_pending: false,
             pending_agent_turn_session_ids: BTreeSet::new(),
             unread_agent_completion_session_ids: BTreeSet::new(),
+            notification_suppressed_session_ids: BTreeSet::new(),
             agent_turn_pending: false,
             auto_continue_default_project_ids,
             auto_continue_session_ids,
@@ -7564,27 +7566,29 @@ impl VibexWorkbench {
         if !self.ui_state.desktop_behavior.notifications_enabled {
             return;
         }
-        let title = "Vibex";
-        let body = match timeline_notification_kind(events, &self.ui_state.desktop_behavior) {
-            Some(NotificationKind::Failed) => Some(locale::text(
-                "Agent turn failed",
-                "Agent 回合失败",
-                "Agent 回合失敗",
-            )),
-            Some(NotificationKind::NeedsInput) => Some(locale::text(
-                "Agent needs your input",
-                "Agent 需要你的输入",
-                "Agent 需要你的輸入",
-            )),
-            Some(NotificationKind::Completed) => Some(locale::text(
-                "Agent turn completed",
-                "Agent 回合已完成",
-                "Agent 回合已完成",
-            )),
-            None => None,
+        let Some(session_id) = events.first().map(|event| event.session_id.as_str()) else {
+            return;
         };
+        if self
+            .notification_suppressed_session_ids
+            .contains(session_id)
+        {
+            return;
+        }
+        let agent_id = self
+            .sessions
+            .iter()
+            .find(|session| session.id.as_str() == session_id)
+            .map(|session| &session.agent_id);
+        let agent_label = agent_id
+            .map(|agent_id| runtime_agent_label(&self.agent_snapshots, agent_id))
+            .unwrap_or_else(|| "Agent".to_string());
+        let body = timeline_notification_body(
+            timeline_notification_kind(events, &self.ui_state.desktop_behavior),
+            &agent_label,
+        );
         if let Some(body) = body
-            && let Err(error) = send_system_notification(title, body)
+            && let Err(error) = send_system_notification("Vibex", &body)
         {
             eprintln!("system notification failed: {}", error.code);
         }
@@ -8750,6 +8754,8 @@ impl VibexWorkbench {
             command_invocation,
             ..
         } = message;
+        self.notification_suppressed_session_ids
+            .remove(session_id.as_str());
         let is_command = command_invocation.is_some();
         let generation = self.session_generation;
         let submitted_session_id = session_id.clone();
@@ -11106,6 +11112,8 @@ impl VibexWorkbench {
         else {
             return;
         };
+        self.notification_suppressed_session_ids
+            .insert(session_id.as_str().to_string());
         let has_queued_messages = self
             .composer_queue
             .iter()
@@ -11176,6 +11184,8 @@ impl VibexWorkbench {
                         }
                         Ok(Err(error)) => {
                             this.agent_error = Some(format!("{}: {}", error.code, error.message));
+                            this.notification_suppressed_session_ids
+                                .remove(interrupted_session_id.as_str());
                             this.composer_queue_interrupted_session_ids
                                 .remove(interrupted_session_id.as_str());
                             if queue_behavior == ComposerQueueInterruptBehavior::Steer {
@@ -11187,6 +11197,8 @@ impl VibexWorkbench {
                         }
                         Err(error) => {
                             this.agent_error = Some(format!("Agent interrupt failed: {error}"));
+                            this.notification_suppressed_session_ids
+                                .remove(interrupted_session_id.as_str());
                             this.composer_queue_interrupted_session_ids
                                 .remove(interrupted_session_id.as_str());
                             if queue_behavior == ComposerQueueInterruptBehavior::Steer {
@@ -11242,6 +11254,8 @@ impl VibexWorkbench {
         self.cancel_auto_continue_countdown(&session_id);
         self.auto_continue_handled_turns
             .insert(session_id.as_str().to_string(), turn_updated_at_ms);
+        self.notification_suppressed_session_ids
+            .remove(session_id.as_str());
         self.set_session_turn_pending(&session_id, true);
         if self.selected_session_id.as_ref() == Some(&session_id) {
             self.agent_error = None;
@@ -16228,6 +16242,10 @@ impl VibexWorkbench {
         let locale = self.resolved_locale();
         let project_actions_label = sidebar_project_actions_label(locale, &project_name);
         let new_session_label = sidebar_new_session_for_project_label(locale, &project_name);
+        let context_menu_hovered = self.sidebar_context_menu_target
+            == Some(SidebarContextMenuTarget::Project(project_id_string.clone()));
+        let context_menu_hover_entity = cx.weak_entity();
+        let context_menu_project_id = project_id_string.clone();
 
         let project_row = div()
             .id(format!("sidebar-project-row-{project_id_string}"))
@@ -31589,6 +31607,29 @@ enum NotificationKind {
     Failed,
 }
 
+fn timeline_notification_body(kind: Option<NotificationKind>, agent_label: &str) -> Option<String> {
+    let locale = locale::current_locale();
+    match kind {
+        Some(NotificationKind::Failed) => Some(match locale {
+            locale::ResolvedLocale::En => format!("{agent_label} encountered an error"),
+            locale::ResolvedLocale::ZhCn => format!("{agent_label} 出现错误"),
+            locale::ResolvedLocale::ZhTw => format!("{agent_label} 出現錯誤"),
+        }),
+        Some(NotificationKind::NeedsInput) => Some(match locale {
+            locale::ResolvedLocale::En => format!("{agent_label} needs your confirmation"),
+            locale::ResolvedLocale::ZhCn => format!("{agent_label} 需要你确认内容"),
+            locale::ResolvedLocale::ZhTw => format!("{agent_label} 需要你確認內容"),
+        }),
+        Some(NotificationKind::Completed) => Some(match locale {
+            locale::ResolvedLocale::En => format!("{agent_label} completed work"),
+            locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => {
+                format!("{agent_label} 工作完成")
+            }
+        }),
+        None => None,
+    }
+}
+
 fn timeline_notification_kind(
     events: &[TimelineLiveEvent],
     preferences: &DesktopBehaviorUiState,
@@ -35244,6 +35285,21 @@ mod tests {
             timeline_notification_kind(&[final_event], &preferences),
             Some(NotificationKind::Completed)
         );
+    }
+
+    #[test]
+    fn timeline_notification_body_uses_the_agent_label() {
+        let completed = timeline_notification_body(Some(NotificationKind::Completed), "Codex")
+            .expect("completed notification should have a body");
+        let needs_input =
+            timeline_notification_body(Some(NotificationKind::NeedsInput), "Claude Code")
+                .expect("needs-input notification should have a body");
+        let failed = timeline_notification_body(Some(NotificationKind::Failed), "Codex")
+            .expect("failed notification should have a body");
+        assert!(completed.starts_with("Codex "));
+        assert!(needs_input.starts_with("Claude Code "));
+        assert!(failed.starts_with("Codex "));
+        assert_eq!(timeline_notification_body(None, "Codex"), None);
     }
 
     #[test]
